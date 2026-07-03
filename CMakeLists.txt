@@ -2597,9 +2597,23 @@ set(AIDA_SOURCES
     src/mcp_server.cpp
     src/settings.cpp
     src/driver_loader.cpp
+    src/vuln/chain_binary_corpus.cpp
+    src/vuln/chain_model.cpp
+    src/vuln/chain_report.cpp
+    src/vuln/chain_schema.cpp
+    src/vuln/chain_state.cpp
+    src/vuln/chain_store.cpp
     src/vuln/cfg_engine.cpp
     src/vuln/kernel_engine.cpp
     src/vuln/microcode_engine.cpp
+    src/vuln/chain_budget.cpp
+    src/vuln/chain_extraction.cpp
+    src/vuln/chain_path_trace.cpp
+    src/vuln/chain_side_effects.cpp
+    src/vuln/chain_solver.cpp
+    src/vuln/chain_state_contracts.cpp
+    src/vuln/chain_trigger_trace.cpp
+    src/vuln/chain_verification_engine.cpp
     src/vuln/surface_engine.cpp
     src/vuln/taint_engine.cpp
     src/vuln/vuln_callsites.cpp
@@ -2634,7 +2648,21 @@ set(AIDA_HEADERS
     src/obfuscation.hpp
     src/settings.hpp
     src/driver_loader.hpp
+    src/vuln/chain_binary_corpus.hpp
+    src/vuln/chain_model.hpp
+    src/vuln/chain_report.hpp
+    src/vuln/chain_schema.hpp
+    src/vuln/chain_state.hpp
+    src/vuln/chain_store.hpp
     src/vuln/microcode_engine.hpp
+    src/vuln/chain_budget.hpp
+    src/vuln/chain_extraction.hpp
+    src/vuln/chain_path_trace.hpp
+    src/vuln/chain_side_effects.hpp
+    src/vuln/chain_solver.hpp
+    src/vuln/chain_state_contracts.hpp
+    src/vuln/chain_trigger_trace.hpp
+    src/vuln/chain_verification_engine.hpp
     src/vuln/taint_engine.hpp
     src/vuln/vuln_common.hpp
     src/vuln/vuln_signatures.hpp

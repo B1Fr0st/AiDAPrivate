@@ -376,10 +376,16 @@ namespace net_redirect {
     void record_redirect_flow(UINT32 rule_id, UINT32 protocol, UINT32 af, UINT32 pid,
                               const UINT8* local_addr, UINT32 local_port,
                               const UINT8* original_remote_addr, UINT32 original_remote_port,
-                              const UINT8* redirected_remote_addr, UINT32 redirected_remote_port);
+                              const UINT8* redirected_remote_addr, UINT32 redirected_remote_port,
+                              const UINT8* injected_local_addr, UINT32 injected_local_port,
+                              const UINT8* injected_remote_addr, UINT32 injected_remote_port,
+                              UINT64 endpoint_handle, UINT32 compartment_id,
+                              UINT32 interface_index, UINT32 sub_interface_index);
     BOOLEAN find_reverse_redirect(UINT32 protocol, UINT32 af, UINT32 pid,
                                   const UINT8* local_addr, UINT32 local_port,
                                   const UINT8* remote_addr, UINT32 remote_port,
+                                  UINT64 endpoint_handle, UINT32 compartment_id,
+                                  UINT32 interface_index, UINT32 sub_interface_index,
                                   UINT32* rule_id, UINT8* original_remote_addr,
                                   UINT32* original_remote_port, UINT32* flow_pid,
                                   LONG* active_flow_count);
@@ -1323,8 +1329,11 @@ namespace net_capture {
                 UINT32 reverse_rule_id = 0;
                 UINT32 reverse_flow_pid = 0;
                 LONG reverse_flow_count = 0;
+                net_inject::inject_metadata reverse_meta = make_inject_metadata(inMetaValues);
                 if (net_redirect::find_reverse_redirect(protocol, 2, pid,
                         local_ip, local_port, remote_ip, remote_port,
+                        reverse_meta.endpoint_handle, reverse_meta.compartment_id,
+                        reverse_meta.interface_index, reverse_meta.sub_interface_index,
                         &reverse_rule_id, original_remote_ip,
                         &original_remote_port, &reverse_flow_pid,
                         &reverse_flow_count)) {
@@ -1349,8 +1358,7 @@ namespace net_capture {
                         strong::kmemcpy(inj_buf->payload, pkt_data + payload_skip, inj_buf->payload_size);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
-                    NTSTATUS reverse_status = net_inject::inject_packet(inj_buf, &inject_meta);
+                    NTSTATUS reverse_status = net_inject::inject_packet(inj_buf, &reverse_meta);
                     if (NT_SUCCESS(reverse_status) && inj_buf->status == 0) {
                         classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
                     }
@@ -1901,8 +1909,12 @@ namespace net_capture {
                         if (inj_buf->payload_size > 0)
                             strong::kmemcpy(inj_buf->payload, pkt_data, inj_buf->payload_size);
                     }
+                    net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
                     net_redirect::record_redirect_flow(redir_rule_id, protocol, 2, pid,
-                        local_ip, local_port, remote_ip, remote_port, redir_addr, redir_port);
+                        local_ip, local_port, remote_ip, remote_port, redir_addr, redir_port,
+                        inj_buf->src_addr, inj_buf->src_port, inj_buf->dst_addr, inj_buf->dst_port,
+                        inject_meta.endpoint_handle, inject_meta.compartment_id,
+                        inject_meta.interface_index, inject_meta.sub_interface_index);
                     WW_LOG("net_redirect::classify layer=out_trans direction=1 protocol=%u pid=%u rule_id=%u match_before=%ld match_after=%ld tuple_before=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u tuple_after=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u iface_src=%u iface_dst=%u compartment=%lu transport_len=%u hdr_skip=%u payload_size=%u raw_transport=%u tcp_options_size=%u decision=block_inject",
                         protocol,
                         pid,
@@ -1923,7 +1935,6 @@ namespace net_capture {
                         (hdr_skip > 20) ? (hdr_skip - 20) : 0u);
                     classifyOut->actionType = FWP_ACTION_BLOCK_;
                     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                    net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
                     NTSTATUS inject_status = net_inject::inject_packet(inj_buf, &inject_meta);
                     if (NT_SUCCESS(inject_status) && inj_buf->status == 0) {
                         classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
@@ -2471,8 +2482,11 @@ namespace net_capture {
                     UINT32 reverse_rule_id = 0;
                     UINT32 reverse_flow_pid = 0;
                     LONG reverse_flow_count = 0;
+                    net_inject::inject_metadata reverse_meta = make_inject_metadata(inMetaValues);
                     if (net_redirect::find_reverse_redirect(protocol, 2, pid,
                             local_ip, local_port, remote_ip, remote_port,
+                            reverse_meta.endpoint_handle, reverse_meta.compartment_id,
+                            reverse_meta.interface_index, reverse_meta.sub_interface_index,
                             &reverse_rule_id, original_remote_ip,
                             &original_remote_port, &reverse_flow_pid,
                             &reverse_flow_count)) {
@@ -2490,8 +2504,7 @@ namespace net_capture {
                             strong::kmemcpy(inj_buf->payload, pkt_data + payload_skip, inj_buf->payload_size);
                         classifyOut->actionType = FWP_ACTION_BLOCK_;
                         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                        net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
-                        NTSTATUS reverse_status = net_inject::inject_packet(inj_buf, &inject_meta);
+                        NTSTATUS reverse_status = net_inject::inject_packet(inj_buf, &reverse_meta);
                         if (NT_SUCCESS(reverse_status) && inj_buf->status == 0) {
                             classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
                         }
@@ -2534,11 +2547,14 @@ namespace net_capture {
                         inj_buf->payload_size = pkt_len - payload_skip;
                         if (inj_buf->payload_size > 0)
                             strong::kmemcpy(inj_buf->payload, pkt_data + payload_skip, inj_buf->payload_size);
+                        net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
                         net_redirect::record_redirect_flow(redir_rule_id, protocol, 2, pid,
-                            local_ip, local_port, remote_ip, remote_port, redir_addr, redir_port);
+                            local_ip, local_port, remote_ip, remote_port, redir_addr, redir_port,
+                            inj_buf->src_addr, inj_buf->src_port, inj_buf->dst_addr, inj_buf->dst_port,
+                            inject_meta.endpoint_handle, inject_meta.compartment_id,
+                            inject_meta.interface_index, inject_meta.sub_interface_index);
                         classifyOut->actionType = FWP_ACTION_BLOCK_;
                         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE_;
-                        net_inject::inject_metadata inject_meta = make_inject_metadata(inMetaValues);
                         NTSTATUS redirect_status = net_inject::inject_packet(inj_buf, &inject_meta);
                         if (NT_SUCCESS(redirect_status) && inj_buf->status == 0) {
                             classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB_;
@@ -9155,9 +9171,17 @@ namespace net_redirect {
         UINT32 local_port;
         UINT32 original_remote_port;
         UINT32 redirected_remote_port;
+        UINT32 injected_local_port;
+        UINT32 injected_remote_port;
+        UINT32 compartment_id;
+        UINT32 interface_index;
+        UINT32 sub_interface_index;
         UINT8  local_addr[16];
         UINT8  original_remote_addr[16];
         UINT8  redirected_remote_addr[16];
+        UINT8  injected_local_addr[16];
+        UINT8  injected_remote_addr[16];
+        UINT64 endpoint_handle;
         UINT64 last_seen;
     } ACTIVE_REDIR_FLOW;
 
@@ -9176,6 +9200,14 @@ namespace net_redirect {
             if (a[i] != b[i]) return FALSE;
         }
         return TRUE;
+    }
+
+    static __forceinline BOOLEAN metadata_value_compatible_uint32(UINT32 recorded, UINT32 observed) {
+        return recorded == 0 || observed == 0 || recorded == observed;
+    }
+
+    static __forceinline BOOLEAN metadata_value_compatible_uint64(UINT64 recorded, UINT64 observed) {
+        return recorded == 0 || observed == 0 || recorded == observed;
     }
 
     static __forceinline UINT64 redir_now_100ns() {
@@ -9200,8 +9232,12 @@ namespace net_redirect {
     void record_redirect_flow(UINT32 rule_id, UINT32 protocol, UINT32 af, UINT32 pid,
                               const UINT8* local_addr, UINT32 local_port,
                               const UINT8* original_remote_addr, UINT32 original_remote_port,
-                              const UINT8* redirected_remote_addr, UINT32 redirected_remote_port) {
-        if (rule_id == 0 || protocol == 0 || !local_addr || !original_remote_addr || !redirected_remote_addr)
+                              const UINT8* redirected_remote_addr, UINT32 redirected_remote_port,
+                              const UINT8* injected_local_addr, UINT32 injected_local_port,
+                              const UINT8* injected_remote_addr, UINT32 injected_remote_port,
+                              UINT64 endpoint_handle, UINT32 compartment_id,
+                              UINT32 interface_index, UINT32 sub_interface_index) {
+        if (rule_id == 0 || protocol == 0 || !local_addr || !original_remote_addr || !redirected_remote_addr || !injected_local_addr || !injected_remote_addr)
             return;
         UINT64 now = redir_now_100ns();
         UINT32 selected = REDIR_MAX_FLOWS;
@@ -9221,10 +9257,12 @@ namespace net_redirect {
             }
             if (flow->protocol == protocol &&
                 flow->address_family == af &&
-                flow->local_port == local_port &&
-                flow->redirected_remote_port == redirected_remote_port &&
-                addr_equal_for_af(flow->local_addr, local_addr, af) &&
-                addr_equal_for_af(flow->redirected_remote_addr, redirected_remote_addr, af)) {
+                flow->injected_local_port == injected_local_port &&
+                flow->injected_remote_port == injected_remote_port &&
+                addr_equal_for_af(flow->injected_local_addr, injected_local_addr, af) &&
+                addr_equal_for_af(flow->injected_remote_addr, injected_remote_addr, af) &&
+                metadata_value_compatible_uint32(flow->compartment_id, compartment_id) &&
+                metadata_value_compatible_uint64(flow->endpoint_handle, endpoint_handle)) {
                 selected = i;
                 reused = 1;
                 break;
@@ -9256,14 +9294,22 @@ namespace net_redirect {
             flow->local_port = local_port;
             flow->original_remote_port = original_remote_port;
             flow->redirected_remote_port = redirected_remote_port;
+            flow->injected_local_port = injected_local_port;
+            flow->injected_remote_port = injected_remote_port;
+            flow->endpoint_handle = endpoint_handle;
+            flow->compartment_id = compartment_id;
+            flow->interface_index = interface_index;
+            flow->sub_interface_index = sub_interface_index;
             strong::kmemcpy(flow->local_addr, local_addr, 16);
             strong::kmemcpy(flow->original_remote_addr, original_remote_addr, 16);
             strong::kmemcpy(flow->redirected_remote_addr, redirected_remote_addr, 16);
+            strong::kmemcpy(flow->injected_local_addr, injected_local_addr, 16);
+            strong::kmemcpy(flow->injected_remote_addr, injected_remote_addr, 16);
             flow->last_seen = now;
             active_after = g_active_redir_flow_count;
         }
         KeReleaseSpinLock(&g_redir_flow_lock, irql);
-        WW_LOG("net_redirect::flow_record rule_id=%u selected=%u reused=%u expired=%u active_after=%ld protocol=%u pid=%u local=%u.%u.%u.%u:%u original=%u.%u.%u.%u:%u redirected=%u.%u.%u.%u:%u",
+        WW_LOG("net_redirect::flow_record rule_id=%u selected=%u reused=%u expired=%u active_after=%ld protocol=%u pid=%u local=%u.%u.%u.%u:%u original=%u.%u.%u.%u:%u redirected=%u.%u.%u.%u:%u injected=%u.%u.%u.%u:%u->%u.%u.%u.%u:%u endpoint=0x%llX compartment=%u iface=%u sub_iface=%u",
             rule_id,
             selected == REDIR_MAX_FLOWS ? 0xFFFFFFFFu : selected,
             reused,
@@ -9273,12 +9319,20 @@ namespace net_redirect {
             pid,
             local_addr[0], local_addr[1], local_addr[2], local_addr[3], local_port,
             original_remote_addr[0], original_remote_addr[1], original_remote_addr[2], original_remote_addr[3], original_remote_port,
-            redirected_remote_addr[0], redirected_remote_addr[1], redirected_remote_addr[2], redirected_remote_addr[3], redirected_remote_port);
+            redirected_remote_addr[0], redirected_remote_addr[1], redirected_remote_addr[2], redirected_remote_addr[3], redirected_remote_port,
+            injected_local_addr[0], injected_local_addr[1], injected_local_addr[2], injected_local_addr[3], injected_local_port,
+            injected_remote_addr[0], injected_remote_addr[1], injected_remote_addr[2], injected_remote_addr[3], injected_remote_port,
+            endpoint_handle,
+            compartment_id,
+            interface_index,
+            sub_interface_index);
     }
 
     BOOLEAN find_reverse_redirect(UINT32 protocol, UINT32 af, UINT32 pid,
                                   const UINT8* local_addr, UINT32 local_port,
                                   const UINT8* remote_addr, UINT32 remote_port,
+                                  UINT64 endpoint_handle, UINT32 compartment_id,
+                                  UINT32 interface_index, UINT32 sub_interface_index,
                                   UINT32* rule_id, UINT8* original_remote_addr,
                                   UINT32* original_remote_port, UINT32* flow_pid,
                                   LONG* active_flow_count) {
@@ -9295,6 +9349,27 @@ namespace net_redirect {
         UINT32 matched_pid = 0;
         UINT32 matched_original_port = 0;
         UINT8 matched_original_addr[16] = {};
+        UINT32 matched_score = 0;
+        UINT64 matched_endpoint = 0;
+        UINT32 matched_compartment = 0;
+        UINT32 matched_interface = 0;
+        UINT32 matched_sub_interface = 0;
+        UINT32 protocol_candidates = 0;
+        UINT32 pid_rejects = 0;
+        UINT32 local_rejects = 0;
+        UINT32 remote_rejects = 0;
+        UINT32 metadata_rejects = 0;
+        UINT32 best_slot = 0xFFFFFFFFu;
+        UINT32 best_rule = 0;
+        UINT32 best_pid = 0;
+        UINT32 best_local_port = 0;
+        UINT32 best_remote_port = 0;
+        UINT32 best_compartment = 0;
+        UINT32 best_interface = 0;
+        UINT32 best_sub_interface = 0;
+        UINT64 best_endpoint = 0;
+        UINT8 best_local_addr[16] = {};
+        UINT8 best_remote_addr[16] = {};
         UINT32 expired = 0;
         KIRQL irql;
         KeAcquireSpinLock(&g_redir_flow_lock, &irql);
@@ -9307,34 +9382,93 @@ namespace net_redirect {
             }
             if (flow->active != 1) continue;
             if (flow->protocol != protocol || flow->address_family != af) continue;
-            if (flow->local_port != local_port) continue;
-            if (flow->redirected_remote_port != remote_port) continue;
-            if (!addr_equal_for_af(flow->local_addr, local_addr, af)) continue;
-            if (!addr_equal_for_af(flow->redirected_remote_addr, remote_addr, af)) continue;
-            if (pid != 0 && flow->pid != 0 && pid != flow->pid) continue;
-            flow->last_seen = now;
+            ++protocol_candidates;
+            if (best_slot == 0xFFFFFFFFu) {
+                best_slot = i;
+                best_rule = flow->rule_id;
+                best_pid = flow->pid;
+                best_local_port = flow->injected_local_port;
+                best_remote_port = flow->injected_remote_port;
+                best_endpoint = flow->endpoint_handle;
+                best_compartment = flow->compartment_id;
+                best_interface = flow->interface_index;
+                best_sub_interface = flow->sub_interface_index;
+                strong::kmemcpy(best_local_addr, flow->injected_local_addr, 16);
+                strong::kmemcpy(best_remote_addr, flow->injected_remote_addr, 16);
+            }
+            if (pid != 0 && flow->pid != 0 && pid != flow->pid) {
+                ++pid_rejects;
+                continue;
+            }
+            if (flow->injected_local_port != local_port || !addr_equal_for_af(flow->injected_local_addr, local_addr, af)) {
+                ++local_rejects;
+                continue;
+            }
+            if (flow->injected_remote_port != remote_port || !addr_equal_for_af(flow->injected_remote_addr, remote_addr, af)) {
+                ++remote_rejects;
+                continue;
+            }
+            if (!metadata_value_compatible_uint32(flow->compartment_id, compartment_id) ||
+                !metadata_value_compatible_uint64(flow->endpoint_handle, endpoint_handle)) {
+                ++metadata_rejects;
+                continue;
+            }
+            UINT32 score = 1;
+            if (flow->compartment_id != 0 && flow->compartment_id == compartment_id) score += 4;
+            if (flow->endpoint_handle != 0 && flow->endpoint_handle == endpoint_handle) score += 4;
+            if (flow->interface_index != 0 && flow->interface_index == interface_index) score += 1;
+            if (flow->sub_interface_index != 0 && flow->sub_interface_index == sub_interface_index) score += 1;
+            if (matched && score < matched_score) continue;
             matched = TRUE;
             matched_slot = i;
             matched_rule = flow->rule_id;
             matched_pid = flow->pid;
             matched_original_port = flow->original_remote_port;
+            matched_score = score;
+            matched_endpoint = flow->endpoint_handle;
+            matched_compartment = flow->compartment_id;
+            matched_interface = flow->interface_index;
+            matched_sub_interface = flow->sub_interface_index;
             strong::kmemcpy(matched_original_addr, flow->original_remote_addr, 16);
-            break;
+            flow->last_seen = now;
         }
         LONG active_after = g_active_redir_flow_count;
         KeReleaseSpinLock(&g_redir_flow_lock, irql);
         if (active_flow_count) *active_flow_count = active_after;
-        WW_LOG("net_redirect::reverse_lookup protocol=%u pid=%u tuple=%u.%u.%u.%u:%u<-%u.%u.%u.%u:%u matched=%u slot=%u rule_id=%u original=%u.%u.%u.%u:%u expired=%u active_flows=%ld",
+        WW_LOG("net_redirect::reverse_lookup protocol=%u pid=%u tuple=%u.%u.%u.%u:%u<-%u.%u.%u.%u:%u endpoint=0x%llX compartment=%u iface=%u sub_iface=%u matched=%u slot=%u rule_id=%u score=%u original=%u.%u.%u.%u:%u matched_endpoint=0x%llX matched_compartment=%u matched_iface=%u matched_sub_iface=%u expired=%u active_flows=%ld candidates=%u pid_rejects=%u local_rejects=%u remote_rejects=%u metadata_rejects=%u best_slot=%u best_rule=%u best_pid=%u best_tuple=%u.%u.%u.%u:%u<-%u.%u.%u.%u:%u best_endpoint=0x%llX best_compartment=%u best_iface=%u best_sub_iface=%u",
             protocol,
             pid,
             local_addr[0], local_addr[1], local_addr[2], local_addr[3], local_port,
             remote_addr[0], remote_addr[1], remote_addr[2], remote_addr[3], remote_port,
+            endpoint_handle,
+            compartment_id,
+            interface_index,
+            sub_interface_index,
             matched ? 1u : 0u,
             matched_slot,
             matched_rule,
+            matched_score,
             matched_original_addr[0], matched_original_addr[1], matched_original_addr[2], matched_original_addr[3], matched_original_port,
+            matched_endpoint,
+            matched_compartment,
+            matched_interface,
+            matched_sub_interface,
             expired,
-            active_after);
+            active_after,
+            protocol_candidates,
+            pid_rejects,
+            local_rejects,
+            remote_rejects,
+            metadata_rejects,
+            best_slot,
+            best_rule,
+            best_pid,
+            best_local_addr[0], best_local_addr[1], best_local_addr[2], best_local_addr[3], best_local_port,
+            best_remote_addr[0], best_remote_addr[1], best_remote_addr[2], best_remote_addr[3], best_remote_port,
+            best_endpoint,
+            best_compartment,
+            best_interface,
+            best_sub_interface);
         if (!matched) return FALSE;
         if (rule_id) *rule_id = matched_rule;
         if (original_remote_port) *original_remote_port = matched_original_port;

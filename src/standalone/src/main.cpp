@@ -512,6 +512,10 @@ static constexpr DWORD kAidaForegroundIdleWaitMs = 24;
 static constexpr DWORD kAidaBackgroundActiveWaitMs = 16;
 static constexpr DWORD kAidaBackgroundIdleWaitMs = 75;
 static constexpr DWORD kAidaPreRenderWaitMs = 16;
+static constexpr DWORD kAidaResizeCoalesceMs = 16;
+static constexpr uint64_t kAidaResizeChurnWindowMs = 1000ULL;
+static constexpr uint32_t kAidaResizeChurnThreshold = 4;
+static constexpr uint64_t kAidaRuntimeAcceptanceLogIntervalMs = 30000ULL;
 static constexpr uint64_t kAidaForegroundIdleHeartbeatMs = 250ULL;
 static constexpr uint64_t kAidaBackgroundIdleHeartbeatMs = 1000ULL;
 static constexpr uint64_t kAidaFullTestHeartbeatMs = 250ULL;
@@ -538,6 +542,56 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 inline int prev_w = 0;
 inline int prev_h = 0;
+static uint64_t g_ResizeRequestTickMs = 0;
+
+struct resize_perf_state_t {
+    uint64_t requests = 0;
+    uint64_t applied = 0;
+    uint64_t skipped_redundant = 0;
+    uint64_t coalesced = 0;
+    uint64_t render_target_recreates = 0;
+    uint64_t blur_resize_calls = 0;
+    uint64_t churn_window_start_ms = 0;
+    uint32_t churn_window_recreates = 0;
+    uint64_t last_churn_log_ms = 0;
+    int blur_w = 0;
+    int blur_h = 0;
+};
+
+static resize_perf_state_t g_resize_perf;
+
+struct gpu_frame_sample_t {
+    bool available = false;
+    bool valid = false;
+    bool disjoint = false;
+    bool pending = false;
+    HRESULT data_hr = S_FALSE;
+    HRESULT create_hr = S_OK;
+    uint64_t frame = 0;
+    uint64_t ready_frame = 0;
+    uint64_t frequency = 0;
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    double gpu_ms = 0.0;
+    uint64_t samples = 0;
+    uint64_t misses = 0;
+};
+
+struct gpu_frame_query_state_t {
+    ID3D11Query* disjoint = nullptr;
+    ID3D11Query* begin = nullptr;
+    ID3D11Query* end = nullptr;
+    bool active = false;
+    bool pending = false;
+    uint64_t active_frame = 0;
+    uint64_t pending_frame = 0;
+    HRESULT create_hr = S_OK;
+    uint64_t samples = 0;
+    uint64_t misses = 0;
+    gpu_frame_sample_t last;
+};
+
+static gpu_frame_query_state_t g_gpu_frame_query;
 
 ImFont* g_font_ui_400 = nullptr;
 ImFont* g_font_ui_500 = nullptr;
@@ -2720,6 +2774,182 @@ __declspec(noinline) static DWORD seh_resize_buffers(IDXGISwapChain* sc, UINT w,
         h,
         static_cast<unsigned>(*hr_out));
     return 0;
+}
+
+static void release_gpu_frame_queries()
+{
+    if (g_gpu_frame_query.end) { g_gpu_frame_query.end->Release(); g_gpu_frame_query.end = nullptr; }
+    if (g_gpu_frame_query.begin) { g_gpu_frame_query.begin->Release(); g_gpu_frame_query.begin = nullptr; }
+    if (g_gpu_frame_query.disjoint) { g_gpu_frame_query.disjoint->Release(); g_gpu_frame_query.disjoint = nullptr; }
+    g_gpu_frame_query = {};
+}
+
+static void initialize_gpu_frame_queries()
+{
+    release_gpu_frame_queries();
+    if (!g_pd3dDevice || !g_pd3dDeviceContext)
+        return;
+    D3D11_QUERY_DESC desc{};
+    desc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+    HRESULT hr_disjoint = g_pd3dDevice->CreateQuery(&desc, &g_gpu_frame_query.disjoint);
+    desc.Query = D3D11_QUERY_TIMESTAMP;
+    HRESULT hr_begin = SUCCEEDED(hr_disjoint) ? g_pd3dDevice->CreateQuery(&desc, &g_gpu_frame_query.begin) : hr_disjoint;
+    HRESULT hr_end = SUCCEEDED(hr_begin) ? g_pd3dDevice->CreateQuery(&desc, &g_gpu_frame_query.end) : hr_begin;
+    HRESULT hr = FAILED(hr_disjoint) ? hr_disjoint : (FAILED(hr_begin) ? hr_begin : hr_end);
+    g_gpu_frame_query.create_hr = hr;
+    g_gpu_frame_query.last.create_hr = hr;
+    if (FAILED(hr) || !g_gpu_frame_query.disjoint || !g_gpu_frame_query.begin || !g_gpu_frame_query.end) {
+        diag::log_tagged_fmt("render",
+            "gpu_frame_query_unavailable hr=0x%08X disjoint=0x%llX begin=0x%llX end=0x%llX device=0x%llX ctx=0x%llX",
+            static_cast<unsigned>(hr),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_gpu_frame_query.disjoint)),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_gpu_frame_query.begin)),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_gpu_frame_query.end)),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDevice)),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDeviceContext)));
+        release_gpu_frame_queries();
+        g_gpu_frame_query.create_hr = hr;
+        g_gpu_frame_query.last.create_hr = hr;
+    }
+}
+
+static void collect_gpu_frame_query(uint64_t frame_number)
+{
+    if (!g_gpu_frame_query.pending || !g_pd3dDeviceContext ||
+        !g_gpu_frame_query.disjoint || !g_gpu_frame_query.begin || !g_gpu_frame_query.end)
+        return;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+    UINT64 begin_ts = 0;
+    UINT64 end_ts = 0;
+    HRESULT hr_disjoint = g_pd3dDeviceContext->GetData(g_gpu_frame_query.disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+    if (hr_disjoint == S_FALSE) {
+        ++g_gpu_frame_query.misses;
+        g_gpu_frame_query.last.pending = true;
+        g_gpu_frame_query.last.misses = g_gpu_frame_query.misses;
+        return;
+    }
+    HRESULT hr_begin = SUCCEEDED(hr_disjoint) ? g_pd3dDeviceContext->GetData(g_gpu_frame_query.begin, &begin_ts, sizeof(begin_ts), D3D11_ASYNC_GETDATA_DONOTFLUSH) : hr_disjoint;
+    if (hr_begin == S_FALSE) {
+        ++g_gpu_frame_query.misses;
+        g_gpu_frame_query.last.pending = true;
+        g_gpu_frame_query.last.misses = g_gpu_frame_query.misses;
+        return;
+    }
+    HRESULT hr_end = SUCCEEDED(hr_begin) ? g_pd3dDeviceContext->GetData(g_gpu_frame_query.end, &end_ts, sizeof(end_ts), D3D11_ASYNC_GETDATA_DONOTFLUSH) : hr_begin;
+    if (hr_end == S_FALSE) {
+        ++g_gpu_frame_query.misses;
+        g_gpu_frame_query.last.pending = true;
+        g_gpu_frame_query.last.misses = g_gpu_frame_query.misses;
+        return;
+    }
+    HRESULT hr = FAILED(hr_disjoint) ? hr_disjoint : (FAILED(hr_begin) ? hr_begin : hr_end);
+    g_gpu_frame_query.pending = false;
+    ++g_gpu_frame_query.samples;
+    gpu_frame_sample_t sample{};
+    sample.available = true;
+    sample.create_hr = g_gpu_frame_query.create_hr;
+    sample.data_hr = hr;
+    sample.frame = g_gpu_frame_query.pending_frame;
+    sample.ready_frame = frame_number;
+    sample.frequency = disjoint.Frequency;
+    sample.begin = begin_ts;
+    sample.end = end_ts;
+    sample.disjoint = disjoint.Disjoint != FALSE;
+    sample.pending = false;
+    sample.samples = g_gpu_frame_query.samples;
+    sample.misses = g_gpu_frame_query.misses;
+    sample.valid = SUCCEEDED(hr) && !sample.disjoint && sample.frequency != 0 && end_ts >= begin_ts;
+    if (sample.valid)
+        sample.gpu_ms = (static_cast<double>(end_ts - begin_ts) * 1000.0) / static_cast<double>(sample.frequency);
+    g_gpu_frame_query.last = sample;
+}
+
+static void begin_gpu_frame_query(uint64_t frame_number)
+{
+    collect_gpu_frame_query(frame_number);
+    if (g_gpu_frame_query.pending || g_gpu_frame_query.active || !g_pd3dDeviceContext ||
+        !g_gpu_frame_query.disjoint || !g_gpu_frame_query.begin || !g_gpu_frame_query.end)
+        return;
+    g_pd3dDeviceContext->Begin(g_gpu_frame_query.disjoint);
+    g_pd3dDeviceContext->End(g_gpu_frame_query.begin);
+    g_gpu_frame_query.active = true;
+    g_gpu_frame_query.active_frame = frame_number;
+}
+
+static void end_gpu_frame_query(uint64_t frame_number)
+{
+    if (!g_gpu_frame_query.active || !g_pd3dDeviceContext ||
+        !g_gpu_frame_query.disjoint || !g_gpu_frame_query.begin || !g_gpu_frame_query.end)
+        return;
+    g_pd3dDeviceContext->End(g_gpu_frame_query.end);
+    g_pd3dDeviceContext->End(g_gpu_frame_query.disjoint);
+    g_gpu_frame_query.active = false;
+    g_gpu_frame_query.pending = true;
+    g_gpu_frame_query.pending_frame = g_gpu_frame_query.active_frame ? g_gpu_frame_query.active_frame : frame_number;
+    g_gpu_frame_query.last.pending = true;
+}
+
+static gpu_frame_sample_t latest_gpu_frame_sample(uint64_t frame_number)
+{
+    collect_gpu_frame_query(frame_number);
+    gpu_frame_sample_t sample = g_gpu_frame_query.last;
+    sample.pending = g_gpu_frame_query.pending;
+    sample.create_hr = g_gpu_frame_query.create_hr;
+    sample.samples = g_gpu_frame_query.samples;
+    sample.misses = g_gpu_frame_query.misses;
+    return sample;
+}
+
+static void record_resize_recreate(const char* source, UINT w, UINT h, uint64_t frame_number)
+{
+    const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+    if (g_resize_perf.churn_window_start_ms == 0 || now_ms - g_resize_perf.churn_window_start_ms > kAidaResizeChurnWindowMs) {
+        g_resize_perf.churn_window_start_ms = now_ms;
+        g_resize_perf.churn_window_recreates = 0;
+    }
+    ++g_resize_perf.churn_window_recreates;
+    if (g_resize_perf.churn_window_recreates >= kAidaResizeChurnThreshold &&
+        now_ms - g_resize_perf.last_churn_log_ms >= kAidaResizeChurnWindowMs) {
+        g_resize_perf.last_churn_log_ms = now_ms;
+        diag::log_tagged_fmt("render",
+            "resize_churn source=%s frame=%llu w=%u h=%u window_ms=%llu recreates=%u requests=%llu applied=%llu coalesced=%llu skipped=%llu rt_recreates=%llu blur_resizes=%llu",
+            source ? source : "<null>",
+            static_cast<unsigned long long>(frame_number),
+            w,
+            h,
+            static_cast<unsigned long long>(now_ms - g_resize_perf.churn_window_start_ms),
+            static_cast<unsigned>(g_resize_perf.churn_window_recreates),
+            static_cast<unsigned long long>(g_resize_perf.requests),
+            static_cast<unsigned long long>(g_resize_perf.applied),
+            static_cast<unsigned long long>(g_resize_perf.coalesced),
+            static_cast<unsigned long long>(g_resize_perf.skipped_redundant),
+            static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
+            static_cast<unsigned long long>(g_resize_perf.blur_resize_calls));
+    }
+}
+
+static bool resize_swapchain_and_target(UINT w, UINT h, uint64_t frame_number, const char* source)
+{
+    CleanupRenderTarget();
+    HRESULT resize_hr = S_OK;
+    DWORD resize_seh = seh_resize_buffers(g_pSwapChain, w, h, &resize_hr, frame_number, source);
+    if (resize_seh != 0 || FAILED(resize_hr)) {
+        diag::log_tagged_critical_fmt("render",
+            "resize_failed source=%s frame=%llu w=%u h=%u seh=0x%08X hr=0x%08X device_removed=0x%08X",
+            source ? source : "<null>",
+            static_cast<unsigned long long>(frame_number),
+            w,
+            h,
+            resize_seh,
+            static_cast<unsigned>(resize_hr),
+            static_cast<unsigned>(g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER));
+        CreateRenderTarget();
+        return false;
+    }
+    ++g_resize_perf.applied;
+    CreateRenderTarget();
+    record_resize_recreate(source, w, h, frame_number);
+    return true;
 }
 
 __declspec(noinline) static DWORD seh_clear_main_render_target(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float* color, HRESULT* removed_out, uint64_t frame_number)
@@ -5099,32 +5329,48 @@ int main(int, char**)
         {
             const UINT resize_w = g_ResizeWidth;
             const UINT resize_h = g_ResizeHeight;
+            const uint64_t resize_now_ms = static_cast<uint64_t>(GetTickCount64());
+            const uint64_t resize_age_ms = g_ResizeRequestTickMs != 0 && resize_now_ms >= g_ResizeRequestTickMs ? resize_now_ms - g_ResizeRequestTickMs : kAidaResizeCoalesceMs;
+            const DWORD resize_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
+            const bool resize_input_pending = (HIWORD(resize_qs) & kAidaInteractiveQueueBits) != 0;
+            if (resize_age_ms < kAidaResizeCoalesceMs && resize_input_pending) {
+                ++g_resize_perf.coalesced;
+                static uint64_t s_last_resize_coalesce_log_ms = 0;
+                if (resize_now_ms - s_last_resize_coalesce_log_ms >= 1000ULL) {
+                    s_last_resize_coalesce_log_ms = resize_now_ms;
+                    diag::log_tagged_fmt("render",
+                        "resize_coalesce w=%u h=%u age_ms=%llu frame=%llu qs=0x%08lX requests=%llu coalesced=%llu applied=%llu skipped=%llu",
+                        resize_w,
+                        resize_h,
+                        static_cast<unsigned long long>(resize_age_ms),
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long>(resize_qs),
+                        static_cast<unsigned long long>(g_resize_perf.requests),
+                        static_cast<unsigned long long>(g_resize_perf.coalesced),
+                        static_cast<unsigned long long>(g_resize_perf.applied),
+                        static_cast<unsigned long long>(g_resize_perf.skipped_redundant));
+                }
+                Sleep(1);
+                continue;
+            }
             diag::log_tagged_critical_fmt("render", "resize_pre w=%u h=%u frame=%llu",
                 resize_w, resize_h, (unsigned long long)frame_number);
             if ((int)resize_w == prev_w && (int)resize_h == prev_h) {
+                ++g_resize_perf.skipped_redundant;
                 g_ResizeWidth = g_ResizeHeight = 0;
+                g_ResizeRequestTickMs = 0;
                 diag::log_tagged_critical_fmt("render",
-                    "resize_skip_redundant w=%u h=%u prev_w=%d prev_h=%d frame=%llu",
+                    "resize_skip_redundant w=%u h=%u prev_w=%d prev_h=%d frame=%llu skipped=%llu",
                     resize_w,
                     resize_h,
                     prev_w,
                     prev_h,
-                    (unsigned long long)frame_number);
+                    (unsigned long long)frame_number,
+                    static_cast<unsigned long long>(g_resize_perf.skipped_redundant));
             } else {
-                CleanupRenderTarget();
-                HRESULT resize_hr = S_OK;
-                DWORD resize_seh = seh_resize_buffers(g_pSwapChain, resize_w, resize_h, &resize_hr, frame_number, "wm_size_pending");
-                if (resize_seh != 0 || FAILED(resize_hr)) {
-                    diag::log_tagged_critical_fmt("render",
-                        "resize_failed source=wm_size_pending frame=%llu w=%u h=%u seh=0x%08X hr=0x%08X device_removed=0x%08X",
-                        static_cast<unsigned long long>(frame_number),
-                        resize_w,
-                        resize_h,
-                        resize_seh,
-                        static_cast<unsigned>(resize_hr),
-                        static_cast<unsigned>(g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER));
+                if (!resize_swapchain_and_target(resize_w, resize_h, frame_number, "wm_size_pending")) {
                     g_ResizeWidth = g_ResizeHeight = 0;
-                    CreateRenderTarget();
+                    g_ResizeRequestTickMs = 0;
                     Sleep(1);
                     continue;
                 }
@@ -5141,7 +5387,7 @@ int main(int, char**)
                 }
                 ::SetWindowRgn(hwnd, nullptr, TRUE);
                 g_ResizeWidth = g_ResizeHeight = 0;
-                CreateRenderTarget();
+                g_ResizeRequestTickMs = 0;
                 prev_w = static_cast<int>(resize_w);
                 prev_h = static_cast<int>(resize_h);
                 diag::log_tagged_critical("render", "resize_post_create_target_done");
@@ -5289,23 +5535,10 @@ int main(int, char**)
             ::SetWindowRgn(hwnd, nullptr, TRUE);
             DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
             DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
-            CleanupRenderTarget();
-            HRESULT resize_hr = S_OK;
-            DWORD resize_seh = seh_resize_buffers(g_pSwapChain, static_cast<UINT>(iw), static_cast<UINT>(ih), &resize_hr, frame_number, "layout_size_change");
-            if (resize_seh != 0 || FAILED(resize_hr)) {
-                diag::log_tagged_critical_fmt("render",
-                    "resize_failed source=layout_size_change frame=%llu iw=%d ih=%d seh=0x%08X hr=0x%08X device_removed=0x%08X",
-                    static_cast<unsigned long long>(frame_number),
-                    iw,
-                    ih,
-                    resize_seh,
-                    static_cast<unsigned>(resize_hr),
-                    static_cast<unsigned>(g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER));
-                CreateRenderTarget();
+            if (!resize_swapchain_and_target(static_cast<UINT>(iw), static_cast<UINT>(ih), frame_number, "layout_size_change")) {
                 Sleep(1);
                 continue;
             }
-            CreateRenderTarget();
             prev_w = iw;
             prev_h = ih;
             diag::log_tagged_critical("render", "second_resize_post");
@@ -5587,18 +5820,21 @@ int main(int, char**)
                 seh_ir, (unsigned long long)frame_number);
         ImDrawData* draw_data = ImGui::GetDrawData();
         const draw_data_metrics_t draw_metrics = collect_draw_data_metrics(draw_data);
+        begin_gpu_frame_query(frame_number);
         aida_tracer::mark_render_phase("imgui_dx11_render");
         DWORD seh_idr = seh_imgui_dx11_render(draw_data, frame_number);
         if (seh_idr != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_dx11_render code=0x%08X frame=%llu",
                 seh_idr, (unsigned long long)frame_number);
         g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
+        end_gpu_frame_query(frame_number);
 
         aida_tracer::mark_render_phase("present");
         HRESULT hr = S_OK;
         const uint64_t present_start_tick_ms = static_cast<uint64_t>(GetTickCount64());
         DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr, frame_number);
         const uint64_t present_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - present_start_tick_ms;
+        collect_gpu_frame_query(frame_number);
         if (seh_present != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_present code=0x%08X frame=%llu",
                 seh_present, (unsigned long long)frame_number);
@@ -5721,8 +5957,9 @@ int main(int, char**)
                     const uint64_t skipped_delta = skipped_render_frames >= s_last_frame_pacing_skipped ? skipped_render_frames - s_last_frame_pacing_skipped : 0ULL;
                     const double fps = since_pacing_log_ms != 0 ? (static_cast<double>(frame_delta) * 1000.0) / static_cast<double>(since_pacing_log_ms) : 0.0;
                     const auto overlay_perf = test_all_features::overlay_perf_snapshot();
+                    const gpu_frame_sample_t gpu = latest_gpu_frame_sample(frame_number);
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu waitable=%d pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d pre_wait_signaled=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu waitable=%d pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d pre_wait_signaled=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long long>(frame_delta),
                         static_cast<unsigned long long>(skipped_delta),
@@ -5734,6 +5971,18 @@ int main(int, char**)
                         static_cast<unsigned long long>(cpu.busy_100ns),
                         static_cast<unsigned long>(cpu.gle),
                         static_cast<unsigned long>(cpu.logical_processors),
+                        gpu.available ? 1 : 0,
+                        gpu.valid ? 1 : 0,
+                        gpu.pending ? 1 : 0,
+                        gpu.gpu_ms,
+                        static_cast<unsigned long long>(gpu.frame),
+                        static_cast<unsigned long long>(gpu.ready_frame),
+                        gpu.disjoint ? 1 : 0,
+                        static_cast<unsigned>(gpu.data_hr),
+                        static_cast<unsigned>(gpu.create_hr),
+                        static_cast<unsigned long long>(gpu.frequency),
+                        static_cast<unsigned long long>(gpu.samples),
+                        static_cast<unsigned long long>(gpu.misses),
                         static_cast<unsigned>(kAidaPresentSyncInterval),
                         static_cast<unsigned>(kAidaPresentFlags),
                         static_cast<unsigned long long>(frame_elapsed_ms),
@@ -5779,6 +6028,12 @@ int main(int, char**)
                         overlay_perf.snapshot_busy ? 1 : 0,
                         static_cast<unsigned long long>(overlay_perf.lock_busy_total),
                         static_cast<unsigned long long>(overlay_perf.render_elapsed_us),
+                        static_cast<unsigned long long>(g_resize_perf.requests),
+                        static_cast<unsigned long long>(g_resize_perf.applied),
+                        static_cast<unsigned long long>(g_resize_perf.coalesced),
+                        static_cast<unsigned long long>(g_resize_perf.skipped_redundant),
+                        static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
+                        static_cast<unsigned long long>(g_resize_perf.blur_resize_calls),
                         static_cast<unsigned long>(thread_count),
                         static_cast<unsigned long>(thread_err),
                         static_cast<unsigned>(wq.active),
@@ -5793,6 +6048,42 @@ int main(int, char**)
                     s_last_frame_pacing_log_ms = tick_now_ms;
                     s_last_frame_pacing_frame = frame_number;
                     s_last_frame_pacing_skipped = skipped_render_frames;
+                    static uint64_t s_last_runtime_acceptance_log_ms = 0;
+                    if (s_last_runtime_acceptance_log_ms == 0 || tick_now_ms - s_last_runtime_acceptance_log_ms >= kAidaRuntimeAcceptanceLogIntervalMs) {
+                        s_last_runtime_acceptance_log_ms = tick_now_ms;
+                        diag::log_tagged_fmt("render",
+                            "runtime_acceptance_sample frame=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f sync=%u flags=0x%08X waitable=%d dirty_mask=0x%08X skipped_total=%llu overlay_visible=%d overlay_running=%d overlay_rendered=%zu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu wq_active=%u wq_pending=%zu svc_active=%u svc_pending=%zu cq_active=%u cq_pending=%zu",
+                            static_cast<unsigned long long>(frame_number),
+                            fps,
+                            cpu.cpu_percent,
+                            cpu.valid ? 1 : 0,
+                            gpu.available ? 1 : 0,
+                            gpu.valid ? 1 : 0,
+                            gpu.pending ? 1 : 0,
+                            gpu.gpu_ms,
+                            static_cast<unsigned>(kAidaPresentSyncInterval),
+                            static_cast<unsigned>(kAidaPresentFlags),
+                            pre_render_wait.waitable_present ? 1 : 0,
+                            static_cast<unsigned>(dirty_mask),
+                            static_cast<unsigned long long>(skipped_render_frames),
+                            overlay_perf.visible ? 1 : 0,
+                            overlay_perf.running ? 1 : 0,
+                            overlay_perf.rendered_log_rows,
+                            static_cast<unsigned long long>(overlay_perf.render_elapsed_us),
+                            static_cast<unsigned long long>(g_resize_perf.requests),
+                            static_cast<unsigned long long>(g_resize_perf.applied),
+                            static_cast<unsigned long long>(g_resize_perf.coalesced),
+                            static_cast<unsigned long long>(g_resize_perf.skipped_redundant),
+                            static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
+                            static_cast<unsigned long long>(g_resize_perf.blur_resize_calls),
+                            static_cast<unsigned long>(thread_count),
+                            static_cast<unsigned>(wq.active),
+                            wq.pending,
+                            static_cast<unsigned>(svc.active),
+                            svc.pending,
+                            static_cast<unsigned>(cq.active),
+                            cq.pending);
+                    }
                 }
             }
         }
@@ -5853,8 +6144,21 @@ int main(int, char**)
     diag::log_tagged_critical("main", "shutdown_terminal_done");
 
     aida_shutdown_diag::mark("shutdown_network");
+    {
+        char network_queue_pre[2400] = {};
+        format_work_queue_crash_snapshot(network_queue_pre, sizeof(network_queue_pre));
+        diag::log_tagged_critical_fmt("main", "shutdown_network_cleanup_pre %s", network_queue_pre);
+    }
+    const uint64_t shutdown_network_start_ms = static_cast<uint64_t>(GetTickCount64());
     network_view::shutdown();
-    diag::log_tagged_critical("main", "shutdown_network_done");
+    const uint64_t shutdown_network_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - shutdown_network_start_ms;
+    {
+        char network_queue_post[2400] = {};
+        format_work_queue_crash_snapshot(network_queue_post, sizeof(network_queue_post));
+        diag::log_tagged_critical_fmt("main", "shutdown_network_cleanup_done elapsed_ms=%llu %s",
+            static_cast<unsigned long long>(shutdown_network_elapsed_ms),
+            network_queue_post);
+    }
     aida_shutdown_diag::mark("shutdown_script_engine");
     script_engine::shutdown();
     diag::log_tagged_critical("main", "shutdown_script_engine_done");
@@ -5955,21 +6259,26 @@ bool CreateDeviceD3D(HWND hWnd)
 
     configure_frame_latency_waitable();
     CreateRenderTarget();
+    initialize_gpu_frame_queries();
     return true;
 }
 
 void CleanupDeviceD3D()
 {
+    release_gpu_frame_queries();
     CleanupRenderTarget();
     if (g_FrameLatencyWaitableObject) { CloseHandle(g_FrameLatencyWaitableObject); g_FrameLatencyWaitableObject = nullptr; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
     g_SwapChainResizeFlags = 0;
+    g_resize_perf.blur_w = 0;
+    g_resize_perf.blur_h = 0;
 }
 
 void CreateRenderTarget()
 {
+    ++g_resize_perf.render_target_recreates;
     ID3D11Texture2D* pBackBuffer = nullptr;
     HRESULT hr_get = E_POINTER;
     HRESULT hr_rtv = E_POINTER;
@@ -6036,18 +6345,27 @@ void CreateRenderTarget()
     int bh = (int)(d.Height / 4u);
     if (bw < 64) bw = 64;
     if (bh < 64) bh = 64;
-    Blur::Resize(bw, bh);
+    const bool blur_size_changed = bw != g_resize_perf.blur_w || bh != g_resize_perf.blur_h;
+    if (blur_size_changed) {
+        Blur::Resize(bw, bh);
+        g_resize_perf.blur_w = bw;
+        g_resize_perf.blur_h = bh;
+        ++g_resize_perf.blur_resize_calls;
+    }
     aida::ui::blur::mark_supported(true);
 
     pBackBuffer->Release();
     diag::log_tagged_critical_fmt("render",
-        "create_render_target_ok backbuffer=0x%llX rtv=0x%llX desc=%ux%u blur=%dx%d",
+        "create_render_target_ok backbuffer=0x%llX rtv=0x%llX desc=%ux%u blur=%dx%d blur_resize=%d rt_recreates=%llu blur_resizes=%llu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(pBackBuffer)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_mainRenderTargetView)),
         d.Width,
         d.Height,
         bw,
-        bh);
+        bh,
+        blur_size_changed ? 1 : 0,
+        static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
+        static_cast<unsigned long long>(g_resize_perf.blur_resize_calls));
 }
 
 void CleanupRenderTarget()
@@ -6344,13 +6662,16 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
         g_ResizeWidth = (UINT)LOWORD(lParam);
         g_ResizeHeight = (UINT)HIWORD(lParam);
+        g_ResizeRequestTickMs = static_cast<uint64_t>(GetTickCount64());
+        ++g_resize_perf.requests;
         diag::log_tagged_critical_fmt("wndproc",
-            "size hwnd=0x%llX wp=%llu w=%u h=%u zoomed=%d",
+            "size hwnd=0x%llX wp=%llu w=%u h=%u zoomed=%d resize_requests=%llu",
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hWnd)),
             static_cast<unsigned long long>(static_cast<UINT_PTR>(wParam)),
             g_ResizeWidth,
             g_ResizeHeight,
-            now_zoomed ? 1 : 0);
+            now_zoomed ? 1 : 0,
+            static_cast<unsigned long long>(g_resize_perf.requests));
         return finish("size", 0);
     }
     case WM_GETMINMAXINFO:

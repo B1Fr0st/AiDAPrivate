@@ -175,18 +175,23 @@ bool record(const event_t& event, uint64_t* out_id)
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
-        bind_text(stmt, 1, event.session_id);
-        sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(event.scan_id));
-        sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(ts));
-        bind_text(stmt, 4, event.tool_name);
-        bind_json(stmt, 5, params_preview);
-        bind_text(stmt, 6, params_hash);
-        bind_json(stmt, 7, result_summary);
-        bind_text(stmt, 8, result_hash);
-        sqlite3_bind_int64(stmt, 9, static_cast<sqlite3_int64>(event.duration_ms));
-        bind_text(stmt, 10, evidence_store::redact_sensitive_text(event.caller, 256));
-        sqlite3_bind_int(stmt, 11, event.success ? 1 : 0);
-        bind_text(stmt, 12, evidence_store::redact_sensitive_text(event.error_message, 2048));
+        const bool bound =
+            findings_db::bind_optional_session_id(db, stmt, 1, event.session_id, "audit_trail") &&
+            sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(event.scan_id)) == SQLITE_OK &&
+            sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(ts)) == SQLITE_OK &&
+            bind_text(stmt, 4, event.tool_name) &&
+            bind_json(stmt, 5, params_preview) &&
+            bind_text(stmt, 6, params_hash) &&
+            bind_json(stmt, 7, result_summary) &&
+            bind_text(stmt, 8, result_hash) &&
+            sqlite3_bind_int64(stmt, 9, static_cast<sqlite3_int64>(event.duration_ms)) == SQLITE_OK &&
+            bind_text(stmt, 10, evidence_store::redact_sensitive_text(event.caller, 256)) &&
+            sqlite3_bind_int(stmt, 11, event.success ? 1 : 0) == SQLITE_OK &&
+            bind_text(stmt, 12, evidence_store::redact_sensitive_text(event.error_message, 2048));
+        if (!bound) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
         int rc = sqlite3_step(stmt);
         if (rc == SQLITE_DONE && out_id) *out_id = static_cast<uint64_t>(sqlite3_last_insert_rowid(db));
         sqlite3_finalize(stmt);

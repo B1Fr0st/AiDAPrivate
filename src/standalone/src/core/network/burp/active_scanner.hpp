@@ -15,6 +15,8 @@ namespace active_scanner {
 
 struct audit_config_t
 {
+    std::string                session_id;
+    uint64_t                   scan_id = 0;
     bool                       scope_only = true;
     std::vector<std::string>   enabled_modules;
     size_t                     max_concurrent_requests = 16;
@@ -29,6 +31,8 @@ struct audit_config_t
 struct audit_status_t
 {
     uint64_t      id = 0;
+    std::string   session_id;
+    uint64_t      scan_id = 0;
     std::string   url;
     std::string   host;
     uint16_t      port = 0;

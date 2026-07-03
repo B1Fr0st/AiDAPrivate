@@ -13,6 +13,8 @@ namespace crawl_audit {
 
 struct pipeline_config_t
 {
+    std::string              session_id;
+    uint64_t                 scan_id = 0;
     std::vector<std::string> start_urls;
     int                      max_depth = 3;
     int                      max_pages = 500;

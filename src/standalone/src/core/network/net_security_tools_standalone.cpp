@@ -58,6 +58,35 @@ static std::string ns_bytes_to_hex(const std::uint8_t* data, std::size_t len) {
     return result;
 }
 
+static std::string ns_sha256_hex(const std::uint8_t* data, std::size_t len) {
+    if ((!data && len != 0) || len > 0xFFFFFFFFull)
+        return {};
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    DWORD hash_obj_size = 0;
+    DWORD hash_len = 0;
+    DWORD cb_data = 0;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return {};
+    if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hash_obj_size), sizeof(hash_obj_size), &cb_data, 0) != 0 ||
+        BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len), sizeof(hash_len), &cb_data, 0) != 0 ||
+        hash_len == 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return {};
+    }
+    std::vector<std::uint8_t> hash_obj(hash_obj_size);
+    std::vector<std::uint8_t> hash(hash_len);
+    if (BCryptCreateHash(hAlg, &hHash, hash_obj.data(), hash_obj_size, nullptr, 0, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return {};
+    }
+    const bool ok = BCryptHashData(hHash, const_cast<PUCHAR>(data), static_cast<ULONG>(len), 0) == 0 &&
+                    BCryptFinishHash(hHash, hash.data(), hash_len, 0) == 0;
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok ? ns_bytes_to_hex(hash.data(), hash.size()) : std::string{};
+}
+
 static std::string ns_payload_hex_param(const json& params) {
     if (params.contains("payload_hex") && params["payload_hex"].is_string())
         return params["payload_hex"].get<std::string>();
@@ -2886,6 +2915,7 @@ tool_result_t quic_detect_connections(const json& params) {
         result["pid"] = pid;
         result["payload_bytes"] = payload.size();
         result["payload_hex_preview"] = ns_bytes_to_hex(payload.data(), std::min<std::size_t>(payload.size(), 96));
+        result["payload_sha256"] = ns_sha256_hex(payload.data(), payload.size());
         result["parser_offset"] = offset;
         result["parser_rejection_reason"] = rejection;
         result["header_classification"] = parsed ? (hdr.is_long_header ? "quic_long_header" : "quic_short_header") : "unclassified";
@@ -2893,7 +2923,21 @@ tool_result_t quic_detect_connections(const json& params) {
         result["quic_version"] = parsed ? hdr.version : 0u;
         result["dcid"] = parsed ? ns_bytes_to_hex(hdr.dcid.data(), hdr.dcid.size()) : "";
         result["scid"] = parsed ? ns_bytes_to_hex(hdr.scid.data(), hdr.scid.size()) : "";
-        result["count"] = parsed ? 1 : 0;
+        result["parser_only"] = true;
+        result["state_contract_only"] = true;
+        result["functional_evidence"] = false;
+        result["capture_evidence"] = false;
+        result["key_evidence"] = false;
+        result["live_capture_required_for_functional"] = true;
+        result["live_capture_correlated"] = false;
+        result["target_pid_correlated"] = false;
+        result["tuple_correlated"] = false;
+        result["payload_hash_correlated"] = false;
+        result["nonce_correlated"] = false;
+        result["capture_counter_delta"] = 0;
+        result["functional_count"] = 0;
+        result["parser_count"] = parsed ? 1 : 0;
+        result["count"] = 0;
         json arr = json::array();
         if (parsed) {
             json cj;
@@ -2911,9 +2955,12 @@ tool_result_t quic_detect_connections(const json& params) {
             cj["alpn"] = "h3";
             cj["quic_version"] = hdr.version;
             cj["parser_offset"] = offset;
+            cj["payload_sha256"] = result["payload_sha256"];
             arr.push_back(std::move(cj));
         }
-        result["connections"] = std::move(arr);
+        result["connections"] = json::array();
+        result["parser_connections"] = std::move(arr);
+        result["zero_detection_reason"] = parsed ? "provided_payload_parser_only_no_driver_capture" : "provided_payload_parser_rejected";
         diag::log_tagged_fmt("net_sec", "quic_detect_connections provided_payload parsed=%d pid=%u bytes=%zu offset=%zu version=0x%08X dcid=%zu scid=%zu rejection=%s",
             parsed ? 1 : 0,
             pid,
@@ -2925,7 +2972,7 @@ tool_result_t quic_detect_connections(const json& params) {
             rejection.empty() ? "<none>" : rejection.c_str());
         if (!parsed)
             return tool_result_t::error(OBFSTR("QUIC payload did not parse as a connection"), result);
-        return tool_result_t::ok(OBFSTR("Detected 1 QUIC connection from provided payload"), result);
+        return tool_result_t::ok(OBFSTR("Parsed 1 QUIC payload as parser-only evidence"), result);
     }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "quic_detect_connections driver not connected");
@@ -2941,7 +2988,17 @@ tool_result_t quic_detect_connections(const json& params) {
     std::uint32_t cap_cnt_after = 0;
     std::uint32_t cap_drp_after = 0;
     device->get_capture_status(cap_active_after, cap_cnt_after, cap_drp_after);
-    diag::log_tagged_fmt("net_sec", "quic_detect_connections count=%zu pid=%u capture_before_active=%d capture_before_count=%u capture_before_dropped=%u capture_after_active=%d capture_after_count=%u capture_after_dropped=%u",
+    std::uint32_t detection_attempts = 1;
+    const DWORD wait_start = GetTickCount();
+    DWORD capture_wait_elapsed_ms = 0;
+    while ((conns.empty() || cap_cnt_after <= cap_cnt_before) && capture_wait_elapsed_ms < 750) {
+        Sleep(25);
+        ++detection_attempts;
+        conns = net_security::QuicAnalyzer::instance().detect_quic_connections(pid);
+        device->get_capture_status(cap_active_after, cap_cnt_after, cap_drp_after);
+        capture_wait_elapsed_ms = GetTickCount() - wait_start;
+    }
+    diag::log_tagged_fmt("net_sec", "quic_detect_connections count=%zu pid=%u capture_before_active=%d capture_before_count=%u capture_before_dropped=%u capture_after_active=%d capture_after_count=%u capture_after_dropped=%u attempts=%u wait_ms=%lu",
         conns.size(),
         pid,
         cap_active_before ? 1 : 0,
@@ -2949,7 +3006,9 @@ tool_result_t quic_detect_connections(const json& params) {
         cap_drp_before,
         cap_active_after ? 1 : 0,
         cap_cnt_after,
-        cap_drp_after);
+        cap_drp_after,
+        detection_attempts,
+        static_cast<unsigned long>(capture_wait_elapsed_ms));
 
     json result;
     result["backend"] = "driver_capture";
@@ -2961,9 +3020,44 @@ tool_result_t quic_detect_connections(const json& params) {
     result["capture_active_after"] = cap_active_after;
     result["capture_count_after"] = cap_cnt_after;
     result["capture_dropped_after"] = cap_drp_after;
-    result["count"] = conns.size();
+    result["detection_attempts"] = detection_attempts;
+    result["capture_wait_elapsed_ms"] = capture_wait_elapsed_ms;
+    const std::uint32_t capture_delta = cap_cnt_after > cap_cnt_before ? (cap_cnt_after - cap_cnt_before) : 0;
+    bool all_pid_correlated = !conns.empty();
+    bool all_tuple_correlated = !conns.empty();
+    bool all_hash_correlated = !conns.empty();
+    bool all_nonce_correlated = !conns.empty();
+    for (const auto& c : conns) {
+        if (pid != 0 && c.pid != pid)
+            all_pid_correlated = false;
+        if (c.src_port == 0 || c.dst_port == 0)
+            all_tuple_correlated = false;
+        if (c.payload_sha256.empty() || c.capture_packet_count == 0)
+            all_hash_correlated = false;
+        if (c.dcid.empty() && c.scid.empty())
+            all_nonce_correlated = false;
+    }
+    const bool functional = !conns.empty() && capture_delta > 0 && all_pid_correlated && all_tuple_correlated && all_hash_correlated && all_nonce_correlated;
+    result["capture_counter_delta"] = capture_delta;
+    result["parser_only"] = false;
+    result["state_contract_only"] = !functional;
+    result["functional_evidence"] = functional;
+    result["capture_evidence"] = functional;
+    result["key_evidence"] = false;
+    result["live_capture_required_for_functional"] = true;
+    result["live_capture_correlated"] = functional;
+    result["target_pid_correlated"] = all_pid_correlated;
+    result["tuple_correlated"] = all_tuple_correlated;
+    result["payload_hash_correlated"] = all_hash_correlated;
+    result["nonce_correlated"] = all_nonce_correlated;
+    result["detected_count"] = conns.size();
+    result["functional_count"] = functional ? conns.size() : 0;
+    result["parser_count"] = 0;
+    result["count"] = functional ? conns.size() : 0;
     if (conns.empty())
         result["zero_detection_reason"] = cap_cnt_after == 0 ? "capture_queue_empty_or_not_drained_before_detector" : "no_quic_header_classified_from_captured_udp_payloads";
+    else if (!functional)
+        result["zero_detection_reason"] = capture_delta == 0 ? "captured_quic_packets_lacked_counter_delta_correlation" : "captured_quic_packets_lacked_pid_tuple_hash_or_nonce_correlation";
     json arr = json::array();
     for (const auto& c : conns) {
         json cj;
@@ -2977,10 +3071,18 @@ tool_result_t quic_detect_connections(const json& params) {
         cj["bytes_sent"] = c.bytes_sent;
         cj["bytes_recv"] = c.bytes_recv;
         cj["alpn"] = c.alpn;
+        cj["capture_packet_count"] = c.capture_packet_count;
+        cj["capture_byte_count"] = c.capture_byte_count;
+        cj["parser_offset"] = c.parser_offset;
+        cj["payload_sha256"] = c.payload_sha256;
         arr.push_back(cj);
     }
-    result["connections"] = arr;
-    return tool_result_t::ok(OBFSTR("Detected ") + std::to_string(conns.size()) + OBFSTR(" QUIC connections"), result);
+    result["captured_connections"] = arr;
+    result["connections"] = functional ? arr : json::array();
+    const std::string message = functional
+        ? OBFSTR("Detected ") + std::to_string(conns.size()) + OBFSTR(" correlated QUIC connections")
+        : OBFSTR("Parsed QUIC capture candidates without functional correlation");
+    return tool_result_t::ok(message, result);
 }
 
 tool_result_t quic_decrypt_initial(const json& params) {
@@ -3262,6 +3364,7 @@ tool_result_t dtls_detect_sessions(const json& params) {
         result["pid"] = pid;
         result["payload_bytes"] = payload.size();
         result["payload_hex_preview"] = ns_bytes_to_hex(payload.data(), std::min<std::size_t>(payload.size(), 96));
+        result["payload_sha256"] = ns_sha256_hex(payload.data(), payload.size());
         result["parser_offset"] = offset;
         result["parser_rejection_reason"] = rejection;
         result["header_classification"] = parsed ? (rec.is_handshake ? "dtls_handshake_record" : "dtls_record") : "unclassified";
@@ -3269,7 +3372,21 @@ tool_result_t dtls_detect_sessions(const json& params) {
         result["content_type"] = parsed ? rec.content_type : 0u;
         result["epoch"] = parsed ? rec.epoch : 0u;
         result["sequence"] = parsed ? rec.sequence : 0u;
-        result["count"] = parsed ? 1 : 0;
+        result["parser_only"] = true;
+        result["state_contract_only"] = true;
+        result["functional_evidence"] = false;
+        result["capture_evidence"] = false;
+        result["key_evidence"] = false;
+        result["live_capture_required_for_functional"] = true;
+        result["live_capture_correlated"] = false;
+        result["target_pid_correlated"] = false;
+        result["tuple_correlated"] = false;
+        result["payload_hash_correlated"] = false;
+        result["nonce_correlated"] = false;
+        result["capture_counter_delta"] = 0;
+        result["functional_count"] = 0;
+        result["parser_count"] = parsed ? 1 : 0;
+        result["count"] = 0;
         json arr = json::array();
         if (parsed) {
             json sj;
@@ -3283,9 +3400,12 @@ tool_result_t dtls_detect_sessions(const json& params) {
             sj["state"] = rec.is_handshake ? "handshake" : (rec.content_type == 23 ? "established" : (rec.content_type == 21 ? "closing" : "unknown"));
             sj["content_type"] = rec.content_type;
             sj["parser_offset"] = offset;
+            sj["payload_sha256"] = result["payload_sha256"];
             arr.push_back(std::move(sj));
         }
-        result["sessions"] = std::move(arr);
+        result["sessions"] = json::array();
+        result["parser_sessions"] = std::move(arr);
+        result["zero_detection_reason"] = parsed ? "provided_payload_parser_only_no_driver_capture" : "provided_payload_parser_rejected";
         diag::log_tagged_fmt("net_sec", "dtls_detect_sessions provided_payload parsed=%d pid=%u bytes=%zu offset=%zu version=0x%04X content_type=%u epoch=%u rejection=%s",
             parsed ? 1 : 0,
             pid,
@@ -3297,7 +3417,7 @@ tool_result_t dtls_detect_sessions(const json& params) {
             rejection.empty() ? "<none>" : rejection.c_str());
         if (!parsed)
             return tool_result_t::error(OBFSTR("DTLS payload did not parse as a session"), result);
-        return tool_result_t::ok(OBFSTR("Detected 1 DTLS session from provided payload"), result);
+        return tool_result_t::ok(OBFSTR("Parsed 1 DTLS payload as parser-only evidence"), result);
     }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "dtls_detect_sessions driver not connected");
@@ -3313,7 +3433,17 @@ tool_result_t dtls_detect_sessions(const json& params) {
     std::uint32_t cap_cnt_after = 0;
     std::uint32_t cap_drp_after = 0;
     device->get_capture_status(cap_active_after, cap_cnt_after, cap_drp_after);
-    diag::log_tagged_fmt("net_sec", "dtls_detect_sessions count=%zu pid=%u capture_before_active=%d capture_before_count=%u capture_before_dropped=%u capture_after_active=%d capture_after_count=%u capture_after_dropped=%u",
+    std::uint32_t detection_attempts = 1;
+    const DWORD wait_start = GetTickCount();
+    DWORD capture_wait_elapsed_ms = 0;
+    while ((sessions.empty() || cap_cnt_after <= cap_cnt_before) && capture_wait_elapsed_ms < 750) {
+        Sleep(25);
+        ++detection_attempts;
+        sessions = net_security::DtlsAnalyzer::instance().detect_dtls_sessions(pid);
+        device->get_capture_status(cap_active_after, cap_cnt_after, cap_drp_after);
+        capture_wait_elapsed_ms = GetTickCount() - wait_start;
+    }
+    diag::log_tagged_fmt("net_sec", "dtls_detect_sessions count=%zu pid=%u capture_before_active=%d capture_before_count=%u capture_before_dropped=%u capture_after_active=%d capture_after_count=%u capture_after_dropped=%u attempts=%u wait_ms=%lu",
         sessions.size(),
         pid,
         cap_active_before ? 1 : 0,
@@ -3321,7 +3451,9 @@ tool_result_t dtls_detect_sessions(const json& params) {
         cap_drp_before,
         cap_active_after ? 1 : 0,
         cap_cnt_after,
-        cap_drp_after);
+        cap_drp_after,
+        detection_attempts,
+        static_cast<unsigned long>(capture_wait_elapsed_ms));
 
     json result;
     result["backend"] = "driver_capture";
@@ -3333,9 +3465,44 @@ tool_result_t dtls_detect_sessions(const json& params) {
     result["capture_active_after"] = cap_active_after;
     result["capture_count_after"] = cap_cnt_after;
     result["capture_dropped_after"] = cap_drp_after;
-    result["count"] = sessions.size();
+    result["detection_attempts"] = detection_attempts;
+    result["capture_wait_elapsed_ms"] = capture_wait_elapsed_ms;
+    const std::uint32_t capture_delta = cap_cnt_after > cap_cnt_before ? (cap_cnt_after - cap_cnt_before) : 0;
+    bool all_pid_correlated = !sessions.empty();
+    bool all_tuple_correlated = !sessions.empty();
+    bool all_hash_correlated = !sessions.empty();
+    bool all_nonce_correlated = !sessions.empty();
+    for (const auto& s : sessions) {
+        if (pid != 0 && s.pid != pid)
+            all_pid_correlated = false;
+        if (s.src_port == 0 || s.dst_port == 0)
+            all_tuple_correlated = false;
+        if (s.payload_sha256.empty())
+            all_hash_correlated = false;
+        if (s.content_type == 0)
+            all_nonce_correlated = false;
+    }
+    const bool functional = !sessions.empty() && capture_delta > 0 && all_pid_correlated && all_tuple_correlated && all_hash_correlated && all_nonce_correlated;
+    result["capture_counter_delta"] = capture_delta;
+    result["parser_only"] = false;
+    result["state_contract_only"] = !functional;
+    result["functional_evidence"] = functional;
+    result["capture_evidence"] = functional;
+    result["key_evidence"] = false;
+    result["live_capture_required_for_functional"] = true;
+    result["live_capture_correlated"] = functional;
+    result["target_pid_correlated"] = all_pid_correlated;
+    result["tuple_correlated"] = all_tuple_correlated;
+    result["payload_hash_correlated"] = all_hash_correlated;
+    result["nonce_correlated"] = all_nonce_correlated;
+    result["detected_count"] = sessions.size();
+    result["functional_count"] = functional ? sessions.size() : 0;
+    result["parser_count"] = 0;
+    result["count"] = functional ? sessions.size() : 0;
     if (sessions.empty())
         result["zero_detection_reason"] = cap_cnt_after == 0 ? "capture_queue_empty_or_not_drained_before_detector" : "no_dtls_record_classified_from_captured_udp_payloads";
+    else if (!functional)
+        result["zero_detection_reason"] = capture_delta == 0 ? "captured_dtls_packets_lacked_counter_delta_correlation" : "captured_dtls_packets_lacked_pid_tuple_hash_or_nonce_correlation";
     json arr = json::array();
     for (const auto& s : sessions) {
         json sj;
@@ -3346,10 +3513,16 @@ tool_result_t dtls_detect_sessions(const json& params) {
         sj["epoch"] = s.epoch;
         sj["state"] = s.state;
         sj["content_type"] = s.content_type;
+        sj["parser_offset"] = s.parser_offset;
+        sj["payload_sha256"] = s.payload_sha256;
         arr.push_back(sj);
     }
-    result["sessions"] = arr;
-    return tool_result_t::ok(OBFSTR("Detected ") + std::to_string(sessions.size()) + OBFSTR(" DTLS sessions"), result);
+    result["captured_sessions"] = arr;
+    result["sessions"] = functional ? arr : json::array();
+    const std::string message = functional
+        ? OBFSTR("Detected ") + std::to_string(sessions.size()) + OBFSTR(" correlated DTLS sessions")
+        : OBFSTR("Parsed DTLS capture candidates without functional correlation");
+    return tool_result_t::ok(message, result);
 }
 
 tool_result_t dtls_extract_keys(const json& params) {
@@ -3419,6 +3592,15 @@ tool_result_t dtls_extract_keys(const json& params) {
 }
 
 tool_result_t network_decrypt_capture(const json& params) {
+    if ((params.contains("pcap_path") && !params["pcap_path"].is_string()) ||
+        (params.contains("keylog_path") && !params["keylog_path"].is_string()) ||
+        (params.contains("display_filter") && !params["display_filter"].is_string())) {
+        json r;
+        r["success"] = false;
+        r["input_valid"] = false;
+        r["error"] = "pcap_path, keylog_path, and display_filter must be strings";
+        return tool_result_t::error(OBFSTR("pcap_path, keylog_path, and display_filter must be strings"), r);
+    }
     std::string pcap_path = params.value("pcap_path", "");
     std::string keylog_path = params.value("keylog_path", "");
     std::string display_filter = params.value("display_filter", "http2");
@@ -3429,6 +3611,26 @@ tool_result_t network_decrypt_capture(const json& params) {
     if (pcap_path.empty()) {
         diag::log_tagged("net_sec", "network_decrypt_capture pcap_path empty -> error");
         return tool_result_t::error(OBFSTR("pcap_path is required"));
+    }
+    if (pcap_path.find('\0') != std::string::npos || keylog_path.find('\0') != std::string::npos || display_filter.find('\0') != std::string::npos) {
+        json r;
+        r["success"] = false;
+        r["input_valid"] = false;
+        r["error"] = "network_decrypt_capture inputs must not contain embedded NUL characters";
+        return tool_result_t::error(OBFSTR("network_decrypt_capture inputs must not contain embedded NUL characters"), r);
+    }
+    std::string display_filter_reason;
+    if (!net_security::validate_tshark_display_filter(display_filter, &display_filter_reason)) {
+        json r;
+        r["success"] = false;
+        r["input_valid"] = false;
+        r["display_filter"] = display_filter;
+        r["display_filter_valid"] = false;
+        r["display_filter_rejection_reason"] = display_filter_reason;
+        r["requires_http2_frames"] = true;
+        diag::log_tagged_fmt("net_sec", "network_decrypt_capture display_filter_invalid filter=%s reason=%s",
+            display_filter.c_str(), display_filter_reason.c_str());
+        return tool_result_t::error(OBFSTR("Invalid tshark display_filter"), r);
     }
 
 
@@ -3450,9 +3652,11 @@ tool_result_t network_decrypt_capture(const json& params) {
     if (tshark_path.empty()) {
         json r;
         const bool empty_fixture_ok = pcap_probe.valid && pcap_probe.packet_count == 0 && keylog_probe.valid;
-        r["success"] = empty_fixture_ok;
+        r["success"] = false;
         r["backend"] = empty_fixture_ok ? "builtin_empty_pcap_fixture" : "tshark";
         r["state_contract"] = empty_fixture_ok ? "valid_empty_pcap_builtin_parse_no_external_decryptor_required" : "non_empty_tls_capture_requires_tshark";
+        r["state_contract_only"] = empty_fixture_ok;
+        r["functional_evidence"] = false;
         r["dependency"] = empty_fixture_ok ? "builtin_empty_pcap_parser" : "tshark";
         r["external_dependency_required"] = !empty_fixture_ok;
         r["host_execution_attempted"] = false;
@@ -3467,6 +3671,7 @@ tool_result_t network_decrypt_capture(const json& params) {
         r["pcap_file"] = pcap_path;
         r["keylog_file"] = keylog_path;
         r["display_filter"] = display_filter;
+        r["display_filter_valid"] = true;
         r["pcap"] = ns_pcap_probe_to_json(pcap_probe);
         r["keylog"] = ns_keylog_probe_to_json(keylog_probe);
         r["pcap_valid"] = pcap_probe.valid;
@@ -3475,6 +3680,8 @@ tool_result_t network_decrypt_capture(const json& params) {
         r["total_packets"] = pcap_probe.packet_count;
         r["decrypted_packets"] = 0;
         r["http2_frames"] = json::array();
+        r["http2_frame_count"] = 0;
+        r["requires_http2_frames"] = true;
         if (empty_fixture_ok) {
             r["expected_empty"] = true;
             r["reason"] = "valid empty capture fixture parsed without tshark";
@@ -3538,6 +3745,8 @@ tool_result_t network_decrypt_capture(const json& params) {
     r["tshark_path"] = tshark_path;
     r["pcap_file"] = decrypt_result.pcap_file_used;
     r["keylog_file"] = decrypt_result.keylog_file_used;
+    r["display_filter"] = display_filter;
+    r["display_filter_valid"] = true;
     r["pcap"] = ns_pcap_probe_to_json(pcap_probe);
     r["keylog"] = ns_keylog_probe_to_json(keylog_probe);
     r["pcap_valid"] = pcap_probe.valid;
@@ -3545,6 +3754,7 @@ tool_result_t network_decrypt_capture(const json& params) {
     r["keylog_entry_count"] = keylog_probe.entry_count;
     r["total_packets"] = decrypt_result.total_packets;
     r["decrypted_packets"] = decrypt_result.decrypted_packets;
+    r["requires_http2_frames"] = true;
     r["timeout_ms"] = decrypt_result.timeout_ms;
     r["elapsed_ms"] = decrypt_result.elapsed_ms;
     r["tshark_process_id"] = decrypt_result.process_id;
@@ -3584,6 +3794,9 @@ tool_result_t network_decrypt_capture(const json& params) {
         frames.push_back(fj);
     }
     r["http2_frames"] = frames;
+    r["http2_frame_count"] = frames.size();
+    r["functional_evidence"] = decrypt_result.success;
+    r["state_contract_only"] = !decrypt_result.success;
 
     if (decrypt_result.success)
         return tool_result_t::ok(
@@ -4050,7 +4263,7 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
                "The target process must have been started with SSLKEYLOGFILE set for key logging to work."),
         {{OBFSTR("pcap_path"), OBFSTR("string"), OBFSTR("Path to the PCAP file to decrypt"), true},
          {OBFSTR("keylog_path"), OBFSTR("string"), OBFSTR("Path to the SSLKEYLOGFILE (auto-detected from env if empty)"), false},
-         {OBFSTR("display_filter"), OBFSTR("string"), OBFSTR("Wireshark display filter (default: 'http2')"), false},
+         {OBFSTR("display_filter"), OBFSTR("string"), OBFSTR("Strict HTTP/2 Wireshark display filter (default: 'http2')"), false},
          {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded TShark decrypt deadline in milliseconds."), false}},
         network_decrypt_capture, true});
 

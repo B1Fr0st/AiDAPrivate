@@ -217,6 +217,40 @@ namespace {
 
     bool camoufox_bridge_sticky_setup_failure(const aida::burp::camoufox::bridge_status_t& st, std::string& marker) {
         marker.clear();
+        const auto string_field = [](const nlohmann::json& obj, const char* key) -> std::string {
+            if (!obj.is_object())
+                return {};
+            auto it = obj.find(key);
+            if (it == obj.end() || it->is_null())
+                return {};
+            if (it->is_string())
+                return it->get<std::string>();
+            if (it->is_boolean())
+                return it->get<bool>() ? "true" : "false";
+            if (it->is_number())
+                return it->dump();
+            return {};
+        };
+        const auto bool_field = [](const nlohmann::json& obj, const char* key) -> bool {
+            if (!obj.is_object())
+                return false;
+            auto it = obj.find(key);
+            return it != obj.end() && it->is_boolean() && it->get<bool>();
+        };
+        const auto uint_field = [](const nlohmann::json& obj, const char* key) -> uint64_t {
+            if (!obj.is_object())
+                return 0;
+            auto it = obj.find(key);
+            if (it == obj.end())
+                return 0;
+            if (it->is_number_unsigned())
+                return it->get<uint64_t>();
+            if (it->is_number_integer()) {
+                const auto value = it->get<int64_t>();
+                return value > 0 ? static_cast<uint64_t>(value) : 0;
+            }
+            return 0;
+        };
         nlohmann::json sticky = nlohmann::json::object();
         if (st.last_launch_diagnostics.is_object()) {
             auto sticky_it = st.last_launch_diagnostics.find("sticky_setup_failure");
@@ -238,6 +272,31 @@ namespace {
                 " phase=" + (phase.empty() ? std::string("<empty>") : phase) +
                 " root=" + (summary.empty() ? std::string("<empty>") : compact_burp_text(summary, 700));
             return true;
+        }
+        if (st.last_launch_diagnostics.is_object()) {
+            const bool nonretryable = bool_field(st.last_launch_diagnostics, "nonretryable_setup_failure") ||
+                bool_field(st.last_launch_diagnostics, "setup_failure_sticky");
+            const std::string phase = string_field(st.last_launch_diagnostics, "phase");
+            if (nonretryable || phase == "sticky_setup_failure") {
+                std::string category = string_field(st.last_launch_diagnostics, "setup_failure_category");
+                if (category.empty())
+                    category = string_field(st.last_launch_diagnostics, "category");
+                std::string summary = string_field(st.last_launch_diagnostics, "setup_failure_summary");
+                if (summary.empty())
+                    summary = string_field(st.last_launch_diagnostics, "error_summary");
+                if (summary.empty())
+                    summary = string_field(st.last_launch_diagnostics, "summary");
+                if (summary.empty())
+                    summary = string_field(st.last_launch_diagnostics, "error");
+                const std::string mode = string_field(st.last_launch_diagnostics, "mode");
+                const uint64_t generation = uint_field(st.last_launch_diagnostics, "generation");
+                marker = "category=" + (category.empty() ? std::string("nonretryable_setup_failure") : category) +
+                    " generation=" + std::to_string(static_cast<unsigned long long>(generation)) +
+                    " mode=" + (mode.empty() ? std::string("<empty>") : mode) +
+                    " phase=" + (phase.empty() ? std::string("<empty>") : phase) +
+                    " root=" + (summary.empty() ? std::string("<empty>") : compact_burp_text(summary, 700));
+                return true;
+            }
         }
         std::string lower_error = st.last_error;
         std::transform(lower_error.begin(), lower_error.end(), lower_error.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });

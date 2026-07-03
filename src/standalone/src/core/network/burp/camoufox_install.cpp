@@ -145,6 +145,9 @@ constexpr DWORD kPythonRuntimeInstallTimeoutMs = 300000;
 constexpr wchar_t kCamoufoxBrowserDirName[] = L"camoufox-135.0.1-beta.24-win.x86_64";
 constexpr char kReverseMcpPackageSpec[] = "camoufox-reverse-mcp";
 constexpr char kReverseMcpInitiatorContractV2[] = "aida_initiator_contract_v2_page_marker";
+constexpr char kReverseMcpAddonPolicyContractV1[] = "aida_default_addon_policy_v1";
+constexpr char kReverseMcpLaunchPolicyContractV1[] = "aida_fast_visible_policy_v1";
+constexpr char kReverseMcpFrozenContractCacheId[] = "aida_initiator_contract_v2_page_marker+addon_policy_v1+launch_policy_v1";
 
 bool env_flag_enabled(const wchar_t* name)
 {
@@ -2311,9 +2314,29 @@ DWORD contract_probe_timeout_ms(DWORD timeout_ms)
     return std::max<DWORD>(timeout_ms, 30000);
 }
 
+bool captured_json_true_field(const std::string& captured, const char* field)
+{
+    if (!field || !*field) return false;
+    const std::string key = std::string("\"") + field + "\"";
+    size_t pos = 0;
+    while ((pos = captured.find(key, pos)) != std::string::npos)
+    {
+        pos += key.size();
+        while (pos < captured.size() && std::isspace(static_cast<unsigned char>(captured[pos]))) ++pos;
+        if (pos >= captured.size() || captured[pos] != ':') continue;
+        ++pos;
+        while (pos < captured.size() && std::isspace(static_cast<unsigned char>(captured[pos]))) ++pos;
+        if (captured.compare(pos, 4, "true") == 0)
+            return true;
+    }
+    return false;
+}
+
 bool validate_contract_probe_output(const std::string& captured, std::string& detail)
 {
     const bool has_contract = captured.find(kReverseMcpInitiatorContractV2) != std::string::npos;
+    const bool has_addon_policy_contract = captured.find(kReverseMcpAddonPolicyContractV1) != std::string::npos;
+    const bool has_launch_policy_contract = captured.find(kReverseMcpLaunchPolicyContractV1) != std::string::npos;
     const bool has_request_id = captured.find("request_id") != std::string::npos;
     const bool has_page_id = captured.find("page_id") != std::string::npos;
     const bool has_marker_param =
@@ -2321,15 +2344,56 @@ bool validate_contract_probe_output(const std::string& captured, std::string& de
         captured.find(",marker") != std::string::npos ||
         captured.find("marker,") != std::string::npos ||
         captured.find("marker]") != std::string::npos;
-    if (has_contract && has_request_id && has_page_id && has_marker_param)
+    const bool addon_policy_contract_ok = captured_json_true_field(captured, "addon_policy_contract_ok");
+    const bool addon_policy_marker_present = captured_json_true_field(captured, "addon_policy_marker_present");
+    const bool default_ubo_exclusion_present = captured_json_true_field(captured, "default_ubo_exclusion_present");
+    const bool exclude_addons_marker_present = captured_json_true_field(captured, "exclude_addons_marker_present");
+    const bool addon_invalid_diagnostic_present = captured_json_true_field(captured, "addon_invalid_diagnostic_present");
+    const bool addon_all_launch_scope_present = captured_json_true_field(captured, "addon_all_launch_scope_present");
+    const bool fast_visible_policy_contract_ok = captured_json_true_field(captured, "fast_visible_policy_contract_ok");
+    const bool fast_visible_policy_marker_present = captured_json_true_field(captured, "fast_visible_policy_marker_present");
+    const bool fast_visible_disabled_return_present = captured_json_true_field(captured, "fast_visible_disabled_return_present");
+    const bool fast_visible_fallback_ignored_present = captured_json_true_field(captured, "fast_visible_fallback_ignored_present");
+    const bool fast_visible_forbidden_return_absent = captured_json_true_field(captured, "fast_visible_forbidden_return_absent");
+    const bool fast_visible_compat_path_absent = captured_json_true_field(captured, "fast_visible_compat_path_absent");
+    const bool fast_visible_selected_async_present = captured_json_true_field(captured, "fast_visible_selected_async_present");
+    if (has_contract && has_addon_policy_contract && has_launch_policy_contract && has_request_id && has_page_id && has_marker_param &&
+        addon_policy_contract_ok &&
+        addon_policy_marker_present &&
+        default_ubo_exclusion_present &&
+        exclude_addons_marker_present &&
+        addon_invalid_diagnostic_present &&
+        addon_all_launch_scope_present &&
+        fast_visible_policy_contract_ok &&
+        fast_visible_policy_marker_present &&
+        fast_visible_disabled_return_present &&
+        fast_visible_fallback_ignored_present &&
+        fast_visible_forbidden_return_absent &&
+        fast_visible_compat_path_absent &&
+        fast_visible_selected_async_present)
     {
         detail = compact_log_tail(captured, 800);
         return true;
     }
     detail = "contract_probe_missing_fields contract=" + std::to_string(has_contract ? 1 : 0) +
+        " addon_contract=" + std::to_string(has_addon_policy_contract ? 1 : 0) +
+        " launch_policy_contract=" + std::to_string(has_launch_policy_contract ? 1 : 0) +
         " request_id=" + std::to_string(has_request_id ? 1 : 0) +
         " page_id=" + std::to_string(has_page_id ? 1 : 0) +
         " marker=" + std::to_string(has_marker_param ? 1 : 0) +
+        " addon_policy=" + std::to_string(addon_policy_contract_ok ? 1 : 0) +
+        " addon_marker=" + std::to_string(addon_policy_marker_present ? 1 : 0) +
+        " default_ubo_exclusion=" + std::to_string(default_ubo_exclusion_present ? 1 : 0) +
+        " exclude_addons=" + std::to_string(exclude_addons_marker_present ? 1 : 0) +
+        " addon_invalid_diag=" + std::to_string(addon_invalid_diagnostic_present ? 1 : 0) +
+        " addon_all_launch_scope=" + std::to_string(addon_all_launch_scope_present ? 1 : 0) +
+        " fast_visible_policy=" + std::to_string(fast_visible_policy_contract_ok ? 1 : 0) +
+        " fast_visible_marker=" + std::to_string(fast_visible_policy_marker_present ? 1 : 0) +
+        " fast_visible_disabled=" + std::to_string(fast_visible_disabled_return_present ? 1 : 0) +
+        " fast_visible_ignored_log=" + std::to_string(fast_visible_fallback_ignored_present ? 1 : 0) +
+        " fast_visible_forbidden_return_absent=" + std::to_string(fast_visible_forbidden_return_absent ? 1 : 0) +
+        " fast_visible_compat_absent=" + std::to_string(fast_visible_compat_path_absent ? 1 : 0) +
+        " fast_visible_selected_async=" + std::to_string(fast_visible_selected_async_present ? 1 : 0) +
         " tail=" + compact_log_tail(captured, 800);
     return false;
 }
@@ -2451,17 +2515,7 @@ bool validate_python_reverse_mcp_contract(const std::string& python, DWORD timeo
     DWORD code = 0;
     std::string captured;
     const DWORD effective_timeout = contract_probe_timeout_ms(timeout_ms);
-    const std::string py =
-        "import inspect,sys;"
-        "from camoufox_reverse_mcp.tools import network;"
-        "fn=network.get_request_initiator;"
-        "params=list(inspect.signature(fn).parameters);"
-        "consts=repr(getattr(getattr(fn,'__code__',None),'co_consts',()));"
-        "contract='aida_initiator_contract_v2_page_marker';"
-        "ok=all(x in params for x in ('request_id','page_id','marker')) and contract in consts;"
-        "print('contract='+contract+' ok='+str(ok)+' params='+','.join(params)+' has_marker_constant='+str(contract in consts));"
-        "sys.exit(0 if ok else 2)";
-    const std::string cmd = quote_arg(python) + " -c " + quote_arg(py);
+    const std::string cmd = quote_arg(python) + " -m camoufox_reverse_mcp --aida-contract-check";
     const ULONGLONG start_ms = GetTickCount64();
     diag::log_tagged_fmt("camoufox_install", "reverse_mcp_contract_probe python start python=%s timeout_ms=%lu",
         python.c_str(), static_cast<unsigned long>(effective_timeout));
@@ -2851,7 +2905,7 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
         {
             cache_miss_reason = "missing_or_unreadable";
         }
-        else if (cached_contract_id != kReverseMcpInitiatorContractV2)
+        else if (cached_contract_id != kReverseMcpFrozenContractCacheId)
         {
             cache_miss_reason = "stale_contract_id";
         }
@@ -2933,7 +2987,7 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
             sg().status.python_path.clear();
             sg().status.module_version.clear();
             sg().status.browser_path.clear();
-            sg().last_error = "frozen camoufox_reverse_mcp executable has stale initiator contract: " + contract_detail;
+            sg().last_error = "frozen camoufox_reverse_mcp executable has stale frozen MCP contract: " + contract_detail;
             set_status_locked(install_state_t::missing_module, sg().last_error);
             diag::log_tagged_fmt("camoufox_install", "probe_step id=%llu frozen_exe_contract_failed mcp=%s elapsed_ms=%llu detail=%.800s",
                 static_cast<unsigned long long>(probe_id),
@@ -2946,12 +3000,12 @@ status_t probe_impl(bool allow_when_busy, DWORD timeout_ms)
         {
             const std::string meipass_dir_utf8 = wide_to_utf8(live_meipass);
             const ULONGLONG save_start_ms = GetTickCount64();
-            const bool saved = save_frozen_mcp_contract_cache(exe_utf8, live_sha256, live_size_v, live_mtime_v, kReverseMcpInitiatorContractV2, meipass_dir_utf8);
+            const bool saved = save_frozen_mcp_contract_cache(exe_utf8, live_sha256, live_size_v, live_mtime_v, kReverseMcpFrozenContractCacheId, meipass_dir_utf8);
             diag::log_tagged_fmt("camoufox_install", "contract_cache save path=%s ok=%d sha256=%s contract_id=%s meipass_dir=%s elapsed_ms=%llu",
                 wide_to_utf8(frozen_mcp_contract_cache_path()).c_str(),
                 saved ? 1 : 0,
                 live_sha256.c_str(),
-                kReverseMcpInitiatorContractV2,
+                kReverseMcpFrozenContractCacheId,
                 meipass_dir_utf8.empty() ? "<empty>" : meipass_dir_utf8.c_str(),
                 static_cast<unsigned long long>(GetTickCount64() - save_start_ms));
             std::lock_guard<std::mutex> lk(sg().mtx);

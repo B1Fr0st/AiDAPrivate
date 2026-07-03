@@ -48,12 +48,19 @@ namespace xref_index {
 		uint64_t    clipped_hi = 0;
 		size_t      pages_read = 0;
 		size_t      pages_failed = 0;
+		size_t      chunks_read = 0;
+		size_t      chunks_failed = 0;
 		size_t      bytes_read = 0;
+		size_t      chunk_size = 0;
 		size_t      targets_found = 0;
 		size_t      xrefs_found = 0;
 		uint64_t    proof_target = 0;
 		uint64_t    proof_source = 0;
 		std::string proof_label;
+		bool        target_discovery_attempted = false;
+		bool        target_discovery_complete = false;
+		bool        target_proof_ready = false;
+		bool        early_target_proof = false;
 		uint32_t    state_before = 0;
 		uint32_t    state_after = 0;
 		bool        table_built_before = false;
@@ -1109,18 +1116,23 @@ namespace xref_index {
 			result.elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 				std::chrono::steady_clock::now() - started).count());
 			diag::log_tagged_critical_fmt("xref",
-				"bounded_live_range_exit ok=%d error=%s module=%s base=0x%llX clipped_lo=0x%llX clipped_hi=0x%llX pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu pid=%u tid=%lu elapsed_us=%llu",
+				"bounded_live_range_exit ok=%d error=%s module=%s base=0x%llX clipped_lo=0x%llX clipped_hi=0x%llX chunks_read=%zu chunks_failed=%zu pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu target_attempted=%d target_complete=%d early_proof=%d pid=%u tid=%lu elapsed_us=%llu",
 				ok ? 1 : 0,
 				result.error.empty() ? "" : result.error.c_str(),
 				result.module.empty() ? "" : result.module.c_str(),
 				static_cast<unsigned long long>(result.module_base),
 				static_cast<unsigned long long>(result.clipped_lo),
 				static_cast<unsigned long long>(result.clipped_hi),
+				result.chunks_read,
+				result.chunks_failed,
 				result.pages_read,
 				result.pages_failed,
 				result.bytes_read,
 				result.targets_found,
 				result.xrefs_found,
+				result.target_discovery_attempted ? 1 : 0,
+				result.target_discovery_complete ? 1 : 0,
+				result.early_target_proof ? 1 : 0,
 				result.pid,
 				detail::current_worker_tid(),
 				static_cast<unsigned long long>(result.elapsed_us));
@@ -1368,11 +1380,40 @@ namespace xref_index {
 		map.reserve(1024);
 
 		const size_t page_size = 4096;
+		const size_t preferred_chunk_size = 64u * 1024u;
+		result.chunk_size = preferred_chunk_size;
+		auto refresh_target_proof = [&](bool complete) {
+			result.target_discovery_attempted = true;
+			result.target_discovery_complete = complete;
+			result.targets_found = 0;
+			result.xrefs_found = 0;
+			result.proof_target = 0;
+			result.proof_source = 0;
+			result.proof_label.clear();
+			for (auto& kv : map) {
+				if (kv.first != 0)
+					++result.targets_found;
+				std::sort(kv.second.begin(), kv.second.end(), detail::sort_less);
+				for (const auto& ann : kv.second) {
+					if (kv.first == 0 || ann.source_addr == 0)
+						continue;
+					++result.xrefs_found;
+					if (result.proof_target == 0) {
+						result.proof_target = kv.first;
+						result.proof_source = ann.source_addr;
+						result.proof_label = ann.source_label;
+					}
+				}
+			}
+			result.target_proof_ready = result.proof_target != 0 && result.proof_source != 0;
+			return result.target_proof_ready;
+		};
 		diag::log_tagged_critical_fmt("xref",
-			"bounded_live_range_page_loop_ready module=%s sections=%zu functions=%zu deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
+			"bounded_live_range_chunk_loop_ready module=%s sections=%zu functions=%zu chunk_size=%zu deadline_remaining_ms=%llu pid=%u tid=%lu elapsed_us=%llu",
 			result.module.c_str(),
 			sections.size(),
 			fns.size(),
+			preferred_chunk_size,
 			static_cast<unsigned long long>(deadline_remaining_ms()),
 			result.pid,
 			detail::current_worker_tid(),
@@ -1387,14 +1428,14 @@ namespace xref_index {
 			const uint64_t end = std::min(result.clipped_hi, section_end);
 			while (cursor < end) {
 				if (deadline_expired())
-					return finish("deadline_before_page_read", false);
-				size_t chunk = page_size;
+					return finish(result.target_discovery_attempted ? "deadline_after_target_discovery" : "deadline_before_target_discovery", false);
+				size_t chunk = preferred_chunk_size;
 				if (cursor + chunk > end)
 					chunk = static_cast<size_t>(end - cursor);
 				std::vector<uint8_t> page_data;
 				const auto page_started = std::chrono::steady_clock::now();
 				diag::log_tagged_critical_fmt("xref",
-					"bounded_live_range_page_pre module=%s base=0x%llX section=0x%llX cursor=0x%llX chunk=%zu pid=%u tid=%lu elapsed_us=%llu",
+					"bounded_live_range_chunk_pre module=%s base=0x%llX section=0x%llX cursor=0x%llX chunk=%zu pid=%u tid=%lu elapsed_us=%llu",
 					result.module.c_str(),
 					static_cast<unsigned long long>(result.module_base),
 					static_cast<unsigned long long>(section_start),
@@ -1406,14 +1447,17 @@ namespace xref_index {
 				const bool read_ok = driver_bridge::read_memory_for(result.pid, cursor, chunk, page_data);
 				const uint64_t page_elapsed_us = detail::elapsed_us_since(page_started);
 				if (read_ok && !page_data.empty()) {
-					++result.pages_read;
+					++result.chunks_read;
+					result.pages_read += (page_data.size() + page_size - 1) / page_size;
 					result.bytes_read += page_data.size();
 					diag::log_tagged_critical_fmt("xref",
-						"bounded_live_range_page_post module=%s cursor=0x%llX chunk=%zu ok=1 bytes=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu page_elapsed_us=%llu elapsed_us=%llu",
+						"bounded_live_range_chunk_post module=%s cursor=0x%llX chunk=%zu ok=1 bytes=%zu chunks_read=%zu chunks_failed=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu chunk_elapsed_us=%llu elapsed_us=%llu",
 						result.module.c_str(),
 						static_cast<unsigned long long>(cursor),
 						chunk,
 						page_data.size(),
+						result.chunks_read,
+						result.chunks_failed,
 						result.pages_read,
 						result.pages_failed,
 						result.pid,
@@ -1421,19 +1465,26 @@ namespace xref_index {
 						static_cast<unsigned long long>(page_elapsed_us),
 						static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 					if (deadline_expired())
-						return finish("deadline_after_page_read", false);
+						return finish(result.target_discovery_attempted ? "deadline_after_target_discovery" : "deadline_before_target_discovery", false);
 					detail::scan_block_for_xrefs(page_data.data(), page_data.size(), cursor, fns, sections, result.module_base, result.module, map);
+					if (refresh_target_proof(false)) {
+						result.early_target_proof = true;
+						return finish("", true);
+					}
 					if (deadline_expired())
-						return finish("deadline_after_page_scan", false);
+						return finish("deadline_after_target_discovery", false);
 				} else {
-					++result.pages_failed;
+					++result.chunks_failed;
+					result.pages_failed += std::max<size_t>(1, (chunk + page_size - 1) / page_size);
 					diag::log_tagged_critical_fmt("xref",
-						"bounded_live_range_page_post module=%s cursor=0x%llX chunk=%zu ok=%d bytes=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu page_elapsed_us=%llu elapsed_us=%llu",
+						"bounded_live_range_chunk_post module=%s cursor=0x%llX chunk=%zu ok=%d bytes=%zu chunks_read=%zu chunks_failed=%zu pages_read=%zu pages_failed=%zu pid=%u tid=%lu chunk_elapsed_us=%llu elapsed_us=%llu",
 						result.module.c_str(),
 						static_cast<unsigned long long>(cursor),
 						chunk,
 						read_ok ? 1 : 0,
 						page_data.size(),
+						result.chunks_read,
+						result.chunks_failed,
 						result.pages_read,
 						result.pages_failed,
 						result.pid,
@@ -1441,27 +1492,13 @@ namespace xref_index {
 						static_cast<unsigned long long>(page_elapsed_us),
 						static_cast<unsigned long long>(detail::elapsed_us_since(started)));
 					if (deadline_expired())
-						return finish("deadline_after_page_read_failed", false);
+						return finish(result.target_discovery_attempted ? "deadline_after_target_discovery" : "deadline_before_target_discovery", false);
 				}
 				cursor += chunk;
 			}
 		}
 
-		for (auto& kv : map) {
-			if (kv.first != 0)
-				++result.targets_found;
-			std::sort(kv.second.begin(), kv.second.end(), detail::sort_less);
-			for (const auto& ann : kv.second) {
-				if (kv.first == 0 || ann.source_addr == 0)
-					continue;
-				++result.xrefs_found;
-				if (result.proof_target == 0) {
-					result.proof_target = kv.first;
-					result.proof_source = ann.source_addr;
-					result.proof_label = ann.source_label;
-				}
-			}
-		}
+		refresh_target_proof(true);
 
 		if (result.pages_read == 0)
 			return finish("range_read_empty", false);

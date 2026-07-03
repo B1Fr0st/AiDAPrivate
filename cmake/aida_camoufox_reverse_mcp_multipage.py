@@ -9,6 +9,7 @@ ROOT = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
 AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
 AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID = "aida_playwright_pageerror_location_patch_20260620_1"
 AIDA_DEFAULT_ADDON_POLICY_V1 = "aida_default_addon_policy_v1"
+AIDA_FAST_VISIBLE_POLICY_V1 = "aida_fast_visible_policy_v1"
 
 
 def fail(message: str) -> None:
@@ -1316,6 +1317,14 @@ def patch_browser_camoufox_stability(text: str) -> str:
             'AIDA_CAMOUFOX_BRIDGE_PATCH_ID = "aida_camoufox_bridge_20260620_crash_diag_1"\n',
             "browser bridge patch id",
         )
+    if "AIDA_FAST_VISIBLE_POLICY_MARKER" not in text:
+        text = replace_once(
+            text,
+            'AIDA_CAMOUFOX_BRIDGE_PATCH_ID = "aida_camoufox_bridge_20260620_crash_diag_1"\n',
+            'AIDA_CAMOUFOX_BRIDGE_PATCH_ID = "aida_camoufox_bridge_20260620_crash_diag_1"\n'
+            f'AIDA_FAST_VISIBLE_POLICY_MARKER = "{AIDA_FAST_VISIBLE_POLICY_V1}"\n',
+            "browser fast-visible policy marker",
+        )
     if "def _flag_enabled(value: Any) -> bool:" not in text:
         helper = '''def _flag_enabled(value: Any) -> bool:
     if isinstance(value, bool):
@@ -1743,6 +1752,7 @@ def _target_closed_error(exc: Exception) -> bool:
         "def _flag_enabled",
         "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK",
         "AIDA_CAMOUFOX_BRIDGE_PATCH_ID",
+        "aida_fast_visible_policy_v1",
         "aida_bridge_patch_active",
         "aida_launch_policy_resolved",
         "aida_fast_visible_fallback_ignored",

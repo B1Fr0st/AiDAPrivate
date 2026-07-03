@@ -4299,9 +4299,9 @@ namespace test_all_features {
 				}
 			};
 
-			bool posted = work_queue::post_service(task);
+			bool posted = work_queue::post_service_labeled("full_test.start_service", task);
 			if (!posted)
-				posted = work_queue::post(task);
+				posted = work_queue::post_labeled("full_test.start_worker", task);
 			if (!posted)
 				posted = critical_work_queue::post_labeled("full_test.startup_fallback", std::move(task));
 			if (!posted) {

@@ -170,6 +170,46 @@ namespace {
 		ImGui::TextDisabled("Drains up to DRAIN_DEBUG_EVENTS_CAP (64) events per call.");
 	}
 
+	bool launch_evts_stimulus_child(test_lab::result_t& r, std::uint32_t attempt, std::uint32_t* child_pid) {
+		if (child_pid) *child_pid = 0;
+		wchar_t comspec[32768];
+		DWORD got = GetEnvironmentVariableW(L"ComSpec", comspec, static_cast<DWORD>(sizeof(comspec) / sizeof(comspec[0])));
+		std::wstring exe;
+		if (got > 0 && got < static_cast<DWORD>(sizeof(comspec) / sizeof(comspec[0]))) {
+			exe.assign(comspec, comspec + got);
+		} else {
+			wchar_t sysdir[MAX_PATH];
+			UINT sysgot = GetSystemDirectoryW(sysdir, MAX_PATH);
+			if (sysgot == 0 || sysgot >= MAX_PATH) {
+				char buf[128];
+				std::snprintf(buf, sizeof(buf), "attempt=%u gle=%lu", attempt, static_cast<unsigned long>(GetLastError()));
+				r.parsed.push_back({ "evts_child_system_dir_failed", buf });
+				return false;
+			}
+			exe.assign(sysdir, sysdir + sysgot);
+			if (!exe.empty() && exe.back() != L'\\') exe.push_back(L'\\');
+			exe += L"cmd.exe";
+		}
+		std::wstring cmdline = L"\"";
+		cmdline += exe;
+		cmdline += L"\" /d /c exit 0";
+		STARTUPINFOW si{};
+		si.cb = sizeof(si);
+		PROCESS_INFORMATION pi{};
+		BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+		if (!ok) {
+			char buf[160];
+			std::snprintf(buf, sizeof(buf), "attempt=%u gle=%lu", attempt, static_cast<unsigned long>(GetLastError()));
+			r.parsed.push_back({ "evts_child_create_failed", buf });
+			return false;
+		}
+		if (child_pid) *child_pid = pi.dwProcessId;
+		WaitForSingleObject(pi.hProcess, 1000);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		return true;
+	}
+
 	void run_evts(test_lab::state_t& s, test_lab::result_t& r) {
 		(void)s;
 		if (!device || !device->is_connected()) {
@@ -178,9 +218,41 @@ namespace {
 			return;
 		}
 
+		std::vector<voyager::device_t::debug_event_record> baseline_events;
+		voyager::device_t::debug_event_drain_stats baseline_stats{};
+		bool baseline_ok = device->drain_debug_events(baseline_events, voyager::detail::DRAIN_DEBUG_EVENTS_CAP, &baseline_stats);
+		if (!baseline_ok) {
+			r.error = "baseline drain_debug_events wrapper returned false";
+			r.ntstatus = static_cast<std::int32_t>(0xC0000001u);
+			r.ok = false;
+			return;
+		}
+
 		std::vector<voyager::device_t::debug_event_record> events;
 		voyager::device_t::debug_event_drain_stats stats{};
-		bool ok = device->drain_debug_events(events, voyager::detail::DRAIN_DEBUG_EVENTS_CAP, &stats);
+		bool ok = true;
+		std::uint32_t children_created = 0;
+		std::uint32_t poll_attempts = 0;
+		for (std::uint32_t child = 0; child < 4u && events.empty(); ++child) {
+			std::uint32_t child_pid = 0;
+			if (launch_evts_stimulus_child(r, child, &child_pid)) {
+				++children_created;
+				char child_buf[64];
+				std::snprintf(child_buf, sizeof(child_buf), "%u", child_pid);
+				r.parsed.push_back({ "fresh_child_pid", child_buf });
+			}
+			for (std::uint32_t poll = 0; poll < 10u && events.empty(); ++poll) {
+				Sleep(50u);
+				events.clear();
+				stats = {};
+				ok = device->drain_debug_events(events, voyager::detail::DRAIN_DEBUG_EVENTS_CAP, &stats);
+				++poll_attempts;
+				if (!ok)
+					break;
+			}
+			if (!ok)
+				break;
+		}
 
 		struct evts_header_dump_t {
 			std::uint32_t returned_count;
@@ -207,6 +279,19 @@ namespace {
 		}
 
 		char buf[256];
+		std::snprintf(buf, sizeof(buf), "%u", baseline_stats.returned_count);
+		r.parsed.push_back({ "baseline_returned_count", buf });
+		std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(baseline_stats.total_published));
+		r.parsed.push_back({ "baseline_total_published", buf });
+		std::snprintf(buf, sizeof(buf), "%u", children_created);
+		r.parsed.push_back({ "fresh_children_created", buf });
+		std::snprintf(buf, sizeof(buf), "%u", poll_attempts);
+		r.parsed.push_back({ "fresh_poll_attempts", buf });
+		std::uint64_t published_delta = 0;
+		if (stats.total_published >= baseline_stats.total_published)
+			published_delta = stats.total_published - baseline_stats.total_published;
+		std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(published_delta));
+		r.parsed.push_back({ "fresh_total_published_delta", buf });
 		std::snprintf(buf, sizeof(buf), "%u", stats.returned_count);
 		r.parsed.push_back({ "returned_count", buf });
 		std::snprintf(buf, sizeof(buf), "%u", stats.dropped_since_last_drain);
@@ -244,6 +329,20 @@ namespace {
 				static_cast<unsigned long long>(e.image_size),
 				path_ascii);
 			r.parsed.push_back({ label, buf });
+		}
+		const bool fresh_returned_event = !events.empty() && stats.returned_count != 0u;
+		r.parsed.push_back({ "fresh_returned_event", fresh_returned_event ? "1" : "0" });
+		if (!fresh_returned_event) {
+			r.ntstatus = static_cast<std::int32_t>(0xC0000225u);
+			if (published_delta != 0) {
+				r.error = "fresh debug events were published but foreground EVTS drain returned zero";
+			} else if (children_created == 0u) {
+				r.error = "EVTS could not create a child-process stimulus";
+			} else {
+				r.error = "EVTS drain returned zero after same-run child-process stimulus";
+			}
+			r.ok = false;
+			return;
 		}
 		r.ok = true;
 	}

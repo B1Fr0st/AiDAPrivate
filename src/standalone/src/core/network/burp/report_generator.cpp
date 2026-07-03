@@ -14,6 +14,8 @@
 #include "findings_db.hpp"
 #include "../../../helpers/diag_log.hpp"
 
+#include <sqlite3.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -774,6 +776,223 @@ bool write_file(const std::string& path, const std::string& body)
     return f.good();
 }
 
+bool bind_report_text(sqlite3_stmt* stmt, int idx, const std::string& s)
+{
+    return sqlite3_bind_text(stmt, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT) == SQLITE_OK;
+}
+
+std::string report_column_text(sqlite3_stmt* stmt, int col)
+{
+    if (sqlite3_column_type(stmt, col) == SQLITE_NULL) return std::string();
+    const unsigned char* p = sqlite3_column_text(stmt, col);
+    const int n = sqlite3_column_bytes(stmt, col);
+    if (!p || n <= 0) return std::string();
+    return std::string(reinterpret_cast<const char*>(p), static_cast<size_t>(n));
+}
+
+const char* stored_format_label(report_format_t f)
+{
+    switch (f) {
+        case report_format_t::html:      return "html";
+        case report_format_t::markdown:  return "markdown";
+        case report_format_t::json:      return "json";
+        case report_format_t::sarif_2_1: return "sarif_2_1_0";
+        case report_format_t::csv:       return "csv";
+    }
+    return "html";
+}
+
+report_format_t stored_format_value(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (s == "markdown" || s == "md")
+        return report_format_t::markdown;
+    if (s == "json")
+        return report_format_t::json;
+    if (s == "sarif" || s == "sarif_2_1" || s == "sarif_2_1_0")
+        return report_format_t::sarif_2_1;
+    if (s == "csv")
+        return report_format_t::csv;
+    return report_format_t::html;
+}
+
+generated_report_t make_report_record(const report_config_t& cfg, size_t issue_count, bool inline_output)
+{
+    auto& h = history();
+    generated_report_t rec;
+    rec.id = h.next_id.fetch_add(1);
+    rec.ts_ms = now_ms();
+    rec.title = safe_text(cfg.title, 256);
+    rec.output_path = inline_output ? std::string() : cfg.output_path;
+    rec.format = cfg.format;
+    rec.issue_count = issue_count;
+    rec.inline_output = inline_output;
+    return rec;
+}
+
+void remember_report_record(generated_report_t rec)
+{
+    auto& h = history();
+    std::lock_guard<std::mutex> lk(h.mtx);
+    h.items.push_back(std::move(rec));
+}
+
+std::vector<generated_report_t> memory_report_history()
+{
+    auto& h = history();
+    std::lock_guard<std::mutex> lk(h.mtx);
+    return h.items;
+}
+
+std::string report_history_key(const generated_report_t& rec)
+{
+    std::ostringstream os;
+    os << rec.id << '|'
+       << rec.ts_ms << '|'
+       << rec.title << '|'
+       << rec.output_path << '|'
+       << static_cast<int>(rec.format) << '|'
+       << rec.issue_count << '|'
+       << (rec.inline_output ? 1 : 0);
+    return os.str();
+}
+
+std::vector<generated_report_t> merge_report_history(std::vector<generated_report_t> db_items,
+                                                     const std::vector<generated_report_t>& memory_items)
+{
+    std::unordered_set<std::string> seen;
+    for (const auto& item : db_items)
+        seen.insert(report_history_key(item));
+    for (const auto& item : memory_items) {
+        const auto key = report_history_key(item);
+        if (!seen.insert(key).second)
+            continue;
+        db_items.push_back(item);
+    }
+    std::sort(db_items.begin(), db_items.end(), [](const generated_report_t& a, const generated_report_t& b) {
+        if (a.ts_ms != b.ts_ms) return a.ts_ms > b.ts_ms;
+        return a.id > b.id;
+    });
+    if (db_items.size() > 512)
+        db_items.resize(512);
+    return db_items;
+}
+
+bool persist_report_record(const report_config_t& cfg, generated_report_t& rec)
+{
+    if (!findings_db::initialize())
+        return false;
+    nlohmann::json metadata;
+    metadata["client_present"] = !cfg.client.empty();
+    metadata["scope_summary_present"] = !cfg.scope_summary.empty();
+    metadata["has_audit_id"] = cfg.has_audit_id;
+    metadata["include_session_context"] = cfg.include_session_context;
+    metadata["include_audit_trail"] = cfg.include_audit_trail;
+    metadata["include_recon"] = cfg.include_recon;
+    metadata["include_suppressed"] = cfg.include_suppressed;
+    metadata["target_domain_present"] = !cfg.target_domain.empty();
+    bool ok = findings_db::with_db("report_history_insert", [&](sqlite3* db) {
+        const char* sql =
+            "INSERT INTO report_history(session_id,audit_id,ts_ms,title,output_path,format,issue_count,inline_output,metadata_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?)";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+        const bool bound =
+            findings_db::bind_optional_session_id(db, stmt, 1, cfg.session_id, "report_history") &&
+            sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(cfg.has_audit_id ? cfg.audit_id : 0)) == SQLITE_OK &&
+            sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(rec.ts_ms)) == SQLITE_OK &&
+            bind_report_text(stmt, 4, rec.title) &&
+            bind_report_text(stmt, 5, rec.output_path) &&
+            bind_report_text(stmt, 6, stored_format_label(rec.format)) &&
+            sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(rec.issue_count)) == SQLITE_OK &&
+            sqlite3_bind_int(stmt, 8, rec.inline_output ? 1 : 0) == SQLITE_OK &&
+            bind_report_text(stmt, 9, metadata.dump());
+        if (!bound) {
+            sqlite3_finalize(stmt);
+            return false;
+        }
+        const int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE)
+            rec.id = static_cast<uint64_t>(sqlite3_last_insert_rowid(db));
+        sqlite3_finalize(stmt);
+        return rc == SQLITE_DONE;
+    });
+    if (!ok) {
+        diag::log_tagged_fmt("report", "report_history_insert_failed err=%s", findings_db::last_error().c_str());
+        return false;
+    }
+    return true;
+}
+
+bool load_report_history_from_db(std::vector<generated_report_t>& out)
+{
+    out.clear();
+    if (!findings_db::initialize())
+        return false;
+    bool ok = findings_db::with_db("report_history_list", [&](sqlite3* db) {
+        const char* sql =
+            "SELECT report_id,ts_ms,title,output_path,format,issue_count,inline_output "
+            "FROM report_history ORDER BY ts_ms DESC,report_id DESC LIMIT 512";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            generated_report_t rec;
+            rec.id = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
+            rec.ts_ms = static_cast<uint64_t>(sqlite3_column_int64(stmt, 1));
+            rec.title = report_column_text(stmt, 2);
+            rec.output_path = report_column_text(stmt, 3);
+            rec.format = stored_format_value(report_column_text(stmt, 4));
+            rec.issue_count = static_cast<size_t>(sqlite3_column_int64(stmt, 5));
+            rec.inline_output = sqlite3_column_int(stmt, 6) != 0;
+            out.push_back(std::move(rec));
+        }
+        sqlite3_finalize(stmt);
+        return true;
+    });
+    if (!ok)
+        out.clear();
+    return ok;
+}
+
+bool report_history_count_from_db(size_t& out)
+{
+    out = 0;
+    if (!findings_db::initialize())
+        return false;
+    return findings_db::with_db("report_history_count", [&](sqlite3* db) {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM report_history", -1, &stmt, nullptr) != SQLITE_OK) return false;
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            out = static_cast<size_t>(sqlite3_column_int64(stmt, 0));
+        sqlite3_finalize(stmt);
+        return true;
+    });
+}
+
+bool clear_report_history_db(size_t& cleared)
+{
+    cleared = 0;
+    if (!findings_db::initialize())
+        return false;
+    return findings_db::with_db("report_history_clear", [&](sqlite3* db) {
+        sqlite3_stmt* count_stmt = nullptr;
+        if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM report_history", -1, &count_stmt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(count_stmt) == SQLITE_ROW)
+                cleared = static_cast<size_t>(sqlite3_column_int64(count_stmt, 0));
+        }
+        if (count_stmt)
+            sqlite3_finalize(count_stmt);
+        char* err = nullptr;
+        const int rc = sqlite3_exec(db, "DELETE FROM report_history", nullptr, nullptr, &err);
+        if (rc != SQLITE_OK) {
+            if (err)
+                sqlite3_free(err);
+            return false;
+        }
+        return true;
+    });
+}
+
 }
 
 bool parse_format(const std::string& s, report_format_t& out)
@@ -819,9 +1038,7 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
 {
     const std::string log_title = safe_text(cfg.title, 256);
     auto history_count = []() {
-        auto& h = history();
-        std::lock_guard<std::mutex> lk(h.mtx);
-        return h.items.size();
+        return list_reports().size();
     };
     issue_store::initialize();
     issue_filter_t issue_filter;
@@ -859,24 +1076,14 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
         case report_format_t::csv:       body = generate_csv(cfg, issues, ctx); break;
     }
     if (cfg.output_path.empty()) {
-        size_t history_after = 0;
-        {
-            auto& h = history();
-            std::lock_guard<std::mutex> lk(h.mtx);
-            generated_report_t rec;
-            rec.id          = h.next_id.fetch_add(1);
-            rec.ts_ms       = now_ms();
-            rec.title       = safe_text(cfg.title, 256);
-            rec.output_path.clear();
-            rec.format      = cfg.format;
-            rec.issue_count = issues.size();
-            rec.inline_output = true;
-            h.items.push_back(std::move(rec));
-            history_after = h.items.size();
-        }
+        generated_report_t rec = make_report_record(cfg, issues.size(), true);
+        const bool persisted = persist_report_record(cfg, rec);
+        remember_report_record(rec);
+        const size_t history_after = history_count();
         out_path_or_error = std::move(body);
-        diag::log_tagged_fmt("report", "generate inline_ok format=%s issues=%zu body_len=%zu",
-            format_label(cfg.format), issues.size(), out_path_or_error.size());
+        diag::log_tagged_fmt("report", "generate inline_ok format=%s issues=%zu body_len=%zu report_id=%llu persisted=%d",
+            format_label(cfg.format), issues.size(), out_path_or_error.size(),
+            static_cast<unsigned long long>(rec.id), persisted ? 1 : 0);
         diag::log_tagged_fmt("report",
             "report_generate_db_post issue_store_count=%zu findings_count=%zu selected_issue_count=%zu history_before=%zu history_after=%zu",
             issue_store_count,
@@ -891,21 +1098,12 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
         out_path_or_error = err_slot();
         return false;
     }
-    {
-        auto& h = history();
-        std::lock_guard<std::mutex> lk(h.mtx);
-        generated_report_t rec;
-        rec.id          = h.next_id.fetch_add(1);
-        rec.ts_ms       = now_ms();
-        rec.title       = safe_text(cfg.title, 256);
-        rec.output_path = cfg.output_path;
-        rec.format      = cfg.format;
-        rec.issue_count = issues.size();
-        rec.inline_output = false;
-        h.items.push_back(std::move(rec));
-    }
-    diag::log_tagged_fmt("report", "generate ok path=%s format=%s issues=%zu body_len=%zu",
-        cfg.output_path.c_str(), format_label(cfg.format), issues.size(), body.size());
+    generated_report_t rec = make_report_record(cfg, issues.size(), false);
+    const bool persisted = persist_report_record(cfg, rec);
+    remember_report_record(rec);
+    diag::log_tagged_fmt("report", "generate ok path=%s format=%s issues=%zu body_len=%zu report_id=%llu persisted=%d",
+        cfg.output_path.c_str(), format_label(cfg.format), issues.size(), body.size(),
+        static_cast<unsigned long long>(rec.id), persisted ? 1 : 0);
     diag::log_tagged_fmt("burp.report", "generated path=%s format=%s issues=%zu",
         cfg.output_path.c_str(), format_label(cfg.format), issues.size());
     diag::log_tagged_fmt("report",
@@ -921,30 +1119,47 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
 
 std::vector<generated_report_t> list_reports()
 {
-    auto& h = history();
-    std::lock_guard<std::mutex> lk(h.mtx);
-    size_t n = h.items.size();
-    diag::log_tagged_fmt("report", "list_reports result=%zu", n);
-    return h.items;
+    std::vector<generated_report_t> from_db;
+    const auto from_memory = memory_report_history();
+    if (load_report_history_from_db(from_db)) {
+        const size_t db_rows = from_db.size();
+        auto merged = merge_report_history(std::move(from_db), from_memory);
+        diag::log_tagged_fmt("report", "list_reports result=%zu db_rows=%zu memory_rows=%zu source=merged",
+            merged.size(), db_rows, from_memory.size());
+        return merged;
+    }
+    diag::log_tagged_fmt("report", "list_reports result=%zu source=memory", from_memory.size());
+    return from_memory;
 }
 
 size_t reports_count()
 {
-    auto& h = history();
-    std::lock_guard<std::mutex> lk(h.mtx);
-    size_t n = h.items.size();
-    diag::log_tagged_fmt("report", "reports_count result=%zu", n);
+    size_t db_count = 0;
+    if (report_history_count_from_db(db_count)) {
+        const auto merged = list_reports();
+        diag::log_tagged_fmt("report", "reports_count result=%zu db_count=%zu source=merged", merged.size(), db_count);
+        return merged.size();
+    }
+    const auto from_memory = memory_report_history();
+    size_t n = from_memory.size();
+    diag::log_tagged_fmt("report", "reports_count result=%zu source=memory", n);
     return n;
 }
 
 void clear_history()
 {
     diag::log_tagged_fmt("report", "clear_history entry");
-    auto& h = history();
-    std::lock_guard<std::mutex> lk(h.mtx);
-    size_t n = h.items.size();
-    h.items.clear();
-    diag::log_tagged_fmt("report", "clear_history done cleared=%zu", n);
+    size_t memory_n = 0;
+    {
+        auto& h = history();
+        std::lock_guard<std::mutex> lk(h.mtx);
+        memory_n = h.items.size();
+        h.items.clear();
+    }
+    size_t db_n = 0;
+    const bool db_cleared = clear_report_history_db(db_n);
+    diag::log_tagged_fmt("report", "clear_history done memory_cleared=%zu db_cleared=%zu db_ok=%d",
+        memory_n, db_n, db_cleared ? 1 : 0);
 }
 
 std::string last_error()

@@ -69,12 +69,6 @@ bool bind_text(sqlite3_stmt* stmt, int idx, const std::string& s)
     return sqlite3_bind_text(stmt, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT) == SQLITE_OK;
 }
 
-bool bind_nullable_text(sqlite3_stmt* stmt, int idx, const std::string& s)
-{
-    if (s.empty()) return sqlite3_bind_null(stmt, idx) == SQLITE_OK;
-    return bind_text(stmt, idx, s);
-}
-
 bool bind_json(sqlite3_stmt* stmt, int idx, const nlohmann::json& j)
 {
     return bind_text(stmt, idx, j.dump());
@@ -160,7 +154,7 @@ bool cleanup_empty_optional_session_id(sqlite3* db, const char* table, int& tota
 bool cleanup_empty_optional_session_ids(sqlite3* db)
 {
     int total_changes = 0;
-    const char* tables[] = {"findings", "finding_correlations", "evidence", "scans", "audit_trail", "traffic_captures"};
+    const char* tables[] = {"findings", "finding_correlations", "evidence", "scans", "audit_trail", "traffic_captures", "report_history"};
     for (const char* table : tables) {
         if (!cleanup_empty_optional_session_id(db, table, total_changes)) return false;
     }
@@ -373,6 +367,19 @@ bool create_schema(sqlite3* db)
         "source TEXT DEFAULT '',"
         "FOREIGN KEY(session_id) REFERENCES audit_sessions(session_id) ON DELETE SET NULL"
         ");"
+        "CREATE TABLE IF NOT EXISTS report_history("
+        "report_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "session_id TEXT,"
+        "audit_id INTEGER DEFAULT 0,"
+        "ts_ms INTEGER NOT NULL,"
+        "title TEXT NOT NULL,"
+        "output_path TEXT DEFAULT '',"
+        "format TEXT NOT NULL,"
+        "issue_count INTEGER DEFAULT 0,"
+        "inline_output INTEGER DEFAULT 0,"
+        "metadata_json TEXT DEFAULT '{}',"
+        "FOREIGN KEY(session_id) REFERENCES audit_sessions(session_id) ON DELETE SET NULL"
+        ");"
         "CREATE INDEX IF NOT EXISTS idx_audit_targets_session ON audit_targets(session_id);"
         "CREATE INDEX IF NOT EXISTS idx_findings_session ON findings(session_id);"
         "CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_id);"
@@ -391,6 +398,8 @@ bool create_schema(sqlite3* db)
         "CREATE INDEX IF NOT EXISTS idx_traffic_session ON traffic_captures(session_id);"
         "CREATE INDEX IF NOT EXISTS idx_traffic_host ON traffic_captures(host);"
         "CREATE INDEX IF NOT EXISTS idx_traffic_path ON traffic_captures(path);"
+        "CREATE INDEX IF NOT EXISTS idx_report_history_session ON report_history(session_id);"
+        "CREATE INDEX IF NOT EXISTS idx_report_history_ts ON report_history(ts_ms);"
         "CREATE VIEW IF NOT EXISTS session_targets AS SELECT id,session_id,url,host,port,scheme,added_ms,is_primary FROM audit_targets;"
         "CREATE VIEW IF NOT EXISTS scan_runs AS SELECT scan_id,session_id,target_url,profile,status,total_probes,completed_probes,issues_found,modules_json,defensive_json,config_json,started_ms,ended_ms,error_message FROM scans;"
         "CREATE VIEW IF NOT EXISTS scan_modules AS SELECT id,scan_id,module_id,status,probes_done,probes_total,issues_found,started_ms,ended_ms,error_message FROM scan_module_status;";
@@ -423,6 +432,12 @@ bool create_schema(sqlite3* db)
     if (!ensure_column(db, "audit_trail", "parameters_hash", "ALTER TABLE audit_trail ADD COLUMN parameters_hash TEXT DEFAULT ''")) return false;
     if (!ensure_column(db, "audit_trail", "result_summary_json", "ALTER TABLE audit_trail ADD COLUMN result_summary_json TEXT DEFAULT '{}'")) return false;
     if (!ensure_column(db, "audit_trail", "result_hash", "ALTER TABLE audit_trail ADD COLUMN result_hash TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "report_history", "session_id", "ALTER TABLE report_history ADD COLUMN session_id TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "report_history", "audit_id", "ALTER TABLE report_history ADD COLUMN audit_id INTEGER DEFAULT 0")) return false;
+    if (!ensure_column(db, "report_history", "output_path", "ALTER TABLE report_history ADD COLUMN output_path TEXT DEFAULT ''")) return false;
+    if (!ensure_column(db, "report_history", "issue_count", "ALTER TABLE report_history ADD COLUMN issue_count INTEGER DEFAULT 0")) return false;
+    if (!ensure_column(db, "report_history", "inline_output", "ALTER TABLE report_history ADD COLUMN inline_output INTEGER DEFAULT 0")) return false;
+    if (!ensure_column(db, "report_history", "metadata_json", "ALTER TABLE report_history ADD COLUMN metadata_json TEXT DEFAULT '{}'")) return false;
     if (!cleanup_empty_optional_session_ids(db)) return false;
     return true;
 }
@@ -754,7 +769,7 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
         int idx = 1;
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
-        bind_nullable_text(stmt, idx++, issue.session_id);
+        bind_optional_session_id(db, stmt, idx++, issue.session_id, "findings");
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.scan_id));
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.audit_id));
         bind_text(stmt, idx++, issue.type_key);
@@ -811,7 +826,7 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
     int idx = 1;
     if (issue.id != 0) sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
     sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
-    bind_nullable_text(stmt, idx++, issue.session_id);
+    bind_optional_session_id(db, stmt, idx++, issue.session_id, "findings");
     sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.scan_id));
     sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.audit_id));
     bind_text(stmt, idx++, issue.type_key);
@@ -851,6 +866,30 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
     return id;
 }
 
+}
+
+bool bind_optional_session_id(sqlite3* db, sqlite3_stmt* stmt, int idx, const std::string& session_id, const char* table_name)
+{
+    if (session_id.empty())
+        return sqlite3_bind_null(stmt, idx) == SQLITE_OK;
+
+    sqlite3_stmt* check = nullptr;
+    bool exists = false;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM audit_sessions WHERE session_id=? LIMIT 1", -1, &check, nullptr) == SQLITE_OK) {
+        bind_text(check, 1, session_id);
+        exists = sqlite3_step(check) == SQLITE_ROW;
+    }
+    if (check)
+        sqlite3_finalize(check);
+
+    if (exists)
+        return bind_text(stmt, idx, session_id);
+
+    diag::log_tagged_fmt("burp_findings",
+        "optional_session_binding_missing table=%s session=%s action=bind_null",
+        table_name ? table_name : "unknown",
+        session_state_label(session_id).c_str());
+    return sqlite3_bind_null(stmt, idx) == SQLITE_OK;
 }
 
 bool initialize()
@@ -1187,7 +1226,7 @@ nlohmann::json correlate(const finding_filter_t& filter, bool persist)
             for (const auto& c : correlations) {
                 sqlite3_stmt* stmt = nullptr;
                 if (sqlite3_prepare_v2(db, "INSERT INTO finding_correlations(session_id,pattern,type_key,description,severity,finding_ids_json,endpoints_json,host,created_ms) VALUES(?,?,?,?,?,?,?,?,?)", -1, &stmt, nullptr) != SQLITE_OK) return false;
-                bind_nullable_text(stmt, 1, filter.session_id);
+                bind_optional_session_id(db, stmt, 1, filter.session_id, "finding_correlations");
                 bind_text(stmt, 2, c.value("pattern", std::string()));
                 bind_text(stmt, 3, c.value("type_key", std::string()));
                 bind_text(stmt, 4, c.value("description", std::string()));
@@ -1358,7 +1397,7 @@ bool upsert_scan_run(const scan_run_t& scan)
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
         int idx = 1;
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(scan.scan_id));
-        bind_nullable_text(stmt, idx++, scan.session_id);
+        bind_optional_session_id(db, stmt, idx++, scan.session_id, "scans");
         bind_text(stmt, idx++, scan.target_url);
         bind_text(stmt, idx++, scan.profile);
         bind_text(stmt, idx++, scan.status);

@@ -161,6 +161,10 @@ struct quic_connection_info_t {
     std::uint64_t packets_recv = 0;
     std::uint64_t bytes_sent = 0;
     std::uint64_t bytes_recv = 0;
+    std::uint64_t capture_packet_count = 0;
+    std::uint64_t capture_byte_count = 0;
+    std::uint64_t parser_offset = 0;
+    std::string payload_sha256;
     std::string alpn;
     std::uint16_t tls_version = 0;
 };
@@ -197,6 +201,8 @@ struct dtls_session_info_t {
     std::uint64_t sequence_number = 0;
     std::uint8_t content_type = 0;
     std::vector<std::uint8_t> payload;
+    std::uint64_t parser_offset = 0;
+    std::string payload_sha256;
     std::string state;
 };
 
@@ -248,6 +254,8 @@ struct pcap_decrypt_result_t {
     std::string raw_output;
     std::string stderr_output;
 };
+
+bool validate_tshark_display_filter(const std::string& display_filter, std::string* reason = nullptr);
 
 
 enum class autoresponder_match_type {
@@ -342,19 +350,24 @@ private:
     TlsKeyExtractor() = default;
 
 
-    std::vector<tls_session_key_t> scan_schannel(std::uint32_t pid);
+    std::vector<tls_session_key_t> scan_schannel(std::uint32_t pid, const tls_key_scan_config_t& config,
+                                                 key_scan_diagnostics_t& diag, ULONGLONG start_ms);
 
 
-    std::vector<tls_session_key_t> scan_openssl(std::uint32_t pid);
+    std::vector<tls_session_key_t> scan_openssl(std::uint32_t pid, const tls_key_scan_config_t& config,
+                                                key_scan_diagnostics_t& diag, ULONGLONG start_ms);
 
 
-    std::vector<tls_session_key_t> scan_nss(std::uint32_t pid);
+    std::vector<tls_session_key_t> scan_nss(std::uint32_t pid, const tls_key_scan_config_t& config,
+                                            key_scan_diagnostics_t& diag, ULONGLONG start_ms);
 
 
-    std::vector<tls_session_key_t> scan_boringssl(std::uint32_t pid);
+    std::vector<tls_session_key_t> scan_boringssl(std::uint32_t pid, const tls_key_scan_config_t& config,
+                                                  key_scan_diagnostics_t& diag, ULONGLONG start_ms);
 
 
-    std::vector<tls_session_key_t> scan_generic_patterns(std::uint32_t pid);
+    std::vector<tls_session_key_t> scan_generic_patterns(std::uint32_t pid, const tls_key_scan_config_t& config,
+                                                         key_scan_diagnostics_t& diag, ULONGLONG start_ms);
 
     bool validate_client_random(const std::uint8_t* data, std::size_t len);
     bool validate_master_secret(const std::uint8_t* data, std::size_t len);

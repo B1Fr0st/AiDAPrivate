@@ -7593,6 +7593,8 @@ inline tool_result_t smc_find_decryptor(const json& params)
     const std::size_t max_backtrace_instructions = static_cast<std::size_t>(capped_param("max_backtrace_instructions", 4, 0, 16));
     const std::size_t max_scan_ranges = static_cast<std::size_t>(capped_param("max_scan_ranges", 8, 1, 64));
     const std::uint32_t max_decode_instructions = static_cast<std::uint32_t>(capped_param("max_instructions", 1024, 16, 65536));
+    const std::size_t max_payload_bytes = static_cast<std::size_t>(capped_param("max_payload_bytes", 65536, 8192, 1048576));
+    const std::size_t max_payload_text_length = static_cast<std::size_t>(capped_param("max_payload_text_length", 4096, 256, 65536));
     const std::uint64_t timeout_ms = capped_param("timeout_ms", 3000, 250, 60000);
     const std::uint64_t local_deadline = started > std::numeric_limits<std::uint64_t>::max() - timeout_ms ? std::numeric_limits<std::uint64_t>::max() : started + timeout_ms;
     const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
@@ -7645,13 +7647,15 @@ inline tool_result_t smc_find_decryptor(const json& params)
         return false;
     };
     diag::log_tagged_fmt("protected_re",
-                         "smc_find_decryptor enter pid=%u target=%s target_size=%llu max_candidates=%zu max_decisions=%zu max_instructions=%u timeout_ms=%llu",
+                         "smc_find_decryptor enter pid=%u target=%s target_size=%llu max_candidates=%zu max_decisions=%zu max_instructions=%u max_payload_bytes=%zu max_payload_text=%zu timeout_ms=%llu",
                          pid,
                          sa_format_address(*target).c_str(),
                          static_cast<unsigned long long>(bounded_target_size),
                          max_candidates,
                          max_decision_samples,
                          max_decode_instructions,
+                         max_payload_bytes,
+                         max_payload_text_length,
                          static_cast<unsigned long long>(timeout_ms));
     auto target_contains = [&](std::uint64_t value) {
         return value >= *target && value < end;
@@ -7810,6 +7814,9 @@ inline tool_result_t smc_find_decryptor(const json& params)
                       const char* cancelled_message,
                       const char* deadline_message) -> tool_result_t {
         const ULONGLONG serialize_started = GetTickCount64();
+        const std::size_t pre_payload_candidate_count = candidates.size();
+        const std::size_t pre_payload_scan_range_count = scan_ranges.size();
+        const std::size_t pre_payload_decision_sample_count = decision_samples.size();
         json out{{"decryptors", candidates},
                  {"count", candidates.size()},
                  {"found", !candidates.empty()},
@@ -7829,13 +7836,15 @@ inline tool_result_t smc_find_decryptor(const json& params)
                  {"result_truncated", result_truncated},
                  {"stop_phase", stop_phase},
                  {"timeout_ms", timeout_ms},
-                 {"deadline_remaining_ms", remaining_ms()},
-                 {"caps", json{{"max_candidates", max_candidates},
-                                {"max_decision_samples", max_decision_samples},
-                                {"max_backtrace_instructions", max_backtrace_instructions},
-                                {"max_scan_ranges", max_scan_ranges},
-                                {"max_instructions", max_decode_instructions}}},
-                 {"elapsed_ms", GetTickCount64() - started}};
+                  {"deadline_remaining_ms", remaining_ms()},
+                  {"caps", json{{"max_candidates", max_candidates},
+                                 {"max_decision_samples", max_decision_samples},
+                                 {"max_backtrace_instructions", max_backtrace_instructions},
+                                 {"max_scan_ranges", max_scan_ranges},
+                                 {"max_instructions", max_decode_instructions},
+                                 {"max_payload_bytes", max_payload_bytes},
+                                 {"max_payload_text_length", max_payload_text_length}}},
+                  {"elapsed_ms", GetTickCount64() - started}};
         if (explicit_scan_base)
         {
             out["scan_base"] = sa_format_address(*explicit_scan_base);
@@ -7844,14 +7853,128 @@ inline tool_result_t smc_find_decryptor(const json& params)
         }
         if (candidates.empty())
             out["no_match_reason"] = scanned == 0 ? "no_instructions_decoded" : "no_memory_write_resolved_into_target_range";
+        bool payload_truncated = false;
+        bool payload_text_truncated = false;
+        std::size_t payload_text_fields_truncated = 0;
+        std::function<void(json&)> cap_text = [&](json& value) {
+            if (value.is_string())
+            {
+                std::string s = value.get<std::string>();
+                if (s.size() > max_payload_text_length)
+                {
+                    s.resize(max_payload_text_length);
+                    value = std::move(s);
+                    payload_text_truncated = true;
+                    ++payload_text_fields_truncated;
+                }
+                return;
+            }
+            if (value.is_array())
+            {
+                for (auto& item : value)
+                    cap_text(item);
+                return;
+            }
+            if (value.is_object())
+            {
+                for (auto it = value.begin(); it != value.end(); ++it)
+                    cap_text(it.value());
+            }
+        };
+        cap_text(out);
+        auto serialized_payload_size = [&]() -> std::size_t {
+            return out.dump().size();
+        };
+        std::size_t payload_bytes = serialized_payload_size();
+        auto trim_one = [&]() -> bool {
+            if (out["decision_samples"].is_array() && !out["decision_samples"].empty()) {
+                auto it = out["decision_samples"].end();
+                --it;
+                out["decision_samples"].erase(it);
+                return true;
+            }
+            if (out["scan_ranges"].is_array() && !out["scan_ranges"].empty()) {
+                auto it = out["scan_ranges"].end();
+                --it;
+                out["scan_ranges"].erase(it);
+                return true;
+            }
+            if (out["decryptors"].is_array() && out["decryptors"].size() > 1) {
+                auto it = out["decryptors"].end();
+                --it;
+                out["decryptors"].erase(it);
+                return true;
+            }
+            return false;
+        };
+        while (payload_bytes > max_payload_bytes && trim_one())
+        {
+            payload_truncated = true;
+            payload_bytes = serialized_payload_size();
+        }
+        if (payload_bytes > max_payload_bytes)
+            payload_truncated = true;
+        const std::size_t returned_candidate_count = out["decryptors"].is_array() ? out["decryptors"].size() : 0;
+        const std::size_t returned_scan_range_count = out["scan_ranges"].is_array() ? out["scan_ranges"].size() : 0;
+        const std::size_t returned_decision_sample_count = out["decision_samples"].is_array() ? out["decision_samples"].size() : 0;
+        out["count"] = returned_candidate_count;
+        out["found"] = pre_payload_candidate_count != 0;
+        if (returned_candidate_count != 0)
+            out["best_candidate"] = out["decryptors"][0];
+        else
+            out["best_candidate"] = nullptr;
+        out["pre_truncation_candidate_count"] = pre_payload_candidate_count;
+        out["pre_truncation_scan_range_count"] = pre_payload_scan_range_count;
+        out["pre_truncation_decision_sample_count"] = pre_payload_decision_sample_count;
+        out["returned_candidate_count"] = returned_candidate_count;
+        out["returned_scan_range_count"] = returned_scan_range_count;
+        out["returned_decision_sample_count"] = returned_decision_sample_count;
+        out["payload_truncated"] = payload_truncated;
+        out["payload_text_truncated"] = payload_text_truncated;
+        out["payload_text_fields_truncated"] = payload_text_fields_truncated;
+        out["payload_max_bytes"] = max_payload_bytes;
+        out["payload_text_max_length"] = max_payload_text_length;
+        out["payload_bytes"] = payload_bytes;
+        if (payload_truncated || payload_text_truncated)
+        {
+            out["partial"] = true;
+            out["result_truncated"] = true;
+            result_truncated = true;
+        }
+        payload_bytes = serialized_payload_size();
+        if (payload_bytes > max_payload_bytes)
+        {
+            payload_truncated = true;
+            out["payload_truncated"] = true;
+            out["partial"] = true;
+            out["result_truncated"] = true;
+            result_truncated = true;
+            payload_bytes = serialized_payload_size();
+            out["payload_bytes"] = payload_bytes;
+        }
+        out["payload_bytes"] = payload_bytes;
         out["serialization_elapsed_ms"] = GetTickCount64() - serialize_started;
+        payload_bytes = serialized_payload_size();
+        out["payload_bytes"] = payload_bytes;
+        payload_bytes = serialized_payload_size();
+        out["payload_bytes"] = payload_bytes;
+        if (payload_bytes > max_payload_bytes)
+        {
+            payload_truncated = true;
+            out["payload_truncated"] = true;
+            out["partial"] = true;
+            out["result_truncated"] = true;
+            result_truncated = true;
+        }
         diag::log_tagged_fmt("protected_re",
-                             "smc_find_decryptor exit pid=%u found=%d count=%zu considered=%zu truncated=%d cancelled=%d deadline=%d elapsed_ms=%llu serialize_ms=%llu",
+                             "smc_find_decryptor exit pid=%u found=%d count=%zu considered=%zu truncated=%d payload_truncated=%d payload_bytes=%zu cancelled=%d deadline=%d elapsed_ms=%llu serialize_ms=%llu",
                              pid,
                              !candidates.empty() ? 1 : 0,
-                             candidates.size(),
+                             returned_candidate_count,
                              candidates_considered,
                              result_truncated ? 1 : 0,
+                             payload_truncated ? 1 : 0,
+                             payload_bytes,
                              cancelled ? 1 : 0,
                              deadline_hit ? 1 : 0,
                              static_cast<unsigned long long>(GetTickCount64() - started),

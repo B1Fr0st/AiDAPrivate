@@ -744,7 +744,7 @@ inline void start_monitors()
     bool posted = false;
     try
     {
-        posted = work_queue::post_service([]() {
+        posted = work_queue::post_service_labeled("anti_tamper.monitor_loop", []() {
             Sleep(5000);
 
             auto& rt = state::get();

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
@@ -34,6 +35,10 @@ using tool_result_t = mcp_standalone::tool_result_t;
 extern DisasmState g_disasm;
 
 namespace disasm_tools {
+
+static constexpr uint64_t kMaxResolvedFunctionBytes = 1024ull * 1024ull;
+static constexpr uint64_t kMaxLiveFunctionDisasmBytes = 256ull * 1024ull;
+static constexpr int kMaxTotalDisasmInstructions = 8192;
 
 static std::string hex_u64(uint64_t value)
 {
@@ -160,6 +165,10 @@ struct resolved_function_t
     std::string section;
     std::string module;
     std::string source;
+    uint64_t uncapped_end = 0;
+    uint64_t size_cap = kMaxResolvedFunctionBytes;
+    bool size_capped = false;
+    bool cache_hit = false;
 };
 
 static bool read_routed_process_bytes(uint64_t address, size_t size, std::vector<uint8_t>& out)
@@ -312,11 +321,17 @@ static bool resolve_cached_function(uint64_t addr, resolved_function_t& out)
         if (addr < r->second.start || (r->second.end > 0 && addr >= r->second.end))
             return false;
         out.start = r->second.start;
+        out.uncapped_end = r->second.end;
         out.end = r->second.end;
+        if (out.end > out.start && out.end - out.start > kMaxResolvedFunctionBytes) {
+            out.end = out.start + kMaxResolvedFunctionBytes;
+            out.size_capped = true;
+        }
         out.name = r->second.display_name.empty() ? function_index::synthetic_name(start) : r->second.display_name;
         out.section = r->second.section;
         out.module = c.cached_module_name;
         out.source = "function_index";
+        out.cache_hit = true;
         return out.end > out.start;
     }
 }
@@ -348,7 +363,15 @@ static bool resolve_live_function(uint64_t addr, resolved_function_t& out)
             if (rf_sizes[i] == 0 || addr < start || addr >= end)
                 continue;
             out.start = start;
-            out.end = std::min<uint64_t>(end, module_base + module_size);
+            uint64_t capped_end = std::min<uint64_t>(end, module_base + module_size);
+            if (section_end > start)
+                capped_end = std::min<uint64_t>(capped_end, section_end);
+            out.uncapped_end = capped_end;
+            out.end = capped_end;
+            if (out.end > out.start && out.end - out.start > kMaxResolvedFunctionBytes) {
+                out.end = out.start + kMaxResolvedFunctionBytes;
+                out.size_capped = true;
+            }
             out.name = function_index::synthetic_name(start);
             out.section = section.empty() ? function_index::detail::section_name_for_va(pe, module_base, start) : section;
             out.module = module_name;
@@ -367,6 +390,7 @@ static bool resolve_live_function(uint64_t addr, resolved_function_t& out)
         return false;
     out.start = addr;
     out.end = decoded_end;
+    out.uncapped_end = decoded_end;
     out.name = export_name;
     out.section = section;
     out.module = module_name;
@@ -459,6 +483,12 @@ static tool_result_t handle_get_function_bounds(const json& params)
     result["section"] = fn.section;
     result["module"]  = fn.module;
     result["source"]  = fn.source;
+    result["bounds_source"] = fn.source;
+    result["bounds_cache_hit"] = fn.cache_hit;
+    result["function_size_capped"] = fn.size_capped;
+    result["function_size_cap"] = fn.size_cap;
+    result["uncapped_end"] = fn.uncapped_end ? hex_u64(fn.uncapped_end) : hex_u64(fn.end);
+    result["uncapped_size"] = (fn.uncapped_end > fn.start) ? (fn.uncapped_end - fn.start) : (fn.end > fn.start ? fn.end - fn.start : 0);
     return tool_result_t::ok(result);
 }
 
@@ -488,20 +518,37 @@ static tool_result_t handle_get_function_disassembly(const json& params)
 
     json arr = json::array();
     int emitted = 0;
+    int total_decoded = 0;
+    bool total_count_exact = true;
+    bool decode_byte_truncated = false;
+    uint64_t decode_byte_limit = 0;
+    size_t bytes_read = 0;
     if (first >= 0) {
-        for (size_t i = static_cast<size_t>(first); i < g_disasm.file.instrs.size() && emitted < max_instrs; ++i) {
+        for (size_t i = static_cast<size_t>(first); i < g_disasm.file.instrs.size(); ++i) {
             const AsmInstr& ins = g_disasm.file.instrs[i];
             if (ins.addr >= fn.end) break;
-            arr.push_back(instruction_to_json(ins));
-            ++emitted;
+            ++total_decoded;
+            if (emitted < max_instrs) {
+                arr.push_back(instruction_to_json(ins));
+                ++emitted;
+            }
+            if (total_decoded >= kMaxTotalDisasmInstructions) {
+                total_count_exact = false;
+                break;
+            }
         }
     } else {
-        const uint64_t span = std::min<uint64_t>(fn.end - fn.start, static_cast<uint64_t>(max_instrs) * 16ULL);
+        const uint64_t function_span = fn.end - fn.start;
+        const uint64_t requested_span = std::min<uint64_t>(function_span, std::max<uint64_t>(4096ull, static_cast<uint64_t>(max_instrs) * 16ULL));
+        const uint64_t span = std::min<uint64_t>(requested_span, kMaxLiveFunctionDisasmBytes);
+        decode_byte_limit = span;
+        decode_byte_truncated = function_span > span;
         std::vector<uint8_t> bytes;
         if (!read_routed_process_bytes(fn.start, static_cast<size_t>(span), bytes))
             return tool_result_t::error("Function bytes could not be read from live memory.");
+        bytes_read = bytes.size();
         size_t off = 0;
-        while (off < bytes.size() && emitted < max_instrs) {
+        while (off < bytes.size() && total_decoded < kMaxTotalDisasmInstructions) {
             const uint64_t va = fn.start + off;
             if (va >= fn.end)
                 break;
@@ -510,15 +557,21 @@ static tool_result_t handle_get_function_disassembly(const json& params)
             const int ins_len = std::max(1, ins.len);
             if (off + static_cast<size_t>(ins_len) > bytes.size())
                 break;
-            arr.push_back(instruction_to_json(ins));
-            ++emitted;
+            ++total_decoded;
+            if (emitted < max_instrs) {
+                arr.push_back(instruction_to_json(ins));
+                ++emitted;
+            }
             off += static_cast<size_t>(ins_len);
         }
+        if (decode_byte_truncated || total_decoded >= kMaxTotalDisasmInstructions || fn.start + off < fn.end)
+            total_count_exact = false;
     }
 
-    diag::log_tagged_fmt("disasm_tools", "get_function_disasm_result start=0x%llX end=0x%llX instr_count=%d truncated=%d",
+    const bool truncated = emitted < total_decoded || !total_count_exact || fn.size_capped;
+    diag::log_tagged_fmt("disasm_tools", "get_function_disasm_result start=0x%llX end=0x%llX instr_count=%d total_instr=%d truncated=%d source=%s cache_hit=%d size_capped=%d",
         static_cast<unsigned long long>(fn.start), static_cast<unsigned long long>(fn.end),
-        emitted, (emitted >= max_instrs) ? 1 : 0);
+        emitted, total_decoded, truncated ? 1 : 0, fn.source.c_str(), fn.cache_hit ? 1 : 0, fn.size_capped ? 1 : 0);
     json result;
     result["function_start"] = hex_u64(fn.start);
     result["function_end"]   = hex_u64(fn.end);
@@ -526,8 +579,22 @@ static tool_result_t handle_get_function_disassembly(const json& params)
     result["module"] = fn.module;
     result["section"] = fn.section;
     result["source"] = fn.source;
+    result["bounds_source"] = fn.source;
+    result["bounds_cache_hit"] = fn.cache_hit;
     result["instruction_count"] = emitted;
-    result["truncated"] = (emitted >= max_instrs);
+    result["returned_instruction_count"] = emitted;
+    result["total_instruction_count"] = total_decoded;
+    result["total_instruction_count_exact"] = total_count_exact;
+    result["max_instrs"] = max_instrs;
+    result["decode_instruction_cap"] = kMaxTotalDisasmInstructions;
+    result["decode_byte_limit"] = decode_byte_limit;
+    result["decode_bytes_read"] = bytes_read;
+    result["decode_byte_truncated"] = decode_byte_truncated;
+    result["function_size_capped"] = fn.size_capped;
+    result["function_size_cap"] = fn.size_cap;
+    result["uncapped_function_end"] = fn.uncapped_end ? hex_u64(fn.uncapped_end) : hex_u64(fn.end);
+    result["uncapped_function_size"] = (fn.uncapped_end > fn.start) ? (fn.uncapped_end - fn.start) : (fn.end > fn.start ? fn.end - fn.start : 0);
+    result["truncated"] = truncated;
     result["instructions"] = std::move(arr);
     return tool_result_t::ok(result);
 }
@@ -1017,19 +1084,28 @@ static tool_result_t handle_get_strings(const json& params)
     json arr = json::array();
     size_t total_found = 0;
     size_t per_section_limit = 65536;
+    const size_t per_section_byte_cap = per_section_limit * 1024;
+    size_t sections_scanned = 0;
+    size_t sections_skipped = 0;
+    size_t bytes_scanned = 0;
+    bool scan_truncated = false;
 
     for (size_t sec_index = 0; sec_index < g_disasm.file.sections.size(); ++sec_index) {
         const PESection& sec = g_disasm.file.sections[sec_index];
         size_t before_section = total_found;
         const uint8_t* p = sec.bytes.data();
         size_t sz = sec.bytes.size();
-        if (sz > per_section_limit * 1024) {
+        if (sz > per_section_byte_cap) {
+            ++sections_skipped;
+            scan_truncated = true;
             diag::log_tagged_fmt("disasm_tools", "get_strings section_skipped index=%zu va=0x%llX bytes=%zu reason=too_large",
                 sec_index,
                 static_cast<unsigned long long>(sec.va),
                 sz);
             continue;
         }
+        ++sections_scanned;
+        bytes_scanned += sz;
 
         if (want_ascii) {
             size_t run_start = 0;
@@ -1094,11 +1170,20 @@ static tool_result_t handle_get_strings(const json& params)
             arr.size());
     }
 
-    diag::log_tagged_fmt("disasm_tools", "get_strings_result total=%zu returned=%zu encoding=%s min_len=%zu sections=%zu",
-        total_found, arr.size(), encoding.c_str(), min_len, g_disasm.file.sections.size());
+    const bool result_truncated = scan_truncated || arr.size() < total_found;
+    diag::log_tagged_fmt("disasm_tools", "get_strings_result total=%zu returned=%zu truncated=%d encoding=%s min_len=%zu sections=%zu scanned=%zu skipped=%zu bytes_scanned=%zu",
+        total_found, arr.size(), result_truncated ? 1 : 0, encoding.c_str(), min_len, g_disasm.file.sections.size(), sections_scanned, sections_skipped, bytes_scanned);
     json result;
     result["total_found"] = total_found;
     result["returned"]    = arr.size();
+    result["limit"]       = max_results;
+    result["truncated"]   = result_truncated;
+    result["scan_truncated"] = scan_truncated;
+    result["sections_total"] = g_disasm.file.sections.size();
+    result["sections_scanned"] = sections_scanned;
+    result["sections_skipped"] = sections_skipped;
+    result["bytes_scanned"] = bytes_scanned;
+    result["per_section_byte_cap"] = per_section_byte_cap;
     result["min_length"]  = min_len;
     result["encoding"]    = encoding;
     result["strings"]     = std::move(arr);

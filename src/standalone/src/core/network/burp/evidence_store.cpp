@@ -423,7 +423,7 @@ bool capture(const evidence_capture_t& capture, evidence_record_t& out)
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
         bool bound =
             sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(record.finding_id)) == SQLITE_OK &&
-            bind_text(stmt, 2, record.session_id) &&
+            findings_db::bind_optional_session_id(db, stmt, 2, record.session_id, "evidence") &&
             sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(record.scan_id)) == SQLITE_OK &&
             bind_text(stmt, 4, kind_to_string(record.kind)) &&
             bind_text(stmt, 5, record.request_raw) &&

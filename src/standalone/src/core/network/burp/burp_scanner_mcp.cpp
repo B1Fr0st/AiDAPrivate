@@ -90,6 +90,22 @@ std::string header_safe(std::string s)
     return s;
 }
 
+std::string safe_session_id(std::string s)
+{
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.erase(s.begin());
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.pop_back();
+    if (s.size() > 128)
+        s.resize(128);
+    for (char& c : s) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F)
+            c = '_';
+    }
+    return s;
+}
+
 bool header_name_equals(const std::string& name, const char* expected)
 {
     std::string lhs = upper_ascii(name);
@@ -582,6 +598,16 @@ tool_result_t tool_start_audit(const json& p)
     }
     if (p.contains("per_module_cap") && p["per_module_cap"].is_number_unsigned())
         cfg.per_module_request_cap = p["per_module_cap"].get<size_t>();
+    if (p.contains("session_id")) {
+        if (!p["session_id"].is_string())
+            return scanner_param_error("session_id must be a string", "session_id");
+        cfg.session_id = safe_session_id(p["session_id"].get<std::string>());
+    }
+    if (p.contains("scan_id")) {
+        if (!p["scan_id"].is_number_unsigned())
+            return scanner_param_error("scan_id must be an unsigned integer", "scan_id");
+        cfg.scan_id = p["scan_id"].get<uint64_t>();
+    }
 
     const auto before = active_scanner::load_snapshot();
     diag::log_tagged_fmt("mcp_burp", "tool_start_audit enqueue_begin url=%s req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu max_active=%zu tid=%lu",
@@ -604,6 +630,9 @@ tool_result_t tool_start_audit(const json& p)
         data["code"] = code;
         data["error"] = last;
         data["url"] = url;
+        if (!cfg.session_id.empty())
+            data["session_id"] = cfg.session_id;
+        data["scan_id"] = cfg.scan_id;
         data["request_length"] = raw.size();
         data["active_audits"] = after.active_audits;
         data["running_audits"] = after.running_audits;
@@ -634,6 +663,9 @@ tool_result_t tool_start_audit(const json& p)
         static_cast<unsigned long long>(GetTickCount64() - started), static_cast<unsigned long>(tid));
     json data;
     data["audit_id"] = id;
+    if (!cfg.session_id.empty())
+        data["session_id"] = cfg.session_id;
+    data["scan_id"] = cfg.scan_id != 0 ? cfg.scan_id : id;
     data["url"] = url;
     if (p.contains("exchange_id") && p["exchange_id"].is_number_unsigned())
         data["exchange_id"] = p["exchange_id"].get<uint64_t>();
@@ -699,6 +731,9 @@ tool_result_t tool_audit_status(const json& p)
     const uint64_t audit_elapsed_ms = audit_runtime_elapsed_ms(st);
     json data;
     data["id"] = st.id;
+    if (!st.session_id.empty())
+        data["session_id"] = st.session_id;
+    data["scan_id"] = st.scan_id;
     data["url"] = st.url;
     data["host"] = st.host;
     data["port"] = st.port;
@@ -786,6 +821,9 @@ tool_result_t tool_list_audits(const json&)
         const size_t issues_found = std::max(st.issues_found, stored_issues);
         json e;
         e["id"] = st.id;
+        if (!st.session_id.empty())
+            e["session_id"] = st.session_id;
+        e["scan_id"] = st.scan_id;
         e["url"] = st.url;
         e["host"] = st.host;
         e["port"] = st.port;
@@ -970,6 +1008,8 @@ void register_scanner_tools(mcp_standalone::server_t& srv)
          {"raw_request_b64", "string", "Base64 raw HTTP request for start_audit", false},
          {"exchange_id", "number", "Sitemap/logger exchange id to replay as the start_audit request.", false},
          {"audit_id", "number", "Audit id for audit_status or cancel", false},
+         {"session_id", "string", "Optional audit session id for start_audit context binding.", false},
+         {"scan_id", "number", "Optional scan id for start_audit context binding.", false},
          {"scope_only", "boolean", "Keep active audit requests constrained to Burp scope", false},
          {"enabled", "boolean", "passive_enable toggle; defaults to true when omitted.", false},
          {"max_concurrent", "number", "Per-audit request concurrency cap", false},

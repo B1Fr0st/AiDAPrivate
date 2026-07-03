@@ -1882,7 +1882,7 @@ static void schedule_async_network_diagnosis(const std::string& url)
         diag_host = diag_host.substr(0, colon);
     }
 
-    if (work_queue::post([diag_host, diag_port]() {
+    if (work_queue::post_labeled("license.network_diagnostics", [diag_host, diag_port]() {
             __try {
                 diagnose_network(diag_host.c_str(), diag_port);
             } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -3904,7 +3904,7 @@ namespace
         {
             std::string reason_copy = reason ? std::string(reason) : std::string("silent_kill_pending");
             lic_log((std::string("silent_kill_scheduled reason=") + reason_copy).c_str());
-            work_queue::post([reason_copy]() {
+            work_queue::post_labeled("license.silent_kill", [reason_copy]() {
                 int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
                 while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
                 {
@@ -6775,7 +6775,7 @@ namespace
                     std::string reason_copy = response.value("kill_reason", std::string("server_kill_directive"));
                     lic_log((std::string("server_kill_at_epoch_scheduled in_seconds=") +
                         std::to_string(kill_epoch - now_epoch) + " reason=" + reason_copy).c_str());
-                    work_queue::post([reason_copy]() {
+                    work_queue::post_labeled("license.server_kill_directive", [reason_copy]() {
                         int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
                         while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
                         {
@@ -9534,7 +9534,7 @@ namespace
         bool heartbeat_posted = false;
         try
         {
-            heartbeat_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
+            heartbeat_posted = work_queue::post_service_labeled("license.heartbeat_worker", [settings_ptr, worker_epoch]() {
                 heartbeat_worker(settings_ptr, worker_epoch);
                 if (s_heartbeat_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_heartbeat_done.store(true, std::memory_order_release);
@@ -9570,7 +9570,7 @@ namespace
         bool srv_refresh_posted = false;
         try
         {
-            srv_refresh_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
+            srv_refresh_posted = work_queue::post_service_labeled("license.server_refresh_worker", [settings_ptr, worker_epoch]() {
                 srv_refresh_worker(settings_ptr, worker_epoch);
                 if (s_srv_refresh_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_srv_refresh_done.store(true, std::memory_order_release);
@@ -9605,7 +9605,7 @@ namespace
         bool kernel_session_recovery_posted = false;
         try
         {
-            kernel_session_recovery_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
+            kernel_session_recovery_posted = work_queue::post_service_labeled("license.kernel_session_recovery", [settings_ptr, worker_epoch]() {
                 kernel_session_recovery_watchdog_worker(settings_ptr, worker_epoch);
                 if (s_kernel_session_recovery_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_kernel_session_recovery_done.store(true, std::memory_order_release);
@@ -9640,7 +9640,7 @@ namespace
         bool seed_rotation_proactive_posted = false;
         try
         {
-            seed_rotation_proactive_posted = work_queue::post_service([settings_ptr, worker_epoch]() {
+            seed_rotation_proactive_posted = work_queue::post_service_labeled("license.seed_rotation_proactive", [settings_ptr, worker_epoch]() {
                 seed_rotation_proactive_watchdog_worker(settings_ptr, worker_epoch);
                 if (s_seed_rotation_proactive_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_seed_rotation_proactive_done.store(true, std::memory_order_release);
@@ -9704,7 +9704,7 @@ namespace
         s_honeypot_tripped.store(true, std::memory_order_release);
         s_honeypot_trip_count.fetch_add(1, std::memory_order_relaxed);
 
-        work_queue::post([trap = std::string(trap_name)]() {
+        work_queue::post_labeled("license.honeypot_report", [trap = std::string(trap_name)]() {
             try { honeypot_report_impl(trap.c_str(), trap.size()); }
             catch (...) {}
         });

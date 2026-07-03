@@ -1456,23 +1456,36 @@ namespace test_lab_view {
 			if (ImGui::CollapsingHeader("Parsed fields", ImGuiTreeNodeFlags_DefaultOpen)) {
 				if (local_copy.parsed.empty()) {
 					render_empty_panel("No parsed fields", "The feature did not return structured parsed fields for this run.", 70.f);
-				} else if (ImGui::BeginTable("##testlab_parsed", 2,
-					ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
-					ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
-					ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthStretch, 0.34f);
-					ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.66f);
-					ImGui::TableHeadersRow();
-					for (std::size_t i = 0; i < local_copy.parsed.size(); ++i) {
-						const auto& p = local_copy.parsed[i];
-						ImGui::TableNextRow(ImGuiTableRowFlags_None, ImGui::GetTextLineHeight() + 4.f);
-						ImGui::PushID(static_cast<int>(i));
-						ImGui::TableSetColumnIndex(0);
-						render_clipped_cell("label", p.label, t.text_secondary);
-						ImGui::TableSetColumnIndex(1);
-						render_clipped_cell("value", p.value, t.text_primary);
-						ImGui::PopID();
+				} else {
+					const float row_h = ImGui::GetTextLineHeight() + 4.f;
+					const float visible_rows = static_cast<float>((std::min)(local_copy.parsed.size(), static_cast<std::size_t>(10)));
+					const float parsed_h = (std::min)(260.f, (std::max)(96.f, 34.f + visible_rows * row_h));
+					ImGui::BeginChild("##testlab_parsed_clip", ImVec2(0.f, parsed_h), true,
+						ImGuiWindowFlags_HorizontalScrollbar);
+					if (ImGui::BeginTable("##testlab_parsed", 2,
+						ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
+						ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+						ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+						ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.66f);
+						ImGui::TableHeadersRow();
+						ImGuiListClipper clipper;
+						clipper.Begin(static_cast<int>(local_copy.parsed.size()), row_h);
+						while (clipper.Step()) {
+							for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+								const auto& p = local_copy.parsed[static_cast<std::size_t>(row)];
+								ImGui::TableNextRow(ImGuiTableRowFlags_None, row_h);
+								ImGui::PushID(row);
+								ImGui::TableSetColumnIndex(0);
+								render_clipped_cell("label", p.label, t.text_secondary);
+								ImGui::TableSetColumnIndex(1);
+								render_clipped_cell("value", p.value, t.text_primary);
+								ImGui::PopID();
+							}
+						}
+						clipper.End();
+						ImGui::EndTable();
 					}
-					ImGui::EndTable();
+					ImGui::EndChild();
 				}
 			}
 		}
@@ -1520,11 +1533,18 @@ namespace test_lab_view {
 				render_empty_panel("No run-all evidence yet", "Run All Safe Tests writes target launch, driver attach, diagnostics, and result evidence here.", 82.f);
 			} else {
 				ImGui::PushStyleColor(ImGuiCol_Text, t.text_secondary);
-				for (const auto& line : tail) {
-					ImGui::Text("[%04llu] %s",
-						static_cast<unsigned long long>(line.index),
-						line.text.c_str());
+				const float line_h = ImGui::GetTextLineHeightWithSpacing();
+				ImGuiListClipper clipper;
+				clipper.Begin(static_cast<int>(tail.size()), line_h);
+				while (clipper.Step()) {
+					for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+						const auto& line = tail[static_cast<std::size_t>(row)];
+						ImGui::Text("[%04llu] %s",
+							static_cast<unsigned long long>(line.index),
+							line.text.c_str());
+					}
 				}
+				clipper.End();
 				ImGui::PopStyleColor();
 				if (g_run_all_active.load(std::memory_order_acquire))
 					ImGui::SetScrollHereY(1.f);

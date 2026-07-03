@@ -78,7 +78,7 @@ enum class bottom_tab_t : int {
 namespace output_log {
 	inline std::deque<std::string> lines[static_cast<int>(bottom_tab_t::COUNT)];
 	inline constexpr size_t MAX_LINES = 4096;
-	inline constexpr size_t MAX_RENDER_LINES = MAX_LINES;
+	inline constexpr size_t MAX_RENDER_LINES = 512;
 	inline std::mutex mutex;
 	inline uint64_t version[static_cast<int>(bottom_tab_t::COUNT)] = {};
 	inline bool auto_scroll[static_cast<int>(bottom_tab_t::COUNT)] = { true, true, true, true, true };

@@ -1395,6 +1395,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	bool pg_failed = false;
 	if (sid == 0) {
 		json failure = page_guard_install_failure_json();
+		pg_failed = true;
 		diag::log_tagged_fmt("scanner",
 			"find_what_accesses install_failed pid=%u active_pid=%u reason=%s remote_call_id=%llu remote_gle=%lu stale_pid=%d deadline_expired=%d cancelled=%d late_completion=%d elapsed_ms=%llu last_error=%s",
 			pid,
@@ -1408,19 +1409,46 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 			failure.value("remote_call_late_completion", false) ? 1 : 0,
 			static_cast<unsigned long long>(GetTickCount64() - started_tick),
 			driver_bridge::last_error().c_str());
-		pg_failed = true;
-		polling_enabled = true;
-		polling_baseline_ok = read_watch_sample(polling_last);
+		json result;
+		result["address"] = sa_format_address(*address);
+		result["size"] = size;
+		result["type"] = type;
+		result["pid"] = pid;
+		result["session_id"] = sid;
+		result["guard_base"] = sa_format_address(page_base);
+		result["guard_size"] = guard_size;
+		result["wait_ms"] = wait_ms;
+		result["failure_reason"] = "page_guard_install_failed";
+		result["phase"] = "install";
+		result["pg_failed"] = true;
+		result["page_guard_installed"] = false;
+		result["page_guard_install_failure"] = failure;
+		result["polling_fallback_attempted"] = false;
+		result["polling_fallback_functional"] = false;
+		result["polling_enabled_before_install"] = polling_enabled;
+		result["polling_baseline_before_install"] = polling_baseline_ok;
+		result["polling_baseline_size_before_install"] = polling_last.size();
+		result["install_elapsed_ms"] = failure.value("install_elapsed_ms", 0ull);
+		result["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started_tick);
+		result["driver_last_error"] = driver_bridge::last_error();
+		result["remote_call"] = failure.contains("remote_call") ? failure["remote_call"] : json::object();
+		result["region"] = json{
+			{"base", failure.value("region_base", std::string())},
+			{"size", failure.value("region_size", 0ull)},
+			{"state", failure.value("region_state", 0u)},
+			{"protect", failure.value("region_protect", 0u)},
+			{"type", failure.value("region_type", 0u)},
+			{"attempted_protect", failure.value("attempted_protect", false)},
+			{"original_protect", failure.value("original_protect", 0u)},
+			{"proposed_protect", failure.value("proposed_protect", 0u)}
+		};
 		diag::log_tagged_fmt("scanner",
-			"find_what_accesses pg_failed falling_back_to_polling pid=%u page_base=0x%llX guard_size=0x%llX wanted_access=%u polling_enabled=%d polling_baseline_ok=%d polling_baseline_size=%zu elapsed_ms=%llu",
+			"find_what_accesses install_terminal_failure pid=%u page_base=0x%llX guard_size=0x%llX polling_fallback_attempted=0 elapsed_ms=%llu",
 			pid,
 			static_cast<unsigned long long>(page_base),
 			static_cast<unsigned long long>(guard_size),
-			wanted_access,
-			polling_enabled ? 1 : 0,
-			polling_baseline_ok ? 1 : 0,
-			polling_last.size(),
 			static_cast<unsigned long long>(GetTickCount64() - started_tick));
+		return tool_result_t::error(OBFSTR("find_what_accesses page-guard install failed."), "page_guard_install_failed", result);
 	}
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses install_done sid=%u pid=%u payloads=1 max_drain=%u elapsed_ms=%llu",

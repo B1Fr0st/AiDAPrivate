@@ -1069,7 +1069,7 @@ namespace handle_strip
             return false;
         };
 
-        bool posted = work_queue::post([state]() {
+        bool posted = work_queue::post_labeled("anti_dump.dacl_seal_worker", [state]() {
             dacl_seal_worker_proc(state);
         });
         if (posted)
@@ -1433,7 +1433,7 @@ inline bool initialize()
     bool expected_posted = false;
     if (s_anti_dump_reencrypt_posted.compare_exchange_strong(expected_posted, true, std::memory_order_acq_rel))
     {
-        if (work_queue::post_service([]() { monitor::run_periodic_reencrypt(); }))
+        if (work_queue::post_service_labeled("anti_dump.periodic_reencrypt", []() { monitor::run_periodic_reencrypt(); }))
             anti_tamper::webhook::write_log("anti_dump", "sa_monitor_work_queue_ok");
         else
         {

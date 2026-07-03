@@ -459,6 +459,10 @@ scanner::send_fn_t make_send_fn(std::shared_ptr<audit_runtime_t> rt_ptr,
 void emit_issue_safe(std::shared_ptr<audit_runtime_t> rt_ptr, issue_t iss)
 {
     iss.audit_id = rt_ptr->status.id;
+    if (iss.session_id.empty())
+        iss.session_id = rt_ptr->status.session_id;
+    if (iss.scan_id == 0)
+        iss.scan_id = rt_ptr->status.scan_id != 0 ? rt_ptr->status.scan_id : rt_ptr->status.id;
     iss.host = rt_ptr->status.host;
     iss.port = rt_ptr->status.port;
     iss.scheme = rt_ptr->status.tls ? "https" : "http";
@@ -486,6 +490,8 @@ void run_module_for_point(std::shared_ptr<audit_runtime_t> rt_ptr,
 
     scanner::module_context_t ctx;
     ctx.audit_id = rt_ptr->status.id;
+    ctx.session_id = rt_ptr->status.session_id;
+    ctx.scan_id = rt_ptr->status.scan_id != 0 ? rt_ptr->status.scan_id : rt_ptr->status.id;
     ctx.host = rt_ptr->status.host;
     ctx.port = rt_ptr->status.port;
     ctx.tls = rt_ptr->status.tls;
@@ -879,6 +885,8 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     rt->config = normalized_cfg;
     rt->raw_request = raw_request;
     rt->status.id = s.next_id.fetch_add(1);
+    rt->status.session_id = normalized_cfg.session_id;
+    rt->status.scan_id = normalized_cfg.scan_id != 0 ? normalized_cfg.scan_id : rt->status.id;
     rt->status.url = url;
     rt->status.host = host;
     rt->status.port = port;
@@ -929,8 +937,11 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     }
 
     const auto queued_load = collect_load_snapshot();
-    diag::log_tagged_fmt("scanner", "enqueue_target queued audit_id=%llu host=%s port=%u tls=%d req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu elapsed_ms=%llu tid=%lu",
-        static_cast<unsigned long long>(rt->status.id), host.c_str(), port, rt->status.tls ? 1 : 0, raw_request.size(),
+    diag::log_tagged_fmt("scanner", "enqueue_target queued audit_id=%llu scan_id=%llu session_present=%d host=%s port=%u tls=%d req_len=%zu active_audits=%zu running_audits=%zu queue_depth=%zu in_flight=%zu elapsed_ms=%llu tid=%lu",
+        static_cast<unsigned long long>(rt->status.id),
+        static_cast<unsigned long long>(rt->status.scan_id),
+        rt->status.session_id.empty() ? 0 : 1,
+        host.c_str(), port, rt->status.tls ? 1 : 0, raw_request.size(),
         queued_load.active_audits, queued_load.running_audits, queued_load.queue_depth, queued_load.in_flight_requests,
         static_cast<unsigned long long>(now_ms() - enqueue_started), static_cast<unsigned long>(GetCurrentThreadId()));
 

@@ -5224,7 +5224,7 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
     state.attached.store(false, std::memory_order_release);
     state.polling.store(true, std::memory_order_release);
     state.running.store(true, std::memory_order_release);
-    if (!work_queue::post_service([]() { dx_debug_loop(); }))
+    if (!work_queue::post_service_labeled("dx_hook.debug_loop", []() { dx_debug_loop(); }))
     {
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);
@@ -5589,7 +5589,7 @@ bool start_staging_watch(std::uint32_t pid, std::uint64_t staging_va,
     state.pid.store(pid, std::memory_order_release);
     state.polling.store(true, std::memory_order_release);
     state.active.store(true, std::memory_order_release);
-    if (!work_queue::post_service([]() { staging_watch_loop(); }))
+    if (!work_queue::post_service_labeled("dx_hook.staging_watch_loop", []() { staging_watch_loop(); }))
     {
         state.polling.store(false, std::memory_order_release);
         state.active.store(false, std::memory_order_release);
@@ -9798,27 +9798,94 @@ tool_result_t auto_narrow(const json& params)
     };
     auto cleanup_prepared = [&](const std::vector<store::dx_hook_record_t>& prepared, const char* phase) -> json {
         const std::uint64_t cleanup_started = GetTickCount64();
+        const std::uint64_t remaining = deadline_remaining_ms();
+        const std::uint64_t cleanup_budget_ms = remaining == std::numeric_limits<std::uint64_t>::max()
+            ? 650ull
+            : std::min<std::uint64_t>(650ull, remaining);
+        const std::uint64_t cleanup_deadline = cleanup_started > std::numeric_limits<std::uint64_t>::max() - cleanup_budget_ms
+            ? std::numeric_limits<std::uint64_t>::max()
+            : cleanup_started + cleanup_budget_ms;
+        auto cleanup_remaining_ms = [&]() -> std::uint64_t {
+            const std::uint64_t now = GetTickCount64();
+            return cleanup_deadline > now ? cleanup_deadline - now : 0;
+        };
         diag::log_tagged_fmt("dx_hook",
-                             "auto_narrow cleanup_begin pid=%u phase=%s prepared=%zu elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             "auto_narrow cleanup_begin pid=%u phase=%s prepared=%zu cleanup_budget_ms=%llu elapsed_ms=%llu deadline_remaining_ms=%llu",
                              scope.pid(),
                              phase ? phase : "",
                              prepared.size(),
+                             static_cast<unsigned long long>(cleanup_budget_ms),
                              static_cast<unsigned long long>(cleanup_started - started_ms),
                              static_cast<unsigned long long>(deadline_remaining_ms()));
-        stop_dx_debug_loop(scope.pid());
-        for (const auto& r : prepared)
-            clear_dx_record_breakpoints(r);
+        bool stop_loop_attempted = false;
+        bool stop_loop_completed = true;
+        bool stop_loop_timeout = false;
+        bool breakpoint_timeout = false;
+        std::size_t breakpoints_attempted = 0;
+        std::size_t breakpoints_skipped = 0;
         frame_tracking_state().enabled.store(false, std::memory_order_release);
+        auto& state = dx_debug_state();
+        const bool state_matches = state.pid.load(std::memory_order_acquire) == scope.pid();
+        if (state_matches) {
+            stop_loop_attempted = true;
+            state.polling.store(false, std::memory_order_release);
+        }
+        if (cleanup_budget_ms == 0) {
+            stop_loop_completed = !state_matches || !state.running.load(std::memory_order_acquire);
+            stop_loop_timeout = !stop_loop_completed;
+        } else {
+            if (state_matches) {
+                while (state.running.load(std::memory_order_acquire) && cleanup_remaining_ms() != 0) {
+                    const std::uint64_t slice = std::min<std::uint64_t>(10, cleanup_remaining_ms());
+                    if (slice == 0)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+                }
+                stop_loop_completed = !state.running.load(std::memory_order_acquire);
+                stop_loop_timeout = !stop_loop_completed;
+            }
+        }
+        for (const auto& r : prepared) {
+            for (auto tid : r.tids) {
+                if (cleanup_remaining_ms() == 0) {
+                    ++breakpoints_skipped;
+                    breakpoint_timeout = true;
+                    continue;
+                }
+                ++breakpoints_attempted;
+                driver_bridge::clear_hardware_breakpoint(tid, r.hw_slot);
+            }
+        }
         const std::uint64_t cleanup_elapsed = GetTickCount64() - cleanup_started;
+        const bool quarantined = stop_loop_timeout || breakpoint_timeout;
         diag::log_tagged_fmt("dx_hook",
-                             "auto_narrow cleanup_end pid=%u phase=%s prepared=%zu cleanup_elapsed_ms=%llu total_elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             "auto_narrow cleanup_end pid=%u phase=%s prepared=%zu cleanup_elapsed_ms=%llu cleanup_budget_ms=%llu stop_attempted=%d stop_completed=%d stop_timeout=%d breakpoint_attempted=%zu breakpoint_skipped=%zu quarantined=%d total_elapsed_ms=%llu deadline_remaining_ms=%llu",
                              scope.pid(),
                              phase ? phase : "",
                              prepared.size(),
                              static_cast<unsigned long long>(cleanup_elapsed),
+                             static_cast<unsigned long long>(cleanup_budget_ms),
+                             stop_loop_attempted ? 1 : 0,
+                             stop_loop_completed ? 1 : 0,
+                             stop_loop_timeout ? 1 : 0,
+                             breakpoints_attempted,
+                             breakpoints_skipped,
+                             quarantined ? 1 : 0,
                              static_cast<unsigned long long>(GetTickCount64() - started_ms),
                              static_cast<unsigned long long>(deadline_remaining_ms()));
-        return json{{"phase", phase ? phase : ""}, {"elapsed_ms", cleanup_elapsed}, {"prepared_records", prepared.size()}};
+        return json{{"phase", phase ? phase : ""},
+                    {"elapsed_ms", cleanup_elapsed},
+                    {"budget_ms", cleanup_budget_ms},
+                    {"deadline_ms", cleanup_deadline},
+                    {"prepared_records", prepared.size()},
+                    {"stop_loop_attempted", stop_loop_attempted},
+                    {"stop_loop_completed", stop_loop_completed},
+                    {"stop_loop_timeout", stop_loop_timeout},
+                    {"breakpoints_attempted", breakpoints_attempted},
+                    {"breakpoints_skipped", breakpoints_skipped},
+                    {"breakpoint_timeout", breakpoint_timeout},
+                    {"cleanup_timeout", quarantined},
+                    {"quarantined", quarantined}};
     };
 
     if (!unsafe_confirmed(params))

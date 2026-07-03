@@ -190,6 +190,8 @@ void pipeline_worker(uint64_t pipeline_id,
     }
 
     active_scanner::audit_config_t audit_cfg;
+    audit_cfg.session_id = config.session_id;
+    audit_cfg.scan_id = config.scan_id;
     audit_cfg.scope_only = config.scope_only;
     audit_cfg.enabled_modules = config.enabled_modules;
     audit_cfg.max_concurrent_requests = static_cast<size_t>(config.max_concurrent);

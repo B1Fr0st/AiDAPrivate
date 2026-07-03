@@ -85,11 +85,24 @@ struct veh_register_remote_diag_t {
     uint64_t handler = 0;
     uint64_t result = 0;
     uint64_t completed = 0;
+    uint64_t target_tid = 0;
+    uint64_t teb_exception_list = 0;
+    uint64_t peb = 0;
+    uint64_t loader_lock = 0;
+    uint64_t loader_lock_owner = 0;
+    uint64_t target_exception_address = 0;
     uint32_t last_error_before = 0;
     uint32_t last_error_after = 0;
+    uint32_t wrapper_phase = 0;
+    uint32_t seh_probe_state = 0;
+    int32_t loader_lock_count = 0;
+    uint32_t loader_lock_probe_state = 0;
+    uint32_t loader_lock_safe_state = 0;
+    uint32_t target_exception_state = 0;
+    uint32_t target_exception_code = 0;
 };
 
-static_assert(sizeof(veh_register_remote_diag_t) == 48, "veh_register_remote_diag_t must be 48 bytes");
+static_assert(sizeof(veh_register_remote_diag_t) == 128, "veh_register_remote_diag_t must be 128 bytes");
 
 struct process_mitigation_diag_t {
     bool open_ok = false;
@@ -792,6 +805,10 @@ static inline std::vector<uint8_t> generate_veh_register_wrapper_shellcode()
         for (int i = 0; i < 8; ++i)
             code.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
     };
+    auto emit_u32 = [&](uint32_t value) {
+        for (int i = 0; i < 4; ++i)
+            code.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+    };
     emit({0x53});
     emit({0x48, 0x83, 0xEC, 0x20});
     emit({0x4C, 0x89, 0xCB});
@@ -800,15 +817,41 @@ static inline std::vector<uint8_t> generate_veh_register_wrapper_shellcode()
     emit({0x48, 0x89, 0x03});
     emit({0x48, 0x89, 0x4B, 0x08});
     emit({0x4C, 0x89, 0x43, 0x10});
+    emit({0xC7, 0x43, 0x60});
+    emit_u32(1);
+    emit({0xC7, 0x43, 0x74});
+    emit_u32(2);
+    emit({0xC7, 0x43, 0x78});
+    emit_u32(0);
+    emit({0x65, 0x48, 0x8B, 0x04, 0x25, 0x48, 0x00, 0x00, 0x00});
+    emit({0x48, 0x89, 0x43, 0x28});
+    emit({0x65, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00});
+    emit({0x48, 0x89, 0x43, 0x30});
+    emit({0xC7, 0x43, 0x64});
+    emit_u32(1);
+    emit({0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00});
+    emit({0x48, 0x89, 0x43, 0x38});
+    emit({0x48, 0x8B, 0x80, 0x10, 0x01, 0x00, 0x00});
+    emit({0x48, 0x89, 0x43, 0x40});
+    emit({0x8B, 0x48, 0x08});
+    emit({0x89, 0x4B, 0x68});
+    emit({0x48, 0x8B, 0x50, 0x10});
+    emit({0x48, 0x89, 0x53, 0x48});
+    emit({0xC7, 0x43, 0x6C});
+    emit_u32(1);
     emit({0x65, 0x8B, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00});
-    emit({0x89, 0x43, 0x28});
-    emit({0x48, 0x89, 0xD1});
+    emit({0x89, 0x43, 0x58});
+    emit({0x48, 0xC7, 0xC1, 0x01, 0x00, 0x00, 0x00});
     emit({0x4C, 0x89, 0xC2});
     emit({0x48, 0x8B, 0x43, 0x08});
+    emit({0xC7, 0x43, 0x60});
+    emit_u32(2);
     emit({0xFF, 0xD0});
     emit({0x48, 0x89, 0x43, 0x18});
     emit({0x65, 0x8B, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00});
-    emit({0x89, 0x43, 0x2C});
+    emit({0x89, 0x43, 0x5C});
+    emit({0xC7, 0x43, 0x60});
+    emit_u32(3);
     emit({0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00});
     emit({0x48, 0x89, 0x43, 0x20});
     emit({0x48, 0x8B, 0x43, 0x18});
@@ -2169,8 +2212,23 @@ public:
         if (veh_target_diag_read_ok)
             std::memcpy(&veh_target_diag, veh_target_diag_bytes.data(), sizeof(veh_target_diag));
         const bool veh_target_diag_magic_ok = veh_target_diag_read_ok && veh_target_diag.magic == VEH_REGISTER_DIAG_MAGIC;
+        uint32_t veh_target_loader_safe_state = 0xFFFFFFFFu;
+        if (veh_target_diag_magic_ok) {
+            if (veh_target_diag.loader_lock_probe_state == 1 && veh_target_diag.loader_lock != 0) {
+                if (veh_target_diag.loader_lock_count < 0 && veh_target_diag.loader_lock_owner == 0) {
+                    veh_target_loader_safe_state = 1;
+                } else if (veh_target_diag.target_tid != 0 && veh_target_diag.loader_lock_owner == veh_target_diag.target_tid) {
+                    veh_target_loader_safe_state = 2;
+                } else {
+                    veh_target_loader_safe_state = 0;
+                }
+            } else {
+                veh_target_loader_safe_state = 0xFFFFFFFEu;
+            }
+        }
+        veh_target_diag.loader_lock_safe_state = veh_target_loader_safe_state;
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_target_diag pid=%u active_pid=%u wrapper=0x%llX diag=0x%llX read_ok=%d bytes=%zu magic=0x%llX magic_ok=%d completed=%llu rtl_add=0x%llX handler=0x%llX result=0x%llX last_error_before=%lu last_error_after=%lu lower_result=0x%llX lower_gle=%lu elapsed_ms=%llu generation=%llu current_generation=%llu",
+            "veh_register_target_diag pid=%u active_pid=%u wrapper=0x%llX diag=0x%llX read_ok=%d bytes=%zu magic=0x%llX magic_ok=%d completed=%llu target_tid=%llu teb_exception_list=0x%llX seh_probe_state=%lu target_exception_state=%lu target_exception_code=0x%08lX target_exception_address=0x%llX peb=0x%llX loader_lock=0x%llX loader_lock_owner=0x%llX loader_lock_count=%ld loader_lock_probe_state=%lu loader_lock_safe_state=%lu wrapper_phase=%lu rtl_add=0x%llX handler=0x%llX result=0x%llX last_error_before=%lu last_error_after=%lu lower_result=0x%llX lower_gle=%lu elapsed_ms=%llu generation=%llu current_generation=%llu",
             pid,
             driver_bridge::attached_pid(),
             static_cast<unsigned long long>(veh_wrapper_addr),
@@ -2180,6 +2238,19 @@ public:
             static_cast<unsigned long long>(veh_target_diag.magic),
             veh_target_diag_magic_ok ? 1 : 0,
             static_cast<unsigned long long>(veh_target_diag.completed),
+            static_cast<unsigned long long>(veh_target_diag.target_tid),
+            static_cast<unsigned long long>(veh_target_diag.teb_exception_list),
+            static_cast<unsigned long>(veh_target_diag.seh_probe_state),
+            static_cast<unsigned long>(veh_target_diag.target_exception_state),
+            static_cast<unsigned long>(veh_target_diag.target_exception_code),
+            static_cast<unsigned long long>(veh_target_diag.target_exception_address),
+            static_cast<unsigned long long>(veh_target_diag.peb),
+            static_cast<unsigned long long>(veh_target_diag.loader_lock),
+            static_cast<unsigned long long>(veh_target_diag.loader_lock_owner),
+            static_cast<long>(veh_target_diag.loader_lock_count),
+            static_cast<unsigned long>(veh_target_diag.loader_lock_probe_state),
+            static_cast<unsigned long>(veh_target_loader_safe_state),
+            static_cast<unsigned long>(veh_target_diag.wrapper_phase),
             static_cast<unsigned long long>(veh_target_diag.rtl_add_fn),
             static_cast<unsigned long long>(veh_target_diag.handler),
             static_cast<unsigned long long>(veh_target_diag.result),
@@ -2191,7 +2262,7 @@ public:
             static_cast<unsigned long long>(install_generation),
             static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)));
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_remote_call_result call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u function=RtlAddVectoredExceptionHandler va=0x%llX wrapper=0x%llX diag=0x%llX handler=0x%llX result=0x%llX target_result=0x%llX target_last_error_after=%lu ok=%d completed=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX seh_addr=0x%llX seh_fault=0x%llX seh_rip=0x%llX lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu generation=%llu current_generation=%llu status=%s last_error=%s",
+            "veh_register_remote_call_result call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u function=RtlAddVectoredExceptionHandler va=0x%llX wrapper=0x%llX diag=0x%llX target_tid=%llu target_teb_exception_list=0x%llX target_loader_lock=0x%llX target_loader_owner=0x%llX target_loader_count=%ld target_loader_safe_state=%lu target_seh_probe=%lu target_exception_state=%lu target_exception_code=0x%08lX target_wrapper_phase=%lu handler=0x%llX result=0x%llX target_result=0x%llX target_last_error_after=%lu ok=%d completed=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX seh_addr=0x%llX seh_fault=0x%llX seh_rip=0x%llX lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu generation=%llu current_generation=%llu status=%s last_error=%s",
             static_cast<unsigned long long>(veh_remote_diag.call_id),
             static_cast<unsigned long long>(veh_expected_call_id),
             pid,
@@ -2200,6 +2271,16 @@ public:
             static_cast<unsigned long long>(rtl_add_fn),
             static_cast<unsigned long long>(veh_wrapper_addr),
             static_cast<unsigned long long>(veh_diag_addr),
+            static_cast<unsigned long long>(veh_target_diag.target_tid),
+            static_cast<unsigned long long>(veh_target_diag.teb_exception_list),
+            static_cast<unsigned long long>(veh_target_diag.loader_lock),
+            static_cast<unsigned long long>(veh_target_diag.loader_lock_owner),
+            static_cast<long>(veh_target_diag.loader_lock_count),
+            static_cast<unsigned long>(veh_target_loader_safe_state),
+            static_cast<unsigned long>(veh_target_diag.seh_probe_state),
+            static_cast<unsigned long>(veh_target_diag.target_exception_state),
+            static_cast<unsigned long>(veh_target_diag.target_exception_code),
+            static_cast<unsigned long>(veh_target_diag.wrapper_phase),
             static_cast<unsigned long long>(sc_addr),
             static_cast<unsigned long long>(veh_remote_diag.result),
             static_cast<unsigned long long>(veh_target_diag.result),
@@ -2413,10 +2494,20 @@ public:
                 veh_remote_diag.lower_completion_reason.c_str(),
                 static_cast<unsigned long long>(GetTickCount64() - install_start));
             diag::log_tagged_fmt("pg_sniff",
-                "veh_register_failed pid=%u active_pid=%u caller_tid=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX method=driver_bridge::call_function result=0x%llX gle=%lu remote_elapsed_ms=%llu remote_status=%s remote_last_error=%s original_protect=0x%08X proposed_protect=0x%08X target_before_base=0x%llX target_before_size=0x%llX target_before_state=0x%08X target_before_protect=0x%08X target_before_type=0x%08X target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X target_after_error=%s handler_before_query=%d handler_before_base=0x%llX handler_before_size=0x%llX handler_before_state=0x%08X handler_before_protect=0x%08X handler_before_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X handler_after_error=%s ring_before_query=%d ring_before_base=0x%llX ring_before_size=0x%llX ring_before_state=0x%08X ring_before_protect=0x%08X ring_before_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X ring_after_error=%s mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
+                "veh_register_failed pid=%u active_pid=%u caller_tid=%lu target_tid=%llu target_teb_exception_list=0x%llX target_loader_lock=0x%llX target_loader_owner=0x%llX target_loader_count=%ld target_loader_safe_state=%lu target_seh_probe=%lu target_exception_state=%lu target_exception_code=0x%08lX target_wrapper_phase=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX remove_va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX method=driver_bridge::call_function result=0x%llX gle=%lu remote_elapsed_ms=%llu remote_status=%s remote_last_error=%s original_protect=0x%08X proposed_protect=0x%08X target_before_base=0x%llX target_before_size=0x%llX target_before_state=0x%08X target_before_protect=0x%08X target_before_type=0x%08X target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X target_after_error=%s handler_before_query=%d handler_before_base=0x%llX handler_before_size=0x%llX handler_before_state=0x%08X handler_before_protect=0x%08X handler_before_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X handler_after_error=%s ring_before_query=%d ring_before_base=0x%llX ring_before_size=0x%llX ring_before_state=0x%08X ring_before_protect=0x%08X ring_before_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X ring_after_error=%s mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s elapsed_ms=%llu",
                 pid,
                 driver_bridge::attached_pid(),
                 static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(veh_target_diag.target_tid),
+                static_cast<unsigned long long>(veh_target_diag.teb_exception_list),
+                static_cast<unsigned long long>(veh_target_diag.loader_lock),
+                static_cast<unsigned long long>(veh_target_diag.loader_lock_owner),
+                static_cast<long>(veh_target_diag.loader_lock_count),
+                static_cast<unsigned long>(veh_target_loader_safe_state),
+                static_cast<unsigned long>(veh_target_diag.seh_probe_state),
+                static_cast<unsigned long>(veh_target_diag.target_exception_state),
+                static_cast<unsigned long>(veh_target_diag.target_exception_code),
+                static_cast<unsigned long>(veh_target_diag.wrapper_phase),
                 static_cast<unsigned long long>(install_generation),
                 static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(ntdll_mod_install.base),
@@ -2565,8 +2656,9 @@ public:
                                               install_stop_generation_.load(std::memory_order_acquire),
                                               veh_mitigation,
                                               veh_remote_diag,
-                                               veh_call_status,
-                                               veh_call_last_error);
+                                              veh_target_diag,
+                                              veh_call_status,
+                                              veh_call_last_error);
             if (lower_uncertain || quarantine_id != 0 || cleanup_veh_remove_attempted) {
                 std::lock_guard<std::mutex> lk(failure_mutex_);
                 last_install_failure_.quarantined = (quarantine_id != 0 || retained_sc || retained_ring) ? 1u : 0u;
@@ -2639,10 +2731,20 @@ public:
             return fail_install(reason, "page-guard install cancelled after VEH registration", &mri, target_addr, region_size, 0);
         }
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_done pid=%u active_pid=%u caller_tid=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX handle=0x%llX method=driver_bridge::call_function gle=%lu remote_elapsed_ms=%llu original_protect=0x%08X proposed_protect=0x%08X mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X elapsed_ms=%llu",
+            "veh_register_done pid=%u active_pid=%u caller_tid=%lu target_tid=%llu target_teb_exception_list=0x%llX target_loader_lock=0x%llX target_loader_owner=0x%llX target_loader_count=%ld target_loader_safe_state=%lu target_seh_probe=%lu target_exception_state=%lu target_exception_code=0x%08lX target_wrapper_phase=%lu generation=%llu current_generation=%llu module=ntdll.dll ntdll_base=0x%llX ntdll_size=0x%llX function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX ring=0x%llX context=0x%llX handle=0x%llX method=driver_bridge::call_function gle=%lu remote_elapsed_ms=%llu original_protect=0x%08X proposed_protect=0x%08X mitigation_open=%d mitigation_open_error=%lu dyn_ok=%d dyn_error=%lu dyn_flags=0x%08lX cfg_ok=%d cfg_error=%lu cfg_flags=0x%08lX target_after_query=%d target_after_base=0x%llX target_after_size=0x%llX target_after_state=0x%08X target_after_protect=0x%08X target_after_type=0x%08X handler_after_query=%d handler_after_base=0x%llX handler_after_size=0x%llX handler_after_state=0x%08X handler_after_protect=0x%08X handler_after_type=0x%08X ring_after_query=%d ring_after_base=0x%llX ring_after_size=0x%llX ring_after_state=0x%08X ring_after_protect=0x%08X ring_after_type=0x%08X elapsed_ms=%llu",
             pid,
             driver_bridge::attached_pid(),
             static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(veh_target_diag.target_tid),
+            static_cast<unsigned long long>(veh_target_diag.teb_exception_list),
+            static_cast<unsigned long long>(veh_target_diag.loader_lock),
+            static_cast<unsigned long long>(veh_target_diag.loader_lock_owner),
+            static_cast<long>(veh_target_diag.loader_lock_count),
+            static_cast<unsigned long>(veh_target_loader_safe_state),
+            static_cast<unsigned long>(veh_target_diag.seh_probe_state),
+            static_cast<unsigned long>(veh_target_diag.target_exception_state),
+            static_cast<unsigned long>(veh_target_diag.target_exception_code),
+            static_cast<unsigned long>(veh_target_diag.wrapper_phase),
             static_cast<unsigned long long>(install_generation),
             static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(ntdll_mod_install.base),
@@ -3409,6 +3511,15 @@ public:
         uint32_t mitigation_cfg_ok = 0;
         uint32_t mitigation_cfg_error = 0;
         uint32_t mitigation_cfg_flags = 0;
+        uint32_t veh_target_last_error_before = 0;
+        uint32_t veh_target_last_error_after = 0;
+        uint32_t veh_target_wrapper_phase = 0;
+        uint32_t veh_target_seh_probe_state = 0;
+        int32_t veh_target_loader_lock_count = 0;
+        uint32_t veh_target_loader_lock_probe_state = 0;
+        uint32_t veh_target_loader_lock_safe_state = 0;
+        uint32_t veh_target_exception_state = 0;
+        uint32_t veh_target_exception_code = 0;
         uint64_t requested_addr = 0;
         uint64_t requested_size = 0;
         uint64_t guard_addr = 0;
@@ -3441,6 +3552,12 @@ public:
         uint64_t remote_call_seh_rip = 0;
         uint64_t remote_call_seh_rsp = 0;
         uint64_t remote_call_seh_rbp = 0;
+        uint64_t veh_target_tid = 0;
+        uint64_t veh_target_teb_exception_list = 0;
+        uint64_t veh_target_peb = 0;
+        uint64_t veh_target_loader_lock = 0;
+        uint64_t veh_target_loader_lock_owner = 0;
+        uint64_t veh_target_exception_address = 0;
         uint64_t quarantine_id = 0;
         uint64_t install_elapsed_ms = 0;
         uint64_t install_generation = 0;
@@ -3762,6 +3879,7 @@ private:
                                            uint64_t current_generation,
                                            const process_mitigation_diag_t& mitigation,
                                            const remote_call_diag_snapshot_t& remote_diag,
+                                           const veh_register_remote_diag_t& target_diag,
                                            const std::string& remote_call_status,
                                            const std::string& remote_call_last_error) {
         std::lock_guard<std::mutex> lk(failure_mutex_);
@@ -3807,6 +3925,21 @@ private:
         last_install_failure_.mitigation_cfg_ok = mitigation.cfg_ok ? 1u : 0u;
         last_install_failure_.mitigation_cfg_error = mitigation.cfg_error;
         last_install_failure_.mitigation_cfg_flags = mitigation.cfg_flags;
+        last_install_failure_.veh_target_tid = target_diag.target_tid;
+        last_install_failure_.veh_target_teb_exception_list = target_diag.teb_exception_list;
+        last_install_failure_.veh_target_peb = target_diag.peb;
+        last_install_failure_.veh_target_loader_lock = target_diag.loader_lock;
+        last_install_failure_.veh_target_loader_lock_owner = target_diag.loader_lock_owner;
+        last_install_failure_.veh_target_exception_address = target_diag.target_exception_address;
+        last_install_failure_.veh_target_last_error_before = target_diag.last_error_before;
+        last_install_failure_.veh_target_last_error_after = target_diag.last_error_after;
+        last_install_failure_.veh_target_wrapper_phase = target_diag.wrapper_phase;
+        last_install_failure_.veh_target_seh_probe_state = target_diag.seh_probe_state;
+        last_install_failure_.veh_target_loader_lock_count = target_diag.loader_lock_count;
+        last_install_failure_.veh_target_loader_lock_probe_state = target_diag.loader_lock_probe_state;
+        last_install_failure_.veh_target_loader_lock_safe_state = target_diag.loader_lock_safe_state;
+        last_install_failure_.veh_target_exception_state = target_diag.target_exception_state;
+        last_install_failure_.veh_target_exception_code = target_diag.target_exception_code;
         last_install_failure_.remote_call_driver_status = remote_call_status;
         last_install_failure_.remote_call_driver_last_error = remote_call_last_error;
         last_install_failure_.remote_call_lower_phase = remote_diag.lower_phase;
@@ -3869,7 +4002,13 @@ private:
             " execution_started=" + std::to_string(remote_diag.execution_started ? 1 : 0) +
             " executing_abandoned=" + std::to_string(remote_diag.executing_abandoned ? 1 : 0) +
             " seh_exception=" + std::to_string(remote_diag.seh_exception ? 1 : 0) +
-            " seh_code=" + std::to_string(remote_diag.seh_exception_code);
+            " seh_code=" + std::to_string(remote_diag.seh_exception_code) +
+            " target_tid=" + std::to_string(target_diag.target_tid) +
+            " target_seh_probe=" + std::to_string(target_diag.seh_probe_state) +
+            " target_exception_state=" + std::to_string(target_diag.target_exception_state) +
+            " loader_lock_probe=" + std::to_string(target_diag.loader_lock_probe_state) +
+            " loader_lock_count=" + std::to_string(target_diag.loader_lock_count) +
+            " loader_lock_safe_state=" + std::to_string(target_diag.loader_lock_safe_state);
         if (!remote_diag.lower_worker_error_message.empty())
             lower_summary += " lower_worker_error=" + remote_diag.lower_worker_error_message;
         if (!last_install_failure_.detail.empty())

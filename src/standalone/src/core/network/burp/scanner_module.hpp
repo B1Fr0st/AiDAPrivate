@@ -24,6 +24,8 @@ struct probe_t
 struct module_context_t
 {
     uint64_t                          audit_id = 0;
+    std::string                       session_id;
+    uint64_t                          scan_id = 0;
     std::string                       url;
     std::string                       host;
     uint16_t                          port = 0;

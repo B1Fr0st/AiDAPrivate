@@ -586,8 +586,16 @@ function Invoke-FrozenMcpContractCheck {
     $addonExcludeMarkerOk = $stdout -match '"exclude_addons_marker_present":true'
     $addonInvalidDiagOk = $stdout -match '"addon_invalid_diagnostic_present":true'
     $addonAllLaunchScopeOk = $stdout -match '"addon_all_launch_scope_present":true'
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk)) {
-        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    $fastVisibleContractMarkerOk = $stdout -match "aida_fast_visible_policy_v1"
+    $fastVisiblePolicyOk = $stdout -match '"fast_visible_policy_contract_ok":true'
+    $fastVisibleMarkerOk = $stdout -match '"fast_visible_policy_marker_present":true'
+    $fastVisibleDisabledOk = $stdout -match '"fast_visible_disabled_return_present":true'
+    $fastVisibleIgnoredOk = $stdout -match '"fast_visible_fallback_ignored_present":true'
+    $fastVisibleForbiddenReturnAbsentOk = $stdout -match '"fast_visible_forbidden_return_absent":true'
+    $fastVisibleCompatAbsentOk = $stdout -match '"fast_visible_compat_path_absent":true'
+    $fastVisibleAsyncOk = $stdout -match '"fast_visible_selected_async_present":true'
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk -and $fastVisibleContractMarkerOk -and $fastVisiblePolicyOk -and $fastVisibleMarkerOk -and $fastVisibleDisabledOk -and $fastVisibleIgnoredOk -and $fastVisibleForbiddenReturnAbsentOk -and $fastVisibleCompatAbsentOk -and $fastVisibleAsyncOk)) {
+        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) fast_visible_contract_marker=$([int]$fastVisibleContractMarkerOk) fast_visible_policy=$([int]$fastVisiblePolicyOk) fast_visible_marker=$([int]$fastVisibleMarkerOk) fast_visible_disabled=$([int]$fastVisibleDisabledOk) fast_visible_ignored=$([int]$fastVisibleIgnoredOk) fast_visible_forbidden_return_absent=$([int]$fastVisibleForbiddenReturnAbsentOk) fast_visible_compat_absent=$([int]$fastVisibleCompatAbsentOk) fast_visible_async=$([int]$fastVisibleAsyncOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "frozen_mcp_contract_check=ok"
 }
@@ -625,7 +633,10 @@ function Assert-SourceAddonPolicyContract {
         "all_launches",
         "default_addons_excluded",
         "explicit_addon_count",
-        "explicit_addons_validated"
+        "explicit_addons_validated",
+        "aida_fast_visible_policy_v1",
+        "aida_fast_visible_fallback_ignored",
+        'selected_launch_path = "async_camoufox"'
     )
     $missing = @()
     foreach ($marker in $required) {
@@ -638,6 +649,17 @@ function Assert-SourceAddonPolicyContract {
     }
     if ($text.Contains("if explicit_addon_count == 0:")) {
         throw "Camoufox reverse MCP source addon policy contract has stale no-explicit-addon UBO exclusion gate in $browserPath"
+    }
+    $forbidden = @(
+        "fast_visible_firefox_compat",
+        "launch_fast_visible_compat_selected",
+        "return _flag_enabled(requested)",
+        'return bool(cfg.get("aida_fast_visible_launch", True))'
+    )
+    foreach ($marker in $forbidden) {
+        if ($text.Contains($marker)) {
+            throw "Camoufox reverse MCP source launch policy contract has forbidden stale marker: $marker in $browserPath"
+        }
     }
     Write-Output "source_addon_policy_contract=ok"
     Write-Output "source_addon_policy_contract_browser=$browserPath"
@@ -694,8 +716,22 @@ function Invoke-SourceMcpContractCheck {
     $latePageWaitOk = $stdout -match '"late_page_wait_floor_present":true'
     $waitForLatePageSelfPagesOk = $stdout -match '"wait_for_late_page_self_pages_present":true'
     $primaryWaitUntilDowngradeAbsent = $stdout -match '"primary_wait_until_downgrade_absent":true'
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent)) {
-        throw "Source MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    $addonPolicyOk = $stdout -match '"addon_policy_contract_ok":true'
+    $addonPolicyMarkerOk = $stdout -match '"addon_policy_marker_present":true'
+    $addonExcludeOk = $stdout -match '"default_ubo_exclusion_present":true'
+    $addonExcludeMarkerOk = $stdout -match '"exclude_addons_marker_present":true'
+    $addonInvalidDiagOk = $stdout -match '"addon_invalid_diagnostic_present":true'
+    $addonAllLaunchScopeOk = $stdout -match '"addon_all_launch_scope_present":true'
+    $fastVisibleContractMarkerOk = $stdout -match "aida_fast_visible_policy_v1"
+    $fastVisiblePolicyOk = $stdout -match '"fast_visible_policy_contract_ok":true'
+    $fastVisibleMarkerOk = $stdout -match '"fast_visible_policy_marker_present":true'
+    $fastVisibleDisabledOk = $stdout -match '"fast_visible_disabled_return_present":true'
+    $fastVisibleIgnoredOk = $stdout -match '"fast_visible_fallback_ignored_present":true'
+    $fastVisibleForbiddenReturnAbsentOk = $stdout -match '"fast_visible_forbidden_return_absent":true'
+    $fastVisibleCompatAbsentOk = $stdout -match '"fast_visible_compat_path_absent":true'
+    $fastVisibleAsyncOk = $stdout -match '"fast_visible_selected_async_present":true'
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk -and $fastVisibleContractMarkerOk -and $fastVisiblePolicyOk -and $fastVisibleMarkerOk -and $fastVisibleDisabledOk -and $fastVisibleIgnoredOk -and $fastVisibleForbiddenReturnAbsentOk -and $fastVisibleCompatAbsentOk -and $fastVisibleAsyncOk)) {
+        throw "Source MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) fast_visible_contract_marker=$([int]$fastVisibleContractMarkerOk) fast_visible_policy=$([int]$fastVisiblePolicyOk) fast_visible_marker=$([int]$fastVisibleMarkerOk) fast_visible_disabled=$([int]$fastVisibleDisabledOk) fast_visible_ignored=$([int]$fastVisibleIgnoredOk) fast_visible_forbidden_return_absent=$([int]$fastVisibleForbiddenReturnAbsentOk) fast_visible_compat_absent=$([int]$fastVisibleCompatAbsentOk) fast_visible_async=$([int]$fastVisibleAsyncOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "source_mcp_contract_check=ok"
 }
@@ -1102,6 +1138,7 @@ import types
 
 AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
 AIDA_DEFAULT_ADDON_POLICY_V1 = "aida_default_addon_policy_v1"
+AIDA_FAST_VISIBLE_POLICY_V1 = "aida_fast_visible_policy_v1"
 
 
 def _aida_contract_probe_from_code(code, source):
@@ -1287,6 +1324,13 @@ def _aida_launch_budget_contract_probe():
         "default_ubo_exclusion_present": False,
         "addon_all_launch_scope_present": False,
         "addon_policy_contract_ok": False,
+        "fast_visible_policy_marker_present": False,
+        "fast_visible_disabled_return_present": False,
+        "fast_visible_fallback_ignored_present": False,
+        "fast_visible_forbidden_return_absent": False,
+        "fast_visible_compat_path_absent": False,
+        "fast_visible_selected_async_present": False,
+        "fast_visible_policy_contract_ok": False,
         "browser_probe_mode": "",
         "navigation_probe_mode": "",
         "browser_probe_details": {},
@@ -1311,6 +1355,12 @@ def _aida_launch_budget_contract_probe():
             diagnostics["exclude_addons_marker_present"] = "exclude_addons" in browser_text
             diagnostics["default_ubo_exclusion_present"] = "DefaultAddons.UBO" in browser_text
             diagnostics["addon_all_launch_scope_present"] = "default_exclusion_scope" in browser_text and "all_launches" in browser_text and "if explicit_addon_count == 0:" not in browser_text
+            diagnostics["fast_visible_policy_marker_present"] = AIDA_FAST_VISIBLE_POLICY_V1 in browser_text
+            diagnostics["fast_visible_disabled_return_present"] = "def _use_fast_visible_launch" in browser_text and "return False" in browser_text
+            diagnostics["fast_visible_fallback_ignored_present"] = "aida_fast_visible_fallback_ignored" in browser_text
+            diagnostics["fast_visible_forbidden_return_absent"] = "return _flag_enabled(requested)" not in browser_text and 'return bool(cfg.get("aida_fast_visible_launch", True))' not in browser_text
+            diagnostics["fast_visible_compat_path_absent"] = "fast_visible_firefox_compat" not in browser_text and "launch_fast_visible_compat_selected" not in browser_text
+            diagnostics["fast_visible_selected_async_present"] = 'selected_launch_path = "async_camoufox"' in browser_text or 'selected_launch_path="async_camoufox"' in browser_text
             tree = ast.parse(browser_text, filename=browser_spec.origin)
             for node in ast.walk(tree):
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "_wait_for_late_page":
@@ -1357,6 +1407,16 @@ def _aida_launch_budget_contract_probe():
                 diagnostics["exclude_addons_marker_present"] = "exclude_addons" in addon_repr
                 diagnostics["default_ubo_exclusion_present"] = "DefaultAddons.UBO" in addon_repr and "DefaultAddons" in addon_repr and "UBO" in addon_repr
                 diagnostics["addon_all_launch_scope_present"] = "default_exclusion_scope" in addon_repr and "all_launches" in addon_repr and "explicit_addon_count == 0" not in addon_repr
+                launch_repr = repr(getattr(launch_code, "co_consts", ())) + repr(getattr(launch_code, "co_names", ())) + repr(getattr(launch_code, "co_varnames", ())) if launch_code is not None else ""
+                use_code = getattr(getattr(browser_module, "_use_fast_visible_launch", None), "__code__", None)
+                use_repr = repr(getattr(use_code, "co_consts", ())) + repr(getattr(use_code, "co_names", ())) + repr(getattr(use_code, "co_varnames", ())) if use_code is not None else ""
+                fast_visible_repr = repr(getattr(browser_module, "AIDA_FAST_VISIBLE_POLICY_MARKER", "")) + launch_repr + use_repr
+                diagnostics["fast_visible_policy_marker_present"] = AIDA_FAST_VISIBLE_POLICY_V1 in fast_visible_repr
+                diagnostics["fast_visible_disabled_return_present"] = "False" in use_repr and "_flag_enabled" not in use_repr and "requested" not in use_repr
+                diagnostics["fast_visible_fallback_ignored_present"] = "aida_fast_visible_fallback_ignored" in fast_visible_repr
+                diagnostics["fast_visible_forbidden_return_absent"] = "return _flag_enabled(requested)" not in fast_visible_repr and 'return bool(cfg.get("aida_fast_visible_launch", True))' not in fast_visible_repr
+                diagnostics["fast_visible_compat_path_absent"] = "fast_visible_firefox_compat" not in fast_visible_repr and "launch_fast_visible_compat_selected" not in fast_visible_repr
+                diagnostics["fast_visible_selected_async_present"] = "async_camoufox" in launch_repr and "selected_launch_path" in launch_repr
                 if launch_code is None:
                     diagnostics["errors"].append({"module": "browser", "error_type": "ProbeError", "error": "BrowserManager.launch code object unavailable"})
                 else:
@@ -1444,6 +1504,12 @@ def _aida_launch_budget_contract_probe():
         and diagnostics["exclude_addons_marker_present"]
         and diagnostics["default_ubo_exclusion_present"]
         and diagnostics["addon_all_launch_scope_present"]
+        and diagnostics["fast_visible_policy_marker_present"]
+        and diagnostics["fast_visible_disabled_return_present"]
+        and diagnostics["fast_visible_fallback_ignored_present"]
+        and diagnostics["fast_visible_forbidden_return_absent"]
+        and diagnostics["fast_visible_compat_path_absent"]
+        and diagnostics["fast_visible_selected_async_present"]
         and not diagnostics["errors"]
     )
     diagnostics["addon_policy_contract_ok"] = (
@@ -1453,6 +1519,14 @@ def _aida_launch_budget_contract_probe():
         and diagnostics["exclude_addons_marker_present"]
         and diagnostics["default_ubo_exclusion_present"]
         and diagnostics["addon_all_launch_scope_present"]
+    )
+    diagnostics["fast_visible_policy_contract_ok"] = (
+        diagnostics["fast_visible_policy_marker_present"]
+        and diagnostics["fast_visible_disabled_return_present"]
+        and diagnostics["fast_visible_fallback_ignored_present"]
+        and diagnostics["fast_visible_forbidden_return_absent"]
+        and diagnostics["fast_visible_compat_path_absent"]
+        and diagnostics["fast_visible_selected_async_present"]
     )
     diagnostics["ok"] = ok
     return diagnostics
@@ -1466,6 +1540,7 @@ def _run_contract_check():
     probe_log.append(f"browser_probe_mode={browser_mode or 'missing'}")
     probe_log.append(f"navigation_probe_mode={navigation_mode or 'missing'}")
     probe_log.append(f"addon_policy={'pass' if launch_budget.get('addon_policy_contract_ok') else 'fail'}")
+    probe_log.append(f"fast_visible_policy={'pass' if launch_budget.get('fast_visible_policy_contract_ok') else 'fail'}")
     browser_details = launch_budget.get("browser_probe_details") or {}
     for key in ("floor", "ceiling", "ratio", "late_page", "self_pages"):
         entry = browser_details.get(key)
@@ -1508,6 +1583,13 @@ def _run_contract_check():
         "exclude_addons_marker_present": bool(launch_budget.get("exclude_addons_marker_present")),
         "default_ubo_exclusion_present": bool(launch_budget.get("default_ubo_exclusion_present")),
         "addon_all_launch_scope_present": bool(launch_budget.get("addon_all_launch_scope_present")),
+        "fast_visible_policy_contract_ok": bool(launch_budget.get("fast_visible_policy_contract_ok")),
+        "fast_visible_policy_marker_present": bool(launch_budget.get("fast_visible_policy_marker_present")),
+        "fast_visible_disabled_return_present": bool(launch_budget.get("fast_visible_disabled_return_present")),
+        "fast_visible_fallback_ignored_present": bool(launch_budget.get("fast_visible_fallback_ignored_present")),
+        "fast_visible_forbidden_return_absent": bool(launch_budget.get("fast_visible_forbidden_return_absent")),
+        "fast_visible_compat_path_absent": bool(launch_budget.get("fast_visible_compat_path_absent")),
+        "fast_visible_selected_async_present": bool(launch_budget.get("fast_visible_selected_async_present")),
         "probe_log": probe_log,
     }
     for line in probe_log:

@@ -5,6 +5,7 @@
 #include "anti_re.hpp"
 #include "vuln/vuln_tools.hpp"
 #include "vuln/verification_tools.hpp"
+#include "vuln/chain_verification_tools.hpp"
 #include "vuln/vuln_signatures.hpp"
 // Slice C12 — bring in taint engine public surface for taint_tools_ext.
 #include "vuln/taint_engine.hpp"
@@ -12540,6 +12541,7 @@ void initialize_all_tools()
     vuln_tools::register_tools();
     vuln_tools::register_advanced_tools();
     aida::vuln::verify::tools::register_verification_tools();
+    aida::vuln::chain_mcp::register_manage_tools();
     aida_ida_batch_tools::register_tools();
     meta_tools::register_tools();
     sdk_underused_tools::register_tools();

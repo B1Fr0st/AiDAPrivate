@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 struct sqlite3;
+struct sqlite3_stmt;
 
 namespace aida {
 namespace burp {
@@ -121,6 +122,7 @@ std::string           storage_path();
 uint64_t              now_ms();
 std::string           generate_id(const std::string& prefix);
 bool                  with_db(const char* operation, const std::function<bool(sqlite3*)>& fn);
+bool                  bind_optional_session_id(sqlite3* db, sqlite3_stmt* stmt, int idx, const std::string& session_id, const char* table_name);
 
 }
 }

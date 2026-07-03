@@ -1880,6 +1880,8 @@ tool_result_t tool_orchestrate(const json& params)
     bool active_started = false;
     if (!profile.module_ids.empty()) {
         active_scanner::audit_config_t cfg;
+        cfg.session_id = job->session_id;
+        cfg.scan_id = job->scan_id;
         cfg.scope_only = scope_only;
         cfg.enabled_modules = profile.module_ids;
         cfg.max_concurrent_requests = profile.max_concurrent_requests;
@@ -1890,6 +1892,8 @@ tool_result_t tool_orchestrate(const json& params)
         if (profile.crawl_first && profile.crawl_depth > 0) {
             crawl_audit::pipeline_config_t crawl_cfg;
             crawl_cfg.start_urls.push_back(target_url);
+            crawl_cfg.session_id = job->session_id;
+            crawl_cfg.scan_id = job->scan_id;
             crawl_cfg.max_depth = profile.crawl_depth;
             crawl_cfg.same_host_only = true;
             crawl_cfg.scope_only = scope_only;

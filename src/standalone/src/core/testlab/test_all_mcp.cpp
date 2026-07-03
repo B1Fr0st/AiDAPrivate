@@ -217,6 +217,14 @@ namespace {
         std::string reason;
     };
 
+    struct mcp_case_ledger_entry_t {
+        std::uint64_t ordinal = 0;
+        std::string case_id;
+        std::string tool;
+        mcp_tool_call_status_t status = mcp_tool_call_status_t::failed;
+        std::string status_name;
+    };
+
     struct mcp_coverage_audit_snapshot_t {
         bool audit_started = false;
         bool audit_completed = false;
@@ -253,6 +261,11 @@ namespace {
         int phase_planned = k_mcp_planned_tool_tests;
         int phase_completed = 0;
         int phase_remaining = k_mcp_planned_tool_tests;
+        int phase_extra_terminal_records = 0;
+        int ledger_terminal_records = 0;
+        int ledger_registered_terminal_tools = 0;
+        int ledger_registered_missing_tools = 0;
+        int ledger_duplicate_case_ids = 0;
 
         int suspect_count() const {
             int total = missing + stale + no_functional_pass + failed_tools + mixed_fail_tools +
@@ -260,7 +273,8 @@ namespace {
                 expected_empty_nonfunctional_tools + empty_result_suspect_tools +
                 unexpected_zero_pass_tools + diagnostic_fallback_tools +
                 static_cast<int>(outstanding_timed_out_workers) +
-                phase_remaining;
+                phase_remaining + phase_extra_terminal_records +
+                ledger_registered_missing_tools + ledger_duplicate_case_ids;
             if (!timed_out_drain_complete)
                 ++total;
             if (destructive_schema_exemptions != k_expected_destructive_schema_only_exemptions ||
@@ -284,6 +298,9 @@ namespace {
     std::mutex g_mcp_audit_snapshot_mtx;
     mcp_coverage_audit_snapshot_t g_mcp_last_audit_snapshot;
     std::vector<mcp_phase_gap_t> g_mcp_last_phase_gaps;
+    std::mutex g_mcp_case_ledger_mtx;
+    std::vector<mcp_case_ledger_entry_t> g_mcp_case_ledger;
+    std::atomic<std::uint64_t> g_mcp_case_ledger_sequence{0};
 
     std::string lower_copy(std::string v) {
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
@@ -328,8 +345,60 @@ namespace {
     void update_mcp_phase_completion_snapshot(int completed) {
         std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
         g_mcp_last_audit_snapshot.phase_completed = completed;
-        g_mcp_last_audit_snapshot.phase_remaining =
-            k_mcp_planned_tool_tests > completed ? k_mcp_planned_tool_tests - completed : 0;
+        g_mcp_last_audit_snapshot.phase_remaining = k_mcp_planned_tool_tests > completed ? k_mcp_planned_tool_tests - completed : 0;
+        g_mcp_last_audit_snapshot.phase_extra_terminal_records = completed > k_mcp_planned_tool_tests ? completed - k_mcp_planned_tool_tests : 0;
+    }
+
+    const char* mcp_case_status_token(mcp_tool_call_status_t status) {
+        switch (status) {
+            case mcp_tool_call_status_t::functional_pass: return "functional_pass";
+            case mcp_tool_call_status_t::schema_pass: return "schema_pass";
+            case mcp_tool_call_status_t::contract_pass: return "contract_pass";
+            case mcp_tool_call_status_t::cleanup_contract_pass: return "cleanup_contract_pass";
+            case mcp_tool_call_status_t::state_contract_pass: return "state_contract_pass";
+            case mcp_tool_call_status_t::accepted_pending: return "accepted_pending";
+            case mcp_tool_call_status_t::guard_pass: return "guard_pass";
+            case mcp_tool_call_status_t::security_guard_pass: return "security_guard_pass";
+            case mcp_tool_call_status_t::negative_pass: return "negative_pass";
+            case mcp_tool_call_status_t::failed: return "failed";
+            case mcp_tool_call_status_t::dependency_blocked: return "dependency_blocked";
+            case mcp_tool_call_status_t::cascade_blocked: return "cascade_blocked";
+            case mcp_tool_call_status_t::skipped: return "skipped";
+            case mcp_tool_call_status_t::timed_out: return "timed_out";
+            default: return "unknown";
+        }
+    }
+
+    void reset_mcp_case_ledger() {
+        std::lock_guard<std::mutex> lk(g_mcp_case_ledger_mtx);
+        g_mcp_case_ledger.clear();
+        g_mcp_case_ledger_sequence.store(0, std::memory_order_release);
+    }
+
+    void record_mcp_case_terminal(const std::string& tool_name, mcp_tool_call_status_t status) {
+        if (tool_name.empty())
+            return;
+        const std::uint64_t ordinal = g_mcp_case_ledger_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        char ordinal_buf[32];
+        _snprintf_s(ordinal_buf, sizeof(ordinal_buf), _TRUNCATE, "%06llu", static_cast<unsigned long long>(ordinal));
+        mcp_case_ledger_entry_t entry;
+        entry.ordinal = ordinal;
+        entry.tool = tool_name;
+        entry.status = status;
+        entry.status_name = mcp_case_status_token(status);
+        entry.case_id = std::string("mcp_case.") + ordinal_buf + "." + mcp_case_id_fragment(tool_name) + "." + entry.status_name;
+        std::lock_guard<std::mutex> lk(g_mcp_case_ledger_mtx);
+        g_mcp_case_ledger.push_back(std::move(entry));
+    }
+
+    std::vector<mcp_case_ledger_entry_t> copy_mcp_case_ledger() {
+        std::lock_guard<std::mutex> lk(g_mcp_case_ledger_mtx);
+        return g_mcp_case_ledger;
+    }
+
+    int mcp_case_ledger_terminal_count() {
+        std::lock_guard<std::mutex> lk(g_mcp_case_ledger_mtx);
+        return static_cast<int>(g_mcp_case_ledger.size());
     }
 
     bool mcp_text_indicates_diagnostic_fallback(const std::string& text) {
@@ -342,6 +411,8 @@ namespace {
     const char* mcp_status_evidence_class(mcp_tool_call_status_t status, const std::string& functional_evidence, const std::string& reason) {
         const std::string combined = functional_evidence + " " + reason;
         if (mcp_text_indicates_diagnostic_fallback(combined))
+            return "diagnostic_fallback";
+        if (status == mcp_tool_call_status_t::functional_pass && functional_evidence.empty() && reason.empty())
             return "diagnostic_fallback";
         switch (status) {
             case mcp_tool_call_status_t::functional_pass: return "functional_positive";
@@ -1445,6 +1516,85 @@ namespace {
                st.last_error.empty();
     }
 
+    bool camoufox_bridge_sticky_setup_failure(const aida::burp::camoufox::bridge_status_t& st, std::string& marker) {
+        marker.clear();
+        const auto string_field = [](const mcp_standalone::json& obj, const char* key) -> std::string {
+            if (!obj.is_object())
+                return {};
+            auto it = obj.find(key);
+            if (it == obj.end() || it->is_null())
+                return {};
+            if (it->is_string())
+                return it->get<std::string>();
+            if (it->is_boolean())
+                return it->get<bool>() ? "true" : "false";
+            if (it->is_number())
+                return it->dump();
+            return {};
+        };
+        const auto uint_field = [](const mcp_standalone::json& obj, const char* key) -> uint64_t {
+            if (!obj.is_object())
+                return 0;
+            auto it = obj.find(key);
+            if (it == obj.end())
+                return 0;
+            if (it->is_number_unsigned())
+                return it->get<uint64_t>();
+            if (it->is_number_integer()) {
+                const auto value = it->get<int64_t>();
+                return value > 0 ? static_cast<uint64_t>(value) : 0;
+            }
+            return 0;
+        };
+        const auto bool_field = [](const mcp_standalone::json& obj, const char* key) -> bool {
+            if (!obj.is_object())
+                return false;
+            auto it = obj.find(key);
+            return it != obj.end() && it->is_boolean() && it->get<bool>();
+        };
+        if (st.last_launch_diagnostics.is_object()) {
+            auto sticky_it = st.last_launch_diagnostics.find("sticky_setup_failure");
+            if (sticky_it != st.last_launch_diagnostics.end() && sticky_it->is_object()) {
+                const auto& sticky = *sticky_it;
+                std::string category = string_field(sticky, "category");
+                std::string summary = string_field(sticky, "error_summary");
+                std::string phase = string_field(sticky, "phase");
+                auto source_it = sticky.find("source");
+                if (phase.empty() && source_it != sticky.end() && source_it->is_object())
+                    phase = string_field(*source_it, "phase");
+                const std::string mode = string_field(sticky, "mode");
+                const uint64_t generation = uint_field(sticky, "generation");
+                marker = "category=" + (category.empty() ? std::string("unknown") : category) +
+                    " generation=" + std::to_string(static_cast<unsigned long long>(generation)) +
+                    " mode=" + (mode.empty() ? std::string("<empty>") : mode) +
+                    " phase=" + (phase.empty() ? std::string("<empty>") : phase) +
+                    " root=" + (summary.empty() ? std::string("<empty>") : compact_text(summary, 700));
+                return true;
+            }
+            const bool nonretryable = bool_field(st.last_launch_diagnostics, "nonretryable_setup_failure") ||
+                bool_field(st.last_launch_diagnostics, "setup_failure_sticky");
+            const std::string phase = string_field(st.last_launch_diagnostics, "phase");
+            if (nonretryable || phase == "sticky_setup_failure") {
+                const std::string category = string_field(st.last_launch_diagnostics, "setup_failure_category");
+                std::string summary = string_field(st.last_launch_diagnostics, "setup_failure_summary");
+                if (summary.empty())
+                    summary = string_field(st.last_launch_diagnostics, "error_summary");
+                if (summary.empty())
+                    summary = string_field(st.last_launch_diagnostics, "error");
+                marker = "category=" + (category.empty() ? std::string("nonretryable_setup_failure") : category) +
+                    " phase=" + (phase.empty() ? std::string("<empty>") : phase) +
+                    " root=" + (summary.empty() ? std::string("<empty>") : compact_text(summary, 700));
+                return true;
+            }
+        }
+        const std::string lower_error = lower_copy(st.last_error);
+        if (lower_error.find("sticky_setup_failure") != std::string::npos) {
+            marker = compact_text(st.last_error, 700);
+            return true;
+        }
+        return false;
+    }
+
     std::string camoufox_status_compact(const aida::burp::camoufox::bridge_status_t& st) {
         const uint64_t visible_windows = camoufox_visible_window_count_from_status(st);
         char buf[1500];
@@ -2437,6 +2587,7 @@ namespace {
             case mcp_tool_call_status_t::skipped: ++stats.skipped; break;
             case mcp_tool_call_status_t::timed_out: ++stats.timed_out; break;
         }
+        record_mcp_case_terminal(name, status);
     }
 
     std::string mcp_tool_attempt_stats_summary(const mcp_tool_attempt_stats_t& st) {
@@ -2763,6 +2914,27 @@ namespace {
         std::string reason;
         auto st = aida::burp::camoufox::get_status();
         log_camoufox_live_bridge_status(hf, tag, "preflight_entry", st);
+        auto block_sticky_failure = [&](const char* stage, int attempt, const std::string& marker) -> bool {
+            reason = std::string("Camoufox sticky setup failure for ") + (tool_name_s.empty() ? std::string("<empty>") : tool_name_s) +
+                ": " + (marker.empty() ? std::string("<empty>") : marker) + "; current " + camoufox_status_compact(st);
+            g_mcp_camoufox_bridge_ready_proven = false;
+            g_mcp_camoufox_bridge_dependency_blocked = true;
+            g_mcp_camoufox_bridge_block_reason = reason;
+            if (out_reason)
+                *out_reason = reason;
+            log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure stage=%s attempt=%d tool=%s reason=%s launch_diag=%s",
+                stage ? stage : "<empty>",
+                attempt,
+                tool_name_s.empty() ? "<empty>" : tool_name_s.c_str(),
+                compact_text(reason, 900).c_str(),
+                compact_json(st.last_launch_diagnostics, 1400).c_str());
+            record_camoufox_bridge_blocked_tool(hf, tag, tool_name, reason, failed);
+            return false;
+        };
+
+        std::string sticky_marker;
+        if (!camoufox_live_bridge_status(st) && camoufox_bridge_sticky_setup_failure(st, sticky_marker))
+            return block_sticky_failure("entry", 0, sticky_marker);
 
         if (!g_mcp_camoufox_bridge_ready_proven &&
             g_mcp_camoufox_bridge_dependency_blocked &&
@@ -2811,6 +2983,8 @@ namespace {
                     camoufox_status_compact(st).c_str(),
                     camoufox_status_compact(after_idle).c_str());
                 st = after_idle;
+                if (camoufox_bridge_sticky_setup_failure(st, sticky_marker))
+                    return block_sticky_failure("after_cleanup_wait", 0, sticky_marker);
             }
         }
 
@@ -2838,6 +3012,11 @@ namespace {
                     launch.ok ? 1 : 0,
                     launch.runner_error.empty() ? "<empty>" : compact_text(launch.runner_error, 700).c_str(),
                     compact_text(reason, 900).c_str());
+                if (camoufox_bridge_sticky_setup_failure(st, sticky_marker))
+                    return block_sticky_failure("launch_attempt", attempt, sticky_marker);
+                const std::string runner_error_l = lower_copy(launch.runner_error);
+                if (!runner_error_l.empty() && runner_error_l.find("sticky_setup_failure") != std::string::npos)
+                    return block_sticky_failure("launch_runner", attempt, compact_text(launch.runner_error, 700));
                 if (attempt < 2) {
                     const bool stopped = aida::burp::camoufox::stop_bridge("testlab.camoufox.preflight_retry");
                     const bool idle = aida::burp::camoufox::wait_until_idle(30000, "testlab.camoufox.preflight_retry");
@@ -3878,6 +4057,39 @@ namespace {
         return true;
     }
 
+    bool driver_kernel_callbacks_live_enumeration_proof(const invoke_result_t& ir, std::string& reason) {
+        if (!driver_kernel_callbacks_structural_proof(ir, reason))
+            return false;
+        uint64_t callbacks_observed = 0;
+        payload_u64_field(ir.data, "callbacks_observed", callbacks_observed);
+        payload_u64_field(ir.data, "callback_count", callbacks_observed);
+        std::size_t callback_entries = 0;
+        const auto it = ir.data.find("callback_types");
+        if (it != ir.data.end() && it->is_array()) {
+            for (const auto& item : *it) {
+                const auto arrays_it = item.find("arrays");
+                if (arrays_it == item.end() || !arrays_it->is_array())
+                    continue;
+                for (const auto& ref : *arrays_it) {
+                    std::size_t callbacks = 0;
+                    if (payload_array_count(ref, "callbacks", callbacks))
+                        callback_entries += callbacks;
+                }
+            }
+        }
+        if (callbacks_observed > 0 || callback_entries > 0) {
+            reason = "kernel callback live enumeration callbacks_observed=" +
+                std::to_string(static_cast<unsigned long long>(callbacks_observed)) +
+                " callback_entries=" + std::to_string(callback_entries);
+            return true;
+        }
+        bool zero_is_clean_state = false;
+        payload_bool_field(ir.data, "zero_is_clean_state", zero_is_clean_state);
+        reason = "kernel callback structural metadata only callbacks_observed=0 callback_entries=0 zero_is_clean_state=" +
+            std::to_string(zero_is_clean_state ? 1 : 0);
+        return false;
+    }
+
     bool browser_lifecycle_privacy_contract_json_proof(const invoke_result_t& ir, std::string& reason) {
         bool privacy_verified = false;
         bool browser_open = false;
@@ -4578,6 +4790,98 @@ namespace {
         return true;
     }
 
+    bool protocol_detect_action(const std::string& tool_lc, const std::string& action_lc) {
+        return (tool_lc == "quic_manage" && action_lc == "detect_connections") ||
+            (tool_lc == "dtls_manage" && action_lc == "detect_sessions");
+    }
+
+    bool protocol_parser_state_contract_payload(const std::string& tool_lc,
+                                                const std::string& action_lc,
+                                                const mcp_standalone::json& data,
+                                                std::string& proof) {
+        proof.clear();
+        if (!protocol_detect_action(tool_lc, action_lc) || !data.is_object())
+            return false;
+        bool parser_only = false;
+        bool state_contract_only = false;
+        bool functional_evidence = true;
+        bool capture_evidence = true;
+        bool target_pid_correlated = true;
+        bool tuple_correlated = true;
+        bool payload_hash_correlated = true;
+        bool nonce_correlated = true;
+        uint64_t parser_count = 0;
+        uint64_t functional_count = 1;
+        uint64_t count = 1;
+        uint64_t capture_delta = 1;
+        size_t parser_items = 0;
+        const char* parser_array = tool_lc == "quic_manage" ? "parser_connections" : "parser_sessions";
+        const bool ok =
+            payload_bool_field(data, "parser_only", parser_only) && parser_only &&
+            payload_bool_field(data, "state_contract_only", state_contract_only) && state_contract_only &&
+            payload_bool_field(data, "functional_evidence", functional_evidence) && !functional_evidence &&
+            payload_bool_field(data, "capture_evidence", capture_evidence) && !capture_evidence &&
+            payload_bool_field(data, "target_pid_correlated", target_pid_correlated) && !target_pid_correlated &&
+            payload_bool_field(data, "tuple_correlated", tuple_correlated) && !tuple_correlated &&
+            payload_bool_field(data, "payload_hash_correlated", payload_hash_correlated) && !payload_hash_correlated &&
+            payload_bool_field(data, "nonce_correlated", nonce_correlated) && !nonce_correlated &&
+            payload_u64_field(data, "parser_count", parser_count) && parser_count > 0 &&
+            payload_u64_field(data, "functional_count", functional_count) && functional_count == 0 &&
+            payload_u64_field(data, "count", count) && count == 0 &&
+            payload_u64_field(data, "capture_counter_delta", capture_delta) && capture_delta == 0 &&
+            payload_array_count(data, parser_array, parser_items) && parser_items > 0;
+        proof = std::string(tool_lc == "quic_manage" ? "quic" : "dtls") +
+            "_parser_only_state_contract parser_count=" + std::to_string(static_cast<unsigned long long>(parser_count)) +
+            " parser_items=" + std::to_string(parser_items) +
+            " functional_count=" + std::to_string(static_cast<unsigned long long>(functional_count)) +
+            " capture_counter_delta=" + std::to_string(static_cast<unsigned long long>(capture_delta));
+        return ok;
+    }
+
+    bool protocol_live_functional_payload(const std::string& tool_lc,
+                                          const std::string& action_lc,
+                                          const mcp_standalone::json& data,
+                                          std::string& proof) {
+        proof.clear();
+        if (!protocol_detect_action(tool_lc, action_lc) || !data.is_object())
+            return false;
+        bool parser_only = true;
+        bool functional_evidence = false;
+        bool capture_evidence = false;
+        bool target_pid_correlated = false;
+        bool tuple_correlated = false;
+        bool payload_hash_correlated = false;
+        bool nonce_correlated = false;
+        uint64_t functional_count = 0;
+        uint64_t detected_count = 0;
+        uint64_t count = 0;
+        uint64_t capture_delta = 0;
+        const bool ok =
+            payload_bool_field(data, "parser_only", parser_only) && !parser_only &&
+            payload_bool_field(data, "functional_evidence", functional_evidence) && functional_evidence &&
+            payload_bool_field(data, "capture_evidence", capture_evidence) && capture_evidence &&
+            payload_bool_field(data, "target_pid_correlated", target_pid_correlated) && target_pid_correlated &&
+            payload_bool_field(data, "tuple_correlated", tuple_correlated) && tuple_correlated &&
+            payload_bool_field(data, "payload_hash_correlated", payload_hash_correlated) && payload_hash_correlated &&
+            payload_bool_field(data, "nonce_correlated", nonce_correlated) && nonce_correlated &&
+            payload_u64_field(data, "capture_counter_delta", capture_delta) && capture_delta > 0 &&
+            payload_u64_field(data, "functional_count", functional_count) && functional_count > 0 &&
+            payload_u64_field(data, "count", count) && count > 0;
+        payload_u64_field(data, "detected_count", detected_count);
+        proof = std::string(tool_lc == "quic_manage" ? "quic" : "dtls") +
+            "_live_driver_capture functional_evidence=" + std::to_string(functional_evidence ? 1 : 0) +
+            " capture_evidence=" + std::to_string(capture_evidence ? 1 : 0) +
+            " capture_counter_delta=" + std::to_string(static_cast<unsigned long long>(capture_delta)) +
+            " functional_count=" + std::to_string(static_cast<unsigned long long>(functional_count)) +
+            " detected_count=" + std::to_string(static_cast<unsigned long long>(detected_count)) +
+            " count=" + std::to_string(static_cast<unsigned long long>(count)) +
+            " target_pid_correlated=" + std::to_string(target_pid_correlated ? 1 : 0) +
+            " tuple_correlated=" + std::to_string(tuple_correlated ? 1 : 0) +
+            " payload_hash_correlated=" + std::to_string(payload_hash_correlated ? 1 : 0) +
+            " nonce_correlated=" + std::to_string(nonce_correlated ? 1 : 0);
+        return ok;
+    }
+
     bool classify_expected_empty_payload(const std::string& tool_name,
                                          const invoke_result_t& ir,
                                          const mcp_standalone::json* args,
@@ -4590,6 +4894,14 @@ namespace {
         const std::string tool_lc = lower_copy(tool_name);
         const std::string action_lc = lower_copy(action);
         const std::string label_lc = lower_copy(tool_name + " " + action);
+        if (protocol_detect_action(tool_lc, action_lc)) {
+            std::string contract_proof;
+            if (protocol_parser_state_contract_payload(tool_lc, action_lc, ir.data, contract_proof)) {
+                status = mcp_tool_call_status_t::state_contract_pass;
+                proof = contract_proof + " zero_reason=" + zero_reason;
+                return true;
+            }
+        }
         if (tool_lc == "burp_dom_xss_manage" && action_lc == "status" &&
             (zero_reason.find("camoufox_ready=false") != std::string::npos ||
              zero_reason.find("browser_open=false") != std::string::npos)) {
@@ -6707,7 +7019,6 @@ namespace {
 
         if (tool_lc == "quic_manage" ||
             tool_lc == "dtls_manage" ||
-            tool_lc == "tls_manage" ||
             tool_lc == "tls_manage") {
             uint64_t count = 1;
             size_t keys = 1;
@@ -7835,7 +8146,7 @@ namespace {
         const char* evidence_class = mcp_status_evidence_class(classification, functional_evidence, reason);
         const bool functional_coverage = mcp_classification_has_functional_coverage(classification, evidence_class);
         const std::string evidence_text = functional_evidence.empty()
-            ? (classification == mcp_tool_call_status_t::functional_pass ? "success_payload" : "nonfunctional_contract")
+            ? (classification == mcp_tool_call_status_t::functional_pass ? "functional_evidence_missing" : "nonfunctional_contract")
             : compact_text(functional_evidence, 700);
         log_msg(hf, tag, "CLASSIFICATION -- tool=%s action=%s classification=%s evidence_class=%s functional_coverage=%d functional_evidence=%s state_before=%s state_after=%s delta=%s dependency=%s dependency_available=%d reason=%s seq=%d",
             tool_name.empty() ? "<empty>" : tool_name.c_str(),
@@ -7941,6 +8252,161 @@ namespace {
         if (value.is_array() || value.is_object())
             return !value.empty();
         return true;
+    }
+
+    bool payload_has_diagnostic_or_empty_markers(const mcp_standalone::json& data) {
+        const std::string lc = lower_copy(compact_json(data, 3000));
+        return lc.find("diagnostic_only") != std::string::npos ||
+            lc.find("fallback") != std::string::npos ||
+            lc.find("failure_reason") != std::string::npos ||
+            lc.find("expected_empty") != std::string::npos ||
+            lc.find("dependency_unavailable") != std::string::npos ||
+            lc.find("dependency_available\":false") != std::string::npos ||
+            lc.find("no_frame_batches") != std::string::npos ||
+            lc.find("packet too small") != std::string::npos;
+    }
+
+    bool generic_payload_functional_evidence(const mcp_standalone::json& data, std::string& evidence) {
+        evidence.clear();
+        if (!json_value_has_material_content(data)) {
+            evidence = "generic_payload_without_material_data";
+            return false;
+        }
+        if (payload_has_diagnostic_or_empty_markers(data)) {
+            evidence = "generic_payload_contains_diagnostic_or_empty_marker";
+            return false;
+        }
+        uint64_t value = 0;
+        std::size_t count = 0;
+        std::string text;
+        if (payload_capture_or_result_evidence(data, evidence))
+            return true;
+        if (payload_positive_u64_any(data, {
+            "count", "total", "returned", "matched", "matches", "decoded", "parsed",
+            "bytes", "bytes_read", "bytes_written", "size", "process_id", "pid",
+            "thread_count", "module_count", "function_count", "instruction_count",
+            "result_count", "entry_count", "field_count", "packet_size"
+        }, &value)) {
+            evidence = "generic_positive_numeric_evidence=" + std::to_string(static_cast<unsigned long long>(value));
+            return true;
+        }
+        if (payload_nonempty_array_any(data, {
+            "items", "entries", "modules", "threads", "functions", "instructions",
+            "commands", "fields", "matches", "packets", "rows", "values"
+        }, &count)) {
+            evidence = "generic_nonempty_array_evidence=" + std::to_string(count);
+            return true;
+        }
+        if (payload_nonempty_string_any(data, {
+            "result", "value", "output", "path", "content", "text", "hex", "decimal",
+            "binary", "address", "module", "symbol", "name", "id", "session_id"
+        }, &text)) {
+            evidence = "generic_nonempty_string_evidence=" + compact_text(text, 180);
+            return true;
+        }
+        evidence = "generic_payload_without_explicit_positive_material";
+        return false;
+    }
+
+    bool dx_list_bound_cbuffers_functional_evidence(const mcp_standalone::json& data, std::string& evidence) {
+        uint64_t actual_bound_count = 0;
+        std::size_t actual_array_count = 0;
+        std::string capture_source;
+        payload_u64_field(data, "actual_bound_count", actual_bound_count);
+        payload_array_count(data, "actual_bound_cbuffers", actual_array_count);
+        payload_string_field(data, "capture_source", capture_source);
+        if (actual_bound_count > 0 &&
+            actual_array_count > 0 &&
+            lower_copy(capture_source) == "hardware_breakpoint_bind_context") {
+            evidence = "dx_list_bound_cbuffers live_bound_count=" +
+                std::to_string(static_cast<unsigned long long>(actual_bound_count)) +
+                " actual_array=" + std::to_string(actual_array_count) +
+                " capture_source=" + capture_source;
+            return true;
+        }
+        evidence = "dx_list_bound_cbuffers_nonfunctional actual_bound_count=" +
+            std::to_string(static_cast<unsigned long long>(actual_bound_count)) +
+            " actual_array=" + std::to_string(actual_array_count) +
+            " capture_source=" + (capture_source.empty() ? std::string("<empty>") : capture_source);
+        return false;
+    }
+
+    bool dx_verify_view_matrix_functional_evidence(const mcp_standalone::json& data, std::string& evidence) {
+        bool verified = false;
+        if (!payload_bool_field(data, "verified", verified) || !verified) {
+            evidence = "dx_verify_view_matrix_not_verified";
+            return false;
+        }
+        uint64_t projected_point_count = 0;
+        std::size_t projected_points = 0;
+        uint64_t heuristic_valid_count = 0;
+        payload_u64_field(data, "projected_point_count", projected_point_count);
+        payload_array_count(data, "projected_points", projected_points);
+        auto heuristic_it = data.find("heuristic");
+        if (heuristic_it != data.end() && heuristic_it->is_object())
+            payload_u64_field(*heuristic_it, "valid_count", heuristic_valid_count);
+        std::string semantics;
+        payload_string_field(data, "finding_semantics", semantics);
+        const bool explicit_projection_proof =
+            projected_point_count > 0 ||
+            projected_points > 0 ||
+            (heuristic_valid_count > 0 && semantics == "projection_verification_evidence_not_camera_object");
+        if (!explicit_projection_proof) {
+            evidence = "dx_verify_view_matrix_missing_projection_evidence projected_point_count=" +
+                std::to_string(static_cast<unsigned long long>(projected_point_count)) +
+                " projected_points=" + std::to_string(projected_points) +
+                " heuristic_valid_count=" + std::to_string(static_cast<unsigned long long>(heuristic_valid_count)) +
+                " semantics=" + (semantics.empty() ? std::string("<empty>") : semantics);
+            return false;
+        }
+        evidence = "dx_verify_view_matrix verified=1 projected_point_count=" +
+            std::to_string(static_cast<unsigned long long>(projected_point_count)) +
+            " projected_points=" + std::to_string(projected_points) +
+            " heuristic_valid_count=" + std::to_string(static_cast<unsigned long long>(heuristic_valid_count)) +
+            " semantics=" + semantics;
+        return true;
+    }
+
+    bool dx_get_frame_summary_functional_evidence(const mcp_standalone::json& data, std::string& evidence) {
+        uint64_t frame_count = 0;
+        if (!payload_u64_field(data, "frame_count", frame_count) || frame_count == 0) {
+            evidence = "dx_get_frame_summary_zero_frame_batches";
+            return false;
+        }
+        evidence = "dx_get_frame_summary frame_count=" + std::to_string(static_cast<unsigned long long>(frame_count));
+        return true;
+    }
+
+    bool gameproto_enet_decode_functional_evidence(const mcp_standalone::json& args, const mcp_standalone::json& data, std::string& evidence, bool& negative_shape) {
+        negative_shape = false;
+        std::string packet_hex;
+        if (args.is_object()) {
+            auto it = args.find("packet_hex");
+            if (it != args.end() && it->is_string())
+                packet_hex = it->get<std::string>();
+        }
+        bool valid = false;
+        uint64_t packet_size = 0;
+        payload_bool_field(data, "valid", valid);
+        payload_u64_field(data, "packet_size", packet_size);
+        if (packet_hex.empty()) {
+            negative_shape = !valid && packet_size == 0;
+            evidence = negative_shape ? "enet_empty_packet_negative_shape" : "enet_empty_packet_without_negative_shape_proof";
+            return false;
+        }
+        std::size_t commands = 0;
+        payload_array_count(data, "commands", commands);
+        if (valid && packet_size > 0 && commands > 0) {
+            evidence = "enet_decode valid=1 packet_size=" +
+                std::to_string(static_cast<unsigned long long>(packet_size)) +
+                " commands=" + std::to_string(commands);
+            return true;
+        }
+        evidence = "enet_decode_missing_positive_packet_evidence valid=" +
+            std::to_string(valid ? 1 : 0) +
+            " packet_size=" + std::to_string(static_cast<unsigned long long>(packet_size)) +
+            " commands=" + std::to_string(commands);
+        return false;
     }
 
     bool driver_integrity_detector_positive_evidence(const mcp_standalone::json& data, std::string& evidence) {
@@ -8061,6 +8527,14 @@ namespace {
             (!nested_action_lc.empty() && (action_lc == "capture" || action_lc == "manage" || action_lc == "cookies"))
                 ? nested_action_lc
                 : action_lc;
+        if (protocol_detect_action(tool_lc, effective_action_lc)) {
+            if (protocol_live_functional_payload(tool_lc, effective_action_lc, ir.data, evidence))
+                return mcp_tool_call_status_t::functional_pass;
+            if (protocol_parser_state_contract_payload(tool_lc, effective_action_lc, ir.data, evidence))
+                return mcp_tool_call_status_t::state_contract_pass;
+            evidence = std::string(tool_lc == "quic_manage" ? "quic" : "dtls") + "_detect_missing_required_live_correlation";
+            return mcp_tool_call_status_t::state_contract_pass;
+        }
         if (tool_lc == "network_capture_manage") {
             std::string capture_reason;
             if (payload_capture_or_result_evidence(ir.data, capture_reason)) {
@@ -8271,6 +8745,27 @@ namespace {
                 return mcp_tool_call_status_t::security_guard_pass;
             return mcp_tool_call_status_t::contract_pass;
         }
+        if (tool_lc == "dx_list_bound_cbuffers") {
+            if (dx_list_bound_cbuffers_functional_evidence(ir.data, evidence))
+                return mcp_tool_call_status_t::functional_pass;
+            return mcp_tool_call_status_t::state_contract_pass;
+        }
+        if (tool_lc == "dx_verify_view_matrix") {
+            if (dx_verify_view_matrix_functional_evidence(ir.data, evidence))
+                return mcp_tool_call_status_t::functional_pass;
+            return mcp_tool_call_status_t::state_contract_pass;
+        }
+        if (tool_lc == "dx_get_frame_summary") {
+            if (dx_get_frame_summary_functional_evidence(ir.data, evidence))
+                return mcp_tool_call_status_t::functional_pass;
+            return mcp_tool_call_status_t::state_contract_pass;
+        }
+        if (tool_lc == "gameproto_enet_decode" || tool_lc == "gameproto_decode_enet") {
+            bool negative_shape = false;
+            if (gameproto_enet_decode_functional_evidence(args, ir.data, evidence, negative_shape))
+                return mcp_tool_call_status_t::functional_pass;
+            return negative_shape ? mcp_tool_call_status_t::negative_pass : mcp_tool_call_status_t::state_contract_pass;
+        }
         if (tool_lc == "network_pre_encrypt_hook") {
             std::string capture_reason;
             if (effective_action_lc == "status") {
@@ -8310,8 +8805,9 @@ namespace {
             evidence = "idempotent_cleanup_contract " + delta_reason;
             return mcp_tool_call_status_t::cleanup_contract_pass;
         }
-        evidence = "success_payload";
-        return mcp_tool_call_status_t::functional_pass;
+        if (generic_payload_functional_evidence(ir.data, evidence))
+            return mcp_tool_call_status_t::functional_pass;
+        return mcp_tool_call_status_t::state_contract_pass;
     }
 
     void cancel_timed_out_tool(HANDLE hf, const char* tag, const std::string& name, const mcp_standalone::json& args) {
@@ -10319,7 +10815,32 @@ namespace {
             mcp_standalone::json{{"device_control_handler_va", "0x140001000"}},
             true, true,
             [](const invoke_result_t& ir, std::string& reason) {
-                return test_coverage_protected_re_domains_11_15_payload_contains(ir, {"dispatch_type", "ioctl_handlers"}, reason);
+                if (!test_coverage_protected_re_domains_11_15_payload_contains(ir, {"dispatch_type", "ioctl_handlers"}, reason))
+                    return false;
+                std::size_t handlers = 0;
+                std::size_t jump_tables = 0;
+                std::size_t comparisons = 0;
+                std::size_t jump_entries = 0;
+                payload_array_count(ir.data, "ioctl_handlers", handlers);
+                payload_array_count(ir.data, "jump_tables", jump_tables);
+                payload_array_count(ir.data, "comparison_evidence", comparisons);
+                auto jt = ir.data.find("jump_tables");
+                if (jt != ir.data.end() && jt->is_array()) {
+                    for (const auto& table : *jt) {
+                        std::size_t entries = 0;
+                        if (payload_array_count(table, "entries", entries))
+                            jump_entries += entries;
+                    }
+                }
+                if (handlers == 0 && jump_entries == 0 && comparisons == 0) {
+                    reason = "drv_find_ioctl_dispatch empty dispatch evidence handlers=0 jump_entries=0 comparisons=0 data=" + compact_json(ir.data, 700);
+                    return false;
+                }
+                reason = "drv_find_ioctl_dispatch handlers=" + std::to_string(handlers) +
+                    " jump_tables=" + std::to_string(jump_tables) +
+                    " jump_entries=" + std::to_string(jump_entries) +
+                    " comparisons=" + std::to_string(comparisons);
+                return true;
             },
             passed, failed);
 
@@ -12143,25 +12664,16 @@ namespace {
             mcp_standalone::json args;
             args["process_id"] = pid;
             args["api"] = "d3d11";
-            args["include_snapshot_fallback"] = true;
+            args["include_snapshot_fallback"] = false;
             args["matrix_buffer_va"] = test_coverage_domains_1_8_hex_ptr(desc.matrix_buffer_va);
-            test_coverage_domains_1_8_case(hf, tag, "dx_list_bound_cbuffers", "list_bound_cbuffers_explicit_diagnostic_fallback", args, 4000,
+            test_coverage_domains_1_8_case(hf, tag, "dx_list_bound_cbuffers", "list_bound_cbuffers_live_bound_context", args, 4000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
                         reason = "list_bound_cbuffers failed text=" + compact_text(ir.text, 300);
                         return false;
                     }
-                    uint64_t count = 0;
-                    if (!payload_u64_field(ir.data, "count", count) || count == 0) {
-                        reason = "no explicit diagnostic cbuffer candidates available";
+                    if (!dx_list_bound_cbuffers_functional_evidence(ir.data, reason))
                         return false;
-                    }
-                    std::string capture_source;
-                    if (!payload_string_field(ir.data, "capture_source", capture_source) ||
-                        lower_copy(capture_source).find("bounded") == std::string::npos) {
-                        reason = "cbuffer diagnostic fallback was not labeled as bounded data=" + compact_json(ir.data, 700);
-                        return false;
-                    }
                     return true;
                 }, passed, failed);
         }
@@ -12333,23 +12845,10 @@ namespace {
             test_coverage_domains_1_8_case(hf, tag, "dx_verify_view_matrix", "verify_fixture_matrix_projection", args, 6000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
-                        if (ir.data.contains("eval_reason") || ir.text.find("eval_reason") != std::string::npos) {
-                            return true;
-                        }
                         reason = "dx_verify_view_matrix failed without eval_reason diagnostic text=" + compact_text(ir.text, 300);
                         return false;
                     }
-                    std::string matrix_type;
-                    if (!payload_string_field(ir.data, "matrix_type", matrix_type)) {
-                        reason = "dx_verify_view_matrix missing matrix_type data=" + compact_json(ir.data, 700);
-                        return false;
-                    }
-                    bool verified = false;
-                    if (!payload_bool_field(ir.data, "verified", verified)) {
-                        reason = "dx_verify_view_matrix missing verified field data=" + compact_json(ir.data, 700);
-                        return false;
-                    }
-                    return true;
+                    return dx_verify_view_matrix_functional_evidence(ir.data, reason);
                 }, passed, failed);
         } else {
             test_coverage_domains_1_8_fixture_fail(hf, tag, "dx_verify_view_matrix", "RE descriptor missing matrix_buffer_va: " + descriptor_reason, failed);
@@ -12484,27 +12983,13 @@ namespace {
             mcp_standalone::json args;
             args["process_id"] = pid;
             args["latest"] = true;
-            test_coverage_domains_1_8_case(hf, tag, "dx_get_frame_summary", "get_frame_summary_no_batches_diagnostic", args, 5000,
+            test_coverage_domains_1_8_case(hf, tag, "dx_get_frame_summary", "get_frame_summary_captured_batches", args, 5000,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
                         reason = "dx_get_frame_summary failed text=" + compact_text(ir.text, 300);
                         return false;
                     }
-                    uint64_t frame_count = 1;
-                    if (!payload_u64_field(ir.data, "frame_count", frame_count)) {
-                        reason = "dx_get_frame_summary missing frame_count data=" + compact_json(ir.data, 700);
-                        return false;
-                    }
-                    if (frame_count != 0) {
-                        reason = "dx_get_frame_summary frame_count should be 0 for no batches data=" + compact_json(ir.data, 700);
-                        return false;
-                    }
-                    std::string failure_reason;
-                    if (!payload_string_field(ir.data, "failure_reason", failure_reason)) {
-                        reason = "dx_get_frame_summary missing failure_reason data=" + compact_json(ir.data, 700);
-                        return false;
-                    }
-                    return true;
+                    return dx_get_frame_summary_functional_evidence(ir.data, reason);
                 }, passed, failed);
         }
 
@@ -15088,7 +15573,7 @@ namespace {
         record_tool_status(tool, out.ok ? mcp_tool_call_status_t::passed :
             mcp_tool_call_status_t::failed);
         log_mcp_call_classification(hf, tag, seq, tool, args, out.ok ? mcp_tool_call_status_t::passed : mcp_tool_call_status_t::failed, out.result,
-            out.ok ? "sidecar_success_payload" : "", out.ok ? std::string() : std::string("sidecar_dispatch_failed"));
+            out.ok ? "sidecar_dispatch_positive_result" : "", out.ok ? std::string() : std::string("sidecar_dispatch_failed"));
         return out;
     }
 
@@ -18186,64 +18671,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         return ok && sent > 0 && got > 0 && spoofed_answer;
     }
 
-    bool seed_udp_capture_for_detection(HANDLE hf, const char* tag, uint16_t port, const std::vector<uint8_t>& payload, bool* active_out = nullptr, uint32_t* captured_out = nullptr, uint32_t* dropped_out = nullptr) {
-        if (!driver_bridge::using_kernel_driver()) {
-            log_msg(hf, tag, "FAIL -- kernel driver not loaded for UDP detection fixture");
-            return false;
-        }
-        bool active_before_stop = false;
-        uint32_t captured_before_stop = 0;
-        uint32_t dropped_before_stop = 0;
-        driver_bridge::get_capture_status(active_before_stop, captured_before_stop, dropped_before_stop);
-        driver_bridge::stop_capture();
-        const DWORD start_tick = GetTickCount();
-        log_msg(hf, tag, "NETWORK-FIXTURE -- udp capture start pid=%lu port=%u protocol=17 payload_bytes=%zu previous_active=%d previous_captured=%u previous_dropped=%u header=%s",
-            static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned>(port),
-            payload.size(),
-            active_before_stop ? 1 : 0,
-            captured_before_stop,
-            dropped_before_stop,
-            hex_preview(payload, 32).c_str());
-        if (!driver_bridge::start_capture(GetCurrentProcessId(), port, 17, nullptr, 1500)) {
-            log_msg(hf, tag, "FAIL -- start_capture failed for UDP fixture pid=%lu port=%u",
-                static_cast<unsigned long>(GetCurrentProcessId()),
-                static_cast<unsigned>(port));
-            return false;
-        }
-        if (!send_udp_fixture_payload(hf, tag, port, payload)) {
-            driver_bridge::stop_capture();
-            return false;
-        }
-        bool active = false;
-        uint32_t captured = 0;
-        uint32_t dropped = 0;
-        uint32_t polls = 0;
-        do {
-            driver_bridge::get_capture_status(active, captured, dropped);
-            if (captured != 0 || dropped != 0 || GetTickCount() - start_tick >= 1500)
-                break;
-            ++polls;
-            Sleep(50);
-        } while (true);
-        if (active_out)
-            *active_out = active;
-        if (captured_out)
-            *captured_out = captured;
-        if (dropped_out)
-            *dropped_out = dropped;
-        log_msg(hf, tag, "NETWORK-FIXTURE -- udp capture seeded pid=%lu port=%u active=%d captured=%u dropped=%u polls=%u elapsed_ms=%lu header=%s",
-            static_cast<unsigned long>(GetCurrentProcessId()),
-            static_cast<unsigned>(port),
-            active ? 1 : 0,
-            captured,
-            dropped,
-            polls,
-            static_cast<unsigned long>(GetTickCount() - start_tick),
-            hex_preview(payload, 32).c_str());
-        return true;
-    }
-
     void stop_udp_capture_after_detection(HANDLE hf, const char* tag, uint16_t port) {
         bool active_before = false;
         uint32_t captured_before = 0;
@@ -18263,6 +18690,137 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             active_after ? 1 : 0,
             captured_after,
             dropped_after);
+    }
+
+    bool start_udp_live_capture_for_detection(HANDLE hf, const char* tag, uint16_t port, bool* active_out = nullptr, uint32_t* captured_out = nullptr, uint32_t* dropped_out = nullptr) {
+        if (!driver_bridge::using_kernel_driver()) {
+            log_msg(hf, tag, "FAIL -- kernel driver not loaded for live UDP detection fixture");
+            return false;
+        }
+        bool active_before_stop = false;
+        uint32_t captured_before_stop = 0;
+        uint32_t dropped_before_stop = 0;
+        driver_bridge::get_capture_status(active_before_stop, captured_before_stop, dropped_before_stop);
+        driver_bridge::stop_capture();
+        const DWORD start_tick = GetTickCount();
+        log_msg(hf, tag, "NETWORK-FIXTURE -- live udp capture start pid=%lu port=%u protocol=17 previous_active=%d previous_captured=%u previous_dropped=%u",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned>(port),
+            active_before_stop ? 1 : 0,
+            captured_before_stop,
+            dropped_before_stop);
+        if (!driver_bridge::start_capture(GetCurrentProcessId(), port, 17, nullptr, 2500)) {
+            log_msg(hf, tag, "FAIL -- live start_capture failed pid=%lu port=%u",
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned>(port));
+            return false;
+        }
+        bool active = false;
+        uint32_t captured = 0;
+        uint32_t dropped = 0;
+        driver_bridge::get_capture_status(active, captured, dropped);
+        if (active_out)
+            *active_out = active;
+        if (captured_out)
+            *captured_out = captured;
+        if (dropped_out)
+            *dropped_out = dropped;
+        log_msg(hf, tag, "NETWORK-FIXTURE -- live udp capture armed pid=%lu port=%u active=%d captured=%u dropped=%u elapsed_ms=%lu",
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned>(port),
+            active ? 1 : 0,
+            captured,
+            dropped,
+            static_cast<unsigned long>(GetTickCount() - start_tick));
+        if (!active) {
+            driver_bridge::stop_capture();
+            log_msg(hf, tag, "FAIL -- live udp capture inactive after start pid=%lu port=%u captured=%u dropped=%u",
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned>(port),
+                captured,
+                dropped);
+        }
+        return active;
+    }
+
+    struct udp_detection_stimulus_t {
+        std::thread worker;
+        std::shared_ptr<std::atomic<bool>> started = std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<std::atomic<uint32_t>> sent = std::make_shared<std::atomic<uint32_t>>(0);
+        std::shared_ptr<std::atomic<uint32_t>> failed = std::make_shared<std::atomic<uint32_t>>(0);
+        std::shared_ptr<std::atomic<DWORD>> tid = std::make_shared<std::atomic<DWORD>>(0);
+    };
+
+    bool start_udp_detection_stimulus(HANDLE hf,
+                                      const char* tag,
+                                      uint16_t port,
+                                      std::vector<uint8_t> payload,
+                                      const char* label,
+                                      udp_detection_stimulus_t& out) {
+        try {
+            std::string tag_s = tag ? tag : "mcp.udp_detection";
+            std::string label_s = label ? label : "udp_detection_stimulus";
+            out.worker = std::thread([hf, tag_s, port, payload = std::move(payload), label_s,
+                                      started = out.started,
+                                      done = out.done,
+                                      sent = out.sent,
+                                      failed = out.failed,
+                                      tid = out.tid]() {
+                const DWORD owner_tid = GetCurrentThreadId();
+                tid->store(owner_tid, std::memory_order_release);
+                started->store(true, std::memory_order_release);
+                const DWORD start_tick = GetTickCount();
+                log_msg(hf, tag_s.c_str(), "NETWORK-FIXTURE -- live udp stimulus start label=%s pid=%lu tid=%lu port=%u bytes=%zu header=%s",
+                    label_s.c_str(),
+                    static_cast<unsigned long>(GetCurrentProcessId()),
+                    static_cast<unsigned long>(owner_tid),
+                    static_cast<unsigned>(port),
+                    payload.size(),
+                    hex_preview(payload, 32).c_str());
+                for (uint32_t i = 0; i < 24; ++i) {
+                    if (i != 0)
+                        Sleep(20);
+                    if (send_udp_fixture_payload(hf, tag_s.c_str(), port, payload))
+                        sent->fetch_add(1, std::memory_order_acq_rel);
+                    else
+                        failed->fetch_add(1, std::memory_order_acq_rel);
+                }
+                done->store(true, std::memory_order_release);
+                log_msg(hf, tag_s.c_str(), "NETWORK-FIXTURE -- live udp stimulus done label=%s pid=%lu tid=%lu port=%u sent=%u failed=%u elapsed_ms=%lu",
+                    label_s.c_str(),
+                    static_cast<unsigned long>(GetCurrentProcessId()),
+                    static_cast<unsigned long>(owner_tid),
+                    static_cast<unsigned>(port),
+                    sent->load(std::memory_order_acquire),
+                    failed->load(std::memory_order_acquire),
+                    static_cast<unsigned long>(GetTickCount() - start_tick));
+            });
+            return true;
+        } catch (const std::exception& ex) {
+            log_msg(hf, tag, "FAIL -- live UDP stimulus thread creation failed port=%u err=%s",
+                static_cast<unsigned>(port),
+                ex.what());
+            out.done->store(true, std::memory_order_release);
+            return false;
+        } catch (...) {
+            log_msg(hf, tag, "FAIL -- live UDP stimulus thread creation failed port=%u err=<unknown>",
+                static_cast<unsigned>(port));
+            out.done->store(true, std::memory_order_release);
+            return false;
+        }
+    }
+
+    void join_udp_detection_stimulus(HANDLE hf, const char* tag, uint16_t port, udp_detection_stimulus_t& stimulus) {
+        if (stimulus.worker.joinable())
+            stimulus.worker.join();
+        log_msg(hf, tag, "NETWORK-FIXTURE -- live udp stimulus joined port=%u started=%d done=%d tid=%lu sent=%u failed=%u",
+            static_cast<unsigned>(port),
+            stimulus.started->load(std::memory_order_acquire) ? 1 : 0,
+            stimulus.done->load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long>(stimulus.tid->load(std::memory_order_acquire)),
+            stimulus.sent->load(std::memory_order_acquire),
+            stimulus.failed->load(std::memory_order_acquire));
     }
 
     std::vector<uint8_t> mcp_http_fixture_request_payload(const char* path) {
@@ -18946,12 +19504,6 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     safe_external_guard_exempt &&
                     st.security_guard_passed > 0 &&
                     st.passed == 0;
-                const bool action_dependency_blocked_nonfatal =
-                    t.name == "analysis_query" &&
-                    st.dependency_blocked > 0 &&
-                    st.passed > 0 &&
-                    st.failed == 0 &&
-                    st.timed_out == 0;
                 const auto expected_reason_it_for_tool = g_mcp_expected_empty_reasons.find(t.name);
                 const auto contract_reason_it_for_tool = g_mcp_nonfunctional_contract_reasons.find(t.name);
                 std::string state_contract_reason_for_tool;
@@ -18994,12 +19546,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                         t.name,
                         fallback_reason + " " + stats_summary);
                 }
-                if (action_dependency_blocked_nonfatal) {
-                    ++covered;
-                    ++passed_tools;
-                    log_msg(hf, tag, "ACTION-DEPENDENCY-BLOCKED-NONFATAL -- registered tool \"%s\" retained functional coverage despite action-level PDB dependency block %s",
-                        t.name.c_str(), stats_summary.c_str());
-                } else if (st.dependency_blocked > 0) {
+                if (st.dependency_blocked > 0) {
                     ++no_pass;
                     log_msg(hf, tag, "DEPENDENCY-BLOCKED-COVERAGE-INVALID -- registered tool \"%s\" dependency-blocked results cannot satisfy functional coverage %s",
                         t.name.c_str(), stats_summary.c_str());
@@ -19096,7 +19643,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                         t.name,
                         stats_summary);
                 }
-                if (st.dependency_blocked > 0 && !action_dependency_blocked_nonfatal)
+                if (st.dependency_blocked > 0)
                     ++dependency_blocked_tools;
                 if (st.cascade_blocked > 0)
                     ++cascade_blocked_tools;
@@ -19270,6 +19817,60 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 reason);
         }
 
+        const auto case_ledger = copy_mcp_case_ledger();
+        const int ledger_terminal_records = static_cast<int>(case_ledger.size());
+        std::set<std::string> ledger_case_ids;
+        std::set<std::string> ledger_registered_tools;
+        int ledger_duplicate_case_ids = 0;
+        for (std::size_t i = 0; i < case_ledger.size(); ++i) {
+            const auto& entry = case_ledger[i];
+            const bool audited_registered = registered.find(entry.tool) != registered.end();
+            if (audited_registered)
+                ledger_registered_tools.insert(entry.tool);
+            if (!ledger_case_ids.insert(entry.case_id).second)
+                ++ledger_duplicate_case_ids;
+            log_msg(hf, tag, "MCP-CASE-LEDGER -- index=%zu case_id=\"%s\" tool=\"%s\" status=%s audited_registered=%d ordinal=%llu",
+                i + 1,
+                entry.case_id.c_str(),
+                entry.tool.c_str(),
+                entry.status_name.c_str(),
+                audited_registered ? 1 : 0,
+                static_cast<unsigned long long>(entry.ordinal));
+        }
+        int ledger_registered_missing_tools = 0;
+        for (const auto& registered_tool : registered) {
+            if (ledger_registered_tools.find(registered_tool) == ledger_registered_tools.end()) {
+                ++ledger_registered_missing_tools;
+                record_mcp_phase_gap("mcp_audit.ledger_missing." + mcp_case_id_fragment(registered_tool),
+                    registered_tool,
+                    "registered audited tool has no terminal MCP case ledger row");
+            }
+        }
+        if (ledger_duplicate_case_ids != 0) {
+            record_mcp_phase_gap("mcp_audit.ledger_duplicate_case_id",
+                "mcp_case_ledger",
+                "duplicate terminal case ledger ids=" + std::to_string(ledger_duplicate_case_ids));
+        }
+        const int phase_completed_by_ledger = ledger_terminal_records;
+        const int phase_remaining_by_ledger = k_mcp_planned_tool_tests > phase_completed_by_ledger ? k_mcp_planned_tool_tests - phase_completed_by_ledger : 0;
+        const int phase_extra_terminal_records = phase_completed_by_ledger > k_mcp_planned_tool_tests ? phase_completed_by_ledger - k_mcp_planned_tool_tests : 0;
+        if (phase_remaining_by_ledger != 0 || phase_extra_terminal_records != 0) {
+            record_mcp_phase_gap("mcp_audit.case_ledger_planned_mismatch",
+                "mcp_case_ledger",
+                "planned=" + std::to_string(k_mcp_planned_tool_tests) +
+                    " terminal=" + std::to_string(phase_completed_by_ledger) +
+                    " remaining=" + std::to_string(phase_remaining_by_ledger) +
+                    " extra=" + std::to_string(phase_extra_terminal_records));
+        }
+        log_msg(hf, tag, "MCP-CASE-LEDGER-SUMMARY -- planned=%d terminal_records=%d phase_remaining=%d phase_extra=%d registered_terminal_tools=%zu registered_missing_tools=%d duplicate_case_ids=%d",
+            k_mcp_planned_tool_tests,
+            ledger_terminal_records,
+            phase_remaining_by_ledger,
+            phase_extra_terminal_records,
+            ledger_registered_tools.size(),
+            ledger_registered_missing_tools,
+            ledger_duplicate_case_ids);
+
         const bool destructive_schema_accounting_ok =
             destructive_schema_exemptions == k_expected_destructive_schema_only_exemptions &&
             destructive_schema_exempt_covered == k_expected_destructive_schema_only_exemptions;
@@ -19303,7 +19904,11 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             diagnostic_fallback_functional_tools == 0 &&
             outstanding_timed_out_workers == 0 &&
             timed_out_drain_complete &&
-            destructive_schema_accounting_ok;
+            destructive_schema_accounting_ok &&
+            phase_remaining_by_ledger == 0 &&
+            phase_extra_terminal_records == 0 &&
+            ledger_registered_missing_tools == 0 &&
+            ledger_duplicate_case_ids == 0;
 
         mcp_coverage_audit_snapshot_t snapshot;
         snapshot.audit_started = true;
@@ -19338,9 +19943,16 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         snapshot.ide_chat_only = registered_ide_chat;
         snapshot.ai_excluded = skipped_ai;
         snapshot.non_ai_audited = non_ai_audited;
+        snapshot.phase_completed = phase_completed_by_ledger;
+        snapshot.phase_remaining = phase_remaining_by_ledger;
+        snapshot.phase_extra_terminal_records = phase_extra_terminal_records;
+        snapshot.ledger_terminal_records = ledger_terminal_records;
+        snapshot.ledger_registered_terminal_tools = static_cast<int>(ledger_registered_tools.size());
+        snapshot.ledger_registered_missing_tools = ledger_registered_missing_tools;
+        snapshot.ledger_duplicate_case_ids = ledger_duplicate_case_ids;
         store_mcp_audit_snapshot(snapshot);
 
-        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d diagnostic_fallback_tools=%d diagnostic_fallback_functional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu strict_safe_contract_proof=1 destructive_schema_expected=%d destructive_schema_ok=%d",
+        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d diagnostic_fallback_tools=%d diagnostic_fallback_functional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu ledger_terminal_records=%d ledger_registered_terminal_tools=%d ledger_registered_missing_tools=%d ledger_duplicate_case_ids=%d phase_remaining=%d phase_extra=%d strict_safe_contract_proof=1 destructive_schema_expected=%d destructive_schema_ok=%d",
             registered_total,
             registered_external,
             registered_internal,
@@ -19369,6 +19981,12 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             outstanding_timed_out_workers,
             timed_out_drain_complete ? 1 : 0,
             g_invoked_tools.size(),
+            ledger_terminal_records,
+            static_cast<int>(ledger_registered_tools.size()),
+            ledger_registered_missing_tools,
+            ledger_duplicate_case_ids,
+            phase_remaining_by_ledger,
+            phase_extra_terminal_records,
             k_expected_destructive_schema_only_exemptions,
             destructive_schema_accounting_ok ? 1 : 0);
 
@@ -20398,14 +21016,14 @@ void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std
 
     void test_tool_driver_enum_kernel_callbacks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call_with_followup(hf, "mcp.driver_enum_kernel_callbacks", get_server(), "driver_enum_kernel_callbacks", {}, passed, failed, skipped,
-            mcp_tool_call_status_t::functional_pass, "kernel_callback_structural_proof",
+            mcp_tool_call_status_t::functional_pass, "kernel_callback_live_enumeration_proof",
             [](const invoke_result_t& ir, std::string& proof) {
                 std::string reason;
-                if (!driver_kernel_callbacks_structural_proof(ir, reason)) {
+                if (!driver_kernel_callbacks_live_enumeration_proof(ir, reason)) {
                     proof = reason;
                     return false;
                 }
-                proof = "kernel callback metadata and callback arrays structurally valid";
+                proof = reason;
                 return true;
             });
     }
@@ -26119,6 +26737,64 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         test_tool_call(hf, "mcp.network_protobuf_decode", get_server(), "network_protobuf_decode", args, passed, failed, skipped);
     }
 
+    bool hint_only_key_scan_result(const mcp_standalone::json& data, const char* label, std::string& proof) {
+        uint64_t keys_found = 0;
+        size_t keys = 0;
+        bool bounded = false;
+        bool hint_only = false;
+        bool hint_used = false;
+        bool deadline_expired = true;
+        bool cancelled = true;
+        uint64_t hint_address = 0;
+        uint64_t hint_size = 0;
+        std::string early_exit_reason;
+        payload_u64_field(data, "keys_found", keys_found);
+        payload_array_count(data, "keys", keys);
+        payload_bool_field(data, "bounded", bounded);
+        payload_bool_field(data, "hint_only", hint_only);
+        payload_bool_field(data, "hint_used", hint_used);
+        payload_bool_field(data, "deadline_expired", deadline_expired);
+        payload_bool_field(data, "cancelled", cancelled);
+        payload_u64_field(data, "hint_address", hint_address);
+        payload_u64_field(data, "hint_size", hint_size);
+        payload_string_field(data, "early_exit_reason", early_exit_reason);
+        proof = std::string(label ? label : "key_scan") +
+            " keys_found=" + std::to_string(static_cast<unsigned long long>(keys_found)) +
+            " keys_array=" + std::to_string(keys) +
+            " bounded=" + std::to_string(bounded ? 1 : 0) +
+            " hint_only=" + std::to_string(hint_only ? 1 : 0) +
+            " hint_used=" + std::to_string(hint_used ? 1 : 0) +
+            " hint_address=" + hex_u64(hint_address) +
+            " hint_size=" + std::to_string(static_cast<unsigned long long>(hint_size)) +
+            " deadline_expired=" + std::to_string(deadline_expired ? 1 : 0) +
+            " cancelled=" + std::to_string(cancelled ? 1 : 0) +
+            " early_exit_reason=" + (early_exit_reason.empty() ? std::string("<empty>") : early_exit_reason);
+        return (keys_found > 0 || keys > 0) && bounded && hint_only && hint_used &&
+            hint_address != 0 && hint_size != 0 && !deadline_expired && !cancelled &&
+            early_exit_reason != "hint_missing";
+    }
+
+    void require_hint_only_key_scan_result(HANDLE hf,
+                                           const char* tag,
+                                           const char* tool_name,
+                                           const mcp_standalone::tool_result_t& result,
+                                           std::atomic<int>& passed,
+                                           std::atomic<int>& failed) {
+        std::string proof;
+        if (hint_only_key_scan_result(result.data, tool_name, proof)) {
+            log_msg(hf, tag, "KEY-FIXTURE-PROOF -- %s", compact_text(proof, 900).c_str());
+            return;
+        }
+        log_msg(hf, tag, "FAIL -- hint-only key scan proof failed: %s text=%s data=%s",
+            compact_text(proof, 900).c_str(),
+            compact_text(result.text, 700).c_str(),
+            compact_json(result.data, 900).c_str());
+        if (passed.load(std::memory_order_acquire) > 0)
+            passed.fetch_sub(1, std::memory_order_acq_rel);
+        failed.fetch_add(1, std::memory_order_acq_rel);
+        convert_tool_pass_to_fail(tool_name ? tool_name : "");
+    }
+
     void test_tool_tls_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.tls_manage.extract_keys", g_mcp_scanner_addr, 4096, {0x54, 0x4C, 0x53, 0x4B})) {
             record_fixture_failed_tool("tls_manage", failed);
@@ -26154,7 +26830,10 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             static_cast<unsigned long long>(g_mcp_scanner_addr),
             bytes.size(),
             driver_bridge::attached_pid());
-        test_tool_action_call(hf, "mcp.tls_manage.extract_keys", "tls_manage", "extract_keys", args, passed, failed, skipped);
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.tls_manage.extract_keys", "tls_manage", "extract_keys", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed)
+            require_hint_only_key_scan_result(hf, "mcp.tls_manage.extract_keys", "tls_manage", result, passed, failed);
     }
 
     void test_tool_tls_manage_start_keylog(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -26345,30 +27024,52 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10
         };
+        mcp_standalone::json parser_args;
+        parser_args["action"] = "detect_connections";
+        parser_args["pid"] = GetCurrentProcessId();
+        parser_args["payload_hex"] = test_coverage_bytes_hex(packet);
+        parser_args["remote_port"] = 443;
+        parser_args["local_port"] = 40000;
+        log_msg(hf, "mcp.quic_manage.detect_connections.parser", "NETWORK-FIXTURE -- quic detector parser-only dispatch bytes=%zu header_class=quic_initial_long",
+            packet.size());
+        test_tool_call_with_followup(hf, "mcp.quic_manage.detect_connections.parser", get_server(), "quic_manage", parser_args, passed, failed, skipped,
+            mcp_tool_call_status_t::state_contract_pass, "quic_parser_only_contract",
+            [](const invoke_result_t& ir, std::string& proof) {
+                return protocol_parser_state_contract_payload("quic_manage", "detect_connections", ir.data, proof);
+            });
+
         bool capture_active = false;
         uint32_t capture_count = 0;
         uint32_t capture_dropped = 0;
-        if (!seed_udp_capture_for_detection(hf, "mcp.quic_manage.detect_connections", 443, packet, &capture_active, &capture_count, &capture_dropped)) {
+        if (!start_udp_live_capture_for_detection(hf, "mcp.quic_manage.detect_connections.live", 443, &capture_active, &capture_count, &capture_dropped)) {
             record_fixture_failed_tool("quic_manage", failed);
             return;
         }
-        mcp_standalone::json args;
-        args["pid"] = GetCurrentProcessId();
-        args["payload_hex"] = test_coverage_bytes_hex(packet);
-        args["remote_port"] = 443;
-        args["local_port"] = 40000;
-        log_msg(hf, "mcp.quic_manage.detect_connections", "NETWORK-FIXTURE -- quic detector dispatch deterministic_payload=1 capture_active=%d capture_count=%u capture_dropped=%u bytes=%zu header_class=quic_initial_long",
+        udp_detection_stimulus_t stimulus;
+        if (!start_udp_detection_stimulus(hf, "mcp.quic_manage.detect_connections.live", 443, packet, "quic_live_detector", stimulus)) {
+            stop_udp_capture_after_detection(hf, "mcp.quic_manage.detect_connections.live", 443);
+            record_fixture_failed_tool("quic_manage", failed);
+            return;
+        }
+        mcp_standalone::json live_args;
+        live_args["action"] = "detect_connections";
+        live_args["pid"] = GetCurrentProcessId();
+        live_args["remote_port"] = 443;
+        live_args["local_port"] = 40000;
+        log_msg(hf, "mcp.quic_manage.detect_connections.live", "NETWORK-FIXTURE -- quic live detector dispatch capture_active=%d capture_count=%u capture_dropped=%u bytes=%zu header_class=quic_initial_long",
             capture_active ? 1 : 0,
             capture_count,
             capture_dropped,
             packet.size());
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_action_call(hf, "mcp.quic_manage.detect_connections", "quic_manage", "detect_connections", args, passed, failed, skipped, false, &result);
-        log_msg(hf, "mcp.quic_manage.detect_connections", "NETWORK-FIXTURE -- quic detector result status=%s text=%s data=%s",
-            mcp_status_classification_name(status),
-            compact_text(result.text, 700).c_str(),
-            compact_json(result.data, 900).c_str());
-        stop_udp_capture_after_detection(hf, "mcp.quic_manage.detect_connections", 443);
+        auto live_status = test_tool_call_with_followup(hf, "mcp.quic_manage.detect_connections.live", get_server(), "quic_manage", live_args, passed, failed, skipped,
+            mcp_tool_call_status_t::functional_pass, "quic_live_driver_capture_correlation",
+            [](const invoke_result_t& ir, std::string& proof) {
+                return protocol_live_functional_payload("quic_manage", "detect_connections", ir.data, proof);
+            });
+        join_udp_detection_stimulus(hf, "mcp.quic_manage.detect_connections.live", 443, stimulus);
+        log_msg(hf, "mcp.quic_manage.detect_connections.live", "NETWORK-FIXTURE -- quic live detector result status=%s",
+            mcp_status_classification_name(live_status));
+        stop_udp_capture_after_detection(hf, "mcp.quic_manage.detect_connections.live", 443);
     }
 
     void test_tool_quic_manage_decrypt_initial(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -26402,7 +27103,10 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         args["hint_only"] = true;
         args["max_results"] = 1u;
         args["timeout_ms"] = 2500u;
-        test_tool_action_call(hf, "mcp.quic_manage.extract_keys", "quic_manage", "extract_keys", args, passed, failed, skipped);
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.quic_manage.extract_keys", "quic_manage", "extract_keys", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed)
+            require_hint_only_key_scan_result(hf, "mcp.quic_manage.extract_keys", "quic_manage", result, passed, failed);
     }
 
     void test_tool_dtls_manage_detect_sessions(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -26413,30 +27117,52 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             0x00, 0x01,
             0x01
         };
+        mcp_standalone::json parser_args;
+        parser_args["action"] = "detect_sessions";
+        parser_args["pid"] = GetCurrentProcessId();
+        parser_args["payload_hex"] = test_coverage_bytes_hex(packet);
+        parser_args["remote_port"] = 4443;
+        parser_args["local_port"] = 40000;
+        log_msg(hf, "mcp.dtls_manage.detect_sessions.parser", "NETWORK-FIXTURE -- dtls detector parser-only dispatch bytes=%zu header_class=dtls_handshake_record",
+            packet.size());
+        test_tool_call_with_followup(hf, "mcp.dtls_manage.detect_sessions.parser", get_server(), "dtls_manage", parser_args, passed, failed, skipped,
+            mcp_tool_call_status_t::state_contract_pass, "dtls_parser_only_contract",
+            [](const invoke_result_t& ir, std::string& proof) {
+                return protocol_parser_state_contract_payload("dtls_manage", "detect_sessions", ir.data, proof);
+            });
+
         bool capture_active = false;
         uint32_t capture_count = 0;
         uint32_t capture_dropped = 0;
-        if (!seed_udp_capture_for_detection(hf, "mcp.dtls_manage.detect_sessions", 4443, packet, &capture_active, &capture_count, &capture_dropped)) {
+        if (!start_udp_live_capture_for_detection(hf, "mcp.dtls_manage.detect_sessions.live", 4443, &capture_active, &capture_count, &capture_dropped)) {
             record_fixture_failed_tool("dtls_manage", failed);
             return;
         }
-        mcp_standalone::json args;
-        args["pid"] = GetCurrentProcessId();
-        args["payload_hex"] = test_coverage_bytes_hex(packet);
-        args["remote_port"] = 4443;
-        args["local_port"] = 40000;
-        log_msg(hf, "mcp.dtls_manage.detect_sessions", "NETWORK-FIXTURE -- dtls detector dispatch deterministic_payload=1 capture_active=%d capture_count=%u capture_dropped=%u bytes=%zu header_class=dtls_handshake_record",
+        udp_detection_stimulus_t stimulus;
+        if (!start_udp_detection_stimulus(hf, "mcp.dtls_manage.detect_sessions.live", 4443, packet, "dtls_live_detector", stimulus)) {
+            stop_udp_capture_after_detection(hf, "mcp.dtls_manage.detect_sessions.live", 4443);
+            record_fixture_failed_tool("dtls_manage", failed);
+            return;
+        }
+        mcp_standalone::json live_args;
+        live_args["action"] = "detect_sessions";
+        live_args["pid"] = GetCurrentProcessId();
+        live_args["remote_port"] = 4443;
+        live_args["local_port"] = 40000;
+        log_msg(hf, "mcp.dtls_manage.detect_sessions.live", "NETWORK-FIXTURE -- dtls live detector dispatch capture_active=%d capture_count=%u capture_dropped=%u bytes=%zu header_class=dtls_handshake_record",
             capture_active ? 1 : 0,
             capture_count,
             capture_dropped,
             packet.size());
-        mcp_standalone::tool_result_t result;
-        auto status = test_tool_action_call(hf, "mcp.dtls_manage.detect_sessions", "dtls_manage", "detect_sessions", args, passed, failed, skipped, false, &result);
-        log_msg(hf, "mcp.dtls_manage.detect_sessions", "NETWORK-FIXTURE -- dtls detector result status=%s text=%s data=%s",
-            mcp_status_classification_name(status),
-            compact_text(result.text, 700).c_str(),
-            compact_json(result.data, 900).c_str());
-        stop_udp_capture_after_detection(hf, "mcp.dtls_manage.detect_sessions", 4443);
+        auto live_status = test_tool_call_with_followup(hf, "mcp.dtls_manage.detect_sessions.live", get_server(), "dtls_manage", live_args, passed, failed, skipped,
+            mcp_tool_call_status_t::functional_pass, "dtls_live_driver_capture_correlation",
+            [](const invoke_result_t& ir, std::string& proof) {
+                return protocol_live_functional_payload("dtls_manage", "detect_sessions", ir.data, proof);
+            });
+        join_udp_detection_stimulus(hf, "mcp.dtls_manage.detect_sessions.live", 4443, stimulus);
+        log_msg(hf, "mcp.dtls_manage.detect_sessions.live", "NETWORK-FIXTURE -- dtls live detector result status=%s",
+            mcp_status_classification_name(live_status));
+        stop_udp_capture_after_detection(hf, "mcp.dtls_manage.detect_sessions.live", 4443);
     }
 
     void test_tool_dtls_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -26481,7 +27207,10 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             static_cast<unsigned long long>(g_mcp_scanner_addr),
             bytes.size(),
             driver_bridge::attached_pid());
-        test_tool_action_call(hf, "mcp.dtls_manage.extract_keys", "dtls_manage", "extract_keys", args, passed, failed, skipped);
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_action_call(hf, "mcp.dtls_manage.extract_keys", "dtls_manage", "extract_keys", args, passed, failed, skipped, false, &result);
+        if (status == mcp_tool_call_status_t::passed)
+            require_hint_only_key_scan_result(hf, "mcp.dtls_manage.extract_keys", "dtls_manage", result, passed, failed);
     }
 
     void test_tool_autoresponder_manage_add_rule(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -26987,6 +27716,38 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             keylog_path.c_str(),
             static_cast<unsigned long long>(keylog_size),
             tshark_paths.c_str());
+        mcp_standalone::json invalid_filter_args;
+        invalid_filter_args["pcap_path"] = pcap_path;
+        invalid_filter_args["keylog_path"] = keylog_path;
+        invalid_filter_args["display_filter"] = "tls";
+        invalid_filter_args["timeout_ms"] = 1000u;
+        auto invalid_filter = invoke_tool_bounded(get_server(), tool_name, invalid_filter_args, tool_timeout_ms(tool_name));
+        bool invalid_filter_valid = true;
+        bool invalid_requires_http2 = false;
+        payload_bool_field(invalid_filter.result.data, "display_filter_valid", invalid_filter_valid);
+        payload_bool_field(invalid_filter.result.data, "requires_http2_frames", invalid_requires_http2);
+        const bool invalid_rejected =
+            !invalid_filter.timed_out &&
+            invalid_filter.result.found &&
+            !invalid_filter.result.threw &&
+            !invalid_filter.result.success &&
+            !invalid_filter_valid &&
+            invalid_requires_http2;
+        log_msg(hf, tag, "DISPLAY-FILTER-VALIDATION -- invalid_filter=tls timed_out=%d found=%d threw=%d success=%d display_filter_valid=%d requires_http2_frames=%d text=%s data=%s",
+            invalid_filter.timed_out ? 1 : 0,
+            invalid_filter.result.found ? 1 : 0,
+            invalid_filter.result.threw ? 1 : 0,
+            invalid_filter.result.success ? 1 : 0,
+            invalid_filter_valid ? 1 : 0,
+            invalid_requires_http2 ? 1 : 0,
+            compact_text(invalid_filter.result.text, 700).c_str(),
+            compact_json(invalid_filter.result.data, 900).c_str());
+        if (!invalid_rejected) {
+            log_msg(hf, tag, "FAIL -- invalid display_filter was not rejected fail-closed before decrypt backend");
+            record_tool_status(tool_name, invalid_filter.timed_out ? mcp_tool_call_status_t::timed_out : mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
         mcp_standalone::json args;
         args["pcap_path"] = pcap_path;
         args["keylog_path"] = keylog_path;
@@ -27061,6 +27822,12 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         uint64_t total_packets = 0;
         payload_u64_field(ir.data, "decrypted_packets", decrypted_packets);
         payload_u64_field(ir.data, "total_packets", total_packets);
+        bool requires_http2_frames = false;
+        bool functional_evidence = false;
+        uint64_t http2_frame_count = 0;
+        payload_bool_field(ir.data, "requires_http2_frames", requires_http2_frames);
+        payload_bool_field(ir.data, "functional_evidence", functional_evidence);
+        payload_u64_field(ir.data, "http2_frame_count", http2_frame_count);
         bool expected_empty = false;
         payload_bool_field(ir.data, "expected_empty", expected_empty);
         uint64_t pcap_packet_count = 1;
@@ -27082,13 +27849,27 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             record_tool_status(tool_name, mcp_tool_call_status_t::state_contract_pass);
             return;
         }
-        if (ir.success && decrypted_packets > 0) {
-            log_msg(hf, tag, "PASS -- network_decrypt_capture decrypted deterministic pcap/keylog fixture packets=%llu total=%llu text=%s",
+        if (ir.success && decrypted_packets > 0 && requires_http2_frames && http2_frame_count > 0 && functional_evidence) {
+            log_msg(hf, tag, "PASS -- network_decrypt_capture decrypted deterministic pcap/keylog fixture packets=%llu total=%llu http2_frames=%llu functional_evidence=1 text=%s",
                 static_cast<unsigned long long>(decrypted_packets),
                 static_cast<unsigned long long>(total_packets),
+                static_cast<unsigned long long>(http2_frame_count),
                 compact_text(ir.text, 700).c_str());
             record_tool_status(tool_name, mcp_tool_call_status_t::passed);
             passed.fetch_add(1);
+            return;
+        }
+        if (ir.success && decrypted_packets > 0) {
+            log_msg(hf, tag, "FAIL -- network_decrypt_capture decrypted packets without required HTTP/2 frame evidence decrypted=%llu total=%llu requires_http2_frames=%d http2_frame_count=%llu functional_evidence=%d text=%s data=%s",
+                static_cast<unsigned long long>(decrypted_packets),
+                static_cast<unsigned long long>(total_packets),
+                requires_http2_frames ? 1 : 0,
+                static_cast<unsigned long long>(http2_frame_count),
+                functional_evidence ? 1 : 0,
+                compact_text(ir.text, 700).c_str(),
+                compact_json(ir.data, 900).c_str());
+            record_tool_status(tool_name, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
             return;
         }
         if (!ir.success && text_lc.find("no matching packets") != std::string::npos) {
@@ -30887,7 +31668,7 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
         if (!cancelled || !cancelled()) {
             mcp_standalone::json args;
             args["packet_hex"] = "";
-            test_coverage_net_thread_domains_9_10_16_case(hf, tag, enet_tool, "enet_empty_packet_shape", args, 1500,
+            test_coverage_net_thread_domains_9_10_16_case(hf, tag, enet_tool, "enet_empty_packet_negative_shape", args, 1500,
                 [](const invoke_result_t& ir, std::string& reason) {
                     if (!ir.success) {
                         reason = "empty packet decode should return structured invalid packet shape";
@@ -31735,7 +32516,7 @@ std::string mcp_coverage_final_summary_line() {
     }
     char buf[2048];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-        "MCP_AUDIT clean=%d suspect=%d started=%d completed=%d missing=%d stale=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d MCP_EXPECTED_EMPTY_NONFUNCTIONAL=%d MCP_ZERO_RESULT_SUSPECT=%d MCP_DIAGNOSTIC_FALLBACK=%d MCP_DIAGNOSTIC_FALLBACK_FUNCTIONAL=%d MCP_MISSING_NONEXEMPT=%d MCP_DEPENDENCY_BLOCKED_FUNCTIONAL=%d MCP_PHASE_REMAINING=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d destructive_schema_expected=%d registered_total=%d non_ai_audited=%d attempted=%d",
+        "MCP_AUDIT clean=%d suspect=%d started=%d completed=%d missing=%d stale=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d MCP_EXPECTED_EMPTY_NONFUNCTIONAL=%d MCP_ZERO_RESULT_SUSPECT=%d MCP_DIAGNOSTIC_FALLBACK=%d MCP_DIAGNOSTIC_FALLBACK_FUNCTIONAL=%d MCP_MISSING_NONEXEMPT=%d MCP_DEPENDENCY_BLOCKED_FUNCTIONAL=%d MCP_PHASE_REMAINING=%d MCP_PHASE_EXTRA_TERMINAL=%d MCP_CASE_LEDGER_TERMINAL=%d MCP_CASE_LEDGER_REGISTERED=%d MCP_CASE_LEDGER_MISSING=%d MCP_CASE_LEDGER_DUPLICATE_IDS=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d destructive_schema_expected=%d registered_total=%d non_ai_audited=%d attempted=%d",
         snapshot.audit_clean ? 1 : 0,
         snapshot.suspect_count(),
         snapshot.audit_started ? 1 : 0,
@@ -31755,6 +32536,11 @@ std::string mcp_coverage_final_summary_line() {
         snapshot.missing,
         snapshot.dependency_blocked_tools,
         snapshot.phase_remaining,
+        snapshot.phase_extra_terminal_records,
+        snapshot.ledger_terminal_records,
+        snapshot.ledger_registered_terminal_tools,
+        snapshot.ledger_registered_missing_tools,
+        snapshot.ledger_duplicate_case_ids,
         snapshot.outstanding_timed_out_workers,
         snapshot.timed_out_drain_complete ? 1 : 0,
         snapshot.destructive_schema_exemptions,
@@ -31780,7 +32566,7 @@ void log_mcp_phase_remaining_diagnostics(HANDLE hf, int phase_remaining) {
         gaps = g_mcp_last_phase_gaps;
     }
     const int effective_remaining = phase_remaining > 0 ? phase_remaining : snapshot.phase_remaining;
-    log_msg(hf, "summary", "MCP-PHASE-REMAINING -- remaining=%d audit_gap_count=%zu audit_clean=%d audit_started=%d audit_completed=%d missing=%d no_functional_pass=%d expected_empty_nonfunctional=%d diagnostic_fallback=%d timed_out=%d outstanding=%zu",
+    log_msg(hf, "summary", "MCP-PHASE-REMAINING -- remaining=%d audit_gap_count=%zu audit_clean=%d audit_started=%d audit_completed=%d missing=%d no_functional_pass=%d expected_empty_nonfunctional=%d diagnostic_fallback=%d timed_out=%d outstanding=%zu ledger_terminal=%d ledger_registered=%d ledger_missing=%d ledger_duplicate_ids=%d phase_extra=%d",
         effective_remaining,
         gaps.size(),
         snapshot.audit_clean ? 1 : 0,
@@ -31791,7 +32577,12 @@ void log_mcp_phase_remaining_diagnostics(HANDLE hf, int phase_remaining) {
         snapshot.expected_empty_nonfunctional_tools,
         snapshot.diagnostic_fallback_tools,
         snapshot.timed_out_tools,
-        snapshot.outstanding_timed_out_workers);
+        snapshot.outstanding_timed_out_workers,
+        snapshot.ledger_terminal_records,
+        snapshot.ledger_registered_terminal_tools,
+        snapshot.ledger_registered_missing_tools,
+        snapshot.ledger_duplicate_case_ids,
+        snapshot.phase_extra_terminal_records);
     if (gaps.empty()) {
         log_msg(hf, "summary", "MCP-PHASE-REMAINING-CASE -- index=0 case_id=\"mcp_audit.no_gap_records\" tool=\"mcp_phase\" reason=audit did not provide terminal gap records");
         return;
@@ -31867,6 +32658,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_mcp_functional_capture_reasons.clear();
     g_mcp_diagnostic_fallback_tools.clear();
     g_mcp_diagnostic_fallback_reasons.clear();
+    reset_mcp_case_ledger();
     reset_mcp_audit_snapshot();
     {
         std::lock_guard<std::mutex> lk(g_timed_out_invocations_mtx);
@@ -32556,21 +33348,26 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
             g_invoked_tools.size());
     }
     delta_failed = failed.load(std::memory_order_acquire) - start_failed;
-    const int phase_completed = delta_passed + delta_failed + delta_skipped;
+    const int phase_completed = mcp_case_ledger_terminal_count();
     update_mcp_phase_completion_snapshot(phase_completed);
-    if (k_mcp_planned_tool_tests > phase_completed) {
-        log_msg(hf, "mcp_phase", "MCP_PHASE_REMAINING -- planned=%d completed=%d remaining=%d audit_summary=\"%s\"",
+    const int phase_remaining = k_mcp_planned_tool_tests > phase_completed ? k_mcp_planned_tool_tests - phase_completed : 0;
+    const int phase_extra = phase_completed > k_mcp_planned_tool_tests ? phase_completed - k_mcp_planned_tool_tests : 0;
+    if (phase_remaining > 0 || phase_extra > 0) {
+        log_msg(hf, "mcp_phase", "MCP_PHASE_REMAINING -- planned=%d completed=%d remaining=%d extra=%d audit_summary=\"%s\"",
             k_mcp_planned_tool_tests,
             phase_completed,
-            k_mcp_planned_tool_tests - phase_completed,
+            phase_remaining,
+            phase_extra,
             mcp_coverage_final_summary_line().c_str());
-        log_mcp_phase_remaining_diagnostics(hf, k_mcp_planned_tool_tests - phase_completed);
+        log_mcp_phase_remaining_diagnostics(hf, phase_remaining);
     }
-    log_msg(hf, "mcp.phase_accounting", "registered_tool_records=%zu explicit_invocations=%zu pass_delta=%d fail_delta=%d skip_delta=%d",
-        g_tool_attempt_stats.size(), g_invoked_tools.size(), delta_passed, delta_failed, delta_skipped);
+    log_msg(hf, "mcp.phase_accounting", "registered_tool_records=%zu explicit_invocations=%zu terminal_ledger_records=%d pass_delta=%d fail_delta=%d skip_delta=%d",
+        g_tool_attempt_stats.size(), g_invoked_tools.size(), phase_completed, delta_passed, delta_failed, delta_skipped);
     set_progress_step("mcp complete");
-    log_msg(hf, "mcp_phase", "MCP_PHASE_DONE -- planned=%d instance=%llu coverage_audit_started=%d coverage_audit_completed=%d registered_tool_records=%zu explicit_invocations=%zu pass_delta=%d fail_delta=%d skip_delta=%d",
+    log_msg(hf, "mcp_phase", "MCP_PHASE_DONE -- planned=%d completed=%d extra=%d instance=%llu coverage_audit_started=%d coverage_audit_completed=%d registered_tool_records=%zu explicit_invocations=%zu pass_delta=%d fail_delta=%d skip_delta=%d",
         k_mcp_planned_tool_tests,
+        phase_completed,
+        phase_extra,
         static_cast<unsigned long long>(phase_instance),
         g_mcp_coverage_audit_started.load(std::memory_order_acquire) ? 1 : 0,
         g_mcp_coverage_audit_completed.load(std::memory_order_acquire) ? 1 : 0,

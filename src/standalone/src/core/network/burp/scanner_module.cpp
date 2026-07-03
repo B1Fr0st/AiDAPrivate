@@ -411,6 +411,8 @@ issue_t make_issue(const std::string& type_key,
     iss.insertion_point = ip.kind + (ip.name.empty() ? std::string() : (":" + ip.name));
     iss.seen_ms = now_ms();
     iss.audit_id = ctx.audit_id;
+    iss.session_id = ctx.session_id;
+    iss.scan_id = ctx.scan_id != 0 ? ctx.scan_id : ctx.audit_id;
     iss.src_exchange_id = resp.id;
 
     evidence_t ev;

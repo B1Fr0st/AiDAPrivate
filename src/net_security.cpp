@@ -46,6 +46,109 @@ static std::string bytes_to_hex_upper(const std::uint8_t* data, std::size_t len)
     return result;
 }
 
+static std::string netsec_sha256_hex(const std::uint8_t* data, std::size_t len) {
+    if ((!data && len != 0) || len > static_cast<std::size_t>(std::numeric_limits<ULONG>::max()))
+        return {};
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    DWORD hash_obj_size = 0, hash_len = 0, cb_data = 0;
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return {};
+    if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hash_obj_size),
+                          sizeof(hash_obj_size), &cb_data, 0) != 0 ||
+        BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len),
+                          sizeof(hash_len), &cb_data, 0) != 0 ||
+        hash_len == 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return {};
+    }
+    std::vector<std::uint8_t> hash_obj(hash_obj_size);
+    std::vector<std::uint8_t> hash(hash_len);
+    if (BCryptCreateHash(hAlg, &hHash, hash_obj.data(), hash_obj_size, nullptr, 0, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return {};
+    }
+    const bool ok = BCryptHashData(hHash, const_cast<PUCHAR>(data), static_cast<ULONG>(len), 0) == 0 &&
+                    BCryptFinishHash(hHash, hash.data(), hash_len, 0) == 0;
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok ? bytes_to_hex(hash.data(), hash.size()) : std::string{};
+}
+
+static bool netsec_has_nul(const std::string& value) {
+    return std::find(value.begin(), value.end(), '\0') != value.end();
+}
+
+static std::string netsec_trim_copy(const std::string& value) {
+    std::size_t first = 0;
+    while (first < value.size() && (value[first] == ' ' || value[first] == '\t' ||
+                                    value[first] == '\r' || value[first] == '\n'))
+        ++first;
+    std::size_t last = value.size();
+    while (last > first && (value[last - 1] == ' ' || value[last - 1] == '\t' ||
+                            value[last - 1] == '\r' || value[last - 1] == '\n'))
+        --last;
+    return value.substr(first, last - first);
+}
+
+static std::string netsec_lower_copy(std::string value) {
+    for (char& c : value) {
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    }
+    return value;
+}
+
+static bool netsec_starts_with(const std::string& value, const char* prefix) {
+    const std::size_t len = std::strlen(prefix);
+    return value.size() >= len && value.compare(0, len, prefix) == 0;
+}
+
+static bool netsec_is_display_filter_token_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+           c == ':' || c == '/' || c == '-';
+}
+
+static bool netsec_is_display_filter_value_token(const std::string& token) {
+    if (token.empty())
+        return false;
+    for (const char c : token) {
+        const bool ok = (c >= '0' && c <= '9') ||
+                        (c >= 'a' && c <= 'f') ||
+                        (c >= 'A' && c <= 'F') ||
+                        c == '.' || c == ':' || c == '/' || c == '-';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+static std::string netsec_quote_windows_arg(const std::string& arg) {
+    std::string out;
+    out.reserve(arg.size() + 2);
+    out.push_back('"');
+    std::size_t backslashes = 0;
+    for (const char c : arg) {
+        if (c == '\\') {
+            ++backslashes;
+            continue;
+        }
+        if (c == '"') {
+            out.append(backslashes * 2 + 1, '\\');
+            out.push_back('"');
+            backslashes = 0;
+            continue;
+        }
+        out.append(backslashes, '\\');
+        backslashes = 0;
+        out.push_back(c);
+    }
+    out.append(backslashes * 2, '\\');
+    out.push_back('"');
+    return out;
+}
+
 static std::vector<std::uint8_t> hex_to_bytes(const std::string& hex) {
     std::vector<std::uint8_t> out;
     std::string clean;
@@ -800,6 +903,115 @@ static bool aes_ecb_encrypt(const std::uint8_t key[16],
 
 namespace net_security {
 
+bool validate_tshark_display_filter(const std::string& display_filter, std::string* reason) {
+    if (reason)
+        reason->clear();
+    if (netsec_has_nul(display_filter)) {
+        if (reason) *reason = "display_filter_contains_nul";
+        return false;
+    }
+    const std::string trimmed = netsec_trim_copy(display_filter);
+    if (trimmed.empty()) {
+        if (reason) *reason = "display_filter_empty";
+        return false;
+    }
+    if (trimmed.size() > 160) {
+        if (reason) *reason = "display_filter_too_long";
+        return false;
+    }
+
+    int depth = 0;
+    bool saw_http2 = false;
+    std::vector<std::string> tokens;
+    std::string token;
+    auto flush_token = [&]() {
+        if (!token.empty()) {
+            tokens.push_back(netsec_lower_copy(token));
+            token.clear();
+        }
+    };
+
+    for (const unsigned char uc : trimmed) {
+        const char c = static_cast<char>(uc);
+        if (uc < 0x20 || uc >= 0x7f) {
+            if (reason) *reason = "display_filter_control_or_non_ascii";
+            return false;
+        }
+        if (c == '"' || c == '\'' || c == '\\' || c == '`' || c == '$' || c == '%' ||
+            c == '^' || c == ';' || c == ',' || c == '[' || c == ']' || c == '{' || c == '}') {
+            if (reason) *reason = "display_filter_unsafe_character";
+            return false;
+        }
+        if (c == '(') {
+            flush_token();
+            ++depth;
+            continue;
+        }
+        if (c == ')') {
+            flush_token();
+            --depth;
+            if (depth < 0) {
+                if (reason) *reason = "display_filter_unbalanced_parentheses";
+                return false;
+            }
+            continue;
+        }
+        if (c == ' ' || c == '\t') {
+            flush_token();
+            continue;
+        }
+        if (c == '&' || c == '|') {
+            flush_token();
+            continue;
+        }
+        if (c == '=' || c == '!' || c == '<' || c == '>') {
+            flush_token();
+            continue;
+        }
+        if (!netsec_is_display_filter_token_char(c)) {
+            if (reason) *reason = "display_filter_unsupported_character";
+            return false;
+        }
+        token.push_back(c);
+    }
+    flush_token();
+    if (depth != 0) {
+        if (reason) *reason = "display_filter_unbalanced_parentheses";
+        return false;
+    }
+    if (tokens.empty()) {
+        if (reason) *reason = "display_filter_empty";
+        return false;
+    }
+
+    for (const auto& t : tokens) {
+        if (t == "and" || t == "or" || t == "not" || t == "eq" || t == "ne" ||
+            t == "gt" || t == "lt" || t == "ge" || t == "le") {
+            continue;
+        }
+        if (t == "http2" || netsec_starts_with(t, "http2.")) {
+            saw_http2 = true;
+            continue;
+        }
+        if (t == "tcp" || t == "tls" || t == "ssl" || t == "frame" ||
+            netsec_starts_with(t, "tcp.") || netsec_starts_with(t, "tls.") ||
+            netsec_starts_with(t, "ssl.") || netsec_starts_with(t, "frame.") ||
+            netsec_starts_with(t, "ip.") || netsec_starts_with(t, "ipv6.")) {
+            continue;
+        }
+        if (netsec_is_display_filter_value_token(t))
+            continue;
+        if (reason) *reason = "display_filter_unsupported_token:" + t;
+        return false;
+    }
+
+    if (!saw_http2) {
+        if (reason) *reason = "display_filter_must_include_http2";
+        return false;
+    }
+    return true;
+}
+
 TlsKeyExtractor& TlsKeyExtractor::instance() {
     static TlsKeyExtractor inst;
     return inst;
@@ -959,9 +1171,13 @@ bool TlsKeyExtractor::validate_master_secret(const std::uint8_t* data, std::size
 }
 
 
-std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid) {
+std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid,
+                                                               const tls_key_scan_config_t& config,
+                                                               key_scan_diagnostics_t& diag,
+                                                               ULONGLONG start_ms) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
+    if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
 
     std::uint64_t schannel_base = 0;
     std::uint32_t schannel_size = 0;
@@ -970,12 +1186,6 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid)
     if (!find_module_in_process(pid, "schannel.dll", schannel_base, schannel_size))
         return keys;
 
-
-    std::uint64_t ncrypt_base = 0;
-    std::uint32_t ncrypt_size = 0;
-    find_module_in_process(pid, "ncrypt.dll", ncrypt_base, ncrypt_size);
-
-
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
     device->solve_dtb();
@@ -983,34 +1193,48 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid)
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
 
     for (const auto& region : regions) {
+        if (netsec_scan_should_stop(config, diag, start_ms)) break;
+        ++diag.regions_seen;
 
-        if (region.state != 0x1000) continue;
-        if (region.size > 0x1000000) continue;
-        if (region.size < 80) continue;
+        if (region.state != 0x1000) { ++diag.regions_skipped_state; continue; }
+        if (region.size > 0x1000000 || region.size < 80) { ++diag.regions_skipped_size; continue; }
+        ++diag.regions_committed;
 
 
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
 
         for (std::uint64_t off = 0; off < region.size; off += CHUNK - 80) {
+            if (netsec_scan_should_stop(config, diag, start_ms)) goto schannel_done;
             std::size_t to_read = static_cast<std::size_t>(
                 std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
             if (to_read < 80) break;
 
             std::memset(buf.data(), 0, CHUNK);
+            ++diag.read_attempts;
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 80) continue;
+            diag.read_bytes += actual;
+            if (actual < 80) {
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = region.base + off;
+                continue;
+            }
 
 
             for (std::size_t i = 0; i + 80 <= actual; i++) {
+                if ((i & 0xFF) == 0 && netsec_scan_should_stop(config, diag, start_ms)) goto schannel_done;
                 const std::uint8_t* candidate_cr = buf.data() + i;
                 if (!looks_like_random(candidate_cr, 32)) continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
 
 
                 for (std::size_t secret_offset : {32ULL, 40ULL, 48ULL}) {
                     if (i + secret_offset + 48 > actual) break;
                     const std::uint8_t* candidate_ms = buf.data() + i + secret_offset;
-                    if (!looks_like_random(candidate_ms, 48)) continue;
+                    if (!looks_like_random(candidate_ms, 48)) { ++diag.reject_count; continue; }
 
 
                     tls_session_key_t key;
@@ -1024,8 +1248,15 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid)
 
 
                     std::string cr_hex = bytes_to_hex(candidate_cr, 32);
-                    if (_seen_keys.find(cr_hex) == _seen_keys.end()) {
-                        _seen_keys[cr_hex] = key;
+                    bool inserted = false;
+                    {
+                        std::lock_guard<std::mutex> seen_lock(_mutex);
+                        if (_seen_keys.find(cr_hex) == _seen_keys.end()) {
+                            _seen_keys[cr_hex] = key;
+                            inserted = true;
+                        }
+                    }
+                    if (inserted) {
                         keys.push_back(key);
                     }
 
@@ -1033,7 +1264,10 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_schannel(std::uint32_t pid)
                     break;
                 }
 
-                if (keys.size() >= 64) goto schannel_done;
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto schannel_done;
+                }
             }
         }
     }
@@ -1044,13 +1278,17 @@ schannel_done:
 }
 
 
-std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) {
+std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid,
+                                                              const tls_key_scan_config_t& config,
+                                                              key_scan_diagnostics_t& diag,
+                                                              ULONGLONG start_ms) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
+    if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
 
 
-    std::uint64_t libssl_base = 0, libcrypto_base = 0;
-    std::uint32_t libssl_size = 0, libcrypto_size = 0;
+    std::uint64_t libssl_base = 0;
+    std::uint32_t libssl_size = 0;
 
 
     bool has_libssl = find_module_in_process(pid, "libssl", libssl_base, libssl_size) ||
@@ -1070,33 +1308,45 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) 
 
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
 
-
-    const std::uint8_t mk_len_pattern[] = { 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-
     for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-        if (region.size > 0x1000000 || region.size < 128) continue;
+        if (netsec_scan_should_stop(config, diag, start_ms)) break;
+        ++diag.regions_seen;
+        if (region.state != 0x1000) { ++diag.regions_skipped_state; continue; }
+        if (region.size > 0x1000000 || region.size < 128) { ++diag.regions_skipped_size; continue; }
+        ++diag.regions_committed;
 
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
 
         for (std::uint64_t off = 0; off < region.size; off += CHUNK - 128) {
+            if (netsec_scan_should_stop(config, diag, start_ms)) goto openssl_done;
             std::size_t to_read = static_cast<std::size_t>(
                 std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
             if (to_read < 128) break;
 
             std::memset(buf.data(), 0, CHUNK);
+            ++diag.read_attempts;
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 128) continue;
+            diag.read_bytes += actual;
+            if (actual < 128) {
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = region.base + off;
+                continue;
+            }
 
             for (std::size_t i = 48; i + 56 <= actual; i++) {
+                if ((i & 0xFF) == 0 && netsec_scan_should_stop(config, diag, start_ms)) goto openssl_done;
 
                 std::uint64_t val64 = *reinterpret_cast<std::uint64_t*>(buf.data() + i);
                 if (val64 != 48) continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
 
 
                 const std::uint8_t* candidate_ms = buf.data() + i - 48;
-                if (!looks_like_random(candidate_ms, 48)) continue;
+                if (!looks_like_random(candidate_ms, 48)) { ++diag.reject_count; continue; }
 
 
                 bool found_cr = false;
@@ -1116,8 +1366,15 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) 
                     key.library = "OpenSSL";
 
                     std::string cr_hex = bytes_to_hex(candidate_cr, 32);
-                    if (_seen_keys.find(cr_hex) == _seen_keys.end()) {
-                        _seen_keys[cr_hex] = key;
+                    bool inserted = false;
+                    {
+                        std::lock_guard<std::mutex> seen_lock(_mutex);
+                        if (_seen_keys.find(cr_hex) == _seen_keys.end()) {
+                            _seen_keys[cr_hex] = key;
+                            inserted = true;
+                        }
+                    }
+                    if (inserted) {
                         keys.push_back(key);
                         found_cr = true;
                         break;
@@ -1136,7 +1393,10 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_openssl(std::uint32_t pid) 
                     keys.push_back(key);
                 }
 
-                if (keys.size() >= 64) goto openssl_done;
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto openssl_done;
+                }
             }
         }
     }
@@ -1147,9 +1407,13 @@ openssl_done:
 }
 
 
-std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid) {
+std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid,
+                                                          const tls_key_scan_config_t& config,
+                                                          key_scan_diagnostics_t& diag,
+                                                          ULONGLONG start_ms) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
+    if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
 
 
     std::uint64_t nss_base = 0;
@@ -1168,28 +1432,43 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid) {
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
 
     for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-        if (region.size > 0x1000000 || region.size < 80) continue;
+        if (netsec_scan_should_stop(config, diag, start_ms)) break;
+        ++diag.regions_seen;
+        if (region.state != 0x1000) { ++diag.regions_skipped_state; continue; }
+        if (region.size > 0x1000000 || region.size < 80) { ++diag.regions_skipped_size; continue; }
+        ++diag.regions_committed;
 
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
 
         for (std::uint64_t off = 0; off < region.size; off += CHUNK - 80) {
+            if (netsec_scan_should_stop(config, diag, start_ms)) goto nss_done;
             std::size_t to_read = static_cast<std::size_t>(
                 std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
             if (to_read < 80) break;
 
             std::memset(buf.data(), 0, CHUNK);
+            ++diag.read_attempts;
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 80) continue;
+            diag.read_bytes += actual;
+            if (actual < 80) {
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = region.base + off;
+                continue;
+            }
 
 
             for (std::size_t i = 0; i + 80 <= actual; i++) {
+                if ((i & 0xFF) == 0 && netsec_scan_should_stop(config, diag, start_ms)) goto nss_done;
                 const std::uint8_t* candidate_ms = buf.data() + i;
                 const std::uint8_t* candidate_cr = buf.data() + i + 48;
 
                 if (!looks_like_random(candidate_ms, 48)) continue;
                 if (!looks_like_random(candidate_cr, 32)) continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
 
                 tls_session_key_t key;
                 key.label = "CLIENT_RANDOM";
@@ -1201,12 +1480,22 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_nss(std::uint32_t pid) {
                 key.library = "NSS";
 
                 std::string cr_hex = bytes_to_hex(candidate_cr, 32);
-                if (_seen_keys.find(cr_hex) == _seen_keys.end()) {
-                    _seen_keys[cr_hex] = key;
+                bool inserted = false;
+                {
+                    std::lock_guard<std::mutex> seen_lock(_mutex);
+                    if (_seen_keys.find(cr_hex) == _seen_keys.end()) {
+                        _seen_keys[cr_hex] = key;
+                        inserted = true;
+                    }
+                }
+                if (inserted) {
                     keys.push_back(key);
                 }
 
-                if (keys.size() >= 64) goto nss_done;
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto nss_done;
+                }
                 i += 79;
             }
         }
@@ -1218,9 +1507,13 @@ nss_done:
 }
 
 
-std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid) {
+std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid,
+                                                               const tls_key_scan_config_t& config,
+                                                               key_scan_diagnostics_t& diag,
+                                                               ULONGLONG start_ms) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
+    if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
 
     std::uint64_t boringssl_base = 0;
     std::uint32_t boringssl_size = 0;
@@ -1258,10 +1551,16 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
 
 
     for (const auto& kpath : keylog_paths) {
+        if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
         if (GetFileAttributesA(kpath.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
 
         auto file_keys = read_keylog_file(kpath);
         for (auto& k : file_keys) {
+            if (keys.size() >= config.max_results) {
+                diag.early_exit_reason = "max_results";
+                return keys;
+            }
+            if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
             k.pid = pid;
             if (k.library.empty()) k.library = "BoringSSL/KeylogFile";
             std::string dedup;
@@ -1271,8 +1570,15 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
                 dedup = bytes_to_hex(k.client_random.data(), k.client_random.size());
             else
                 continue;
-            if (_seen_keys.find(dedup) == _seen_keys.end()) {
-                _seen_keys[dedup] = k;
+            bool inserted = false;
+            {
+                std::lock_guard<std::mutex> seen_lock(_mutex);
+                if (_seen_keys.find(dedup) == _seen_keys.end()) {
+                    _seen_keys[dedup] = k;
+                    inserted = true;
+                }
+            }
+            if (inserted) {
                 keys.push_back(k);
             }
         }
@@ -1288,27 +1594,74 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
         voyager::device_t::peb_info peb{};
         if (device->read_peb(peb) && peb.ldr_address != 0) {
 
-            std::uint64_t peb_base = 0;
-
-
             std::uint64_t peb_estimated = peb.ldr_address - 0x18;
             std::uint8_t pp_buf[8] = {};
-            if (device->read_raw(peb_estimated + 0x20, pp_buf, 8) == 8) {
+            if (netsec_scan_should_stop(config, diag, start_ms)) {
+                device->set_process_id(saved_pid);
+                if (saved_pid != 0) device->solve_dtb();
+                return keys;
+            }
+            ++diag.read_attempts;
+            std::size_t actual_pp = device->read_raw(peb_estimated + 0x20, pp_buf, 8);
+            diag.read_bytes += actual_pp;
+            if (actual_pp != 8) {
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = peb_estimated + 0x20;
+            }
+            if (actual_pp == 8) {
                 std::uint64_t proc_params = *reinterpret_cast<std::uint64_t*>(pp_buf);
                 if (is_plausible_pointer(proc_params)) {
 
 
                     std::uint8_t env_buf[8] = {};
                     std::uint8_t env_size_buf[8] = {};
-                    if (device->read_raw(proc_params + 0x80, env_buf, 8) == 8 &&
-                        device->read_raw(proc_params + 0x3F0, env_size_buf, 8) == 8) {
+                    if (netsec_scan_should_stop(config, diag, start_ms)) {
+                        device->set_process_id(saved_pid);
+                        if (saved_pid != 0) device->solve_dtb();
+                        return keys;
+                    }
+                    ++diag.read_attempts;
+                    std::size_t env_ptr_read = device->read_raw(proc_params + 0x80, env_buf, 8);
+                    diag.read_bytes += env_ptr_read;
+                    if (env_ptr_read != 8) {
+                        ++diag.read_short;
+                        if (diag.first_short_read_va == 0)
+                            diag.first_short_read_va = proc_params + 0x80;
+                    }
+                    if (netsec_scan_should_stop(config, diag, start_ms)) {
+                        device->set_process_id(saved_pid);
+                        if (saved_pid != 0) device->solve_dtb();
+                        return keys;
+                    }
+                    ++diag.read_attempts;
+                    std::size_t env_size_read = device->read_raw(proc_params + 0x3F0, env_size_buf, 8);
+                    diag.read_bytes += env_size_read;
+                    if (env_size_read != 8) {
+                        ++diag.read_short;
+                        if (diag.first_short_read_va == 0)
+                            diag.first_short_read_va = proc_params + 0x3F0;
+                    }
+                    if (env_ptr_read == 8 && env_size_read == 8) {
                         std::uint64_t env_ptr = *reinterpret_cast<std::uint64_t*>(env_buf);
                         std::uint64_t env_size = *reinterpret_cast<std::uint64_t*>(env_size_buf);
                         if (is_plausible_pointer(env_ptr) && env_size > 0 && env_size < 0x100000) {
 
                             std::size_t read_size = static_cast<std::size_t>(std::min(env_size, static_cast<std::uint64_t>(0x40000)));
                             std::vector<std::uint8_t> env_data(read_size);
+                            if (netsec_scan_should_stop(config, diag, start_ms)) {
+                                device->set_process_id(saved_pid);
+                                if (saved_pid != 0) device->solve_dtb();
+                                return keys;
+                            }
+                            ++diag.read_attempts;
                             std::size_t actual = device->read_raw(env_ptr, env_data.data(), read_size);
+                            diag.read_bytes += actual;
+                            if (actual < 32) {
+                                ++diag.read_short;
+                                if (diag.first_short_read_va == 0)
+                                    diag.first_short_read_va = env_ptr;
+                            }
                             if (actual >= 32) {
 
                                 const wchar_t* env_str = reinterpret_cast<const wchar_t*>(env_data.data());
@@ -1338,6 +1691,12 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
                                         GetFileAttributesA(target_keylog.c_str()) != INVALID_FILE_ATTRIBUTES) {
                                         auto file_keys = read_keylog_file(target_keylog);
                                         for (auto& k : file_keys) {
+                                            if (keys.size() >= config.max_results) {
+                                                diag.early_exit_reason = "max_results";
+                                                break;
+                                            }
+                                            if (netsec_scan_should_stop(config, diag, start_ms))
+                                                break;
                                             k.pid = pid;
                                             if (k.library.empty()) k.library = "BoringSSL/ProcessKeylog";
                                             std::string dedup;
@@ -1347,8 +1706,15 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
                                                 dedup = bytes_to_hex(k.client_random.data(), k.client_random.size());
                                             else
                                                 continue;
-                                            if (_seen_keys.find(dedup) == _seen_keys.end()) {
-                                                _seen_keys[dedup] = k;
+                                            bool inserted = false;
+                                            {
+                                                std::lock_guard<std::mutex> seen_lock(_mutex);
+                                                if (_seen_keys.find(dedup) == _seen_keys.end()) {
+                                                    _seen_keys[dedup] = k;
+                                                    inserted = true;
+                                                }
+                                            }
+                                            if (inserted) {
                                                 keys.push_back(k);
                                             }
                                         }
@@ -1372,9 +1738,13 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_boringssl(std::uint32_t pid
 }
 
 
-std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint32_t pid) {
+std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint32_t pid,
+                                                                       const tls_key_scan_config_t& config,
+                                                                       key_scan_diagnostics_t& diag,
+                                                                       ULONGLONG start_ms) {
     std::vector<tls_session_key_t> keys;
     if (!device || !device->is_connected()) return keys;
+    if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
 
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
@@ -1388,28 +1758,43 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
     std::size_t pattern_len = 14;
 
     for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-        if (region.size > 0x2000000 || region.size < 128) continue;
+        if (netsec_scan_should_stop(config, diag, start_ms)) break;
+        ++diag.regions_seen;
+        if (region.state != 0x1000) { ++diag.regions_skipped_state; continue; }
+        if (region.size > 0x2000000 || region.size < 128) { ++diag.regions_skipped_size; continue; }
+        ++diag.regions_committed;
 
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
 
         for (std::uint64_t off = 0; off < region.size; off += CHUNK - 256) {
+            if (netsec_scan_should_stop(config, diag, start_ms)) goto generic_done;
             std::size_t to_read = static_cast<std::size_t>(
                 std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
             if (to_read < 128) break;
 
             std::memset(buf.data(), 0, CHUNK);
+            ++diag.read_attempts;
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 128) continue;
+            diag.read_bytes += actual;
+            if (actual < 128) {
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = region.base + off;
+                continue;
+            }
 
 
             for (std::size_t i = 0; i + pattern_len + 64 + 1 + 96 < actual; i++) {
+                if ((i & 0xFF) == 0 && netsec_scan_should_stop(config, diag, start_ms)) goto generic_done;
                 bool prefix_match = true;
                 for (std::size_t j = 0; j < pattern_len; j++) {
                     if (buf[i + j] != pattern[j]) { prefix_match = false; break; }
                 }
                 if (!prefix_match) continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
 
 
                 std::size_t pos = i + pattern_len;
@@ -1422,7 +1807,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                     else break;
                     pos++;
                 }
-                if (cr_hex_str.size() != 64) continue;
+                if (cr_hex_str.size() != 64) { ++diag.reject_count; continue; }
 
 
                 while (pos < actual && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
@@ -1436,7 +1821,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                     else break;
                     pos++;
                 }
-                if (ms_hex_str.size() < 64) continue;
+                if (ms_hex_str.size() < 64) { ++diag.reject_count; continue; }
 
                 tls_session_key_t key;
                 key.label = "CLIENT_RANDOM";
@@ -1447,12 +1832,22 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                 key.pid = pid;
                 key.library = "KeylogBuffer";
 
-                if (_seen_keys.find(cr_hex_str) == _seen_keys.end()) {
-                    _seen_keys[cr_hex_str] = key;
+                bool inserted = false;
+                {
+                    std::lock_guard<std::mutex> seen_lock(_mutex);
+                    if (_seen_keys.find(cr_hex_str) == _seen_keys.end()) {
+                        _seen_keys[cr_hex_str] = key;
+                        inserted = true;
+                    }
+                }
+                if (inserted) {
                     keys.push_back(key);
                 }
 
-                if (keys.size() >= 64) goto generic_done;
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto generic_done;
+                }
             }
 
 
@@ -1467,11 +1862,15 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
             for (const char* label : tls13_labels) {
                 std::size_t label_len = std::strlen(label);
                 for (std::size_t i = 0; i + label_len + 64 + 1 + 64 < actual; i++) {
+                    if ((i & 0xFF) == 0 && netsec_scan_should_stop(config, diag, start_ms)) goto generic_done;
                     bool match = true;
                     for (std::size_t j = 0; j < label_len; j++) {
                         if (buf[i + j] != static_cast<std::uint8_t>(label[j])) { match = false; break; }
                     }
                     if (!match) continue;
+                    ++diag.candidate_hits;
+                    if (diag.first_hit_elapsed_ms == 0)
+                        diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
 
                     std::size_t pos = i + label_len;
                     std::string cr_hex_str;
@@ -1482,7 +1881,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                         else break;
                         pos++;
                     }
-                    if (cr_hex_str.size() != 64) continue;
+                    if (cr_hex_str.size() != 64) { ++diag.reject_count; continue; }
 
                     while (pos < actual && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
 
@@ -1494,7 +1893,7 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                         else break;
                         pos++;
                     }
-                    if (secret_hex_str.size() < 64) continue;
+                    if (secret_hex_str.size() < 64) { ++diag.reject_count; continue; }
 
                     tls_session_key_t key;
 
@@ -1507,12 +1906,22 @@ std::vector<tls_session_key_t> TlsKeyExtractor::scan_generic_patterns(std::uint3
                     key.library = "KeylogBuffer";
 
                     std::string dedup_key = key.label + ":" + cr_hex_str;
-                    if (_seen_keys.find(dedup_key) == _seen_keys.end()) {
-                        _seen_keys[dedup_key] = key;
+                    bool inserted = false;
+                    {
+                        std::lock_guard<std::mutex> seen_lock(_mutex);
+                        if (_seen_keys.find(dedup_key) == _seen_keys.end()) {
+                            _seen_keys[dedup_key] = key;
+                            inserted = true;
+                        }
+                    }
+                    if (inserted) {
                         keys.push_back(key);
                     }
 
-                    if (keys.size() >= 64) goto generic_done;
+                    if (keys.size() >= config.max_results) {
+                        diag.early_exit_reason = "max_results";
+                        goto generic_done;
+                    }
                 }
             }
         }
@@ -1526,10 +1935,15 @@ generic_done:
 
 static std::vector<tls_session_key_t> scan_tls13_secrets_impl(
     voyager::device_t* dev, std::uint32_t pid,
+    const tls_key_scan_config_t& config,
+    key_scan_diagnostics_t& diag,
+    ULONGLONG start_ms,
+    std::mutex& seen_mutex,
     std::map<std::string, tls_session_key_t>& seen_keys) {
 
     std::vector<tls_session_key_t> keys;
     if (!dev || !dev->is_connected()) return keys;
+    if (netsec_scan_should_stop(config, diag, start_ms)) return keys;
 
     std::uint32_t saved_pid = dev->get_process_id();
     dev->set_process_id(pid);
@@ -1539,25 +1953,40 @@ static std::vector<tls_session_key_t> scan_tls13_secrets_impl(
 
 
     for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-        if (region.size > 0x2000000 || region.size < 128) continue;
+        if (netsec_scan_should_stop(config, diag, start_ms)) break;
+        ++diag.regions_seen;
+        if (region.state != 0x1000) { ++diag.regions_skipped_state; continue; }
+        if (region.size > 0x2000000 || region.size < 128) { ++diag.regions_skipped_size; continue; }
+        ++diag.regions_committed;
 
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
 
         for (std::uint64_t off = 0; off < region.size; off += CHUNK - 128) {
+            if (netsec_scan_should_stop(config, diag, start_ms)) goto tls13_done;
             std::size_t to_read = static_cast<std::size_t>(
                 std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
             if (to_read < 128) break;
 
             std::memset(buf.data(), 0, CHUNK);
+            ++diag.read_attempts;
             std::size_t actual = dev->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 128) continue;
+            diag.read_bytes += actual;
+            if (actual < 128) {
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = region.base + off;
+                continue;
+            }
 
 
             for (std::size_t i = 64; i + 2 <= actual; i += 2) {
+                if ((i & 0xFF) == 0 && netsec_scan_should_stop(config, diag, start_ms)) goto tls13_done;
                 std::uint16_t ver = (static_cast<std::uint16_t>(buf[i]) << 8) | buf[i + 1];
                 if (ver != 0x0304) continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
 
 
                 for (int cr_off = -128; cr_off < -16; cr_off += 8) {
@@ -1582,10 +2011,7 @@ static std::vector<tls_session_key_t> scan_tls13_secrets_impl(
                         if (sec_pos < 0 || sec_pos + 32 > static_cast<std::int64_t>(actual)) break;
 
                         const std::uint8_t* secret = buf.data() + sec_pos;
-                        if (!looks_like_random(secret, 32)) {
-
-                            continue;
-                        }
+                        if (!looks_like_random(secret, 32)) { ++diag.reject_count; continue; }
 
                         tls_session_key_t key;
                         key.label = tls13_labels[secret_idx];
@@ -1598,8 +2024,15 @@ static std::vector<tls_session_key_t> scan_tls13_secrets_impl(
 
                         std::string dedup = key.label + ":" +
                                             bytes_to_hex(cr, 32);
-                        if (seen_keys.find(dedup) == seen_keys.end()) {
-                            seen_keys[dedup] = key;
+                        bool inserted = false;
+                        {
+                            std::lock_guard<std::mutex> seen_lock(seen_mutex);
+                            if (seen_keys.find(dedup) == seen_keys.end()) {
+                                seen_keys[dedup] = key;
+                                inserted = true;
+                            }
+                        }
+                        if (inserted) {
                             keys.push_back(key);
                         }
                         secret_idx++;
@@ -1612,7 +2045,10 @@ static std::vector<tls_session_key_t> scan_tls13_secrets_impl(
                     }
                 }
 
-                if (keys.size() >= 64) goto tls13_done;
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto tls13_done;
+                }
             }
         }
     }
@@ -1693,33 +2129,32 @@ std::vector<tls_session_key_t> TlsKeyExtractor::extract_keys(const tls_key_scan_
         return all_keys;
     }
 
-    std::lock_guard<std::mutex> lock(_mutex);
     if (config.scan_schannel && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
-        auto keys = scan_schannel(pid);
+        auto keys = scan_schannel(pid, config, diag, start_ms);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
     if (config.scan_openssl && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
-        auto keys = scan_openssl(pid);
+        auto keys = scan_openssl(pid, config, diag, start_ms);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
     if (config.scan_nss && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
-        auto keys = scan_nss(pid);
+        auto keys = scan_nss(pid, config, diag, start_ms);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
     if (config.scan_boringssl && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
-        auto keys = scan_boringssl(pid);
+        auto keys = scan_boringssl(pid, config, diag, start_ms);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
 
     if (config.scan_generic && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
-        auto keys = scan_generic_patterns(pid);
+        auto keys = scan_generic_patterns(pid, config, diag, start_ms);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
 
     if (config.scan_tls13_structures && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
-        auto keys = scan_tls13_secrets_impl(device.get(), pid, _seen_keys);
+        auto keys = scan_tls13_secrets_impl(device.get(), pid, config, diag, start_ms, _mutex, _seen_keys);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
@@ -2531,6 +2966,20 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
     result.keylog_file_used = keylog_path;
     result.timeout_ms = std::max<std::uint32_t>(1000, std::min<std::uint32_t>(timeout_ms, 60000));
 
+    if (netsec_has_nul(pcap_path) || netsec_has_nul(keylog_path)) {
+        result.error_message = "PCAP and keylog paths must not contain embedded NUL characters";
+        result.elapsed_ms = GetTickCount64() - start_ms;
+        return result;
+    }
+
+    std::string filter_error;
+    const std::string effective_display_filter = netsec_trim_copy(display_filter);
+    if (!validate_tshark_display_filter(effective_display_filter, &filter_error)) {
+        result.error_message = "Invalid tshark display filter: " + filter_error;
+        result.elapsed_ms = GetTickCount64() - start_ms;
+        return result;
+    }
+
     if (GetFileAttributesA(pcap_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         result.error_message = "PCAP file not found: " + pcap_path;
         result.win32_error = GetLastError();
@@ -2554,12 +3003,10 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         return result;
     }
 
-
-    std::string cmd = "\"" + tshark + "\"";
-    cmd += " -n -r \"" + pcap_path + "\"";
-    cmd += " -o \"tls.keylog_file:" + keylog_path + "\"";
-    if (!display_filter.empty())
-        cmd += " -Y \"" + display_filter + "\"";
+    std::string cmd = netsec_quote_windows_arg(tshark);
+    cmd += " -n -r " + netsec_quote_windows_arg(pcap_path);
+    cmd += " -o " + netsec_quote_windows_arg("tls.keylog_file:" + keylog_path);
+    cmd += " -Y " + netsec_quote_windows_arg(effective_display_filter);
     cmd += " -T json -l";
 
     std::error_code pcap_ec;
@@ -2574,7 +3021,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         keylog_path.c_str(),
         static_cast<unsigned long long>(keylog_size),
         keylog_ec ? 0 : 1,
-        display_filter.c_str(),
+        effective_display_filter.c_str(),
         result.timeout_ms);
 
     SECURITY_ATTRIBUTES sa{};
@@ -2801,14 +3248,16 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
     } catch (const std::exception& ex) {
 
         if (result.raw_output.size() < 10) {
-            result.error_message = std::string("No packets matched the filter '") + display_filter +
+            result.error_message = std::string("No packets matched the filter '") + effective_display_filter +
                                    "'. TLS decryption may have failed - ensure the keylog file has valid keys for this capture.";
         } else {
             result.error_message = std::string("Failed to parse tshark JSON output: ") + ex.what();
         }
     }
 
-    result.success = (result.decrypted_packets > 0);
+    result.success = (result.decrypted_packets > 0 && !result.http2_frames.empty());
+    if (!result.success && result.decrypted_packets > 0 && result.http2_frames.empty() && result.error_message.empty())
+        result.error_message = "tshark decrypted HTTP/2 packets but produced no HTTP/2 frame evidence";
     result.elapsed_ms = GetTickCount64() - start_ms;
     diag::log_tagged_fmt("net_sec", "tshark_decrypt parse_done success=%d total_packets=%u decrypted=%u http2_frames=%zu parse_ms=%llu elapsed_ms=%llu error=%s",
         result.success ? 1 : 0,
@@ -3696,6 +4145,7 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
     for (const auto& pkt : packets) {
         if (pkt.protocol != 17) continue;
         if (pkt.payload.size() < 5) continue;
+        if (filter_pid != 0 && pkt.pid != filter_pid) continue;
 
         quic_header_t hdr;
         std::size_t quic_offset = 0;
@@ -3728,9 +4178,10 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
             hdr.scid.size());
 
 
-        std::string key = bytes_to_hex(pkt.local_addr, 4) + ":" +
+        const std::size_t addr_len = pkt.address_family == 23 ? 16 : 4;
+        std::string key = bytes_to_hex(pkt.local_addr, addr_len) + ":" +
                           std::to_string(pkt.local_port) + "-" +
-                          bytes_to_hex(pkt.remote_addr, 4) + ":" +
+                          bytes_to_hex(pkt.remote_addr, addr_len) + ":" +
                           std::to_string(pkt.remote_port);
 
         auto& conn = conn_map[key];
@@ -3754,6 +4205,12 @@ std::vector<quic_connection_info_t> QuicAnalyzer::detect_quic_connections(std::u
             conn.packets_recv++;
             conn.bytes_recv += pkt.payload_size;
         }
+        conn.capture_packet_count++;
+        conn.capture_byte_count += pkt.payload_size;
+        if (conn.payload_sha256.empty() && quic_offset < pkt.payload.size())
+            conn.payload_sha256 = netsec_sha256_hex(pkt.payload.data() + quic_offset, pkt.payload.size() - quic_offset);
+        if (conn.parser_offset == 0)
+            conn.parser_offset = quic_offset;
 
         if (hdr.version != 0) {
             conn.tls_version = 0x0304;
@@ -4144,6 +4601,9 @@ std::vector<dtls_session_info_t> DtlsAnalyzer::detect_dtls_sessions(std::uint32_
         session.sequence_number = rec.sequence;
         session.content_type = rec.content_type;
         session.payload.assign(pkt.payload.begin(), pkt.payload.end());
+        session.parser_offset = dtls_offset;
+        if (dtls_offset < pkt.payload.size())
+            session.payload_sha256 = netsec_sha256_hex(pkt.payload.data() + dtls_offset, pkt.payload.size() - dtls_offset);
 
         if (rec.is_handshake) {
             session.state = "handshake";

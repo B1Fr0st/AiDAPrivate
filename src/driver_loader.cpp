@@ -53,6 +53,32 @@ namespace
     bool g_loaded = false;
     std::string s_last_error;
 
+    struct materialization_summary_t
+    {
+        bool active = false;
+        const char* mode = "";
+        ULONGLONG started_ms = 0;
+        unsigned total_files = 0;
+        unsigned driver_files = 0;
+        unsigned runtime_files = 0;
+        unsigned long long total_bytes = 0;
+        unsigned long long driver_bytes = 0;
+        unsigned long long runtime_bytes = 0;
+        DWORD mapper_pid = 0;
+        DWORD mapper_tid = 0;
+        DWORD mapper_create_gle = ERROR_SUCCESS;
+        DWORD mapper_wait_result = WAIT_TIMEOUT;
+        DWORD mapper_wait_gle = ERROR_SUCCESS;
+        DWORD mapper_exit_code = 0;
+        DWORD mapper_exit_gle = ERROR_SUCCESS;
+        int whoswho_deleted = -1;
+        int sentinel_deleted = -1;
+        int stage_dir_deleted = -1;
+        int keep_stage = 0;
+    };
+
+    materialization_summary_t s_materialization_summary;
+
     void loader_diag(const char* msg)
     {
 #ifdef AIDA_STANDALONE
@@ -75,6 +101,73 @@ namespace
         (void)fmt;
 #endif
     }
+
+    bool should_keep_stage();
+
+    void reset_materialization_summary(const char* mode)
+    {
+        s_materialization_summary = {};
+        s_materialization_summary.active = true;
+        s_materialization_summary.mode = mode ? mode : "";
+        s_materialization_summary.started_ms = GetTickCount64();
+        s_materialization_summary.keep_stage = should_keep_stage() ? 1 : 0;
+    }
+
+    void record_materialized_file(const char* label, unsigned long bytes)
+    {
+        if (!s_materialization_summary.active)
+            return;
+        ++s_materialization_summary.total_files;
+        s_materialization_summary.total_bytes += bytes;
+        const bool driver_blob =
+            (label && (std::strcmp(label, "whoswho") == 0 || std::strcmp(label, "sentinel") == 0));
+        if (driver_blob) {
+            ++s_materialization_summary.driver_files;
+            s_materialization_summary.driver_bytes += bytes;
+        } else {
+            ++s_materialization_summary.runtime_files;
+            s_materialization_summary.runtime_bytes += bytes;
+        }
+    }
+
+    void log_materialization_summary()
+    {
+        if (!s_materialization_summary.active)
+            return;
+        s_materialization_summary.active = false;
+        const ULONGLONG now = GetTickCount64();
+        loader_diag_fmt(
+            "driver_materialization_summary mode=%s success=%d files=%u driver_files=%u runtime_files=%u bytes=%llu driver_bytes=%llu runtime_bytes=%llu mapper_pid=%lu mapper_tid=%lu create_gle=%lu wait=0x%08lX wait_gle=%lu exit=0x%08lX exit_gle=%lu cleanup_whoswho=%d cleanup_sentinel=%d cleanup_stage=%d keep_stage=%d elapsed_ms=%llu last_error_empty=%d",
+            s_materialization_summary.mode ? s_materialization_summary.mode : "",
+            g_loaded ? 1 : 0,
+            s_materialization_summary.total_files,
+            s_materialization_summary.driver_files,
+            s_materialization_summary.runtime_files,
+            s_materialization_summary.total_bytes,
+            s_materialization_summary.driver_bytes,
+            s_materialization_summary.runtime_bytes,
+            static_cast<unsigned long>(s_materialization_summary.mapper_pid),
+            static_cast<unsigned long>(s_materialization_summary.mapper_tid),
+            static_cast<unsigned long>(s_materialization_summary.mapper_create_gle),
+            static_cast<unsigned long>(s_materialization_summary.mapper_wait_result),
+            static_cast<unsigned long>(s_materialization_summary.mapper_wait_gle),
+            static_cast<unsigned long>(s_materialization_summary.mapper_exit_code),
+            static_cast<unsigned long>(s_materialization_summary.mapper_exit_gle),
+            s_materialization_summary.whoswho_deleted,
+            s_materialization_summary.sentinel_deleted,
+            s_materialization_summary.stage_dir_deleted,
+            s_materialization_summary.keep_stage,
+            static_cast<unsigned long long>(now >= s_materialization_summary.started_ms ? now - s_materialization_summary.started_ms : 0),
+            s_last_error.empty() ? 1 : 0);
+    }
+
+    struct materialization_summary_scope_t
+    {
+        explicit materialization_summary_scope_t(const char* mode) { reset_materialization_summary(mode); }
+        ~materialization_summary_scope_t() { log_materialization_summary(); }
+        materialization_summary_scope_t(const materialization_summary_scope_t&) = delete;
+        materialization_summary_scope_t& operator=(const materialization_summary_scope_t&) = delete;
+    };
 
     void set_last_error(const char* msg)
     {
@@ -512,6 +605,7 @@ namespace
             label ? label : "?",
             out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
             ciphertext_len);
+        record_materialized_file(label, ciphertext_len);
         return true;
     }
 
@@ -632,6 +726,7 @@ namespace
             label ? label : "?",
             out_path_utf8.empty() ? "<empty>" : out_path_utf8.c_str(),
             ciphertext_len);
+        record_materialized_file(label, ciphertext_len);
         return true;
     }
 
@@ -1131,6 +1226,7 @@ namespace driver_loader
 
         s_last_error.clear();
         loader_diag("initialize_and_load_begin");
+        materialization_summary_scope_t materialization_scope("legacy_mapper");
 
         loader_diag("native_services_skipped_unsigned_driver_policy");
 
@@ -1236,9 +1332,10 @@ namespace driver_loader
 
         if (!created) {
             DWORD gle = GetLastError();
-            cleanup_stage_file(whoswho_path, "whoswho");
-            cleanup_stage_file(sentinel_path, "sentinel");
-            cleanup_stage_dir(stage);
+            s_materialization_summary.mapper_create_gle = gle;
+            s_materialization_summary.whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho") ? 1 : 0;
+            s_materialization_summary.sentinel_deleted = cleanup_stage_file(sentinel_path, "sentinel") ? 1 : 0;
+            s_materialization_summary.stage_dir_deleted = cleanup_stage_dir(stage) ? 1 : 0;
             if (gle == ERROR_VIRUS_INFECTED || gle == ERROR_VIRUS_DELETED) {
                 set_last_error_fmt("Security software blocked mapper stage gle=%lu mapper=\"%s\" stage_dir=\"%s\"",
                     static_cast<unsigned long>(gle),
@@ -1253,6 +1350,8 @@ namespace driver_loader
         loader_diag_fmt("mapper_create_process_ok pid=%lu tid=%lu",
             static_cast<unsigned long>(pi.dwProcessId),
             static_cast<unsigned long>(pi.dwThreadId));
+        s_materialization_summary.mapper_pid = pi.dwProcessId;
+        s_materialization_summary.mapper_tid = pi.dwThreadId;
 
         HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
         if (hJob) {
@@ -1271,6 +1370,8 @@ namespace driver_loader
 
         DWORD wait_result = WaitForSingleObject(pi.hProcess, 90000);
         DWORD wait_gle = GetLastError();
+        s_materialization_summary.mapper_wait_result = wait_result;
+        s_materialization_summary.mapper_wait_gle = wait_gle;
         loader_diag_fmt("mapper_wait result=0x%08lX gle=%lu",
             static_cast<unsigned long>(wait_result),
             static_cast<unsigned long>(wait_gle));
@@ -1278,6 +1379,8 @@ namespace driver_loader
         DWORD exit_code = 1;
         BOOL got_exit = GetExitCodeProcess(pi.hProcess, &exit_code);
         DWORD exit_gle = GetLastError();
+        s_materialization_summary.mapper_exit_code = exit_code;
+        s_materialization_summary.mapper_exit_gle = exit_gle;
         loader_diag_fmt("mapper_exit got=%d code=0x%08lX gle=%lu log=\"%s\"",
             got_exit ? 1 : 0,
             static_cast<unsigned long>(exit_code),
@@ -1291,6 +1394,9 @@ namespace driver_loader
         bool whoswho_deleted = cleanup_stage_file(whoswho_path, "whoswho");
         bool sentinel_deleted = cleanup_stage_file(sentinel_path, "sentinel");
         bool legacy_stage_dir_deleted = cleanup_stage_dir(stage);
+        s_materialization_summary.whoswho_deleted = whoswho_deleted ? 1 : 0;
+        s_materialization_summary.sentinel_deleted = sentinel_deleted ? 1 : 0;
+        s_materialization_summary.stage_dir_deleted = legacy_stage_dir_deleted ? 1 : 0;
         if (!whoswho_deleted || !sentinel_deleted || !legacy_stage_dir_deleted) {
             set_last_error_fmt("Mapper stage cleanup failed whoswho_deleted=%d sentinel_deleted=%d stage_dir_deleted=%d",
                 whoswho_deleted ? 1 : 0,

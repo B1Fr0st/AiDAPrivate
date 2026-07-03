@@ -120,7 +120,7 @@ bool initialize() {
 		return true;
 	}
 	st.stop_requested.store(false, std::memory_order_release);
-	bool posted = work_queue::post([]() {
+	bool posted = work_queue::post_labeled("session_health.watcher_loop", []() {
 		watcher_loop();
 	});
 	if (!posted) {

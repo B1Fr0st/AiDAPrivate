@@ -521,9 +521,30 @@ const wchar_t* socket_module_dll_name(const std::string& lower_name)
     return nullptr;
 }
 
+std::uint64_t sendrecv_target_scan_reserve_ms(std::uint32_t timeout_ms)
+{
+    return (std::max<std::uint64_t>)(125, (std::min<std::uint64_t>)(5000, timeout_ms / 2));
+}
+
 std::uint64_t socket_resolution_app_scan_reserve_ms(const scan_deadline_t& deadline)
 {
-    return (std::max<std::uint64_t>)(100, (std::min<std::uint64_t>)(750, deadline.timeout_ms / 4));
+    return sendrecv_target_scan_reserve_ms(deadline.timeout_ms);
+}
+
+std::uint32_t socket_resolution_budget_ms(std::uint32_t timeout_ms,
+                                          std::uint64_t remaining_ms,
+                                          std::uint64_t reserve_ms)
+{
+    if (remaining_ms == 0)
+        return 1;
+    const std::uint64_t available = remaining_ms > reserve_ms + 50 ? remaining_ms - reserve_ms : (std::max<std::uint64_t>)(1, remaining_ms / 3);
+    const std::uint64_t cap = (std::max<std::uint64_t>)(150, (std::min<std::uint64_t>)(3000, timeout_ms / 3));
+    std::uint64_t budget = (std::min)(available, cap);
+    if (budget < 75 && remaining_ms >= 75)
+        budget = 75;
+    if (budget > remaining_ms)
+        budget = remaining_ms;
+    return static_cast<std::uint32_t>((std::max<std::uint64_t>)(1, budget));
 }
 
 struct local_module_lookup_result_t {
@@ -671,6 +692,46 @@ bool module_matches_scan_target(const driver_bridge::module_info_t& module,
     std::size_t slash = path.find_last_of("\\/");
     const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
     return base == wanted || base.find(wanted) != std::string::npos;
+}
+
+std::vector<driver_bridge::module_info_t> prioritize_sendrecv_scan_modules(const std::vector<driver_bridge::module_info_t>& modules,
+                                                                           const sendrecv_scan_options_t& options,
+                                                                           nlohmann::json& diagnostics)
+{
+    diagnostics = nlohmann::json::object();
+    diagnostics["filter_present"] = options.module_base != 0 || !options.module_name.empty();
+    diagnostics["module_name"] = options.module_name;
+    diagnostics["module_base"] = options.module_base == 0 ? nlohmann::json(nullptr) : nlohmann::json(fmt_addr(options.module_base));
+    diagnostics["input_module_count"] = modules.size();
+    diagnostics["matched_modules"] = nlohmann::json::array();
+    diagnostics["ordered_samples"] = nlohmann::json::array();
+    std::vector<driver_bridge::module_info_t> ordered;
+    ordered.reserve(modules.size());
+    std::vector<std::size_t> matched;
+    matched.reserve(modules.size());
+    std::vector<std::size_t> unmatched;
+    unmatched.reserve(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (module_matches_scan_target(modules[i], options))
+            matched.push_back(i);
+        else
+            unmatched.push_back(i);
+    }
+    for (const std::size_t index : matched) {
+        const auto& module = modules[index];
+        ordered.push_back(module);
+        if (diagnostics["matched_modules"].size() < 16)
+            diagnostics["matched_modules"].push_back(nlohmann::json{{"name", module.name}, {"base", fmt_addr(module.base)}, {"size", module.size}, {"path", module.path}, {"original_index", index}});
+    }
+    for (const std::size_t index : unmatched)
+        ordered.push_back(modules[index]);
+    for (std::size_t i = 0; i < ordered.size() && i < 16; ++i)
+        diagnostics["ordered_samples"].push_back(nlohmann::json{{"name", ordered[i].name}, {"base", fmt_addr(ordered[i].base)}, {"size", ordered[i].size}, {"path", ordered[i].path}, {"priority_index", i}, {"target_match", module_matches_scan_target(ordered[i], options)}});
+    diagnostics["matched_count"] = matched.size();
+    diagnostics["unmatched_count"] = unmatched.size();
+    diagnostics["ordered_module_count"] = ordered.size();
+    diagnostics["target_prioritized"] = diagnostics.value("filter_present", false) && !matched.empty();
+    return ordered;
 }
 
 bool compute_scan_window(const driver_bridge::module_info_t& module,
@@ -3088,6 +3149,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         options.timeout_ms = 30000;
 
     scan_deadline_t deadline(options.timeout_ms);
+    const ULONGLONG find_t0 = GetTickCount64();
     diag::log_tagged_fmt("net_proto",
         "find_sendrecv begin pid=%u max_results=%u max_modules=%u max_scan_bytes=%llu timeout_ms=%u module_name=%s module_base=0x%llX scan_base=0x%llX scan_size=0x%llX",
         pid,
@@ -3100,34 +3162,88 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         static_cast<unsigned long long>(options.scan_base),
         static_cast<unsigned long long>(options.scan_size));
     deadline.stage = "enumerate_modules";
+    const ULONGLONG enumerate_t0 = GetTickCount64();
     std::vector<driver_bridge::module_info_t> modules;
     if (!deadline.expired("before_enumerate_modules"))
         modules = driver_bridge::enumerate_modules_for(pid);
+    const std::uint64_t enumerate_elapsed_ms = GetTickCount64() - enumerate_t0;
     diag::log_tagged_fmt("net_proto",
-        "find_sendrecv enumerate_modules_done pid=%u module_count=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+        "find_sendrecv enumerate_modules_done pid=%u module_count=%zu deadline_hit=%d enumerate_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
         pid,
         modules.size(),
         deadline.hit ? 1 : 0,
+        static_cast<unsigned long long>(enumerate_elapsed_ms),
+        static_cast<unsigned long long>(deadline.remaining_ms()),
+        static_cast<unsigned long long>(deadline.elapsed_ms()));
+    const ULONGLONG target_selection_t0 = GetTickCount64();
+    nlohmann::json target_selection = nlohmann::json::object();
+    std::vector<driver_bridge::module_info_t> scan_modules = prioritize_sendrecv_scan_modules(modules, options, target_selection);
+    const std::uint64_t target_selection_elapsed_ms = GetTickCount64() - target_selection_t0;
+    target_selection["elapsed_ms"] = target_selection_elapsed_ms;
+    diag::log_tagged_fmt("net_proto",
+        "find_sendrecv target_module_selection pid=%u input_modules=%zu ordered_modules=%zu matched=%zu filter_present=%d target_prioritized=%d elapsed_ms=%llu remaining_ms=%llu total_elapsed_ms=%llu",
+        pid,
+        modules.size(),
+        scan_modules.size(),
+        target_selection.value("matched_count", static_cast<std::size_t>(0)),
+        target_selection.value("filter_present", false) ? 1 : 0,
+        target_selection.value("target_prioritized", false) ? 1 : 0,
+        static_cast<unsigned long long>(target_selection_elapsed_ms),
         static_cast<unsigned long long>(deadline.remaining_ms()),
         static_cast<unsigned long long>(deadline.elapsed_ms()));
     nlohmann::json socket_resolution = nlohmann::json::object();
     socket_resolution["enumerated_module_count"] = modules.size();
+    socket_resolution["scan_ordered_module_count"] = scan_modules.size();
     socket_resolution["deadline_remaining_ms_after_enumeration"] = deadline.remaining_ms();
     socket_resolution["elapsed_ms_after_enumeration"] = deadline.elapsed_ms();
     if (!deadline.expired("resolve_socket_exports"))
         socket_resolution["module_count"] = modules.size();
+    const std::uint64_t target_scan_reserve_ms = sendrecv_target_scan_reserve_ms(options.timeout_ms);
+    const std::uint64_t resolve_remaining_ms = deadline.remaining_ms();
+    const std::uint32_t resolve_budget_ms = socket_resolution_budget_ms(options.timeout_ms, resolve_remaining_ms, target_scan_reserve_ms);
+    socket_resolution["target_scan_reserve_ms"] = target_scan_reserve_ms;
+    socket_resolution["dependency_budget_ms"] = resolve_budget_ms;
+    socket_resolution["parent_deadline_remaining_ms_before_resolution"] = resolve_remaining_ms;
     diag::log_tagged_fmt("net_proto",
-        "find_sendrecv resolve_socket_exports_begin pid=%u module_count=%zu deadline_hit=%d remaining_ms=%llu elapsed_ms=%llu",
+        "find_sendrecv resolve_socket_exports_begin pid=%u module_count=%zu dependency_budget_ms=%u target_scan_reserve_ms=%llu parent_deadline_hit=%d parent_remaining_ms=%llu elapsed_ms=%llu",
         pid,
         modules.size(),
+        resolve_budget_ms,
+        static_cast<unsigned long long>(target_scan_reserve_ms),
         deadline.hit ? 1 : 0,
         static_cast<unsigned long long>(deadline.remaining_ms()),
         static_cast<unsigned long long>(deadline.elapsed_ms()));
-    const auto apis = deadline.hit ? std::vector<api_target_t>() : resolve_socket_apis(modules, pid, deadline, socket_resolution);
+    scan_deadline_t resolve_deadline(resolve_budget_ms);
+    const ULONGLONG socket_resolution_t0 = GetTickCount64();
+    const auto apis = deadline.hit ? std::vector<api_target_t>() : resolve_socket_apis(modules, pid, resolve_deadline, socket_resolution);
+    const std::uint64_t socket_resolution_elapsed_ms = GetTickCount64() - socket_resolution_t0;
+    if (resolve_deadline.cancelled)
+        deadline.expired("resolve_socket_exports_cancelled");
+    else
+        deadline.expired("after_resolve_socket_exports");
+    const bool dependency_deadline_hit = resolve_deadline.hit && !resolve_deadline.cancelled;
+    const bool dependency_cancelled = resolve_deadline.cancelled;
+    socket_resolution["enumerated_module_count"] = modules.size();
+    socket_resolution["scan_ordered_module_count"] = scan_modules.size();
+    socket_resolution["target_scan_reserve_ms"] = target_scan_reserve_ms;
+    socket_resolution["dependency_budget_ms"] = resolve_budget_ms;
+    socket_resolution["parent_deadline_remaining_ms_before_resolution"] = resolve_remaining_ms;
+    socket_resolution["dependency_deadline_hit"] = dependency_deadline_hit;
+    socket_resolution["dependency_cancelled"] = dependency_cancelled;
+    socket_resolution["dependency_stage"] = resolve_deadline.stage;
+    socket_resolution["dependency_elapsed_ms"] = resolve_deadline.elapsed_ms();
+    socket_resolution["dependency_remaining_ms"] = resolve_deadline.remaining_ms();
+    socket_resolution["socket_resolution_elapsed_ms"] = socket_resolution_elapsed_ms;
+    socket_resolution["parent_deadline_hit_after_resolution"] = deadline.hit;
+    socket_resolution["parent_deadline_remaining_ms_after_resolution"] = deadline.remaining_ms();
     diag::log_tagged_fmt("net_proto",
-        "find_sendrecv resolve_socket_exports_done pid=%u api_count=%zu deadline_hit=%d stage=%s remaining_ms=%llu elapsed_ms=%llu",
+        "find_sendrecv resolve_socket_exports_done pid=%u api_count=%zu dependency_deadline_hit=%d dependency_cancelled=%d dependency_stage=%s dependency_elapsed_ms=%llu parent_deadline_hit=%d parent_stage=%s parent_remaining_ms=%llu elapsed_ms=%llu",
         pid,
         apis.size(),
+        dependency_deadline_hit ? 1 : 0,
+        dependency_cancelled ? 1 : 0,
+        resolve_deadline.stage.c_str(),
+        static_cast<unsigned long long>(socket_resolution_elapsed_ms),
         deadline.hit ? 1 : 0,
         deadline.stage.c_str(),
         static_cast<unsigned long long>(deadline.remaining_ms()),
@@ -3135,15 +3251,26 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     if (apis.empty()) {
         const std::string root_cause = deadline.cancelled
             ? std::string("cancelled")
-            : socket_resolution.value("root_cause", deadline.hit ? std::string("socket_export_resolution_deadline") : std::string("socket_exports_unresolved"));
+            : socket_resolution.value("root_cause", dependency_deadline_hit ? std::string("socket_export_resolution_deadline") : (deadline.hit ? std::string("socket_export_resolution_deadline") : std::string("socket_exports_unresolved")));
+        const bool effective_deadline_hit = (deadline.hit || dependency_deadline_hit) && !deadline.cancelled && !dependency_cancelled;
+        const nlohmann::json phase_timings = nlohmann::json{
+            {"enumerate_modules_ms", enumerate_elapsed_ms},
+            {"target_module_selection_ms", target_selection_elapsed_ms},
+            {"socket_export_resolution_ms", socket_resolution_elapsed_ms},
+            {"module_read_ms", 0},
+            {"import_scan_ms", 0},
+            {"thunk_scan_ms", 0},
+            {"callsite_scan_ms", 0},
+            {"total_wall_ms", static_cast<std::uint64_t>(GetTickCount64() - find_t0)}
+        };
         out["process_id"] = pid;
         out["dependency_unavailable"] = true;
         out["root_cause"] = root_cause;
         out["results"] = nlohmann::json::array();
         out["result_count"] = 0;
         out["count"] = 0;
-        out["deadline_hit"] = deadline.hit && !deadline.cancelled;
-        out["cancelled"] = deadline.cancelled;
+        out["deadline_hit"] = effective_deadline_hit;
+        out["cancelled"] = deadline.cancelled || dependency_cancelled;
         out["elapsed_ms"] = deadline.elapsed_ms();
         out["deadline_remaining_ms"] = deadline.remaining_ms();
         out["timeout_ms"] = options.timeout_ms;
@@ -3158,20 +3285,26 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         out["dependency_result"] = nlohmann::json{
             {"ok", false},
             {"root_cause", root_cause},
-            {"deadline_hit", deadline.hit && !deadline.cancelled},
-            {"cancelled", deadline.cancelled},
-            {"stage", deadline.stage},
+            {"deadline_hit", effective_deadline_hit},
+            {"dependency_deadline_hit", dependency_deadline_hit},
+            {"cancelled", deadline.cancelled || dependency_cancelled},
+            {"stage", dependency_deadline_hit ? resolve_deadline.stage : deadline.stage},
+            {"dependency_stage", resolve_deadline.stage},
+            {"dependency_budget_ms", resolve_budget_ms},
+            {"target_scan_reserve_ms", target_scan_reserve_ms},
             {"deadline_remaining_ms", deadline.remaining_ms()},
             {"elapsed_ms", deadline.elapsed_ms()}
         };
         out["diagnostics"] = nlohmann::json{
             {"socket_resolution", socket_resolution},
+            {"target_selection", target_selection},
+            {"phase_timings", phase_timings},
             {"app_modules_scanned", nlohmann::json::array()},
             {"scanned_bytes", 0},
             {"candidate_hit_count", 0},
             {"deadline_stage", deadline.stage},
             {"deadline_remaining_ms", deadline.remaining_ms()},
-            {"cancelled", deadline.cancelled}
+            {"cancelled", deadline.cancelled || dependency_cancelled}
         };
         out["evidence"] = nlohmann::json::array({"socket API exports not resolved from loaded-module or remote-module export tables"});
         out["limitations"] = nlohmann::json::array({
@@ -3179,12 +3312,15 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             "no send/recv callsite results are fabricated when socket exports are unavailable"
         });
         diag::log_tagged_fmt("net_proto",
-            "find_sendrecv done pid=%u results=0 apis=0 scanned_modules=0 scanned_bytes=0 dependency_unavailable=1 root=%s deadline_hit=%d cancelled=%d elapsed_ms=%llu stage=%s",
+            "find_sendrecv timing pid=%u enumerate_ms=%llu target_selection_ms=%llu socket_resolution_ms=%llu module_read_ms=0 import_scan_ms=0 thunk_scan_ms=0 callsite_scan_ms=0 total_wall_ms=%llu dependency_unavailable=1 root=%s deadline_hit=%d cancelled=%d stage=%s",
             pid,
+            static_cast<unsigned long long>(enumerate_elapsed_ms),
+            static_cast<unsigned long long>(target_selection_elapsed_ms),
+            static_cast<unsigned long long>(socket_resolution_elapsed_ms),
+            static_cast<unsigned long long>(phase_timings["total_wall_ms"].get<std::uint64_t>()),
             root_cause.c_str(),
-            (deadline.hit && !deadline.cancelled) ? 1 : 0,
-            deadline.cancelled ? 1 : 0,
-            static_cast<unsigned long long>(deadline.elapsed_ms()),
+            effective_deadline_hit ? 1 : 0,
+            (deadline.cancelled || dependency_cancelled) ? 1 : 0,
             deadline.stage.c_str());
         return true;
     }
@@ -3204,6 +3340,10 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     std::set<std::uint64_t> seen_callsites;
     std::uint64_t scanned_bytes = 0;
     std::uint64_t candidate_hits = 0;
+    std::uint64_t module_read_elapsed_total_ms = 0;
+    std::uint64_t import_scan_elapsed_total_ms = 0;
+    std::uint64_t thunk_scan_elapsed_total_ms = 0;
+    std::uint64_t callsite_scan_elapsed_total_ms = 0;
     std::uint32_t scanned_count = 0;
     std::string stop_reason;
     bool stopped = false;
@@ -3214,7 +3354,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         deadline.expired(stage);
     };
 
-    for (const auto& module : modules) {
+    for (const auto& module : scan_modules) {
         if (deadline.expired("module_loop")) {
             diag::log_tagged_fmt("net_proto",
                 "find_sendrecv module_loop_deadline pid=%u scanned_modules=%u scanned_bytes=%llu remaining_ms=%llu elapsed_ms=%llu",
@@ -3325,6 +3465,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         const bool read_ok = !deadline.expired("before_module_read") && driver_bridge::read_memory_for(pid, read_base, to_read, bytes);
         module_diag["read_ok"] = read_ok;
         module_diag["read_elapsed_ms"] = GetTickCount64() - read_t0;
+        module_read_elapsed_total_ms += module_diag["read_elapsed_ms"].get<std::uint64_t>();
         module_diag["bytes_read"] = bytes.size();
         module_diag["deadline_remaining_ms_after_read"] = deadline.remaining_ms();
         diag::log_tagged_fmt("net_proto",
@@ -3415,6 +3556,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         }
         module_diag["import_slot_count"] = import_slots.size();
         module_diag["import_slot_scan_elapsed_ms"] = GetTickCount64() - import_slots_t0;
+        import_scan_elapsed_total_ms += module_diag["import_slot_scan_elapsed_ms"].get<std::uint64_t>();
         diag::log_tagged_fmt("net_proto",
             "find_sendrecv scan_import_slots_done pid=%u name=%s import_slots=%zu stopped=%d scan_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
             pid,
@@ -3467,6 +3609,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
             excluded_targets.insert(t.first);
         module_diag["import_thunk_count"] = thunks.size();
         module_diag["import_thunk_scan_elapsed_ms"] = GetTickCount64() - thunks_t0;
+        thunk_scan_elapsed_total_ms += module_diag["import_thunk_scan_elapsed_ms"].get<std::uint64_t>();
         diag::log_tagged_fmt("net_proto",
             "find_sendrecv scan_import_thunks_done pid=%u name=%s thunks=%zu stopped=%d scan_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
             pid,
@@ -3557,6 +3700,7 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
                 results.back()["callsite_resolution"] = "register_indirect_import_slot_load";
         }
         module_diag["callsite_scan_elapsed_ms"] = GetTickCount64() - callsites_t0;
+        callsite_scan_elapsed_total_ms += module_diag["callsite_scan_elapsed_ms"].get<std::uint64_t>();
         module_diag["candidate_hit_count"] = module_candidate_hits;
         module_diag["results_after_module"] = results.size();
         module_diag["deadline_hit"] = deadline.hit;
@@ -3599,8 +3743,20 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
     out["socket_api_count"] = apis.size();
     out["stage"] = deadline.hit ? deadline.stage : (stop_reason.empty() ? "complete" : stop_reason);
     out["deadline_stage"] = deadline.stage;
+    const nlohmann::json phase_timings = nlohmann::json{
+        {"enumerate_modules_ms", enumerate_elapsed_ms},
+        {"target_module_selection_ms", target_selection_elapsed_ms},
+        {"socket_export_resolution_ms", socket_resolution_elapsed_ms},
+        {"module_read_ms", module_read_elapsed_total_ms},
+        {"import_scan_ms", import_scan_elapsed_total_ms},
+        {"thunk_scan_ms", thunk_scan_elapsed_total_ms},
+        {"callsite_scan_ms", callsite_scan_elapsed_total_ms},
+        {"total_wall_ms", static_cast<std::uint64_t>(GetTickCount64() - find_t0)}
+    };
     out["diagnostics"] = nlohmann::json{
         {"socket_resolution", socket_resolution},
+        {"target_selection", target_selection},
+        {"phase_timings", phase_timings},
         {"module_diagnostics", module_diagnostics},
         {"app_module_skips", app_module_skips},
         {"app_module_skip_histogram", app_module_skip_histogram},
@@ -3634,6 +3790,21 @@ bool find_sendrecv_handlers(const sendrecv_scan_options_t& input,
         (deadline.hit && !deadline.cancelled) ? 1 : 0,
         deadline.cancelled ? 1 : 0,
         static_cast<unsigned long long>(deadline.elapsed_ms()),
+        out["stage"].get<std::string>().c_str(),
+        stop_reason.empty() ? "complete" : stop_reason.c_str());
+    diag::log_tagged_fmt("net_proto",
+        "find_sendrecv timing pid=%u enumerate_ms=%llu target_selection_ms=%llu socket_resolution_ms=%llu module_read_ms=%llu import_scan_ms=%llu thunk_scan_ms=%llu callsite_scan_ms=%llu total_wall_ms=%llu dependency_deadline_hit=%d parent_deadline_hit=%d stage=%s stop=%s",
+        pid,
+        static_cast<unsigned long long>(enumerate_elapsed_ms),
+        static_cast<unsigned long long>(target_selection_elapsed_ms),
+        static_cast<unsigned long long>(socket_resolution_elapsed_ms),
+        static_cast<unsigned long long>(module_read_elapsed_total_ms),
+        static_cast<unsigned long long>(import_scan_elapsed_total_ms),
+        static_cast<unsigned long long>(thunk_scan_elapsed_total_ms),
+        static_cast<unsigned long long>(callsite_scan_elapsed_total_ms),
+        static_cast<unsigned long long>(phase_timings["total_wall_ms"].get<std::uint64_t>()),
+        dependency_deadline_hit ? 1 : 0,
+        (deadline.hit && !deadline.cancelled) ? 1 : 0,
         out["stage"].get<std::string>().c_str(),
         stop_reason.empty() ? "complete" : stop_reason.c_str());
     return true;
