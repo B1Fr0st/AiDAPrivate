@@ -55,6 +55,7 @@
 #include <cwchar>
 #include <deque>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -63,6 +64,10 @@
 #include <vector>
 
 namespace test_all_features {
+
+	std::string mcp_coverage_final_summary_line();
+	int mcp_coverage_suspect_count();
+	void log_mcp_phase_remaining_diagnostics(HANDLE hf, int phase_remaining);
 
 	void flush_full_test_log(void* hf) {
 		HANDLE handle = static_cast<HANDLE>(hf);
@@ -156,8 +161,37 @@ namespace test_all_features {
 		std::atomic<std::uint64_t> g_saved_dtb{ 0 };
 
 		std::mutex        g_log_mtx;
-		std::deque<std::string> g_log_lines;
+		enum class overlay_log_severity_t : std::uint8_t {
+			normal,
+			success,
+			warning,
+			error
+		};
+		struct overlay_log_line_t {
+			std::string text;
+			overlay_log_severity_t severity = overlay_log_severity_t::normal;
+		};
+		std::deque<overlay_log_line_t> g_log_lines;
 		constexpr std::size_t kMaxLogLines = 4096;
+		constexpr std::size_t kOverlayRenderTailLines = 512;
+		std::atomic<std::uint64_t> g_log_version{ 0 };
+		std::atomic<std::uint64_t> g_progress_version{ 0 };
+		std::atomic<std::uint64_t> g_overlay_lock_busy_total{ 0 };
+		std::atomic<std::uint64_t> g_overlay_snapshot_changes{ 0 };
+		std::atomic<std::uint64_t> g_overlay_render_elapsed_us{ 0 };
+		std::atomic<std::uint64_t> g_overlay_rendered_rows{ 0 };
+		std::atomic<std::uint64_t> g_overlay_cached_rows{ 0 };
+		std::atomic<std::uint64_t> g_overlay_total_rows{ 0 };
+		std::atomic<bool> g_overlay_snapshot_busy{ false };
+		std::atomic<bool> g_overlay_snapshot_changed{ false };
+		std::atomic<bool> g_overlay_visible{ false };
+		overlay_log_severity_t classify_overlay_log_line(const std::string& line);
+		std::uint64_t mix_overlay_dirty_value(std::uint64_t state, std::uint64_t value);
+		bool try_snapshot_log_tail_if_changed(std::size_t max_lines,
+			std::uint64_t& known_version,
+			std::vector<overlay_log_line_t>& out,
+			std::size_t* total_lines,
+			bool* changed);
 
 		struct destructive_skip_key_t {
 			const char* category;
@@ -280,9 +314,13 @@ namespace test_all_features {
 
 		void push_log(const std::string& line) {
 			std::lock_guard<std::mutex> lk(g_log_mtx);
-			g_log_lines.push_back(line);
+			overlay_log_line_t entry;
+			entry.text = line;
+			entry.severity = classify_overlay_log_line(line);
+			g_log_lines.push_back(std::move(entry));
 			if (g_log_lines.size() > kMaxLogLines)
 				g_log_lines.pop_front();
+			g_log_version.fetch_add(1, std::memory_order_acq_rel);
 		}
 
 		void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
@@ -352,11 +390,61 @@ namespace test_all_features {
 		void store_label_snapshot(std::shared_ptr<const std::string>& slot, const char* label) {
 			auto next = std::make_shared<const std::string>((label != nullptr) ? label : "");
 			std::atomic_store_explicit(&slot, next, std::memory_order_release);
+			g_progress_version.fetch_add(1, std::memory_order_acq_rel);
 		}
 
 		std::string load_label_snapshot(const std::shared_ptr<const std::string>& slot) {
 			auto current = std::atomic_load_explicit(&slot, std::memory_order_acquire);
 			return current ? *current : std::string();
+		}
+
+		overlay_log_severity_t classify_overlay_log_line(const std::string& line) {
+			if (line.find("FAIL") != std::string::npos || line.find("FATAL") != std::string::npos || line.find("CRASH") != std::string::npos)
+				return overlay_log_severity_t::error;
+			if (line.find("SUSPECT") != std::string::npos || line.find("SKIP") != std::string::npos || line.find("INCOMPLETE") != std::string::npos)
+				return overlay_log_severity_t::warning;
+			if (line.find("PASS") != std::string::npos)
+				return overlay_log_severity_t::success;
+			return overlay_log_severity_t::normal;
+		}
+
+		std::uint64_t mix_overlay_dirty_value(std::uint64_t state, std::uint64_t value) {
+			state ^= value + 0x9E3779B97F4A7C15ull + (state << 6) + (state >> 2);
+			return state;
+		}
+
+		bool try_snapshot_log_tail_if_changed(std::size_t max_lines,
+			std::uint64_t& known_version,
+			std::vector<overlay_log_line_t>& out,
+			std::size_t* total_lines,
+			bool* changed)
+		{
+			if (changed)
+				*changed = false;
+			if (total_lines)
+				*total_lines = 0;
+			std::unique_lock<std::mutex> lk(g_log_mtx, std::try_to_lock);
+			if (!lk.owns_lock())
+				return false;
+			const std::uint64_t current_version = g_log_version.load(std::memory_order_acquire);
+			const std::size_t total = g_log_lines.size();
+			if (total_lines)
+				*total_lines = total;
+			if (current_version == known_version)
+				return true;
+			out.clear();
+			const std::size_t count = (std::min)(total, max_lines);
+			out.reserve(count);
+			const std::size_t skip = total > count ? total - count : 0;
+			auto it = g_log_lines.begin();
+			std::advance(it, static_cast<std::deque<overlay_log_line_t>::difference_type>(skip));
+			for (; it != g_log_lines.end(); ++it)
+				out.push_back(*it);
+			known_version = current_version;
+			if (changed)
+				*changed = true;
+			g_overlay_snapshot_changes.fetch_add(1, std::memory_order_acq_rel);
+			return true;
 		}
 
 		int current_completed_count() {
@@ -1253,6 +1341,8 @@ namespace test_all_features {
 						entry.planned,
 						entry.completed,
 						remaining);
+					if (entry.name == "MCP tool tests")
+						log_mcp_phase_remaining_diagnostics(hf, remaining);
 				} else if (remaining > 0) {
 					++errors;
 					log_msg(hf, "summary", "INCOMPLETE -- phase completed fewer tests than planned phase_index=%zu phase=\"%s\" planned=%d completed=%d remaining=%d",
@@ -1261,6 +1351,8 @@ namespace test_all_features {
 						entry.planned,
 						entry.completed,
 						remaining);
+					if (entry.name == "MCP tool tests")
+						log_mcp_phase_remaining_diagnostics(hf, remaining);
 				}
 				if (entry.hung_logged) {
 					++errors;
@@ -3869,12 +3961,22 @@ namespace test_all_features {
 				log_msg(hf, "summary", "SUSPECT -- no verified target attach; every PASS that depended on the target is unreliable");
 			}
 
-			int suspect = g_suspect.load();
-			if (suspect > 0) {
+			const int legacy_suspect = g_suspect.load();
+			const int mcp_suspect = mcp_coverage_suspect_count();
+			int suspect = legacy_suspect + mcp_suspect;
+			log_msg(hf, "summary", "MCP-AUDIT-SUMMARY -- %s", mcp_coverage_final_summary_line().c_str());
+			if (legacy_suspect > 0) {
 				log_msg(hf, "summary", "SUSPECT -- %d test(s) reported PASS while returning zero/empty content; review log entries tagged SUSPECT",
-					suspect);
+					legacy_suspect);
+			}
+			if (mcp_suspect > 0) {
+				log_msg(hf, "summary", "SUSPECT -- MCP audit reported %d suspicious, incomplete, missing, blocked, expected-empty, diagnostic-fallback, or timeout condition(s); review MCP-AUDIT-SUMMARY and MCP-PHASE-REMAINING-CASE entries",
+					mcp_suspect);
 			} else {
-				log_msg(hf, "summary", "no SUSPECT (empty-pass) tests detected by orchestrator");
+				log_msg(hf, "summary", "no MCP audit suspect conditions detected");
+			}
+			if (suspect == 0) {
+				log_msg(hf, "summary", "no SUSPECT (empty-pass or MCP audit) tests detected by orchestrator");
 			}
 
 			if (planned > executed) {
@@ -4048,6 +4150,7 @@ namespace test_all_features {
 			{
 				std::lock_guard<std::mutex> lk(g_log_mtx);
 				g_log_lines.clear();
+				g_log_version.fetch_add(1, std::memory_order_acq_rel);
 			}
 			set_phase("Initializing...");
 			set_step("start_tests_impl queued");
@@ -4291,6 +4394,45 @@ namespace test_all_features {
 			full_test_env_active();
 	}
 
+	std::uint64_t overlay_dirty_version() {
+		std::uint64_t state = 0xCBF29CE484222325ull;
+		state = mix_overlay_dirty_value(state, g_log_version.load(std::memory_order_acquire));
+		state = mix_overlay_dirty_value(state, g_progress_version.load(std::memory_order_acquire));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_total.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_current.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_passed.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_failed.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_skipped.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_suspect.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_target_pid.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, g_driver_attached.load(std::memory_order_acquire) ? 1ull : 0ull);
+		state = mix_overlay_dirty_value(state, g_running.load(std::memory_order_acquire) ? 1ull : 0ull);
+		state = mix_overlay_dirty_value(state, g_start_queued.load(std::memory_order_acquire) ? 1ull : 0ull);
+		state = mix_overlay_dirty_value(state, globals::ui::test_all_visible ? 1ull : 0ull);
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_active_phase_index.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_active_phase_planned.load(std::memory_order_acquire)));
+		state = mix_overlay_dirty_value(state, static_cast<std::uint64_t>(g_active_phase_completed.load(std::memory_order_acquire)));
+		return state;
+	}
+
+	overlay_perf_snapshot_t overlay_perf_snapshot() {
+		overlay_perf_snapshot_t out;
+		out.visible = g_overlay_visible.load(std::memory_order_acquire);
+		out.running = is_running();
+		out.snapshot_busy = g_overlay_snapshot_busy.load(std::memory_order_acquire);
+		out.snapshot_changed = g_overlay_snapshot_changed.load(std::memory_order_acquire);
+		out.dirty_version = overlay_dirty_version();
+		out.log_version = g_log_version.load(std::memory_order_acquire);
+		out.progress_version = g_progress_version.load(std::memory_order_acquire);
+		out.lock_busy_total = g_overlay_lock_busy_total.load(std::memory_order_acquire);
+		out.snapshot_changes = g_overlay_snapshot_changes.load(std::memory_order_acquire);
+		out.render_elapsed_us = g_overlay_render_elapsed_us.load(std::memory_order_acquire);
+		out.total_log_lines = static_cast<std::size_t>(g_overlay_total_rows.load(std::memory_order_acquire));
+		out.cached_log_lines = static_cast<std::size_t>(g_overlay_cached_rows.load(std::memory_order_acquire));
+		out.rendered_log_rows = static_cast<std::size_t>(g_overlay_rendered_rows.load(std::memory_order_acquire));
+		return out;
+	}
+
 	void set_progress_step(const char* label) {
 		set_step(label ? label : "");
 	}
@@ -4316,7 +4458,17 @@ namespace test_all_features {
 	}
 
 	void render_overlay(float vw, float vh) {
-		if (!globals::ui::test_all_visible) return;
+		if (!globals::ui::test_all_visible) {
+			g_overlay_visible.store(false, std::memory_order_release);
+			return;
+		}
+		g_overlay_visible.store(true, std::memory_order_release);
+		const auto overlay_render_start = std::chrono::steady_clock::now();
+		std::size_t overlay_rendered_rows = 0;
+		std::size_t overlay_cached_rows = 0;
+		std::size_t overlay_total_rows = 0;
+		bool overlay_snapshot_busy_now = false;
+		bool overlay_snapshot_changed_now = false;
 
 		const auto& t = aida::ui::resolved();
 
@@ -4443,41 +4595,51 @@ namespace test_all_features {
 
 			if (g_code_font) ImGui::PushFont(g_code_font);
 
-			std::vector<std::string> log_snapshot;
-			bool log_snapshot_busy = false;
-			{
-				std::unique_lock<std::mutex> lk(g_log_mtx, std::try_to_lock);
-				if (lk.owns_lock())
-					log_snapshot.assign(g_log_lines.begin(), g_log_lines.end());
-				else
-					log_snapshot_busy = true;
+			static std::vector<overlay_log_line_t> log_snapshot;
+			static std::uint64_t log_snapshot_version = 0;
+			static std::size_t log_snapshot_total = 0;
+			if (try_snapshot_log_tail_if_changed(kOverlayRenderTailLines, log_snapshot_version, log_snapshot, &log_snapshot_total, &overlay_snapshot_changed_now)) {
+				overlay_total_rows = log_snapshot_total;
+				overlay_cached_rows = log_snapshot.size();
+			} else {
+				overlay_snapshot_busy_now = true;
+				g_overlay_lock_busy_total.fetch_add(1, std::memory_order_acq_rel);
+				overlay_total_rows = log_snapshot_total;
+				overlay_cached_rows = log_snapshot.size();
 			}
-			if (log_snapshot_busy) {
+			if (overlay_snapshot_busy_now) {
 				ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
 				ImGui::TextUnformatted("Test log snapshot is busy");
 				ImGui::PopStyleColor();
 			} else {
-				for (const auto& line : log_snapshot) {
-
-					if (line.find("SUSPECT") != std::string::npos) {
-						ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
-						ImGui::TextUnformatted(line.c_str());
-						ImGui::PopStyleColor();
-					} else if (line.find("PASS") != std::string::npos) {
-						ImGui::PushStyleColor(ImGuiCol_Text, t.success);
-						ImGui::TextUnformatted(line.c_str());
-						ImGui::PopStyleColor();
-					} else if (line.find("FAIL") != std::string::npos) {
-						ImGui::PushStyleColor(ImGuiCol_Text, t.error);
-						ImGui::TextUnformatted(line.c_str());
-						ImGui::PopStyleColor();
-					} else if (line.find("SKIP") != std::string::npos) {
-						ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
-						ImGui::TextUnformatted(line.c_str());
-						ImGui::PopStyleColor();
-					} else {
-						ImGui::TextUnformatted(line.c_str());
+				ImGuiListClipper clipper;
+				const int row_count = static_cast<int>(log_snapshot.size());
+				clipper.Begin(row_count, ImGui::GetTextLineHeightWithSpacing());
+				while (clipper.Step()) {
+					for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+						const overlay_log_line_t& line = log_snapshot[static_cast<std::size_t>(row)];
+						switch (line.severity) {
+						case overlay_log_severity_t::success:
+							ImGui::PushStyleColor(ImGuiCol_Text, t.success);
+							ImGui::TextUnformatted(line.text.c_str());
+							ImGui::PopStyleColor();
+							break;
+						case overlay_log_severity_t::warning:
+							ImGui::PushStyleColor(ImGuiCol_Text, t.warning);
+							ImGui::TextUnformatted(line.text.c_str());
+							ImGui::PopStyleColor();
+							break;
+						case overlay_log_severity_t::error:
+							ImGui::PushStyleColor(ImGuiCol_Text, t.error);
+							ImGui::TextUnformatted(line.text.c_str());
+							ImGui::PopStyleColor();
+							break;
+						default:
+							ImGui::TextUnformatted(line.text.c_str());
+							break;
+						}
 					}
+					overlay_rendered_rows += static_cast<std::size_t>(clipper.DisplayEnd - clipper.DisplayStart);
 				}
 			}
 
@@ -4499,6 +4661,33 @@ namespace test_all_features {
 		ImGui::End();
 
 		globals::ui::test_all_visible = open;
+		g_overlay_visible.store(globals::ui::test_all_visible, std::memory_order_release);
+		g_overlay_snapshot_busy.store(overlay_snapshot_busy_now, std::memory_order_release);
+		g_overlay_snapshot_changed.store(overlay_snapshot_changed_now, std::memory_order_release);
+		g_overlay_total_rows.store(static_cast<std::uint64_t>(overlay_total_rows), std::memory_order_release);
+		g_overlay_cached_rows.store(static_cast<std::uint64_t>(overlay_cached_rows), std::memory_order_release);
+		g_overlay_rendered_rows.store(static_cast<std::uint64_t>(overlay_rendered_rows), std::memory_order_release);
+		const std::uint64_t overlay_elapsed_us = static_cast<std::uint64_t>(
+			std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - overlay_render_start).count());
+		g_overlay_render_elapsed_us.store(overlay_elapsed_us, std::memory_order_release);
+		static std::uint64_t s_last_overlay_slow_log_ms = 0;
+		const std::uint64_t now_ms = now_ms_tick();
+		const bool overlay_slow = overlay_elapsed_us >= (is_running() ? 8000ull : 4000ull);
+		if (overlay_slow && now_ms - s_last_overlay_slow_log_ms >= 5000ull) {
+			s_last_overlay_slow_log_ms = now_ms;
+			diag::log_tagged_fmt("test_all",
+				"overlay_slow elapsed_us=%llu visible=%d running=%d total_rows=%zu cached_rows=%zu rendered_rows=%zu log_version=%llu snapshot_changed=%d snapshot_busy=%d lock_busy_total=%llu",
+				static_cast<unsigned long long>(overlay_elapsed_us),
+				globals::ui::test_all_visible ? 1 : 0,
+				is_running() ? 1 : 0,
+				overlay_total_rows,
+				overlay_cached_rows,
+				overlay_rendered_rows,
+				static_cast<unsigned long long>(g_log_version.load(std::memory_order_acquire)),
+				overlay_snapshot_changed_now ? 1 : 0,
+				overlay_snapshot_busy_now ? 1 : 0,
+				static_cast<unsigned long long>(g_overlay_lock_busy_total.load(std::memory_order_acquire)));
+		}
 	}
 
 }

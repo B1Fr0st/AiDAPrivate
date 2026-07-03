@@ -31,6 +31,9 @@ struct config_t
     size_t       baseline_count = 5;
     double       diff_sigma_threshold = 3.0;
     bool         report_as_issues = true;
+    std::string  session_id;
+    uint64_t     scan_id = 0;
+    uint64_t     audit_id = 0;
 };
 
 struct hit_t

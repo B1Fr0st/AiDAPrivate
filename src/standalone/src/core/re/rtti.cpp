@@ -918,6 +918,37 @@ bool type_from_vtable(std::uint32_t pid,
                       type_info_t& out)
 {
     const std::uint64_t started_ms = GetTickCount64();
+    auto remaining_ms = []() -> std::uint64_t {
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline == 0)
+            return std::numeric_limits<std::uint64_t>::max();
+        const std::uint64_t now = GetTickCount64();
+        return deadline > now ? deadline - now : 0;
+    };
+    auto budget_exhausted = [&](const char* phase) -> bool {
+        if (mcp_standalone::current_call_cancelled())
+        {
+            diag::log_tagged_fmt("rtti",
+                                 "type_from_vtable cancelled pid=%u phase=%s vtable=%s elapsed_ms=%llu",
+                                 pid,
+                                 phase ? phase : "",
+                                 sa_format_address(vtable_va).c_str(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            return true;
+        }
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline != 0 && GetTickCount64() >= deadline)
+        {
+            diag::log_tagged_fmt("rtti",
+                                 "type_from_vtable deadline pid=%u phase=%s vtable=%s elapsed_ms=%llu",
+                                 pid,
+                                 phase ? phase : "",
+                                 sa_format_address(vtable_va).c_str(),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            return true;
+        }
+        return false;
+    };
     diag::log_tagged_fmt("rtti",
                          "type_from_vtable enter pid=%u module=%s base=%s vtable=%s",
                          pid,
@@ -970,16 +1001,29 @@ bool type_from_vtable(std::uint32_t pid,
     out.hierarchy_descriptor_va = col.hierarchy_descriptor_va;
     add_col_record(out, col);
     vtable_record_t vt;
-    if (validate_vtable(pid, layout, vtable_va, vt))
+    const bool can_validate_vtable = !budget_exhausted("before_validate_vtable") && remaining_ms() > 750;
+    if (can_validate_vtable && validate_vtable(pid, layout, vtable_va, vt))
     {
         vt.vtable_va = vtable_va;
         vt.complete_object_locator_va = col_va;
         add_vtable_record(out, vt);
     }
-    apply_base_classes(out, read_base_classes(pid, layout, col, 64));
+    else
+    {
+        vt.vtable_va = vtable_va;
+        vt.complete_object_locator_va = col_va;
+        vt.sampled_slots = 0;
+        vt.readable_slots = 0;
+        vt.executable_slots = 0;
+        vt.confidence = can_validate_vtable ? "exact_selector_unvalidated" : "exact_selector_unvalidated_due_budget";
+        vt.score = 1;
+        add_vtable_record(out, vt);
+    }
+    if (!budget_exhausted("before_base_classes") && remaining_ms() > 500)
+        apply_base_classes(out, read_base_classes(pid, layout, col, 16));
     out.module_name = module.name;
     diag::log_tagged_fmt("rtti",
-                         "type_from_vtable exit pid=%u type=%s decorated=%s vtable=%s col=%s td=%s hierarchy=%s bases=%zu signature=%u relative=%d self_match=%d pointer_size=%u elapsed_ms=%llu",
+                         "type_from_vtable exit pid=%u type=%s decorated=%s vtable=%s col=%s td=%s hierarchy=%s bases=%zu signature=%u relative=%d self_match=%d pointer_size=%u remaining_ms=%llu elapsed_ms=%llu",
                          pid,
                          out.name.c_str(),
                          out.decorated_name.c_str(),
@@ -992,6 +1036,7 @@ bool type_from_vtable(std::uint32_t pid,
                          col.relative ? 1 : 0,
                          col.self_consistent ? 1 : 0,
                          layout.pointer_size,
+                         static_cast<unsigned long long>(remaining_ms()),
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return true;
 }
@@ -1016,7 +1061,9 @@ bool type_from_col(std::uint32_t pid,
     out.hierarchy_descriptor_va = col.hierarchy_descriptor_va;
     out.module_name = module.name;
     add_col_record(out, col);
-    apply_base_classes(out, read_base_classes(pid, layout, col, 64));
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    if (!mcp_standalone::current_call_cancelled() && (deadline == 0 || GetTickCount64() + 500 < deadline))
+        apply_base_classes(out, read_base_classes(pid, layout, col, 16));
     return true;
 }
 
@@ -1883,7 +1930,7 @@ scan_result_t scan_types(const json& params)
     std::size_t unfiltered_build_count = 0;
     for (auto& [td, type] : all_by_td)
     {
-        if ((unfiltered_build_count++ & 0xFFu) == 0 && ctx.stop("rtti_unfiltered_build"))
+        if ((unfiltered_build_count++ & 0xFFu) == 0 && !exact_selector_direct_hit && ctx.stop("rtti_unfiltered_build"))
             break;
         (void)td;
         unfiltered.push_back(std::move(type));
@@ -1896,7 +1943,7 @@ scan_result_t scan_types(const json& params)
     std::size_t result_filter_count = 0;
     for (const auto& type : unfiltered)
     {
-        if ((result_filter_count++ & 0xFFu) == 0 && ctx.stop("rtti_result_filter"))
+        if ((result_filter_count++ & 0xFFu) == 0 && !exact_selector_direct_hit && ctx.stop("rtti_result_filter"))
             break;
         if (has_exact_type_descriptor && type.type_descriptor_va != exact_type_descriptor_va)
             continue;
@@ -1920,9 +1967,11 @@ scan_result_t scan_types(const json& params)
     result.unfiltered_cap_hit = all_by_td.size() >= max_unfiltered;
     result.deadline_hit = ctx.deadline_hit;
     result.cancelled = ctx.cancelled;
-    result.partial = ctx.deadline_hit || ctx.cancelled || result.unfiltered_cap_hit;
     result.timeout_ms = timeout_ms;
     result.elapsed_ms = GetTickCount64() - started_ms;
+    if (timeout_ms != 0 && result.elapsed_ms >= timeout_ms)
+        result.deadline_hit = true;
+    result.partial = result.deadline_hit || ctx.cancelled || result.unfiltered_cap_hit;
     result.scanned_module_count = ctx.scanned_module_count;
     result.type_descriptor_count = ctx.type_descriptor_count;
     result.complete_object_locator_count = ctx.complete_object_locator_count;
@@ -2366,6 +2415,58 @@ tool_result_t list_hierarchy(const json& params)
     const bool has_vtable_hint =
         (parse_address_param(params, "vtable_va", vtable_hint) ||
          parse_address_param(params, "rtti_vtable_va", vtable_hint)) && vtable_hint != 0;
+    std::uint64_t col_hint = 0;
+    const bool has_col_hint =
+        (parse_address_param(params, "complete_object_locator_va", col_hint) ||
+         parse_address_param(params, "rtti_complete_object_locator_va", col_hint)) && col_hint != 0;
+    std::uint64_t type_descriptor_hint = 0;
+    const bool has_type_descriptor_hint =
+        (parse_address_param(params, "type_descriptor_va", type_descriptor_hint) ||
+         parse_address_param(params, "rtti_type_descriptor_va", type_descriptor_hint)) && type_descriptor_hint != 0;
+    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 5500, 500, 120000);
+    auto direct_hierarchy_result = [&](type_info_t resolved,
+                                       const char* resolution,
+                                       const driver_bridge::module_info_t& module,
+                                       const char* selector_key,
+                                       std::uint64_t selector_value) {
+        const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
+        std::vector<type_info_t> direct_types;
+        direct_types.push_back(resolved);
+        const auto index = build_type_index(direct_types);
+        json result = type_to_json(resolved, max_vtables_per_type);
+        attach_hierarchy(result, resolved, index, max_vtables_per_type);
+        const std::uint64_t elapsed = GetTickCount64() - started_ms;
+        const bool direct_deadline_hit = timeout_ms != 0 && elapsed >= timeout_ms;
+        result["resolution"] = resolution ? resolution : "exact_selector_direct";
+        result["focused_scan_skipped"] = true;
+        result["deadline_hit"] = direct_deadline_hit;
+        result["cancelled"] = false;
+        result["partial"] = direct_deadline_hit;
+        result["elapsed_ms"] = elapsed;
+        result["timeout_ms"] = timeout_ms;
+        result["scanned_module_count"] = 1;
+        result["bytes_scanned"] = 0;
+        result["module_base_va"] = sa_format_address(module.base);
+        result["exact_selector_flags"] = {
+            {"selector_key", selector_key ? selector_key : ""},
+            {"selector_value", selector_value ? json(sa_format_address(selector_value)) : json(nullptr)},
+            {"vtable_provided", has_vtable_hint},
+            {"vtable_va", has_vtable_hint ? json(sa_format_address(vtable_hint)) : json(nullptr)},
+            {"complete_object_locator_provided", has_col_hint},
+            {"complete_object_locator_va", has_col_hint ? json(sa_format_address(col_hint)) : json(nullptr)},
+            {"type_descriptor_provided", has_type_descriptor_hint},
+            {"type_descriptor_va", has_type_descriptor_hint ? json(sa_format_address(type_descriptor_hint)) : json(nullptr)}
+        };
+        diag::log_tagged_fmt("rtti",
+                             "list_hierarchy exact_selector_direct pid=%u selector=%s value=%s type=%s bases=%zu elapsed_ms=%llu",
+                             scope.pid(),
+                             selector_key ? selector_key : "",
+                             selector_value ? sa_format_address(selector_value).c_str() : "0x0",
+                             resolved.name.c_str(),
+                             resolved.base_classes.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return result;
+    };
     if (has_vtable_hint)
     {
         if (auto module = find_module_for_address(scope.pid(), vtable_hint))
@@ -2387,53 +2488,40 @@ tool_result_t list_hierarchy(const json& params)
                                      static_cast<unsigned long long>(GetTickCount64() - started_ms));
                 if (match)
                 {
-                    const std::size_t max_vtables_per_type = static_cast<std::size_t>(numeric_param(params, "max_vtables_per_type", 64, 1, 512));
-                    json hierarchy_scan_params = params;
-                    hierarchy_scan_params["module_base_va"] = sa_format_address(module->base);
-                    hierarchy_scan_params["type_descriptor_va"] = sa_format_address(hinted.type_descriptor_va);
-                    hierarchy_scan_params["max_results"] = 1;
-                    auto hierarchy_scan = scan_types(hierarchy_scan_params);
-                    type_info_t resolved = hinted;
-                    std::vector<type_resolution_record_t> index;
-                    if (hierarchy_scan.ok)
-                    {
-                        index = hierarchy_scan.type_index;
-                        for (const auto& scanned_type : hierarchy_scan.types)
-                        {
-                            if (scanned_type.type_descriptor_va == hinted.type_descriptor_va)
-                            {
-                                resolved = scanned_type;
-                                break;
-                            }
-                        }
-                    }
-                    if (index.empty())
-                    {
-                        std::vector<type_info_t> fallback_types;
-                        fallback_types.push_back(resolved);
-                        index = build_type_index(fallback_types);
-                    }
-                    json result = type_to_json(resolved, max_vtables_per_type);
-                    attach_hierarchy(result, resolved, index, max_vtables_per_type);
-                    result["resolution"] = "vtable_hint_col";
-                    if (hierarchy_scan.ok)
-                    {
-                        add_scan_diagnostics(result, hierarchy_scan, include_diagnostics);
-                        result["focused_scan_ok"] = true;
-                    }
-                    else
-                    {
-                        result["focused_scan_ok"] = false;
-                        result["focused_scan_error"] = hierarchy_scan.error;
-                        result["focused_scan_details"] = scan_error_payload(hierarchy_scan, include_diagnostics);
-                        result["deadline_hit"] = hierarchy_scan.deadline_hit;
-                        result["cancelled"] = hierarchy_scan.cancelled;
-                        result["partial"] = true;
-                        result["timeout_ms"] = hierarchy_scan.timeout_ms;
-                        result["elapsed_ms"] = GetTickCount64() - started_ms;
-                    }
-                    return tool_result_t::ok(result);
+                    return tool_result_t::ok(direct_hierarchy_result(hinted, "vtable_hint_direct_col", *module, "vtable_va", vtable_hint));
                 }
+            }
+        }
+    }
+    if (has_col_hint)
+    {
+        if (auto module = find_module_for_address(scope.pid(), col_hint))
+        {
+            type_info_t hinted;
+            if (type_from_col(scope.pid(), *module, col_hint, hinted))
+            {
+                const std::string query_lower = lower_ascii(query);
+                const bool match = query.empty() ? true : (query_is_va ? (hinted.col_va == va || hinted.type_descriptor_va == va) :
+                    (lower_ascii(hinted.name).find(query_lower) != std::string::npos ||
+                     lower_ascii(hinted.decorated_name).find(query_lower) != std::string::npos));
+                if (match)
+                    return tool_result_t::ok(direct_hierarchy_result(hinted, "complete_object_locator_direct", *module, "complete_object_locator_va", col_hint));
+            }
+        }
+    }
+    if (has_type_descriptor_hint)
+    {
+        if (auto module = find_module_for_address(scope.pid(), type_descriptor_hint))
+        {
+            type_info_t hinted;
+            if (type_from_type_descriptor(scope.pid(), *module, type_descriptor_hint, hinted))
+            {
+                const std::string query_lower = lower_ascii(query);
+                const bool match = query.empty() ? true : (query_is_va ? hinted.type_descriptor_va == va :
+                    (lower_ascii(hinted.name).find(query_lower) != std::string::npos ||
+                     lower_ascii(hinted.decorated_name).find(query_lower) != std::string::npos));
+                if (match)
+                    return tool_result_t::ok(direct_hierarchy_result(hinted, "type_descriptor_direct", *module, "type_descriptor_va", type_descriptor_hint));
             }
         }
     }

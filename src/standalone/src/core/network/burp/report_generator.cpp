@@ -818,11 +818,33 @@ const char* default_extension(report_format_t f)
 bool generate(const report_config_t& cfg, std::string& out_path_or_error)
 {
     const std::string log_title = safe_text(cfg.title, 256);
+    auto history_count = []() {
+        auto& h = history();
+        std::lock_guard<std::mutex> lk(h.mtx);
+        return h.items.size();
+    };
+    issue_store::initialize();
+    issue_filter_t issue_filter;
+    issue_filter.include_suppressed = true;
+    const size_t issue_store_count = issue_store::list(issue_filter).size();
+    const size_t history_before = history_count();
+    const size_t findings_before = findings_db::is_initialized() ? findings_db::count() : 0;
     diag::log_tagged_fmt("report", "generate entry path=%s format=%s title=%s",
         cfg.output_path.c_str(), format_label(cfg.format), log_title.c_str());
+    diag::log_tagged_fmt("report",
+        "report_generate_db_pre issue_store_count=%zu findings_count=%zu history_count=%zu db_initialized=%d",
+        issue_store_count,
+        findings_before,
+        history_before,
+        findings_db::is_initialized() ? 1 : 0);
     std::vector<issue_t> issues;
     if (!collect_issues(cfg, issues)) {
-        diag::log_tagged_fmt("report", "generate collect_failed err=%s", err_slot().c_str());
+        diag::log_tagged_fmt("report",
+            "generate collect_failed err=%s issue_store_count=%zu findings_count=%zu history_count=%zu",
+            err_slot().c_str(),
+            issue_store_count,
+            findings_db::is_initialized() ? findings_db::count() : 0,
+            history_count());
         out_path_or_error = err_slot();
         return false;
     }
@@ -837,20 +859,31 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
         case report_format_t::csv:       body = generate_csv(cfg, issues, ctx); break;
     }
     if (cfg.output_path.empty()) {
-        auto& h = history();
-        std::lock_guard<std::mutex> lk(h.mtx);
-        generated_report_t rec;
-        rec.id          = h.next_id.fetch_add(1);
-        rec.ts_ms       = now_ms();
-        rec.title       = safe_text(cfg.title, 256);
-        rec.output_path.clear();
-        rec.format      = cfg.format;
-        rec.issue_count = issues.size();
-        rec.inline_output = true;
-        h.items.push_back(std::move(rec));
+        size_t history_after = 0;
+        {
+            auto& h = history();
+            std::lock_guard<std::mutex> lk(h.mtx);
+            generated_report_t rec;
+            rec.id          = h.next_id.fetch_add(1);
+            rec.ts_ms       = now_ms();
+            rec.title       = safe_text(cfg.title, 256);
+            rec.output_path.clear();
+            rec.format      = cfg.format;
+            rec.issue_count = issues.size();
+            rec.inline_output = true;
+            h.items.push_back(std::move(rec));
+            history_after = h.items.size();
+        }
         out_path_or_error = std::move(body);
         diag::log_tagged_fmt("report", "generate inline_ok format=%s issues=%zu body_len=%zu",
             format_label(cfg.format), issues.size(), out_path_or_error.size());
+        diag::log_tagged_fmt("report",
+            "report_generate_db_post issue_store_count=%zu findings_count=%zu selected_issue_count=%zu history_before=%zu history_after=%zu",
+            issue_store_count,
+            findings_db::count(),
+            issues.size(),
+            history_before,
+            history_after);
         return true;
     }
     if (!write_file(cfg.output_path, body)) {
@@ -875,6 +908,13 @@ bool generate(const report_config_t& cfg, std::string& out_path_or_error)
         cfg.output_path.c_str(), format_label(cfg.format), issues.size(), body.size());
     diag::log_tagged_fmt("burp.report", "generated path=%s format=%s issues=%zu",
         cfg.output_path.c_str(), format_label(cfg.format), issues.size());
+    diag::log_tagged_fmt("report",
+        "report_generate_db_post issue_store_count=%zu findings_count=%zu selected_issue_count=%zu history_before=%zu history_after=%zu",
+        issue_store_count,
+        findings_db::count(),
+        issues.size(),
+        history_before,
+        history_count());
     out_path_or_error = cfg.output_path;
     return true;
 }

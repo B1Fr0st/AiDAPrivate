@@ -18,6 +18,7 @@
 #include <dxgi.h>
 #include <fstream>
 #include <gdiplus.h>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -5238,6 +5239,9 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
             break;
         if (mcp_standalone::current_call_cancelled())
             break;
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline != 0 && GetTickCount64() >= deadline)
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     const DWORD gle = state.error.load(std::memory_order_acquire);
@@ -6445,6 +6449,9 @@ void stop_dx_debug_loop(std::uint32_t pid)
     for (int i = 0; i < 80 && state.running.load(std::memory_order_acquire); ++i)
     {
         if (mcp_standalone::current_call_cancelled())
+            break;
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline != 0 && GetTickCount64() >= deadline)
             break;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
@@ -9688,6 +9695,8 @@ tool_result_t correlate_results(const json& params)
 
     result["matching_frames"] = std::move(frame_matches);
     result["matching_frame_count"] = result["matching_frames"].size();
+    result["frame_matches"] = result["matching_frames"];
+    result["frame_match_count"] = result["matching_frame_count"];
     result["same_frame"] = result["matching_frame_count"].get<std::size_t>() > 0;
     result["correlation_strength"] = "none";
     if (result["matching_frame_count"].get<std::size_t>() > 0)
@@ -9706,6 +9715,12 @@ tool_result_t correlate_results(const json& params)
             break;
         }
     }
+
+    diag::log_tagged_fmt("dx_hook",
+                         "correlate_results schema pid=%u batches=%zu matching_frame_count=%zu aliases=frame_matches,frame_match_count",
+                         scope.pid(),
+                         batches.size(),
+                         result["matching_frame_count"].get<std::size_t>());
 
     return tool_result_t::ok("Cross-tool correlation complete.", result);
 }
@@ -9764,6 +9779,47 @@ tool_result_t auto_narrow(const json& params)
     const std::uint32_t min_bones = static_cast<std::uint32_t>(numeric_param(params, "min_bones", 4, 1, 1024));
     const std::uint32_t max_bones = static_cast<std::uint32_t>(numeric_param(params, "max_bones", 256, min_bones, 4096));
     const std::string api = api_param(params);
+    const std::uint64_t requested_frame_wait_ms = numeric_param(params, "frame_wait_ms", static_cast<std::uint64_t>(capture_frames) * 1000ull + 1000ull, 250, 30000);
+    auto deadline_remaining_ms = []() -> std::uint64_t {
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline == 0)
+            return std::numeric_limits<std::uint64_t>::max();
+        const std::uint64_t now = GetTickCount64();
+        return deadline > now ? deadline - now : 0;
+    };
+    auto resolved_targets_json = [&](const std::optional<slot_entry_t>& present_target,
+                                     const std::optional<slot_entry_t>& draw_target,
+                                     const std::optional<slot_entry_t>& cbuffer_target) {
+        return json{
+            {"present", present_target ? json(sa_format_address(present_target->target_va)) : json(nullptr)},
+            {"draw", draw_target ? json(sa_format_address(draw_target->target_va)) : json(nullptr)},
+            {"cbuffer_bind", cbuffer_target ? json(sa_format_address(cbuffer_target->target_va)) : json(nullptr)}
+        };
+    };
+    auto cleanup_prepared = [&](const std::vector<store::dx_hook_record_t>& prepared, const char* phase) -> json {
+        const std::uint64_t cleanup_started = GetTickCount64();
+        diag::log_tagged_fmt("dx_hook",
+                             "auto_narrow cleanup_begin pid=%u phase=%s prepared=%zu elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             scope.pid(),
+                             phase ? phase : "",
+                             prepared.size(),
+                             static_cast<unsigned long long>(cleanup_started - started_ms),
+                             static_cast<unsigned long long>(deadline_remaining_ms()));
+        stop_dx_debug_loop(scope.pid());
+        for (const auto& r : prepared)
+            clear_dx_record_breakpoints(r);
+        frame_tracking_state().enabled.store(false, std::memory_order_release);
+        const std::uint64_t cleanup_elapsed = GetTickCount64() - cleanup_started;
+        diag::log_tagged_fmt("dx_hook",
+                             "auto_narrow cleanup_end pid=%u phase=%s prepared=%zu cleanup_elapsed_ms=%llu total_elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             scope.pid(),
+                             phase ? phase : "",
+                             prepared.size(),
+                             static_cast<unsigned long long>(cleanup_elapsed),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             static_cast<unsigned long long>(deadline_remaining_ms()));
+        return json{{"phase", phase ? phase : ""}, {"elapsed_ms", cleanup_elapsed}, {"prepared_records", prepared.size()}};
+    };
 
     if (!unsafe_confirmed(params))
         return unsafe_required("dx_auto_narrow");
@@ -9831,12 +9887,9 @@ tool_result_t auto_narrow(const json& params)
     {
         json result;
         result["process_id"] = scope.pid();
-        result["resolved_targets"] = {
-            {"present", present_target ? json(sa_format_address(present_target->target_va)) : json(nullptr)},
-            {"draw", draw_target ? json(sa_format_address(draw_target->target_va)) : json(nullptr)},
-            {"cbuffer_bind", cbuffer_target ? json(sa_format_address(cbuffer_target->target_va)) : json(nullptr)}
-        };
+        result["resolved_targets"] = resolved_targets_json(present_target, draw_target, cbuffer_target);
         result["failure_reason"] = "could_not_resolve_all_three_targets";
+        result["capability"] = {{"available", false}, {"reason", "could_not_resolve_required_frame_capture_targets"}};
         return tool_result_t::error("Auto-narrow requires Present, Draw, and CBufferBind targets.", result);
     }
 
@@ -9869,6 +9922,8 @@ tool_result_t auto_narrow(const json& params)
         json result;
         result["process_id"] = scope.pid();
         result["failure_reason"] = "hwbp_arming_failed";
+        result["capability"] = {{"available", false}, {"reason", "hwbp_arming_failed"}};
+        result["resolved_targets"] = resolved_targets_json(present_target, draw_target, cbuffer_target);
         return tool_result_t::error("Could not arm all 3 HWBPs.", result);
     }
 
@@ -9883,26 +9938,47 @@ tool_result_t auto_narrow(const json& params)
     std::string debug_error;
     if (!start_dx_debug_loop(scope.pid(), debug_error))
     {
-        for (const auto& r : prepared) { clear_dx_record_breakpoints(r); store::remove_dx_hook(r.id); }
+        json cleanup = cleanup_prepared(prepared, "debug_loop_start_failed");
+        for (const auto& r : prepared)
+            store::remove_dx_hook(r.id);
         json result;
         result["process_id"] = scope.pid();
         result["failure_reason"] = debug_error;
+        result["capability"] = {{"available", false}, {"reason", "debug_loop_start_failed"}};
+        result["resolved_targets"] = resolved_targets_json(present_target, draw_target, cbuffer_target);
+        result["cleanup"] = std::move(cleanup);
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
         return tool_result_t::error("Debug loop failed to start.", result);
     }
 
     if (dx_call_cancelled("auto_narrow_post_debug_start", scope.pid(), started_ms))
     {
-        stop_dx_debug_loop(scope.pid());
-        for (const auto& r : prepared) clear_dx_record_breakpoints(r);
-        frame_tracking_state().enabled.store(false, std::memory_order_release);
+        json cleanup = cleanup_prepared(prepared, "post_debug_start_cancelled");
         json result;
         result["process_id"] = scope.pid();
         result["cancelled"] = true;
+        result["cleanup"] = std::move(cleanup);
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
         return tool_result_t::error("Auto-narrow cancelled after debug loop start.", result);
     }
 
-    const std::uint64_t frame_deadline_ms = started_ms + capture_frames * 2000ull + 5000ull;
+    std::uint64_t frame_wait_budget_ms = requested_frame_wait_ms;
+    const std::uint64_t remaining_before_wait = deadline_remaining_ms();
+    if (remaining_before_wait != std::numeric_limits<std::uint64_t>::max())
+        frame_wait_budget_ms = remaining_before_wait > 750ull ? std::min<std::uint64_t>(frame_wait_budget_ms, remaining_before_wait - 750ull) : 0ull;
+    const std::uint64_t frame_wait_started_ms = GetTickCount64();
+    const std::uint64_t frame_deadline_ms = frame_wait_started_ms > std::numeric_limits<std::uint64_t>::max() - frame_wait_budget_ms ? std::numeric_limits<std::uint64_t>::max() : frame_wait_started_ms + frame_wait_budget_ms;
     bool auto_narrow_cancelled = false;
+    diag::log_tagged_fmt("dx_hook",
+                         "auto_narrow frame_wait_begin pid=%u requested_frames=%u wait_budget_ms=%llu resolved_present=%s resolved_draw=%s resolved_cbuffer=%s elapsed_ms=%llu deadline_remaining_ms=%llu",
+                         scope.pid(),
+                         capture_frames,
+                         static_cast<unsigned long long>(frame_wait_budget_ms),
+                         sa_format_address(present_target->target_va).c_str(),
+                         sa_format_address(draw_target->target_va).c_str(),
+                         sa_format_address(cbuffer_target->target_va).c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                         static_cast<unsigned long long>(deadline_remaining_ms()));
     while (store::list_frame_batches(scope.pid()).size() < capture_frames)
     {
         if (GetTickCount64() > frame_deadline_ms)
@@ -9915,9 +9991,7 @@ tool_result_t auto_narrow(const json& params)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    stop_dx_debug_loop(scope.pid());
-    for (const auto& r : prepared) clear_dx_record_breakpoints(r);
-    frame_tracking_state().enabled.store(false, std::memory_order_release);
+    json cleanup = cleanup_prepared(prepared, "frame_wait_complete");
 
     if (auto_narrow_cancelled)
     {
@@ -9925,6 +9999,8 @@ tool_result_t auto_narrow(const json& params)
         result["process_id"] = scope.pid();
         result["captured_frames"] = store::list_frame_batches(scope.pid()).size();
         result["cancelled"] = true;
+        result["cleanup"] = std::move(cleanup);
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
         return tool_result_t::error("Auto-narrow cancelled during frame capture.", result);
     }
 
@@ -9934,6 +10010,8 @@ tool_result_t auto_narrow(const json& params)
         result["process_id"] = scope.pid();
         result["captured_frames"] = store::list_frame_batches(scope.pid()).size();
         result["cancelled"] = true;
+        result["cleanup"] = std::move(cleanup);
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
         return tool_result_t::error("Auto-narrow cancelled after frame capture.", result);
     }
 
@@ -9943,8 +10021,23 @@ tool_result_t auto_narrow(const json& params)
         json result;
         result["process_id"] = scope.pid();
         result["captured_frames"] = 0;
-        result["failure_reason"] = "no_frames_captured_within_timeout";
-        return tool_result_t::error("Auto-narrow captured no frames within timeout.", result);
+        result["capture_frames_requested"] = capture_frames;
+        result["frame_wait_budget_ms"] = frame_wait_budget_ms;
+        result["failure_reason"] = "no_frame_batches";
+        result["phase"] = "frame_wait";
+        result["capability"] = {{"available", false}, {"reason", "no_frame_batches"}, {"requires_frame_source", true}};
+        result["resolved_targets"] = resolved_targets_json(present_target, draw_target, cbuffer_target);
+        result["cleanup"] = std::move(cleanup);
+        result["deadline_remaining_ms"] = deadline_remaining_ms();
+        result["elapsed_ms"] = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("dx_hook",
+                             "auto_narrow no_frame_batches pid=%u requested_frames=%u wait_budget_ms=%llu elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             scope.pid(),
+                             capture_frames,
+                             static_cast<unsigned long long>(frame_wait_budget_ms),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                             static_cast<unsigned long long>(deadline_remaining_ms()));
+        return tool_result_t::error("Auto-narrow observed no frame batches before the bounded frame wait elapsed.", result);
     }
 
     auto classifications = classify_cbuffers(scope.pid());

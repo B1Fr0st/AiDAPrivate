@@ -36,7 +36,50 @@ struct tls_key_scan_config_t {
     bool scan_openssl = true;
     bool scan_nss = true;
     bool scan_boringssl = true;
+    bool scan_generic = true;
+    bool scan_tls13_structures = true;
     std::uint32_t max_results = 64;
+    std::uint32_t timeout_ms = 10000;
+    std::uint32_t max_regions = 0;
+    std::uint32_t max_read_attempts = 0;
+    std::uint64_t max_read_bytes = 0;
+    std::uint64_t hint_address = 0;
+    std::uint32_t hint_size = 0;
+    bool hint_only = false;
+    const std::atomic<bool>* cancel_flag = nullptr;
+};
+
+struct key_scan_diagnostics_t {
+    std::uint32_t requested_pid = 0;
+    std::uint32_t effective_pid = 0;
+    std::uint32_t attached_pid = 0;
+    std::uint32_t timeout_ms = 0;
+    std::uint32_t max_results = 0;
+    std::uint32_t max_regions = 0;
+    std::uint32_t max_read_attempts = 0;
+    std::uint64_t max_read_bytes = 0;
+    std::uint64_t hint_address = 0;
+    std::uint32_t hint_size = 0;
+    bool hint_only = false;
+    bool hint_used = false;
+    bool deadline_expired = false;
+    bool cancelled = false;
+    bool truncated = false;
+    std::uint64_t elapsed_ms = 0;
+    std::uint64_t enumerate_elapsed_ms = 0;
+    std::uint64_t first_hit_elapsed_ms = 0;
+    std::uint64_t regions_seen = 0;
+    std::uint64_t regions_committed = 0;
+    std::uint64_t regions_skipped_state = 0;
+    std::uint64_t regions_skipped_size = 0;
+    std::uint64_t read_attempts = 0;
+    std::uint64_t read_bytes = 0;
+    std::uint64_t read_short = 0;
+    std::uint64_t first_short_read_va = 0;
+    std::uint64_t candidate_hits = 0;
+    std::uint64_t reject_count = 0;
+    std::uint64_t keys_found = 0;
+    std::string early_exit_reason;
 };
 
 
@@ -86,6 +129,18 @@ struct keylog_config_t {
     std::uint32_t pid = 0;
     std::string output_file;
     std::uint32_t poll_interval_ms = 500;
+    std::uint32_t scan_timeout_ms = 1500;
+    std::uint32_t stop_wait_ms = 350;
+    std::uint32_t max_results = 16;
+    bool scan_schannel = true;
+    bool scan_openssl = true;
+    bool scan_nss = true;
+    bool scan_boringssl = true;
+    bool scan_generic = true;
+    bool scan_tls13_structures = true;
+    std::uint64_t hint_address = 0;
+    std::uint32_t hint_size = 0;
+    bool hint_only = false;
     bool append = true;
     bool log_tls12 = true;
     bool log_tls13 = true;
@@ -156,11 +211,28 @@ struct dtls_key_info_t {
 
 struct pcap_decrypt_result_t {
     bool success = false;
+    bool dependency_slow = false;
+    bool dependency_unavailable = false;
+    bool killed_on_deadline = false;
+    bool launched = false;
     std::string error_message;
     std::string keylog_file_used;
     std::string pcap_file_used;
+    std::string tshark_path;
     std::uint32_t total_packets = 0;
     std::uint32_t decrypted_packets = 0;
+    std::uint32_t timeout_ms = 0;
+    std::uint32_t process_id = 0;
+    std::uint32_t wait_status = 0;
+    std::uint32_t exit_code = 0;
+    std::uint32_t win32_error = 0;
+    std::uint64_t elapsed_ms = 0;
+    std::uint64_t launch_elapsed_ms = 0;
+    std::uint64_t first_stdout_elapsed_ms = 0;
+    std::uint64_t first_stderr_elapsed_ms = 0;
+    std::uint64_t stdout_bytes = 0;
+    std::uint64_t stderr_bytes = 0;
+    std::uint64_t json_parse_elapsed_ms = 0;
     struct http2_frame_t {
         std::string stream_id;
         std::string method;
@@ -174,6 +246,7 @@ struct pcap_decrypt_result_t {
     };
     std::vector<http2_frame_t> http2_frames;
     std::string raw_output;
+    std::string stderr_output;
 };
 
 
@@ -219,12 +292,17 @@ public:
 
 
     std::vector<tls_session_key_t> extract_keys(const tls_key_scan_config_t& config);
+    key_scan_diagnostics_t last_tls_scan_diagnostics() const;
 
 
     std::vector<quic_key_info_t> extract_quic_keys(std::uint32_t pid);
+    std::vector<quic_key_info_t> extract_quic_keys(const tls_key_scan_config_t& config);
+    key_scan_diagnostics_t last_quic_scan_diagnostics() const;
 
 
     std::vector<dtls_key_info_t> extract_dtls_keys(std::uint32_t pid);
+    std::vector<dtls_key_info_t> extract_dtls_keys(const tls_key_scan_config_t& config);
+    key_scan_diagnostics_t last_dtls_scan_diagnostics() const;
 
 
     bool write_keylog_file(const std::string& path, const std::vector<tls_session_key_t>& keys, bool append);
@@ -243,7 +321,8 @@ public:
 
     pcap_decrypt_result_t decrypt_pcap_with_tshark(const std::string& pcap_path,
                                                     const std::string& keylog_path,
-                                                    const std::string& display_filter = "http2");
+                                                    const std::string& display_filter = "http2",
+                                                    std::uint32_t timeout_ms = 9500);
 
 
     std::string find_tshark_path();
@@ -283,6 +362,7 @@ private:
     bool wait_keylog_worker_done(std::uint64_t generation, DWORD timeout_ms);
 
     mutable std::mutex _mutex;
+    mutable std::mutex _diagnostics_mutex;
     std::mutex _keylog_lifecycle_mutex;
     std::mutex _keylog_worker_mutex;
     std::condition_variable _keylog_worker_cv;
@@ -292,6 +372,9 @@ private:
     std::atomic<DWORD> _keylog_worker_tid{0};
     keylog_config_t _keylog_config;
     std::map<std::string, tls_session_key_t> _seen_keys;
+    key_scan_diagnostics_t _last_tls_scan;
+    key_scan_diagnostics_t _last_quic_scan;
+    key_scan_diagnostics_t _last_dtls_scan;
 };
 
 

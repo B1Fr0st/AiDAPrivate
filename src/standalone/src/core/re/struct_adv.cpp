@@ -550,6 +550,7 @@ tool_result_t observe(const json& params)
 
 tool_result_t correlate(const json& params)
 {
+    const std::uint64_t started_ms = GetTickCount64();
     if (!params.contains("field_addresses") || !params["field_addresses"].is_array())
         return tool_result_t::error("'field_addresses' array is required.");
     struct field_t
@@ -576,6 +577,48 @@ tool_result_t correlate(const json& params)
     const bool has_pid = parse_pid_param(params, pid);
     const std::uint64_t default_search = std::min<std::uint64_t>(max_span, 0x400);
     const std::uint64_t base_search_window = numeric_param(params, "base_search_window", default_search, 0, max_span);
+    const std::uint64_t timeout_ms = numeric_param(params, "timeout_ms", 2500, 100, 60000);
+    const std::size_t max_candidates_to_evaluate = static_cast<std::size_t>(numeric_param(params, "max_candidates_to_evaluate", 128, 8, 4096));
+    bool deadline_hit = false;
+    bool cancelled = false;
+    bool truncated = false;
+    auto timed_out = [&]() -> bool {
+        if (cancelled || deadline_hit)
+            return true;
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            deadline_hit = true;
+            return true;
+        }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+        {
+            deadline_hit = true;
+            return true;
+        }
+        if (GetTickCount64() - started_ms >= timeout_ms)
+        {
+            deadline_hit = true;
+            return true;
+        }
+        return false;
+    };
+    driver_bridge::memory_region_t field_region{};
+    const bool field_region_ok = has_pid &&
+        query_region(pid, min_va, field_region) &&
+        is_readable(field_region) &&
+        region_contains_address(field_region, fields.back().va);
+    diag::log_tagged_fmt("struct_adv",
+                         "correlate enter pid=%u field_count=%zu min=%s max=%s max_span=%llu base_search_window=%llu timeout_ms=%llu field_region_ok=%d",
+                         pid,
+                         fields.size(),
+                         sa_format_address(min_va).c_str(),
+                         sa_format_address(fields.back().va).c_str(),
+                         static_cast<unsigned long long>(max_span),
+                         static_cast<unsigned long long>(base_search_window),
+                         static_cast<unsigned long long>(timeout_ms),
+                         field_region_ok ? 1 : 0);
     struct candidate_t
     {
         std::uint64_t base = 0;
@@ -588,9 +631,6 @@ tool_result_t correlate(const json& params)
         double leading_score = 0.0;
         double score = 0.0;
         bool readable_region = false;
-        bool base_preview_read = false;
-        std::string base_type;
-        std::string base_preview_hex;
     };
     std::vector<candidate_t> candidates;
     std::set<std::uint64_t> seen_bases;
@@ -599,6 +639,13 @@ tool_result_t correlate(const json& params)
         const std::uint64_t step = align;
         for (std::uint64_t lead = 0; lead <= base_search_window && lead <= min_va; lead += step)
         {
+            if (timed_out())
+                break;
+            if (seen_bases.size() >= max_candidates_to_evaluate)
+            {
+                truncated = true;
+                break;
+            }
             const std::uint64_t raw = min_va - lead;
             const std::uint64_t candidate = raw & ~(align - 1ull);
             if (candidate > min_va || seen_bases.count(candidate) != 0)
@@ -612,10 +659,9 @@ tool_result_t correlate(const json& params)
             bool readable = false;
             if (has_pid)
             {
-                driver_bridge::memory_region_t region{};
-                readable = query_region(pid, candidate, region) &&
-                           is_readable(region) &&
-                           region_contains_address(region, fields.back().va);
+                readable = field_region_ok &&
+                           region_contains_address(field_region, candidate) &&
+                           region_contains_address(field_region, fields.back().va);
             }
             candidate_t c;
             c.base = candidate;
@@ -624,16 +670,6 @@ tool_result_t correlate(const json& params)
             c.leading_slack = min_va - candidate;
             c.alignment_cost = alignment_cost;
             c.readable_region = readable;
-            if (has_pid && readable)
-            {
-                std::vector<std::uint8_t> base_preview;
-                if (read_bytes(pid, candidate, 16, base_preview) && !base_preview.empty())
-                {
-                    c.base_preview_read = true;
-                    c.base_type = infer_scalar_type_for_process(pid, base_preview);
-                    c.base_preview_hex = bytes_to_hex(base_preview, 16);
-                }
-            }
             const double align_penalty = fields.empty() ? 0.0 : static_cast<double>(alignment_cost) / static_cast<double>(fields.size() * align);
             const double span_ratio = max_span ? static_cast<double>(c.span) / static_cast<double>(max_span) : 1.0;
             const double slack_ratio = max_span ? static_cast<double>(c.leading_slack) / static_cast<double>(max_span) : 1.0;
@@ -653,15 +689,11 @@ tool_result_t correlate(const json& params)
             c.score -= std::min(0.08, slack_ratio * 0.08);
             if (has_pid)
                 c.score += readable ? 0.10 : -0.08;
-            if (c.base_type == "code_pointer")
-                c.score += 0.11;
-            else if (c.base_type == "pointer")
-                c.score += 0.08;
-            else if (c.base_type == "zero")
-                c.score -= 0.03;
             c.score = clamp_score(c.score);
             candidates.push_back(c);
         }
+        if (timed_out() || truncated)
+            break;
     }
     if (candidates.empty())
     {
@@ -679,10 +711,12 @@ tool_result_t correlate(const json& params)
     });
     std::uint64_t best_base = candidates.front().base;
     json candidate_rows = json::array();
+    std::size_t candidates_evaluated = 0;
     for (const auto& c : candidates)
     {
         if (candidate_rows.size() >= 16)
             break;
+        ++candidates_evaluated;
         json row;
         row["base_va"] = sa_format_address(c.base);
         row["alignment"] = c.alignment;
@@ -691,11 +725,24 @@ tool_result_t correlate(const json& params)
         row["alignment_cost"] = c.alignment_cost;
         row["score"] = c.score;
         row["readable_region"] = c.readable_region;
-        row["base_preview_read"] = c.base_preview_read;
-        if (c.base_preview_read)
+        bool base_preview_read = false;
+        std::string base_type;
+        std::string base_preview_hex;
+        if (has_pid && c.readable_region && !timed_out())
         {
-            row["base_type"] = c.base_type;
-            row["base_preview_hex"] = c.base_preview_hex;
+            std::vector<std::uint8_t> base_preview;
+            if (read_bytes(pid, c.base, 16, base_preview) && !base_preview.empty())
+            {
+                base_preview_read = true;
+                base_type = infer_scalar_type_for_process(pid, base_preview);
+                base_preview_hex = bytes_to_hex(base_preview, 16);
+            }
+        }
+        row["base_preview_read"] = base_preview_read;
+        if (base_preview_read)
+        {
+            row["base_type"] = base_type;
+            row["base_preview_hex"] = base_preview_hex;
         }
         row["score_components"] = {
             {"alignment", c.alignment_score},
@@ -707,6 +754,11 @@ tool_result_t correlate(const json& params)
     json arr = json::array();
     for (const auto& f : fields)
     {
+        if (timed_out())
+        {
+            truncated = true;
+            break;
+        }
         json row;
         row["name"] = f.name;
         row["va"] = sa_format_address(f.va);
@@ -730,8 +782,27 @@ tool_result_t correlate(const json& params)
     result["span"] = fields.back().va - best_base;
     result["candidate_bases"] = std::move(candidate_rows);
     result["candidate_count"] = candidates.size();
+    result["candidates_evaluated"] = candidates_evaluated;
+    const bool output_truncated = truncated || candidate_rows.size() < candidates.size();
+    result["truncated"] = output_truncated;
+    result["deadline_hit"] = deadline_hit;
+    result["cancelled"] = cancelled;
+    result["partial"] = deadline_hit || cancelled || output_truncated;
+    result["timeout_ms"] = timeout_ms;
+    result["elapsed_ms"] = GetTickCount64() - started_ms;
     result["base_search_window"] = base_search_window;
     result["selected_score"] = candidates.front().score;
+    diag::log_tagged_fmt("struct_adv",
+                         "correlate exit pid=%u found=%d candidates=%zu evaluated=%zu fields_returned=%zu truncated=%d deadline=%d cancelled=%d elapsed_ms=%llu",
+                         pid,
+                         !candidates.empty() ? 1 : 0,
+                         candidates.size(),
+                         candidates_evaluated,
+                         result["fields"].size(),
+                         result["truncated"].get<bool>() ? 1 : 0,
+                         deadline_hit ? 1 : 0,
+                         cancelled ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
 

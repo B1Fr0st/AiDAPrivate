@@ -168,6 +168,7 @@ namespace {
     std::atomic<bool> g_mcp_coverage_audit_started{false};
     std::atomic<bool> g_mcp_coverage_audit_completed{false};
     constexpr int k_mcp_planned_tool_tests = 514;
+    constexpr int k_expected_destructive_schema_only_exemptions = 6;
     constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 75000;
     constexpr DWORD k_camoufox_dependency_probe_timeout_ms = 9000;
     constexpr long long k_camoufox_reverse_tool_sidecar_timeout_ms = 65000;
@@ -210,6 +211,67 @@ namespace {
         int timed_out = 0;
     };
 
+    struct mcp_phase_gap_t {
+        std::string case_id;
+        std::string tool;
+        std::string reason;
+    };
+
+    struct mcp_coverage_audit_snapshot_t {
+        bool audit_started = false;
+        bool audit_completed = false;
+        bool audit_clean = false;
+        int missing = 0;
+        int stale = 0;
+        int attempted = 0;
+        int functional_passed_tools = 0;
+        int covered_total = 0;
+        int no_functional_pass = 0;
+        int failed_tools = 0;
+        int mixed_fail_tools = 0;
+        int skipped_tools = 0;
+        int timed_out_tools = 0;
+        int dependency_blocked_tools = 0;
+        int cascade_blocked_tools = 0;
+        int accepted_pending_tools = 0;
+        int expected_empty_nonfunctional_tools = 0;
+        int empty_result_suspect_tools = 0;
+        int unexpected_zero_pass_tools = 0;
+        int diagnostic_fallback_tools = 0;
+        int diagnostic_fallback_functional_tools = 0;
+        int destructive_schema_exemptions = 0;
+        int destructive_safe_contract_covered = 0;
+        int security_guard_covered = 0;
+        std::size_t outstanding_timed_out_workers = 0;
+        bool timed_out_drain_complete = false;
+        int registered_total = 0;
+        int external = 0;
+        int internal = 0;
+        int ide_chat_only = 0;
+        int ai_excluded = 0;
+        int non_ai_audited = 0;
+        int phase_planned = k_mcp_planned_tool_tests;
+        int phase_completed = 0;
+        int phase_remaining = k_mcp_planned_tool_tests;
+
+        int suspect_count() const {
+            int total = missing + stale + no_functional_pass + failed_tools + mixed_fail_tools +
+                skipped_tools + timed_out_tools + dependency_blocked_tools + cascade_blocked_tools +
+                expected_empty_nonfunctional_tools + empty_result_suspect_tools +
+                unexpected_zero_pass_tools + diagnostic_fallback_tools +
+                static_cast<int>(outstanding_timed_out_workers) +
+                phase_remaining;
+            if (!timed_out_drain_complete)
+                ++total;
+            if (destructive_schema_exemptions != k_expected_destructive_schema_only_exemptions ||
+                destructive_safe_contract_covered != k_expected_destructive_schema_only_exemptions)
+                ++total;
+            if (!audit_started || !audit_completed)
+                ++total;
+            return total;
+        }
+    };
+
     std::map<std::string, mcp_tool_attempt_stats_t> g_tool_attempt_stats;
     std::map<std::string, int> g_mcp_zero_output_suspects;
     std::map<std::string, std::string> g_mcp_zero_output_reasons;
@@ -217,12 +279,101 @@ namespace {
     std::map<std::string, std::string> g_mcp_expected_empty_reasons;
     std::map<std::string, std::string> g_mcp_nonfunctional_contract_reasons;
     std::map<std::string, std::string> g_mcp_functional_capture_reasons;
+    std::map<std::string, int> g_mcp_diagnostic_fallback_tools;
+    std::map<std::string, std::string> g_mcp_diagnostic_fallback_reasons;
+    std::mutex g_mcp_audit_snapshot_mtx;
+    mcp_coverage_audit_snapshot_t g_mcp_last_audit_snapshot;
+    std::vector<mcp_phase_gap_t> g_mcp_last_phase_gaps;
 
     std::string lower_copy(std::string v) {
         std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(c));
         });
         return v;
+    }
+
+    std::string mcp_case_id_fragment(std::string value) {
+        if (value.empty())
+            return "unknown";
+        for (char& c : value) {
+            const unsigned char uc = static_cast<unsigned char>(c);
+            if (!std::isalnum(uc) && c != '_' && c != '-' && c != '.')
+                c = '_';
+        }
+        return value;
+    }
+
+    void reset_mcp_audit_snapshot() {
+        std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
+        g_mcp_last_audit_snapshot = mcp_coverage_audit_snapshot_t{};
+        g_mcp_last_phase_gaps.clear();
+    }
+
+    void record_mcp_phase_gap(const std::string& case_id, const std::string& tool, const std::string& reason) {
+        std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
+        if (g_mcp_last_phase_gaps.size() >= 1024)
+            return;
+        mcp_phase_gap_t gap;
+        gap.case_id = case_id.empty() ? "mcp_audit.unknown" : case_id;
+        gap.tool = tool.empty() ? "<none>" : tool;
+        gap.reason = reason.empty() ? "<empty>" : reason;
+        g_mcp_last_phase_gaps.push_back(std::move(gap));
+    }
+
+    void store_mcp_audit_snapshot(const mcp_coverage_audit_snapshot_t& snapshot) {
+        std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
+        g_mcp_last_audit_snapshot = snapshot;
+    }
+
+    void update_mcp_phase_completion_snapshot(int completed) {
+        std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
+        g_mcp_last_audit_snapshot.phase_completed = completed;
+        g_mcp_last_audit_snapshot.phase_remaining =
+            k_mcp_planned_tool_tests > completed ? k_mcp_planned_tool_tests - completed : 0;
+    }
+
+    bool mcp_text_indicates_diagnostic_fallback(const std::string& text) {
+        const std::string lc = lower_copy(text);
+        return lc.find("diagnostic") != std::string::npos ||
+            lc.find("fallback") != std::string::npos ||
+            lc.find("heuristic") != std::string::npos;
+    }
+
+    const char* mcp_status_evidence_class(mcp_tool_call_status_t status, const std::string& functional_evidence, const std::string& reason) {
+        const std::string combined = functional_evidence + " " + reason;
+        if (mcp_text_indicates_diagnostic_fallback(combined))
+            return "diagnostic_fallback";
+        switch (status) {
+            case mcp_tool_call_status_t::functional_pass: return "functional_positive";
+            case mcp_tool_call_status_t::schema_pass: return "schema_contract";
+            case mcp_tool_call_status_t::contract_pass: return "nonfunctional_contract";
+            case mcp_tool_call_status_t::cleanup_contract_pass: return "cleanup_postcondition";
+            case mcp_tool_call_status_t::state_contract_pass: return "expected_empty_nonfunctional";
+            case mcp_tool_call_status_t::accepted_pending: return "accepted_pending_nonfunctional";
+            case mcp_tool_call_status_t::guard_pass: return "negative_guard";
+            case mcp_tool_call_status_t::security_guard_pass: return "negative_guard";
+            case mcp_tool_call_status_t::negative_pass: return "negative_guard";
+            case mcp_tool_call_status_t::failed: return "failed";
+            case mcp_tool_call_status_t::dependency_blocked: return "dependency_blocked";
+            case mcp_tool_call_status_t::cascade_blocked: return "cascade_blocked";
+            case mcp_tool_call_status_t::skipped: return "skipped";
+            case mcp_tool_call_status_t::timed_out: return "timed_out";
+            default: return "unknown";
+        }
+    }
+
+    bool mcp_classification_has_functional_coverage(mcp_tool_call_status_t status, const char* evidence_class) {
+        return status == mcp_tool_call_status_t::functional_pass &&
+            evidence_class != nullptr &&
+            std::strcmp(evidence_class, "diagnostic_fallback") != 0;
+    }
+
+    void record_mcp_diagnostic_fallback(const std::string& tool_name, const std::string& reason) {
+        if (tool_name.empty())
+            return;
+        ++g_mcp_diagnostic_fallback_tools[tool_name];
+        if (!reason.empty())
+            g_mcp_diagnostic_fallback_reasons[tool_name] = reason;
     }
 
     std::string semantic_action_from_args(const mcp_standalone::json& args) {
@@ -734,8 +885,7 @@ namespace {
             "pack_find_oep",
             "pack_iat_manage",
             "opaque_predicate_patch",
-            "net_replay_mutate",
-            "dx_hook_manage"
+            "net_replay_mutate"
         };
         const std::string lowered = lower_copy(name);
         return is_destructive_mcp_tool(lowered) && exact.find(lowered) != exact.end();
@@ -7372,6 +7522,8 @@ namespace {
             return 30000;
         if (name == "network_pg_sniff")
             return 10000;
+        if (name == "network_decrypt_capture")
+            return 15000;
         if (name == "tls_manage")
             return 15000;
         if (name == "drv_find_device_names")
@@ -7628,11 +7780,18 @@ namespace {
         const std::string delta_s = delta.empty()
             ? payload_state_summary_field(evidence.data, { "delta", "removed_count", "cleared_count", "deleted_count", "stopped_count", "capture_count", "total_captures", "access_count" })
             : delta;
-        log_msg(hf, tag, "CLASSIFICATION -- tool=%s action=%s classification=%s functional_evidence=%s state_before=%s state_after=%s delta=%s dependency=%s dependency_available=%d reason=%s seq=%d",
+        const char* evidence_class = mcp_status_evidence_class(classification, functional_evidence, reason);
+        const bool functional_coverage = mcp_classification_has_functional_coverage(classification, evidence_class);
+        const std::string evidence_text = functional_evidence.empty()
+            ? (classification == mcp_tool_call_status_t::functional_pass ? "success_payload" : "nonfunctional_contract")
+            : compact_text(functional_evidence, 700);
+        log_msg(hf, tag, "CLASSIFICATION -- tool=%s action=%s classification=%s evidence_class=%s functional_coverage=%d functional_evidence=%s state_before=%s state_after=%s delta=%s dependency=%s dependency_available=%d reason=%s seq=%d",
             tool_name.empty() ? "<empty>" : tool_name.c_str(),
             action.empty() ? "<none>" : action.c_str(),
             mcp_status_classification_name(classification),
-            functional_evidence.empty() ? (mcp_status_is_functional(classification) ? "success_payload" : "nonfunctional_contract") : compact_text(functional_evidence, 700).c_str(),
+            evidence_class,
+            functional_coverage ? 1 : 0,
+            evidence_text.c_str(),
             compact_text(before, 350).c_str(),
             compact_text(after, 350).c_str(),
             compact_text(delta_s, 350).c_str(),
@@ -7640,6 +7799,12 @@ namespace {
             payload_dependency_available_value(evidence.data) ? 1 : 0,
             validation_reason_schema(reason, evidence.data).c_str(),
             seq);
+        if (std::strcmp(evidence_class, "diagnostic_fallback") == 0) {
+            std::string fallback_reason = evidence_text;
+            if (!reason.empty())
+                fallback_reason += " reason=" + reason;
+            record_mcp_diagnostic_fallback(tool_name, fallback_reason);
+        }
         const std::string nonfunctional_contract_reason = functional_evidence.empty() ? reason : functional_evidence;
         if (!mcp_status_is_functional(classification) && !tool_name.empty() && !nonfunctional_contract_reason.empty())
             g_mcp_nonfunctional_contract_reasons[tool_name] = nonfunctional_contract_reason;
@@ -9684,9 +9849,7 @@ namespace {
                     static_cast<unsigned long>(owner_tid));
             }
             };
-            std::thread stimulus_thread(std::move(emitter_fn));
-            stimulus_thread.detach();
-            const bool posted_to_queue = true;
+            const bool posted_to_queue = work_queue::post_service_labeled(emitter_label.c_str(), std::move(emitter_fn));
             if (posted_to_queue) {
                 state.posted = true;
                 const auto wq_stats_after_post = work_queue::stats();
@@ -11269,6 +11432,50 @@ namespace {
         std::uint32_t analysis_export_count = 0;
         std::uint64_t reserved[8] = {};
     };
+
+    struct test_coverage_domains_1_8_struct_mutation_diag_t {
+        std::uint32_t magic = 0;
+        std::uint32_t version = 0;
+        std::uint32_t size = 0;
+        std::uint32_t call_count = 0;
+        std::uint32_t last_index = 0;
+        std::uint32_t last_delta = 0;
+        std::uint32_t struct_count = 0;
+        std::uint32_t struct_size = 0;
+        std::uint64_t struct_array_va = 0;
+        std::uint64_t selected_struct_va = 0;
+        std::uint64_t result_va = 0;
+        std::uint64_t before_hash = 0;
+        std::uint64_t after_hash = 0;
+        std::uint32_t null_array = 0;
+        std::uint32_t out_of_range = 0;
+        std::uint32_t last_error_code = 0;
+        std::uint32_t reserved = 0;
+    };
+
+    bool test_coverage_domains_1_8_read_struct_mutation_diag(std::uint32_t pid,
+                                                             const test_coverage_domains_1_8_re_descriptor_t& desc,
+                                                             test_coverage_domains_1_8_struct_mutation_diag_t& out,
+                                                             std::string& reason) {
+        out = {};
+        const std::uint64_t diag_va = desc.reserved[0];
+        const std::uint64_t diag_size = desc.reserved[1];
+        if (diag_va == 0 || diag_size < sizeof(out)) {
+            char diag_va_buf[32] = {};
+            _snprintf_s(diag_va_buf, sizeof(diag_va_buf), _TRUNCATE, "0x%016llX", static_cast<unsigned long long>(diag_va));
+            reason = "struct mutation diagnostic block missing diag_va=" + std::string(diag_va_buf) +
+                " diag_size=" + std::to_string(diag_size);
+            return false;
+        }
+        std::vector<std::uint8_t> bytes;
+        if (!testlab_read_remote_exact(pid, diag_va, sizeof(out), bytes, reason) || bytes.size() < sizeof(out)) {
+            if (reason.empty())
+                reason = "struct mutation diagnostic read returned short buffer";
+            return false;
+        }
+        std::memcpy(&out, bytes.data(), sizeof(out));
+        return true;
+    }
 
     using test_coverage_domains_1_8_validator_t = std::function<bool(const invoke_result_t&, std::string&)>;
 
@@ -13336,7 +13543,15 @@ namespace {
         std::string preflight_before_reason;
         std::string preflight_after_reason;
         const std::size_t struct_preflight_read_size = std::min<std::size_t>(static_cast<std::size_t>(desc.struct_size), 128);
+        driver_bridge::memory_region_t preflight_region_before{};
+        const bool preflight_region_before_ok = driver_bridge::query_memory_for(pid, observed_struct_va, preflight_region_before);
+        const std::string preflight_region_before_error = preflight_region_before_ok ? std::string() : driver_bridge::last_error();
         const bool preflight_before_ok = testlab_read_remote_exact(pid, observed_struct_va, struct_preflight_read_size, preflight_before, preflight_before_reason);
+        test_coverage_domains_1_8_struct_mutation_diag_t preflight_diag_before{};
+        test_coverage_domains_1_8_struct_mutation_diag_t preflight_diag_after{};
+        std::string preflight_diag_before_reason;
+        std::string preflight_diag_after_reason;
+        const bool preflight_diag_before_ok = test_coverage_domains_1_8_read_struct_mutation_diag(pid, desc, preflight_diag_before, preflight_diag_before_reason);
         const std::uint64_t preflight_started = GetTickCount64();
         std::uint64_t preflight_result = 0;
         for (int preflight_attempt = 0; preflight_attempt < 3; ++preflight_attempt) {
@@ -13354,6 +13569,10 @@ namespace {
         }
         const std::uint64_t preflight_elapsed = GetTickCount64() - preflight_started;
         const bool preflight_after_ok = testlab_read_remote_exact(pid, observed_struct_va, struct_preflight_read_size, preflight_after, preflight_after_reason);
+        driver_bridge::memory_region_t preflight_region_after{};
+        const bool preflight_region_after_ok = driver_bridge::query_memory_for(pid, observed_struct_va, preflight_region_after);
+        const std::string preflight_region_after_error = preflight_region_after_ok ? std::string() : driver_bridge::last_error();
+        const bool preflight_diag_after_ok = test_coverage_domains_1_8_read_struct_mutation_diag(pid, desc, preflight_diag_after, preflight_diag_after_reason);
         const bool struct_mutation_preflight_ok =
             preflight_result != 0 &&
             preflight_before_ok &&
@@ -13374,6 +13593,43 @@ namespace {
             driver_bridge::last_error().c_str(),
             preflight_before_reason.empty() ? "<empty>" : compact_text(preflight_before_reason, 500).c_str(),
             preflight_after_reason.empty() ? "<empty>" : compact_text(preflight_after_reason, 500).c_str());
+        log_msg(hf, tag, "STRUCT-MUTATION-PREFLIGHT-DIAG -- pid=%u active_pid=%u diag_va=0x%016llX diag_size=%llu before_diag_ok=%d after_diag_ok=%d before_call_count=%u after_call_count=%u last_index=%u last_delta=%u struct_array=0x%016llX selected=0x%016llX result=0x%016llX before_hash=0x%016llX after_hash=0x%016llX null_array=%u out_of_range=%u last_error_code=%u expected_result=0x%016llX result_matches=%d region_before_ok=%d region_before_base=0x%016llX region_before_size=0x%016llX region_before_state=0x%08X region_before_protect=0x%08X region_after_ok=%d region_after_base=0x%016llX region_after_size=0x%016llX region_after_state=0x%08X region_after_protect=0x%08X byte_before=%s byte_after=%s before_reason=%s after_reason=%s region_before_error=%s region_after_error=%s",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(desc.reserved[0]),
+            static_cast<unsigned long long>(desc.reserved[1]),
+            preflight_diag_before_ok ? 1 : 0,
+            preflight_diag_after_ok ? 1 : 0,
+            preflight_diag_before.call_count,
+            preflight_diag_after.call_count,
+            preflight_diag_after.last_index,
+            preflight_diag_after.last_delta,
+            static_cast<unsigned long long>(preflight_diag_after.struct_array_va),
+            static_cast<unsigned long long>(preflight_diag_after.selected_struct_va),
+            static_cast<unsigned long long>(preflight_diag_after.result_va),
+            static_cast<unsigned long long>(preflight_diag_after.before_hash),
+            static_cast<unsigned long long>(preflight_diag_after.after_hash),
+            preflight_diag_after.null_array,
+            preflight_diag_after.out_of_range,
+            preflight_diag_after.last_error_code,
+            static_cast<unsigned long long>(observed_struct_va),
+            preflight_diag_after.result_va == observed_struct_va ? 1 : 0,
+            preflight_region_before_ok ? 1 : 0,
+            static_cast<unsigned long long>(preflight_region_before.base),
+            static_cast<unsigned long long>(preflight_region_before.size),
+            preflight_region_before.state,
+            preflight_region_before.protect,
+            preflight_region_after_ok ? 1 : 0,
+            static_cast<unsigned long long>(preflight_region_after.base),
+            static_cast<unsigned long long>(preflight_region_after.size),
+            preflight_region_after.state,
+            preflight_region_after.protect,
+            hex_preview(preflight_before, 64).c_str(),
+            hex_preview(preflight_after, 64).c_str(),
+            preflight_diag_before_reason.empty() ? "<empty>" : compact_text(preflight_diag_before_reason, 500).c_str(),
+            preflight_diag_after_reason.empty() ? "<empty>" : compact_text(preflight_diag_after_reason, 500).c_str(),
+            preflight_region_before_error.empty() ? "<empty>" : compact_text(preflight_region_before_error, 500).c_str(),
+            preflight_region_after_error.empty() ? "<empty>" : compact_text(preflight_region_after_error, 500).c_str());
 
         if (!cancelled || !cancelled()) {
             mcp_standalone::json args;
@@ -17512,12 +17768,59 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         uint64_t accepts_after = 0;
         long long request_delta = 0;
         long long accept_delta = 0;
+        bool rule_before_found = false;
+        bool rule_after_found = false;
+        uint32_t rule_match_count_before = 0;
+        uint32_t rule_match_count_after = 0;
+        uint32_t rule_protocol = 0;
+        uint32_t rule_match_port = 0;
+        uint32_t rule_redirect_port = 0;
+        uint32_t rule_af = 0;
     };
 
     network_redirect_stimulus_result_t stimulate_network_redirect_rule(HANDLE hf, const char* tag, uint64_t rule_id, uint16_t match_port, uint16_t redirect_port, const char* path) {
         network_redirect_stimulus_result_t diag;
         diag.requests_before = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
         diag.accepts_before = g_burp_http_fixture ? g_burp_http_fixture->accept_count.load(std::memory_order_acquire) : 0;
+        auto capture_rule_snapshot = [&](const char* phase) {
+            const auto rules = driver_bridge::list_redirect_rules();
+            bool found_rule = false;
+            driver_bridge::redirect_rule_info_t matched{};
+            for (const auto& rule : rules) {
+                if (rule.rule_id == rule_id) {
+                    matched = rule;
+                    found_rule = true;
+                    break;
+                }
+            }
+            if (found_rule) {
+                if (std::strcmp(phase ? phase : "", "before") == 0) {
+                    diag.rule_before_found = true;
+                    diag.rule_match_count_before = matched.match_count;
+                } else {
+                    diag.rule_after_found = true;
+                    diag.rule_match_count_after = matched.match_count;
+                }
+                diag.rule_protocol = matched.protocol;
+                diag.rule_match_port = matched.match_port;
+                diag.rule_redirect_port = matched.redirect_port;
+                diag.rule_af = matched.af;
+            }
+            log_msg(hf, tag, "REDIRECT-RULE-SNAPSHOT -- phase=%s rule_id=%llu found=%d rules=%zu protocol=%u match_port=%u redirect_port=%u af=%u match_count=%u active=%u expected_match_port=%u expected_redirect_port=%u",
+                phase ? phase : "<empty>",
+                static_cast<unsigned long long>(rule_id),
+                found_rule ? 1 : 0,
+                rules.size(),
+                matched.protocol,
+                matched.match_port,
+                matched.redirect_port,
+                matched.af,
+                matched.match_count,
+                matched.active,
+                static_cast<unsigned>(match_port),
+                static_cast<unsigned>(redirect_port));
+        };
+        capture_rule_snapshot("before");
         const auto payload = mcp_http_fixture_request_payload(path ? path : "/aida-network-redirect-stimulus");
         if (match_port == 0) {
             log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u wsa_ready=%d attempts=%d sent=0 delivered=0 reason=%s path=%s",
@@ -17681,10 +17984,11 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         Sleep(200);
         diag.requests_after = g_burp_http_fixture ? g_burp_http_fixture->request_count.load(std::memory_order_acquire) : 0;
         diag.accepts_after = g_burp_http_fixture ? g_burp_http_fixture->accept_count.load(std::memory_order_acquire) : 0;
+        capture_rule_snapshot("after");
         diag.request_delta = static_cast<long long>(diag.requests_after) - static_cast<long long>(diag.requests_before);
         diag.accept_delta = static_cast<long long>(diag.accepts_after) - static_cast<long long>(diag.accepts_before);
         diag.delivered = diag.sent && diag.request_delta > 0;
-        log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u attempts=%d sent=%d response_len=%zu requests_before=%llu requests_after=%llu request_delta=%lld accepts_before=%llu accepts_after=%llu accept_delta=%lld delivered=%d connect_rc=%d connect_err=%d so_connect=%d send_rc=%d send_err=%d so_send=%d recv_rc=%d recv_err=%d so_recv=%d path=%s",
+        log_msg(hf, tag, "RULE-STIMULUS -- tool=network_redirect_manage rule_id=%llu match_port=%u redirect_port=%u attempts=%d sent=%d response_len=%zu requests_before=%llu requests_after=%llu request_delta=%lld accepts_before=%llu accepts_after=%llu accept_delta=%lld delivered=%d rule_before_found=%d rule_after_found=%d rule_match_before=%u rule_match_after=%u rule_match_delta=%d rule_protocol=%u rule_match_port=%u rule_redirect_port=%u rule_af=%u connect_rc=%d connect_err=%d so_connect=%d send_rc=%d send_err=%d so_send=%d recv_rc=%d recv_err=%d so_recv=%d path=%s",
             static_cast<unsigned long long>(rule_id),
             static_cast<unsigned>(match_port),
             static_cast<unsigned>(redirect_port),
@@ -17698,6 +18002,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             static_cast<unsigned long long>(diag.accepts_after),
             diag.accept_delta,
             diag.delivered ? 1 : 0,
+            diag.rule_before_found ? 1 : 0,
+            diag.rule_after_found ? 1 : 0,
+            diag.rule_match_count_before,
+            diag.rule_match_count_after,
+            static_cast<int>(diag.rule_match_count_after) - static_cast<int>(diag.rule_match_count_before),
+            diag.rule_protocol,
+            diag.rule_match_port,
+            diag.rule_redirect_port,
+            diag.rule_af,
             diag.connect_rc,
             diag.connect_error,
             diag.so_error_after_connect,
@@ -18455,6 +18768,13 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         if (!srv) {
             (void)skipped;
             log_msg(hf, tag, "FAIL -- no server instance");
+            mcp_coverage_audit_snapshot_t snapshot;
+            snapshot.audit_started = true;
+            snapshot.audit_completed = true;
+            snapshot.audit_clean = false;
+            snapshot.failed_tools = 1;
+            record_mcp_phase_gap("mcp_audit.no_server", "mcp_server", "no server instance");
+            store_mcp_audit_snapshot(snapshot);
             failed.fetch_add(1);
             return;
         }
@@ -18505,6 +18825,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         int empty_result_suspect_tools = 0;
         int unexpected_zero_pass_tools = 0;
         int expected_empty_nonfunctional_tools = 0;
+        int diagnostic_fallback_tools = 0;
+        int diagnostic_fallback_functional_tools = 0;
         for (const auto& t : srv->get_tools()) {
             if (!registered_all.insert(t.name).second)
                 continue;
@@ -18589,6 +18911,14 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     state_contract_reason_for_tool += contract_reason_it_for_tool->second;
                 }
                 const std::string state_contract_reason_lc = lower_copy(state_contract_reason_for_tool);
+                const auto diagnostic_fallback_it_for_tool = g_mcp_diagnostic_fallback_tools.find(t.name);
+                const auto diagnostic_fallback_reason_it_for_tool = g_mcp_diagnostic_fallback_reasons.find(t.name);
+                const bool diagnostic_fallback_evidence = diagnostic_fallback_it_for_tool != g_mcp_diagnostic_fallback_tools.end();
+                if (diagnostic_fallback_evidence) {
+                    ++diagnostic_fallback_tools;
+                    if (st.passed > 0)
+                        ++diagnostic_fallback_functional_tools;
+                }
                 const bool seh_x64_state_contract_covered =
                     (t.name == "debugger_get_seh_chain" || t.name == "dbg_get_seh_chain") &&
                     clean_nonfunctional_contract &&
@@ -18597,6 +18927,21 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     (state_contract_reason_lc.find("x64_empty_chain_proven=1") != std::string::npos ||
                      state_contract_reason_lc.find("seh_x64_empty_chain_state_proven") != std::string::npos);
                 const std::string stats_summary = mcp_tool_attempt_stats_summary(st);
+                const bool true_mixed_fail = st.passed > 0 && (st.failed > 0 || st.timed_out > 0);
+                if (diagnostic_fallback_evidence) {
+                    const std::string fallback_reason = diagnostic_fallback_reason_it_for_tool == g_mcp_diagnostic_fallback_reasons.end()
+                        ? std::string("diagnostic_fallback_evidence")
+                        : diagnostic_fallback_reason_it_for_tool->second;
+                    log_msg(hf, tag, "%s -- registered tool \"%s\" diagnostic fallback evidence_class observed functional_pass=%d %s proof=%s",
+                        st.passed > 0 ? "DIAGNOSTIC-FALLBACK-FUNCTIONAL-SUSPECT" : "DIAGNOSTIC-FALLBACK-NONFUNCTIONAL",
+                        t.name.c_str(),
+                        st.passed,
+                        stats_summary.c_str(),
+                        compact_text(fallback_reason, 700).c_str());
+                    record_mcp_phase_gap("mcp_audit.diagnostic_fallback." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        fallback_reason + " " + stats_summary);
+                }
                 if (action_dependency_blocked_nonfatal) {
                     ++covered;
                     ++passed_tools;
@@ -18604,24 +18949,21 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                         t.name.c_str(), stats_summary.c_str());
                 } else if (st.dependency_blocked > 0) {
                     ++no_pass;
-                    if (st.passed > 0 || st.failed > 0 || st.timed_out > 0 || nonfunctional_evidence)
-                        ++mixed_fail_tools;
                     log_msg(hf, tag, "DEPENDENCY-BLOCKED-COVERAGE-INVALID -- registered tool \"%s\" dependency-blocked results cannot satisfy functional coverage %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.dependency_blocked." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else if (st.cascade_blocked > 0) {
                     ++no_pass;
-                    if (st.passed > 0 || st.failed > 0 || st.timed_out > 0 || nonfunctional_evidence)
-                        ++mixed_fail_tools;
                     log_msg(hf, tag, "CASCADE-BLOCKED-COVERAGE-INVALID -- registered tool \"%s\" cascade-blocked results cannot satisfy functional coverage %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.cascade_blocked." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else if (st.passed > 0) {
                     ++covered;
                     ++passed_tools;
-                    if (st.failed > 0 || st.timed_out > 0) {
-                        ++mixed_fail_tools;
-                        log_msg(hf, tag, "MIXED-FAIL -- registered tool \"%s\" had functional pass evidence but also failed or timed out %s",
-                            t.name.c_str(), stats_summary.c_str());
-                    }
                 } else if (destructive_safe_contract_proof) {
                     ++covered;
                     ++destructive_schema_exempt_covered;
@@ -18642,50 +18984,97 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     ++no_pass;
                     log_msg(hf, tag, "DESTRUCTIVE-SAFE-CONTRACT-INVALID -- registered tool \"%s\" destructive_schema_only=1 functional_pass=0 structured_safe_contract=0 %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.destructive_contract_invalid." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else if (safe_external_guard_exempt && (st.security_guard_passed > 0 || st.guard_passed > 0)) {
                     ++no_pass;
                     log_msg(hf, tag, "GUARD-SAFE-CONTRACT-INVALID -- registered tool \"%s\" guard_only=1 functional_pass=0 structured_safe_contract=0 %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.guard_contract_invalid." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else if (st.cleanup_contract_passed > 0 && st.failed == 0 && st.timed_out == 0) {
                     ++no_pass;
                     log_msg(hf, tag, "CLEANUP-CONTRACT-NONFUNCTIONAL -- registered tool \"%s\" cleanup behavior observed without seeded functional delta %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.cleanup_nonfunctional." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else if (st.state_contract_passed > 0 && st.failed == 0 && st.timed_out == 0) {
                     ++no_pass;
                     log_msg(hf, tag, "STATE-CONTRACT-NONFUNCTIONAL -- registered tool \"%s\" state contract observed without functional evidence %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.state_nonfunctional." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else if (st.accepted_pending > 0 && st.failed == 0 && st.timed_out == 0) {
                     ++no_pass;
                     log_msg(hf, tag, "ACCEPTED-PENDING-NONFUNCTIONAL -- registered tool \"%s\" accepted work but did not produce functional proof %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.accepted_pending." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else if (safe_external_guard_exempt && st.guard_passed > 0 && st.failed == 0 && st.timed_out == 0) {
                     ++no_pass;
                     log_msg(hf, tag, "SAFE-GUARD-NONFUNCTIONAL -- registered tool \"%s\" safe_external_guard=1 functional_pass=0 %s",
                         t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.safe_guard_nonfunctional." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 } else {
                     ++no_pass;
                     log_msg(hf, tag, "NO-FUNCTIONAL-PASS -- registered tool \"%s\" destructive_schema_exempt=%d safe_external_guard_exempt=%d %s",
                         t.name.c_str(), destructive_exempt ? 1 : 0, safe_external_guard_exempt ? 1 : 0, stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.no_functional_pass." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
                 }
-                if (st.failed > 0 && !guard_only_safe_contract_proof)
+                if (true_mixed_fail) {
+                    ++mixed_fail_tools;
+                    log_msg(hf, tag, "MIXED-FAIL -- registered tool \"%s\" had functional pass evidence and at least one failed or timed-out invocation %s",
+                        t.name.c_str(), stats_summary.c_str());
+                    record_mcp_phase_gap("mcp_audit.true_mixed_fail." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
+                }
+                if (st.failed > 0 && !guard_only_safe_contract_proof) {
                     ++failed_tools;
+                    record_mcp_phase_gap("mcp_audit.failed." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
+                }
                 if (st.dependency_blocked > 0 && !action_dependency_blocked_nonfatal)
                     ++dependency_blocked_tools;
                 if (st.cascade_blocked > 0)
                     ++cascade_blocked_tools;
-                if (st.skipped > 0)
+                if (st.skipped > 0) {
                     ++skipped_tools;
-                if (st.timed_out > 0)
+                    record_mcp_phase_gap("mcp_audit.skipped." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
+                }
+                if (st.timed_out > 0) {
                     ++timed_out_tools;
+                    record_mcp_phase_gap("mcp_audit.timed_out." + mcp_case_id_fragment(t.name),
+                        t.name,
+                        stats_summary);
+                }
             } else if (g_invoked_tools.find(t.name) != g_invoked_tools.end()) {
                 ++attempted;
                 ++no_pass;
                 log_msg(hf, tag, "NO-FUNCTIONAL-PASS -- registered tool \"%s\" was attempted without a recorded terminal status",
                     t.name.c_str());
+                record_mcp_phase_gap("mcp_audit.no_terminal_status." + mcp_case_id_fragment(t.name),
+                    t.name,
+                    "attempted without recorded terminal status");
             } else {
                 ++missing;
                 log_msg(hf, tag, "MISSING -- registered tool \"%s\" was not attempted by the full MCP harness",
                     t.name.c_str());
+                record_mcp_phase_gap("mcp_audit.missing." + mcp_case_id_fragment(t.name),
+                    t.name,
+                    "registered audited tool was not attempted by the full MCP harness");
             }
         }
 
@@ -18770,6 +19159,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 expected.second,
                 functional_pass,
                 expected_reason.empty() ? "<empty>" : compact_text(expected_reason, 900).c_str());
+            record_mcp_phase_gap("mcp_audit.expected_empty_nonfunctional." + mcp_case_id_fragment(expected.first),
+                expected.first,
+                expected_reason.empty() ? "expected empty nonfunctional without independent functional coverage" : expected_reason);
         }
 
         for (const auto& suspect : g_mcp_zero_output_suspects) {
@@ -18793,6 +19185,9 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     suspect.second,
                     functional_pass);
             }
+            record_mcp_phase_gap("mcp_audit.empty_result_suspect." + mcp_case_id_fragment(suspect.first),
+                suspect.first,
+                reason_it == g_mcp_zero_output_reasons.end() ? "unexpected zero-output evidence" : reason_it->second);
         }
 
         int stale = 0;
@@ -18801,10 +19196,99 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 ++stale;
                 log_msg(hf, tag, "STALE -- explicit MCP test attempted unregistered tool \"%s\"",
                     attempted.c_str());
+                record_mcp_phase_gap("mcp_audit.stale." + mcp_case_id_fragment(attempted),
+                    attempted,
+                    "explicit MCP test attempted unregistered tool");
             }
         }
 
-        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu strict_safe_contract_proof=1",
+        for (const auto& rec : copy_timed_out_invocations()) {
+            std::string reason = "timed-out worker did not drain seq=" + std::to_string(rec.seq) +
+                " timeout_ms=" + std::to_string(rec.timeout_ms) +
+                " domain=" + rec.domain;
+            if (rec.state) {
+                std::lock_guard<std::mutex> lk(rec.state->mutex);
+                reason += " handler_entered=" + std::to_string(rec.state->handler_entered ? 1 : 0) +
+                    " handler_exited=" + std::to_string(rec.state->handler_exited ? 1 : 0) +
+                    " done=" + std::to_string(rec.state->done ? 1 : 0) +
+                    " worker_phase=" + (rec.state->worker_phase.empty() ? std::string("<empty>") : rec.state->worker_phase);
+            }
+            record_mcp_phase_gap("mcp_audit.outstanding_timeout.seq_" + std::to_string(rec.seq) + "." + mcp_case_id_fragment(rec.tool_name),
+                rec.tool_name,
+                reason);
+        }
+
+        const bool destructive_schema_accounting_ok =
+            destructive_schema_exemptions == k_expected_destructive_schema_only_exemptions &&
+            destructive_schema_exempt_covered == k_expected_destructive_schema_only_exemptions;
+        if (!destructive_schema_accounting_ok) {
+            log_msg(hf, tag, "DESTRUCTIVE-SCHEMA-ACCOUNTING-FAIL -- expected=%d exemptions=%d covered=%d dx_hook_manage_schema_exempt=%d",
+                k_expected_destructive_schema_only_exemptions,
+                destructive_schema_exemptions,
+                destructive_schema_exempt_covered,
+                0);
+            record_mcp_phase_gap("mcp_audit.destructive_schema_accounting",
+                "destructive_schema_only",
+                "expected six destructive schema-only exemptions but observed exemptions=" +
+                    std::to_string(destructive_schema_exemptions) +
+                    " covered=" + std::to_string(destructive_schema_exempt_covered));
+        }
+
+        const bool audit_clean =
+            missing == 0 &&
+            stale == 0 &&
+            no_pass == 0 &&
+            failed_tools == 0 &&
+            mixed_fail_tools == 0 &&
+            skipped_tools == 0 &&
+            timed_out_tools == 0 &&
+            dependency_blocked_tools == 0 &&
+            cascade_blocked_tools == 0 &&
+            expected_empty_nonfunctional_tools == 0 &&
+            empty_result_suspect_tools == 0 &&
+            unexpected_zero_pass_tools == 0 &&
+            diagnostic_fallback_tools == 0 &&
+            diagnostic_fallback_functional_tools == 0 &&
+            outstanding_timed_out_workers == 0 &&
+            timed_out_drain_complete &&
+            destructive_schema_accounting_ok;
+
+        mcp_coverage_audit_snapshot_t snapshot;
+        snapshot.audit_started = true;
+        snapshot.audit_completed = true;
+        snapshot.audit_clean = audit_clean;
+        snapshot.missing = missing;
+        snapshot.stale = stale;
+        snapshot.attempted = attempted;
+        snapshot.functional_passed_tools = passed_tools;
+        snapshot.covered_total = covered;
+        snapshot.no_functional_pass = no_pass;
+        snapshot.failed_tools = failed_tools;
+        snapshot.mixed_fail_tools = mixed_fail_tools;
+        snapshot.skipped_tools = skipped_tools;
+        snapshot.timed_out_tools = timed_out_tools;
+        snapshot.dependency_blocked_tools = dependency_blocked_tools;
+        snapshot.cascade_blocked_tools = cascade_blocked_tools;
+        snapshot.accepted_pending_tools = accepted_pending_tools;
+        snapshot.expected_empty_nonfunctional_tools = expected_empty_nonfunctional_tools;
+        snapshot.empty_result_suspect_tools = empty_result_suspect_tools;
+        snapshot.unexpected_zero_pass_tools = unexpected_zero_pass_tools;
+        snapshot.diagnostic_fallback_tools = diagnostic_fallback_tools;
+        snapshot.diagnostic_fallback_functional_tools = diagnostic_fallback_functional_tools;
+        snapshot.destructive_schema_exemptions = destructive_schema_exemptions;
+        snapshot.destructive_safe_contract_covered = destructive_schema_exempt_covered;
+        snapshot.security_guard_covered = security_guard_covered;
+        snapshot.outstanding_timed_out_workers = outstanding_timed_out_workers;
+        snapshot.timed_out_drain_complete = timed_out_drain_complete;
+        snapshot.registered_total = registered_total;
+        snapshot.external = registered_external;
+        snapshot.internal = registered_internal;
+        snapshot.ide_chat_only = registered_ide_chat;
+        snapshot.ai_excluded = skipped_ai;
+        snapshot.non_ai_audited = non_ai_audited;
+        store_mcp_audit_snapshot(snapshot);
+
+        log_msg(hf, tag, "DIAG -- registry total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_tools=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d security_guard_covered=%d schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d expected_empty_nonfunctional_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d diagnostic_fallback_tools=%d diagnostic_fallback_functional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d explicit_invocations=%zu strict_safe_contract_proof=1 destructive_schema_expected=%d destructive_schema_ok=%d",
             registered_total,
             registered_external,
             registered_internal,
@@ -18828,23 +19312,27 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             expected_empty_nonfunctional_tools,
             empty_result_suspect_tools,
             unexpected_zero_pass_tools,
+            diagnostic_fallback_tools,
+            diagnostic_fallback_functional_tools,
             outstanding_timed_out_workers,
             timed_out_drain_complete ? 1 : 0,
-            g_invoked_tools.size());
+            g_invoked_tools.size(),
+            k_expected_destructive_schema_only_exemptions,
+            destructive_schema_accounting_ok ? 1 : 0);
 
-        if (missing == 0 && stale == 0 && no_pass == 0 && failed_tools == 0 && mixed_fail_tools == 0 && skipped_tools == 0 && timed_out_tools == 0 && dependency_blocked_tools == 0 && cascade_blocked_tools == 0 && expected_empty_nonfunctional_tools == 0 && empty_result_suspect_tools == 0 && unexpected_zero_pass_tools == 0 && outstanding_timed_out_workers == 0 && timed_out_drain_complete) {
-            log_msg(hf, tag, "PASS -- attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d accepted_pending_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_safe_contract_proof=1",
-                attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, accepted_pending_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers,
+        if (audit_clean) {
+            log_msg(hf, tag, "PASS -- attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d accepted_pending_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d diagnostic_fallback_tools=%d diagnostic_fallback_functional_tools=%d outstanding_timed_out_workers=%zu registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_safe_contract_proof=1",
+                attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, accepted_pending_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, diagnostic_fallback_tools, diagnostic_fallback_functional_tools, outstanding_timed_out_workers,
                 registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions);
             passed.fetch_add(1);
         } else {
-            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d accepted_pending_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d strict_functional_coverage=1 strict_safe_contract_proof=1",
-                missing, stale, attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, accepted_pending_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, outstanding_timed_out_workers, timed_out_drain_complete ? 1 : 0,
-                registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions);
+            log_msg(hf, tag, "FAIL -- missing=%d stale=%d attempted=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d covered_total=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d skipped_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d accepted_pending_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d diagnostic_fallback_tools=%d diagnostic_fallback_functional_tools=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d registered_total=%d external=%d internal=%d ide_chat_only=%d ai_excluded=%d non_ai_audited=%d destructive_schema_exemptions=%d destructive_schema_expected=%d destructive_schema_ok=%d strict_functional_coverage=1 strict_safe_contract_proof=1",
+                missing, stale, attempted, passed_tools, destructive_schema_exempt_covered, security_guard_covered, covered, no_pass, failed_tools, mixed_fail_tools, skipped_tools, timed_out_tools, dependency_blocked_tools, cascade_blocked_tools, accepted_pending_tools, empty_result_suspect_tools, unexpected_zero_pass_tools, expected_empty_nonfunctional_tools, diagnostic_fallback_tools, diagnostic_fallback_functional_tools, outstanding_timed_out_workers, timed_out_drain_complete ? 1 : 0,
+                registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions, k_expected_destructive_schema_only_exemptions, destructive_schema_accounting_ok ? 1 : 0);
             failed.fetch_add(1);
         }
         const auto cq_end = critical_work_queue::stats();
-        log_msg(hf, tag, "END -- missing=%d stale=%d no_functional_pass=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d failed_tools=%d mixed_fail_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d timed_out_tools=%d outstanding_timed_out_workers=%zu schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d strict_safe_contract_proof=1 pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+        log_msg(hf, tag, "END -- missing=%d stale=%d no_functional_pass=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d failed_tools=%d mixed_fail_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d diagnostic_fallback_tools=%d diagnostic_fallback_functional_tools=%d timed_out_tools=%d outstanding_timed_out_workers=%zu schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d strict_safe_contract_proof=1 pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             missing,
             stale,
             no_pass,
@@ -18858,6 +19346,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             empty_result_suspect_tools,
             unexpected_zero_pass_tools,
             expected_empty_nonfunctional_tools,
+            diagnostic_fallback_tools,
+            diagnostic_fallback_functional_tools,
             timed_out_tools,
             outstanding_timed_out_workers,
             schema_pass_tools,
@@ -23806,6 +24296,18 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
     }
 
     void test_tool_network_capture_manage_stop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const bool fixture_ready = ensure_burp_http_fixture(hf, "mcp.network_capture_manage.stop");
+        bool stimulus_sent = false;
+        if (fixture_ready) {
+            const auto payload = mcp_http_fixture_request_payload("/aida-network-stop-fixture");
+            stimulus_sent = send_burp_fixture_tcp_payload(hf, "mcp.network_capture_manage.stop", payload);
+            Sleep(150);
+        }
+        log_msg(hf, "mcp.network_capture_manage.stop", "CAPTURE-STOP-STIMULUS -- fixture_ready=%d sent=%d port=%u active_pid=%u capture_action=stop stimulus_path=/aida-network-stop-fixture",
+            fixture_ready ? 1 : 0,
+            stimulus_sent ? 1 : 0,
+            g_burp_http_fixture ? g_burp_http_fixture->port : 0,
+            driver_bridge::attached_pid());
         mcp_standalone::json args;
         args[k_test_lab_safe_fixture_flag] = true;
         test_tool_action_call(hf, "mcp.network_capture_manage.stop", "network_capture_manage", "stop", args, passed, failed, skipped);
@@ -24304,18 +24806,25 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
             const bool match_count_ok = require_positive_rule_match_count_from_list(hf, "mcp.network_redirect_manage.list",
                 "network_redirect_manage", g_network_redirect_rule_id, result, passed, failed);
             if (match_count_ok && !redirect_diag.delivered) {
-                log_msg(hf, "mcp.network_redirect_manage.list", "kernel_redirect_chain_dump rule_id=%llu match_port=%u redirect_port=%u kernel_match_count_before=%llu kernel_match_count_after=%llu attempts=%d connect_rc=%d connect_err=%d so_connect=%d list_payload=%s",
+                log_msg(hf, "mcp.network_redirect_manage.list", "kernel_redirect_chain_dump rule_id=%llu match_port=%u redirect_port=%u kernel_match_count_before=%llu kernel_match_count_after=%llu stimulus_rule_before_found=%d stimulus_rule_after_found=%d stimulus_rule_match_before=%u stimulus_rule_match_after=%u stimulus_rule_protocol=%u stimulus_rule_match_port=%u stimulus_rule_redirect_port=%u attempts=%d connect_rc=%d connect_err=%d so_connect=%d list_payload=%s",
                     static_cast<unsigned long long>(g_network_redirect_rule_id),
                     static_cast<unsigned>(g_network_redirect_match_port),
                     static_cast<unsigned>(g_network_redirect_rule_port),
                     static_cast<unsigned long long>(before_probe.match_count),
                     static_cast<unsigned long long>(after_probe.match_count),
+                    redirect_diag.rule_before_found ? 1 : 0,
+                    redirect_diag.rule_after_found ? 1 : 0,
+                    redirect_diag.rule_match_count_before,
+                    redirect_diag.rule_match_count_after,
+                    redirect_diag.rule_protocol,
+                    redirect_diag.rule_match_port,
+                    redirect_diag.rule_redirect_port,
                     redirect_diag.attempts,
                     redirect_diag.connect_rc,
                     redirect_diag.connect_error,
                     redirect_diag.so_error_after_connect,
                     compact_json(result.data, 1400).c_str());
-                log_msg(hf, "mcp.network_redirect_manage.list", "FIXTURE-REDIRECT-PATH-FAILURE -- kernel_match_count_positive=1 delivery_proven=0 rule_id=%llu match_port=%u redirect_port=%u before_found=%d before_match=%llu after_found=%d after_match=%llu attempts=%d sent=%d response_len=%zu requests_before=%llu requests_after=%llu request_delta=%lld accepts_before=%llu accepts_after=%llu accept_delta=%lld connect_rc=%d connect_err=%d so_connect=%d send_rc=%d send_err=%d so_send=%d recv_rc=%d recv_err=%d so_recv=%d data=%s",
+                log_msg(hf, "mcp.network_redirect_manage.list", "FIXTURE-REDIRECT-PATH-FAILURE -- kernel_match_count_positive=1 delivery_proven=0 rule_id=%llu match_port=%u redirect_port=%u before_found=%d before_match=%llu after_found=%d after_match=%llu stimulus_rule_before_found=%d stimulus_rule_after_found=%d stimulus_rule_match_before=%u stimulus_rule_match_after=%u stimulus_rule_match_delta=%d attempts=%d sent=%d response_len=%zu requests_before=%llu requests_after=%llu request_delta=%lld accepts_before=%llu accepts_after=%llu accept_delta=%lld connect_rc=%d connect_err=%d so_connect=%d send_rc=%d send_err=%d so_send=%d recv_rc=%d recv_err=%d so_recv=%d data=%s",
                     static_cast<unsigned long long>(g_network_redirect_rule_id),
                     static_cast<unsigned>(g_network_redirect_match_port),
                     static_cast<unsigned>(g_network_redirect_rule_port),
@@ -24323,6 +24832,11 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                     static_cast<unsigned long long>(before_probe.match_count),
                     after_probe.match_count_found ? 1 : 0,
                     static_cast<unsigned long long>(after_probe.match_count),
+                    redirect_diag.rule_before_found ? 1 : 0,
+                    redirect_diag.rule_after_found ? 1 : 0,
+                    redirect_diag.rule_match_count_before,
+                    redirect_diag.rule_match_count_after,
+                    static_cast<int>(redirect_diag.rule_match_count_after) - static_cast<int>(redirect_diag.rule_match_count_before),
                     redirect_diag.attempts,
                     redirect_diag.sent ? 1 : 0,
                     redirect_diag.response_len,
@@ -25554,7 +26068,41 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
     }
 
     void test_tool_tls_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_action_call(hf, "mcp.tls_manage.extract_keys", "tls_manage", "extract_keys", {}, passed, failed, skipped);
+        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.tls_manage.extract_keys", g_mcp_scanner_addr, 4096, {0x54, 0x4C, 0x53, 0x4B})) {
+            record_fixture_failed_tool("tls_manage", failed);
+            return;
+        }
+        const std::string key_line =
+            "CLIENT_RANDOM "
+            "89ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01234567 "
+            "D13F59A7C2E48B6D90F1A3C5E7B9D20416385A7C9EB0D2F416385A7C9EB0D2F4";
+        std::vector<uint8_t> bytes(key_line.begin(), key_line.end());
+        bytes.push_back(0);
+        if (!driver_bridge::write_memory(g_mcp_scanner_addr, bytes)) {
+            log_msg(hf, "mcp.tls_manage.extract_keys", "FAIL -- could not seed TLS key fixture addr=0x%016llX",
+                static_cast<unsigned long long>(g_mcp_scanner_addr));
+            record_tool_status("tls_manage", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        mcp_standalone::json args;
+        args["pid"] = driver_bridge::attached_pid();
+        args["hint_address"] = hex_u64(g_mcp_scanner_addr);
+        args["hint_size"] = static_cast<uint64_t>(bytes.size());
+        args["hint_only"] = true;
+        args["max_results"] = 1u;
+        args["timeout_ms"] = 2500u;
+        args["scan_schannel"] = false;
+        args["scan_openssl"] = false;
+        args["scan_nss"] = false;
+        args["scan_boringssl"] = false;
+        args["scan_generic"] = true;
+        args["scan_tls13_structures"] = false;
+        log_msg(hf, "mcp.tls_manage.extract_keys", "KEY-FIXTURE -- seeded addr=0x%016llX bytes=%zu pid=%u timeout_ms=2500 max_results=1",
+            static_cast<unsigned long long>(g_mcp_scanner_addr),
+            bytes.size(),
+            driver_bridge::attached_pid());
+        test_tool_action_call(hf, "mcp.tls_manage.extract_keys", "tls_manage", "extract_keys", args, passed, failed, skipped);
     }
 
     void test_tool_tls_manage_start_keylog(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -25569,6 +26117,15 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         args["output_file"] = temp_file_narrow("aida_mcp_tls_keylog_test.keys");
         args["poll_interval_ms"] = 100u;
         args["append"] = false;
+        args["scan_timeout_ms"] = 250u;
+        args["stop_wait_ms"] = 250u;
+        args["max_results"] = 1u;
+        args["scan_schannel"] = false;
+        args["scan_openssl"] = false;
+        args["scan_nss"] = false;
+        args["scan_boringssl"] = false;
+        args["scan_generic"] = false;
+        args["scan_tls13_structures"] = false;
         test_tool_action_call(hf, "mcp.tls_manage.start_keylog", "tls_manage", "start_keylog", args, passed, failed, skipped);
     }
 
@@ -25788,6 +26345,11 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         }
         mcp_standalone::json args;
         args["pid"] = driver_bridge::attached_pid();
+        args["hint_address"] = hex_u64(g_mcp_scanner_addr);
+        args["hint_size"] = static_cast<uint64_t>(bytes.size());
+        args["hint_only"] = true;
+        args["max_results"] = 1u;
+        args["timeout_ms"] = 2500u;
         test_tool_action_call(hf, "mcp.quic_manage.extract_keys", "quic_manage", "extract_keys", args, passed, failed, skipped);
     }
 
@@ -25826,7 +26388,48 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
     }
 
     void test_tool_dtls_manage_extract_keys(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        test_tool_action_call(hf, "mcp.dtls_manage.extract_keys", "dtls_manage", "extract_keys", {}, passed, failed, skipped);
+        if (g_mcp_scanner_addr == 0 && !ensure_mcp_private_bytes(hf, "mcp.dtls_manage.extract_keys", g_mcp_scanner_addr, 4096, {0x44, 0x54, 0x4C, 0x53})) {
+            record_fixture_failed_tool("dtls_manage", failed);
+            return;
+        }
+        std::vector<uint8_t> bytes(160, 0);
+        const uint8_t client_random[32] = {
+            0x8A, 0xF3, 0x10, 0x6D, 0x36, 0xFC, 0x8F, 0xC3,
+            0xF2, 0x33, 0xCA, 0xBB, 0x6F, 0x13, 0xE0, 0x54,
+            0x63, 0xA5, 0x14, 0x1F, 0x08, 0x42, 0xD8, 0x9C,
+            0x38, 0x4F, 0x18, 0xFB, 0x3B, 0x2D, 0x56, 0xAA
+        };
+        const uint8_t master_secret[48] = {
+            0x7C, 0x21, 0xD4, 0x9B, 0x11, 0xE7, 0x5A, 0xC8,
+            0x30, 0xF2, 0x6E, 0xBD, 0x94, 0x43, 0x18, 0xAF,
+            0x02, 0xD9, 0x71, 0x56, 0xEA, 0x3C, 0x85, 0x40,
+            0xB7, 0x1D, 0x69, 0xF0, 0x24, 0xCE, 0x8B, 0x35,
+            0xA9, 0x50, 0x6C, 0x13, 0xDF, 0x82, 0x47, 0xB0,
+            0x2A, 0xF5, 0x99, 0x1E, 0x64, 0xC1, 0x0D, 0x73
+        };
+        std::copy(client_random, client_random + sizeof(client_random), bytes.begin() + 32);
+        std::copy(master_secret, master_secret + sizeof(master_secret), bytes.begin() + 64);
+        bytes[96] = 0xFE;
+        bytes[97] = 0xFD;
+        if (!driver_bridge::write_memory(g_mcp_scanner_addr, bytes)) {
+            log_msg(hf, "mcp.dtls_manage.extract_keys", "FAIL -- could not seed DTLS key fixture addr=0x%016llX",
+                static_cast<unsigned long long>(g_mcp_scanner_addr));
+            record_tool_status("dtls_manage", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+        mcp_standalone::json args;
+        args["pid"] = driver_bridge::attached_pid();
+        args["hint_address"] = hex_u64(g_mcp_scanner_addr);
+        args["hint_size"] = static_cast<uint64_t>(bytes.size());
+        args["hint_only"] = true;
+        args["max_results"] = 1u;
+        args["timeout_ms"] = 2500u;
+        log_msg(hf, "mcp.dtls_manage.extract_keys", "KEY-FIXTURE -- seeded addr=0x%016llX bytes=%zu pid=%u timeout_ms=2500 max_results=1",
+            static_cast<unsigned long long>(g_mcp_scanner_addr),
+            bytes.size(),
+            driver_bridge::attached_pid());
+        test_tool_action_call(hf, "mcp.dtls_manage.extract_keys", "dtls_manage", "extract_keys", args, passed, failed, skipped);
     }
 
     void test_tool_autoresponder_manage_add_rule(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -26336,6 +26939,7 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         args["pcap_path"] = pcap_path;
         args["keylog_path"] = keylog_path;
         args["display_filter"] = "http2";
+        args["timeout_ms"] = 12500u;
         g_invoked_tools.insert(tool_name);
         auto timed = invoke_tool_bounded(get_server(), tool_name, args, tool_timeout_ms(tool_name));
         const auto& ir = timed.result;
@@ -26373,6 +26977,22 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
                     " searched_paths=" + tshark_paths +
                     " text=" + compact_text(ir.text, 900),
                 failed);
+            return;
+        }
+        bool dependency_slow = false;
+        payload_bool_field(ir.data, "dependency_slow", dependency_slow);
+        if (dependency_slow) {
+            uint64_t elapsed_ms = 0;
+            uint64_t timeout_ms = 0;
+            payload_u64_field(ir.data, "elapsed_ms", elapsed_ms);
+            payload_u64_field(ir.data, "timeout_ms", timeout_ms);
+            record_dependency_blocked_tool_with_blocker(hf, tag, tool_name,
+                std::string("network_decrypt_capture dependency_slow=1 elapsed_ms=") + std::to_string(elapsed_ms) +
+                    " timeout_ms=" + std::to_string(timeout_ms) +
+                    " pcap_size=" + std::to_string(static_cast<unsigned long long>(pcap_size)) +
+                    " keylog_size=" + std::to_string(static_cast<unsigned long long>(keylog_size)) +
+                    " text=" + compact_text(ir.text, 900),
+                "tshark", "", "network_decrypt_capture_tshark_deadline", failed);
             return;
         }
         if (text_lc.find("tshark not found") != std::string::npos ||
@@ -31054,6 +31674,85 @@ void test_tool_burp_scanner_manage_start_audit(HANDLE hf, std::atomic<int>& pass
     }
 
 }
+
+std::string mcp_coverage_final_summary_line() {
+    mcp_coverage_audit_snapshot_t snapshot;
+    {
+        std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
+        snapshot = g_mcp_last_audit_snapshot;
+    }
+    char buf[2048];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "MCP_AUDIT clean=%d suspect=%d started=%d completed=%d missing=%d stale=%d no_functional_pass=%d failed_tools=%d mixed_fail_tools=%d timed_out_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d MCP_EXPECTED_EMPTY_NONFUNCTIONAL=%d MCP_ZERO_RESULT_SUSPECT=%d MCP_DIAGNOSTIC_FALLBACK=%d MCP_DIAGNOSTIC_FALLBACK_FUNCTIONAL=%d MCP_MISSING_NONEXEMPT=%d MCP_DEPENDENCY_BLOCKED_FUNCTIONAL=%d MCP_PHASE_REMAINING=%d outstanding_timed_out_workers=%zu timed_out_drain_complete=%d destructive_schema_exemptions=%d destructive_safe_contract_covered=%d destructive_schema_expected=%d registered_total=%d non_ai_audited=%d attempted=%d",
+        snapshot.audit_clean ? 1 : 0,
+        snapshot.suspect_count(),
+        snapshot.audit_started ? 1 : 0,
+        snapshot.audit_completed ? 1 : 0,
+        snapshot.missing,
+        snapshot.stale,
+        snapshot.no_functional_pass,
+        snapshot.failed_tools,
+        snapshot.mixed_fail_tools,
+        snapshot.timed_out_tools,
+        snapshot.dependency_blocked_tools,
+        snapshot.cascade_blocked_tools,
+        snapshot.expected_empty_nonfunctional_tools,
+        snapshot.empty_result_suspect_tools,
+        snapshot.diagnostic_fallback_tools,
+        snapshot.diagnostic_fallback_functional_tools,
+        snapshot.missing,
+        snapshot.dependency_blocked_tools,
+        snapshot.phase_remaining,
+        snapshot.outstanding_timed_out_workers,
+        snapshot.timed_out_drain_complete ? 1 : 0,
+        snapshot.destructive_schema_exemptions,
+        snapshot.destructive_safe_contract_covered,
+        k_expected_destructive_schema_only_exemptions,
+        snapshot.registered_total,
+        snapshot.non_ai_audited,
+        snapshot.attempted);
+    return std::string(buf);
+}
+
+int mcp_coverage_suspect_count() {
+    std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
+    return g_mcp_last_audit_snapshot.suspect_count();
+}
+
+void log_mcp_phase_remaining_diagnostics(HANDLE hf, int phase_remaining) {
+    mcp_coverage_audit_snapshot_t snapshot;
+    std::vector<mcp_phase_gap_t> gaps;
+    {
+        std::lock_guard<std::mutex> lk(g_mcp_audit_snapshot_mtx);
+        snapshot = g_mcp_last_audit_snapshot;
+        gaps = g_mcp_last_phase_gaps;
+    }
+    const int effective_remaining = phase_remaining > 0 ? phase_remaining : snapshot.phase_remaining;
+    log_msg(hf, "summary", "MCP-PHASE-REMAINING -- remaining=%d audit_gap_count=%zu audit_clean=%d audit_started=%d audit_completed=%d missing=%d no_functional_pass=%d expected_empty_nonfunctional=%d diagnostic_fallback=%d timed_out=%d outstanding=%zu",
+        effective_remaining,
+        gaps.size(),
+        snapshot.audit_clean ? 1 : 0,
+        snapshot.audit_started ? 1 : 0,
+        snapshot.audit_completed ? 1 : 0,
+        snapshot.missing,
+        snapshot.no_functional_pass,
+        snapshot.expected_empty_nonfunctional_tools,
+        snapshot.diagnostic_fallback_tools,
+        snapshot.timed_out_tools,
+        snapshot.outstanding_timed_out_workers);
+    if (gaps.empty()) {
+        log_msg(hf, "summary", "MCP-PHASE-REMAINING-CASE -- index=0 case_id=\"mcp_audit.no_gap_records\" tool=\"mcp_phase\" reason=audit did not provide terminal gap records");
+        return;
+    }
+    for (std::size_t i = 0; i < gaps.size(); ++i) {
+        log_msg(hf, "summary", "MCP-PHASE-REMAINING-CASE -- index=%zu case_id=\"%s\" tool=\"%s\" reason=%s",
+            i + 1,
+            gaps[i].case_id.c_str(),
+            gaps[i].tool.c_str(),
+            compact_text(gaps[i].reason, 900).c_str());
+    }
+}
+
 void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& global_skipped, bool(*cancelled)()) {
     g_mcp_cancelled_fn = cancelled;
     const char* phase_tag = "mcp_phase";
@@ -31114,6 +31813,9 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     g_mcp_expected_empty_reasons.clear();
     g_mcp_nonfunctional_contract_reasons.clear();
     g_mcp_functional_capture_reasons.clear();
+    g_mcp_diagnostic_fallback_tools.clear();
+    g_mcp_diagnostic_fallback_reasons.clear();
+    reset_mcp_audit_snapshot();
     {
         std::lock_guard<std::mutex> lk(g_timed_out_invocations_mtx);
         g_timed_out_invocations.clear();
@@ -31802,6 +32504,16 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
             g_invoked_tools.size());
     }
     delta_failed = failed.load(std::memory_order_acquire) - start_failed;
+    const int phase_completed = delta_passed + delta_failed + delta_skipped;
+    update_mcp_phase_completion_snapshot(phase_completed);
+    if (k_mcp_planned_tool_tests > phase_completed) {
+        log_msg(hf, "mcp_phase", "MCP_PHASE_REMAINING -- planned=%d completed=%d remaining=%d audit_summary=\"%s\"",
+            k_mcp_planned_tool_tests,
+            phase_completed,
+            k_mcp_planned_tool_tests - phase_completed,
+            mcp_coverage_final_summary_line().c_str());
+        log_mcp_phase_remaining_diagnostics(hf, k_mcp_planned_tool_tests - phase_completed);
+    }
     log_msg(hf, "mcp.phase_accounting", "registered_tool_records=%zu explicit_invocations=%zu pass_delta=%d fail_delta=%d skip_delta=%d",
         g_tool_attempt_stats.size(), g_invoked_tools.size(), delta_passed, delta_failed, delta_skipped);
     set_progress_step("mcp complete");

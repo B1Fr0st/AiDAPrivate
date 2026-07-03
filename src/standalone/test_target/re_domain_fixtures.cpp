@@ -103,6 +103,41 @@ std::atomic<bool> g_local_running{false};
 std::uint64_t g_dx_static_slot_accumulator = 0;
 volatile std::uint64_t g_analysis_sink = 0;
 
+struct struct_mutation_diag_t {
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    std::uint32_t size = 0;
+    std::uint32_t call_count = 0;
+    std::uint32_t last_index = 0;
+    std::uint32_t last_delta = 0;
+    std::uint32_t struct_count = 0;
+    std::uint32_t struct_size = 0;
+    std::uint64_t struct_array_va = 0;
+    std::uint64_t selected_struct_va = 0;
+    std::uint64_t result_va = 0;
+    std::uint64_t before_hash = 0;
+    std::uint64_t after_hash = 0;
+    std::uint32_t null_array = 0;
+    std::uint32_t out_of_range = 0;
+    std::uint32_t last_error_code = 0;
+    std::uint32_t reserved = 0;
+};
+
+struct_mutation_diag_t g_struct_mutation_diag{};
+
+std::uint64_t hash_struct_bytes(const fixture_struct_t* value) noexcept
+{
+    if (!value)
+        return 0;
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(value);
+    std::uint64_t hash = 1469598103934665603ull;
+    for (std::size_t i = 0; i < sizeof(fixture_struct_t); ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
 const char* g_dx_static_slot_names[kDxStaticSlotCount] = {
     "VSSetConstantBuffers",
     "DrawIndexed",
@@ -426,6 +461,8 @@ void update_descriptor()
     aida_test_re_descriptor.analysis_callgraph_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_callgraph);
     aida_test_re_descriptor.analysis_dispatch_fn_va = reinterpret_cast<std::uint64_t>(&aida_test_re_analysis_dispatch);
     aida_test_re_descriptor.analysis_export_count = 3;
+    aida_test_re_descriptor.reserved[0] = reinterpret_cast<std::uint64_t>(&g_struct_mutation_diag);
+    aida_test_re_descriptor.reserved[1] = sizeof(g_struct_mutation_diag);
     update_analysis_range_fields();
 }
 
@@ -574,16 +611,42 @@ std::uint64_t heap_burst_impl(std::uint32_t count, std::uint32_t payload_size) n
 
 std::uint64_t mutate_struct_impl(std::uint32_t index, std::uint32_t delta) noexcept
 {
-    if (!g_struct_array || index >= kStructCount)
+    g_struct_mutation_diag.magic = 0xA1DA5701u;
+    g_struct_mutation_diag.version = 1;
+    g_struct_mutation_diag.size = sizeof(g_struct_mutation_diag);
+    ++g_struct_mutation_diag.call_count;
+    g_struct_mutation_diag.last_index = index;
+    g_struct_mutation_diag.last_delta = delta;
+    g_struct_mutation_diag.struct_count = kStructCount;
+    g_struct_mutation_diag.struct_size = sizeof(fixture_struct_t);
+    g_struct_mutation_diag.struct_array_va = reinterpret_cast<std::uint64_t>(g_struct_array);
+    g_struct_mutation_diag.selected_struct_va = 0;
+    g_struct_mutation_diag.result_va = 0;
+    g_struct_mutation_diag.before_hash = 0;
+    g_struct_mutation_diag.after_hash = 0;
+    g_struct_mutation_diag.null_array = g_struct_array ? 0u : 1u;
+    g_struct_mutation_diag.out_of_range = index >= kStructCount ? 1u : 0u;
+    g_struct_mutation_diag.last_error_code = 0;
+    if (!g_struct_array) {
+        g_struct_mutation_diag.last_error_code = 1;
         return 0;
+    }
+    if (index >= kStructCount) {
+        g_struct_mutation_diag.last_error_code = 2;
+        return 0;
+    }
 
     fixture_struct_t& s = g_struct_array[index];
+    g_struct_mutation_diag.selected_struct_va = reinterpret_cast<std::uint64_t>(&s);
+    g_struct_mutation_diag.before_hash = hash_struct_bytes(&s);
     s.health += delta;
     s.armor ^= (delta << 1u) | 1u;
     s.position[0] += static_cast<float>(delta);
     s.position[1] += static_cast<float>(delta % 17u);
     s.position[2] += static_cast<float>(delta % 23u);
     s.link = reinterpret_cast<std::uint64_t>(&g_struct_array[(index + 1u) % kStructCount]);
+    g_struct_mutation_diag.after_hash = hash_struct_bytes(&s);
+    g_struct_mutation_diag.result_va = reinterpret_cast<std::uint64_t>(&s);
     return reinterpret_cast<std::uint64_t>(&s);
 }
 

@@ -3274,14 +3274,87 @@ inline tool_result_t cff_recover_cfg(const json& params)
         return tool_result_t::error("address is required");
     const std::uint32_t pid = requested_pid(params);
     const std::uint32_t size = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "size").value_or(0x10000)), 0x100, 0x20000);
-    auto insns = disassemble_target(pid, *address, size, 8192);
+    const ULONGLONG started = GetTickCount64();
+    auto capped_param = [&](const char* key, std::uint64_t fallback, std::uint64_t lo, std::uint64_t hi) -> std::uint64_t {
+        return std::clamp<std::uint64_t>(parse_param_u64(params, key).value_or(fallback), lo, hi);
+    };
+    const std::uint32_t max_instructions = static_cast<std::uint32_t>(capped_param("max_instructions", 512, 32, 8192));
+    const std::size_t max_blocks = static_cast<std::size_t>(capped_param("max_blocks", 64, 1, 1024));
+    const std::size_t max_edges = static_cast<std::size_t>(capped_param("max_edges", 128, 1, 4096));
+    const std::size_t max_il_per_block = static_cast<std::size_t>(capped_param("max_il_per_block", 8, 0, 64));
+    const std::size_t max_serialized_instructions = static_cast<std::size_t>(capped_param("max_serialized_instructions", 128, 0, 4096));
+    const std::size_t max_state_writes_per_block = static_cast<std::size_t>(capped_param("max_state_writes_per_block", 16, 0, 256));
+    const std::uint64_t timeout_ms = capped_param("timeout_ms", 3000, 250, 60000);
+    const std::uint64_t local_deadline = started > std::numeric_limits<std::uint64_t>::max() - timeout_ms ? std::numeric_limits<std::uint64_t>::max() : started + timeout_ms;
+    const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+    bool cancelled = false;
+    bool deadline_hit = false;
+    bool result_truncated = false;
+    std::string stop_phase;
+    auto remaining_ms = [&]() -> std::uint64_t {
+        const std::uint64_t now = GetTickCount64();
+        std::uint64_t deadline = local_deadline;
+        if (call_deadline != 0)
+            deadline = std::min<std::uint64_t>(deadline, call_deadline);
+        return deadline > now ? deadline - now : 0;
+    };
+    auto stop_requested = [&](const char* phase) -> bool {
+        if (cancelled || deadline_hit)
+            return true;
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            stop_phase = phase ? phase : "";
+        }
+        else
+        {
+            const std::uint64_t now = GetTickCount64();
+            if (now >= local_deadline || (call_deadline != 0 && now >= call_deadline))
+            {
+                deadline_hit = true;
+                stop_phase = phase ? phase : "";
+            }
+        }
+        return cancelled || deadline_hit;
+    };
+    diag::log_tagged_fmt("protected_re",
+                         "cff_recover_cfg enter pid=%u address=%s size=%u max_instructions=%u max_blocks=%zu max_edges=%zu timeout_ms=%llu",
+                         pid,
+                         sa_format_address(*address).c_str(),
+                         size,
+                         max_instructions,
+                         max_blocks,
+                         max_edges,
+                         static_cast<unsigned long long>(timeout_ms));
+    const ULONGLONG decode_started = GetTickCount64();
+    auto insns = disassemble_target(pid, *address, size, max_instructions);
+    const ULONGLONG decode_elapsed = GetTickCount64() - decode_started;
+    if (insns.size() >= max_instructions)
+        result_truncated = true;
     auto blocks = build_blocks(insns);
-    json detection = detect_flattening(pid, *address, size);
+    const std::size_t total_block_count = blocks.size();
+    const std::size_t block_limit = std::min<std::size_t>(blocks.size(), max_blocks);
+    if (blocks.size() > block_limit)
+        result_truncated = true;
+    json detection = stop_requested("before_detection") ? json::object() : detect_flattening(pid, *address, size);
+    if (detection.contains("blocks") && detection["blocks"].is_array() && detection["blocks"].size() > max_blocks)
+    {
+        json limited = json::array();
+        for (std::size_t i = 0; i < detection["blocks"].size() && i < max_blocks; ++i)
+            limited.push_back(detection["blocks"][i]);
+        detection["blocks"] = std::move(limited);
+        detection["blocks_truncated"] = true;
+        detection["blocks_returned"] = detection["blocks"].size();
+        result_truncated = true;
+    }
     std::string state_key = params.value("state_var_hint", std::string());
     if (state_key.empty())
         state_key = detection.value("state_variable", std::string("unknown"));
     std::map<std::uint64_t, int> state_to_block;
-    for (const auto& b : blocks) {
+    for (std::size_t bi = 0; bi < block_limit; ++bi) {
+        if (stop_requested("state_index"))
+            break;
+        const auto& b = blocks[bi];
         for (const auto& ins : b.insns) {
             const std::string m = mnemonic_of(ins);
             auto ops = split_operands(ins.ops);
@@ -3293,9 +3366,17 @@ inline tool_result_t cff_recover_cfg(const json& params)
     }
     json recovered = json::array();
     json recovered_edges = json::array();
-    for (const auto& b : blocks) {
+    std::size_t serialized_instruction_count = 0;
+    std::size_t edges_considered = 0;
+    for (std::size_t bi = 0; bi < block_limit; ++bi) {
+        if (stop_requested("block_recovery"))
+            break;
+        const auto& b = blocks[bi];
         json rb;
         rb["id"] = b.id;
+        rb["start"] = sa_format_address(b.start);
+        rb["end"] = sa_format_address(b.end);
+        rb["instruction_count"] = b.insns.size();
         std::optional<std::uint64_t> state_in;
         json state_writes = json::array();
         for (const auto& ins : b.insns) {
@@ -3307,7 +3388,12 @@ inline tool_result_t cff_recover_cfg(const json& params)
             }
             if ((m == "mov" || m == "lea") && ops.size() >= 2 && cff_state_operand_key(ops[0]) == state_key) {
                 if (auto imm = immediate_operand_value(ops[1]))
-                    state_writes.push_back(json{{"write_va", sa_format_address(ins.addr)}, {"state_out", sa_format_address(*imm)}});
+                {
+                    if (state_writes.size() < max_state_writes_per_block)
+                        state_writes.push_back(json{{"write_va", sa_format_address(ins.addr)}, {"state_out", sa_format_address(*imm)}});
+                    else
+                        result_truncated = true;
+                }
             }
         }
         if (!state_in)
@@ -3321,12 +3407,16 @@ inline tool_result_t cff_recover_cfg(const json& params)
                 auto it = state_to_block.find(*v);
                 if (it != state_to_block.end()) {
                     outs.push_back(sa_format_address(*v));
-                    recovered_edges.push_back(json{{"from", b.id}, {"to", it->second}, {"state_value", sa_format_address(*v)}, {"proof", "state_write_to_dispatcher_case"}});
+                    ++edges_considered;
+                    if (recovered_edges.size() < max_edges)
+                        recovered_edges.push_back(json{{"from", b.id}, {"to", it->second}, {"state_value", sa_format_address(*v)}, {"proof", "state_write_to_dispatcher_case"}});
+                    else
+                        result_truncated = true;
                 }
             }
         }
         for (int sid : b.successors) {
-            if (sid >= 0 && sid < static_cast<int>(blocks.size())) {
+            if (sid >= 0 && sid < static_cast<int>(block_limit)) {
                 auto imm = first_immediate_in_block(blocks[static_cast<std::size_t>(sid)]);
                 const std::string out_state = imm ? sa_format_address(*imm) : sa_format_address(blocks[static_cast<std::size_t>(sid)].start);
                 bool present = false;
@@ -3338,21 +3428,35 @@ inline tool_result_t cff_recover_cfg(const json& params)
                 }
                 if (!present)
                     outs.push_back(out_state);
-                recovered_edges.push_back(json{{"from", b.id}, {"to", sid}, {"state_value", out_state}, {"proof", "native_cfg_edge"}});
+                ++edges_considered;
+                if (recovered_edges.size() < max_edges)
+                    recovered_edges.push_back(json{{"from", b.id}, {"to", sid}, {"state_value", out_state}, {"proof", "native_cfg_edge"}});
+                else
+                    result_truncated = true;
             }
         }
         rb["state_out"] = outs;
         json il = json::array();
         for (const auto& ins : b.insns)
+        {
+            if (il.size() >= max_il_per_block || serialized_instruction_count >= max_serialized_instructions)
+            {
+                result_truncated = true;
+                break;
+            }
             il.push_back(json{{"va", sa_format_address(ins.addr)}, {"op", ins.mnem}, {"operands", ins.ops}});
+            ++serialized_instruction_count;
+        }
         rb["il"] = il;
+        rb["il_truncated"] = il.size() < b.insns.size();
         recovered.push_back(std::move(rb));
     }
     std::ostringstream ps;
     ps << "void recovered_flattened_function(void) {\n";
     if (state_key != "unknown")
         ps << "uint64_t state = load_state(\"" << state_key << "\");\n";
-    for (const auto& b : blocks) {
+    for (std::size_t bi = 0; bi < block_limit; ++bi) {
+        const auto& b = blocks[bi];
         ps << "block_" << b.id << ":\n";
         bool emitted = false;
         for (const auto& e : recovered_edges) {
@@ -3362,19 +3466,79 @@ inline tool_result_t cff_recover_cfg(const json& params)
             emitted = true;
             break;
         }
-        if (!emitted && !b.successors.empty())
-            ps << "    goto block_" << b.successors.front() << ";\n";
+        if (!emitted)
+        {
+            for (int sid : b.successors)
+            {
+                if (sid >= 0 && sid < static_cast<int>(block_limit))
+                {
+                    ps << "    goto block_" << sid << ";\n";
+                    emitted = true;
+                    break;
+                }
+            }
+        }
     }
     ps << "}\n";
+    std::ostringstream dot;
+    dot << "digraph cff_recovered {\n";
+    for (std::size_t bi = 0; bi < block_limit; ++bi)
+    {
+        const auto& b = blocks[bi];
+        dot << "  n" << b.id << " [label=\"B" << b.id << "\\n" << sa_format_address(b.start) << "\"];\n";
+    }
+    for (const auto& e : recovered_edges)
+    {
+        if (!e.is_object())
+            continue;
+        dot << "  n" << e.value("from", -1) << " -> n" << e.value("to", -1) << ";\n";
+    }
+    dot << "}\n";
     json out;
     out["recovered_blocks"] = recovered;
     out["recovered_edges"] = recovered_edges;
-    out["cfg_dot"] = cfg_to_dot(blocks, "cff_recovered");
+    out["cfg_dot"] = dot.str();
     out["pseudocode"] = ps.str();
     out["detection"] = detection;
     out["confidence"] = detection.value("confidence", 0.0);
     out["state_variable"] = state_key;
     out["transition_count"] = recovered_edges.size();
+    out["transition_count_total_considered"] = edges_considered;
+    out["instruction_count_total_decoded"] = insns.size();
+    out["serialized_instruction_count"] = serialized_instruction_count;
+    out["block_count_total"] = total_block_count;
+    out["block_count_returned"] = recovered.size();
+    out["result_truncated"] = result_truncated;
+    out["deadline_hit"] = deadline_hit;
+    out["cancelled"] = cancelled;
+    out["partial"] = result_truncated || deadline_hit || cancelled;
+    out["stop_phase"] = stop_phase;
+    out["timeout_ms"] = timeout_ms;
+    out["deadline_remaining_ms"] = remaining_ms();
+    out["elapsed_ms"] = GetTickCount64() - started;
+    out["phase_timings"] = json{{"decode_elapsed_ms", decode_elapsed}};
+    out["caps"] = json{{"max_instructions", max_instructions},
+                       {"max_blocks", max_blocks},
+                       {"max_edges", max_edges},
+                       {"max_il_per_block", max_il_per_block},
+                       {"max_serialized_instructions", max_serialized_instructions},
+                       {"max_state_writes_per_block", max_state_writes_per_block}};
+    diag::log_tagged_fmt("protected_re",
+                         "cff_recover_cfg exit pid=%u blocks=%zu/%zu edges=%zu/%zu instructions=%zu truncated=%d deadline=%d cancelled=%d elapsed_ms=%llu",
+                         pid,
+                         recovered.size(),
+                         total_block_count,
+                         recovered_edges.size(),
+                         edges_considered,
+                         insns.size(),
+                         result_truncated ? 1 : 0,
+                         deadline_hit ? 1 : 0,
+                         cancelled ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started));
+    if (cancelled)
+        return tool_result_t::error("CFF CFG recovery cancelled.", out);
+    if (deadline_hit && recovered.empty())
+        return tool_result_t::error("CFF CFG recovery deadline reached before any block was recovered.", out);
     return tool_result_t::ok("Recovered CFG from flattened control flow evidence", out);
 }
 
@@ -6181,6 +6345,7 @@ inline tool_result_t drv_find_device_names(const json& params)
             return tool_result_t::error(err.empty() ? "No kernel modules found" : err);
     }
     const std::uint32_t max_modules = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(parse_param_u64(params, "max_modules").value_or(32)), 1, 128);
+    const std::uint64_t read_chunk_size = std::clamp<std::uint64_t>(parse_param_u64(params, "chunk_size").value_or(256ull * 1024ull), 0x1000ull, 1024ull * 1024ull);
     json found = json::array();
     auto partial_with_found = [&]() {
         json out = partial_payload();
@@ -6196,18 +6361,86 @@ inline tool_result_t drv_find_device_names(const json& params)
         json mod_diag{{"module", mod.name}, {"base", sa_format_address(mod.base)}, {"size", mod.size}};
         const std::uint64_t module_started_ms = GetTickCount64();
         const std::uint64_t scan_size = std::min<std::uint64_t>(mod.size ? mod.size : 0x200000, 16ull * 1024ull * 1024ull);
-        std::vector<std::uint8_t> bytes;
-        if (!read_target_memory(0, mod.base, static_cast<std::size_t>(scan_size), bytes) || bytes.size() < 16)
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(scan_size), 0);
+        std::uint64_t module_bytes_read = 0;
+        std::uint32_t chunks_attempted = 0;
+        std::uint32_t chunks_ok = 0;
+        std::uint32_t chunks_failed = 0;
+        bool chunk_short_read = false;
+        json chunk_diagnostics = json::array();
+        for (std::uint64_t off = 0; off < scan_size;) {
+            if (stop_requested("module_chunk_read"))
+            {
+                mod_diag["partial"] = true;
+                mod_diag["read_cancelled"] = cancelled;
+                mod_diag["deadline_hit"] = deadline_hit;
+                mod_diag["last_read_rva"] = off;
+                mod_diag["elapsed_ms"] = GetTickCount64() - module_started_ms;
+                mod_diag["bytes_read"] = module_bytes_read;
+                mod_diag["chunks_attempted"] = chunks_attempted;
+                mod_diag["chunks_ok"] = chunks_ok;
+                mod_diag["chunks_failed"] = chunks_failed;
+                mod_diag["chunk_size"] = read_chunk_size;
+                mod_diag["chunk_diagnostics"] = chunk_diagnostics;
+                bytes_scanned += module_bytes_read;
+                if (module_bytes_read >= 16)
+                    ++modules_scanned;
+                module_diagnostics.push_back(std::move(mod_diag));
+                return tool_result_t::error(cancelled ? "Driver device-name scan cancelled." : "Driver device-name scan deadline reached.", partial_with_found());
+            }
+            const std::uint64_t chunk_size_u64 = std::min<std::uint64_t>(read_chunk_size, scan_size - off);
+            std::vector<std::uint8_t> chunk;
+            const std::uint64_t chunk_started = GetTickCount64();
+            const bool chunk_ok = read_target_memory(0, mod.base + off, static_cast<std::size_t>(chunk_size_u64), chunk) && !chunk.empty();
+            const std::uint64_t chunk_elapsed = GetTickCount64() - chunk_started;
+            ++chunks_attempted;
+            if (chunk_ok) {
+                ++chunks_ok;
+                const std::size_t copy_size = std::min<std::size_t>(chunk.size(), static_cast<std::size_t>(chunk_size_u64));
+                std::memcpy(bytes.data() + static_cast<std::size_t>(off), chunk.data(), copy_size);
+                module_bytes_read += copy_size;
+                if (copy_size < chunk_size_u64)
+                    chunk_short_read = true;
+            } else {
+                ++chunks_failed;
+            }
+            if (chunk_diagnostics.size() < 64) {
+                chunk_diagnostics.push_back(json{{"rva", off},
+                                                 {"va", sa_format_address(mod.base + off)},
+                                                 {"requested", chunk_size_u64},
+                                                 {"ok", chunk_ok},
+                                                 {"bytes", chunk.size()},
+                                                 {"elapsed_ms", chunk_elapsed}});
+            }
+            off += chunk_size_u64;
+        }
+        if (module_bytes_read < 16)
         {
             mod_diag["read_ok"] = false;
             mod_diag["elapsed_ms"] = GetTickCount64() - module_started_ms;
+            mod_diag["scan_size"] = scan_size;
+            mod_diag["chunk_size"] = read_chunk_size;
+            mod_diag["bytes_read"] = module_bytes_read;
+            mod_diag["chunks_attempted"] = chunks_attempted;
+            mod_diag["chunks_ok"] = chunks_ok;
+            mod_diag["chunks_failed"] = chunks_failed;
+            mod_diag["chunk_short_read"] = chunk_short_read;
+            mod_diag["chunk_diagnostics"] = chunk_diagnostics;
             module_diagnostics.push_back(std::move(mod_diag));
             continue;
         }
-        bytes_scanned += bytes.size();
+        bytes_scanned += module_bytes_read;
         ++modules_scanned;
         mod_diag["read_ok"] = true;
-        mod_diag["bytes_read"] = bytes.size();
+        mod_diag["scan_size"] = scan_size;
+        mod_diag["chunk_size"] = read_chunk_size;
+        mod_diag["bytes_read"] = module_bytes_read;
+        mod_diag["bytes_buffered"] = bytes.size();
+        mod_diag["chunks_attempted"] = chunks_attempted;
+        mod_diag["chunks_ok"] = chunks_ok;
+        mod_diag["chunks_failed"] = chunks_failed;
+        mod_diag["chunk_short_read"] = chunk_short_read;
+        mod_diag["chunk_diagnostics"] = chunk_diagnostics;
         pe_layout_t pe;
         const bool pe_ok = read_pe_layout(0, mod.base, pe);
         for (std::size_t i = 0; i + 16 < bytes.size(); i += 2) {
@@ -7352,19 +7585,80 @@ inline tool_result_t smc_find_decryptor(const json& params)
     const std::uint64_t max_u64 = std::numeric_limits<std::uint64_t>::max();
     const std::uint64_t end = *target > max_u64 - bounded_target_size ? max_u64 : *target + bounded_target_size;
     const ULONGLONG started = GetTickCount64();
+    auto capped_param = [&](const char* key, std::uint64_t fallback, std::uint64_t lo, std::uint64_t hi) -> std::uint64_t {
+        return std::clamp<std::uint64_t>(parse_param_u64(params, key).value_or(fallback), lo, hi);
+    };
+    const std::size_t max_candidates = static_cast<std::size_t>(capped_param("max_candidates", 8, 1, 64));
+    const std::size_t max_decision_samples = static_cast<std::size_t>(capped_param("max_decision_samples", 8, 0, 64));
+    const std::size_t max_backtrace_instructions = static_cast<std::size_t>(capped_param("max_backtrace_instructions", 4, 0, 16));
+    const std::size_t max_scan_ranges = static_cast<std::size_t>(capped_param("max_scan_ranges", 8, 1, 64));
+    const std::uint32_t max_decode_instructions = static_cast<std::uint32_t>(capped_param("max_instructions", 1024, 16, 65536));
+    const std::uint64_t timeout_ms = capped_param("timeout_ms", 3000, 250, 60000);
+    const std::uint64_t local_deadline = started > std::numeric_limits<std::uint64_t>::max() - timeout_ms ? std::numeric_limits<std::uint64_t>::max() : started + timeout_ms;
+    const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
     json candidates = json::array();
     json scan_ranges = json::array();
     json decision_samples = json::array();
     std::uint64_t scanned = 0;
+    std::uint64_t bytes_read_total = 0;
+    std::size_t candidates_considered = 0;
     bool cancelled = false;
+    bool deadline_hit = false;
+    bool result_truncated = false;
+    std::string stop_phase;
+    auto remaining_ms = [&]() -> std::uint64_t {
+        const std::uint64_t now = GetTickCount64();
+        std::uint64_t deadline = local_deadline;
+        if (call_deadline != 0)
+            deadline = std::min<std::uint64_t>(deadline, call_deadline);
+        return deadline > now ? deadline - now : 0;
+    };
+    auto stop_requested = [&](const char* phase) -> bool {
+        if (cancelled || deadline_hit)
+            return true;
+        if (mcp_standalone::current_call_cancelled())
+        {
+            cancelled = true;
+            stop_phase = phase ? phase : "";
+        }
+        else
+        {
+            const std::uint64_t now = GetTickCount64();
+            if (now >= local_deadline || (call_deadline != 0 && now >= call_deadline))
+            {
+                deadline_hit = true;
+                stop_phase = phase ? phase : "";
+            }
+        }
+        if (cancelled || deadline_hit)
+        {
+            diag::log_tagged_fmt("protected_re",
+                                 "smc_find_decryptor budget_exit phase=%s pid=%u cancelled=%d deadline=%d elapsed_ms=%llu remaining_ms=%llu",
+                                 stop_phase.c_str(),
+                                 pid,
+                                 cancelled ? 1 : 0,
+                                 deadline_hit ? 1 : 0,
+                                 static_cast<unsigned long long>(GetTickCount64() - started),
+                                 static_cast<unsigned long long>(remaining_ms()));
+            return true;
+        }
+        return false;
+    };
+    diag::log_tagged_fmt("protected_re",
+                         "smc_find_decryptor enter pid=%u target=%s target_size=%llu max_candidates=%zu max_decisions=%zu max_instructions=%u timeout_ms=%llu",
+                         pid,
+                         sa_format_address(*target).c_str(),
+                         static_cast<unsigned long long>(bounded_target_size),
+                         max_candidates,
+                         max_decision_samples,
+                         max_decode_instructions,
+                         static_cast<unsigned long long>(timeout_ms));
     auto target_contains = [&](std::uint64_t value) {
         return value >= *target && value < end;
     };
     auto scan_code_range = [&](std::uint64_t scan_base, std::uint32_t scan_size, const std::string& source) -> bool {
-        if (mcp_standalone::current_call_cancelled()) {
-            cancelled = true;
+        if (stop_requested("range_enter"))
             return false;
-        }
         const std::uint32_t requested_scan_size = scan_size;
         scan_size = std::clamp<std::uint32_t>(scan_size, 1, 0x100000);
         json range_diag;
@@ -7388,17 +7682,24 @@ inline tool_result_t smc_find_decryptor(const json& params)
         const bool raw_ok = read_target_memory(pid, scan_base, scan_size, raw);
         range_diag["read_ok"] = raw_ok;
         range_diag["bytes_read"] = raw.size();
+        bytes_read_total += raw.size();
         range_diag["marker_bytes_head"] = bytes_to_hex(raw, 64);
-        auto insns = raw_ok && !raw.empty() ? disassemble_linear_bytes(scan_base, raw, 65536) : disassemble_target(pid, scan_base, scan_size, 65536);
+        const ULONGLONG decode_started = GetTickCount64();
+        auto insns = raw_ok && !raw.empty() ? disassemble_linear_bytes(scan_base, raw, max_decode_instructions) : disassemble_target(pid, scan_base, scan_size, max_decode_instructions);
         range_diag["instructions_decoded"] = insns.size();
-        scan_ranges.push_back(std::move(range_diag));
+        range_diag["instruction_decode_cap"] = max_decode_instructions;
+        range_diag["decode_elapsed_ms"] = GetTickCount64() - decode_started;
+        if (insns.size() >= max_decode_instructions)
+            result_truncated = true;
+        if (scan_ranges.size() < max_scan_ranges)
+            scan_ranges.push_back(std::move(range_diag));
+        else
+            result_truncated = true;
         scanned += insns.size();
         std::map<std::string, std::uint64_t> reg_values;
         for (std::size_t ii = 0; ii < insns.size(); ++ii) {
-            if ((ii & 0x3FF) == 0 && mcp_standalone::current_call_cancelled()) {
-                cancelled = true;
+            if ((ii & 0xFF) == 0 && stop_requested("instruction_scan"))
                 return false;
-            }
             const auto& ins = insns[ii];
             const std::string mnem = mnemonic_of(ins);
             auto ops = split_operands(ins.ops);
@@ -7432,46 +7733,134 @@ inline tool_result_t smc_find_decryptor(const json& params)
                     chosen_source = "immediate_operand_value";
                 }
             }
-            json decision;
-            decision["instruction"] = instruction_to_json(ins);
-            decision["memory_write"] = memory_write;
-            decision["decoded_memory_ref"] = ref ? json(sa_format_address(ref)) : json(nullptr);
-            decision["decoded_memory_source"] = ref_source.empty() ? "none" : ref_source;
-            decision["operand_text_ref"] = operand_ref ? json(sa_format_address(operand_ref)) : json(nullptr);
-            decision["operand_text_source"] = operand_ref_source.empty() ? "none" : operand_ref_source;
-            decision["operand_text_evidence"] = operand_ref_evidence.is_null() ? json::object() : operand_ref_evidence;
-            decision["target_range"] = json{{"base", sa_format_address(*target)}, {"end", sa_format_address(end)}, {"size", bounded_target_size}};
-            decision["chosen_memory_target"] = chosen_ref ? json(sa_format_address(chosen_ref)) : json(nullptr);
-            decision["chosen_source"] = chosen_source.empty() ? "none" : chosen_source;
-            decision["matched_target_range"] = match;
-            decision["tracked_registers"] = reg_values.size();
-            if (decision_samples.size() < 32)
-                decision_samples.push_back(decision);
             if (!match)
                 continue;
+            ++candidates_considered;
+            json decision_summary;
+            decision_summary["memory_write"] = memory_write;
+            decision_summary["decoded_memory_ref"] = ref ? json(sa_format_address(ref)) : json(nullptr);
+            decision_summary["decoded_memory_source"] = ref_source.empty() ? "none" : ref_source;
+            decision_summary["operand_text_ref"] = operand_ref ? json(sa_format_address(operand_ref)) : json(nullptr);
+            decision_summary["operand_text_source"] = operand_ref_source.empty() ? "none" : operand_ref_source;
+            decision_summary["chosen_memory_target"] = chosen_ref ? json(sa_format_address(chosen_ref)) : json(nullptr);
+            decision_summary["chosen_source"] = chosen_source.empty() ? "none" : chosen_source;
+            decision_summary["matched_target_range"] = true;
+            decision_summary["tracked_registers"] = reg_values.size();
+            if (decision_samples.size() < max_decision_samples)
+            {
+                json decision = decision_summary;
+                decision["instruction"] = instruction_to_json(ins);
+                decision["operand_text_evidence"] = operand_ref_evidence.is_null() ? json::object() : operand_ref_evidence;
+                decision["target_range"] = json{{"base", sa_format_address(*target)}, {"end", sa_format_address(end)}, {"size", bounded_target_size}};
+                decision_samples.push_back(std::move(decision));
+            }
+            else
+            {
+                result_truncated = true;
+            }
             const std::size_t raw_offset = (ins.addr >= scan_base && ins.addr - scan_base < raw.size()) ? static_cast<std::size_t>(ins.addr - scan_base) : 0;
             const std::string marker_bytes = bytes_window_hex(raw, raw_offset, 16, 24);
             const std::uint64_t function_start = estimate_function_start_from_instruction_window(insns, ii, ins.addr);
-            json backtrace = backtrace_window_json(insns, ii, 12);
-            candidates.push_back(json{{"decryptor_va", sa_format_address(function_start)},
-                                      {"function_start_va", sa_format_address(function_start)},
-                                      {"write_instruction_va", sa_format_address(ins.addr)},
-                                      {"memory_reference_va", chosen_ref ? sa_format_address(chosen_ref) : sa_format_address(ins.imm_unsigned)},
-                                      {"memory_reference_source", chosen_source.empty() ? "unknown" : chosen_source},
-                                      {"key_register", ops.size() > 1 ? reg_from_operand(ops.back()) : "unknown"},
-                                      {"key_operand", ops.size() > 1 ? ops.back() : std::string()},
-                                      {"estimated_algo", estimate_algo_from_mnemonic(mnem)},
-                                      {"evidence", instruction_to_json(ins)},
-                                      {"reference_evidence", json{{"function_start_va", sa_format_address(function_start)}, {"backtrace_window", backtrace}, {"backtrace_instruction_count", backtrace.size()}}},
-                                      {"decision", decision},
-                                      {"source", source},
-                                      {"tracked_register_count", reg_values.size()},
-                                      {"marker_bytes_hex", marker_bytes},
-                                      {"confidence", chosen_source.rfind("operand_text_tracked_register:", 0) == 0 ? 0.78 : (chosen_source.rfind("tracked_register:", 0) == 0 ? 0.74 : 0.58)}});
-            if (candidates.size() >= 128)
+            json backtrace = backtrace_window_json(insns, ii, max_backtrace_instructions);
+            if (candidates.size() < max_candidates)
+            {
+                candidates.push_back(json{{"decryptor_va", sa_format_address(function_start)},
+                                          {"function_start_va", sa_format_address(function_start)},
+                                          {"write_instruction_va", sa_format_address(ins.addr)},
+                                          {"memory_reference_va", chosen_ref ? sa_format_address(chosen_ref) : sa_format_address(ins.imm_unsigned)},
+                                          {"memory_reference_source", chosen_source.empty() ? "unknown" : chosen_source},
+                                          {"key_register", ops.size() > 1 ? reg_from_operand(ops.back()) : "unknown"},
+                                          {"key_operand", ops.size() > 1 ? ops.back() : std::string()},
+                                          {"estimated_algo", estimate_algo_from_mnemonic(mnem)},
+                                          {"evidence", instruction_to_json(ins)},
+                                          {"reference_evidence", json{{"function_start_va", sa_format_address(function_start)}, {"backtrace_window", backtrace}, {"backtrace_instruction_count", backtrace.size()}, {"backtrace_truncated", max_backtrace_instructions < 12}}},
+                                          {"decision", decision_summary},
+                                          {"source", source},
+                                          {"tracked_register_count", reg_values.size()},
+                                          {"marker_bytes_hex", marker_bytes},
+                                          {"confidence", chosen_source.rfind("operand_text_tracked_register:", 0) == 0 ? 0.78 : (chosen_source.rfind("tracked_register:", 0) == 0 ? 0.74 : 0.58)}});
+            }
+            else
+            {
+                result_truncated = true;
+            }
+            if (candidates.size() >= max_candidates)
+            {
+                result_truncated = true;
                 break;
+            }
         }
-        return !cancelled;
+        diag::log_tagged_fmt("protected_re",
+                             "smc_find_decryptor range_done pid=%u source=%s decoded=%zu candidates=%zu considered=%zu truncated=%d elapsed_ms=%llu remaining_ms=%llu",
+                             pid,
+                             source.c_str(),
+                             insns.size(),
+                             candidates.size(),
+                             candidates_considered,
+                             result_truncated ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started),
+                             static_cast<unsigned long long>(remaining_ms()));
+        return !cancelled && !deadline_hit;
+    };
+    auto finish = [&](bool explicit_scan_mode,
+                      bool module_scan_skipped,
+                      std::optional<std::uint64_t> explicit_scan_base,
+                      std::uint64_t scan_size_requested,
+                      std::uint64_t scan_size_effective,
+                      const char* cancelled_message,
+                      const char* deadline_message) -> tool_result_t {
+        const ULONGLONG serialize_started = GetTickCount64();
+        json out{{"decryptors", candidates},
+                 {"count", candidates.size()},
+                 {"found", !candidates.empty()},
+                 {"best_candidate", candidates.empty() ? json(nullptr) : candidates[0]},
+                 {"instructions_scanned", scanned},
+                 {"scan_bytes", bytes_read_total},
+                 {"candidates_considered", candidates_considered},
+                 {"explicit_scan_mode", explicit_scan_mode},
+                 {"module_scan_skipped", module_scan_skipped},
+                 {"target_va", sa_format_address(*target)},
+                 {"target_size_effective", bounded_target_size},
+                 {"scan_ranges", scan_ranges},
+                 {"decision_samples", decision_samples},
+                 {"cancelled", cancelled},
+                 {"deadline_hit", deadline_hit},
+                 {"partial", cancelled || deadline_hit || result_truncated},
+                 {"result_truncated", result_truncated},
+                 {"stop_phase", stop_phase},
+                 {"timeout_ms", timeout_ms},
+                 {"deadline_remaining_ms", remaining_ms()},
+                 {"caps", json{{"max_candidates", max_candidates},
+                                {"max_decision_samples", max_decision_samples},
+                                {"max_backtrace_instructions", max_backtrace_instructions},
+                                {"max_scan_ranges", max_scan_ranges},
+                                {"max_instructions", max_decode_instructions}}},
+                 {"elapsed_ms", GetTickCount64() - started}};
+        if (explicit_scan_base)
+        {
+            out["scan_base"] = sa_format_address(*explicit_scan_base);
+            out["scan_size_requested"] = scan_size_requested;
+            out["scan_size_effective"] = scan_size_effective;
+        }
+        if (candidates.empty())
+            out["no_match_reason"] = scanned == 0 ? "no_instructions_decoded" : "no_memory_write_resolved_into_target_range";
+        out["serialization_elapsed_ms"] = GetTickCount64() - serialize_started;
+        diag::log_tagged_fmt("protected_re",
+                             "smc_find_decryptor exit pid=%u found=%d count=%zu considered=%zu truncated=%d cancelled=%d deadline=%d elapsed_ms=%llu serialize_ms=%llu",
+                             pid,
+                             !candidates.empty() ? 1 : 0,
+                             candidates.size(),
+                             candidates_considered,
+                             result_truncated ? 1 : 0,
+                             cancelled ? 1 : 0,
+                             deadline_hit ? 1 : 0,
+                             static_cast<unsigned long long>(GetTickCount64() - started),
+                             static_cast<unsigned long long>(out["serialization_elapsed_ms"].get<std::uint64_t>()));
+        if (cancelled)
+            return tool_result_t::error(cancelled_message, out);
+        if (deadline_hit && candidates.empty())
+            return tool_result_t::error(deadline_message, out);
+        return tool_result_t::ok(out);
     };
     auto scan_base = parse_param_u64(params, "scan_base");
     auto scan_size = parse_param_u64(params, "scan_size");
@@ -7482,21 +7871,17 @@ inline tool_result_t smc_find_decryptor(const json& params)
         std::uint64_t reported_effective = effective_scan;
         if (!scan_ranges.empty() && scan_ranges.back().contains("scan_size_effective") && scan_ranges.back()["scan_size_effective"].is_number_unsigned())
             reported_effective = scan_ranges.back()["scan_size_effective"].get<std::uint64_t>();
-        json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", true}, {"module_scan_skipped", true}, {"scan_base", sa_format_address(*scan_base)}, {"scan_size_requested", scan_size.value_or(0x10000)}, {"scan_size_effective", reported_effective}, {"target_va", sa_format_address(*target)}, {"target_size_effective", bounded_target_size}, {"scan_ranges", scan_ranges}, {"decision_samples", decision_samples}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
-        if (candidates.empty())
-            out["no_match_reason"] = scanned == 0 ? "no_instructions_decoded" : "no_memory_write_resolved_into_target_range";
-        if (cancelled)
-            return tool_result_t::error("SMC decryptor explicit scan cancelled", out);
-        return tool_result_t::ok(out);
+        return finish(true, true, scan_base, scan_size.value_or(0x10000), reported_effective, "SMC decryptor explicit scan cancelled", "SMC decryptor explicit scan deadline reached");
     }
     auto mods = user_modules(pid);
     for (const auto& m : mods) {
-        if (mcp_standalone::current_call_cancelled()) {
-            cancelled = true;
+        if (stop_requested("module_loop"))
+            break;
+        if (candidates.size() >= max_candidates)
+        {
+            result_truncated = true;
             break;
         }
-        if (candidates.size() >= 128)
-            break;
         pe_layout_t pe;
         if (!read_pe_layout(pid, m.base, pe))
             continue;
@@ -7506,18 +7891,16 @@ inline tool_result_t smc_find_decryptor(const json& params)
             const std::uint32_t sec_size = std::min<std::uint32_t>(sec.virtual_size ? sec.virtual_size : sec.raw_size, 0x100000);
             if (!scan_code_range(sec.va, sec_size, m.name + ":" + sec.name))
                 break;
-            if (candidates.size() >= 128)
+            if (candidates.size() >= max_candidates)
+            {
+                result_truncated = true;
                 break;
+            }
         }
-        if (cancelled)
+        if (cancelled || deadline_hit)
             break;
     }
-    json out{{"decryptors", candidates}, {"count", candidates.size()}, {"instructions_scanned", scanned}, {"explicit_scan_mode", false}, {"module_scan_skipped", false}, {"scan_ranges", scan_ranges}, {"decision_samples", decision_samples}, {"cancelled", cancelled}, {"elapsed_ms", GetTickCount64() - started}};
-    if (candidates.empty())
-        out["no_match_reason"] = scanned == 0 ? "no_instructions_decoded" : "no_memory_write_resolved_into_target_range";
-    if (cancelled)
-        return tool_result_t::error("SMC decryptor scan cancelled", out);
-    return tool_result_t::ok(out);
+    return finish(false, false, std::nullopt, 0, 0, "SMC decryptor scan cancelled", "SMC decryptor scan deadline reached");
 }
 
 inline std::optional<target_module_t> select_user_main_module(const json& params, std::string* err)

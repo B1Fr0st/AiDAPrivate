@@ -449,6 +449,11 @@ bool resolve_chain_once(std::uint32_t pid, const json& chain, std::uint64_t& out
     const auto& hops_array = (*root)["hops"];
     for (std::size_t i = 0; i < hops_array.size(); ++i)
     {
+        if (mcp_standalone::current_call_cancelled())
+            return false;
+        const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+        if (deadline != 0 && GetTickCount64() >= deadline)
+            return false;
         const auto& hop = hops_array[i];
         std::int64_t offset = hop.value("offset", 0ll);
         std::uint64_t slot_va = 0;
@@ -922,6 +927,7 @@ tool_result_t verify_stable(const json& params)
     bool deadline_hit = false;
     bool cancelled = false;
     std::string stop_phase;
+    std::uint64_t last_sample_elapsed_ms = 0;
     auto effective_remaining_ms = [&]() -> std::uint64_t {
         const std::uint64_t now = GetTickCount64();
         return effective_deadline > now ? effective_deadline - now : 0;
@@ -947,6 +953,23 @@ tool_result_t verify_stable(const json& params)
     {
         if (stop_requested("verify_stable_sample"))
             break;
+        if (i != 0 && last_sample_elapsed_ms != 0)
+        {
+            const std::uint64_t remaining = effective_remaining_ms();
+            if (remaining <= last_sample_elapsed_ms + 50ull)
+            {
+                deadline_hit = true;
+                stop_phase = "verify_stable_sample_cost_guard";
+                diag::log_tagged_fmt("encptr",
+                                     "verify_stable sample_guard pid=%u next_index=%zu last_sample_elapsed_ms=%llu remaining_ms=%llu elapsed_ms=%llu",
+                                     scope.pid(),
+                                     i,
+                                     static_cast<unsigned long long>(last_sample_elapsed_ms),
+                                     static_cast<unsigned long long>(remaining),
+                                     static_cast<unsigned long long>(GetTickCount64() - started_ms));
+                break;
+            }
+        }
         const auto sample_started = GetTickCount64();
         std::uint64_t value = 0;
         const bool ok = resolve_chain_once(scope.pid(), params["chain"], value);
@@ -964,6 +987,7 @@ tool_result_t verify_stable(const json& params)
         {
             ++failures;
         }
+        last_sample_elapsed_ms = GetTickCount64() - sample_started;
         values.push_back(std::move(row));
         diag::log_tagged_fmt("encptr",
                              "verify_stable sample pid=%u index=%zu ok=%d unique=%zu failures=%zu sample_elapsed_ms=%llu total_elapsed_ms=%llu deadline_remaining_ms=%llu",
@@ -1004,8 +1028,11 @@ tool_result_t verify_stable(const json& params)
     std::string stability = "never_same";
     if (ok_count == samples && unique.size() == 1)
         stability = "always_same";
+    else if (interval_ms == 0 && ok_count > 0 && unique.size() == 1 && failures == 0)
+        stability = "single_sample_same_partial";
     else if (ok_count > 1 && unique.size() < ok_count)
         stability = "sometimes_same";
+    const bool stable_partial = interval_ms == 0 && ok_count > 0 && unique.size() == 1 && failures == 0 && ok_count < samples;
 
     json result;
     result["process_id"] = scope.pid();
@@ -1015,6 +1042,8 @@ tool_result_t verify_stable(const json& params)
     result["sample_failures"] = failures;
     result["unique_values"] = unique.size();
     result["stability"] = stability;
+    result["stable_partial"] = stable_partial;
+    result["sample_strictness"] = stable_partial ? "partial_zero_interval_deadline_bounded" : "requested_sample_count";
     result["deadline_hit"] = deadline_hit;
     result["cancelled"] = cancelled;
     result["partial"] = deadline_hit || cancelled || values.size() < samples;
@@ -1026,16 +1055,21 @@ tool_result_t verify_stable(const json& params)
     result["elapsed_ms"] = GetTickCount64() - started_ms;
     result["samples"] = std::move(values);
     diag::log_tagged_fmt("encptr",
-                         "verify_stable exit pid=%u ok_samples=%zu failures=%zu unique=%zu stability=%s deadline_hit=%d elapsed_ms=%llu",
+                         "verify_stable exit pid=%u ok_samples=%zu failures=%zu unique=%zu stability=%s stable_partial=%d deadline_hit=%d elapsed_ms=%llu",
                          scope.pid(),
                          ok_count,
                          failures,
                          unique.size(),
                          stability.c_str(),
+                         stable_partial ? 1 : 0,
                          deadline_hit ? 1 : 0,
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     if (deadline_hit || cancelled)
+    {
+        if (!cancelled && stable_partial)
+            return tool_result_t::ok("Encrypted pointer stability partially proven before the bounded deadline.", result);
         return tool_result_t::error(cancelled ? "Encrypted pointer stability verification cancelled." : "Encrypted pointer stability verification deadline reached before all samples completed.", result);
+    }
     return tool_result_t::ok(result);
 }
 }

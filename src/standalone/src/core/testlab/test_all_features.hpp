@@ -13,6 +13,23 @@ namespace test_all_features {
 	void render_overlay(float vw, float vh);
 	bool is_running();
 	bool is_unattended_full_test_active();
+	struct overlay_perf_snapshot_t {
+		bool visible = false;
+		bool running = false;
+		bool snapshot_busy = false;
+		bool snapshot_changed = false;
+		std::uint64_t dirty_version = 0;
+		std::uint64_t log_version = 0;
+		std::uint64_t progress_version = 0;
+		std::uint64_t lock_busy_total = 0;
+		std::uint64_t snapshot_changes = 0;
+		std::uint64_t render_elapsed_us = 0;
+		std::size_t total_log_lines = 0;
+		std::size_t cached_log_lines = 0;
+		std::size_t rendered_log_rows = 0;
+	};
+	std::uint64_t overlay_dirty_version();
+	overlay_perf_snapshot_t overlay_perf_snapshot();
 	void set_progress_step(const char* label);
 	void format_debug_snapshot(char* out, std::size_t cap);
 	void log_external_session_event(const char* source, unsigned msg, std::uintptr_t wparam, std::intptr_t lparam);

@@ -44,6 +44,7 @@
 #include "../network/burp/param_miner.hpp"
 #include "../network/burp/payload_library.hpp"
 #include "../network/burp/issue.hpp"
+#include "../network/burp/findings_db.hpp"
 #include "../network/burp/browser_launch.hpp"
 #include "../network/burp/insertion_points.hpp"
 #include "../network/burp/scanner_module.hpp"
@@ -212,6 +213,39 @@ namespace {
         log_msg(hf, tag, "%s privacy_diag=%s",
             label,
             compact_burp_json(st.privacy_diagnostics, 900).c_str());
+    }
+
+    bool camoufox_bridge_sticky_setup_failure(const aida::burp::camoufox::bridge_status_t& st, std::string& marker) {
+        marker.clear();
+        nlohmann::json sticky = nlohmann::json::object();
+        if (st.last_launch_diagnostics.is_object()) {
+            auto sticky_it = st.last_launch_diagnostics.find("sticky_setup_failure");
+            if (sticky_it != st.last_launch_diagnostics.end() && sticky_it->is_object())
+                sticky = *sticky_it;
+        }
+        if (sticky.is_object() && !sticky.empty()) {
+            const std::string category = sticky.value("category", std::string("unknown"));
+            const std::string summary = sticky.value("error_summary", std::string());
+            std::string phase = sticky.value("phase", std::string());
+            auto source_it = sticky.find("source");
+            if (phase.empty() && source_it != sticky.end() && source_it->is_object())
+                phase = source_it->value("phase", std::string());
+            const std::string mode = sticky.value("mode", std::string());
+            const uint64_t generation = sticky.value("generation", static_cast<uint64_t>(0));
+            marker = "category=" + category +
+                " generation=" + std::to_string(static_cast<unsigned long long>(generation)) +
+                " mode=" + (mode.empty() ? std::string("<empty>") : mode) +
+                " phase=" + (phase.empty() ? std::string("<empty>") : phase) +
+                " root=" + (summary.empty() ? std::string("<empty>") : compact_burp_text(summary, 700));
+            return true;
+        }
+        std::string lower_error = st.last_error;
+        std::transform(lower_error.begin(), lower_error.end(), lower_error.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower_error.find("sticky_setup_failure") != std::string::npos) {
+            marker = compact_burp_text(st.last_error, 700);
+            return true;
+        }
+        return false;
     }
 
     bool camoufox_install_status_ready(const aida::burp::camoufox::install::status_t& st) {
@@ -1575,9 +1609,19 @@ namespace {
         return true;
     }
 
-    void ensure_report_fixture(HANDLE hf, const char* tag) {
+    bool ensure_report_fixture(HANDLE hf, const char* tag) {
         auto reports = aida::burp::report::list_reports();
-        if (!reports.empty()) return;
+        bool has_nonempty_history = false;
+        for (const auto& report : reports) {
+            if (report.issue_count > 0) {
+                has_nonempty_history = true;
+                break;
+            }
+        }
+        if (has_nonempty_history) {
+            log_msg(hf, tag, "fixture_report existing_history reports=%zu", reports.size());
+            return true;
+        }
         aida::burp::issue_store::initialize();
         aida::burp::issue_t issue;
         issue.type_key = "testlab.fixture.csp";
@@ -1591,7 +1635,18 @@ namespace {
         issue.port = burp_fixture_port() ? burp_fixture_port() : 80;
         issue.path = "/aida-mcp-test";
         issue.seen_ms = fixture_now_ms();
+        aida::burp::issue_filter_t all_issues;
+        all_issues.include_suppressed = true;
+        const size_t issue_store_before = aida::burp::issue_store::list(all_issues).size();
+        const size_t findings_before = aida::burp::findings_db::is_initialized() ? aida::burp::findings_db::count() : 0;
         uint64_t issue_id = aida::burp::issue_store::add(issue);
+        if (issue_id == 0) {
+            log_msg(hf, tag, "fixture_report add_failed issue_store_before=%zu findings_before=%zu issue_err=%s",
+                issue_store_before,
+                findings_before,
+                aida::burp::issue_store::last_error().c_str());
+            return false;
+        }
         aida::burp::report::report_config_t cfg;
         cfg.title = "AiDA TestLab Burp Fixture Report";
         cfg.client = "AiDA TestLab";
@@ -1600,8 +1655,39 @@ namespace {
         cfg.format = aida::burp::report::report_format_t::html;
         std::string out;
         bool ok = aida::burp::report::generate(cfg, out);
-        log_msg(hf, tag, "fixture_report generate ok=%d issue_id=%llu path=%s reports_before=%zu err=%s",
-            ok ? 1 : 0, static_cast<unsigned long long>(issue_id), out.c_str(), reports.size(), aida::burp::report::last_error().c_str());
+        auto reports_after = aida::burp::report::list_reports();
+        const size_t issue_store_after = aida::burp::issue_store::list(all_issues).size();
+        const size_t findings_after = aida::burp::findings_db::is_initialized() ? aida::burp::findings_db::count() : 0;
+        std::error_code file_ec;
+        const bool file_exists = std::filesystem::exists(cfg.output_path, file_ec);
+        uint64_t file_size = 0;
+        if (file_exists) {
+            const auto raw_size = std::filesystem::file_size(cfg.output_path, file_ec);
+            if (!file_ec) file_size = static_cast<uint64_t>(raw_size);
+        }
+        size_t nonempty_report_count = 0;
+        for (const auto& report : reports_after) {
+            if (report.issue_count > 0) ++nonempty_report_count;
+        }
+        log_msg(hf, tag, "fixture_report generate ok=%d issue_id=%llu path=%s reports_before=%zu reports_after=%zu nonempty_reports=%zu issue_store_before=%zu issue_store_after=%zu findings_before=%zu findings_after=%zu file_exists=%d file_size=%llu report_err=%s db_err=%s",
+            ok ? 1 : 0,
+            static_cast<unsigned long long>(issue_id),
+            out.c_str(),
+            reports.size(),
+            reports_after.size(),
+            nonempty_report_count,
+            issue_store_before,
+            issue_store_after,
+            findings_before,
+            findings_after,
+            file_exists ? 1 : 0,
+            static_cast<unsigned long long>(file_size),
+            aida::burp::report::last_error().c_str(),
+            aida::burp::findings_db::last_error().c_str());
+        if (!ok || reports_after.empty() || nonempty_report_count == 0 || !file_exists || file_size == 0 || findings_after == 0) {
+            return false;
+        }
+        return true;
     }
 
     uint16_t reserve_loopback_port_for_fixture(HANDLE hf, const char* tag) {
@@ -2824,11 +2910,29 @@ namespace {
     void test_report_list(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
         const char* tag = "report_list";
         log_msg(hf, tag, "START -- report::list_reports()");
-        ensure_report_fixture(hf, tag);
+        if (!ensure_report_fixture(hf, tag)) {
+            const size_t findings_count = aida::burp::findings_db::is_initialized() ? aida::burp::findings_db::count() : 0;
+            fail_empty_evidence(hf, tag, failed, "report generation fixture failed before report list; findings_count=%zu report_err=%s db_err=%s",
+                findings_count,
+                aida::burp::report::last_error().c_str(),
+                aida::burp::findings_db::last_error().c_str());
+            return;
+        }
         auto reports = aida::burp::report::list_reports();
         log_msg(hf, tag, "report count = %zu", reports.size());
         if (reports.empty()) {
             fail_empty_evidence(hf, tag, failed, "report list returned zero reports after report generation fixture/action should have created a report");
+            return;
+        }
+        bool has_nonempty_history = false;
+        for (const auto& report : reports) {
+            if (report.issue_count > 0) {
+                has_nonempty_history = true;
+                break;
+            }
+        }
+        if (!has_nonempty_history) {
+            fail_empty_evidence(hf, tag, failed, "report list returned reports but none have issue_count > 0");
             return;
         }
         log_msg(hf, tag, "PASS -- list_reports returned %zu entries", reports.size());
@@ -3463,6 +3567,14 @@ namespace {
             passed.fetch_add(1);
             return;
         }
+        std::string sticky_marker;
+        if (camoufox_bridge_sticky_setup_failure(before, sticky_marker)) {
+            log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox nonretryable setup failure; bounded relaunch suppressed marker=%s",
+                sticky_marker.c_str());
+            return;
+        }
         const uint64_t t0 = GetTickCount64();
         static test_lab::bounded_runner_t relaunch_runner(1);
         auto relaunch_state = std::make_shared<std::atomic<bool>>(false);
@@ -3528,6 +3640,13 @@ namespace {
         if (ready_after) {
             log_msg(hf, tag, "PASS -- Camoufox bridge recovered from initial not-ready state child_pid=%u", after.child_pid);
             passed.fetch_add(1);
+            return;
+        }
+        if (camoufox_bridge_sticky_setup_failure(after, sticky_marker)) {
+            log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox nonretryable setup failure after bounded relaunch marker=%s",
+                sticky_marker.c_str());
             return;
         }
         fail_empty_evidence(hf, tag, failed,
@@ -4733,6 +4852,14 @@ namespace {
             passed.fetch_add(1);
             return;
         }
+        std::string sticky_marker;
+        if (camoufox_bridge_sticky_setup_failure(bridge_before, sticky_marker)) {
+            log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox nonretryable setup failure; launch suppressed marker=%s",
+                sticky_marker.c_str());
+            return;
+        }
 
         aida::burp::camoufox::launch_config_t cfg;
         cfg.headless = false;
@@ -4768,6 +4895,13 @@ namespace {
             static_cast<unsigned long long>(GetTickCount64() - t0));
         log_camoufox_bridge_snapshot(hf, tag, "after_bridge", bridge_after);
         if (!ready) {
+            if (camoufox_bridge_sticky_setup_failure(bridge_after, sticky_marker)) {
+                log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
+                fail_empty_evidence(hf, tag, failed,
+                    "Camoufox nonretryable setup failure after launch attempt marker=%s",
+                    sticky_marker.c_str());
+                return;
+            }
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox browser did not launch into a ready live state state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u last_error=%s launch_diag=%s cleanup_diag=%s privacy_diag=%s",
                 camoufox_bridge_state_name(bridge_after.state),

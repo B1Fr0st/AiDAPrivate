@@ -8,6 +8,7 @@ import sys
 ROOT = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
 AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
 AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID = "aida_playwright_pageerror_location_patch_20260620_1"
+AIDA_DEFAULT_ADDON_POLICY_V1 = "aida_default_addon_policy_v1"
 
 
 def fail(message: str) -> None:
@@ -62,6 +63,21 @@ def validate_browser_launch_budget_contract(path: pathlib.Path, text: str) -> No
         fail(f"browser late page contract missing self.pages reference in _wait_for_late_page in {path}")
     if 'source="self_pages"' not in late_page_body:
         fail(f"browser late page contract missing self_pages source tag in _wait_for_late_page in {path}")
+
+
+def validate_browser_addon_policy_contract(path: pathlib.Path, text: str) -> None:
+    required_markers = (
+        AIDA_DEFAULT_ADDON_POLICY_V1,
+        "DefaultAddons.UBO",
+        "exclude_addons",
+        "launch_options_addon_policy",
+        "launch_options_addon_invalid",
+        "default_addons_excluded",
+        "explicit_addon_count",
+    )
+    for marker in required_markers:
+        if marker not in text:
+            fail(f"browser addon policy contract missing {marker} in {path}")
 
 
 def replace_in_function(text: str, function_name: str, old: str, new: str, label: str) -> str:
@@ -1803,6 +1819,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_pending_activation(updated)
         updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
+        validate_browser_addon_policy_contract(path, updated)
         validate_browser_launch_budget_contract(path, updated)
         if updated != text:
             write_text(path, updated)
@@ -1857,6 +1874,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_pending_activation(updated)
         updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
+        validate_browser_addon_policy_contract(path, updated)
         validate_browser_launch_budget_contract(path, updated)
         if updated != text:
             write_text(path, updated)
@@ -1931,6 +1949,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_pending_activation(updated)
         updated = patch_browser_new_page_diagnostics(updated)
         updated = patch_browser_debug_helper(updated)
+        validate_browser_addon_policy_contract(path, updated)
         validate_browser_launch_budget_contract(path, updated)
         write_text(path, updated)
         return
@@ -2455,6 +2474,7 @@ def patch_browser(path: pathlib.Path) -> None:
     for marker in ("self._aida_multipage_patch = 4", "async def list_pages", "async def resolve_page", "page_id", "active_page_id", "_pending_page_ids_by_context", "page_privacy_verified", "def _mark_page_terminal", "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK", "aida_camoufox_bridge_20260620_crash_diag_1", "aida_bridge_patch_active", "aida_launch_policy_resolved", "context_close_event", "cmdline_sha256", "subprocess_diagnostics_installed", "stdout_capture", "stderr_capture", "exit_ts_ms", "diagnostic_original_style_bundled", "_registered_page_records"):
         if marker not in text:
             fail(f"browser validation missing {marker}")
+    validate_browser_addon_policy_contract(path, text)
     validate_browser_launch_budget_contract(path, text)
     write_text(path, text)
 

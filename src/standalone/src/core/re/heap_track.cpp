@@ -530,16 +530,150 @@ void append_event_capture(store::heap_session_t session, const pending_alloc_t& 
 std::size_t arm_heap_existing_threads(std::uint32_t pid)
 {
     auto session = event_session_for_pid(pid);
-    if (!session)
+    if (!session) {
+        diag::log_tagged_fmt("heap_track",
+            "breakpoint_arm_existing_no_session pid=%u active_pid=%u",
+            pid,
+            driver_bridge::attached_pid());
         return 0;
+    }
     const auto threads = threads_for(pid);
     std::size_t armed = 0;
     std::vector<std::uint32_t> armed_tids;
+    auto dr_address = [](const driver_bridge::thread_context_t& ctx, int slot) -> std::uint64_t {
+        switch (slot)
+        {
+        case 0: return ctx.dr0;
+        case 1: return ctx.dr1;
+        case 2: return ctx.dr2;
+        case 3: return ctx.dr3;
+        default: return 0;
+        }
+    };
+    diag::log_tagged_fmt("heap_track",
+        "breakpoint_arm_existing_begin pid=%u active_pid=%u session_id=%s thread_count=%zu slot=%d target=%s kernel=%d attached=%d status=%s last_error=%s",
+        pid,
+        driver_bridge::attached_pid(),
+        session->id.c_str(),
+        threads.size(),
+        session->hw_slot,
+        sa_format_address(session->rtl_allocate_heap).c_str(),
+        driver_bridge::using_kernel_driver() ? 1 : 0,
+        driver_bridge::attached_pid() == pid ? 1 : 0,
+        driver_bridge::status().c_str(),
+        driver_bridge::last_error().c_str());
     for (const auto& th : threads)
     {
-        if (th.tid == 0 || session->hw_slot < 0 || session->hw_slot > 3 || session->rtl_allocate_heap == 0)
+        diag::log_tagged_fmt("heap_track",
+            "breakpoint_arm_thread_begin pid=%u active_pid=%u session_id=%s tid=%u owner_pid=%u enum_state=%u priority=%d enum_rip=%s slot=%d target=%s",
+            pid,
+            driver_bridge::attached_pid(),
+            session->id.c_str(),
+            th.tid,
+            th.owner_pid,
+            th.state,
+            th.priority,
+            sa_format_address(th.rip).c_str(),
+            session->hw_slot,
+            sa_format_address(session->rtl_allocate_heap).c_str());
+        if (th.tid == 0 || session->hw_slot < 0 || session->hw_slot > 3 || session->rtl_allocate_heap == 0) {
+            diag::log_tagged_fmt("heap_track",
+                "breakpoint_arm_thread_skip pid=%u session_id=%s tid=%u reason=invalid_candidate slot=%d target=%s owner_pid=%u",
+                pid,
+                session->id.c_str(),
+                th.tid,
+                session->hw_slot,
+                sa_format_address(session->rtl_allocate_heap).c_str(),
+                th.owner_pid);
             continue;
-        if (driver_bridge::set_hardware_breakpoint(th.tid, session->hw_slot, session->rtl_allocate_heap, 0, 0))
+        }
+        driver_bridge::thread_context_t before_ctx{};
+        const bool before_ok = driver_bridge::get_thread_context(th.tid, before_ctx);
+        const DWORD before_gle = before_ok ? ERROR_SUCCESS : GetLastError();
+        const std::string before_status = driver_bridge::status();
+        const std::string before_last_error = driver_bridge::last_error();
+        diag::log_tagged_fmt("heap_track",
+            "breakpoint_arm_thread_context_before pid=%u active_pid=%u session_id=%s tid=%u ok=%d gle=%lu rip=%s rsp=%s rflags=0x%llX dr0=%s dr1=%s dr2=%s dr3=%s dr6=0x%llX dr7=0x%llX status=%s last_error=%s",
+            pid,
+            driver_bridge::attached_pid(),
+            session->id.c_str(),
+            th.tid,
+            before_ok ? 1 : 0,
+            static_cast<unsigned long>(before_gle),
+            sa_format_address(before_ctx.rip).c_str(),
+            sa_format_address(before_ctx.rsp).c_str(),
+            static_cast<unsigned long long>(before_ctx.rflags),
+            sa_format_address(before_ctx.dr0).c_str(),
+            sa_format_address(before_ctx.dr1).c_str(),
+            sa_format_address(before_ctx.dr2).c_str(),
+            sa_format_address(before_ctx.dr3).c_str(),
+            static_cast<unsigned long long>(before_ctx.dr6),
+            static_cast<unsigned long long>(before_ctx.dr7),
+            before_status.c_str(),
+            before_last_error.c_str());
+        if (!before_ok) {
+            diag::log_tagged_fmt("heap_track",
+                "breakpoint_arm_thread_result pid=%u active_pid=%u session_id=%s tid=%u armed=0 reason=context_before_failed gle=%lu status=%s last_error=%s",
+                pid,
+                driver_bridge::attached_pid(),
+                session->id.c_str(),
+                th.tid,
+                static_cast<unsigned long>(before_gle),
+                before_status.c_str(),
+                before_last_error.c_str());
+            continue;
+        }
+        const bool set_ok = driver_bridge::set_hardware_breakpoint(th.tid, session->hw_slot, session->rtl_allocate_heap, 0, 0);
+        const DWORD set_gle = set_ok ? ERROR_SUCCESS : GetLastError();
+        const std::string set_status = driver_bridge::status();
+        const std::string set_last_error = driver_bridge::last_error();
+        diag::log_tagged_fmt("heap_track",
+            "breakpoint_arm_thread_set pid=%u active_pid=%u session_id=%s tid=%u ok=%d gle=%lu slot=%d target=%s status=%s last_error=%s",
+            pid,
+            driver_bridge::attached_pid(),
+            session->id.c_str(),
+            th.tid,
+            set_ok ? 1 : 0,
+            static_cast<unsigned long>(set_gle),
+            session->hw_slot,
+            sa_format_address(session->rtl_allocate_heap).c_str(),
+            set_status.c_str(),
+            set_last_error.c_str());
+        driver_bridge::thread_context_t after_ctx{};
+        const bool after_ok = driver_bridge::get_thread_context(th.tid, after_ctx);
+        const DWORD after_gle = after_ok ? ERROR_SUCCESS : GetLastError();
+        const std::uint64_t after_dr = dr_address(after_ctx, session->hw_slot);
+        const bool slot_enabled = after_ok && (after_ctx.dr7 & (1ull << static_cast<unsigned>(session->hw_slot * 2))) != 0;
+        const bool verify_ok = set_ok && after_ok && after_dr == session->rtl_allocate_heap && slot_enabled;
+        const char* result_reason = verify_ok ? "armed" : (!set_ok ? "set_hardware_breakpoint_failed" : (!after_ok ? "context_after_failed" : (after_dr != session->rtl_allocate_heap ? "verify_address_mismatch" : "verify_dr7_enable_missing")));
+        diag::log_tagged_fmt("heap_track",
+            "breakpoint_arm_thread_context_after pid=%u active_pid=%u session_id=%s tid=%u get_ok=%d get_gle=%lu set_ok=%d set_gle=%lu verify_ok=%d reason=%s rip=%s rsp=%s rflags=0x%llX dr0=%s dr1=%s dr2=%s dr3=%s dr6=0x%llX dr7=0x%llX verify_slot=%d verify_addr=%s target=%s slot_enabled=%d status=%s last_error=%s",
+            pid,
+            driver_bridge::attached_pid(),
+            session->id.c_str(),
+            th.tid,
+            after_ok ? 1 : 0,
+            static_cast<unsigned long>(after_gle),
+            set_ok ? 1 : 0,
+            static_cast<unsigned long>(set_gle),
+            verify_ok ? 1 : 0,
+            result_reason,
+            sa_format_address(after_ctx.rip).c_str(),
+            sa_format_address(after_ctx.rsp).c_str(),
+            static_cast<unsigned long long>(after_ctx.rflags),
+            sa_format_address(after_ctx.dr0).c_str(),
+            sa_format_address(after_ctx.dr1).c_str(),
+            sa_format_address(after_ctx.dr2).c_str(),
+            sa_format_address(after_ctx.dr3).c_str(),
+            static_cast<unsigned long long>(after_ctx.dr6),
+            static_cast<unsigned long long>(after_ctx.dr7),
+            session->hw_slot,
+            sa_format_address(after_dr).c_str(),
+            sa_format_address(session->rtl_allocate_heap).c_str(),
+            slot_enabled ? 1 : 0,
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
+        if (verify_ok)
         {
             ++armed;
             if (std::find(armed_tids.begin(), armed_tids.end(), th.tid) == armed_tids.end())

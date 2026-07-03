@@ -2,7 +2,6 @@
 
 #include "imgui/imgui.h"
 #include "theme.hpp"
-#include <vector>
 #include <atomic>
 
 namespace aida::ui::blur {
@@ -18,7 +17,6 @@ namespace aida::ui::blur {
 	};
 
 	namespace detail {
-		inline std::vector<layer_request_t> s_pending;
 		inline std::atomic<bool> s_blur_supported{ false };
 	}
 
@@ -26,7 +24,7 @@ namespace aida::ui::blur {
 	inline bool supported() { return detail::s_blur_supported.load(std::memory_order_acquire); }
 
 	inline void schedule(const layer_request_t& r) {
-		detail::s_pending.push_back(r);
+		(void)r;
 	}
 
 	inline void schedule_simple(ImVec2 pos, ImVec2 size, float radius = 8.f,
@@ -39,9 +37,6 @@ namespace aida::ui::blur {
 		r.alpha = alpha;
 		schedule(r);
 	}
-
-	inline std::vector<layer_request_t>& pending() { return detail::s_pending; }
-	inline void clear_pending() { detail::s_pending.clear(); }
 
 	inline void render_glass_fill(ImDrawList* dl, ImVec2 a, ImVec2 b,
 	                               float radius, float alpha = 1.f) {

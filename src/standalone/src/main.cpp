@@ -504,8 +504,32 @@ static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
 static constexpr DWORD kAidaInteractiveQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_HOTKEY | QS_ALLPOSTMESSAGE;
-static constexpr UINT kAidaPresentSyncInterval = 0;
+static constexpr UINT kAidaPresentSyncInterval = 1;
 static constexpr UINT kAidaPresentFlags = 0;
+static constexpr DWORD kAidaInteractiveWaitMs = 1;
+static constexpr DWORD kAidaForegroundActiveWaitMs = 8;
+static constexpr DWORD kAidaForegroundIdleWaitMs = 24;
+static constexpr DWORD kAidaBackgroundActiveWaitMs = 16;
+static constexpr DWORD kAidaBackgroundIdleWaitMs = 75;
+static constexpr DWORD kAidaPreRenderWaitMs = 16;
+static constexpr uint64_t kAidaForegroundIdleHeartbeatMs = 250ULL;
+static constexpr uint64_t kAidaBackgroundIdleHeartbeatMs = 1000ULL;
+static constexpr uint64_t kAidaFullTestHeartbeatMs = 250ULL;
+static constexpr uint64_t kAidaModalHeartbeatMs = 16ULL;
+static constexpr uint64_t kAidaFramePacingLogIntervalMs = 10000ULL;
+static constexpr uint32_t kAidaDirtyStartup = 0x00000001u;
+static constexpr uint32_t kAidaDirtyMessage = 0x00000002u;
+static constexpr uint32_t kAidaDirtyResize = 0x00000004u;
+static constexpr uint32_t kAidaDirtyState = 0x00000008u;
+static constexpr uint32_t kAidaDirtyInput = 0x00000010u;
+static constexpr uint32_t kAidaDirtyCursor = 0x00000020u;
+static constexpr uint32_t kAidaDirtyOverlay = 0x00000040u;
+static constexpr uint32_t kAidaDirtyTheme = 0x00000080u;
+static constexpr uint32_t kAidaDirtyModal = 0x00000100u;
+static constexpr uint32_t kAidaDirtyProgress = 0x00000200u;
+static constexpr uint32_t kAidaDirtyHeartbeat = 0x00000400u;
+static constexpr uint32_t kAidaDirtyWork = 0x00000800u;
+static constexpr uint32_t kAidaDirtySecurity = 0x00001000u;
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -2940,6 +2964,129 @@ static DWORD count_current_process_threads(DWORD* err_out)
     return count;
 }
 
+static uint64_t filetime_to_u64(const FILETIME& ft)
+{
+    ULARGE_INTEGER value{};
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return value.QuadPart;
+}
+
+struct process_cpu_delta_t {
+    bool valid = false;
+    DWORD gle = 0;
+    DWORD logical_processors = 1;
+    uint64_t wall_ms = 0;
+    uint64_t busy_100ns = 0;
+    double cpu_percent = 0.0;
+};
+
+static process_cpu_delta_t sample_current_process_cpu(uint64_t now_ms)
+{
+    static uint64_t s_last_wall_ms = 0;
+    static uint64_t s_last_busy_100ns = 0;
+    static DWORD s_logical_processors = 0;
+    process_cpu_delta_t out{};
+    if (s_logical_processors == 0) {
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        s_logical_processors = std::max<DWORD>(1, si.dwNumberOfProcessors);
+    }
+    out.logical_processors = s_logical_processors;
+    FILETIME create_time{};
+    FILETIME exit_time{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    SetLastError(0);
+    if (!GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time, &user_time)) {
+        out.gle = GetLastError();
+        return out;
+    }
+    const uint64_t busy_100ns = filetime_to_u64(kernel_time) + filetime_to_u64(user_time);
+    if (s_last_wall_ms != 0 && now_ms > s_last_wall_ms && busy_100ns >= s_last_busy_100ns) {
+        out.valid = true;
+        out.wall_ms = now_ms - s_last_wall_ms;
+        out.busy_100ns = busy_100ns - s_last_busy_100ns;
+        const double capacity_100ns = static_cast<double>(out.wall_ms) * 10000.0 * static_cast<double>(s_logical_processors);
+        if (capacity_100ns > 0.0)
+            out.cpu_percent = std::min(100.0, (static_cast<double>(out.busy_100ns) * 100.0) / capacity_100ns);
+    }
+    s_last_wall_ms = now_ms;
+    s_last_busy_100ns = busy_100ns;
+    return out;
+}
+
+struct frame_wait_result_t {
+    DWORD requested_ms = 0;
+    DWORD actual_ms = 0;
+    DWORD result = WAIT_TIMEOUT;
+    DWORD gle = 0;
+    bool waitable_present = false;
+    bool frame_latency_signaled = false;
+    bool input_available = false;
+};
+
+static frame_wait_result_t wait_for_frame_latency_or_input(DWORD requested_ms)
+{
+    frame_wait_result_t out{};
+    out.requested_ms = requested_ms;
+    HANDLE waitable = g_FrameLatencyWaitableObject;
+    out.waitable_present = waitable != nullptr;
+    const uint64_t wait_start_ms = static_cast<uint64_t>(GetTickCount64());
+    SetLastError(0);
+    if (waitable) {
+        HANDLE handles[1] = { waitable };
+        out.result = MsgWaitForMultipleObjectsEx(1, handles, requested_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        out.frame_latency_signaled = out.result == WAIT_OBJECT_0;
+        out.input_available = out.result == WAIT_OBJECT_0 + 1;
+    } else {
+        out.result = MsgWaitForMultipleObjectsEx(0, nullptr, requested_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        out.input_available = out.result == WAIT_OBJECT_0;
+    }
+    if (out.result == WAIT_FAILED)
+        out.gle = GetLastError();
+    out.actual_ms = static_cast<DWORD>(std::min<uint64_t>(static_cast<uint64_t>(GetTickCount64()) - wait_start_ms, 0xFFFFFFFFULL));
+    return out;
+}
+
+struct draw_data_metrics_t {
+    int draw_lists = 0;
+    int draw_cmds = 0;
+    int callbacks = 0;
+    int reset_callbacks = 0;
+    int total_vtx = 0;
+    int total_idx = 0;
+};
+
+static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data)
+{
+    draw_data_metrics_t out{};
+    if (!draw_data)
+        return out;
+    out.draw_lists = draw_data->CmdListsCount;
+    out.total_vtx = draw_data->TotalVtxCount;
+    out.total_idx = draw_data->TotalIdxCount;
+    if (draw_data->CmdListsCount > 0 && !draw_data->CmdLists.Data)
+        return out;
+    const int list_count = draw_data->CmdListsCount > 0 ? draw_data->CmdListsCount : 0;
+    for (int list_index = 0; list_index < list_count; ++list_index) {
+        const ImDrawList* list = draw_data->CmdLists[list_index];
+        if (!list)
+            continue;
+        out.draw_cmds += list->CmdBuffer.Size;
+        for (int cmd_index = 0; cmd_index < list->CmdBuffer.Size; ++cmd_index) {
+            const ImDrawCmd& cmd = list->CmdBuffer[cmd_index];
+            if (!cmd.UserCallback)
+                continue;
+            if (cmd.UserCallback == ImDrawCallback_ResetRenderState)
+                ++out.reset_callbacks;
+            else
+                ++out.callbacks;
+        }
+    }
+    return out;
+}
+
 static void format_message_pump_stall_context(char* out, size_t cap)
 {
     if (!out || cap == 0)
@@ -4700,9 +4847,14 @@ int main(int, char**)
     bool done = false;
     static int prev_state = -1;
     static uint64_t frame_number = 0;
+    static uint64_t skipped_render_frames = 0;
     while (!done)
     {
         const uint64_t frame_start_tick_ms = static_cast<uint64_t>(GetTickCount64());
+        uint32_t pumped_messages = 0;
+        uint32_t pumped_input_messages = 0;
+        uint32_t pumped_resize_messages = 0;
+        uint32_t pumped_paint_messages = 0;
         aida_tracer::render_pulse(frame_number);
         aida_tracer::mark_render_phase("frame_top");
         if (frame_number < 5)
@@ -4838,6 +4990,41 @@ int main(int, char**)
             }
             if (!has_message)
                 break;
+
+            ++pumped_messages;
+            switch (msg.message) {
+            case WM_MOUSEMOVE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP:
+            case WM_MOUSEWHEEL:
+            case WM_MOUSEHWHEEL:
+            case WM_KEYDOWN:
+            case WM_KEYUP:
+            case WM_CHAR:
+            case WM_HOTKEY:
+            case WM_SETFOCUS:
+            case WM_KILLFOCUS:
+            case WM_ACTIVATE:
+            case WM_ACTIVATEAPP:
+                ++pumped_input_messages;
+                break;
+            case WM_SIZE:
+            case WM_MOVE:
+            case WM_DPICHANGED:
+                ++pumped_resize_messages;
+                break;
+            case WM_PAINT:
+            case WM_NCPAINT:
+            case WM_ERASEBKGND:
+                ++pumped_paint_messages;
+                break;
+            default:
+                break;
+            }
 
             bool close_related_msg = msg.message == WM_CLOSE || msg.message == WM_DESTROY ||
                 msg.message == WM_NCDESTROY || msg.message == WM_QUIT ||
@@ -5124,6 +5311,167 @@ int main(int, char**)
             diag::log_tagged_critical("render", "second_resize_post");
         }
 
+        ImGuiIO& pre_frame_io = ImGui::GetIO();
+        const uint64_t dirty_now_ms = static_cast<uint64_t>(GetTickCount64());
+        static bool dirty_state_initialized = false;
+        static uint64_t last_render_tick_ms = 0;
+        static uint64_t last_overlay_dirty_version = 0;
+        static uint32_t last_theme_generation = 0;
+        static int last_dirty_state = -1;
+        static bool last_full_test_running = false;
+        static bool last_bulk_busy = false;
+        static bool last_activation_progress = false;
+        static bool last_ai_thinking = false;
+        static POINT last_cursor_pos{};
+        static bool last_cursor_valid = false;
+        static bool last_cursor_over = false;
+        POINT cursor_pos{};
+        const bool cursor_pos_ok = ::GetCursorPos(&cursor_pos) != FALSE;
+        const bool cursor_moved = cursor_pos_ok && (!last_cursor_valid || cursor_pos.x != last_cursor_pos.x || cursor_pos.y != last_cursor_pos.y);
+        const bool cursor_over_aida_pre = aida_cursor_over_window(hwnd);
+        const bool cursor_over_changed = !dirty_state_initialized || cursor_over_aida_pre != last_cursor_over;
+        const bool cursor_motion_relevant = cursor_moved && (cursor_over_aida_pre || last_cursor_over || aida_focus_monitor::focused());
+        const uint64_t overlay_dirty_version = test_all_features::overlay_dirty_version();
+        const uint32_t theme_generation = aida::ui::theme_generation();
+        static uint64_t theme_animation_until_ms = 0;
+        if (!dirty_state_initialized || themes::changed || theme_generation != last_theme_generation)
+            theme_animation_until_ms = dirty_now_ms + 300ull;
+        const bool theme_animation_pre = dirty_now_ms < theme_animation_until_ms;
+        const bool foreground_pre = aida_focus_monitor::focused();
+        const bool foreground_like_pre = foreground_pre || cursor_over_aida_pre;
+        const DWORD dirty_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
+        const bool interactive_pending_pre = (HIWORD(dirty_qs) & kAidaInteractiveQueueBits) != 0;
+        const bool full_test_running_pre = test_all_features::is_running();
+        const bool bulk_busy_pre = function_index::static_bulk_in_progress();
+        const bool ai_thinking_pre = g_ai_thinking_active;
+        const bool activation_progress_pre =
+            license::checking ||
+            license::activation_worker_active.load(std::memory_order_acquire) ||
+            standalone_license::is_arc_download_in_progress() ||
+            standalone_license::is_arc_transfer_in_progress();
+        const bool modal_or_animation_pre =
+            globals::ui::command_palette_open ||
+            globals::ui::process_attach_open ||
+            globals::ui::driver_status_open ||
+            globals::ui::shortcuts_dialog_open ||
+            g_settings_open ||
+            menu_bar::any_open ||
+            aida::agent_picker::is_open() ||
+            source_reconstruct_view::is_open() ||
+            theme_animation_pre;
+        const bool input_active_pre =
+            cursor_motion_relevant ||
+            pre_frame_io.MouseWheel != 0.0f ||
+            pre_frame_io.MouseWheelH != 0.0f ||
+            pre_frame_io.WantTextInput ||
+            pre_frame_io.WantCaptureKeyboard ||
+            pre_frame_io.KeyCtrl ||
+            pre_frame_io.KeyShift ||
+            pre_frame_io.KeyAlt ||
+            pre_frame_io.KeySuper;
+        uint32_t dirty_mask = 0;
+        if (!dirty_state_initialized || frame_number < 5)
+            dirty_mask |= kAidaDirtyStartup;
+        if (pumped_messages != 0 || pumped_paint_messages != 0)
+            dirty_mask |= kAidaDirtyMessage;
+        if (pumped_resize_messages != 0 || g_ResizeWidth != 0 || g_ResizeHeight != 0 || iw != prev_w || ih != prev_h)
+            dirty_mask |= kAidaDirtyResize;
+        if (cur_state != last_dirty_state)
+            dirty_mask |= kAidaDirtyState;
+        if (pumped_input_messages != 0 || interactive_pending_pre || input_active_pre)
+            dirty_mask |= kAidaDirtyInput;
+        if (cursor_over_changed || cursor_motion_relevant)
+            dirty_mask |= kAidaDirtyCursor;
+        if (globals::ui::test_all_visible && overlay_dirty_version != last_overlay_dirty_version)
+            dirty_mask |= kAidaDirtyOverlay;
+        if (themes::changed || theme_generation != last_theme_generation || theme_animation_pre)
+            dirty_mask |= kAidaDirtyTheme;
+        if (modal_or_animation_pre)
+            dirty_mask |= kAidaDirtyModal;
+        if (full_test_running_pre != last_full_test_running ||
+            activation_progress_pre != last_activation_progress ||
+            ai_thinking_pre != last_ai_thinking ||
+            activation_progress_pre ||
+            ai_thinking_pre)
+            dirty_mask |= kAidaDirtyProgress;
+        if (bulk_busy_pre != last_bulk_busy)
+            dirty_mask |= kAidaDirtyWork;
+        const uint64_t since_render_ms = last_render_tick_ms != 0 && dirty_now_ms >= last_render_tick_ms ? dirty_now_ms - last_render_tick_ms : 0;
+        uint64_t heartbeat_ms = foreground_like_pre ? kAidaForegroundIdleHeartbeatMs : kAidaBackgroundIdleHeartbeatMs;
+        if (full_test_running_pre || bulk_busy_pre)
+            heartbeat_ms = kAidaFullTestHeartbeatMs;
+        if (modal_or_animation_pre || activation_progress_pre || ai_thinking_pre)
+            heartbeat_ms = kAidaModalHeartbeatMs;
+        if (!dirty_state_initialized || since_render_ms >= heartbeat_ms)
+            dirty_mask |= kAidaDirtyHeartbeat | kAidaDirtySecurity;
+        const bool wake_fast_pre =
+            cursor_over_aida_pre ||
+            interactive_pending_pre ||
+            input_active_pre ||
+            pumped_messages != 0 ||
+            modal_or_animation_pre ||
+            activation_progress_pre;
+        DWORD idle_wait_request_ms = kAidaBackgroundIdleWaitMs;
+        if (wake_fast_pre)
+            idle_wait_request_ms = kAidaInteractiveWaitMs;
+        else if (foreground_like_pre)
+            idle_wait_request_ms = (full_test_running_pre || bulk_busy_pre || activation_progress_pre) ? kAidaForegroundActiveWaitMs : kAidaForegroundIdleWaitMs;
+        else if (full_test_running_pre || bulk_busy_pre)
+            idle_wait_request_ms = kAidaBackgroundActiveWaitMs;
+        frame_wait_result_t pre_render_wait{};
+        if (dirty_mask == 0) {
+            aida_tracer::mark_render_phase("idle_frame_wait");
+            const frame_wait_result_t idle_wait = wait_for_frame_latency_or_input(idle_wait_request_ms);
+            ++skipped_render_frames;
+            static uint64_t s_last_skip_wait_log_ms = 0;
+            const bool skip_wait_anomaly = idle_wait.result == WAIT_FAILED || (idle_wait.waitable_present && idle_wait.actual_ms == 0 && !idle_wait.input_available && !idle_wait.frame_latency_signaled);
+            if (skip_wait_anomaly && dirty_now_ms - s_last_skip_wait_log_ms >= 5000ull) {
+                s_last_skip_wait_log_ms = dirty_now_ms;
+                diag::log_tagged_fmt("render",
+                    "dirty_skip_anomaly skipped=%llu waitable=%d request_ms=%lu actual_ms=%lu result=0x%08lX gle=%lu input=%d signaled=%d qs=0x%08lX foreground=%d cursor_over=%d full_test=%d bulk_busy=%d",
+                    static_cast<unsigned long long>(skipped_render_frames),
+                    idle_wait.waitable_present ? 1 : 0,
+                    static_cast<unsigned long>(idle_wait.requested_ms),
+                    static_cast<unsigned long>(idle_wait.actual_ms),
+                    static_cast<unsigned long>(idle_wait.result),
+                    static_cast<unsigned long>(idle_wait.gle),
+                    idle_wait.input_available ? 1 : 0,
+                    idle_wait.frame_latency_signaled ? 1 : 0,
+                    static_cast<unsigned long>(dirty_qs),
+                    foreground_pre ? 1 : 0,
+                    cursor_over_aida_pre ? 1 : 0,
+                    full_test_running_pre ? 1 : 0,
+                    bulk_busy_pre ? 1 : 0);
+            }
+            aida_tracer::mark_render_phase("idle_frame_skipped");
+            continue;
+        }
+        DWORD pre_render_wait_ms = kAidaPreRenderWaitMs;
+        if ((dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage)) != 0)
+            pre_render_wait_ms = 0;
+        aida_tracer::mark_render_phase("pre_render_wait");
+        pre_render_wait = wait_for_frame_latency_or_input(pre_render_wait_ms);
+        aida_tracer::mark_render_phase("pre_render_wait_done");
+        if (pre_render_wait.input_available && (dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage)) == 0) {
+            ++skipped_render_frames;
+            aida_tracer::mark_render_phase("pre_render_input_requeue");
+            continue;
+        }
+        dirty_state_initialized = true;
+        last_render_tick_ms = dirty_now_ms;
+        last_overlay_dirty_version = overlay_dirty_version;
+        last_theme_generation = theme_generation;
+        last_dirty_state = cur_state;
+        last_full_test_running = full_test_running_pre;
+        last_bulk_busy = bulk_busy_pre;
+        last_activation_progress = activation_progress_pre;
+        last_ai_thinking = ai_thinking_pre;
+        if (cursor_pos_ok) {
+            last_cursor_pos = cursor_pos;
+            last_cursor_valid = true;
+        }
+        last_cursor_over = cursor_over_aida_pre;
+
         if (frame_number < 5)
             crash_log_write("dx11_new_frame");
         aida_tracer::mark_render_phase("dx11_new_frame");
@@ -5156,7 +5504,6 @@ int main(int, char**)
 
         aida::ui::clock::tick();
         aida::ui::tick_theme_animation(aida::ui::clock::dt());
-        aida::ui::blur::clear_pending();
         {
             const auto& __t = aida::ui::resolved();
             themes::resolved.name = "AiDA";
@@ -5238,8 +5585,10 @@ int main(int, char**)
         if (seh_ir != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_render code=0x%08X frame=%llu",
                 seh_ir, (unsigned long long)frame_number);
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        const draw_data_metrics_t draw_metrics = collect_draw_data_metrics(draw_data);
         aida_tracer::mark_render_phase("imgui_dx11_render");
-        DWORD seh_idr = seh_imgui_dx11_render(ImGui::GetDrawData(), frame_number);
+        DWORD seh_idr = seh_imgui_dx11_render(draw_data, frame_number);
         if (seh_idr != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_dx11_render code=0x%08X frame=%llu",
                 seh_idr, (unsigned long long)frame_number);
@@ -5260,14 +5609,14 @@ int main(int, char**)
                 hr, (unsigned long long)frame_number);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
+        const uint64_t timing_now_ms = static_cast<uint64_t>(GetTickCount64());
+        const uint64_t frame_elapsed_ms = timing_now_ms - frame_start_tick_ms;
+        const bool present_failed = (hr & 0x80000000u) || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
+        const bool frame_slow = frame_elapsed_ms >= 250ULL || present_elapsed_ms >= 100ULL;
         if (frame_number < 5)
             crash_log_fmt("frame_end #%llu", frame_number);
         {
             static uint64_t s_last_frame_timing_log_ms = 0;
-            const uint64_t timing_now_ms = static_cast<uint64_t>(GetTickCount64());
-            const uint64_t frame_elapsed_ms = timing_now_ms - frame_start_tick_ms;
-            const bool present_failed = (hr & 0x80000000u) || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
-            const bool frame_slow = frame_elapsed_ms >= 250ULL || present_elapsed_ms >= 100ULL;
             if ((present_failed || frame_slow) && (timing_now_ms - s_last_frame_timing_log_ms) >= 5000ULL) {
                 s_last_frame_timing_log_ms = timing_now_ms;
                 const DWORD timing_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
@@ -5290,51 +5639,16 @@ int main(int, char**)
         frame_number++;
 
         {
-            static uint64_t s_last_interaction_ms = 0;
-            static ImVec2   s_last_mouse_pos = ImVec2(-1.f, -1.f);
-            const uint64_t now_ms = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            ImGuiIO& io = ImGui::GetIO();
-            bool interacted = false;
-            if (io.MouseDelta.x != 0.f || io.MouseDelta.y != 0.f) interacted = true;
-            if (s_last_mouse_pos.x != io.MousePos.x || s_last_mouse_pos.y != io.MousePos.y) {
-                s_last_mouse_pos = io.MousePos;
-                interacted = true;
-            }
-            if (io.MouseWheel != 0.f || io.MouseWheelH != 0.f) interacted = true;
-            for (int b = 0; b < IM_ARRAYSIZE(io.MouseDown); ++b) {
-                if (io.MouseDown[b]) { interacted = true; break; }
-            }
-            if (io.WantTextInput || io.WantCaptureKeyboard) interacted = true;
-            if (ImGui::IsAnyItemActive() || ImGui::IsAnyItemFocused()) interacted = true;
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.0f)
-                || ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.0f)
-                || ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 1.0f))
-                interacted = true;
-            if (io.KeyCtrl || io.KeyShift || io.KeyAlt || io.KeySuper) interacted = true;
-            if (g_ResizeWidth != 0 || g_ResizeHeight != 0) interacted = true;
-            if (interacted) s_last_interaction_ms = now_ms;
-
-            const bool bulk_busy = function_index::static_bulk_in_progress();
-            const bool full_test_running = test_all_features::is_running();
-            const uint64_t since_interaction_ms = (now_ms > s_last_interaction_ms)
-                ? (now_ms - s_last_interaction_ms) : 0ull;
-            const bool foreground = aida_focus_monitor::focused();
-            const bool foreground_like = true;
-            const bool cursor_over_aida = aida_cursor_over_window(hwnd);
-            const DWORD idle_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
-            const bool interactive_pending = (HIWORD(idle_qs) & kAidaInteractiveQueueBits) != 0;
             const uint64_t tick_now_ms = static_cast<uint64_t>(GetTickCount64());
-
             uint32_t idle_block_mask = 0;
-            if (bulk_busy) idle_block_mask |= 0x00000001u;
-            if (full_test_running) idle_block_mask |= 0x00000002u;
-            if (since_interaction_ms < 150ull) idle_block_mask |= 0x00000004u;
-            if (io.WantTextInput || io.WantCaptureKeyboard) idle_block_mask |= 0x00000008u;
-            if (ImGui::IsAnyItemActive()) idle_block_mask |= 0x00000010u;
-            if (interactive_pending) idle_block_mask |= 0x00000020u;
-            if (cursor_over_aida) idle_block_mask |= 0x00000040u;
+            if (bulk_busy_pre) idle_block_mask |= 0x00000001u;
+            if (full_test_running_pre) idle_block_mask |= 0x00000002u;
+            if (activation_progress_pre) idle_block_mask |= 0x00000004u;
+            if (input_active_pre) idle_block_mask |= 0x00000008u;
+            if (interactive_pending_pre) idle_block_mask |= 0x00000010u;
+            if (cursor_over_aida_pre) idle_block_mask |= 0x00000020u;
+            if (modal_or_animation_pre) idle_block_mask |= 0x00000040u;
+            if (wake_fast_pre) idle_block_mask |= 0x00000080u;
 
             static uint64_t s_last_idle_pacing_probe_ms = 0;
             static uint64_t s_last_idle_pacing_log_ms = 0;
@@ -5356,18 +5670,20 @@ int main(int, char**)
                 if (idle_unhealthy && tick_now_ms - s_last_idle_pacing_log_ms >= 30000ULL) {
                     s_last_idle_pacing_log_ms = tick_now_ms;
                     diag::log_tagged_fmt("render",
-                        "idle_pacing_anomaly frame=%llu post_frame_idle_wait_ms=%lu block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX since_interaction_ms=%llu bulk_busy=%d full_test=%d threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                        "idle_pacing_anomaly frame=%llu pre_render_wait_ms=%lu idle_wait_request_ms=%lu dirty_mask=0x%08X block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX bulk_busy=%d full_test=%d skipped=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
                         static_cast<unsigned long long>(frame_number),
-                        0UL,
+                        static_cast<unsigned long>(pre_render_wait.actual_ms),
+                        static_cast<unsigned long>(idle_wait_request_ms),
+                        static_cast<unsigned>(dirty_mask),
                         static_cast<unsigned>(idle_block_mask),
-                        foreground ? 1 : 0,
-                        foreground_like ? 1 : 0,
-                        cursor_over_aida ? 1 : 0,
-                        interactive_pending ? 1 : 0,
-                        static_cast<unsigned long>(idle_qs),
-                        static_cast<unsigned long long>(since_interaction_ms),
-                        bulk_busy ? 1 : 0,
-                        full_test_running ? 1 : 0,
+                        foreground_pre ? 1 : 0,
+                        foreground_like_pre ? 1 : 0,
+                        cursor_over_aida_pre ? 1 : 0,
+                        interactive_pending_pre ? 1 : 0,
+                        static_cast<unsigned long>(dirty_qs),
+                        bulk_busy_pre ? 1 : 0,
+                        full_test_running_pre ? 1 : 0,
+                        static_cast<unsigned long long>(skipped_render_frames),
                         static_cast<unsigned long>(thread_count),
                         static_cast<unsigned long>(thread_err),
                         static_cast<unsigned>(wq.active),
@@ -5379,6 +5695,104 @@ int main(int, char**)
                         static_cast<unsigned>(cq.active),
                         cq.pending,
                         static_cast<unsigned long long>(cq.oldest_active_ms));
+                }
+            }
+            static uint64_t s_last_frame_pacing_log_ms = 0;
+            static uint64_t s_last_frame_pacing_frame = 0;
+            static uint64_t s_last_frame_pacing_skipped = 0;
+            const bool wait_failed = pre_render_wait.result == WAIT_FAILED;
+            if (s_last_frame_pacing_log_ms == 0) {
+                s_last_frame_pacing_log_ms = tick_now_ms;
+                s_last_frame_pacing_frame = frame_number;
+                s_last_frame_pacing_skipped = skipped_render_frames;
+                (void)sample_current_process_cpu(tick_now_ms);
+            } else {
+                const uint64_t since_pacing_log_ms = tick_now_ms >= s_last_frame_pacing_log_ms ? tick_now_ms - s_last_frame_pacing_log_ms : 0ULL;
+                const bool pacing_due = since_pacing_log_ms >= kAidaFramePacingLogIntervalMs;
+                const bool pacing_anomaly = wait_failed || present_failed || frame_slow || (pre_render_wait.waitable_present && pre_render_wait.requested_ms != 0 && pre_render_wait.actual_ms == 0 && !pre_render_wait.frame_latency_signaled);
+                if (pacing_due || (pacing_anomaly && since_pacing_log_ms >= 5000ULL)) {
+                    DWORD thread_err = 0;
+                    const DWORD thread_count = count_current_process_threads(&thread_err);
+                    const auto wq = work_queue::stats();
+                    const auto svc = work_queue::service_stats();
+                    const auto cq = critical_work_queue::stats();
+                    const process_cpu_delta_t cpu = sample_current_process_cpu(tick_now_ms);
+                    const uint64_t frame_delta = frame_number >= s_last_frame_pacing_frame ? frame_number - s_last_frame_pacing_frame : 0ULL;
+                    const uint64_t skipped_delta = skipped_render_frames >= s_last_frame_pacing_skipped ? skipped_render_frames - s_last_frame_pacing_skipped : 0ULL;
+                    const double fps = since_pacing_log_ms != 0 ? (static_cast<double>(frame_delta) * 1000.0) / static_cast<double>(since_pacing_log_ms) : 0.0;
+                    const auto overlay_perf = test_all_features::overlay_perf_snapshot();
+                    diag::log_tagged_fmt("render",
+                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu waitable=%d pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d pre_wait_signaled=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long long>(frame_delta),
+                        static_cast<unsigned long long>(skipped_delta),
+                        static_cast<unsigned long long>(skipped_render_frames),
+                        fps,
+                        cpu.cpu_percent,
+                        cpu.valid ? 1 : 0,
+                        static_cast<unsigned long long>(cpu.wall_ms),
+                        static_cast<unsigned long long>(cpu.busy_100ns),
+                        static_cast<unsigned long>(cpu.gle),
+                        static_cast<unsigned long>(cpu.logical_processors),
+                        static_cast<unsigned>(kAidaPresentSyncInterval),
+                        static_cast<unsigned>(kAidaPresentFlags),
+                        static_cast<unsigned long long>(frame_elapsed_ms),
+                        static_cast<unsigned long long>(present_elapsed_ms),
+                        pre_render_wait.waitable_present ? 1 : 0,
+                        static_cast<unsigned long>(pre_render_wait.requested_ms),
+                        static_cast<unsigned long>(pre_render_wait.actual_ms),
+                        static_cast<unsigned long>(pre_render_wait.result),
+                        static_cast<unsigned long>(pre_render_wait.gle),
+                        pre_render_wait.input_available ? 1 : 0,
+                        pre_render_wait.frame_latency_signaled ? 1 : 0,
+                        static_cast<unsigned>(dirty_mask),
+                        static_cast<unsigned long>(idle_wait_request_ms),
+                        foreground_pre ? 1 : 0,
+                        foreground_like_pre ? 1 : 0,
+                        cursor_over_aida_pre ? 1 : 0,
+                        interactive_pending_pre ? 1 : 0,
+                        static_cast<unsigned long>(dirty_qs),
+                        static_cast<unsigned>(idle_block_mask),
+                        bulk_busy_pre ? 1 : 0,
+                        full_test_running_pre ? 1 : 0,
+                        modal_or_animation_pre ? 1 : 0,
+                        activation_progress_pre ? 1 : 0,
+                        ai_thinking_pre ? 1 : 0,
+                        pumped_messages,
+                        pumped_input_messages,
+                        pumped_resize_messages,
+                        pumped_paint_messages,
+                        draw_metrics.draw_lists,
+                        draw_metrics.draw_cmds,
+                        draw_metrics.total_vtx,
+                        draw_metrics.total_idx,
+                        draw_metrics.callbacks,
+                        draw_metrics.reset_callbacks,
+                        overlay_perf.visible ? 1 : 0,
+                        overlay_perf.running ? 1 : 0,
+                        overlay_perf.total_log_lines,
+                        overlay_perf.cached_log_lines,
+                        overlay_perf.rendered_log_rows,
+                        static_cast<unsigned long long>(overlay_perf.log_version),
+                        static_cast<unsigned long long>(overlay_perf.dirty_version),
+                        overlay_perf.snapshot_changed ? 1 : 0,
+                        overlay_perf.snapshot_busy ? 1 : 0,
+                        static_cast<unsigned long long>(overlay_perf.lock_busy_total),
+                        static_cast<unsigned long long>(overlay_perf.render_elapsed_us),
+                        static_cast<unsigned long>(thread_count),
+                        static_cast<unsigned long>(thread_err),
+                        static_cast<unsigned>(wq.active),
+                        wq.pending,
+                        static_cast<unsigned long long>(wq.oldest_active_ms),
+                        static_cast<unsigned>(svc.active),
+                        svc.pending,
+                        static_cast<unsigned long long>(svc.oldest_active_ms),
+                        static_cast<unsigned>(cq.active),
+                        cq.pending,
+                        static_cast<unsigned long long>(cq.oldest_active_ms));
+                    s_last_frame_pacing_log_ms = tick_now_ms;
+                    s_last_frame_pacing_frame = frame_number;
+                    s_last_frame_pacing_skipped = skipped_render_frames;
                 }
             }
         }

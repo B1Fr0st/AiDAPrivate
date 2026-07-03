@@ -236,6 +236,7 @@ static const char* network_tab_name(network_view::sub_tab_t tab) {
     case network_view::sub_tab_t::browser: return "browser";
     case network_view::sub_tab_t::reports: return "reports";
     case network_view::sub_tab_t::headless: return "headless";
+    case network_view::sub_tab_t::offensive: return "offensive";
     case network_view::sub_tab_t::COUNT: break;
     }
     return "";
@@ -1091,7 +1092,8 @@ static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& p
         && is_analysis_center_view(center_view_t::stealth_view)
         && !is_analysis_center_view(center_view_t::types_hub), "analysis center route family");
 
-    ck.require(static_cast<int>(network_view::sub_tab_t::COUNT) == 35, "network subtab count");
+    constexpr int kExpectedNetworkSubtabs = 36;
+    ck.require(static_cast<int>(network_view::sub_tab_t::COUNT) == kExpectedNetworkSubtabs, "network subtab count");
     for (int i = 0; i < static_cast<int>(network_view::sub_tab_t::COUNT); ++i) {
         auto tab = static_cast<network_view::sub_tab_t>(i);
         auto prev = network_view::g_state.active_tab;
@@ -1528,8 +1530,8 @@ static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& p
         ck.failures.c_str(),
         us);
     if (palette_ok && ck.ok && dispatch_state_ok) {
-        pass(hf, passed, "ui_palette_views", "command palette, %d center routes, 35 network tabs, hub/debugger/emulation subviews, and backing route state invariants passed (%d checks, elapsed_us=%lld)",
-            static_cast<int>(std::size(views)), ck.checked, us);
+        pass(hf, passed, "ui_palette_views", "command palette, %d center routes, %d network tabs, hub/debugger/emulation subviews, and backing route state invariants passed (%d checks, elapsed_us=%lld)",
+            static_cast<int>(std::size(views)), static_cast<int>(network_view::sub_tab_t::COUNT), ck.checked, us);
     } else {
         fail(hf, failed, "ui_palette_views", "palette_ok=%d checks_ok=%d dispatch_state_ok=%d active_view=%d palette_open=%d query=%s checked=%d failures=%s elapsed_us=%lld",
             palette_ok ? 1 : 0,

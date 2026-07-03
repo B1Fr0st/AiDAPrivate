@@ -77,6 +77,19 @@ static constexpr size_t PATCH_PAGE_BASE         = 183;
 static constexpr size_t PATCH_PAGE_SIZE         = 196;
 static constexpr size_t PATCH_ORIG_PROTECT      = 208;
 static constexpr size_t PATCH_VIRT_PROTECT      = 227;
+static constexpr uint64_t VEH_REGISTER_DIAG_MAGIC = 0xA1DA565548444947ull;
+
+struct veh_register_remote_diag_t {
+    uint64_t magic = 0;
+    uint64_t rtl_add_fn = 0;
+    uint64_t handler = 0;
+    uint64_t result = 0;
+    uint64_t completed = 0;
+    uint32_t last_error_before = 0;
+    uint32_t last_error_after = 0;
+};
+
+static_assert(sizeof(veh_register_remote_diag_t) == 48, "veh_register_remote_diag_t must be 48 bytes");
 
 struct process_mitigation_diag_t {
     bool open_ok = false;
@@ -769,6 +782,43 @@ static inline uint64_t remote_thread_call(uint32_t pid,
 }
 
 
+static inline std::vector<uint8_t> generate_veh_register_wrapper_shellcode()
+{
+    std::vector<uint8_t> code;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) {
+        code.insert(code.end(), bytes.begin(), bytes.end());
+    };
+    auto emit_u64 = [&](uint64_t value) {
+        for (int i = 0; i < 8; ++i)
+            code.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+    };
+    emit({0x53});
+    emit({0x48, 0x83, 0xEC, 0x20});
+    emit({0x4C, 0x89, 0xCB});
+    emit({0x48, 0xB8});
+    emit_u64(VEH_REGISTER_DIAG_MAGIC);
+    emit({0x48, 0x89, 0x03});
+    emit({0x48, 0x89, 0x4B, 0x08});
+    emit({0x4C, 0x89, 0x43, 0x10});
+    emit({0x65, 0x8B, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00});
+    emit({0x89, 0x43, 0x28});
+    emit({0x48, 0x89, 0xD1});
+    emit({0x4C, 0x89, 0xC2});
+    emit({0x48, 0x8B, 0x43, 0x08});
+    emit({0xFF, 0xD0});
+    emit({0x48, 0x89, 0x43, 0x18});
+    emit({0x65, 0x8B, 0x04, 0x25, 0x68, 0x00, 0x00, 0x00});
+    emit({0x89, 0x43, 0x2C});
+    emit({0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00});
+    emit({0x48, 0x89, 0x43, 0x20});
+    emit({0x48, 0x8B, 0x43, 0x18});
+    emit({0x48, 0x83, 0xC4, 0x20});
+    emit({0x5B});
+    emit({0xC3});
+    return code;
+}
+
+
 static inline std::vector<uint8_t> generate_veh_shellcode(
         uint64_t ring_base,
         uint64_t page_base,
@@ -1240,6 +1290,8 @@ class pg_engine_t {
         uint64_t shellcode_addr = 0;
         uint64_t ring_addr = 0;
         uint64_t context_addr = 0;
+        uint64_t wrapper_addr = 0;
+        uint64_t diag_addr = 0;
         uint64_t rtl_add_fn = 0;
         uint64_t rtl_remove_fn = 0;
         uint64_t veh_result = 0;
@@ -1382,7 +1434,7 @@ public:
             const ULONGLONG quarantine_age = GetTickCount64() >= active_quarantine.created_ms ? GetTickCount64() - active_quarantine.created_ms : 0;
             if (quarantine_age > 30000) {
                 diag::log_tagged_fmt("pg_sniff",
-                    "install_quarantine_timeout_cleanup pid=%u active_pid=%u quarantine_id=%llu age_ms=%llu veh_result=0x%llX rtl_remove=0x%llX sc=0x%llX ring=0x%llX generation=%llu elapsed_ms=%llu",
+                    "install_quarantine_timeout_cleanup pid=%u active_pid=%u quarantine_id=%llu age_ms=%llu veh_result=0x%llX rtl_remove=0x%llX sc=0x%llX ring=0x%llX wrapper=0x%llX diag=0x%llX generation=%llu elapsed_ms=%llu",
                     pid,
                     active_quarantine.active_pid,
                     static_cast<unsigned long long>(active_quarantine.quarantine_id),
@@ -1391,6 +1443,8 @@ public:
                     static_cast<unsigned long long>(active_quarantine.rtl_remove_fn),
                     static_cast<unsigned long long>(active_quarantine.shellcode_addr),
                     static_cast<unsigned long long>(active_quarantine.ring_addr),
+                    static_cast<unsigned long long>(active_quarantine.wrapper_addr),
+                    static_cast<unsigned long long>(active_quarantine.diag_addr),
                     static_cast<unsigned long long>(install_generation),
                     static_cast<unsigned long long>(GetTickCount64() - install_start));
                 if (active_quarantine.veh_result != 0 && active_quarantine.rtl_remove_fn != 0) {
@@ -1405,6 +1459,10 @@ public:
                     driver_bridge::free_memory_for(pid, active_quarantine.shellcode_addr);
                 if (active_quarantine.ring_addr != 0)
                     driver_bridge::free_memory_for(pid, active_quarantine.ring_addr);
+                if (active_quarantine.wrapper_addr != 0)
+                    driver_bridge::free_memory_for(pid, active_quarantine.wrapper_addr);
+                if (active_quarantine.diag_addr != 0)
+                    driver_bridge::free_memory_for(pid, active_quarantine.diag_addr);
                 release_install_quarantine_reservation(active_quarantine.quarantine_id, "quarantine_timeout_expired");
                 diag::log_tagged_fmt("pg_sniff",
                     "install_quarantine_timeout_cleaned pid=%u quarantine_id=%llu released=1 continuing_install=1 generation=%llu elapsed_ms=%llu",
@@ -1996,6 +2054,69 @@ public:
             SetLastError(ERROR_CANCELLED);
             return fail_install("mcp_cancelled", "page-guard install cancelled before VEH remote call", &mri, target_addr, region_size, 0);
         }
+        uint64_t veh_wrapper_addr = 0;
+        uint64_t veh_diag_addr = 0;
+        uint32_t veh_wrapper_old_protect = 0;
+        auto fail_veh_register_setup = [&](const char* reason_code, const char* detail, DWORD win32_error) -> uint32_t {
+            const bool cleanup_wrapper_ok = veh_wrapper_addr == 0 || driver_bridge::free_memory_for(pid, veh_wrapper_addr);
+            const std::string cleanup_wrapper_error = cleanup_wrapper_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_diag_ok = veh_diag_addr == 0 || driver_bridge::free_memory_for(pid, veh_diag_addr);
+            const std::string cleanup_diag_error = cleanup_diag_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_sc_ok = driver_bridge::free_memory_for(pid, sc_addr);
+            const std::string cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
+            const bool cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
+            const std::string cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+            release_install_quarantine_reservation(quarantine_reservation_id, reason_code);
+            diag::log_tagged_fmt("pg_sniff",
+                "veh_register_wrapper_setup_failed pid=%u active_pid=%u reason=%s wrapper=0x%llX diag=0x%llX sc=0x%llX ring=0x%llX cleanup_wrapper_ok=%d cleanup_wrapper_error=%s cleanup_diag_ok=%d cleanup_diag_error=%s cleanup_sc_ok=%d cleanup_sc_error=%s cleanup_ring_ok=%d cleanup_ring_error=%s win32=%lu elapsed_ms=%llu",
+                pid,
+                driver_bridge::attached_pid(),
+                reason_code ? reason_code : "",
+                static_cast<unsigned long long>(veh_wrapper_addr),
+                static_cast<unsigned long long>(veh_diag_addr),
+                static_cast<unsigned long long>(sc_addr),
+                static_cast<unsigned long long>(ring_addr),
+                cleanup_wrapper_ok ? 1 : 0,
+                cleanup_wrapper_error.c_str(),
+                cleanup_diag_ok ? 1 : 0,
+                cleanup_diag_error.c_str(),
+                cleanup_sc_ok ? 1 : 0,
+                cleanup_sc_error.c_str(),
+                cleanup_ring_ok ? 1 : 0,
+                cleanup_ring_error.c_str(),
+                static_cast<unsigned long>(win32_error),
+                static_cast<unsigned long long>(GetTickCount64() - install_start));
+            SetLastError(win32_error);
+            return fail_install(reason_code, detail, &mri, target_addr, region_size, 0);
+        };
+        std::vector<uint8_t> veh_diag_zero(sizeof(veh_register_remote_diag_t), 0);
+        veh_diag_addr = driver_bridge::allocate_memory_for(pid, sizeof(veh_register_remote_diag_t));
+        if (veh_diag_addr == 0)
+            return fail_veh_register_setup("veh_diag_alloc", "failed to allocate target-side VEH registration diagnostic block", GetLastError() ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY);
+        if (!driver_bridge::write_memory_for(pid, veh_diag_addr, veh_diag_zero))
+            return fail_veh_register_setup("veh_diag_write", "failed to initialize target-side VEH registration diagnostic block", GetLastError() ? GetLastError() : ERROR_WRITE_FAULT);
+        std::vector<uint8_t> veh_wrapper = generate_veh_register_wrapper_shellcode();
+        veh_wrapper_addr = driver_bridge::allocate_memory_for(pid, veh_wrapper.size() + 16);
+        if (veh_wrapper_addr == 0)
+            return fail_veh_register_setup("veh_wrapper_alloc", "failed to allocate target-side VEH registration wrapper", GetLastError() ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY);
+        if (!driver_bridge::write_memory_for(pid, veh_wrapper_addr, veh_wrapper))
+            return fail_veh_register_setup("veh_wrapper_write", "failed to write target-side VEH registration wrapper", GetLastError() ? GetLastError() : ERROR_WRITE_FAULT);
+        if (!driver_bridge::protect_memory_for(pid, veh_wrapper_addr, veh_wrapper.size(), PAGE_EXECUTE_READ, &veh_wrapper_old_protect))
+            return fail_veh_register_setup("veh_wrapper_protect", "failed to make target-side VEH registration wrapper executable", GetLastError() ? GetLastError() : ERROR_ACCESS_DENIED);
+        diag::log_tagged_fmt("pg_sniff",
+            "veh_register_wrapper_ready pid=%u active_pid=%u wrapper=0x%llX wrapper_size=%zu diag=0x%llX diag_size=%zu wrapper_old_protect=0x%08X rtl_add=0x%llX handler=0x%llX generation=%llu current_generation=%llu elapsed_ms=%llu",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(veh_wrapper_addr),
+            veh_wrapper.size(),
+            static_cast<unsigned long long>(veh_diag_addr),
+            sizeof(veh_register_remote_diag_t),
+            veh_wrapper_old_protect,
+            static_cast<unsigned long long>(rtl_add_fn),
+            static_cast<unsigned long long>(sc_addr),
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
         const char* veh_diag_id = driver_bridge::current_remote_call_diag_id();
         char veh_generated_diag_id[128] = {};
         if (!veh_diag_id || !veh_diag_id[0]) {
@@ -2034,22 +2155,55 @@ public:
             static_cast<unsigned long long>(install_generation),
             static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(GetTickCount64() - install_start));
-        uint64_t veh_handle = driver_remote_call_impl(pid, rtl_add_fn, 1, sc_addr, 0, 0, "RtlAddVectoredExceptionHandler");
+        uint64_t veh_handle = driver_remote_call_impl(pid, veh_wrapper_addr, rtl_add_fn, 1, sc_addr, veh_diag_addr, "RtlAddVectoredExceptionHandler.wrapper");
         remote_call_diag_snapshot_t veh_remote_diag = last_driver_remote_call_diag();
         uint64_t veh_call_elapsed = GetTickCount64() - veh_call_start;
         DWORD veh_call_gle = veh_handle != 0 ? ERROR_SUCCESS : GetLastError();
         std::string veh_call_status = driver_bridge::status();
         std::string veh_call_last_error = driver_bridge::last_error();
+        veh_register_remote_diag_t veh_target_diag{};
+        std::vector<uint8_t> veh_target_diag_bytes;
+        const bool veh_target_diag_read_ok =
+            driver_bridge::read_memory_for(pid, veh_diag_addr, sizeof(veh_target_diag), veh_target_diag_bytes) &&
+            veh_target_diag_bytes.size() >= sizeof(veh_target_diag);
+        if (veh_target_diag_read_ok)
+            std::memcpy(&veh_target_diag, veh_target_diag_bytes.data(), sizeof(veh_target_diag));
+        const bool veh_target_diag_magic_ok = veh_target_diag_read_ok && veh_target_diag.magic == VEH_REGISTER_DIAG_MAGIC;
         diag::log_tagged_fmt("pg_sniff",
-            "veh_register_remote_call_result call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u function=RtlAddVectoredExceptionHandler va=0x%llX handler=0x%llX result=0x%llX ok=%d completed=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX seh_addr=0x%llX seh_fault=0x%llX seh_rip=0x%llX lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu generation=%llu current_generation=%llu status=%s last_error=%s",
+            "veh_register_target_diag pid=%u active_pid=%u wrapper=0x%llX diag=0x%llX read_ok=%d bytes=%zu magic=0x%llX magic_ok=%d completed=%llu rtl_add=0x%llX handler=0x%llX result=0x%llX last_error_before=%lu last_error_after=%lu lower_result=0x%llX lower_gle=%lu elapsed_ms=%llu generation=%llu current_generation=%llu",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(veh_wrapper_addr),
+            static_cast<unsigned long long>(veh_diag_addr),
+            veh_target_diag_read_ok ? 1 : 0,
+            veh_target_diag_bytes.size(),
+            static_cast<unsigned long long>(veh_target_diag.magic),
+            veh_target_diag_magic_ok ? 1 : 0,
+            static_cast<unsigned long long>(veh_target_diag.completed),
+            static_cast<unsigned long long>(veh_target_diag.rtl_add_fn),
+            static_cast<unsigned long long>(veh_target_diag.handler),
+            static_cast<unsigned long long>(veh_target_diag.result),
+            static_cast<unsigned long>(veh_target_diag.last_error_before),
+            static_cast<unsigned long>(veh_target_diag.last_error_after),
+            static_cast<unsigned long long>(veh_remote_diag.result),
+            static_cast<unsigned long>(veh_call_gle),
+            static_cast<unsigned long long>(veh_call_elapsed),
+            static_cast<unsigned long long>(install_generation),
+            static_cast<unsigned long long>(install_stop_generation_.load(std::memory_order_acquire)));
+        diag::log_tagged_fmt("pg_sniff",
+            "veh_register_remote_call_result call_id=%llu expected_call_id=%llu pid=%u active_pid_entry=%u active_pid_after=%u function=RtlAddVectoredExceptionHandler va=0x%llX wrapper=0x%llX diag=0x%llX handler=0x%llX result=0x%llX target_result=0x%llX target_last_error_after=%lu ok=%d completed=%d gle=%lu timeout_ms=%u deadline_ms=%llu deadline_remaining_ms=%llu cancelled_before=%d cancelled_after=%d deadline_expired_before=%d deadline_expired_after=%d stale_pid=%d late_completion=%d lower_phase=%s lower_reason=%s lower_completed=%d lower_ok=%d lower_gle=%lu lower_worker_tid=%lu lower_worker_alive=%u lower_queue_depth_submit=%u lower_queue_depth_after_pop=%u lower_inflight_after=%u lower_queue_wait_ms=%llu lower_elapsed_ms=%llu lower_deadline_remaining_finish_ms=%llu lower_worker_exception=%d lower_worker_creation_failed=%d zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX seh_addr=0x%llX seh_fault=0x%llX seh_rip=0x%llX lower_error_value=%d lower_error_category=%s lower_error_message=%s remote_elapsed_ms=%llu measured_elapsed_ms=%llu generation=%llu current_generation=%llu status=%s last_error=%s",
             static_cast<unsigned long long>(veh_remote_diag.call_id),
             static_cast<unsigned long long>(veh_expected_call_id),
             pid,
             veh_remote_diag.active_pid_entry,
             veh_remote_diag.active_pid_after,
             static_cast<unsigned long long>(rtl_add_fn),
+            static_cast<unsigned long long>(veh_wrapper_addr),
+            static_cast<unsigned long long>(veh_diag_addr),
             static_cast<unsigned long long>(sc_addr),
             static_cast<unsigned long long>(veh_remote_diag.result),
+            static_cast<unsigned long long>(veh_target_diag.result),
+            static_cast<unsigned long>(veh_target_diag.last_error_after),
             veh_remote_diag.ok ? 1 : 0,
             veh_remote_diag.completed ? 1 : 0,
             static_cast<unsigned long>(veh_call_gle),
@@ -2129,13 +2283,19 @@ public:
             bool cleanup_veh_remove_ok = false;
             bool cleanup_sc_ok = false;
             bool cleanup_ring_ok = false;
+            bool cleanup_wrapper_ok = false;
+            bool cleanup_diag_ok = false;
             bool retained_sc = false;
             bool retained_ring = false;
+            bool retained_wrapper = false;
+            bool retained_diag = false;
             uint64_t cleanup_removed = 0;
             uint64_t quarantine_id = 0;
             const char* cleanup_decision = "definite_no_handler_free";
             std::string cleanup_sc_error;
             std::string cleanup_ring_error;
+            std::string cleanup_wrapper_error;
+            std::string cleanup_diag_error;
             if (lower_uncertain) {
                 cleanup_decision = known_late_handle ? "known_late_handle_remove_then_free" : "retain_uncertain_handler_resources";
                 if (known_late_handle && driver_bridge::attached_pid() == pid) {
@@ -2160,13 +2320,25 @@ public:
                         retained_sc = true;
                         retained_ring = true;
                     }
+                    cleanup_wrapper_ok = driver_bridge::free_memory_for(pid, veh_wrapper_addr);
+                    cleanup_wrapper_error = cleanup_wrapper_ok ? std::string() : driver_bridge::last_error();
+                    cleanup_diag_ok = driver_bridge::free_memory_for(pid, veh_diag_addr);
+                    cleanup_diag_error = cleanup_diag_ok ? std::string() : driver_bridge::last_error();
+                    veh_wrapper_addr = cleanup_wrapper_ok ? 0 : veh_wrapper_addr;
+                    veh_diag_addr = cleanup_diag_ok ? 0 : veh_diag_addr;
+                    retained_wrapper = !cleanup_wrapper_ok;
+                    retained_diag = !cleanup_diag_ok;
                 } else {
                     cleanup_sc_error = "retained_uncertain_remote_handler";
                     cleanup_ring_error = "retained_uncertain_remote_handler";
+                    cleanup_wrapper_error = "retained_uncertain_remote_wrapper";
+                    cleanup_diag_error = "retained_uncertain_remote_wrapper";
                     retained_sc = true;
                     retained_ring = true;
+                    retained_wrapper = true;
+                    retained_diag = true;
                 }
-                if (retained_sc || retained_ring) {
+                if (retained_sc || retained_ring || retained_wrapper || retained_diag) {
                     quarantine_id = add_install_quarantine(quarantine_reservation_id,
                                                            pid,
                                                            driver_bridge::attached_pid(),
@@ -2174,6 +2346,8 @@ public:
                                                            sc_addr,
                                                            ring_addr,
                                                            veh_context_addr,
+                                                           retained_wrapper ? veh_wrapper_addr : 0,
+                                                           retained_diag ? veh_diag_addr : 0,
                                                            rtl_add_fn,
                                                            rtl_remove_fn,
                                                            veh_remote_diag.result,
@@ -2188,10 +2362,18 @@ public:
                 cleanup_sc_error = cleanup_sc_ok ? std::string() : driver_bridge::last_error();
                 cleanup_ring_ok = driver_bridge::free_memory_for(pid, ring_addr);
                 cleanup_ring_error = cleanup_ring_ok ? std::string() : driver_bridge::last_error();
+                cleanup_wrapper_ok = driver_bridge::free_memory_for(pid, veh_wrapper_addr);
+                cleanup_wrapper_error = cleanup_wrapper_ok ? std::string() : driver_bridge::last_error();
+                cleanup_diag_ok = driver_bridge::free_memory_for(pid, veh_diag_addr);
+                cleanup_diag_error = cleanup_diag_ok ? std::string() : driver_bridge::last_error();
+                veh_wrapper_addr = cleanup_wrapper_ok ? 0 : veh_wrapper_addr;
+                veh_diag_addr = cleanup_diag_ok ? 0 : veh_diag_addr;
+                retained_wrapper = !cleanup_wrapper_ok;
+                retained_diag = !cleanup_diag_ok;
                 release_install_quarantine_reservation(quarantine_reservation_id, "veh_register_definite_failure");
             }
             diag::log_tagged_fmt("pg_sniff",
-                "veh_register_cleanup_decision pid=%u active_pid=%u call_id=%llu expected_call_id=%llu decision=%s lower_uncertain=%d lower_started=%d known_late_handle=%d known_handle=0x%llX quarantine_id=%llu retained_sc=%d retained_ring=%d remove_attempted=%d remove_ok=%d removed=0x%llX sc=0x%llX ring=0x%llX context=0x%llX zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX deadline_expired_after=%d stale_pid=%d lower_phase=%s lower_reason=%s elapsed_ms=%llu",
+                "veh_register_cleanup_decision pid=%u active_pid=%u call_id=%llu expected_call_id=%llu decision=%s lower_uncertain=%d lower_started=%d known_late_handle=%d known_handle=0x%llX quarantine_id=%llu retained_sc=%d retained_ring=%d retained_wrapper=%d retained_diag=%d remove_attempted=%d remove_ok=%d removed=0x%llX sc=0x%llX ring=0x%llX context=0x%llX wrapper=0x%llX diag=0x%llX cleanup_wrapper_ok=%d cleanup_wrapper_error=%s cleanup_diag_ok=%d cleanup_diag_error=%s zero_result_rejected=%d removed_from_queue=%d popped=%d execution_started=%d executing_abandoned=%d seh_exception=%d seh_code=0x%08lX deadline_expired_after=%d stale_pid=%d lower_phase=%s lower_reason=%s elapsed_ms=%llu",
                 pid,
                 driver_bridge::attached_pid(),
                 static_cast<unsigned long long>(veh_remote_diag.call_id),
@@ -2204,12 +2386,20 @@ public:
                 static_cast<unsigned long long>(quarantine_id),
                 retained_sc ? 1 : 0,
                 retained_ring ? 1 : 0,
+                retained_wrapper ? 1 : 0,
+                retained_diag ? 1 : 0,
                 cleanup_veh_remove_attempted ? 1 : 0,
                 cleanup_veh_remove_ok ? 1 : 0,
                 static_cast<unsigned long long>(cleanup_removed),
                 static_cast<unsigned long long>(sc_addr),
                 static_cast<unsigned long long>(ring_addr),
                 static_cast<unsigned long long>(veh_context_addr),
+                static_cast<unsigned long long>(veh_wrapper_addr),
+                static_cast<unsigned long long>(veh_diag_addr),
+                cleanup_wrapper_ok ? 1 : 0,
+                cleanup_wrapper_error.c_str(),
+                cleanup_diag_ok ? 1 : 0,
+                cleanup_diag_error.c_str(),
                 veh_remote_diag.zero_result_rejected ? 1 : 0,
                 veh_remote_diag.removed_from_queue ? 1 : 0,
                 veh_remote_diag.popped_from_queue ? 1 : 0,
@@ -2399,6 +2589,30 @@ public:
             return 0;
         }
         release_install_quarantine_reservation(quarantine_reservation_id, "veh_register_success");
+        const uint64_t veh_wrapper_addr_registered = veh_wrapper_addr;
+        const uint64_t veh_diag_addr_registered = veh_diag_addr;
+        const bool veh_cleanup_wrapper_ok = veh_wrapper_addr == 0 || driver_bridge::free_memory_for(pid, veh_wrapper_addr);
+        const std::string veh_cleanup_wrapper_error = veh_cleanup_wrapper_ok ? std::string() : driver_bridge::last_error();
+        if (veh_cleanup_wrapper_ok)
+            veh_wrapper_addr = 0;
+        const bool veh_cleanup_diag_ok = veh_diag_addr == 0 || driver_bridge::free_memory_for(pid, veh_diag_addr);
+        const std::string veh_cleanup_diag_error = veh_cleanup_diag_ok ? std::string() : driver_bridge::last_error();
+        if (veh_cleanup_diag_ok)
+            veh_diag_addr = 0;
+        diag::log_tagged_fmt("pg_sniff",
+            "veh_register_wrapper_cleanup pid=%u active_pid=%u wrapper=0x%llX diag=0x%llX cleanup_wrapper_ok=%d cleanup_wrapper_error=%s cleanup_diag_ok=%d cleanup_diag_error=%s handle=0x%llX target_result=0x%llX target_last_error_after=%lu elapsed_ms=%llu",
+            pid,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(veh_wrapper_addr_registered),
+            static_cast<unsigned long long>(veh_diag_addr_registered),
+            veh_cleanup_wrapper_ok ? 1 : 0,
+            veh_cleanup_wrapper_error.c_str(),
+            veh_cleanup_diag_ok ? 1 : 0,
+            veh_cleanup_diag_error.c_str(),
+            static_cast<unsigned long long>(veh_handle),
+            static_cast<unsigned long long>(veh_target_diag.result),
+            static_cast<unsigned long>(veh_target_diag.last_error_after),
+            static_cast<unsigned long long>(GetTickCount64() - install_start));
         if (const char* reason = check_install_cancelled("after_veh_register")) {
             uint64_t removed = remove_vectored_exception_handler_remote(pid,
                                                                          ntdll_mod_install.base,
@@ -3301,7 +3515,7 @@ private:
         }
         for (const auto& quarantine : retired) {
             diag::log_tagged_fmt("pg_sniff",
-                "install_quarantine_retired phase=%s pid=%u active_pid=%u quarantine_id=%llu call_id=%llu reserved=%d sc=0x%llX ring=0x%llX context=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu age_ms=%llu",
+                "install_quarantine_retired phase=%s pid=%u active_pid=%u quarantine_id=%llu call_id=%llu reserved=%d sc=0x%llX ring=0x%llX context=0x%llX wrapper=0x%llX diag=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu age_ms=%llu",
                 phase ? phase : "",
                 quarantine.pid,
                 quarantine.active_pid,
@@ -3311,6 +3525,8 @@ private:
                 static_cast<unsigned long long>(quarantine.shellcode_addr),
                 static_cast<unsigned long long>(quarantine.ring_addr),
                 static_cast<unsigned long long>(quarantine.context_addr),
+                static_cast<unsigned long long>(quarantine.wrapper_addr),
+                static_cast<unsigned long long>(quarantine.diag_addr),
                 static_cast<unsigned long long>(quarantine.rtl_add_fn),
                 static_cast<unsigned long long>(quarantine.rtl_remove_fn),
                 static_cast<unsigned long long>(quarantine.veh_result),
@@ -3424,6 +3640,8 @@ private:
                                     uint64_t shellcode_addr,
                                     uint64_t ring_addr,
                                     uint64_t context_addr,
+                                    uint64_t wrapper_addr,
+                                    uint64_t diag_addr,
                                     uint64_t rtl_add_fn,
                                     uint64_t rtl_remove_fn,
                                     uint64_t veh_result,
@@ -3448,6 +3666,8 @@ private:
             committed.shellcode_addr = shellcode_addr;
             committed.ring_addr = ring_addr;
             committed.context_addr = context_addr;
+            committed.wrapper_addr = wrapper_addr;
+            committed.diag_addr = diag_addr;
             committed.rtl_add_fn = rtl_add_fn;
             committed.rtl_remove_fn = rtl_remove_fn;
             committed.veh_result = veh_result;
@@ -3463,7 +3683,7 @@ private:
                 quarantines_.push_back(committed);
         }
         diag::log_tagged_fmt("pg_sniff",
-            "install_quarantine_committed pid=%u active_pid=%u quarantine_id=%llu reservation_id=%llu used_reservation=%d call_id=%llu sc=0x%llX ring=0x%llX context=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu generation=%llu",
+            "install_quarantine_committed pid=%u active_pid=%u quarantine_id=%llu reservation_id=%llu used_reservation=%d call_id=%llu sc=0x%llX ring=0x%llX context=0x%llX wrapper=0x%llX diag=0x%llX rtl_add=0x%llX rtl_remove=0x%llX veh_result=0x%llX remote_gle=%lu generation=%llu",
             pid,
             active_pid,
             static_cast<unsigned long long>(committed.quarantine_id),
@@ -3473,6 +3693,8 @@ private:
             static_cast<unsigned long long>(shellcode_addr),
             static_cast<unsigned long long>(ring_addr),
             static_cast<unsigned long long>(context_addr),
+            static_cast<unsigned long long>(wrapper_addr),
+            static_cast<unsigned long long>(diag_addr),
             static_cast<unsigned long long>(rtl_add_fn),
             static_cast<unsigned long long>(rtl_remove_fn),
             static_cast<unsigned long long>(veh_result),

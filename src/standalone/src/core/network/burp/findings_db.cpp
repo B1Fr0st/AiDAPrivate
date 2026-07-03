@@ -17,6 +17,7 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -66,6 +67,12 @@ bool exec_simple(sqlite3* db, const char* sql)
 bool bind_text(sqlite3_stmt* stmt, int idx, const std::string& s)
 {
     return sqlite3_bind_text(stmt, idx, s.c_str(), static_cast<int>(s.size()), SQLITE_TRANSIENT) == SQLITE_OK;
+}
+
+bool bind_nullable_text(sqlite3_stmt* stmt, int idx, const std::string& s)
+{
+    if (s.empty()) return sqlite3_bind_null(stmt, idx) == SQLITE_OK;
+    return bind_text(stmt, idx, s);
 }
 
 bool bind_json(sqlite3_stmt* stmt, int idx, const nlohmann::json& j)
@@ -136,6 +143,29 @@ bool ensure_column(sqlite3* db, const char* table, const char* column, const cha
 {
     if (column_exists(db, table, column)) return true;
     return exec_simple(db, ddl);
+}
+
+bool cleanup_empty_optional_session_id(sqlite3* db, const char* table, int& total_changes)
+{
+    std::string sql = std::string("UPDATE ") + table + " SET session_id=NULL WHERE session_id=''";
+    if (!exec_simple(db, sql.c_str())) return false;
+    const int changes = sqlite3_changes(db);
+    total_changes += changes;
+    if (changes > 0) {
+        diag::log_tagged_fmt("burp_findings", "schema_cleanup_empty_session table=%s rows=%d", table, changes);
+    }
+    return true;
+}
+
+bool cleanup_empty_optional_session_ids(sqlite3* db)
+{
+    int total_changes = 0;
+    const char* tables[] = {"findings", "finding_correlations", "evidence", "scans", "audit_trail", "traffic_captures"};
+    for (const char* table : tables) {
+        if (!cleanup_empty_optional_session_id(db, table, total_changes)) return false;
+    }
+    diag::log_tagged_fmt("burp_findings", "schema_cleanup_empty_session total_rows=%d", total_changes);
+    return true;
 }
 
 bool create_schema(sqlite3* db)
@@ -393,6 +423,7 @@ bool create_schema(sqlite3* db)
     if (!ensure_column(db, "audit_trail", "parameters_hash", "ALTER TABLE audit_trail ADD COLUMN parameters_hash TEXT DEFAULT ''")) return false;
     if (!ensure_column(db, "audit_trail", "result_summary_json", "ALTER TABLE audit_trail ADD COLUMN result_summary_json TEXT DEFAULT '{}'")) return false;
     if (!ensure_column(db, "audit_trail", "result_hash", "ALTER TABLE audit_trail ADD COLUMN result_hash TEXT DEFAULT ''")) return false;
+    if (!cleanup_empty_optional_session_ids(db)) return false;
     return true;
 }
 
@@ -468,6 +499,61 @@ std::string build_dedupe_key(const issue_t& issue)
     key += '|';
     key += normalize_case(issue.insertion_point);
     return key;
+}
+
+bool validate_issue_for_mirror(const issue_t& issue, std::string& reason)
+{
+    const auto blank = [](const std::string& value) {
+        return std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isspace(c) != 0; });
+    };
+    if (blank(issue.type_key)) {
+        reason = "empty_type_key";
+        return false;
+    }
+    if (blank(issue.host)) {
+        reason = "empty_host";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+std::string session_state_label(const std::string& session_id)
+{
+    if (session_id.empty()) return "null";
+    const size_t h = std::hash<std::string>{}(session_id);
+    std::ostringstream oss;
+    oss << "len:" << session_id.size() << ":hash:" << std::hex << static_cast<unsigned long long>(h);
+    return oss.str();
+}
+
+void log_finding_upsert_begin(const issue_t& issue, const char* mode, size_t evidence_count)
+{
+    diag::log_tagged_fmt("burp_findings",
+        "finding_upsert_begin mode=%s issue_store_id=%llu finding_id=%llu session=%s scan_id=%llu audit_id=%llu type_key=%s host=%s path=%s evidence_count=%zu",
+        mode ? mode : "unknown",
+        static_cast<unsigned long long>(issue.id),
+        static_cast<unsigned long long>(issue.id),
+        session_state_label(issue.session_id).c_str(),
+        static_cast<unsigned long long>(issue.scan_id),
+        static_cast<unsigned long long>(issue.audit_id),
+        issue.type_key.c_str(),
+        evidence_store::redact_sensitive_text(issue.host, 256).c_str(),
+        evidence_store::redact_sensitive_text(issue.path, 512).c_str(),
+        evidence_count);
+}
+
+void log_sqlite_step(sqlite3* db, const char* operation, int rc)
+{
+    diag::log_tagged_fmt("burp_findings",
+        "finding_upsert_step op=%s rc=%d extended_rc=%d errmsg=%s changes=%d last_insert_rowid=%lld autocommit=%d",
+        operation ? operation : "unknown",
+        rc,
+        db ? sqlite3_extended_errcode(db) : 0,
+        db ? sqlite3_errmsg(db) : "no database",
+        db ? sqlite3_changes(db) : 0,
+        db ? static_cast<long long>(sqlite3_last_insert_rowid(db)) : 0ll,
+        db ? sqlite3_get_autocommit(db) : 0);
 }
 
 std::vector<std::string> json_to_string_vector(const nlohmann::json& j)
@@ -623,7 +709,7 @@ bool evidence_exists(sqlite3* db, uint64_t finding_id)
     return found;
 }
 
-uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_insert_evidence)
+uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_insert_evidence, size_t evidence_count)
 {
     issue_t issue = in_issue;
     if (issue.seen_ms == 0) issue.seen_ms = now_ms();
@@ -647,6 +733,7 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
     const uint64_t existing_id = find_existing_id(db, issue, dedupe_key);
     const nlohmann::json cwe_json = issue.cwe;
     if (existing_id != 0) {
+        log_finding_upsert_begin(issue, "update", evidence_count);
         const char* sql =
             "UPDATE findings SET "
             "issue_store_id=CASE WHEN ?!=0 THEN ? ELSE issue_store_id END,"
@@ -660,11 +747,14 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
             "suppressed_by=CASE WHEN ?!=0 THEN ? ELSE suppressed_by END,"
             "suppressed_ms=CASE WHEN ?!=0 THEN ? ELSE suppressed_ms END WHERE id=?";
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return 0;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            set_sqlite_error(db, "finding_upsert_prepare_update");
+            return 0;
+        }
         int idx = 1;
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
-        bind_text(stmt, idx++, issue.session_id);
+        bind_nullable_text(stmt, idx++, issue.session_id);
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.scan_id));
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.audit_id));
         bind_text(stmt, idx++, issue.type_key);
@@ -699,6 +789,8 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.suppressed_ms));
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(existing_id));
         const int rc = sqlite3_step(stmt);
+        log_sqlite_step(db, "update", rc);
+        if (rc != SQLITE_DONE) set_sqlite_error(db, "finding_upsert_update");
         sqlite3_finalize(stmt);
         if (rc != SQLITE_DONE) return 0;
         should_insert_evidence = !evidence_exists(db, existing_id);
@@ -711,11 +803,15 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
         "INSERT INTO findings(id,issue_store_id,session_id,scan_id,audit_id,type_key,name,description,remediation,severity,confidence,scheme,host,port,path,parameter,insertion_point,dedupe_key,cwe_json,cvss_score,cvss_vector,cvss_severity,owasp_category,source_exchange_id,first_seen_ms,last_seen_ms,suppressed,suppress_reason,suppressed_by,suppressed_ms,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" :
         "INSERT INTO findings(issue_store_id,session_id,scan_id,audit_id,type_key,name,description,remediation,severity,confidence,scheme,host,port,path,parameter,insertion_point,dedupe_key,cwe_json,cvss_score,cvss_vector,cvss_severity,owasp_category,source_exchange_id,first_seen_ms,last_seen_ms,suppressed,suppress_reason,suppressed_by,suppressed_ms,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return 0;
+    log_finding_upsert_begin(issue, "insert", evidence_count);
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        set_sqlite_error(db, "finding_upsert_prepare_insert");
+        return 0;
+    }
     int idx = 1;
     if (issue.id != 0) sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
     sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.id));
-    bind_text(stmt, idx++, issue.session_id);
+    bind_nullable_text(stmt, idx++, issue.session_id);
     sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.scan_id));
     sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.audit_id));
     bind_text(stmt, idx++, issue.type_key);
@@ -745,6 +841,8 @@ uint64_t upsert_finding_row(sqlite3* db, const issue_t& in_issue, bool& should_i
     sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(issue.suppressed_ms));
     bind_json(stmt, idx++, nlohmann::json::object());
     const int rc = sqlite3_step(stmt);
+    log_sqlite_step(db, "insert", rc);
+    if (rc != SQLITE_DONE) set_sqlite_error(db, "finding_upsert_insert");
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return 0;
     const uint64_t id = issue.id != 0 ? issue.id : static_cast<uint64_t>(sqlite3_last_insert_rowid(db));
@@ -818,7 +916,7 @@ uint64_t upsert(issue_t issue)
     bool should_insert_evidence = false;
     uint64_t id = 0;
     bool ok = with_db("finding_upsert", [&](sqlite3* db) {
-        id = upsert_finding_row(db, issue, should_insert_evidence);
+        id = upsert_finding_row(db, issue, should_insert_evidence, evidence.size());
         return id != 0;
     });
     if (!ok || id == 0) return 0;
@@ -1089,7 +1187,7 @@ nlohmann::json correlate(const finding_filter_t& filter, bool persist)
             for (const auto& c : correlations) {
                 sqlite3_stmt* stmt = nullptr;
                 if (sqlite3_prepare_v2(db, "INSERT INTO finding_correlations(session_id,pattern,type_key,description,severity,finding_ids_json,endpoints_json,host,created_ms) VALUES(?,?,?,?,?,?,?,?,?)", -1, &stmt, nullptr) != SQLITE_OK) return false;
-                bind_text(stmt, 1, filter.session_id);
+                bind_nullable_text(stmt, 1, filter.session_id);
                 bind_text(stmt, 2, c.value("pattern", std::string()));
                 bind_text(stmt, 3, c.value("type_key", std::string()));
                 bind_text(stmt, 4, c.value("description", std::string()));
@@ -1176,18 +1274,72 @@ bool mirror_issue_store(bool replace_existing)
     issue_filter_t filter;
     filter.include_suppressed = true;
     auto issues = issue_store::list(filter);
+    const size_t before_count = count();
     if (replace_existing) {
-        with_db("mirror_issue_store_clear", [](sqlite3* db) {
+        if (!with_db("mirror_issue_store_clear", [](sqlite3* db) {
             return exec_simple(db, "DELETE FROM findings WHERE issue_store_id!=0");
-        });
+        })) {
+            diag::log_tagged_fmt("burp_findings", "mirror_issue_store_clear_failed err=%s", last_error().c_str());
+            return false;
+        }
     }
     size_t imported = 0;
+    size_t skipped = 0;
+    size_t failed = 0;
+    uint64_t first_skipped_id = 0;
+    uint64_t first_failed_id = 0;
+    std::string first_reason;
     for (auto issue : issues) {
-        uint64_t id = upsert(std::move(issue));
-        if (id != 0) ++imported;
+        std::string reason;
+        if (!validate_issue_for_mirror(issue, reason)) {
+            ++skipped;
+            if (first_skipped_id == 0) {
+                first_skipped_id = issue.id;
+                first_reason = reason;
+            }
+            diag::log_tagged_fmt("burp_findings",
+                "mirror_issue_store_skip issue_store_id=%llu type_key=%s host_present=%d session_present=%d scan_id=%llu audit_id=%llu reason=%s",
+                static_cast<unsigned long long>(issue.id),
+                issue.type_key.c_str(),
+                issue.host.empty() ? 0 : 1,
+                issue.session_id.empty() ? 0 : 1,
+                static_cast<unsigned long long>(issue.scan_id),
+                static_cast<unsigned long long>(issue.audit_id),
+                reason.c_str());
+            continue;
+        }
+        uint64_t id = upsert(issue);
+        if (id != 0) {
+            ++imported;
+        } else {
+            ++failed;
+            if (first_failed_id == 0) first_failed_id = issue.id;
+            diag::log_tagged_fmt("burp_findings",
+                "mirror_issue_store_failed issue_store_id=%llu type_key=%s host=%s session=%s scan_id=%llu audit_id=%llu err=%s",
+                static_cast<unsigned long long>(issue.id),
+                issue.type_key.c_str(),
+                evidence_store::redact_sensitive_text(issue.host, 256).c_str(),
+                session_state_label(issue.session_id).c_str(),
+                static_cast<unsigned long long>(issue.scan_id),
+                static_cast<unsigned long long>(issue.audit_id),
+                last_error().c_str());
+        }
     }
-    diag::log_tagged_fmt("burp_findings", "mirror_issue_store imported=%zu replace=%d", imported, replace_existing ? 1 : 0);
-    return imported == issues.size();
+    const size_t after_count = count();
+    diag::log_tagged_fmt("burp_findings",
+        "mirror_issue_store_summary total=%zu valid=%zu imported=%zu skipped=%zu failed=%zu first_skipped_id=%llu first_failed_id=%llu reason=%s before_count=%zu after_count=%zu replace=%d",
+        issues.size(),
+        issues.size() - skipped,
+        imported,
+        skipped,
+        failed,
+        static_cast<unsigned long long>(first_skipped_id),
+        static_cast<unsigned long long>(first_failed_id),
+        first_reason.c_str(),
+        before_count,
+        after_count,
+        replace_existing ? 1 : 0);
+    return failed == 0;
 }
 
 bool upsert_scan_run(const scan_run_t& scan)
@@ -1206,7 +1358,7 @@ bool upsert_scan_run(const scan_run_t& scan)
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
         int idx = 1;
         sqlite3_bind_int64(stmt, idx++, static_cast<sqlite3_int64>(scan.scan_id));
-        bind_text(stmt, idx++, scan.session_id);
+        bind_nullable_text(stmt, idx++, scan.session_id);
         bind_text(stmt, idx++, scan.target_url);
         bind_text(stmt, idx++, scan.profile);
         bind_text(stmt, idx++, scan.status);

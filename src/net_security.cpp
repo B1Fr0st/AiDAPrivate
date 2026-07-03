@@ -303,6 +303,358 @@ static bool looks_like_random(const std::uint8_t* data, std::size_t len) {
     return true;
 }
 
+static bool netsec_hex_char(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static void netsec_skip_ascii_space(const std::vector<std::uint8_t>& buf, std::size_t actual, std::size_t& pos) {
+    while (pos < actual && (buf[pos] == ' ' || buf[pos] == '\t'))
+        ++pos;
+}
+
+static bool netsec_read_hex_token(const std::vector<std::uint8_t>& buf, std::size_t actual,
+                                  std::size_t& pos, std::size_t min_chars,
+                                  std::size_t max_chars, std::string& out) {
+    out.clear();
+    while (pos < actual && out.size() < max_chars) {
+        const char c = static_cast<char>(buf[pos]);
+        if (!netsec_hex_char(c))
+            break;
+        out.push_back(c);
+        ++pos;
+    }
+    return out.size() >= min_chars;
+}
+
+static bool netsec_scan_should_stop(const tls_key_scan_config_t& config,
+                                    key_scan_diagnostics_t& diag,
+                                    ULONGLONG start_ms) {
+    if (config.cancel_flag && !config.cancel_flag->load(std::memory_order_acquire)) {
+        diag.cancelled = true;
+        if (diag.early_exit_reason.empty())
+            diag.early_exit_reason = "cancelled";
+        return true;
+    }
+    if (config.timeout_ms != 0 && GetTickCount64() - start_ms >= config.timeout_ms) {
+        diag.deadline_expired = true;
+        diag.truncated = true;
+        if (diag.early_exit_reason.empty())
+            diag.early_exit_reason = "deadline";
+        return true;
+    }
+    if (config.max_regions != 0 && diag.regions_seen >= config.max_regions) {
+        diag.truncated = true;
+        if (diag.early_exit_reason.empty())
+            diag.early_exit_reason = "max_regions";
+        return true;
+    }
+    if (config.max_read_attempts != 0 && diag.read_attempts >= config.max_read_attempts) {
+        diag.truncated = true;
+        if (diag.early_exit_reason.empty())
+            diag.early_exit_reason = "max_read_attempts";
+        return true;
+    }
+    if (config.max_read_bytes != 0 && diag.read_bytes >= config.max_read_bytes) {
+        diag.truncated = true;
+        if (diag.early_exit_reason.empty())
+            diag.early_exit_reason = "max_read_bytes";
+        return true;
+    }
+    return false;
+}
+
+static void netsec_finish_diag(key_scan_diagnostics_t& diag, ULONGLONG start_ms, std::uint64_t keys_found) {
+    diag.elapsed_ms = GetTickCount64() - start_ms;
+    diag.keys_found = keys_found;
+    if (diag.early_exit_reason.empty())
+        diag.early_exit_reason = "complete";
+}
+
+static std::vector<tls_session_key_t> netsec_scan_tls_keylog_range(std::uint32_t pid,
+                                                                    const tls_key_scan_config_t& config,
+                                                                    key_scan_diagnostics_t& diag,
+                                                                    ULONGLONG start_ms) {
+    std::vector<tls_session_key_t> keys;
+    if (!device || !device->is_connected() || config.hint_address == 0 || config.hint_size < 32)
+        return keys;
+
+    const std::uint32_t saved_pid = device->get_process_id();
+    device->set_process_id(pid);
+    device->solve_dtb();
+
+    diag.hint_used = true;
+    ++diag.regions_seen;
+    ++diag.regions_committed;
+    constexpr std::size_t CHUNK = 0x10000;
+    constexpr std::size_t OVERLAP = 256;
+    const std::uint64_t limit = config.max_read_bytes != 0
+        ? std::min<std::uint64_t>(config.hint_size, config.max_read_bytes)
+        : static_cast<std::uint64_t>(config.hint_size);
+    std::vector<std::uint8_t> buf(CHUNK);
+    static const char* labels[] = {
+        "CLIENT_RANDOM ",
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET ",
+        "CLIENT_TRAFFIC_SECRET_0 ",
+        "SERVER_TRAFFIC_SECRET_0 ",
+        "EXPORTER_SECRET ",
+    };
+
+    for (std::uint64_t off = 0; off < limit && !netsec_scan_should_stop(config, diag, start_ms); off += CHUNK - OVERLAP) {
+        const std::size_t to_read = static_cast<std::size_t>(std::min<std::uint64_t>(CHUNK, limit - off));
+        if (to_read < 32)
+            break;
+        std::memset(buf.data(), 0, buf.size());
+        ++diag.read_attempts;
+        const std::size_t actual = device->read_raw(config.hint_address + off, buf.data(), to_read);
+        diag.read_bytes += actual;
+        if (actual < 32) {
+            ++diag.read_short;
+            if (diag.first_short_read_va == 0)
+                diag.first_short_read_va = config.hint_address + off;
+            continue;
+        }
+
+        for (const char* label : labels) {
+            const std::size_t label_len = std::strlen(label);
+            for (std::size_t i = 0; i + label_len + 64 + 1 + 64 < actual; ++i) {
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto tls_range_done;
+                }
+                if (netsec_scan_should_stop(config, diag, start_ms))
+                    goto tls_range_done;
+                bool match = true;
+                for (std::size_t j = 0; j < label_len; ++j) {
+                    if (buf[i + j] != static_cast<std::uint8_t>(label[j])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match)
+                    continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
+                std::size_t pos = i + label_len;
+                std::string cr_hex;
+                if (!netsec_read_hex_token(buf, actual, pos, 64, 64, cr_hex)) {
+                    ++diag.reject_count;
+                    continue;
+                }
+                netsec_skip_ascii_space(buf, actual, pos);
+                std::string secret_hex;
+                if (!netsec_read_hex_token(buf, actual, pos, 64, 128, secret_hex)) {
+                    ++diag.reject_count;
+                    continue;
+                }
+                tls_session_key_t key;
+                const bool client_random_label = std::strcmp(label, "CLIENT_RANDOM ") == 0;
+                key.label = client_random_label ? "CLIENT_RANDOM" : std::string(label, label_len - 1);
+                key.client_random = hex_to_bytes(cr_hex);
+                key.secret = hex_to_bytes(secret_hex);
+                key.tls_version = client_random_label ? 0x0303 : 0x0304;
+                key.timestamp = get_timestamp_ms();
+                key.pid = pid;
+                key.library = "KeylogHint";
+                bool duplicate = false;
+                for (const auto& existing : keys) {
+                    if (existing.label == key.label && existing.client_random == key.client_random) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate)
+                    keys.push_back(std::move(key));
+            }
+        }
+    }
+
+tls_range_done:
+    device->set_process_id(saved_pid);
+    if (saved_pid != 0)
+        device->solve_dtb();
+    return keys;
+}
+
+static std::vector<quic_key_info_t> netsec_scan_quic_keylog_range(std::uint32_t pid,
+                                                                   const tls_key_scan_config_t& config,
+                                                                   key_scan_diagnostics_t& diag,
+                                                                   ULONGLONG start_ms,
+                                                                   bool has_msquic) {
+    std::vector<quic_key_info_t> keys;
+    if (!device || !device->is_connected() || config.hint_address == 0 || config.hint_size < 32)
+        return keys;
+
+    const std::uint32_t saved_pid = device->get_process_id();
+    device->set_process_id(pid);
+    device->solve_dtb();
+
+    diag.hint_used = true;
+    ++diag.regions_seen;
+    ++diag.regions_committed;
+    constexpr std::size_t CHUNK = 0x10000;
+    constexpr std::size_t OVERLAP = 256;
+    const std::uint64_t limit = config.max_read_bytes != 0
+        ? std::min<std::uint64_t>(config.hint_size, config.max_read_bytes)
+        : static_cast<std::uint64_t>(config.hint_size);
+    std::vector<std::uint8_t> buf(CHUNK);
+    static const char* quic_labels[] = {
+        "QUIC_CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
+        "QUIC_SERVER_HANDSHAKE_TRAFFIC_SECRET ",
+        "QUIC_CLIENT_TRAFFIC_SECRET_0 ",
+        "QUIC_SERVER_TRAFFIC_SECRET_0 ",
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET ",
+        "CLIENT_TRAFFIC_SECRET_0 ",
+        "SERVER_TRAFFIC_SECRET_0 ",
+    };
+
+    for (std::uint64_t off = 0; off < limit && !netsec_scan_should_stop(config, diag, start_ms); off += CHUNK - OVERLAP) {
+        const std::size_t to_read = static_cast<std::size_t>(std::min<std::uint64_t>(CHUNK, limit - off));
+        if (to_read < 32)
+            break;
+        std::memset(buf.data(), 0, buf.size());
+        ++diag.read_attempts;
+        const std::size_t actual = device->read_raw(config.hint_address + off, buf.data(), to_read);
+        diag.read_bytes += actual;
+        if (actual < 32) {
+            ++diag.read_short;
+            if (diag.first_short_read_va == 0)
+                diag.first_short_read_va = config.hint_address + off;
+            continue;
+        }
+
+        for (const char* label : quic_labels) {
+            const std::size_t label_len = std::strlen(label);
+            for (std::size_t i = 0; i + label_len + 64 + 1 + 64 < actual; ++i) {
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto quic_range_done;
+                }
+                if (netsec_scan_should_stop(config, diag, start_ms))
+                    goto quic_range_done;
+                bool match = true;
+                for (std::size_t j = 0; j < label_len; ++j) {
+                    if (buf[i + j] != static_cast<std::uint8_t>(label[j])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match)
+                    continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
+                std::size_t pos = i + label_len;
+                std::string cr_hex;
+                if (!netsec_read_hex_token(buf, actual, pos, 64, 64, cr_hex)) {
+                    ++diag.reject_count;
+                    continue;
+                }
+                netsec_skip_ascii_space(buf, actual, pos);
+                std::string secret_hex;
+                if (!netsec_read_hex_token(buf, actual, pos, 64, 128, secret_hex)) {
+                    ++diag.reject_count;
+                    continue;
+                }
+                quic_key_info_t key;
+                key.label = std::string(label, label_len - 1);
+                key.client_random = hex_to_bytes(cr_hex);
+                key.secret = hex_to_bytes(secret_hex);
+                key.pid = pid;
+                key.library = has_msquic ? "msquic" : "BoringSSL-QUIC";
+                bool duplicate = false;
+                for (const auto& existing : keys) {
+                    if (existing.label == key.label && existing.client_random == key.client_random) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate)
+                    keys.push_back(std::move(key));
+            }
+        }
+    }
+
+quic_range_done:
+    device->set_process_id(saved_pid);
+    if (saved_pid != 0)
+        device->solve_dtb();
+    return keys;
+}
+
+static std::vector<dtls_key_info_t> netsec_scan_dtls_range(std::uint32_t pid,
+                                                           const tls_key_scan_config_t& config,
+                                                           key_scan_diagnostics_t& diag,
+                                                           ULONGLONG start_ms) {
+    std::vector<dtls_key_info_t> keys;
+    if (!device || !device->is_connected() || config.hint_address == 0 || config.hint_size < 96)
+        return keys;
+
+    const std::uint32_t saved_pid = device->get_process_id();
+    device->set_process_id(pid);
+    device->solve_dtb();
+
+    diag.hint_used = true;
+    ++diag.regions_seen;
+    ++diag.regions_committed;
+    std::uint64_t hint_limit = config.hint_size;
+    if (config.max_read_bytes != 0)
+        hint_limit = std::min<std::uint64_t>(hint_limit, config.max_read_bytes);
+    const std::size_t to_read = static_cast<std::size_t>(std::min<std::uint64_t>(hint_limit, 0x100000));
+    std::vector<std::uint8_t> buf(to_read);
+    ++diag.read_attempts;
+    const std::size_t actual = device->read_raw(config.hint_address, buf.data(), to_read);
+    diag.read_bytes += actual;
+    if (actual < 96) {
+        ++diag.read_short;
+        diag.first_short_read_va = config.hint_address;
+        device->set_process_id(saved_pid);
+        if (saved_pid != 0)
+            device->solve_dtb();
+        return keys;
+    }
+
+    for (std::size_t i = 0; i + 2 <= actual && !netsec_scan_should_stop(config, diag, start_ms); i += 2) {
+        const std::uint16_t ver = (static_cast<std::uint16_t>(buf[i]) << 8) | buf[i + 1];
+        if (ver != 0xFEFF && ver != 0xFEFD)
+            continue;
+        ++diag.candidate_hits;
+        if (diag.first_hit_elapsed_ms == 0)
+            diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
+        for (int search_off = -128; search_off < 128; search_off += 8) {
+            const std::int64_t cr_pos = static_cast<std::int64_t>(i) + search_off;
+            if (cr_pos < 0 || cr_pos + 80 > static_cast<std::int64_t>(actual))
+                continue;
+            const std::uint8_t* cr = buf.data() + cr_pos;
+            const std::uint8_t* ms = buf.data() + cr_pos + 32;
+            if (!looks_like_random(cr, 32) || !looks_like_random(ms, 48)) {
+                ++diag.reject_count;
+                continue;
+            }
+            dtls_key_info_t key;
+            key.dtls_version = ver;
+            key.client_random.assign(cr, cr + 32);
+            key.master_secret.assign(ms, ms + 48);
+            key.pid = pid;
+            key.library = "DTLS";
+            keys.push_back(std::move(key));
+            if (keys.size() >= config.max_results) {
+                diag.early_exit_reason = "max_results";
+                goto dtls_range_done;
+            }
+            break;
+        }
+    }
+
+dtls_range_done:
+    device->set_process_id(saved_pid);
+    if (saved_pid != 0)
+        device->solve_dtb();
+    return keys;
+}
+
 
 static bool hmac_sha256(const std::uint8_t* key, std::size_t key_len,
                         const std::uint8_t* data, std::size_t data_len,
@@ -1272,39 +1624,101 @@ tls13_done:
 
 
 std::vector<tls_session_key_t> TlsKeyExtractor::extract_keys(const tls_key_scan_config_t& config) {
-    std::lock_guard<std::mutex> lock(_mutex);
+    const ULONGLONG start_ms = GetTickCount64();
     std::vector<tls_session_key_t> all_keys;
+    key_scan_diagnostics_t diag;
+    diag.requested_pid = config.pid;
+    diag.attached_pid = device && device->is_connected() ? device->get_process_id() : 0;
+    diag.timeout_ms = config.timeout_ms;
+    diag.max_results = config.max_results;
+    diag.max_regions = config.max_regions;
+    diag.max_read_attempts = config.max_read_attempts;
+    diag.max_read_bytes = config.max_read_bytes;
+    diag.hint_address = config.hint_address;
+    diag.hint_size = config.hint_size;
+    diag.hint_only = config.hint_only;
 
     std::uint32_t pid = config.pid;
     if (pid == 0 && device && device->is_connected())
         pid = device->get_process_id();
-    if (pid == 0) return all_keys;
+    diag.effective_pid = pid;
+    if (pid == 0 || config.max_results == 0) {
+        diag.early_exit_reason = pid == 0 ? "no_effective_pid" : "max_results_zero";
+        netsec_finish_diag(diag, start_ms, 0);
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_tls_scan = diag;
+        return all_keys;
+    }
 
-    if (config.scan_schannel) {
+    if (config.hint_address != 0 && config.hint_size != 0) {
+        auto hinted = netsec_scan_tls_keylog_range(pid, config, diag, start_ms);
+        all_keys.insert(all_keys.end(), hinted.begin(), hinted.end());
+        if (!all_keys.empty()) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            for (const auto& key : all_keys) {
+                std::string dedup = key.label;
+                if (!key.client_random.empty())
+                    dedup += ":" + bytes_to_hex(key.client_random.data(), key.client_random.size());
+                else if (!key.secret.empty())
+                    dedup += ":" + bytes_to_hex(key.secret.data(), std::min<std::size_t>(key.secret.size(), 16));
+                _seen_keys[dedup] = key;
+            }
+        }
+        if (config.hint_only || all_keys.size() >= config.max_results || netsec_scan_should_stop(config, diag, start_ms)) {
+            if (all_keys.size() > config.max_results)
+                all_keys.resize(config.max_results);
+            if (diag.early_exit_reason.empty())
+                diag.early_exit_reason = config.hint_only ? "hint_only_complete" : "hint_complete";
+            netsec_finish_diag(diag, start_ms, all_keys.size());
+            diag::log_tagged_fmt("net_sec", "tls_extract_keys bounded_done requested_pid=%u effective_pid=%u keys=%zu hint_used=%d hint_only=%d elapsed_ms=%llu reason=%s deadline=%d cancelled=%d",
+                config.pid,
+                pid,
+                all_keys.size(),
+                diag.hint_used ? 1 : 0,
+                config.hint_only ? 1 : 0,
+                static_cast<unsigned long long>(diag.elapsed_ms),
+                diag.early_exit_reason.c_str(),
+                diag.deadline_expired ? 1 : 0,
+                diag.cancelled ? 1 : 0);
+            std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+            _last_tls_scan = diag;
+            return all_keys;
+        }
+    }
+    if (config.hint_only) {
+        diag.early_exit_reason = "hint_missing";
+        netsec_finish_diag(diag, start_ms, all_keys.size());
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_tls_scan = diag;
+        return all_keys;
+    }
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (config.scan_schannel && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
         auto keys = scan_schannel(pid);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
-    if (config.scan_openssl && all_keys.size() < config.max_results) {
+    if (config.scan_openssl && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
         auto keys = scan_openssl(pid);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
-    if (config.scan_nss && all_keys.size() < config.max_results) {
+    if (config.scan_nss && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
         auto keys = scan_nss(pid);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
-    if (config.scan_boringssl && all_keys.size() < config.max_results) {
+    if (config.scan_boringssl && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
         auto keys = scan_boringssl(pid);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
 
-    if (all_keys.size() < config.max_results) {
+    if (config.scan_generic && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
         auto keys = scan_generic_patterns(pid);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
 
 
-    if (all_keys.size() < config.max_results) {
+    if (config.scan_tls13_structures && all_keys.size() < config.max_results && !netsec_scan_should_stop(config, diag, start_ms)) {
         auto keys = scan_tls13_secrets_impl(device.get(), pid, _seen_keys);
         all_keys.insert(all_keys.end(), keys.begin(), keys.end());
     }
@@ -1312,25 +1726,85 @@ std::vector<tls_session_key_t> TlsKeyExtractor::extract_keys(const tls_key_scan_
     if (all_keys.size() > config.max_results)
         all_keys.resize(config.max_results);
 
+    netsec_finish_diag(diag, start_ms, all_keys.size());
+    diag::log_tagged_fmt("net_sec", "tls_extract_keys scan_done requested_pid=%u effective_pid=%u keys=%zu elapsed_ms=%llu reason=%s deadline=%d cancelled=%d hint_used=%d",
+        config.pid,
+        pid,
+        all_keys.size(),
+        static_cast<unsigned long long>(diag.elapsed_ms),
+        diag.early_exit_reason.c_str(),
+        diag.deadline_expired ? 1 : 0,
+        diag.cancelled ? 1 : 0,
+        diag.hint_used ? 1 : 0);
+    {
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_tls_scan = diag;
+    }
     return all_keys;
 }
 
 std::map<std::string, tls_session_key_t> TlsKeyExtractor::get_seen_keys() const {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::get_seen_keys busy tid=%lu",
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return {};
+    }
     return _seen_keys;
+}
+
+key_scan_diagnostics_t TlsKeyExtractor::last_tls_scan_diagnostics() const {
+    std::lock_guard<std::mutex> lock(_diagnostics_mutex);
+    return _last_tls_scan;
 }
 
 
 std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pid) {
+    tls_key_scan_config_t config;
+    config.pid = pid;
+    return extract_quic_keys(config);
+}
+
+std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(const tls_key_scan_config_t& config) {
+    const ULONGLONG start_ms = GetTickCount64();
     std::vector<quic_key_info_t> keys;
+    key_scan_diagnostics_t diag;
+    diag.requested_pid = config.pid;
+    diag.attached_pid = device && device->is_connected() ? device->get_process_id() : 0;
+    diag.timeout_ms = config.timeout_ms;
+    diag.max_results = config.max_results;
+    diag.max_regions = config.max_regions;
+    diag.max_read_attempts = config.max_read_attempts;
+    diag.max_read_bytes = config.max_read_bytes;
+    diag.hint_address = config.hint_address;
+    diag.hint_size = config.hint_size;
+    diag.hint_only = config.hint_only;
+
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "quic_extract_keys backend_unavailable device_not_connected");
+        diag.early_exit_reason = "device_not_connected";
+        netsec_finish_diag(diag, start_ms, 0);
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_quic_scan = diag;
         return keys;
     }
 
+    std::uint32_t pid = config.pid;
     if (pid == 0) pid = device->get_process_id();
     if (pid == 0) {
         diag::log_tagged("net_sec", "quic_extract_keys rejected pid=0");
+        diag.early_exit_reason = "no_effective_pid";
+        netsec_finish_diag(diag, start_ms, 0);
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_quic_scan = diag;
+        return keys;
+    }
+    diag.effective_pid = pid;
+    if (config.max_results == 0) {
+        diag.early_exit_reason = "max_results_zero";
+        netsec_finish_diag(diag, start_ms, 0);
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_quic_scan = diag;
         return keys;
     }
 
@@ -1338,19 +1812,67 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
     std::uint64_t msquic_base = 0;
     std::uint32_t msquic_size = 0;
     bool has_msquic = find_module_in_process(pid, "msquic.dll", msquic_base, msquic_size);
-    diag::log_tagged_fmt("net_sec", "quic_extract_keys scan_start pid=%u has_msquic=%d msquic_base=0x%llX msquic_size=0x%X current_device_pid=%u",
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys scan_start requested_pid=%u effective_pid=%u has_msquic=%d msquic_base=0x%llX msquic_size=0x%X current_device_pid=%u timeout_ms=%u max_results=%u max_regions=%u max_reads=%u max_bytes=%llu hint=0x%llX hint_size=%u hint_only=%d",
+        config.pid,
         pid,
         has_msquic ? 1 : 0,
         static_cast<unsigned long long>(msquic_base),
         msquic_size,
-        device->get_process_id());
+        device->get_process_id(),
+        config.timeout_ms,
+        config.max_results,
+        config.max_regions,
+        config.max_read_attempts,
+        static_cast<unsigned long long>(config.max_read_bytes),
+        static_cast<unsigned long long>(config.hint_address),
+        config.hint_size,
+        config.hint_only ? 1 : 0);
+
+    if (config.hint_address != 0 && config.hint_size != 0) {
+        auto hinted = netsec_scan_quic_keylog_range(pid, config, diag, start_ms, has_msquic);
+        keys.insert(keys.end(), hinted.begin(), hinted.end());
+        if (config.hint_only || keys.size() >= config.max_results || netsec_scan_should_stop(config, diag, start_ms)) {
+            if (keys.size() > config.max_results)
+                keys.resize(config.max_results);
+            if (diag.early_exit_reason.empty())
+                diag.early_exit_reason = config.hint_only ? "hint_only_complete" : "hint_complete";
+            netsec_finish_diag(diag, start_ms, keys.size());
+            diag::log_tagged_fmt("net_sec", "quic_extract_keys scan_done requested_pid=%u effective_pid=%u keys=%zu regions=%llu committed=%llu read_attempts=%llu read_bytes=%llu label_hits=%llu reject=%llu elapsed_ms=%llu reason=%s deadline=%d cancelled=%d truncated=%d",
+                config.pid,
+                pid,
+                keys.size(),
+                static_cast<unsigned long long>(diag.regions_seen),
+                static_cast<unsigned long long>(diag.regions_committed),
+                static_cast<unsigned long long>(diag.read_attempts),
+                static_cast<unsigned long long>(diag.read_bytes),
+                static_cast<unsigned long long>(diag.candidate_hits),
+                static_cast<unsigned long long>(diag.reject_count),
+                static_cast<unsigned long long>(diag.elapsed_ms),
+                diag.early_exit_reason.c_str(),
+                diag.deadline_expired ? 1 : 0,
+                diag.cancelled ? 1 : 0,
+                diag.truncated ? 1 : 0);
+            std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+            _last_quic_scan = diag;
+            return keys;
+        }
+    }
+    if (config.hint_only) {
+        diag.early_exit_reason = "hint_missing";
+        netsec_finish_diag(diag, start_ms, keys.size());
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_quic_scan = diag;
+        return keys;
+    }
 
 
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
     device->solve_dtb();
 
+    const ULONGLONG enum_start = GetTickCount64();
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
+    diag.enumerate_elapsed_ms = GetTickCount64() - enum_start;
     diag::log_tagged_fmt("net_sec", "quic_extract_keys regions_enumerated pid=%u count=%zu saved_pid=%u device_pid=%u",
         pid,
         regions.size(),
@@ -1368,12 +1890,6 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
         "SERVER_TRAFFIC_SECRET_0 ",
     };
 
-    std::size_t regions_seen = 0;
-    std::size_t regions_committed = 0;
-    std::size_t regions_skipped_state = 0;
-    std::size_t regions_skipped_size = 0;
-    std::size_t read_attempts = 0;
-    std::size_t read_short = 0;
     std::size_t label_hits = 0;
     std::size_t reject_client_random = 0;
     std::size_t reject_separator = 0;
@@ -1381,23 +1897,24 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
     std::size_t region_logs = 0;
     std::size_t hit_logs = 0;
     std::size_t reject_logs = 0;
-    std::uint64_t first_short_read_va = 0;
 
     for (const auto& region : regions) {
-        ++regions_seen;
+        if (netsec_scan_should_stop(config, diag, start_ms))
+            break;
+        ++diag.regions_seen;
         if (region.state != 0x1000) {
-            ++regions_skipped_state;
+            ++diag.regions_skipped_state;
             continue;
         }
         if (region.size > 0x2000000 || region.size < 128) {
-            ++regions_skipped_size;
+            ++diag.regions_skipped_size;
             continue;
         }
-        ++regions_committed;
+        ++diag.regions_committed;
         if (region_logs < 16) {
             diag::log_tagged_fmt("net_sec", "quic_extract_keys region pid=%u index=%zu base=0x%llX size=0x%llX state=0x%X protect=0x%X",
                 pid,
-                regions_seen - 1,
+                static_cast<std::size_t>(diag.regions_seen - 1),
                 static_cast<unsigned long long>(region.base),
                 static_cast<unsigned long long>(region.size),
                 region.state,
@@ -1409,23 +1926,32 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
         std::vector<std::uint8_t> buf(CHUNK);
 
         for (std::uint64_t off = 0; off < region.size; off += CHUNK - 256) {
+            if (netsec_scan_should_stop(config, diag, start_ms))
+                goto quic_done;
             std::size_t to_read = static_cast<std::size_t>(
                 std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
             if (to_read < 128) break;
 
             std::memset(buf.data(), 0, CHUNK);
-            ++read_attempts;
+            ++diag.read_attempts;
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
+            diag.read_bytes += actual;
             if (actual < 128) {
-                ++read_short;
-                if (first_short_read_va == 0)
-                    first_short_read_va = region.base + off;
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = region.base + off;
                 continue;
             }
 
             for (const char* label : quic_labels) {
                 std::size_t label_len = std::strlen(label);
                 for (std::size_t i = 0; i + label_len + 64 + 1 + 64 < actual; i++) {
+                    if (keys.size() >= config.max_results) {
+                        diag.early_exit_reason = "max_results";
+                        goto quic_done;
+                    }
+                    if (netsec_scan_should_stop(config, diag, start_ms))
+                        goto quic_done;
                     bool match = true;
                     for (std::size_t j = 0; j < label_len; j++) {
                         if (buf[i + j] != static_cast<std::uint8_t>(label[j])) { match = false; break; }
@@ -1433,6 +1959,9 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                     if (!match) continue;
 
                     ++label_hits;
+                    ++diag.candidate_hits;
+                    if (diag.first_hit_elapsed_ms == 0)
+                        diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
                     const std::uint64_t hit_va = region.base + off + i;
                     if (hit_logs < 16) {
                         diag::log_tagged_fmt("net_sec", "quic_extract_keys label_hit pid=%u va=0x%llX label=%.*s chunk_actual=%zu region_base=0x%llX region_size=0x%llX",
@@ -1457,6 +1986,7 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                     }
                     if (cr_hex.size() != 64) {
                         ++reject_client_random;
+                        ++diag.reject_count;
                         if (reject_logs < 16) {
                             diag::log_tagged_fmt("net_sec", "quic_extract_keys reject_client_random pid=%u va=0x%llX label=%.*s chars=%zu pos=%zu actual=%zu",
                                 pid,
@@ -1478,6 +2008,7 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                     }
                     if (!separator_seen) {
                         ++reject_separator;
+                        ++diag.reject_count;
                         if (reject_logs < 16) {
                             diag::log_tagged_fmt("net_sec", "quic_extract_keys reject_separator pid=%u va=0x%llX label=%.*s pos=%zu actual=%zu",
                                 pid,
@@ -1501,6 +2032,7 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                     }
                     if (secret_hex.size() < 64) {
                         ++reject_secret;
+                        ++diag.reject_count;
                         if (reject_logs < 16) {
                             diag::log_tagged_fmt("net_sec", "quic_extract_keys reject_secret pid=%u va=0x%llX label=%.*s chars=%zu pos=%zu actual=%zu",
                                 pid,
@@ -1531,68 +2063,203 @@ std::vector<quic_key_info_t> TlsKeyExtractor::extract_quic_keys(std::uint32_t pi
                         key.library.c_str(),
                         keys.size());
 
-                    if (keys.size() >= 64) goto quic_done;
+                    if (keys.size() >= config.max_results) {
+                        diag.early_exit_reason = "max_results";
+                        goto quic_done;
+                    }
                 }
             }
         }
     }
 quic_done:
-    diag::log_tagged_fmt("net_sec", "quic_extract_keys scan_done pid=%u keys=%zu regions=%zu committed=%zu skipped_state=%zu skipped_size=%zu read_attempts=%zu read_short=%zu first_short_read_va=0x%llX label_hits=%zu reject_client_random=%zu reject_separator=%zu reject_secret=%zu saved_pid=%u restore_needed=%d",
+    netsec_finish_diag(diag, start_ms, keys.size());
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys scan_done requested_pid=%u effective_pid=%u keys=%zu regions=%llu committed=%llu skipped_state=%llu skipped_size=%llu read_attempts=%llu read_bytes=%llu read_short=%llu first_short_read_va=0x%llX label_hits=%zu reject_client_random=%zu reject_separator=%zu reject_secret=%zu elapsed_ms=%llu enumerate_ms=%llu first_hit_ms=%llu reason=%s deadline=%d cancelled=%d truncated=%d saved_pid=%u restore_needed=%d",
+        config.pid,
         pid,
         keys.size(),
-        regions_seen,
-        regions_committed,
-        regions_skipped_state,
-        regions_skipped_size,
-        read_attempts,
-        read_short,
-        static_cast<unsigned long long>(first_short_read_va),
+        static_cast<unsigned long long>(diag.regions_seen),
+        static_cast<unsigned long long>(diag.regions_committed),
+        static_cast<unsigned long long>(diag.regions_skipped_state),
+        static_cast<unsigned long long>(diag.regions_skipped_size),
+        static_cast<unsigned long long>(diag.read_attempts),
+        static_cast<unsigned long long>(diag.read_bytes),
+        static_cast<unsigned long long>(diag.read_short),
+        static_cast<unsigned long long>(diag.first_short_read_va),
         label_hits,
         reject_client_random,
         reject_separator,
         reject_secret,
+        static_cast<unsigned long long>(diag.elapsed_ms),
+        static_cast<unsigned long long>(diag.enumerate_elapsed_ms),
+        static_cast<unsigned long long>(diag.first_hit_elapsed_ms),
+        diag.early_exit_reason.c_str(),
+        diag.deadline_expired ? 1 : 0,
+        diag.cancelled ? 1 : 0,
+        diag.truncated ? 1 : 0,
         saved_pid,
         saved_pid != 0 ? 1 : 0);
     device->set_process_id(saved_pid);
     if (saved_pid != 0) device->solve_dtb();
+    {
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_quic_scan = diag;
+    }
     return keys;
+}
+
+key_scan_diagnostics_t TlsKeyExtractor::last_quic_scan_diagnostics() const {
+    std::lock_guard<std::mutex> lock(_diagnostics_mutex);
+    return _last_quic_scan;
 }
 
 
 std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(std::uint32_t pid) {
-    std::vector<dtls_key_info_t> keys;
-    if (!device || !device->is_connected()) return keys;
+    tls_key_scan_config_t config;
+    config.pid = pid;
+    return extract_dtls_keys(config);
+}
 
+std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(const tls_key_scan_config_t& config) {
+    const ULONGLONG start_ms = GetTickCount64();
+    std::vector<dtls_key_info_t> keys;
+    key_scan_diagnostics_t diag;
+    diag.requested_pid = config.pid;
+    diag.attached_pid = device && device->is_connected() ? device->get_process_id() : 0;
+    diag.timeout_ms = config.timeout_ms;
+    diag.max_results = config.max_results;
+    diag.max_regions = config.max_regions;
+    diag.max_read_attempts = config.max_read_attempts;
+    diag.max_read_bytes = config.max_read_bytes;
+    diag.hint_address = config.hint_address;
+    diag.hint_size = config.hint_size;
+    diag.hint_only = config.hint_only;
+
+    if (!device || !device->is_connected()) {
+        diag.early_exit_reason = "device_not_connected";
+        netsec_finish_diag(diag, start_ms, 0);
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_dtls_scan = diag;
+        return keys;
+    }
+
+    std::uint32_t pid = config.pid;
     if (pid == 0) pid = device->get_process_id();
-    if (pid == 0) return keys;
+    diag.effective_pid = pid;
+    if (pid == 0 || config.max_results == 0) {
+        diag.early_exit_reason = pid == 0 ? "no_effective_pid" : "max_results_zero";
+        netsec_finish_diag(diag, start_ms, 0);
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_dtls_scan = diag;
+        return keys;
+    }
+
+    diag::log_tagged_fmt("net_sec", "dtls_extract_keys scan_start requested_pid=%u effective_pid=%u timeout_ms=%u max_results=%u max_regions=%u max_reads=%u max_bytes=%llu hint=0x%llX hint_size=%u hint_only=%d current_device_pid=%u",
+        config.pid,
+        pid,
+        config.timeout_ms,
+        config.max_results,
+        config.max_regions,
+        config.max_read_attempts,
+        static_cast<unsigned long long>(config.max_read_bytes),
+        static_cast<unsigned long long>(config.hint_address),
+        config.hint_size,
+        config.hint_only ? 1 : 0,
+        device->get_process_id());
+
+    if (config.hint_address != 0 && config.hint_size != 0) {
+        auto hinted = netsec_scan_dtls_range(pid, config, diag, start_ms);
+        keys.insert(keys.end(), hinted.begin(), hinted.end());
+        if (config.hint_only || keys.size() >= config.max_results || netsec_scan_should_stop(config, diag, start_ms)) {
+            if (keys.size() > config.max_results)
+                keys.resize(config.max_results);
+            if (diag.early_exit_reason.empty())
+                diag.early_exit_reason = config.hint_only ? "hint_only_complete" : "hint_complete";
+            netsec_finish_diag(diag, start_ms, keys.size());
+            diag::log_tagged_fmt("net_sec", "dtls_extract_keys scan_done requested_pid=%u effective_pid=%u keys=%zu regions=%llu committed=%llu read_attempts=%llu read_bytes=%llu hits=%llu reject=%llu elapsed_ms=%llu reason=%s deadline=%d cancelled=%d truncated=%d",
+                config.pid,
+                pid,
+                keys.size(),
+                static_cast<unsigned long long>(diag.regions_seen),
+                static_cast<unsigned long long>(diag.regions_committed),
+                static_cast<unsigned long long>(diag.read_attempts),
+                static_cast<unsigned long long>(diag.read_bytes),
+                static_cast<unsigned long long>(diag.candidate_hits),
+                static_cast<unsigned long long>(diag.reject_count),
+                static_cast<unsigned long long>(diag.elapsed_ms),
+                diag.early_exit_reason.c_str(),
+                diag.deadline_expired ? 1 : 0,
+                diag.cancelled ? 1 : 0,
+                diag.truncated ? 1 : 0);
+            std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+            _last_dtls_scan = diag;
+            return keys;
+        }
+    }
+    if (config.hint_only) {
+        diag.early_exit_reason = "hint_missing";
+        netsec_finish_diag(diag, start_ms, keys.size());
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_dtls_scan = diag;
+        return keys;
+    }
 
 
     std::uint32_t saved_pid = device->get_process_id();
     device->set_process_id(pid);
     device->solve_dtb();
 
+    const ULONGLONG enum_start = GetTickCount64();
     auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
+    diag.enumerate_elapsed_ms = GetTickCount64() - enum_start;
 
     for (const auto& region : regions) {
-        if (region.state != 0x1000) continue;
-        if (region.size > 0x1000000 || region.size < 128) continue;
+        if (netsec_scan_should_stop(config, diag, start_ms))
+            break;
+        ++diag.regions_seen;
+        if (region.state != 0x1000) {
+            ++diag.regions_skipped_state;
+            continue;
+        }
+        if (region.size > 0x1000000 || region.size < 128) {
+            ++diag.regions_skipped_size;
+            continue;
+        }
+        ++diag.regions_committed;
 
         constexpr std::size_t CHUNK = 0x10000;
         std::vector<std::uint8_t> buf(CHUNK);
 
         for (std::uint64_t off = 0; off < region.size; off += CHUNK - 128) {
+            if (netsec_scan_should_stop(config, diag, start_ms))
+                goto dtls_done;
             std::size_t to_read = static_cast<std::size_t>(
                 std::min(static_cast<std::uint64_t>(CHUNK), region.size - off));
             if (to_read < 128) break;
 
             std::memset(buf.data(), 0, CHUNK);
+            ++diag.read_attempts;
             std::size_t actual = device->read_raw(region.base + off, buf.data(), to_read);
-            if (actual < 128) continue;
+            diag.read_bytes += actual;
+            if (actual < 128) {
+                ++diag.read_short;
+                if (diag.first_short_read_va == 0)
+                    diag.first_short_read_va = region.base + off;
+                continue;
+            }
 
             for (std::size_t i = 0; i + 128 <= actual; i += 8) {
+                if (keys.size() >= config.max_results) {
+                    diag.early_exit_reason = "max_results";
+                    goto dtls_done;
+                }
+                if (netsec_scan_should_stop(config, diag, start_ms))
+                    goto dtls_done;
 
                 std::uint16_t ver = (static_cast<std::uint16_t>(buf[i]) << 8) | buf[i + 1];
                 if (ver != 0xFEFF && ver != 0xFEFD) continue;
+                ++diag.candidate_hits;
+                if (diag.first_hit_elapsed_ms == 0)
+                    diag.first_hit_elapsed_ms = GetTickCount64() - start_ms;
 
 
                 for (int search_off = -128; search_off < 128; search_off += 8) {
@@ -1602,8 +2269,14 @@ std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(std::uint32_t pi
                     const std::uint8_t* cr = buf.data() + cr_pos;
                     const std::uint8_t* ms = buf.data() + cr_pos + 32;
 
-                    if (!looks_like_random(cr, 32)) continue;
-                    if (!looks_like_random(ms, 48)) continue;
+                    if (!looks_like_random(cr, 32)) {
+                        ++diag.reject_count;
+                        continue;
+                    }
+                    if (!looks_like_random(ms, 48)) {
+                        ++diag.reject_count;
+                        continue;
+                    }
 
                     dtls_key_info_t key;
                     key.dtls_version = ver;
@@ -1613,7 +2286,10 @@ std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(std::uint32_t pi
                     key.library = "DTLS";
                     keys.push_back(key);
 
-                    if (keys.size() >= 64) goto dtls_done;
+                    if (keys.size() >= config.max_results) {
+                        diag.early_exit_reason = "max_results";
+                        goto dtls_done;
+                    }
                     i += 80;
                     break;
                 }
@@ -1621,9 +2297,42 @@ std::vector<dtls_key_info_t> TlsKeyExtractor::extract_dtls_keys(std::uint32_t pi
         }
     }
 dtls_done:
+    netsec_finish_diag(diag, start_ms, keys.size());
+    diag::log_tagged_fmt("net_sec", "dtls_extract_keys scan_done requested_pid=%u effective_pid=%u keys=%zu regions=%llu committed=%llu skipped_state=%llu skipped_size=%llu read_attempts=%llu read_bytes=%llu read_short=%llu first_short_read_va=0x%llX hits=%llu rejects=%llu elapsed_ms=%llu enumerate_ms=%llu first_hit_ms=%llu reason=%s deadline=%d cancelled=%d truncated=%d saved_pid=%u restore_needed=%d",
+        config.pid,
+        pid,
+        keys.size(),
+        static_cast<unsigned long long>(diag.regions_seen),
+        static_cast<unsigned long long>(diag.regions_committed),
+        static_cast<unsigned long long>(diag.regions_skipped_state),
+        static_cast<unsigned long long>(diag.regions_skipped_size),
+        static_cast<unsigned long long>(diag.read_attempts),
+        static_cast<unsigned long long>(diag.read_bytes),
+        static_cast<unsigned long long>(diag.read_short),
+        static_cast<unsigned long long>(diag.first_short_read_va),
+        static_cast<unsigned long long>(diag.candidate_hits),
+        static_cast<unsigned long long>(diag.reject_count),
+        static_cast<unsigned long long>(diag.elapsed_ms),
+        static_cast<unsigned long long>(diag.enumerate_elapsed_ms),
+        static_cast<unsigned long long>(diag.first_hit_elapsed_ms),
+        diag.early_exit_reason.c_str(),
+        diag.deadline_expired ? 1 : 0,
+        diag.cancelled ? 1 : 0,
+        diag.truncated ? 1 : 0,
+        saved_pid,
+        saved_pid != 0 ? 1 : 0);
     device->set_process_id(saved_pid);
     if (saved_pid != 0) device->solve_dtb();
+    {
+        std::lock_guard<std::mutex> diag_lock(_diagnostics_mutex);
+        _last_dtls_scan = diag;
+    }
     return keys;
+}
+
+key_scan_diagnostics_t TlsKeyExtractor::last_dtls_scan_diagnostics() const {
+    std::lock_guard<std::mutex> lock(_diagnostics_mutex);
+    return _last_dtls_scan;
 }
 
 
@@ -1814,52 +2523,87 @@ bool TlsKeyExtractor::ensure_sslkeylogfile_env(const std::string& path) {
 
 pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
     const std::string& pcap_path, const std::string& keylog_path,
-    const std::string& display_filter) {
+    const std::string& display_filter, std::uint32_t timeout_ms) {
 
+    const ULONGLONG start_ms = GetTickCount64();
     pcap_decrypt_result_t result;
     result.pcap_file_used = pcap_path;
     result.keylog_file_used = keylog_path;
+    result.timeout_ms = std::max<std::uint32_t>(1000, std::min<std::uint32_t>(timeout_ms, 60000));
 
     if (GetFileAttributesA(pcap_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         result.error_message = "PCAP file not found: " + pcap_path;
+        result.win32_error = GetLastError();
+        result.elapsed_ms = GetTickCount64() - start_ms;
         return result;
     }
 
     if (GetFileAttributesA(keylog_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         result.error_message = "Keylog file not found: " + keylog_path;
+        result.win32_error = GetLastError();
+        result.elapsed_ms = GetTickCount64() - start_ms;
         return result;
     }
 
     std::string tshark = find_tshark_path();
+    result.tshark_path = tshark;
     if (tshark.empty()) {
         result.error_message = "tshark not found. Install Wireshark to enable PCAP decryption.";
+        result.dependency_unavailable = true;
+        result.elapsed_ms = GetTickCount64() - start_ms;
         return result;
     }
 
 
     std::string cmd = "\"" + tshark + "\"";
-    cmd += " -r \"" + pcap_path + "\"";
+    cmd += " -n -r \"" + pcap_path + "\"";
     cmd += " -o \"tls.keylog_file:" + keylog_path + "\"";
     if (!display_filter.empty())
         cmd += " -Y \"" + display_filter + "\"";
     cmd += " -T json -l";
 
+    std::error_code pcap_ec;
+    std::error_code keylog_ec;
+    const std::uint64_t pcap_size = std::filesystem::file_size(pcap_path, pcap_ec);
+    const std::uint64_t keylog_size = std::filesystem::file_size(keylog_path, keylog_ec);
+    diag::log_tagged_fmt("net_sec", "tshark_decrypt launch_prepare tshark=%s pcap=%s pcap_size=%llu pcap_size_ok=%d keylog=%s keylog_size=%llu keylog_size_ok=%d filter=%s timeout_ms=%u",
+        tshark.c_str(),
+        pcap_path.c_str(),
+        static_cast<unsigned long long>(pcap_size),
+        pcap_ec ? 0 : 1,
+        keylog_path.c_str(),
+        static_cast<unsigned long long>(keylog_size),
+        keylog_ec ? 0 : 1,
+        display_filter.c_str(),
+        result.timeout_ms);
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
-    HANDLE hReadPipe = nullptr, hWritePipe = nullptr;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+    HANDLE hStdoutRead = nullptr, hStdoutWrite = nullptr;
+    HANDLE hStderrRead = nullptr, hStderrWrite = nullptr;
+    if (!CreatePipe(&hStdoutRead, &hStdoutWrite, &sa, 0)) {
         result.error_message = "Failed to create pipe for tshark output";
+        result.win32_error = GetLastError();
+        result.elapsed_ms = GetTickCount64() - start_ms;
         return result;
     }
-    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+    if (!CreatePipe(&hStderrRead, &hStderrWrite, &sa, 0)) {
+        result.error_message = "Failed to create pipe for tshark stderr";
+        result.win32_error = GetLastError();
+        CloseHandle(hStdoutRead);
+        CloseHandle(hStdoutWrite);
+        result.elapsed_ms = GetTickCount64() - start_ms;
+        return result;
+    }
+    SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hStderrRead, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
+    si.hStdOutput = hStdoutWrite;
+    si.hStdError = hStderrWrite;
 
     PROCESS_INFORMATION pi{};
 
@@ -1868,44 +2612,120 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
 
     if (!CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        result.error_message = "Failed to launch tshark: error " + std::to_string(GetLastError());
+        result.win32_error = GetLastError();
+        CloseHandle(hStdoutRead);
+        CloseHandle(hStdoutWrite);
+        CloseHandle(hStderrRead);
+        CloseHandle(hStderrWrite);
+        result.error_message = "Failed to launch tshark: error " + std::to_string(result.win32_error);
+        result.elapsed_ms = GetTickCount64() - start_ms;
         return result;
     }
 
-    CloseHandle(hWritePipe);
+    result.launched = true;
+    result.process_id = pi.dwProcessId;
+    result.launch_elapsed_ms = GetTickCount64() - start_ms;
+    CloseHandle(hStdoutWrite);
+    CloseHandle(hStderrWrite);
+    diag::log_tagged_fmt("net_sec", "tshark_decrypt process_started pid=%lu launch_elapsed_ms=%llu timeout_ms=%u",
+        static_cast<unsigned long>(pi.dwProcessId),
+        static_cast<unsigned long long>(result.launch_elapsed_ms),
+        result.timeout_ms);
 
 
-    std::string output;
-    output.reserve(1024 * 1024);
-    char read_buf[8192];
-    DWORD bytes_read = 0;
     constexpr std::size_t MAX_OUTPUT = 16 * 1024 * 1024;
+    std::string stdout_output;
+    std::string stderr_output;
+    stdout_output.reserve(1024 * 1024);
+    stderr_output.reserve(16 * 1024);
+    std::atomic<std::uint64_t> stdout_bytes{0};
+    std::atomic<std::uint64_t> stderr_bytes{0};
+    std::atomic<std::uint64_t> first_stdout_ms{0};
+    std::atomic<std::uint64_t> first_stderr_ms{0};
 
-    while (output.size() < MAX_OUTPUT && ReadFile(hReadPipe, read_buf, sizeof(read_buf), &bytes_read, nullptr) && bytes_read > 0) {
-        output.append(read_buf, bytes_read);
+    auto drain_pipe = [&](HANDLE pipe, std::string& sink, std::atomic<std::uint64_t>& byte_counter,
+                          std::atomic<std::uint64_t>& first_byte_elapsed) {
+        char read_buf[8192];
+        DWORD bytes_read = 0;
+        while (ReadFile(pipe, read_buf, sizeof(read_buf), &bytes_read, nullptr) && bytes_read > 0) {
+            const std::uint64_t old = byte_counter.fetch_add(bytes_read, std::memory_order_acq_rel);
+            if (old == 0)
+                first_byte_elapsed.store(GetTickCount64() - start_ms, std::memory_order_release);
+            if (sink.size() < MAX_OUTPUT) {
+                const std::size_t room = MAX_OUTPUT - sink.size();
+                sink.append(read_buf, std::min<std::size_t>(room, bytes_read));
+            }
+        }
+        CloseHandle(pipe);
+    };
+
+    std::thread stdout_thread(drain_pipe, hStdoutRead, std::ref(stdout_output), std::ref(stdout_bytes), std::ref(first_stdout_ms));
+    std::thread stderr_thread(drain_pipe, hStderrRead, std::ref(stderr_output), std::ref(stderr_bytes), std::ref(first_stderr_ms));
+
+    DWORD wait_status = WAIT_TIMEOUT;
+    while (true) {
+        wait_status = WaitForSingleObject(pi.hProcess, 50);
+        if (wait_status == WAIT_OBJECT_0 || wait_status == WAIT_FAILED)
+            break;
+        if (GetTickCount64() - start_ms >= result.timeout_ms) {
+            result.killed_on_deadline = true;
+            result.dependency_slow = true;
+            TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+            WaitForSingleObject(pi.hProcess, 2000);
+            break;
+        }
     }
-
-    WaitForSingleObject(pi.hProcess, 30000);
+    result.wait_status = wait_status;
 
     DWORD exit_code = 0;
     GetExitCodeProcess(pi.hProcess, &exit_code);
+    result.exit_code = exit_code;
+
+    if (stdout_thread.joinable())
+        stdout_thread.join();
+    if (stderr_thread.joinable())
+        stderr_thread.join();
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    CloseHandle(hReadPipe);
 
-    result.raw_output = output;
+    result.raw_output = stdout_output;
+    result.stderr_output = stderr_output.size() > 8192 ? stderr_output.substr(0, 8192) : stderr_output;
+    result.stdout_bytes = stdout_bytes.load(std::memory_order_acquire);
+    result.stderr_bytes = stderr_bytes.load(std::memory_order_acquire);
+    result.first_stdout_elapsed_ms = first_stdout_ms.load(std::memory_order_acquire);
+    result.first_stderr_elapsed_ms = first_stderr_ms.load(std::memory_order_acquire);
+    result.elapsed_ms = GetTickCount64() - start_ms;
 
-    if (exit_code != 0 && output.empty()) {
+    diag::log_tagged_fmt("net_sec", "tshark_decrypt process_exit pid=%u exit_code=%u wait_status=%u killed=%d dependency_slow=%d elapsed_ms=%llu stdout_bytes=%llu stderr_bytes=%llu first_stdout_ms=%llu first_stderr_ms=%llu",
+        result.process_id,
+        result.exit_code,
+        result.wait_status,
+        result.killed_on_deadline ? 1 : 0,
+        result.dependency_slow ? 1 : 0,
+        static_cast<unsigned long long>(result.elapsed_ms),
+        static_cast<unsigned long long>(result.stdout_bytes),
+        static_cast<unsigned long long>(result.stderr_bytes),
+        static_cast<unsigned long long>(result.first_stdout_elapsed_ms),
+        static_cast<unsigned long long>(result.first_stderr_elapsed_ms));
+
+    if (result.killed_on_deadline) {
+        result.error_message = "tshark exceeded decrypt deadline";
+        return result;
+    }
+
+    if (exit_code != 0 && stdout_output.empty()) {
         result.error_message = "tshark exited with code " + std::to_string(exit_code);
+        if (!stderr_output.empty())
+            result.error_message += ": " + stderr_output.substr(0, 512);
         return result;
     }
 
 
     try {
-        auto json_arr = nlohmann::json::parse(output);
+        const ULONGLONG parse_start = GetTickCount64();
+        auto json_arr = nlohmann::json::parse(stdout_output);
+        result.json_parse_elapsed_ms = GetTickCount64() - parse_start;
         result.total_packets = static_cast<std::uint32_t>(json_arr.size());
 
         for (const auto& pkt : json_arr) {
@@ -1978,15 +2798,26 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
                 process_http2_stream(http2);
             }
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception& ex) {
 
         if (result.raw_output.size() < 10) {
             result.error_message = std::string("No packets matched the filter '") + display_filter +
                                    "'. TLS decryption may have failed - ensure the keylog file has valid keys for this capture.";
+        } else {
+            result.error_message = std::string("Failed to parse tshark JSON output: ") + ex.what();
         }
     }
 
     result.success = (result.decrypted_packets > 0);
+    result.elapsed_ms = GetTickCount64() - start_ms;
+    diag::log_tagged_fmt("net_sec", "tshark_decrypt parse_done success=%d total_packets=%u decrypted=%u http2_frames=%zu parse_ms=%llu elapsed_ms=%llu error=%s",
+        result.success ? 1 : 0,
+        result.total_packets,
+        result.decrypted_packets,
+        result.http2_frames.size(),
+        static_cast<unsigned long long>(result.json_parse_elapsed_ms),
+        static_cast<unsigned long long>(result.elapsed_ms),
+        result.error_message.empty() ? "<none>" : result.error_message.c_str());
 
     return result;
 }
@@ -2034,14 +2865,33 @@ void TlsKeyExtractor::keylog_worker_loop(const char* mode, std::uint64_t generat
                _keylog_generation.load(std::memory_order_acquire) == generation) {
             tls_key_scan_config_t scan_cfg;
             scan_cfg.pid = config.pid;
+            scan_cfg.scan_schannel = config.scan_schannel;
+            scan_cfg.scan_openssl = config.scan_openssl;
+            scan_cfg.scan_nss = config.scan_nss;
+            scan_cfg.scan_boringssl = config.scan_boringssl;
+            scan_cfg.scan_generic = config.scan_generic;
+            scan_cfg.scan_tls13_structures = config.scan_tls13_structures;
+            scan_cfg.max_results = config.max_results;
+            scan_cfg.timeout_ms = config.scan_timeout_ms;
+            scan_cfg.hint_address = config.hint_address;
+            scan_cfg.hint_size = config.hint_size;
+            scan_cfg.hint_only = config.hint_only;
+            scan_cfg.cancel_flag = &_keylog_active;
 
             const ULONGLONG t0 = GetTickCount64();
             auto keys = extract_keys(scan_cfg);
-            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker scan_done mode=%s pid=%u keys=%zu elapsed_ms=%llu",
+            auto scan_diag = last_tls_scan_diagnostics();
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker scan_done mode=%s requested_pid=%u effective_pid=%u keys=%zu elapsed_ms=%llu scan_reason=%s deadline=%d cancelled=%d hint_used=%d generation=%llu",
                 mode ? mode : "",
                 scan_cfg.pid,
+                scan_diag.effective_pid,
                 keys.size(),
-                static_cast<unsigned long long>(GetTickCount64() - t0));
+                static_cast<unsigned long long>(GetTickCount64() - t0),
+                scan_diag.early_exit_reason.c_str(),
+                scan_diag.deadline_expired ? 1 : 0,
+                scan_diag.cancelled ? 1 : 0,
+                scan_diag.hint_used ? 1 : 0,
+                static_cast<unsigned long long>(generation));
             if (!keys.empty()) {
                 const bool wrote = write_keylog_file(config.output_file, keys, config.append);
                 diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::worker write_keylog mode=%s wrote=%d path=%s keys=%zu",
@@ -2170,6 +3020,15 @@ bool TlsKeyExtractor::stop_keylog() {
     std::lock_guard<std::mutex> lifecycle_lock(_keylog_lifecycle_mutex);
     const ULONGLONG t0 = GetTickCount64();
     const std::uint64_t generation = _keylog_generation.load(std::memory_order_acquire);
+    keylog_config_t config;
+    {
+        std::unique_lock<std::mutex> lock(_mutex, std::try_to_lock);
+        if (lock.owns_lock())
+            config = _keylog_config;
+        else
+            config.stop_wait_ms = 350;
+    }
+    const DWORD wait_ms = static_cast<DWORD>(std::max<std::uint32_t>(50, std::min<std::uint32_t>(config.stop_wait_ms, 5000)));
     diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog entry active=%d worker_done=%d generation=%llu worker_tid=%lu tid=%lu",
         _keylog_active.load(std::memory_order_acquire) ? 1 : 0,
         _keylog_worker_done.load(std::memory_order_acquire) ? 1 : 0,
@@ -2178,10 +3037,11 @@ bool TlsKeyExtractor::stop_keylog() {
         static_cast<unsigned long>(GetCurrentThreadId()));
     if (!_keylog_active.load(std::memory_order_acquire)) {
         if (!_keylog_worker_done.load(std::memory_order_acquire)) {
-            const bool done = wait_keylog_worker_done(generation, 1000);
-            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog inactive_worker_done=%d generation=%llu elapsed_ms=%llu",
+            const bool done = wait_keylog_worker_done(generation, wait_ms);
+            diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog inactive_worker_done=%d generation=%llu wait_ms=%lu elapsed_ms=%llu",
                 done ? 1 : 0,
                 static_cast<unsigned long long>(generation),
+                static_cast<unsigned long>(wait_ms),
                 static_cast<unsigned long long>(GetTickCount64() - t0));
         } else {
             diag::log_tagged("net_sec", "TlsKeyExtractor::stop_keylog rejected active=0");
@@ -2189,11 +3049,12 @@ bool TlsKeyExtractor::stop_keylog() {
         return false;
     }
     _keylog_active.store(false, std::memory_order_release);
-    const bool done = wait_keylog_worker_done(generation, 10000);
-    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog worker_done=%d generation=%llu worker_tid=%lu elapsed_ms=%llu",
+    const bool done = wait_keylog_worker_done(generation, wait_ms);
+    diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::stop_keylog worker_done=%d generation=%llu worker_tid=%lu wait_ms=%lu elapsed_ms=%llu",
         done ? 1 : 0,
         static_cast<unsigned long long>(generation),
         static_cast<unsigned long>(_keylog_worker_tid.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(wait_ms),
         static_cast<unsigned long long>(GetTickCount64() - t0));
     return done;
 }

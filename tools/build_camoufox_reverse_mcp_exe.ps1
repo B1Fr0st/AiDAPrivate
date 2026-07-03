@@ -580,8 +580,13 @@ function Invoke-FrozenMcpContractCheck {
     $latePageWaitOk = $stdout -match '"late_page_wait_floor_present":true'
     $waitForLatePageSelfPagesOk = $stdout -match '"wait_for_late_page_self_pages_present":true'
     $primaryWaitUntilDowngradeAbsent = $stdout -match '"primary_wait_until_downgrade_absent":true'
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent)) {
-        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    $addonPolicyOk = $stdout -match '"addon_policy_contract_ok":true'
+    $addonPolicyMarkerOk = $stdout -match '"addon_policy_marker_present":true'
+    $addonExcludeOk = $stdout -match '"default_ubo_exclusion_present":true'
+    $addonExcludeMarkerOk = $stdout -match '"exclude_addons_marker_present":true'
+    $addonInvalidDiagOk = $stdout -match '"addon_invalid_diagnostic_present":true'
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk)) {
+        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "frozen_mcp_contract_check=ok"
 }
@@ -600,6 +605,35 @@ function Assert-FrozenMcpCustomerSafeExecutable {
     if (Test-FrozenMcpOneDirRuntime $Executable) {
         throw "Frozen MCP executable is a PyInstaller onedir bootloader with sibling _internal runtime. Build a self-contained onefile executable before customer deployment."
     }
+}
+
+function Assert-SourceAddonPolicyContract {
+    param([string]$SourceRoot)
+    $browserPath = Join-Path $SourceRoot "src\camoufox_reverse_mcp\browser.py"
+    if (-not [IO.File]::Exists($browserPath)) {
+        throw "Camoufox reverse MCP browser.py was not found for addon policy validation: $browserPath"
+    }
+    $text = Get-Content -Raw -LiteralPath $browserPath
+    $required = @(
+        "aida_default_addon_policy_v1",
+        "DefaultAddons.UBO",
+        "exclude_addons",
+        "launch_options_addon_policy",
+        "launch_options_addon_invalid",
+        "default_addons_excluded",
+        "explicit_addon_count"
+    )
+    $missing = @()
+    foreach ($marker in $required) {
+        if (-not $text.Contains($marker)) {
+            $missing += $marker
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw "Camoufox reverse MCP source addon policy contract missing markers: $($missing -join ',') in $browserPath"
+    }
+    Write-Output "source_addon_policy_contract=ok"
+    Write-Output "source_addon_policy_contract_browser=$browserPath"
 }
 
 function Invoke-SourceMcpContractCheck {
@@ -973,6 +1007,7 @@ $SourceRoot = (Resolve-Path -LiteralPath $SourceRoot -ErrorAction Stop).Path
 if (-not [IO.File]::Exists((Join-Path $SourceRoot "pyproject.toml"))) {
     throw "camoufox-reverse-mcp pyproject.toml was not found at $SourceRoot"
 }
+Assert-SourceAddonPolicyContract -SourceRoot $SourceRoot
 
 $Python = Resolve-Python $Python
 $version = (& $Python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
@@ -1059,6 +1094,7 @@ import types
 
 
 AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
+AIDA_DEFAULT_ADDON_POLICY_V1 = "aida_default_addon_policy_v1"
 
 
 def _aida_contract_probe_from_code(code, source):
@@ -1237,6 +1273,12 @@ def _aida_launch_budget_contract_probe():
         "primary_wait_until_downgrade_present": True,
         "wait_for_late_page_self_pages_present": False,
         "late_page_wait_floor_present": False,
+        "addon_policy_marker_present": False,
+        "addon_policy_log_present": False,
+        "addon_invalid_diagnostic_present": False,
+        "exclude_addons_marker_present": False,
+        "default_ubo_exclusion_present": False,
+        "addon_policy_contract_ok": False,
         "browser_probe_mode": "",
         "navigation_probe_mode": "",
         "browser_probe_details": {},
@@ -1255,6 +1297,11 @@ def _aida_launch_budget_contract_probe():
             diagnostics["page_create_ceiling_present"] = "page_create_ceiling_s = 18.0 if fast_probe else 35.0" in browser_text
             diagnostics["page_create_ratio_present"] = "launch_timeout_s * (0.18 if fast_probe else 0.40)" in browser_text
             diagnostics["late_page_wait_floor_present"] = "late_page_wait_s = 1.0 if fast_probe else min(8.0, max(2.0, launch_timeout_s * 0.12))" in browser_text
+            diagnostics["addon_policy_marker_present"] = AIDA_DEFAULT_ADDON_POLICY_V1 in browser_text
+            diagnostics["addon_policy_log_present"] = "launch_options_addon_policy" in browser_text
+            diagnostics["addon_invalid_diagnostic_present"] = "launch_options_addon_invalid" in browser_text
+            diagnostics["exclude_addons_marker_present"] = "exclude_addons" in browser_text
+            diagnostics["default_ubo_exclusion_present"] = "DefaultAddons.UBO" in browser_text
             tree = ast.parse(browser_text, filename=browser_spec.origin)
             for node in ast.walk(tree):
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "_wait_for_late_page":
@@ -1282,6 +1329,24 @@ def _aida_launch_budget_contract_probe():
                 browser_manager_cls = getattr(browser_module, "BrowserManager", None)
                 launch_attr = getattr(browser_manager_cls, "launch", None) if browser_manager_cls is not None else None
                 launch_code = getattr(launch_attr, "__code__", None)
+                addon_functions = [
+                    getattr(browser_module, "_build_camoufox_launch_options", None),
+                    getattr(browser_module, "_apply_default_addon_policy", None),
+                    getattr(browser_module, "_addon_exception_matches", None),
+                ]
+                addon_repr = ""
+                for addon_func in addon_functions:
+                    addon_code = getattr(addon_func, "__code__", None)
+                    if addon_code is not None:
+                        addon_repr += repr(getattr(addon_code, "co_consts", ()))
+                        addon_repr += repr(getattr(addon_code, "co_names", ()))
+                        addon_repr += repr(getattr(addon_code, "co_varnames", ()))
+                marker_attr = str(getattr(browser_module, "AIDA_DEFAULT_ADDON_POLICY_MARKER", ""))
+                diagnostics["addon_policy_marker_present"] = marker_attr == AIDA_DEFAULT_ADDON_POLICY_V1 or AIDA_DEFAULT_ADDON_POLICY_V1 in addon_repr
+                diagnostics["addon_policy_log_present"] = "launch_options_addon_policy" in addon_repr
+                diagnostics["addon_invalid_diagnostic_present"] = "launch_options_addon_invalid" in addon_repr
+                diagnostics["exclude_addons_marker_present"] = "exclude_addons" in addon_repr
+                diagnostics["default_ubo_exclusion_present"] = "DefaultAddons.UBO" in addon_repr and "DefaultAddons" in addon_repr and "UBO" in addon_repr
                 if launch_code is None:
                     diagnostics["errors"].append({"module": "browser", "error_type": "ProbeError", "error": "BrowserManager.launch code object unavailable"})
                 else:
@@ -1363,7 +1428,19 @@ def _aida_launch_budget_contract_probe():
         and diagnostics["late_page_wait_floor_present"]
         and diagnostics["wait_for_late_page_self_pages_present"]
         and not diagnostics["primary_wait_until_downgrade_present"]
+        and diagnostics["addon_policy_marker_present"]
+        and diagnostics["addon_policy_log_present"]
+        and diagnostics["addon_invalid_diagnostic_present"]
+        and diagnostics["exclude_addons_marker_present"]
+        and diagnostics["default_ubo_exclusion_present"]
         and not diagnostics["errors"]
+    )
+    diagnostics["addon_policy_contract_ok"] = (
+        diagnostics["addon_policy_marker_present"]
+        and diagnostics["addon_policy_log_present"]
+        and diagnostics["addon_invalid_diagnostic_present"]
+        and diagnostics["exclude_addons_marker_present"]
+        and diagnostics["default_ubo_exclusion_present"]
     )
     diagnostics["ok"] = ok
     return diagnostics
@@ -1376,6 +1453,7 @@ def _run_contract_check():
     navigation_mode = launch_budget.get("navigation_probe_mode", "")
     probe_log.append(f"browser_probe_mode={browser_mode or 'missing'}")
     probe_log.append(f"navigation_probe_mode={navigation_mode or 'missing'}")
+    probe_log.append(f"addon_policy={'pass' if launch_budget.get('addon_policy_contract_ok') else 'fail'}")
     browser_details = launch_budget.get("browser_probe_details") or {}
     for key in ("floor", "ceiling", "ratio", "late_page", "self_pages"):
         entry = browser_details.get(key)
@@ -1411,6 +1489,12 @@ def _run_contract_check():
         "late_page_wait_floor_present": bool(launch_budget.get("late_page_wait_floor_present")),
         "primary_wait_until_downgrade_absent": not bool(launch_budget.get("primary_wait_until_downgrade_present", True)),
         "wait_for_late_page_self_pages_present": bool(launch_budget.get("wait_for_late_page_self_pages_present")),
+        "addon_policy_contract_ok": bool(launch_budget.get("addon_policy_contract_ok")),
+        "addon_policy_marker_present": bool(launch_budget.get("addon_policy_marker_present")),
+        "addon_policy_log_present": bool(launch_budget.get("addon_policy_log_present")),
+        "addon_invalid_diagnostic_present": bool(launch_budget.get("addon_invalid_diagnostic_present")),
+        "exclude_addons_marker_present": bool(launch_budget.get("exclude_addons_marker_present")),
+        "default_ubo_exclusion_present": bool(launch_budget.get("default_ubo_exclusion_present")),
         "probe_log": probe_log,
     }
     for line in probe_log:
@@ -1475,9 +1559,24 @@ def _run_import_smoke():
         import camoufox_reverse_mcp.tools.network as network_module
         pageerror_patch_marker = getattr(playwright_patch_module, "AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID", "")
         patch_marker = getattr(browser_module, "AIDA_CAMOUFOX_BRIDGE_PATCH_ID", "")
+        addon_policy_marker = getattr(browser_module, "AIDA_DEFAULT_ADDON_POLICY_MARKER", "")
         launch_code = getattr(browser_module.BrowserManager.launch, "__code__", None)
         launch_consts = repr(getattr(launch_code, "co_consts", ()))
         launch_names = repr(getattr(launch_code, "co_names", ()))
+        launch_options_code = getattr(getattr(browser_module, "_build_camoufox_launch_options", None), "__code__", None)
+        addon_policy_code = getattr(getattr(browser_module, "_apply_default_addon_policy", None), "__code__", None)
+        addon_exception_code = getattr(getattr(browser_module, "_addon_exception_matches", None), "__code__", None)
+        addon_policy_contract = (
+            repr(getattr(launch_options_code, "co_consts", ())) +
+            repr(getattr(launch_options_code, "co_names", ())) +
+            repr(getattr(launch_options_code, "co_varnames", ())) +
+            repr(getattr(addon_policy_code, "co_consts", ())) +
+            repr(getattr(addon_policy_code, "co_names", ())) +
+            repr(getattr(addon_policy_code, "co_varnames", ())) +
+            repr(getattr(addon_exception_code, "co_consts", ())) +
+            repr(getattr(addon_exception_code, "co_names", ())) +
+            repr(getattr(addon_exception_code, "co_varnames", ()))
+        )
         privacy_verify_code = getattr(getattr(browser_module, "_verify_page_privacy", None), "__code__", None)
         privacy_verify_consts = repr(getattr(privacy_verify_code, "co_consts", ()))
         browser_recovery_consts = (
@@ -1497,10 +1596,15 @@ def _run_import_smoke():
             raise RuntimeError(f"frozen Playwright pageError patch marker mismatch: {pageerror_patch_marker!r}")
         if patch_marker != "aida_camoufox_bridge_20260620_crash_diag_1":
             raise RuntimeError(f"frozen browser patch marker mismatch: {patch_marker!r}")
+        if addon_policy_marker != "aida_default_addon_policy_v1":
+            raise RuntimeError(f"frozen addon policy marker mismatch: {addon_policy_marker!r}")
         if "aida_bridge_patch_active" not in launch_consts or "aida_launch_policy_resolved" not in launch_consts:
             raise RuntimeError("frozen browser launch diagnostics missing")
         if "AIDA_CAMOUFOX_BRIDGE_PATCH_ID" not in launch_names:
             raise RuntimeError("frozen browser launch patch marker missing")
+        for marker in ("aida_default_addon_policy_v1", "DefaultAddons.UBO", "exclude_addons", "launch_options_addon_policy", "launch_options_addon_invalid"):
+            if marker not in addon_policy_contract:
+                raise RuntimeError(f"frozen addon policy contract marker missing: {marker}")
         for marker in ("launch_new_page_task_result",):
             if marker not in launch_consts:
                 raise RuntimeError(f"frozen browser launch marker missing: {marker}")
@@ -1531,6 +1635,7 @@ def _run_import_smoke():
             pageerror_patch=playwright_patch,
         )
         import_started = time.perf_counter()
+        from camoufox.addons import DefaultAddons
         from camoufox.utils import launch_options
         debug(
             "import_smoke_launch_options_import_ok",
@@ -1550,7 +1655,14 @@ def _run_import_smoke():
         if executable:
             kwargs["executable_path"] = executable
         options_started = time.perf_counter()
-        options = launch_options(**kwargs)
+        direct_kwargs = dict(kwargs)
+        direct_kwargs["exclude_addons"] = [DefaultAddons.UBO]
+        options = launch_options(**direct_kwargs)
+        builder_options = browser_module._build_camoufox_launch_options(True, dict(kwargs))
+        addon_policy = dict(getattr(browser_module, "_LAST_ADDON_POLICY", {}) or {})
+        if not addon_policy.get("default_addons_excluded") or not addon_policy.get("exclude_default_ubo"):
+            raise RuntimeError(f"addon policy exclusion was not applied: {addon_policy}")
+        builder_addons = builder_options.get("addons") if isinstance(builder_options, dict) else []
         debug(
             "import_smoke_launch_options_ok",
             elapsed_ms=int((time.perf_counter() - options_started) * 1000),
@@ -1558,6 +1670,13 @@ def _run_import_smoke():
             has_executable=bool(options.get("executable_path")),
             args=len(options.get("args") or []),
             env_keys=len(options.get("env") or {}),
+            direct_exclude_default_ubo=True,
+            builder_args=len(builder_options.get("args") or []) if isinstance(builder_options, dict) else 0,
+            builder_env_keys=len(builder_options.get("env") or {}) if isinstance(builder_options, dict) else 0,
+            builder_addon_count=len(builder_addons) if isinstance(builder_addons, (list, tuple)) else (1 if builder_addons else 0),
+            default_addons_excluded=bool(addon_policy.get("default_addons_excluded")),
+            exclude_default_ubo=bool(addon_policy.get("exclude_default_ubo")),
+            explicit_addon_count=int(addon_policy.get("explicit_addon_count") or 0),
         )
         print("AIDA_CAMOUFOX_IMPORT_SMOKE_OK", flush=True)
         return 0

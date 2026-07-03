@@ -603,6 +603,78 @@ static std::uint64_t ns_json_u64_param(const json& params, const char* key, std:
     return fallback;
 }
 
+static std::uint32_t ns_json_u32_bounded_param(const json& params, const char* key,
+                                               std::uint32_t fallback,
+                                               std::uint32_t min_value,
+                                               std::uint32_t max_value) {
+    const std::uint64_t raw = ns_json_u64_param(params, key, fallback);
+    const std::uint64_t bounded = std::max<std::uint64_t>(min_value, std::min<std::uint64_t>(raw, max_value));
+    return static_cast<std::uint32_t>(bounded);
+}
+
+static net_security::tls_key_scan_config_t ns_key_scan_config_from_params(const json& params,
+                                                                          std::uint32_t default_timeout_ms,
+                                                                          std::uint32_t default_max_results) {
+    net_security::tls_key_scan_config_t config;
+    config.pid = params.value("pid", 0u);
+    config.scan_schannel = params.value("scan_schannel", true);
+    config.scan_openssl = params.value("scan_openssl", true);
+    config.scan_nss = params.value("scan_nss", true);
+    config.scan_boringssl = params.value("scan_boringssl", true);
+    config.scan_generic = params.value("scan_generic", true);
+    config.scan_tls13_structures = params.value("scan_tls13_structures", true);
+    config.max_results = ns_json_u32_bounded_param(params, "max_results", default_max_results, 1, 4096);
+    if (params.contains("max_keys"))
+        config.max_results = ns_json_u32_bounded_param(params, "max_keys", config.max_results, 1, 4096);
+    config.timeout_ms = ns_json_u32_bounded_param(params, "timeout_ms", default_timeout_ms, 250, 60000);
+    config.max_regions = ns_json_u32_bounded_param(params, "max_regions", 0, 0, 1000000);
+    config.max_read_attempts = ns_json_u32_bounded_param(params, "max_read_attempts", 0, 0, 10000000);
+    config.max_read_bytes = ns_json_u64_param(params, "max_read_bytes", 0);
+    config.hint_address = ns_json_u64_param(params, "hint_address", 0);
+    if (config.hint_address == 0)
+        config.hint_address = ns_json_u64_param(params, "memory_hint_address", 0);
+    config.hint_size = ns_json_u32_bounded_param(params, "hint_size", 0, 0, 0x10000000);
+    if (config.hint_size == 0)
+        config.hint_size = ns_json_u32_bounded_param(params, "memory_hint_size", 0, 0, 0x10000000);
+    config.hint_only = params.value("hint_only", false) || params.value("memory_hint_only", false);
+    return config;
+}
+
+static json ns_key_scan_diag_json(const net_security::key_scan_diagnostics_t& d) {
+    json j;
+    j["requested_pid"] = d.requested_pid;
+    j["effective_pid"] = d.effective_pid;
+    j["attached_pid"] = d.attached_pid;
+    j["timeout_ms"] = d.timeout_ms;
+    j["max_results"] = d.max_results;
+    j["max_regions"] = d.max_regions;
+    j["max_read_attempts"] = d.max_read_attempts;
+    j["max_read_bytes"] = d.max_read_bytes;
+    j["hint_address"] = d.hint_address;
+    j["hint_size"] = d.hint_size;
+    j["hint_only"] = d.hint_only;
+    j["hint_used"] = d.hint_used;
+    j["deadline_expired"] = d.deadline_expired;
+    j["cancelled"] = d.cancelled;
+    j["truncated"] = d.truncated;
+    j["elapsed_ms"] = d.elapsed_ms;
+    j["enumerate_elapsed_ms"] = d.enumerate_elapsed_ms;
+    j["first_hit_elapsed_ms"] = d.first_hit_elapsed_ms;
+    j["regions_seen"] = d.regions_seen;
+    j["regions_committed"] = d.regions_committed;
+    j["regions_skipped_state"] = d.regions_skipped_state;
+    j["regions_skipped_size"] = d.regions_skipped_size;
+    j["read_attempts"] = d.read_attempts;
+    j["read_bytes"] = d.read_bytes;
+    j["read_short"] = d.read_short;
+    j["first_short_read_va"] = d.first_short_read_va;
+    j["candidate_hits"] = d.candidate_hits;
+    j["reject_count"] = d.reject_count;
+    j["keys_found"] = d.keys_found;
+    j["early_exit_reason"] = d.early_exit_reason;
+    return j;
+}
+
 static json ns_tls_keylog_ledger_json(const ns_tls_keylog_session_state_t& s) {
     json j;
     j["active"] = s.active;
@@ -2210,13 +2282,20 @@ static tool_result_t aida_tls_test_crime(const json& params)
 }
 
 tool_result_t tls_extract_keys(const json& params) {
-    std::uint32_t pid = params.value("pid", 0u);
-    diag::log_tagged_fmt("net_sec", "tls_extract_keys entry pid=%u scan_schannel=%d scan_openssl=%d scan_nss=%d scan_boringssl=%d",
-        pid,
+    auto config = ns_key_scan_config_from_params(params, 9000, 64);
+    diag::log_tagged_fmt("net_sec", "tls_extract_keys entry pid=%u scan_schannel=%d scan_openssl=%d scan_nss=%d scan_boringssl=%d scan_generic=%d scan_tls13=%d timeout_ms=%u max_results=%u hint=0x%llX hint_size=%u hint_only=%d",
+        config.pid,
         (int)params.value("scan_schannel", true),
         (int)params.value("scan_openssl", true),
         (int)params.value("scan_nss", true),
-        (int)params.value("scan_boringssl", true));
+        (int)params.value("scan_boringssl", true),
+        config.scan_generic ? 1 : 0,
+        config.scan_tls13_structures ? 1 : 0,
+        config.timeout_ms,
+        config.max_results,
+        static_cast<unsigned long long>(config.hint_address),
+        config.hint_size,
+        config.hint_only ? 1 : 0);
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "tls_extract_keys driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
@@ -2231,18 +2310,27 @@ tool_result_t tls_extract_keys(const json& params) {
         return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
     }
 
-    net_security::tls_key_scan_config_t config;
-    config.pid = pid;
-    config.scan_schannel = params.value("scan_schannel", true);
-    config.scan_openssl = params.value("scan_openssl", true);
-    config.scan_nss = params.value("scan_nss", true);
-    config.scan_boringssl = params.value("scan_boringssl", true);
-    config.max_results = params.value("max_results", 64u);
-
     auto keys = net_security::TlsKeyExtractor::instance().extract_keys(config);
-    diag::log_tagged_fmt("net_sec", "tls_extract_keys keys_found=%zu pid=%u", keys.size(), pid);
+    auto scan_diag = net_security::TlsKeyExtractor::instance().last_tls_scan_diagnostics();
+    diag::log_tagged_fmt("net_sec", "tls_extract_keys keys_found=%zu requested_pid=%u effective_pid=%u elapsed_ms=%llu reason=%s deadline=%d cancelled=%d truncated=%d",
+        keys.size(),
+        config.pid,
+        scan_diag.effective_pid,
+        static_cast<unsigned long long>(scan_diag.elapsed_ms),
+        scan_diag.early_exit_reason.c_str(),
+        scan_diag.deadline_expired ? 1 : 0,
+        scan_diag.cancelled ? 1 : 0,
+        scan_diag.truncated ? 1 : 0);
     json result;
     result["keys_found"] = keys.size();
+    result["requested_pid"] = config.pid;
+    result["effective_pid"] = scan_diag.effective_pid;
+    result["driver_attached_pid"] = driver_bridge::attached_pid();
+    result["scan"] = ns_key_scan_diag_json(scan_diag);
+    result["deadline_expired"] = scan_diag.deadline_expired;
+    result["cancelled"] = scan_diag.cancelled;
+    result["truncated"] = scan_diag.truncated;
+    result["bounded"] = true;
     json arr = json::array();
     for (const auto& k : keys) {
         json kj;
@@ -2257,6 +2345,8 @@ tool_result_t tls_extract_keys(const json& params) {
         arr.push_back(kj);
     }
     result["keys"] = arr;
+    if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
+        return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("TLS key extraction exceeded scan deadline") : OBFSTR("TLS key extraction cancelled"), result);
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" TLS session keys"), result);
 }
 
@@ -2269,6 +2359,24 @@ tool_result_t tls_start_keylog(const json& params) {
     config.pid = params.value("pid", 0u);
     config.output_file = params.value("output_file", "");
     config.poll_interval_ms = params.value("poll_interval_ms", 2000u);
+    config.scan_timeout_ms = ns_json_u32_bounded_param(params, "scan_timeout_ms", 1500, 100, 60000);
+    config.stop_wait_ms = ns_json_u32_bounded_param(params, "stop_wait_ms", 350, 50, 5000);
+    config.max_results = ns_json_u32_bounded_param(params, "max_results", 16, 1, 4096);
+    if (params.contains("max_keys"))
+        config.max_results = ns_json_u32_bounded_param(params, "max_keys", config.max_results, 1, 4096);
+    config.scan_schannel = params.value("scan_schannel", true);
+    config.scan_openssl = params.value("scan_openssl", true);
+    config.scan_nss = params.value("scan_nss", true);
+    config.scan_boringssl = params.value("scan_boringssl", true);
+    config.scan_generic = params.value("scan_generic", true);
+    config.scan_tls13_structures = params.value("scan_tls13_structures", true);
+    config.hint_address = ns_json_u64_param(params, "hint_address", 0);
+    if (config.hint_address == 0)
+        config.hint_address = ns_json_u64_param(params, "memory_hint_address", 0);
+    config.hint_size = ns_json_u32_bounded_param(params, "hint_size", 0, 0, 0x10000000);
+    if (config.hint_size == 0)
+        config.hint_size = ns_json_u32_bounded_param(params, "memory_hint_size", 0, 0, 0x10000000);
+    config.hint_only = params.value("hint_only", false) || params.value("memory_hint_only", false);
     config.append = params.value("append", true);
 
     if (config.output_file.empty()) {
@@ -2306,6 +2414,12 @@ tool_result_t tls_start_keylog(const json& params) {
     r["pid"] = config.pid;
     r["output_file"] = config.output_file;
     r["poll_interval_ms"] = config.poll_interval_ms;
+    r["scan_timeout_ms"] = config.scan_timeout_ms;
+    r["stop_wait_ms"] = config.stop_wait_ms;
+    r["max_results"] = config.max_results;
+    r["hint_address"] = config.hint_address;
+    r["hint_size"] = config.hint_size;
+    r["hint_only"] = config.hint_only;
     r["append"] = config.append;
     r["active_before"] = extractor_active_before || ledger_active_before;
     r["active_after"] = extractor_active_after;
@@ -2475,9 +2589,13 @@ tool_result_t tls_stop_keylog(const json& params) {
     const bool extractor_active_after = extractor.is_keylogging();
     const auto seen_after = extractor.get_seen_keys();
     const auto file_after = ns_probe_keylog_file(ledger_output_file);
-    r["status"] = stopped ? "stopped" : "stop_failed";
+    const bool stop_accepted = stopped || !extractor_active_after;
+    r["status"] = stopped ? "stopped" : (stop_accepted ? "stopping" : "stop_failed");
     r["stop_attempted"] = true;
-    r["stop_succeeded"] = stopped;
+    r["stop_succeeded"] = stop_accepted;
+    r["worker_done"] = stopped;
+    r["bounded_stop"] = true;
+    r["stop_wait_timeout"] = !stopped && stop_accepted;
     r["active_after"] = extractor_active_after;
     r["extractor_active_after"] = extractor_active_after;
     r["key_count_after"] = static_cast<std::uint64_t>(seen_after.size());
@@ -2487,15 +2605,15 @@ tool_result_t tls_stop_keylog(const json& params) {
     r["win32_last_error"] = static_cast<unsigned long>(gle);
     r["elapsed_ms"] = elapsed_ms;
     r["lifetime_ms"] = ledger_started_ms != 0 && call_start_ms >= ledger_started_ms ? call_start_ms - ledger_started_ms : 0;
-    r["worker_exit_reason"] = stopped ? "extractor_worker_done" : "extractor_stop_failed_or_timeout";
+    r["worker_exit_reason"] = stopped ? "extractor_worker_done" : (stop_accepted ? "extractor_worker_unwinding_after_bounded_stop" : "extractor_stop_failed_or_timeout");
 
     {
         std::lock_guard<std::mutex> lock(ledger_state.mutex);
         const bool same_session = ledger_state.session_id == ledger_session_before;
-        if (stopped && same_session) {
+        if (stop_accepted && same_session) {
             ledger_state.active = false;
             ledger_state.stopped_ms = call_start_ms;
-            ledger_state.last_error.clear();
+            ledger_state.last_error = stopped ? "" : "extractor_worker_unwinding_after_bounded_stop";
             ++ledger_state.stops;
         } else if (same_session) {
             ledger_state.last_error = "extractor_stop_failed_or_timeout";
@@ -2506,7 +2624,9 @@ tool_result_t tls_stop_keylog(const json& params) {
         r["ledger_after"] = ns_tls_keylog_ledger_json(ledger_state);
     }
 
-    diag::log_tagged_fmt("net_sec", "tls_stop_keylog stopped=%d session_id=%llu requested_session_id=%llu active_before=%d active_after=%d elapsed_ms=%llu lifetime_ms=%llu keys_before=%zu keys_after=%zu output_file=%s gle=%lu",
+    diag::log_tagged_fmt("net_sec", "tls_stop_keylog stopped=%d stop_accepted=%d worker_done=%d session_id=%llu requested_session_id=%llu active_before=%d active_after=%d elapsed_ms=%llu lifetime_ms=%llu keys_before=%zu keys_after=%zu output_file=%s gle=%lu",
+        stopped ? 1 : 0,
+        stop_accepted ? 1 : 0,
         stopped ? 1 : 0,
         static_cast<unsigned long long>(ledger_session_before),
         static_cast<unsigned long long>(requested_session_id),
@@ -2518,8 +2638,8 @@ tool_result_t tls_stop_keylog(const json& params) {
         seen_after.size(),
         ledger_output_file.c_str(),
         static_cast<unsigned long>(gle));
-    if (stopped)
-        return tool_result_t::ok(OBFSTR("TLS keylogging stopped"), r);
+    if (stop_accepted)
+        return tool_result_t::ok(stopped ? OBFSTR("TLS keylogging stopped") : OBFSTR("TLS keylogging stop accepted; worker is unwinding"), r);
     return tool_result_t::error(OBFSTR("TLS keylogging stop failed"), r);
 }
 
@@ -2908,18 +3028,44 @@ tool_result_t quic_decrypt_initial(const json& params) {
 }
 
 tool_result_t quic_extract_keys(const json& params) {
-    std::uint32_t pid = params.value("pid", 0u);
-    diag::log_tagged_fmt("net_sec", "quic_extract_keys entry pid=%u", pid);
+    auto config = ns_key_scan_config_from_params(params, 9000, 64);
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys entry pid=%u timeout_ms=%u max_results=%u max_regions=%u max_reads=%u max_bytes=%llu hint=0x%llX hint_size=%u hint_only=%d",
+        config.pid,
+        config.timeout_ms,
+        config.max_results,
+        config.max_regions,
+        config.max_read_attempts,
+        static_cast<unsigned long long>(config.max_read_bytes),
+        static_cast<unsigned long long>(config.hint_address),
+        config.hint_size,
+        config.hint_only ? 1 : 0);
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "quic_extract_keys driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
     }
 
-    auto keys = net_security::QuicAnalyzer::instance().extract_quic_traffic_keys(pid);
-    diag::log_tagged_fmt("net_sec", "quic_extract_keys keys_found=%zu pid=%u", keys.size(), pid);
+    auto keys = net_security::TlsKeyExtractor::instance().extract_quic_keys(config);
+    auto scan_diag = net_security::TlsKeyExtractor::instance().last_quic_scan_diagnostics();
+    diag::log_tagged_fmt("net_sec", "quic_extract_keys keys_found=%zu requested_pid=%u effective_pid=%u elapsed_ms=%llu reason=%s deadline=%d cancelled=%d truncated=%d",
+        keys.size(),
+        config.pid,
+        scan_diag.effective_pid,
+        static_cast<unsigned long long>(scan_diag.elapsed_ms),
+        scan_diag.early_exit_reason.c_str(),
+        scan_diag.deadline_expired ? 1 : 0,
+        scan_diag.cancelled ? 1 : 0,
+        scan_diag.truncated ? 1 : 0);
 
     json result;
     result["keys_found"] = keys.size();
+    result["requested_pid"] = config.pid;
+    result["effective_pid"] = scan_diag.effective_pid;
+    result["driver_attached_pid"] = driver_bridge::attached_pid();
+    result["scan"] = ns_key_scan_diag_json(scan_diag);
+    result["deadline_expired"] = scan_diag.deadline_expired;
+    result["cancelled"] = scan_diag.cancelled;
+    result["truncated"] = scan_diag.truncated;
+    result["bounded"] = true;
     json arr = json::array();
     for (const auto& k : keys) {
         json kj;
@@ -2931,6 +3077,8 @@ tool_result_t quic_extract_keys(const json& params) {
         arr.push_back(kj);
     }
     result["keys"] = arr;
+    if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
+        return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("QUIC key extraction exceeded scan deadline") : OBFSTR("QUIC key extraction cancelled"), result);
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" QUIC keys"), result);
 }
 
@@ -3219,8 +3367,17 @@ tool_result_t dtls_detect_sessions(const json& params) {
 }
 
 tool_result_t dtls_extract_keys(const json& params) {
-    std::uint32_t pid = params.value("pid", 0u);
-    diag::log_tagged_fmt("net_sec", "dtls_extract_keys entry pid=%u", pid);
+    auto config = ns_key_scan_config_from_params(params, 9000, 64);
+    diag::log_tagged_fmt("net_sec", "dtls_extract_keys entry pid=%u timeout_ms=%u max_results=%u max_regions=%u max_reads=%u max_bytes=%llu hint=0x%llX hint_size=%u hint_only=%d",
+        config.pid,
+        config.timeout_ms,
+        config.max_results,
+        config.max_regions,
+        config.max_read_attempts,
+        static_cast<unsigned long long>(config.max_read_bytes),
+        static_cast<unsigned long long>(config.hint_address),
+        config.hint_size,
+        config.hint_only ? 1 : 0);
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "dtls_extract_keys driver not connected");
         return tool_result_t::error(OBFSTR("Driver not connected"));
@@ -3235,11 +3392,28 @@ tool_result_t dtls_extract_keys(const json& params) {
         return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
     }
 
-    auto keys = net_security::TlsKeyExtractor::instance().extract_dtls_keys(pid);
-    diag::log_tagged_fmt("net_sec", "dtls_extract_keys keys_found=%zu pid=%u", keys.size(), pid);
+    auto keys = net_security::TlsKeyExtractor::instance().extract_dtls_keys(config);
+    auto scan_diag = net_security::TlsKeyExtractor::instance().last_dtls_scan_diagnostics();
+    diag::log_tagged_fmt("net_sec", "dtls_extract_keys keys_found=%zu requested_pid=%u effective_pid=%u elapsed_ms=%llu reason=%s deadline=%d cancelled=%d truncated=%d",
+        keys.size(),
+        config.pid,
+        scan_diag.effective_pid,
+        static_cast<unsigned long long>(scan_diag.elapsed_ms),
+        scan_diag.early_exit_reason.c_str(),
+        scan_diag.deadline_expired ? 1 : 0,
+        scan_diag.cancelled ? 1 : 0,
+        scan_diag.truncated ? 1 : 0);
 
     json result;
     result["keys_found"] = keys.size();
+    result["requested_pid"] = config.pid;
+    result["effective_pid"] = scan_diag.effective_pid;
+    result["driver_attached_pid"] = driver_bridge::attached_pid();
+    result["scan"] = ns_key_scan_diag_json(scan_diag);
+    result["deadline_expired"] = scan_diag.deadline_expired;
+    result["cancelled"] = scan_diag.cancelled;
+    result["truncated"] = scan_diag.truncated;
+    result["bounded"] = true;
     json arr = json::array();
     for (const auto& k : keys) {
         json kj;
@@ -3251,6 +3425,8 @@ tool_result_t dtls_extract_keys(const json& params) {
         arr.push_back(kj);
     }
     result["keys"] = arr;
+    if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
+        return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("DTLS key extraction exceeded scan deadline") : OBFSTR("DTLS key extraction cancelled"), result);
     return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" DTLS keys"), result);
 }
 
@@ -3258,8 +3434,9 @@ tool_result_t network_decrypt_capture(const json& params) {
     std::string pcap_path = params.value("pcap_path", "");
     std::string keylog_path = params.value("keylog_path", "");
     std::string display_filter = params.value("display_filter", "http2");
-    diag::log_tagged_fmt("net_sec", "network_decrypt_capture entry pcap_path=%s keylog_path=%s display_filter=%s",
-        pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str());
+    const std::uint32_t timeout_ms = ns_json_u32_bounded_param(params, "timeout_ms", 9500, 1000, 60000);
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture entry pcap_path=%s keylog_path=%s display_filter=%s timeout_ms=%u",
+        pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(), timeout_ms);
 
     if (pcap_path.empty()) {
         diag::log_tagged("net_sec", "network_decrypt_capture pcap_path empty -> error");
@@ -3332,11 +3509,27 @@ tool_result_t network_decrypt_capture(const json& params) {
     }
     ns_add_unique_path(searched_paths, tshark_path);
 
-    diag::log_tagged_fmt("net_sec", "network_decrypt_capture calling tshark pcap=%s keylog=%s filter=%s tshark=%s", pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(), tshark_path.c_str());
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture calling tshark pcap=%s keylog=%s filter=%s tshark=%s timeout_ms=%u pcap_packets=%u keylog_entries=%u",
+        pcap_path.c_str(),
+        keylog_path.c_str(),
+        display_filter.c_str(),
+        tshark_path.c_str(),
+        timeout_ms,
+        pcap_probe.packet_count,
+        keylog_probe.entry_count);
     auto decrypt_result = net_security::TlsKeyExtractor::instance().decrypt_pcap_with_tshark(
-        pcap_path, keylog_path, display_filter);
-    diag::log_tagged_fmt("net_sec", "network_decrypt_capture result success=%d total_packets=%u decrypted=%u http2_frames=%zu",
-        (int)decrypt_result.success, decrypt_result.total_packets, decrypt_result.decrypted_packets, decrypt_result.http2_frames.size());
+        pcap_path, keylog_path, display_filter, timeout_ms);
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture result success=%d dependency_slow=%d killed=%d total_packets=%u decrypted=%u http2_frames=%zu elapsed_ms=%llu exit_code=%u stdout_bytes=%llu stderr_bytes=%llu",
+        (int)decrypt_result.success,
+        decrypt_result.dependency_slow ? 1 : 0,
+        decrypt_result.killed_on_deadline ? 1 : 0,
+        decrypt_result.total_packets,
+        decrypt_result.decrypted_packets,
+        decrypt_result.http2_frames.size(),
+        static_cast<unsigned long long>(decrypt_result.elapsed_ms),
+        decrypt_result.exit_code,
+        static_cast<unsigned long long>(decrypt_result.stdout_bytes),
+        static_cast<unsigned long long>(decrypt_result.stderr_bytes));
 
     json r;
     r["success"] = decrypt_result.success;
@@ -3347,6 +3540,8 @@ tool_result_t network_decrypt_capture(const json& params) {
     r["dependency_available"] = true;
     r["dependency_unavailable"] = false;
     r["dependency_blocked"] = false;
+    r["dependency_slow"] = decrypt_result.dependency_slow;
+    r["killed_on_deadline"] = decrypt_result.killed_on_deadline;
     r["tshark_available"] = true;
     r["tshark_dependency_available"] = true;
     r["host_execution_attempted"] = true;
@@ -3362,9 +3557,22 @@ tool_result_t network_decrypt_capture(const json& params) {
     r["keylog_entry_count"] = keylog_probe.entry_count;
     r["total_packets"] = decrypt_result.total_packets;
     r["decrypted_packets"] = decrypt_result.decrypted_packets;
+    r["timeout_ms"] = decrypt_result.timeout_ms;
+    r["elapsed_ms"] = decrypt_result.elapsed_ms;
+    r["tshark_process_id"] = decrypt_result.process_id;
+    r["tshark_exit_code"] = decrypt_result.exit_code;
+    r["tshark_wait_status"] = decrypt_result.wait_status;
+    r["tshark_win32_error"] = decrypt_result.win32_error;
+    r["tshark_launched"] = decrypt_result.launched;
+    r["tshark_launch_elapsed_ms"] = decrypt_result.launch_elapsed_ms;
+    r["tshark_first_stdout_elapsed_ms"] = decrypt_result.first_stdout_elapsed_ms;
+    r["tshark_first_stderr_elapsed_ms"] = decrypt_result.first_stderr_elapsed_ms;
+    r["tshark_stdout_bytes"] = decrypt_result.stdout_bytes;
+    r["tshark_stderr_bytes"] = decrypt_result.stderr_bytes;
+    r["tshark_json_parse_elapsed_ms"] = decrypt_result.json_parse_elapsed_ms;
     r["reason"] = decrypt_result.success
         ? "tshark decrypted capture"
-        : (decrypt_result.error_message.empty() ? "tshark completed without matching decrypted packets" : decrypt_result.error_message);
+        : (decrypt_result.dependency_slow ? "tshark dependency exceeded decrypt deadline" : (decrypt_result.error_message.empty() ? "tshark completed without matching decrypted packets" : decrypt_result.error_message));
 
     if (!decrypt_result.error_message.empty())
         r["error"] = decrypt_result.error_message;
@@ -3394,6 +3602,9 @@ tool_result_t network_decrypt_capture(const json& params) {
             OBFSTR("Decrypted ") + std::to_string(decrypt_result.decrypted_packets) +
             OBFSTR(" packets, found ") + std::to_string(decrypt_result.http2_frames.size()) +
             OBFSTR(" HTTP/2 frames"), r);
+
+    if (decrypt_result.dependency_slow)
+        return tool_result_t::error(OBFSTR("tshark dependency exceeded decrypt deadline"), r);
 
     return tool_result_t::error(decrypt_result.error_message.empty() ?
         OBFSTR("Decryption failed - no matching packets found") : decrypt_result.error_message, r);
@@ -3653,7 +3864,28 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         OBFSTR("tls_manage"), OBFSTR("network_security"),
         OBFSTR("Manage TLS key extraction and keylog capture. Actions: extract_keys, start_keylog, stop_keylog, get_extracted_keys."),
         {{OBFSTR("action"), OBFSTR("string"), OBFSTR("extract_keys|start_keylog|stop_keylog|get_extracted_keys"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false},
+         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID; 0 resolves to the attached driver target."), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded memory scan deadline in milliseconds."), false},
+         {OBFSTR("scan_timeout_ms"), OBFSTR("number"), OBFSTR("Per-worker bounded key scan deadline for start_keylog."), false},
+         {OBFSTR("stop_wait_ms"), OBFSTR("number"), OBFSTR("Bounded wait for keylog worker shutdown."), false},
+         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum keys to return."), false},
+         {OBFSTR("max_keys"), OBFSTR("number"), OBFSTR("Alias for max_results."), false},
+         {OBFSTR("max_regions"), OBFSTR("number"), OBFSTR("Maximum memory regions to scan; 0 means unrestricted diagnostic scan."), false},
+         {OBFSTR("max_read_attempts"), OBFSTR("number"), OBFSTR("Maximum process memory reads; 0 means unrestricted diagnostic scan."), false},
+         {OBFSTR("max_read_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes to read from target memory; 0 means unrestricted diagnostic scan."), false},
+         {OBFSTR("scan_schannel"), OBFSTR("boolean"), OBFSTR("Enable SChannel key scanner."), false},
+         {OBFSTR("scan_openssl"), OBFSTR("boolean"), OBFSTR("Enable OpenSSL key scanner."), false},
+         {OBFSTR("scan_nss"), OBFSTR("boolean"), OBFSTR("Enable NSS key scanner."), false},
+         {OBFSTR("scan_boringssl"), OBFSTR("boolean"), OBFSTR("Enable BoringSSL key scanner."), false},
+         {OBFSTR("scan_generic"), OBFSTR("boolean"), OBFSTR("Enable generic keylog-pattern scanner."), false},
+         {OBFSTR("scan_tls13_structures"), OBFSTR("boolean"), OBFSTR("Enable TLS 1.3 structure scanner."), false},
+         {OBFSTR("hint_address"), OBFSTR("string"), OBFSTR("Optional target memory address hint for bounded fixture/key scans."), false},
+         {OBFSTR("memory_hint_address"), OBFSTR("string"), OBFSTR("Alias for hint_address."), false},
+         {OBFSTR("hint_size"), OBFSTR("number"), OBFSTR("Size of the hinted target memory range."), false},
+         {OBFSTR("memory_hint_size"), OBFSTR("number"), OBFSTR("Alias for hint_size."), false},
+         {OBFSTR("hint_only"), OBFSTR("boolean"), OBFSTR("Restrict extraction to the hinted range instead of broad process scanning."), false},
+         {OBFSTR("memory_hint_only"), OBFSTR("boolean"), OBFSTR("Alias for hint_only."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -3751,6 +3983,14 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum observer observations to return."), false},
          {OBFSTR("local_port"), OBFSTR("number"), OBFSTR("Synthetic source port for deterministic payload detection."), false},
          {OBFSTR("remote_port"), OBFSTR("number"), OBFSTR("Synthetic destination port for deterministic payload detection."), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded key extraction scan deadline in milliseconds."), false},
+         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum keys to return for extract_keys."), false},
+         {OBFSTR("max_regions"), OBFSTR("number"), OBFSTR("Maximum memory regions to scan for extract_keys."), false},
+         {OBFSTR("max_read_attempts"), OBFSTR("number"), OBFSTR("Maximum process memory reads for extract_keys."), false},
+         {OBFSTR("max_read_bytes"), OBFSTR("number"), OBFSTR("Maximum target memory bytes to read for extract_keys."), false},
+         {OBFSTR("hint_address"), OBFSTR("string"), OBFSTR("Optional target memory address hint for bounded key scans."), false},
+         {OBFSTR("hint_size"), OBFSTR("number"), OBFSTR("Size of the hinted target memory range."), false},
+         {OBFSTR("hint_only"), OBFSTR("boolean"), OBFSTR("Restrict extract_keys to the hinted range."), false},
          {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
@@ -3775,6 +4015,14 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
          {OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Optional DTLS packet bytes for deterministic detection."), false},
          {OBFSTR("local_port"), OBFSTR("number"), OBFSTR("Synthetic source port for deterministic payload detection."), false},
          {OBFSTR("remote_port"), OBFSTR("number"), OBFSTR("Synthetic destination port for deterministic payload detection."), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded key extraction scan deadline in milliseconds."), false},
+         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum keys to return for extract_keys."), false},
+         {OBFSTR("max_regions"), OBFSTR("number"), OBFSTR("Maximum memory regions to scan for extract_keys."), false},
+         {OBFSTR("max_read_attempts"), OBFSTR("number"), OBFSTR("Maximum process memory reads for extract_keys."), false},
+         {OBFSTR("max_read_bytes"), OBFSTR("number"), OBFSTR("Maximum target memory bytes to read for extract_keys."), false},
+         {OBFSTR("hint_address"), OBFSTR("string"), OBFSTR("Optional target memory address hint for bounded key scans."), false},
+         {OBFSTR("hint_size"), OBFSTR("number"), OBFSTR("Size of the hinted target memory range."), false},
+         {OBFSTR("hint_only"), OBFSTR("boolean"), OBFSTR("Restrict extract_keys to the hinted range."), false},
          {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
@@ -3814,7 +4062,8 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
                "The target process must have been started with SSLKEYLOGFILE set for key logging to work."),
         {{OBFSTR("pcap_path"), OBFSTR("string"), OBFSTR("Path to the PCAP file to decrypt"), true},
          {OBFSTR("keylog_path"), OBFSTR("string"), OBFSTR("Path to the SSLKEYLOGFILE (auto-detected from env if empty)"), false},
-         {OBFSTR("display_filter"), OBFSTR("string"), OBFSTR("Wireshark display filter (default: 'http2')"), false}},
+         {OBFSTR("display_filter"), OBFSTR("string"), OBFSTR("Wireshark display filter (default: 'http2')"), false},
+         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded TShark decrypt deadline in milliseconds."), false}},
         network_decrypt_capture, true});
 
     diag::log_tagged("net_sec", "register_net_security_tools complete");

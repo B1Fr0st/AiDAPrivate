@@ -3564,6 +3564,54 @@ namespace {
     bool is_startup_offset_for_demote_filter(std::uint32_t offset) noexcept {
         return offset == 8u || offset == 44u || offset == 46u || offset == 50u || offset == 52u;
     }
+
+    void atomic_max_u32(std::atomic<std::uint32_t>& target, std::uint32_t value) noexcept {
+        std::uint32_t observed = target.load(std::memory_order_relaxed);
+        while (observed < value && !target.compare_exchange_weak(observed, value, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        }
+    }
+
+    void maybe_emit_send_request_shared_lock_success_summary(DWORD control_code,
+                                                             std::uint32_t waiting_writers,
+                                                             std::uint32_t shared_inflight_count,
+                                                             DWORD local_tid) noexcept {
+        static std::atomic<std::uint64_t> s_samples{0};
+        static std::atomic<std::uint64_t> s_last_log_ms{0};
+        static std::atomic<std::uint64_t> s_last_logged_sample{0};
+        static std::atomic<std::uint32_t> s_max_waiting_writers{0};
+        static std::atomic<std::uint32_t> s_max_shared_inflight{0};
+        static std::atomic<std::uint32_t> s_last_ioctl{0};
+        static std::atomic<std::uint32_t> s_last_tid{0};
+        const std::uint64_t sample = s_samples.fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+        s_last_ioctl.store(static_cast<std::uint32_t>(control_code), std::memory_order_release);
+        s_last_tid.store(static_cast<std::uint32_t>(local_tid), std::memory_order_release);
+        atomic_max_u32(s_max_waiting_writers, waiting_writers);
+        atomic_max_u32(s_max_shared_inflight, shared_inflight_count);
+        const std::uint64_t now_ms = ::GetTickCount64();
+        const bool writer_pressure = waiting_writers != 0;
+        const std::uint64_t interval_ms = writer_pressure ? 1000ULL : 10000ULL;
+        std::uint64_t last_ms = s_last_log_ms.load(std::memory_order_acquire);
+        if (sample != 1ULL && last_ms != 0 && now_ms - last_ms < interval_ms)
+            return;
+        if (!s_last_log_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_acq_rel, std::memory_order_acquire))
+            return;
+        const std::uint64_t previous_sample = s_last_logged_sample.exchange(sample, std::memory_order_acq_rel);
+        const std::uint64_t samples_since_last = previous_sample == 0 ? sample : sample - previous_sample;
+        const std::uint32_t max_waiting_writers = s_max_waiting_writers.exchange(waiting_writers, std::memory_order_acq_rel);
+        const std::uint32_t max_shared_inflight = s_max_shared_inflight.exchange(shared_inflight_count, std::memory_order_acq_rel);
+        diag::log_tagged_fmt("comm",
+            "send_request_shared_lock_success_summary samples=%llu ioctl=0x%08X last_ioctl=0x%08X waiter_count=%u max_waiter_count=%u inflight_share_count=%u max_inflight_share_count=%u local_tid=%lu last_tid=%lu interval_ms=%llu",
+            static_cast<unsigned long long>(samples_since_last),
+            static_cast<unsigned>(control_code),
+            static_cast<unsigned>(s_last_ioctl.load(std::memory_order_acquire)),
+            static_cast<unsigned>(waiting_writers),
+            static_cast<unsigned>(max_waiting_writers),
+            static_cast<unsigned>(shared_inflight_count),
+            static_cast<unsigned>(max_shared_inflight),
+            static_cast<unsigned long>(local_tid),
+            static_cast<unsigned long>(s_last_tid.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(interval_ms));
+    }
 }
 
 bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD input_size) const noexcept {
@@ -3713,12 +3761,10 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         shared_lock_oldest_holder_tid_.store(local_tid_for_lock, std::memory_order_release);
         shared_lock_oldest_holder_acquired_tsc_.store(__rdtsc(), std::memory_order_release);
     }
-    diag::log_tagged_fmt("comm",
-        "send_request_in_lock_shared_acquired ioctl=0x%08X waiter_count=%u inflight_share_count=%u local_tid=%lu",
-        control_code,
+    maybe_emit_send_request_shared_lock_success_summary(control_code,
         seed_rotation_mtx_.get_waiting_writers(),
         shared_inflight_count_after,
-        static_cast<unsigned long>(local_tid_for_lock));
+        local_tid_for_lock);
     struct shared_unlock_scope_t {
         voyager::detail::writer_priority_shared_mutex* mtx;
         std::atomic<std::uint32_t>* inflight;

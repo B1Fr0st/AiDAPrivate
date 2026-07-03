@@ -35,6 +35,7 @@ static void run_one_location(const insertion_point_t& ip, const module_context_t
     cfg.baseline_count = 5;
     cfg.diff_sigma_threshold = 3.0;
     cfg.report_as_issues = true;
+    cfg.audit_id = ctx.audit_id;
 
     uint64_t id = aida::burp::param_miner::start(std::move(cfg));
     if (id == 0) {

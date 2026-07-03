@@ -2040,6 +2040,479 @@ uint64_t file_size_for_log(const std::string& path)
     return static_cast<uint64_t>(size.QuadPart);
 }
 
+struct setup_path_fingerprint_t
+{
+    bool exists = false;
+    bool directory = false;
+    DWORD attr = INVALID_FILE_ATTRIBUTES;
+    DWORD gle = ERROR_SUCCESS;
+    uint64_t size = 0;
+    uint64_t mtime_100ns = 0;
+};
+
+setup_path_fingerprint_t collect_setup_path_fingerprint_w(const std::wstring& path)
+{
+    setup_path_fingerprint_t out;
+    if (path.empty())
+    {
+        out.gle = ERROR_PATH_NOT_FOUND;
+        return out;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+    {
+        out.gle = GetLastError();
+        return out;
+    }
+    out.exists = true;
+    out.attr = fad.dwFileAttributes;
+    out.directory = (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (!out.directory)
+        out.size = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | static_cast<uint64_t>(fad.nFileSizeLow);
+    out.mtime_100ns = filetime_to_u64(fad.ftLastWriteTime);
+    return out;
+}
+
+nlohmann::json setup_path_fingerprint_json(const setup_path_fingerprint_t& fp)
+{
+    return {
+        {"exists", fp.exists},
+        {"directory", fp.directory},
+        {"attr", static_cast<uint32_t>(fp.attr)},
+        {"gle", static_cast<uint32_t>(fp.gle)},
+        {"size", fp.size},
+        {"mtime_100ns", fp.mtime_100ns}
+    };
+}
+
+std::string setup_path_fingerprint_key(const setup_path_fingerprint_t& fp)
+{
+    std::ostringstream oss;
+    oss << (fp.exists ? 1 : 0) << ':'
+        << (fp.directory ? 1 : 0) << ':'
+        << static_cast<unsigned long>(fp.attr) << ':'
+        << static_cast<unsigned long>(fp.gle) << ':'
+        << fp.size << ':'
+        << fp.mtime_100ns;
+    return oss.str();
+}
+
+std::string normalized_sticky_path_key(const std::string& path)
+{
+    return normalize_launch_path(path);
+}
+
+nlohmann::json local_helper_file_diag_json(const local_helper_file_diag_t& fd)
+{
+    return {
+        {"exists", fd.exists},
+        {"attr", static_cast<uint32_t>(fd.attr)},
+        {"gle", static_cast<uint32_t>(fd.gle)},
+        {"size", fd.size},
+        {"mtime_100ns", fd.mtime_100ns},
+        {"sha256", fd.sha256},
+        {"hash_status", fd.hash_status}
+    };
+}
+
+std::string local_helper_file_diag_key(const local_helper_file_diag_t& fd)
+{
+    std::ostringstream oss;
+    oss << (fd.exists ? 1 : 0) << ':'
+        << static_cast<unsigned long>(fd.attr) << ':'
+        << static_cast<unsigned long>(fd.gle) << ':'
+        << fd.size << ':'
+        << fd.mtime_100ns << ':'
+        << (fd.sha256.empty() ? fd.hash_status : fd.sha256);
+    return oss.str();
+}
+
+struct addon_cache_fingerprint_t
+{
+    std::string addons_dir;
+    std::string ubo_dir;
+    std::string manifest_path;
+    setup_path_fingerprint_t addons;
+    setup_path_fingerprint_t ubo;
+    setup_path_fingerprint_t manifest;
+};
+
+addon_cache_fingerprint_t collect_addon_cache_fingerprint()
+{
+    addon_cache_fingerprint_t out;
+    wchar_t local[MAX_PATH] = {};
+    const DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH)
+        return out;
+    const std::wstring addons_dir = join_path_w(join_path_w(join_path_w(join_path_w(local, L"camoufox"), L"camoufox"), L"Cache"), L"addons");
+    const std::wstring ubo_dir = join_path_w(addons_dir, L"UBO");
+    const std::wstring manifest_path = join_path_w(ubo_dir, L"manifest.json");
+    out.addons_dir = wide_to_utf8(addons_dir);
+    out.ubo_dir = wide_to_utf8(ubo_dir);
+    out.manifest_path = wide_to_utf8(manifest_path);
+    out.addons = collect_setup_path_fingerprint_w(addons_dir);
+    out.ubo = collect_setup_path_fingerprint_w(ubo_dir);
+    out.manifest = collect_setup_path_fingerprint_w(manifest_path);
+    return out;
+}
+
+nlohmann::json addon_cache_fingerprint_json(const addon_cache_fingerprint_t& fp)
+{
+    return {
+        {"addons_dir", fp.addons_dir},
+        {"ubo_dir", fp.ubo_dir},
+        {"manifest_path", fp.manifest_path},
+        {"addons", setup_path_fingerprint_json(fp.addons)},
+        {"ubo", setup_path_fingerprint_json(fp.ubo)},
+        {"manifest", setup_path_fingerprint_json(fp.manifest)}
+    };
+}
+
+std::string addon_cache_fingerprint_key(const addon_cache_fingerprint_t& fp)
+{
+    std::ostringstream oss;
+    oss << normalized_sticky_path_key(fp.addons_dir) << '|'
+        << setup_path_fingerprint_key(fp.addons) << '|'
+        << normalized_sticky_path_key(fp.ubo_dir) << '|'
+        << setup_path_fingerprint_key(fp.ubo) << '|'
+        << normalized_sticky_path_key(fp.manifest_path) << '|'
+        << setup_path_fingerprint_key(fp.manifest);
+    return oss.str();
+}
+
+struct sticky_setup_context_t
+{
+    std::string session_id;
+    std::string mode;
+    std::string command_path;
+    std::string browser_path;
+    local_helper_file_diag_t command_file;
+    local_helper_file_diag_t browser_file;
+    addon_cache_fingerprint_t addon_cache;
+    std::string key;
+    nlohmann::json details = nlohmann::json::object();
+};
+
+sticky_setup_context_t make_sticky_setup_context(const launch_config_t& cfg, const std::string& mode, const std::string& command_path)
+{
+    sticky_setup_context_t ctx;
+    ctx.session_id = cfg.session_id.empty() ? std::string("default") : cfg.session_id;
+    ctx.mode = mode.empty() ? std::string("unknown") : mode;
+    ctx.command_path = command_path;
+    ctx.browser_path = cfg.browser_executable;
+    ctx.command_file = collect_local_helper_file_diag(command_path);
+    ctx.browser_file = collect_local_helper_file_diag(cfg.browser_executable);
+    ctx.addon_cache = collect_addon_cache_fingerprint();
+    std::ostringstream key;
+    key << "mode=" << ctx.mode
+        << "|command=" << normalized_sticky_path_key(ctx.command_path)
+        << "|command_file=" << local_helper_file_diag_key(ctx.command_file)
+        << "|browser=" << normalized_sticky_path_key(ctx.browser_path)
+        << "|browser_file=" << local_helper_file_diag_key(ctx.browser_file)
+        << "|addon=" << addon_cache_fingerprint_key(ctx.addon_cache);
+    ctx.key = key.str();
+    ctx.details = {
+        {"session_id", ctx.session_id},
+        {"mode", ctx.mode},
+        {"command_path", ctx.command_path},
+        {"browser_path", ctx.browser_path},
+        {"command_file", local_helper_file_diag_json(ctx.command_file)},
+        {"browser_file", local_helper_file_diag_json(ctx.browser_file)},
+        {"addon_cache", addon_cache_fingerprint_json(ctx.addon_cache)}
+    };
+    return ctx;
+}
+
+struct sticky_setup_failure_state_t
+{
+    bool active = false;
+    std::string key;
+    std::string category;
+    std::string summary;
+    std::string session_id;
+    std::string mode;
+    std::string command_path;
+    std::string browser_path;
+    std::string debug_log;
+    uint64_t generation = 0;
+    uint64_t set_ms = 0;
+    uint64_t elapsed_ms = 0;
+    uint32_t child_pid = 0;
+    nlohmann::json context = nlohmann::json::object();
+    nlohmann::json source = nlohmann::json::object();
+};
+
+std::mutex& sticky_setup_failure_mtx()
+{
+    static std::mutex m;
+    return m;
+}
+
+sticky_setup_failure_state_t& sticky_setup_failure_state()
+{
+    static sticky_setup_failure_state_t s;
+    return s;
+}
+
+nlohmann::json sticky_source_summary_json(const nlohmann::json& source)
+{
+    nlohmann::json out = nlohmann::json::object();
+    if (!source.is_object())
+        return out;
+    const char* keys[] = {
+        "status", "phase", "transport_phase", "timeout_phase", "sidecar_timeout_phase",
+        "readiness_sub_step", "cancellation_source", "strict_launch_budget_blown",
+        "error_type", "error_kind", "error_summary", "sidecar_error_type",
+        "sidecar_error_kind", "sidecar_error_summary", "last_debug_event_name",
+        "debug_phase", "debug_tail_len", "child_debug_log", "debug_log_size",
+        "process_tree_count", "browser_process_count", "error_tail", "response_tail"
+    };
+    for (const char* key : keys)
+    {
+        auto it = source.find(key);
+        if (it != source.end())
+            out[key] = *it;
+    }
+    return out;
+}
+
+nlohmann::json sticky_setup_failure_json_from_state(const sticky_setup_failure_state_t& s)
+{
+    return {
+        {"active", s.active},
+        {"nonretryable", true},
+        {"category", s.category},
+        {"error_summary", s.summary},
+        {"key", s.key},
+        {"generation", s.generation},
+        {"session_id", s.session_id},
+        {"mode", s.mode},
+        {"command_path", s.command_path},
+        {"browser_path", s.browser_path},
+        {"child_pid", s.child_pid},
+        {"debug_log", s.debug_log},
+        {"set_ms", s.set_ms},
+        {"elapsed_ms", s.elapsed_ms},
+        {"context", s.context},
+        {"source", s.source}
+    };
+}
+
+std::string sticky_setup_failure_error_text(const std::string& category, const std::string& summary)
+{
+    return std::string("camoufox sticky_setup_failure category=") +
+        (category.empty() ? "unknown" : category) +
+        " root=" +
+        (summary.empty() ? std::string("<empty>") : compact_child_output_tail(summary, 700));
+}
+
+void attach_sticky_setup_failure(nlohmann::json& target, const nlohmann::json& sticky)
+{
+    if (!target.is_object())
+        target = nlohmann::json::object();
+    target["nonretryable_setup_failure"] = true;
+    target["sticky_setup_failure"] = sticky;
+    target["setup_failure_category"] = json_string_or(sticky, "category", std::string());
+    target["setup_failure_key"] = json_string_or(sticky, "key", std::string());
+    target["setup_failure_summary"] = json_string_or(sticky, "error_summary", std::string());
+}
+
+nlohmann::json set_sticky_setup_failure(const sticky_setup_context_t& ctx,
+                                        const std::string& category,
+                                        const std::string& summary,
+                                        uint64_t generation,
+                                        uint32_t child_pid,
+                                        const std::string& debug_log,
+                                        uint64_t elapsed_ms,
+                                        const nlohmann::json& source)
+{
+    sticky_setup_failure_state_t snapshot;
+    {
+        std::lock_guard<std::mutex> lk(sticky_setup_failure_mtx());
+        auto& state = sticky_setup_failure_state();
+        state.active = true;
+        state.key = ctx.key;
+        state.category = category.empty() ? std::string("unknown") : category;
+        state.summary = compact_child_output_tail(summary, 1200);
+        state.session_id = ctx.session_id;
+        state.mode = ctx.mode;
+        state.command_path = ctx.command_path;
+        state.browser_path = ctx.browser_path;
+        state.debug_log = debug_log;
+        state.generation = generation;
+        state.set_ms = now_ms();
+        state.elapsed_ms = elapsed_ms;
+        state.child_pid = child_pid;
+        state.context = ctx.details;
+        state.source = sticky_source_summary_json(source);
+        snapshot = state;
+    }
+    const nlohmann::json sticky = sticky_setup_failure_json_from_state(snapshot);
+    diag::log_tagged_fmt("camoufox",
+        "sticky_setup_failure_set generation=%llu session_id=%s category=%s child_pid=%lu elapsed_ms=%llu mode=%s command_path=%s command_exists=%d command_sha256=%s command_hash_status=%s browser_path=%s browser_exists=%d browser_sha256=%s browser_hash_status=%s addon_ubo_exists=%d addon_manifest_exists=%d debug_log=%s key_tail=%.700s summary=%.900s",
+        static_cast<unsigned long long>(generation),
+        ctx.session_id.c_str(),
+        snapshot.category.c_str(),
+        static_cast<unsigned long>(child_pid),
+        static_cast<unsigned long long>(elapsed_ms),
+        ctx.mode.c_str(),
+        ctx.command_path.empty() ? "<empty>" : ctx.command_path.c_str(),
+        ctx.command_file.exists ? 1 : 0,
+        ctx.command_file.sha256.empty() ? "<empty>" : ctx.command_file.sha256.c_str(),
+        ctx.command_file.hash_status.empty() ? "<empty>" : ctx.command_file.hash_status.c_str(),
+        ctx.browser_path.empty() ? "<empty>" : ctx.browser_path.c_str(),
+        ctx.browser_file.exists ? 1 : 0,
+        ctx.browser_file.sha256.empty() ? "<empty>" : ctx.browser_file.sha256.c_str(),
+        ctx.browser_file.hash_status.empty() ? "<empty>" : ctx.browser_file.hash_status.c_str(),
+        ctx.addon_cache.ubo.exists ? 1 : 0,
+        ctx.addon_cache.manifest.exists ? 1 : 0,
+        debug_log.empty() ? "<empty>" : debug_log.c_str(),
+        compact_child_output_tail(ctx.key, 700).c_str(),
+        snapshot.summary.empty() ? "<empty>" : snapshot.summary.c_str());
+    return sticky;
+}
+
+void clear_sticky_setup_failure(const char* reason)
+{
+    sticky_setup_failure_state_t old;
+    {
+        std::lock_guard<std::mutex> lk(sticky_setup_failure_mtx());
+        auto& state = sticky_setup_failure_state();
+        if (!state.active)
+            return;
+        old = state;
+        state = sticky_setup_failure_state_t{};
+    }
+    diag::log_tagged_fmt("camoufox",
+        "sticky_setup_failure_clear reason=%s generation=%llu session_id=%s category=%s child_pid=%lu mode=%s command_path=%s browser_path=%s age_ms=%llu key_tail=%.700s summary=%.900s",
+        safe_reason(reason),
+        static_cast<unsigned long long>(old.generation),
+        old.session_id.empty() ? "<empty>" : old.session_id.c_str(),
+        old.category.empty() ? "<empty>" : old.category.c_str(),
+        static_cast<unsigned long>(old.child_pid),
+        old.mode.empty() ? "<empty>" : old.mode.c_str(),
+        old.command_path.empty() ? "<empty>" : old.command_path.c_str(),
+        old.browser_path.empty() ? "<empty>" : old.browser_path.c_str(),
+        static_cast<unsigned long long>(now_ms() >= old.set_ms ? now_ms() - old.set_ms : 0),
+        compact_child_output_tail(old.key, 700).c_str(),
+        old.summary.empty() ? "<empty>" : old.summary.c_str());
+}
+
+bool sticky_setup_failure_hit_or_clear(const sticky_setup_context_t& ctx,
+                                       uint64_t generation,
+                                       uint32_t child_pid,
+                                       uint64_t elapsed_ms,
+                                       nlohmann::json& out_sticky,
+                                       std::string& out_error)
+{
+    sticky_setup_failure_state_t snapshot;
+    bool active = false;
+    bool key_match = false;
+    {
+        std::lock_guard<std::mutex> lk(sticky_setup_failure_mtx());
+        auto& state = sticky_setup_failure_state();
+        active = state.active;
+        if (!active)
+            return false;
+        key_match = state.key == ctx.key;
+        snapshot = state;
+        if (!key_match)
+            state = sticky_setup_failure_state_t{};
+    }
+    if (!key_match)
+    {
+        diag::log_tagged_fmt("camoufox",
+            "sticky_setup_failure_clear reason=dependency_fingerprint_changed old_generation=%llu old_session_id=%s old_category=%s old_command_path=%s old_browser_path=%s new_session_id=%s new_mode=%s new_command_path=%s new_browser_path=%s old_key_tail=%.500s new_key_tail=%.500s",
+            static_cast<unsigned long long>(snapshot.generation),
+            snapshot.session_id.empty() ? "<empty>" : snapshot.session_id.c_str(),
+            snapshot.category.empty() ? "<empty>" : snapshot.category.c_str(),
+            snapshot.command_path.empty() ? "<empty>" : snapshot.command_path.c_str(),
+            snapshot.browser_path.empty() ? "<empty>" : snapshot.browser_path.c_str(),
+            ctx.session_id.c_str(),
+            ctx.mode.c_str(),
+            ctx.command_path.empty() ? "<empty>" : ctx.command_path.c_str(),
+            ctx.browser_path.empty() ? "<empty>" : ctx.browser_path.c_str(),
+            compact_child_output_tail(snapshot.key, 500).c_str(),
+            compact_child_output_tail(ctx.key, 500).c_str());
+        return false;
+    }
+    out_sticky = sticky_setup_failure_json_from_state(snapshot);
+    out_sticky["hit_generation"] = generation;
+    out_sticky["hit_child_pid"] = child_pid;
+    out_sticky["hit_elapsed_ms"] = elapsed_ms;
+    out_sticky["hit_context"] = ctx.details;
+    out_error = sticky_setup_failure_error_text(snapshot.category, snapshot.summary);
+    diag::log_tagged_fmt("camoufox",
+        "sticky_setup_failure_hit generation=%llu original_generation=%llu session_id=%s original_session_id=%s category=%s child_pid=%lu original_child_pid=%lu elapsed_ms=%llu age_ms=%llu mode=%s command_path=%s browser_path=%s addon_ubo_exists=%d addon_manifest_exists=%d key_tail=%.700s summary=%.900s",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(snapshot.generation),
+        ctx.session_id.c_str(),
+        snapshot.session_id.empty() ? "<empty>" : snapshot.session_id.c_str(),
+        snapshot.category.empty() ? "<empty>" : snapshot.category.c_str(),
+        static_cast<unsigned long>(child_pid),
+        static_cast<unsigned long>(snapshot.child_pid),
+        static_cast<unsigned long long>(elapsed_ms),
+        static_cast<unsigned long long>(now_ms() >= snapshot.set_ms ? now_ms() - snapshot.set_ms : 0),
+        ctx.mode.c_str(),
+        ctx.command_path.empty() ? "<empty>" : ctx.command_path.c_str(),
+        ctx.browser_path.empty() ? "<empty>" : ctx.browser_path.c_str(),
+        ctx.addon_cache.ubo.exists ? 1 : 0,
+        ctx.addon_cache.manifest.exists ? 1 : 0,
+        compact_child_output_tail(ctx.key, 700).c_str(),
+        snapshot.summary.empty() ? "<empty>" : snapshot.summary.c_str());
+    return true;
+}
+
+std::string classify_nonretryable_setup_failure_text(const std::string& text)
+{
+    if (text.empty())
+        return {};
+    const std::string lower = ascii_lower_copy(text);
+    if (lower.find("invalidaddonpath") != std::string::npos ||
+        lower.find("invalid addon path") != std::string::npos ||
+        (lower.find("manifest.json") != std::string::npos && (lower.find("missing") != std::string::npos || lower.find("not found") != std::string::npos)))
+        return "invalid_addon_path";
+    if (lower.find("required_reverse_tools_missing") != std::string::npos ||
+        lower.find("did not expose required reverse tools") != std::string::npos ||
+        lower.find("missing_tools") != std::string::npos)
+        return "required_reverse_tools_missing";
+    if (lower.find("mcp executable preflight failed") != std::string::npos ||
+        lower.find("executable image probe failed") != std::string::npos ||
+        lower.find("executable path is unavailable") != std::string::npos)
+        return "mcp_executable_preflight";
+    if (lower.find("browser executable not found") != std::string::npos ||
+        lower.find("browser executable is unavailable") != std::string::npos ||
+        lower.find("browser_required_failed") != std::string::npos)
+        return "browser_executable_missing";
+    if (lower.find("not a camoufox browser bundle") != std::string::npos ||
+        lower.find("browser_rejected_non_camoufox") != std::string::npos)
+        return "browser_executable_rejected";
+    if (lower.find("contract") != std::string::npos &&
+        (lower.find("failed") != std::string::npos || lower.find("missing") != std::string::npos || lower.find("invalid") != std::string::npos || lower.find("stale") != std::string::npos))
+        return "frozen_contract_failure";
+    return {};
+}
+
+nlohmann::json maybe_set_sticky_setup_failure(const sticky_setup_context_t& ctx,
+                                              const std::string& error_text,
+                                              const nlohmann::json& diagnostics,
+                                              uint64_t generation,
+                                              uint32_t child_pid,
+                                              const std::string& debug_log,
+                                              uint64_t elapsed_ms)
+{
+    std::string combined = error_text;
+    if (diagnostics.is_object() && !diagnostics.empty())
+    {
+        combined.push_back(' ');
+        combined += diagnostics.dump();
+    }
+    const std::string category = classify_nonretryable_setup_failure_text(combined);
+    if (category.empty())
+        return nlohmann::json::object();
+    return set_sticky_setup_failure(ctx, category, error_text.empty() ? combined : error_text, generation, child_pid, debug_log, elapsed_ms, diagnostics);
+}
+
 size_t text_marker_count(const std::string& text, const std::string& marker)
 {
     if (text.empty() || marker.empty())
@@ -7162,6 +7635,7 @@ bool start_bridge(const launch_config_t& cfg)
                 sg().active_cfg = effective_cfg;
                 sg().last_launch_ms = now_ms() - bridge_start_ms;
                 emit_stage_timing(true, "ready_reuse", sg().child_pid);
+                clear_sticky_setup_failure("start_bridge_ready_reuse");
                 return true;
             }
         }
@@ -7381,12 +7855,60 @@ bool start_bridge(const launch_config_t& cfg)
         effective_cfg.browser_executable.empty() ? "<empty>" : effective_cfg.browser_executable.c_str(),
         static_cast<int>(browser_attr != INVALID_FILE_ATTRIBUTES && (browser_attr & FILE_ATTRIBUTE_DIRECTORY) == 0),
         static_cast<unsigned long>(browser_attr));
+    const sticky_setup_context_t setup_ctx = make_sticky_setup_context(
+        effective_cfg,
+        runtime_mode_name(use_server_executable),
+        use_server_executable ? server_executable : python_path);
+    nlohmann::json sticky_hit;
+    std::string sticky_hit_error;
+    if (sticky_setup_failure_hit_or_clear(setup_ctx, start_generation, sg().child_pid, now_ms() - bridge_start_ms, sticky_hit, sticky_hit_error))
+    {
+        sg().client.reset();
+        sg().child_pid = 0;
+        sg().state = bridge_state_t::error;
+        clear_page_state_locked();
+        sg().last_error = sticky_hit_error;
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        sg().last_launch_diagnostics = {
+            {"status", "blocked"},
+            {"phase", "sticky_setup_failure"},
+            {"generation", start_generation},
+            {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
+            {"elapsed_ms", sg().last_launch_ms},
+            {"caller", "start_bridge"}
+        };
+        attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky_hit);
+        publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "sticky_setup_failure", 0);
+        return false;
+    }
     if (effective_cfg.browser_executable.empty() || browser_attr == INVALID_FILE_ATTRIBUTES || (browser_attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
     {
         sg().last_error = effective_cfg.browser_executable.empty()
             ? std::string("Camoufox browser executable not found\n") + install::setup_instructions()
             : std::string("Configured Camoufox browser executable is unavailable\n") + install::setup_instructions();
         sg().state = bridge_state_t::error;
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        sg().last_launch_diagnostics = {
+            {"status", "error"},
+            {"phase", "browser_executable_preflight"},
+            {"generation", start_generation},
+            {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
+            {"browser_path", effective_cfg.browser_executable},
+            {"browser_attr", static_cast<uint32_t>(browser_attr)},
+            {"elapsed_ms", sg().last_launch_ms}
+        };
+        const nlohmann::json sticky = set_sticky_setup_failure(
+            setup_ctx,
+            "browser_executable_missing",
+            sg().last_error,
+            start_generation,
+            0,
+            camoufox_debug_log_path(),
+            sg().last_launch_ms,
+            sg().last_launch_diagnostics);
+        attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky);
+        sg().last_error = sticky_setup_failure_error_text("browser_executable_missing", sg().last_error);
         diag::log_tagged_fmt("camoufox", "start_bridge browser_required_failed generation=%llu err=%s",
             static_cast<unsigned long long>(start_generation), sg().last_error.c_str());
         publish_state(bridge_state_t::error, sg().last_error);
@@ -7396,6 +7918,26 @@ bool start_bridge(const launch_config_t& cfg)
     {
         sg().last_error = "Configured browser executable is not a Camoufox browser bundle";
         sg().state = bridge_state_t::error;
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        sg().last_launch_diagnostics = {
+            {"status", "error"},
+            {"phase", "browser_executable_preflight"},
+            {"generation", start_generation},
+            {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
+            {"browser_path", effective_cfg.browser_executable},
+            {"elapsed_ms", sg().last_launch_ms}
+        };
+        const nlohmann::json sticky = set_sticky_setup_failure(
+            setup_ctx,
+            "browser_executable_rejected",
+            sg().last_error,
+            start_generation,
+            0,
+            camoufox_debug_log_path(),
+            sg().last_launch_ms,
+            sg().last_launch_diagnostics);
+        attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky);
+        sg().last_error = sticky_setup_failure_error_text("browser_executable_rejected", sg().last_error);
         diag::log_tagged_fmt("camoufox", "start_bridge browser_rejected_non_camoufox path=%s",
             effective_cfg.browser_executable.c_str());
         publish_state(bridge_state_t::error, sg().last_error);
@@ -7417,6 +7959,29 @@ bool start_bridge(const launch_config_t& cfg)
         if (!preflight_server_executable_locked(server_executable))
         {
             sg().state = bridge_state_t::error;
+            sg().last_launch_ms = now_ms() - bridge_start_ms;
+            sg().last_launch_diagnostics = {
+                {"status", "error"},
+                {"phase", "mcp_executable_preflight"},
+                {"generation", start_generation},
+                {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
+                {"command", server_executable},
+                {"elapsed_ms", sg().last_launch_ms},
+                {"error", sg().last_error}
+            };
+            const nlohmann::json sticky = maybe_set_sticky_setup_failure(
+                setup_ctx,
+                sg().last_error,
+                sg().last_launch_diagnostics,
+                start_generation,
+                0,
+                camoufox_debug_log_path(),
+                sg().last_launch_ms);
+            if (sticky.is_object() && !sticky.empty())
+            {
+                attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky);
+                sg().last_error = sticky_setup_failure_error_text(json_string_or(sticky, "category", std::string()), sg().last_error);
+            }
             publish_state(bridge_state_t::error, sg().last_error);
             return false;
         }
@@ -7665,6 +8230,28 @@ bool start_bridge(const launch_config_t& cfg)
         clear_page_state_locked();
         sg().child_pid = 0;
         sg().last_launch_ms = now_ms() - bridge_start_ms;
+        sg().last_launch_diagnostics = {
+            {"status", "error"},
+            {"phase", "required_reverse_tools_missing"},
+            {"generation", start_generation},
+            {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
+            {"child_pid", failed_pid},
+            {"missing_tools", missing_tools},
+            {"inventory", tool_inventory},
+            {"mcp_last_error", inner},
+            {"elapsed_ms", sg().last_launch_ms}
+        };
+        const nlohmann::json sticky = set_sticky_setup_failure(
+            setup_ctx,
+            "required_reverse_tools_missing",
+            sg().last_error,
+            start_generation,
+            failed_pid,
+            camoufox_debug_log_path(),
+            sg().last_launch_ms,
+            sg().last_launch_diagnostics);
+        attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky);
+        sg().last_error = sticky_setup_failure_error_text("required_reverse_tools_missing", sg().last_error);
         diag::log_tagged("camoufox", sg().last_error.c_str());
         terminate_process_id_async(failed_pid, "required_reverse_tools_missing");
         publish_state(bridge_state_t::error, sg().last_error);
@@ -8009,6 +8596,20 @@ bool start_bridge(const launch_config_t& cfg)
                 debug_phase.empty() ? "<none>" : debug_phase.c_str(),
                 timeout_tree.empty() ? "<empty>" : timeout_tree.c_str(),
                 debug_tail.size(), debug_tail.c_str());
+            const nlohmann::json sticky = maybe_set_sticky_setup_failure(
+                setup_ctx,
+                sg().last_error + " " + debug_tail,
+                sg().last_launch_diagnostics,
+                start_generation,
+                timed_out_pid,
+                child_debug_log,
+                sg().last_launch_ms);
+            if (sticky.is_object() && !sticky.empty())
+            {
+                attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky);
+                sg().last_error = sticky_setup_failure_error_text(json_string_or(sticky, "category", std::string()), sg().last_error);
+                clear_auto_restart_block_locked("sticky_setup_failure_set");
+            }
             const std::string state_error = sg().last_error;
             lk.unlock();
             const process_tree_reap_result_t reap = cleanup_client_reap_now_detach_disconnect(timed_out_client, timed_out_pid, cleanup_reason, start_generation);
@@ -8083,6 +8684,20 @@ bool start_bridge(const launch_config_t& cfg)
             launch.text.size(),
             compact_child_output_tail(launch.text, 900).c_str(),
             sg().last_launch_diagnostics.dump().c_str());
+        const nlohmann::json sticky = maybe_set_sticky_setup_failure(
+            setup_ctx,
+            sg().last_error,
+            sg().last_launch_diagnostics,
+            start_generation,
+            launch_child_pid,
+            child_debug_log,
+            now_ms() - bridge_start_ms);
+        if (sticky.is_object() && !sticky.empty())
+        {
+            attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky);
+            sg().last_error = sticky_setup_failure_error_text(json_string_or(sticky, "category", std::string()), sg().last_error);
+            clear_auto_restart_block_locked("sticky_setup_failure_set");
+        }
         auto failed_client = sg().client;
         const uint32_t failed_pid = sg().child_pid;
         sg().client.reset();
@@ -8168,6 +8783,20 @@ bool start_bridge(const launch_config_t& cfg)
                 sg().privacy_verified ? 1 : 0,
                 sg().cleanup_pending ? 1 : 0,
                 launch_diag.dump().c_str());
+            const nlohmann::json sticky = maybe_set_sticky_setup_failure(
+                setup_ctx,
+                sg().last_error,
+                sg().last_launch_diagnostics,
+                start_generation,
+                sg().child_pid,
+                child_debug_log,
+                now_ms() - bridge_start_ms);
+            if (sticky.is_object() && !sticky.empty())
+            {
+                attach_sticky_setup_failure(sg().last_launch_diagnostics, sticky);
+                sg().last_error = sticky_setup_failure_error_text(json_string_or(sticky, "category", std::string()), sg().last_error);
+                clear_auto_restart_block_locked("sticky_setup_failure_set");
+            }
             auto failed_client = sg().client;
             const uint32_t failed_pid = sg().child_pid;
             sg().client.reset();
@@ -8472,6 +9101,7 @@ bool start_bridge(const launch_config_t& cfg)
         ready_url.length, sg().active_page_title.size(), static_cast<unsigned long long>(sg().last_launch_ms));
     publish_state(bridge_state_t::ready, std::string());
     emit_stage_timing(true, "ready", sg().child_pid);
+    clear_sticky_setup_failure("start_bridge_ready");
     return true;
 }
 
@@ -8606,6 +9236,7 @@ bool stop_bridge(const char* reason)
             sg().client.reset();
             clear_page_state_locked();
             clear_auto_restart_block_locked("stop_bridge_already_stopped");
+            clear_sticky_setup_failure("stop_bridge_already_stopped");
             sg().child_pid = 0;
             sg().cleanup_pending = false;
             sg().last_cleanup_ms = now_ms() - stop_start_ms;
@@ -8621,6 +9252,7 @@ bool stop_bridge(const char* reason)
         sg().state = bridge_state_t::stopped;
         sg().last_error.clear();
         clear_auto_restart_block_locked("stop_bridge");
+        clear_sticky_setup_failure("stop_bridge");
         mark_cleanup_started_locked(stop_generation, child_pid, std::string("stop_bridge:") + stop_reason);
     }
     diag::log_tagged_fmt("camoufox", "stop_bridge cleanup_sync reason=%s generation=%llu child_pid=%lu client=%d browser_open=%d",
@@ -8682,6 +9314,7 @@ bool force_cleanup(const char* reason)
         sg().state = bridge_state_t::stopped;
         sg().last_error = std::string("force_cleanup requested: ") + cleanup_reason;
         clear_auto_restart_block_locked("force_cleanup");
+        clear_sticky_setup_failure("force_cleanup");
         if (child_pid != 0 || cli)
         {
             mark_cleanup_started_locked(generation, child_pid, std::string("force_cleanup:") + cleanup_reason);
@@ -9616,6 +10249,7 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 session->last_launch_ms = now_ms() - t0;
                 diag::log_tagged_fmt("camoufox", "managed_start reuse_ready session_id=%s child_pid=%lu page_count=%zu",
                     sid.c_str(), static_cast<unsigned long>(session->child_pid), session->pages.size());
+                clear_sticky_setup_failure("managed_start_ready_reuse");
                 return true;
             }
         }
@@ -9780,6 +10414,39 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         effective_cfg.browser_executable.empty() ? "<empty>" : effective_cfg.browser_executable.c_str(),
         static_cast<int>(browser_attr != INVALID_FILE_ATTRIBUTES && (browser_attr & FILE_ATTRIBUTE_DIRECTORY) == 0),
         static_cast<unsigned long>(browser_attr));
+    const sticky_setup_context_t setup_ctx = make_sticky_setup_context(
+        effective_cfg,
+        runtime_mode_name(use_server_executable),
+        use_server_executable ? server_executable : python_path);
+    uint64_t setup_generation = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        setup_generation = session->generation + 1;
+    }
+    nlohmann::json sticky_hit;
+    std::string sticky_hit_error;
+    if (sticky_setup_failure_hit_or_clear(setup_ctx, setup_generation, 0, now_ms() - t0, sticky_hit, sticky_hit_error))
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        session->state = bridge_state_t::error;
+        session->last_error = sticky_hit_error;
+        session->last_launch_ms = now_ms() - t0;
+        session->last_launch_diagnostics = {
+            {"status", "blocked"},
+            {"phase", "sticky_setup_failure"},
+            {"generation", setup_generation},
+            {"session_id", sid},
+            {"elapsed_ms", session->last_launch_ms},
+            {"caller", "managed_start"}
+        };
+        attach_sticky_setup_failure(session->last_launch_diagnostics, sticky_hit);
+        diag::log_tagged_fmt("camoufox", "managed_start sticky_setup_failure_blocked session_id=%s generation=%llu elapsed_ms=%llu err=%s",
+            sid.c_str(),
+            static_cast<unsigned long long>(setup_generation),
+            static_cast<unsigned long long>(session->last_launch_ms),
+            session->last_error.c_str());
+        return false;
+    }
     if (effective_cfg.browser_executable.empty() || browser_attr == INVALID_FILE_ATTRIBUTES || (browser_attr & FILE_ATTRIBUTE_DIRECTORY) != 0)
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
@@ -9787,6 +10454,27 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->last_error = effective_cfg.browser_executable.empty()
             ? std::string("Camoufox browser executable not found\n") + install::setup_instructions()
             : std::string("Configured Camoufox browser executable is unavailable\n") + install::setup_instructions();
+        session->last_launch_ms = now_ms() - t0;
+        session->last_launch_diagnostics = {
+            {"status", "error"},
+            {"phase", "browser_executable_preflight"},
+            {"generation", setup_generation},
+            {"session_id", sid},
+            {"browser_path", effective_cfg.browser_executable},
+            {"browser_attr", static_cast<uint32_t>(browser_attr)},
+            {"elapsed_ms", session->last_launch_ms}
+        };
+        const nlohmann::json sticky = set_sticky_setup_failure(
+            setup_ctx,
+            "browser_executable_missing",
+            session->last_error,
+            setup_generation,
+            0,
+            camoufox_debug_log_path(),
+            session->last_launch_ms,
+            session->last_launch_diagnostics);
+        attach_sticky_setup_failure(session->last_launch_diagnostics, sticky);
+        session->last_error = sticky_setup_failure_error_text("browser_executable_missing", session->last_error);
         diag::log_tagged_fmt("camoufox", "managed_start browser_required_failed session_id=%s err=%s",
             sid.c_str(), session->last_error.c_str());
         return false;
@@ -9796,6 +10484,26 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
         session->state = bridge_state_t::error;
         session->last_error = "Configured browser executable is not a Camoufox browser bundle";
+        session->last_launch_ms = now_ms() - t0;
+        session->last_launch_diagnostics = {
+            {"status", "error"},
+            {"phase", "browser_executable_preflight"},
+            {"generation", setup_generation},
+            {"session_id", sid},
+            {"browser_path", effective_cfg.browser_executable},
+            {"elapsed_ms", session->last_launch_ms}
+        };
+        const nlohmann::json sticky = set_sticky_setup_failure(
+            setup_ctx,
+            "browser_executable_rejected",
+            session->last_error,
+            setup_generation,
+            0,
+            camoufox_debug_log_path(),
+            session->last_launch_ms,
+            session->last_launch_diagnostics);
+        attach_sticky_setup_failure(session->last_launch_diagnostics, sticky);
+        session->last_error = sticky_setup_failure_error_text("browser_executable_rejected", session->last_error);
         diag::log_tagged_fmt("camoufox", "managed_start browser_rejected_non_camoufox session_id=%s path=%s",
             sid.c_str(), effective_cfg.browser_executable.c_str());
         return false;
@@ -9828,6 +10536,29 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             std::lock_guard<std::recursive_mutex> slk(session->mtx);
             session->state = bridge_state_t::error;
             session->last_error = sg().last_error.empty() ? std::string("camoufox managed session preflight failed") : sg().last_error;
+            session->last_launch_ms = now_ms() - t0;
+            session->last_launch_diagnostics = {
+                {"status", "error"},
+                {"phase", "mcp_executable_preflight"},
+                {"generation", setup_generation},
+                {"session_id", sid},
+                {"command", use_server_executable ? server_executable : python_path},
+                {"elapsed_ms", session->last_launch_ms},
+                {"error", session->last_error}
+            };
+            const nlohmann::json sticky = maybe_set_sticky_setup_failure(
+                setup_ctx,
+                session->last_error,
+                session->last_launch_diagnostics,
+                setup_generation,
+                0,
+                camoufox_debug_log_path(),
+                session->last_launch_ms);
+            if (sticky.is_object() && !sticky.empty())
+            {
+                attach_sticky_setup_failure(session->last_launch_diagnostics, sticky);
+                session->last_error = sticky_setup_failure_error_text(json_string_or(sticky, "category", std::string()), session->last_error);
+            }
             diag::log_tagged_fmt("camoufox", "managed_start preflight_failed session_id=%s preflight_elapsed_ms=%llu elapsed_ms=%llu err=%s",
                 sid.c_str(), static_cast<unsigned long long>(now_ms() - preflight_start_ms),
                 static_cast<unsigned long long>(now_ms() - t0), session->last_error.c_str());
@@ -10137,6 +10868,29 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             (managed_missing_tools.empty() ? std::string("<unknown>") : managed_missing_tools) +
             "; inventory=" + (managed_tool_inventory.empty() ? std::string("<empty>") : managed_tool_inventory) +
             "; mcp last_error=" + managed_inner;
+        session->last_launch_ms = now_ms() - t0;
+        session->last_launch_diagnostics = {
+            {"status", "error"},
+            {"phase", "required_reverse_tools_missing"},
+            {"generation", managed_generation},
+            {"session_id", sid},
+            {"child_pid", pid},
+            {"missing_tools", managed_missing_tools},
+            {"inventory", managed_tool_inventory},
+            {"mcp_last_error", managed_inner},
+            {"elapsed_ms", session->last_launch_ms}
+        };
+        const nlohmann::json sticky = set_sticky_setup_failure(
+            setup_ctx,
+            "required_reverse_tools_missing",
+            session->last_error,
+            managed_generation,
+            pid,
+            child_debug_log,
+            session->last_launch_ms,
+            session->last_launch_diagnostics);
+        attach_sticky_setup_failure(session->last_launch_diagnostics, sticky);
+        session->last_error = sticky_setup_failure_error_text("required_reverse_tools_missing", session->last_error);
         diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=required_tools session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
             sid.c_str(),
             static_cast<unsigned long long>(preflight_ms),
@@ -10247,6 +11001,20 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 managed_launch_error_text,
                 launch.text);
         }
+        nlohmann::json managed_sticky;
+        {
+            std::lock_guard<std::recursive_mutex> lk(session->mtx);
+            managed_sticky = maybe_set_sticky_setup_failure(
+                setup_ctx,
+                managed_launch_error_text,
+                session->last_launch_diagnostics,
+                managed_generation,
+                pid,
+                child_debug_log,
+                now_ms() - t0);
+            if (managed_sticky.is_object() && !managed_sticky.empty())
+                attach_sticky_setup_failure(session->last_launch_diagnostics, managed_sticky);
+        }
         log_managed_failure_diagnostics("launch_browser_failed", pid, managed_launch_error_text, launch.text);
         cleanup_managed_process("launch_browser_failed", pid, std::string("managed_launch_failed_") + sid);
         cli->disconnect();
@@ -10255,6 +11023,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->child_pid = 0;
         session->state = bridge_state_t::error;
         session->last_error = managed_launch_error_text.empty() ? std::string("camoufox managed launch_browser failed") : managed_launch_error_text;
+        if (managed_sticky.is_object() && !managed_sticky.empty())
+            session->last_error = sticky_setup_failure_error_text(json_string_or(managed_sticky, "category", std::string()), session->last_error);
         diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=launch_rpc session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
             sid.c_str(),
             static_cast<unsigned long long>(preflight_ms),
@@ -10325,6 +11095,20 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
             session->privacy_verified ? 1 : 0,
             session->cleanup_pending ? 1 : 0,
             managed_error_diag.dump().c_str());
+        nlohmann::json managed_sticky;
+        {
+            std::lock_guard<std::recursive_mutex> lk(session->mtx);
+            managed_sticky = maybe_set_sticky_setup_failure(
+                setup_ctx,
+                failure_text,
+                session->last_launch_diagnostics,
+                managed_generation,
+                pid,
+                child_debug_log,
+                now_ms() - t0);
+            if (managed_sticky.is_object() && !managed_sticky.empty())
+                attach_sticky_setup_failure(session->last_launch_diagnostics, managed_sticky);
+        }
         log_managed_failure_diagnostics("launch_browser_returned_error", pid, failure_text, launch.text);
         cleanup_managed_process("launch_browser_returned_error", pid, std::string("managed_launch_returned_error_") + sid);
         cli->disconnect();
@@ -10333,6 +11117,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->child_pid = 0;
         session->state = bridge_state_t::error;
         session->last_error = std::string("camoufox managed launch_browser returned error: ") + failure_text;
+        if (managed_sticky.is_object() && !managed_sticky.empty())
+            session->last_error = sticky_setup_failure_error_text(json_string_or(managed_sticky, "category", std::string()), session->last_error);
         diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=launch_returned_error session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
             sid.c_str(),
             static_cast<unsigned long long>(preflight_ms),
@@ -10513,6 +11299,7 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         static_cast<unsigned long long>(visible_window_ms),
         static_cast<unsigned long long>(now_ms() - t0),
         static_cast<unsigned long>(cli->child_process_id()));
+    clear_sticky_setup_failure("managed_start_ready");
     return true;
 }
 
@@ -10551,6 +11338,7 @@ bool stop_managed_bridge(const std::string& session_id, const char* reason)
         session->last_error.clear();
         session->last_cleanup_ms = 0;
     }
+    clear_sticky_setup_failure("managed_stop_bridge");
     if (child_pid != 0)
         terminate_process_tree_sync(child_pid, std::string("managed_stop_") + sid + "_" + stop_reason);
     {

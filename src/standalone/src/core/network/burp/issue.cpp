@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -103,11 +104,43 @@ uint64_t now_ms()
     return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
+constexpr uint64_t kMinimumReasonableSeenMs = 1577836800000ull;
+
 void set_err(const std::string& msg)
 {
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.err_mtx);
     s.last_error = msg;
+}
+
+bool blank_string(const std::string& value)
+{
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isspace(c) != 0; });
+}
+
+bool validate_loaded_issue(issue_t& issue, const char* source, std::string& reason)
+{
+    if (blank_string(issue.type_key)) {
+        reason = "empty_type_key";
+        return false;
+    }
+    if (blank_string(issue.host)) {
+        reason = "empty_host";
+        return false;
+    }
+    const uint64_t now = now_ms();
+    if (issue.seen_ms == 0 || issue.seen_ms < kMinimumReasonableSeenMs) {
+        diag::log_tagged_fmt("issue", "%s normalize_seen_ms id=%llu old=%llu new=%llu type_key=%s host=%s",
+            source ? source : "issue",
+            static_cast<unsigned long long>(issue.id),
+            static_cast<unsigned long long>(issue.seen_ms),
+            static_cast<unsigned long long>(now),
+            issue.type_key.c_str(),
+            issue.host.c_str());
+        issue.seen_ms = now;
+    }
+    reason.clear();
+    return true;
 }
 
 std::string resolve_appdata_dir()
@@ -296,7 +329,19 @@ uint64_t add(issue_t issue)
     auto& s = state();
     if (!s.initialized.load()) initialize();
 
-    if (issue.seen_ms == 0) issue.seen_ms = now_ms();
+    std::string validation_reason;
+    if (!validate_loaded_issue(issue, "add", validation_reason)) {
+        set_err("issue_store.add: " + validation_reason);
+        diag::log_tagged_fmt("issue",
+            "add rejected reason=%s type_key=%s host_present=%d session_present=%d scan_id=%llu audit_id=%llu",
+            validation_reason.c_str(),
+            issue.type_key.c_str(),
+            issue.host.empty() ? 0 : 1,
+            issue.session_id.empty() ? 0 : 1,
+            static_cast<unsigned long long>(issue.scan_id),
+            static_cast<unsigned long long>(issue.audit_id));
+        return 0;
+    }
 
     const std::string key = build_dedupe_key(issue);
     diag::log_tagged_fmt("issue", "add dedupe_key=%s", key.c_str());
@@ -519,10 +564,19 @@ bool import_json(const nlohmann::json& doc, bool replace_existing)
                     it.evidence.push_back(std::move(ev));
             }
         }
-        if (it.type_key.empty() || it.host.empty())
+        std::string validation_reason;
+        if (!validate_loaded_issue(it, "import_json", validation_reason)) {
+            diag::log_tagged_fmt("issue",
+                "import_json issue_skipped id=%llu reason=%s type_key=%s host_present=%d session_present=%d scan_id=%llu audit_id=%llu",
+                static_cast<unsigned long long>(it.id),
+                validation_reason.c_str(),
+                it.type_key.c_str(),
+                it.host.empty() ? 0 : 1,
+                it.session_id.empty() ? 0 : 1,
+                static_cast<unsigned long long>(it.scan_id),
+                static_cast<unsigned long long>(it.audit_id));
             continue;
-        if (it.seen_ms == 0)
-            it.seen_ms = now_ms();
+        }
         if (it.id > max_id)
             max_id = it.id;
         const std::string key = build_dedupe_key(it);
@@ -705,6 +759,20 @@ bool load_from_disk()
                         }
                     }
                 }
+                std::string validation_reason;
+                if (!validate_loaded_issue(it, "load_from_disk", validation_reason)) {
+                    ++skipped;
+                    diag::log_tagged_fmt("issue",
+                        "load_from_disk issue_skipped id=%llu reason=%s type_key=%s host_present=%d session_present=%d scan_id=%llu audit_id=%llu",
+                        static_cast<unsigned long long>(it.id),
+                        validation_reason.c_str(),
+                        it.type_key.c_str(),
+                        it.host.empty() ? 0 : 1,
+                        it.session_id.empty() ? 0 : 1,
+                        static_cast<unsigned long long>(it.scan_id),
+                        static_cast<unsigned long long>(it.audit_id));
+                    continue;
+                }
                 keys.insert(build_dedupe_key(it));
                 loaded.push_back(std::move(it));
             } catch (const std::exception& ex) {
@@ -724,6 +792,10 @@ bool load_from_disk()
             s.items = std::move(loaded);
             s.dedupe_keys = std::move(keys);
             s.next_id.store(next);
+        }
+        if (skipped > 0) {
+            s.unsaved_changes.fetch_add(1, std::memory_order_acq_rel);
+            save_to_disk();
         }
         diag::log_tagged_fmt("burp", "issue_store loaded count=%zu next_id=%llu",
             s.items.size(), static_cast<unsigned long long>(next));

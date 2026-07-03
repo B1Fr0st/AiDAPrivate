@@ -36,6 +36,12 @@ namespace {
 static std::mutex&  err_mtx() { static std::mutex m; return m; }
 static std::string& err_slot() { static std::string s; return s; }
 
+uint64_t now_ms()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
 void set_err(const std::string& s)
 {
     std::lock_guard<std::mutex> lk(err_mtx());
@@ -201,6 +207,11 @@ static void record_hit(job_t& job, hit_t h)
     h.id = job.next_hit_id.fetch_add(1);
     if (job.cfg.report_as_issues) {
         issue_t iss;
+        std::string scheme;
+        std::string host;
+        std::string path;
+        uint16_t port = 0;
+        const bool parsed_url = parse_url(job.cfg.target_url, scheme, host, port, path);
         iss.type_key = "burp.param_miner.hidden_param";
         iss.name = std::string("Hidden parameter: ") + h.param_name;
         iss.description = "ParamMiner detected a parameter (" + h.param_name +
@@ -209,13 +220,32 @@ static void record_hit(job_t& job, hit_t h)
         iss.remediation = "Audit this parameter and ensure it is documented, validated, and not bypassing security controls.";
         iss.severity = severity_t::info;
         iss.confidence = (h.cache_diff || h.echoed || h.header_echoed) ? confidence_t::firm : confidence_t::tentative;
+        iss.session_id = job.cfg.session_id;
+        iss.scan_id = job.cfg.scan_id;
+        iss.audit_id = job.cfg.audit_id;
+        if (iss.scan_id == 0 && iss.audit_id != 0) iss.scan_id = iss.audit_id;
+        iss.scheme = scheme;
+        iss.host = host;
+        iss.port = port;
+        iss.path = path.empty() ? "/" : path;
         iss.parameter = h.param_name;
         iss.insertion_point = h.location_label;
         evidence_t ev;
         ev.marker = h.evidence;
         iss.evidence.push_back(std::move(ev));
-        iss.seen_ms = static_cast<uint64_t>(GetTickCount64());
-        issue_store::add(std::move(iss));
+        iss.seen_ms = now_ms();
+        const uint64_t issue_id = parsed_url ? issue_store::add(std::move(iss)) : 0;
+        diag::log_tagged_fmt("param_miner",
+            "record_hit_issue parsed_url=%d issue_id=%llu target_host_present=%d target_path_present=%d session_present=%d scan_id=%llu audit_id=%llu param=%s location=%s",
+            parsed_url ? 1 : 0,
+            static_cast<unsigned long long>(issue_id),
+            host.empty() ? 0 : 1,
+            path.empty() ? 0 : 1,
+            job.cfg.session_id.empty() ? 0 : 1,
+            static_cast<unsigned long long>(job.cfg.scan_id),
+            static_cast<unsigned long long>(job.cfg.audit_id),
+            h.param_name.c_str(),
+            h.location_label.c_str());
     }
     {
         std::lock_guard<std::mutex> lk(job.hits_mtx);
