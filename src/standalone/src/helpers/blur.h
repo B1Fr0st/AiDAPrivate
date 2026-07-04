@@ -15,8 +15,11 @@ public:
         std::uint64_t slow_suppressed = 0;
         std::uint64_t cache_reuse = 0;
         std::uint64_t adaptive_fallback = 0;
+        std::uint64_t interactive_fallback = 0;
+        std::uint64_t throttle_fallback = 0;
         std::uint64_t last_cache_age_ms = 0;
         std::uint64_t pressure_until_ms = 0;
+        std::uint64_t input_pressure_until_ms = 0;
         std::uint64_t total_area = 0;
         std::uint64_t last_area = 0;
         std::uint64_t total_elapsed_ms = 0;
@@ -39,6 +42,8 @@ public:
     static void ApplyPass(ID3D11ShaderResourceView* src, ID3D11RenderTargetView* dst, bool horizontal);
     static ImDrawCallback ExpectedCallback();
     static Stats SnapshotStats();
+    static void SetInteractionPressure(bool active, std::uint64_t until_ms);
+    static bool InteractionPressureActive();
 
     static ID3D11Device* s_device;
     static ID3D11DeviceContext* s_ctx;

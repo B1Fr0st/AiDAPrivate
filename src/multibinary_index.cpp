@@ -849,7 +849,7 @@ json extract_syscall_services_for_current_idb(const vuln::chain::corpus_record_t
             svc["source"] = limit_source;
             svc["build_identity"] = json::object({
                 {"module_id", corpus.identity.corpus_id},
-                {"input_sha256", corpus.identity.input_sha256},
+                {"input_sha256", corpus.identity.hashes.sha256},
                 {"image_base", hex_u64(static_cast<std::uint64_t>(get_imagebase()))},
                 {"processor", inf_get_procname().c_str()},
                 {"bitness", static_cast<int>(inf_get_app_bitness())}
@@ -2196,7 +2196,7 @@ json build_deep_summary_record(const vuln::chain::corpus_record_t& corpus, const
     });
     out["dependencies"] = json::object({
         {"module_id", corpus.identity.corpus_id},
-        {"input_sha256", corpus.identity.input_sha256},
+        {"input_sha256", corpus.identity.hashes.sha256},
         {"auto_analysis_ok", auto_is_ok()},
         {"function_signature", item.value("signature", json(nullptr))}
     });

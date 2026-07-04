@@ -71,6 +71,8 @@ struct DisasmFile
     uint64_t               image_base = 0;
     uint64_t               entry_point = 0;
     uint64_t               text_va    = 0;
+    uint16_t               machine = IMAGE_FILE_MACHINE_AMD64;
+    bool                   is_64bit = true;
     std::vector<PESection> sections;
     std::vector<AsmInstr>  instrs;
     bool                   loaded = false;
@@ -145,7 +147,9 @@ namespace static_analysis
 
 namespace zydis_detail
 {
-    inline ZydisDecoder&   decoder()   { static ZydisDecoder   d; return d; }
+    inline ZydisDecoder&   decoder64() { static ZydisDecoder   d; return d; }
+    inline ZydisDecoder&   decoder32() { static ZydisDecoder   d; return d; }
+    inline ZydisDecoder&   decoder()   { return decoder64(); }
     inline ZydisFormatter& formatter() { static ZydisFormatter f; return f; }
     inline std::mutex&     mutex()     { static std::mutex     m; return m; }
     inline bool&           ready()     { static bool r = false; return r; }
@@ -154,7 +158,8 @@ namespace zydis_detail
     inline void ensure_init()
     {
         std::call_once(flag(), []() {
-            ZydisDecoderInit(&decoder(), ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+            ZydisDecoderInit(&decoder64(), ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+            ZydisDecoderInit(&decoder32(), ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
             ZydisFormatterInit(&formatter(), ZYDIS_FORMATTER_STYLE_INTEL);
             ZydisFormatterSetProperty(&formatter(), ZYDIS_FORMATTER_PROP_FORCE_SEGMENT, ZYAN_FALSE);
             ZydisFormatterSetProperty(&formatter(), ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_FALSE);
@@ -164,7 +169,7 @@ namespace zydis_detail
 }
 
 
-inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va)
+inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bool is_64bit = true)
 {
     zydis_detail::ensure_init();
     std::lock_guard<std::mutex> decode_lk(zydis_detail::mutex());
@@ -182,7 +187,11 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va)
     ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT];
 
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-            &zydis_detail::decoder(), code, avail, &instruction, operands)))
+            is_64bit ? &zydis_detail::decoder64() : &zydis_detail::decoder32(),
+            code,
+            avail,
+            &instruction,
+            operands)))
     {
         ins.len = 1;
         snprintf(ins.mnem, sizeof(ins.mnem), "db");
@@ -347,24 +356,66 @@ namespace disasm
 
         const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) { out.err = "Not a PE file"; return false; }
-        if (static_cast<DWORD>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > fsz) {
+        if (dos->e_lfanew < 0) {
             out.err = "Corrupt PE"; return false;
         }
 
-        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(raw.data() + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) { out.err = "Not a PE file"; return false; }
-        if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
-            out.err = "Not x64 PE"; return false;
+        const uint64_t nt_off = static_cast<uint64_t>(dos->e_lfanew);
+        const uint64_t file_header_off = nt_off + sizeof(DWORD);
+        if (file_header_off + sizeof(IMAGE_FILE_HEADER) > fsz) {
+            out.err = "Corrupt PE"; return false;
         }
 
-        out.image_base  = nt->OptionalHeader.ImageBase;
-        out.entry_point = out.image_base + nt->OptionalHeader.AddressOfEntryPoint;
+        const auto* nt_base = raw.data() + nt_off;
+        DWORD signature = 0;
+        std::memcpy(&signature, nt_base, sizeof(signature));
+        if (signature != IMAGE_NT_SIGNATURE) { out.err = "Not a PE file"; return false; }
+
+        const auto* fh = reinterpret_cast<const IMAGE_FILE_HEADER*>(raw.data() + file_header_off);
+        const uint64_t opt_off = file_header_off + sizeof(IMAGE_FILE_HEADER);
+        if (fh->SizeOfOptionalHeader < sizeof(WORD) ||
+            opt_off + fh->SizeOfOptionalHeader > fsz) {
+            out.err = "Corrupt PE"; return false;
+        }
+
+        WORD opt_magic = 0;
+        std::memcpy(&opt_magic, raw.data() + opt_off, sizeof(opt_magic));
+        const bool is_pe64 = (fh->Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                              opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+        const bool is_pe32 = (fh->Machine == IMAGE_FILE_MACHINE_I386 &&
+                              opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC);
+        if (!is_pe64 && !is_pe32) {
+            out.err = "Unsupported PE architecture"; return false;
+        }
+
+        out.machine = fh->Machine;
+        out.is_64bit = is_pe64;
+        DWORD entry_rva = 0;
+        if (is_pe64) {
+            if (fh->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) {
+                out.err = "Corrupt PE"; return false;
+            }
+            const auto* opt64 = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(raw.data() + opt_off);
+            out.image_base = opt64->ImageBase;
+            entry_rva = opt64->AddressOfEntryPoint;
+        } else {
+            if (fh->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32)) {
+                out.err = "Corrupt PE"; return false;
+            }
+            const auto* opt32 = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(raw.data() + opt_off);
+            out.image_base = opt32->ImageBase;
+            entry_rva = opt32->AddressOfEntryPoint;
+        }
+        out.entry_point = out.image_base + entry_rva;
 
         const auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
-            reinterpret_cast<const uint8_t*>(nt)
-            + offsetof(IMAGE_NT_HEADERS64, OptionalHeader)
-            + nt->FileHeader.SizeOfOptionalHeader);
-        WORD nsec = nt->FileHeader.NumberOfSections;
+            raw.data() + opt_off + fh->SizeOfOptionalHeader);
+        WORD nsec = fh->NumberOfSections;
+        if (nsec == 0 ||
+            opt_off + fh->SizeOfOptionalHeader +
+                static_cast<uint64_t>(nsec) * sizeof(IMAGE_SECTION_HEADER) > fsz) {
+            out.err = "Corrupt PE"; return false;
+        }
 
         bool any_exec_loaded = false;
         for (WORD i = 0; i < nsec; i++) {
@@ -442,7 +493,7 @@ namespace disasm
                 }
                 const int remaining = sz - off;
                 const int avail = (remaining < 15) ? remaining : 15;
-                AsmInstr ins = zydis_decode_one(data + off, avail, va + off);
+                AsmInstr ins = zydis_decode_one(data + off, avail, va + off, file.is_64bit);
                 const int raw_len = (ins.len < 15) ? ins.len : 15;
                 memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                 file.instrs.push_back(ins);
@@ -496,7 +547,7 @@ namespace disasm
                 }
                 const int remaining = sz - off;
                 const int avail = (remaining < 15) ? remaining : 15;
-                AsmInstr ins = zydis_decode_one(data + off, avail, va + off);
+                AsmInstr ins = zydis_decode_one(data + off, avail, va + off, file.is_64bit);
                 const int raw_len = (ins.len < 15) ? ins.len : 15;
                 memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                 file.instrs.push_back(ins);
@@ -589,8 +640,9 @@ namespace disasm
 
         uint32_t pid = state.live_pid;
         DisasmState* state_ptr = &state;
+        bool decode_is_64bit = state.file.is_64bit;
 
-        work_queue::post([state_ptr, pid, win_start, read_sz]() {
+        work_queue::post([state_ptr, pid, win_start, read_sz, decode_is_64bit]() {
             diag::log_tagged_critical_fmt("disasm",
                 "live_decode_worker_enter pid=%u win_start=0x%llX read_sz=%llu tid=%lu",
                 pid,
@@ -632,7 +684,7 @@ namespace disasm
                     }
                     int remaining = sz - off;
                     int avail = (remaining < 15) ? remaining : 15;
-                    AsmInstr ins = zydis_decode_one(data + off, avail, win_start + off);
+                    AsmInstr ins = zydis_decode_one(data + off, avail, win_start + off, decode_is_64bit);
                     int raw_len = (ins.len < 15) ? ins.len : 15;
                     memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
                     instrs.push_back(ins);
@@ -688,13 +740,18 @@ namespace disasm
         state.live_view_addr = base;
 
         std::vector<PESection> snapshot_sections;
+        bool live_is_64bit = true;
+        uint16_t live_machine = IMAGE_FILE_MACHINE_AMD64;
         {
             diag::log_tagged_critical("disasm", "start_live_pre_pe_parse_sections_only");
             pe_parser::pe_info_t pe;
             if (pe_parser::parse(base, pe, false)) {
+                live_is_64bit = pe.is_64bit;
+                live_machine = pe.is_64bit ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
                 diag::log_tagged_critical_fmt("disasm",
-                    "start_live_post_pe_parse sections=%llu",
-                    (unsigned long long)pe.sections.size());
+                    "start_live_post_pe_parse sections=%llu is64=%d",
+                    (unsigned long long)pe.sections.size(),
+                    pe.is_64bit ? 1 : 0);
                 constexpr uint32_t kCntCode = 0x00000020u;
                 constexpr uint32_t kMemExec = 0x20000000u;
                 constexpr uint32_t kMemRead = 0x40000000u;
@@ -771,6 +828,8 @@ namespace disasm
         state.file.path     = "live://" + std::to_string(pid) + "/" + module_name;
         state.file.image_base = base;
         state.file.text_va    = state.live_view_addr;
+        state.file.machine    = live_machine;
+        state.file.is_64bit   = live_is_64bit;
         state.file.sections   = std::move(snapshot_sections);
         state.file.loaded     = true;
 

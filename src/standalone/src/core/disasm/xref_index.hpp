@@ -344,7 +344,8 @@ namespace xref_index {
 			const std::vector<functions_panel::function_entry_t>& fns,
 			const std::vector<pe_parser::section_info_t>& sections,
 			uint64_t module_base, const std::string& module_name,
-			std::unordered_map<uint64_t, std::vector<annotation_t>>& map)
+			std::unordered_map<uint64_t, std::vector<annotation_t>>& map,
+			bool is_64bit = true)
 		{
 			if (!data || length == 0) return;
 			int sz = static_cast<int>(length);
@@ -354,7 +355,7 @@ namespace xref_index {
 				if (avail > 15) avail = 15;
 
 				uint64_t ins_addr = base_va + static_cast<uint64_t>(pos);
-				AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr);
+				AsmInstr ins = zydis_decode_one(data + pos, avail, ins_addr, is_64bit);
 				if (ins.len <= 0) {
 					pos += 1;
 					continue;
@@ -629,7 +630,8 @@ namespace xref_index {
 					return;
 				}
 				scan_block_for_xrefs(s.bytes.data(), s.bytes.size(), s.va,
-					fns, sections, mod->base, mod->name, map);
+					fns, sections, mod->base, mod->name, map,
+					have_disk_pe ? view.is_pe32_plus : g_disasm.file.is_64bit);
 			}
 
 			if (have_disk_pe) {

@@ -368,7 +368,7 @@ void file_browser::open_file(int idx)
     if (idx < 0 || idx >= (int)entries.size()) return;
     auto& ent = entries[idx];
     if (ent.is_dir) return;
-    file_browser::open_path(ent.full_path);
+    file_browser::request_open_confirmation(ent.full_path);
 }
 
 namespace file_browser {
@@ -388,6 +388,24 @@ inline std::string truncate_middle(const std::string& s, size_t max_len) {
     return out;
 }
 
+}
+
+void request_open_confirmation(const std::string& path)
+{
+    if (path.empty()) return;
+
+    std::error_code ec;
+    if (fs::is_directory(path, ec) && !ec) {
+        open_path(path);
+        return;
+    }
+
+    pending_open_path = path;
+    size_t sl = path.find_last_of("/\\");
+    pending_open_filename = (sl != std::string::npos) ? path.substr(sl + 1) : path;
+    pending_open_should_open = true;
+    pending_open_modal_visible = true;
+    diag::log_tagged_fmt("file_open", "explorer_confirm_requested path=%s", path.c_str());
 }
 
 void record_recent_workspace(const std::string& path)
@@ -466,7 +484,7 @@ void render_pending_confirm_modal()
     bool already_open = analysis_session::find_session_by_path(
         file_browser::pending_open_path, &existing_idx);
 
-    if (ImGui::BeginPopupModal("Open binary?###aida_open_binary_confirm",
+    if (ImGui::BeginPopupModal("Load file?###aida_open_binary_confirm",
                                &open_flag_local,
                                ImGuiWindowFlags_NoSavedSettings
                                | ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -498,6 +516,8 @@ void render_pending_confirm_modal()
         ImGui::PopStyleColor();
 
         ImGui::Spacing();
+        ImGui::TextWrapped("do you want to load this file?");
+        ImGui::Spacing();
 
         if (already_open) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.text_secondary));
@@ -523,12 +543,12 @@ void render_pending_confirm_modal()
         (void)io;
 
         if (already_open) {
-            if (aida::ui::button("Switch to tab", aida::ui::button_kind_t::primary,
+            if (aida::ui::button("Switch", aida::ui::button_kind_t::primary,
                                  aida::ui::size_t_::md, ImVec2(150.f, 0.f),
                                  false, nullptr, false))
                 switch_now = true;
         } else {
-            if (aida::ui::button("Open in new tab", aida::ui::button_kind_t::primary,
+            if (aida::ui::button("Load", aida::ui::button_kind_t::primary,
                                  aida::ui::size_t_::md, ImVec2(160.f, 0.f),
                                  false, nullptr, false))
                 open_now = true;
@@ -541,13 +561,9 @@ void render_pending_confirm_modal()
 
         if (open_now && !already_open) {
             std::string path_copy = file_browser::pending_open_path;
-            bool started = analysis_session::open_session(path_copy);
-            if (started) {
-                globals::ui::active_center_view = center_view_t::disassembly;
-                diag::log_tagged_fmt("file_open", "explorer_click_open path=%s",
-                    path_copy.c_str());
-                file_browser::record_recent_workspace(path_copy);
-            }
+            diag::log_tagged_fmt("file_open", "explorer_confirm_load path=%s",
+                path_copy.c_str());
+            file_browser::open_path(path_copy);
             ImGui::CloseCurrentPopup();
             file_browser::pending_open_modal_visible = false;
             file_browser::pending_open_path.clear();

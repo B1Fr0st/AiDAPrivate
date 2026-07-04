@@ -574,6 +574,11 @@ function Invoke-FrozenMcpContractCheck {
     $hasPageId = $stdout -match "page_id"
     $hasMarker = $stdout -match '"marker"' -or $stdout -match ",marker" -or $stdout -match "marker," -or $stdout -match "marker]"
     $launchBudgetOk = $stdout -match '"launch_budget_contract_ok":true'
+    $launchBudgetPolicyMarkerOk = $stdout -match "aida_launch_budget_policy_v1" -and $stdout -match '"launch_budget_policy_marker_present":true'
+    $launchBudgetPolicyMaxOk = $stdout -match '"launch_budget_policy_max_ok":true'
+    $launchBudgetRequestedClampOk = $stdout -match '"launch_budget_requested_timeout_clamp_ok":true'
+    $launchBudgetPhaseBoundsOk = $stdout -match '"launch_budget_phase_bounds_ok":true'
+    $launchBudgetRetryOk = $stdout -match '"launch_budget_retry_contract_ok":true'
     $pageCreateFloorOk = $stdout -match '"page_create_floor_present":true'
     $pageCreateCeilingOk = $stdout -match '"page_create_ceiling_present":true'
     $pageCreateRatioOk = $stdout -match '"page_create_ratio_present":true'
@@ -595,8 +600,8 @@ function Invoke-FrozenMcpContractCheck {
     $fastVisibleForbiddenReturnAbsentOk = $stdout -match '"fast_visible_forbidden_return_absent":true'
     $fastVisibleCompatAbsentOk = $stdout -match '"fast_visible_compat_path_absent":true'
     $fastVisibleAsyncOk = $stdout -match '"fast_visible_selected_async_present":true'
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonContractMarkerOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk -and $fastVisibleContractMarkerOk -and $fastVisiblePolicyOk -and $fastVisibleMarkerOk -and $fastVisibleDisabledOk -and $fastVisibleIgnoredOk -and $fastVisibleForbiddenReturnAbsentOk -and $fastVisibleCompatAbsentOk -and $fastVisibleAsyncOk)) {
-        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_contract_marker=$([int]$addonContractMarkerOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) fast_visible_contract_marker=$([int]$fastVisibleContractMarkerOk) fast_visible_policy=$([int]$fastVisiblePolicyOk) fast_visible_marker=$([int]$fastVisibleMarkerOk) fast_visible_disabled=$([int]$fastVisibleDisabledOk) fast_visible_ignored=$([int]$fastVisibleIgnoredOk) fast_visible_forbidden_return_absent=$([int]$fastVisibleForbiddenReturnAbsentOk) fast_visible_compat_absent=$([int]$fastVisibleCompatAbsentOk) fast_visible_async=$([int]$fastVisibleAsyncOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $launchBudgetPolicyMarkerOk -and $launchBudgetPolicyMaxOk -and $launchBudgetRequestedClampOk -and $launchBudgetPhaseBoundsOk -and $launchBudgetRetryOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonContractMarkerOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk -and $fastVisibleContractMarkerOk -and $fastVisiblePolicyOk -and $fastVisibleMarkerOk -and $fastVisibleDisabledOk -and $fastVisibleIgnoredOk -and $fastVisibleForbiddenReturnAbsentOk -and $fastVisibleCompatAbsentOk -and $fastVisibleAsyncOk)) {
+        throw "Frozen MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) launch_budget_policy_marker=$([int]$launchBudgetPolicyMarkerOk) launch_budget_policy_max=$([int]$launchBudgetPolicyMaxOk) launch_budget_requested_clamp=$([int]$launchBudgetRequestedClampOk) launch_budget_phase_bounds=$([int]$launchBudgetPhaseBoundsOk) launch_budget_retry=$([int]$launchBudgetRetryOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_contract_marker=$([int]$addonContractMarkerOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) fast_visible_contract_marker=$([int]$fastVisibleContractMarkerOk) fast_visible_policy=$([int]$fastVisiblePolicyOk) fast_visible_marker=$([int]$fastVisibleMarkerOk) fast_visible_disabled=$([int]$fastVisibleDisabledOk) fast_visible_ignored=$([int]$fastVisibleIgnoredOk) fast_visible_forbidden_return_absent=$([int]$fastVisibleForbiddenReturnAbsentOk) fast_visible_compat_absent=$([int]$fastVisibleCompatAbsentOk) fast_visible_async=$([int]$fastVisibleAsyncOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "frozen_mcp_contract_check=ok"
 }
@@ -711,6 +716,11 @@ function Invoke-SourceMcpContractCheck {
     $hasPageId = $stdout -match "page_id"
     $hasMarker = $stdout -match '"marker"' -or $stdout -match ",marker" -or $stdout -match "marker," -or $stdout -match "marker]"
     $launchBudgetOk = $stdout -match '"launch_budget_contract_ok":true'
+    $launchBudgetPolicyMarkerOk = $stdout -match "aida_launch_budget_policy_v1" -and $stdout -match '"launch_budget_policy_marker_present":true'
+    $launchBudgetPolicyMaxOk = $stdout -match '"launch_budget_policy_max_ok":true'
+    $launchBudgetRequestedClampOk = $stdout -match '"launch_budget_requested_timeout_clamp_ok":true'
+    $launchBudgetPhaseBoundsOk = $stdout -match '"launch_budget_phase_bounds_ok":true'
+    $launchBudgetRetryOk = $stdout -match '"launch_budget_retry_contract_ok":true'
     $pageCreateFloorOk = $stdout -match '"page_create_floor_present":true'
     $pageCreateCeilingOk = $stdout -match '"page_create_ceiling_present":true'
     $pageCreateRatioOk = $stdout -match '"page_create_ratio_present":true'
@@ -732,8 +742,8 @@ function Invoke-SourceMcpContractCheck {
     $fastVisibleForbiddenReturnAbsentOk = $stdout -match '"fast_visible_forbidden_return_absent":true'
     $fastVisibleCompatAbsentOk = $stdout -match '"fast_visible_compat_path_absent":true'
     $fastVisibleAsyncOk = $stdout -match '"fast_visible_selected_async_present":true'
-    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonContractMarkerOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk -and $fastVisibleContractMarkerOk -and $fastVisiblePolicyOk -and $fastVisibleMarkerOk -and $fastVisibleDisabledOk -and $fastVisibleIgnoredOk -and $fastVisibleForbiddenReturnAbsentOk -and $fastVisibleCompatAbsentOk -and $fastVisibleAsyncOk)) {
-        throw "Source MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_contract_marker=$([int]$addonContractMarkerOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) fast_visible_contract_marker=$([int]$fastVisibleContractMarkerOk) fast_visible_policy=$([int]$fastVisiblePolicyOk) fast_visible_marker=$([int]$fastVisibleMarkerOk) fast_visible_disabled=$([int]$fastVisibleDisabledOk) fast_visible_ignored=$([int]$fastVisibleIgnoredOk) fast_visible_forbidden_return_absent=$([int]$fastVisibleForbiddenReturnAbsentOk) fast_visible_compat_absent=$([int]$fastVisibleCompatAbsentOk) fast_visible_async=$([int]$fastVisibleAsyncOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
+    if ($proc.ExitCode -ne 0 -or -not ($hasContract -and $hasRequestId -and $hasPageId -and $hasMarker -and $launchBudgetOk -and $launchBudgetPolicyMarkerOk -and $launchBudgetPolicyMaxOk -and $launchBudgetRequestedClampOk -and $launchBudgetPhaseBoundsOk -and $launchBudgetRetryOk -and $pageCreateFloorOk -and $pageCreateCeilingOk -and $pageCreateRatioOk -and $latePageWaitOk -and $waitForLatePageSelfPagesOk -and $primaryWaitUntilDowngradeAbsent -and $addonPolicyOk -and $addonContractMarkerOk -and $addonPolicyMarkerOk -and $addonExcludeOk -and $addonExcludeMarkerOk -and $addonInvalidDiagOk -and $addonAllLaunchScopeOk -and $fastVisibleContractMarkerOk -and $fastVisiblePolicyOk -and $fastVisibleMarkerOk -and $fastVisibleDisabledOk -and $fastVisibleIgnoredOk -and $fastVisibleForbiddenReturnAbsentOk -and $fastVisibleCompatAbsentOk -and $fastVisibleAsyncOk)) {
+        throw "Source MCP contract check failed exit=$($proc.ExitCode) contract=$([int]$hasContract) request_id=$([int]$hasRequestId) page_id=$([int]$hasPageId) marker=$([int]$hasMarker) launch_budget=$([int]$launchBudgetOk) launch_budget_policy_marker=$([int]$launchBudgetPolicyMarkerOk) launch_budget_policy_max=$([int]$launchBudgetPolicyMaxOk) launch_budget_requested_clamp=$([int]$launchBudgetRequestedClampOk) launch_budget_phase_bounds=$([int]$launchBudgetPhaseBoundsOk) launch_budget_retry=$([int]$launchBudgetRetryOk) page_create_floor=$([int]$pageCreateFloorOk) page_create_ceiling=$([int]$pageCreateCeilingOk) page_create_ratio=$([int]$pageCreateRatioOk) late_page_wait=$([int]$latePageWaitOk) wait_for_late_page_self_pages=$([int]$waitForLatePageSelfPagesOk) wait_until_downgrade_absent=$([int]$primaryWaitUntilDowngradeAbsent) addon_policy=$([int]$addonPolicyOk) addon_contract_marker=$([int]$addonContractMarkerOk) addon_marker=$([int]$addonPolicyMarkerOk) addon_exclude_ubo=$([int]$addonExcludeOk) addon_exclude_marker=$([int]$addonExcludeMarkerOk) addon_invalid_diag=$([int]$addonInvalidDiagOk) addon_all_launch_scope=$([int]$addonAllLaunchScopeOk) fast_visible_contract_marker=$([int]$fastVisibleContractMarkerOk) fast_visible_policy=$([int]$fastVisiblePolicyOk) fast_visible_marker=$([int]$fastVisibleMarkerOk) fast_visible_disabled=$([int]$fastVisibleDisabledOk) fast_visible_ignored=$([int]$fastVisibleIgnoredOk) fast_visible_forbidden_return_absent=$([int]$fastVisibleForbiddenReturnAbsentOk) fast_visible_compat_absent=$([int]$fastVisibleCompatAbsentOk) fast_visible_async=$([int]$fastVisibleAsyncOk) stdout=[$(ConvertTo-CompactLogText $stdout)] stderr=[$(ConvertTo-CompactLogText $stderr)]"
     }
     Write-Output "source_mcp_contract_check=ok"
 }
@@ -980,7 +990,7 @@ function Invoke-FrozenMcpSmoke {
     $livePsi.RedirectStandardOutput = $true
     $livePsi.RedirectStandardError = $true
     $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE"] = "1"
-    $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS"] = "120000"
+    $livePsi.Environment["AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS"] = "40000"
     $livePsi.Environment["AIDA_CAMOUFOX_TESTLAB_FAST_PROBE"] = "0"
     $livePsi.Environment["AIDA_CAMOUFOX_EXECUTABLE"] = $browser
     $livePsi.Environment["AIDA_CAMOUFOX_DEBUG_LOG"] = $smokeLog
@@ -1141,6 +1151,7 @@ import types
 AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
 AIDA_DEFAULT_ADDON_POLICY_V1 = "aida_default_addon_policy_v1"
 AIDA_FAST_VISIBLE_POLICY_V1 = "aida_fast_visible_policy_v1"
+AIDA_LAUNCH_BUDGET_POLICY_V1 = "aida_launch_budget_policy_v1"
 
 
 def _aida_contract_probe_from_code(code, source):
@@ -1196,83 +1207,132 @@ def _aida_const_has_string(consts, target):
     return False
 
 
-def _aida_const_has_float(consts, target):
-    for value in consts:
-        if isinstance(value, float) and value == target:
-            return True
-        if isinstance(value, tuple):
-            for inner in value:
-                if isinstance(inner, float) and inner == target:
-                    return True
-    return False
+def _aida_launch_budget_policy_namespace_from_source(source_text, filename):
+    tree = ast.parse(source_text, filename=filename)
+    selected = []
+    needed_names = {
+        "AIDA_VISIBLE_READINESS_MAX_MS",
+        "AIDA_LAUNCH_BUDGET_POLICY_MARKER",
+        "AIDA_LAUNCH_MAX_TIMEOUT_MS",
+        "AIDA_LAUNCH_FLOOR_MS",
+        "AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS",
+        "AIDA_LAUNCH_DEFAULT_FAST_PROBE_MS",
+        "AIDA_LAUNCH_DEFAULT_NORMAL_MS",
+        "AIDA_NAVIGATION_MIN_TIMEOUT_MS",
+        "AIDA_NAVIGATION_DEFAULT_TIMEOUT_MS",
+        "AIDA_NAVIGATION_MAX_TIMEOUT_MS",
+        "AIDA_LAUNCH_PHASE_POLICY",
+        "_int_config",
+        "_aida_launch_mode",
+        "_aida_default_launch_timeout_ms",
+        "_aida_clamp_int",
+        "_aida_phase_budget_seconds",
+        "aida_launch_budget_policy_snapshot",
+        "aida_resolve_launch_budget_policy",
+        "aida_retry_launch_timeout_ms",
+        "aida_clamp_navigation_timeout_ms",
+        "aida_validate_launch_budget_policy",
+    }
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            selected.append(node)
+            break
+    for node in tree.body:
+        name = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+        if name in needed_names:
+            selected.append(node)
+    module = ast.Module(body=selected, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"Any": object}
+    exec(compile(module, filename, "exec"), namespace)
+    return namespace, tree
 
 
-def _aida_launch_co_locate_floor(launch_code):
-    if not isinstance(launch_code, types.CodeType):
-        return False, "launch_code_missing"
-    consts = tuple(launch_code.co_consts or ())
-    if not _aida_const_has_string(consts, "page_create_floor_s"):
-        return False, "marker_string_missing:page_create_floor_s"
-    if not _aida_const_has_float(consts, 25.0):
-        return False, "literal_missing:25.0"
-    if not _aida_const_has_float(consts, 12.0):
-        return False, "literal_missing:12.0_fast_probe_branch"
-    if not _aida_const_has_string(consts, "launch_budget_allocation"):
-        return False, "marker_string_missing:launch_budget_allocation"
-    if not _aida_const_has_string(consts, "fast_probe"):
-        return False, "marker_string_missing:fast_probe"
-    return True, "co_located"
-
-
-def _aida_launch_co_locate_ceiling(launch_code):
-    if not isinstance(launch_code, types.CodeType):
-        return False, "launch_code_missing"
-    consts = tuple(launch_code.co_consts or ())
-    if not _aida_const_has_string(consts, "page_create_ceiling_s"):
-        return False, "marker_string_missing:page_create_ceiling_s"
-    if not _aida_const_has_float(consts, 35.0):
-        return False, "literal_missing:35.0"
-    if not _aida_const_has_float(consts, 18.0):
-        return False, "literal_missing:18.0_fast_probe_branch"
-    if not _aida_const_has_string(consts, "launch_budget_allocation"):
-        return False, "marker_string_missing:launch_budget_allocation"
-    if not _aida_const_has_string(consts, "fast_probe"):
-        return False, "marker_string_missing:fast_probe"
-    return True, "co_located"
-
-
-def _aida_launch_co_locate_ratio(launch_code):
-    if not isinstance(launch_code, types.CodeType):
-        return False, "launch_code_missing"
-    consts = tuple(launch_code.co_consts or ())
-    if not _aida_const_has_float(consts, 0.4):
-        return False, "literal_missing:0.4_slow_ratio"
-    if not _aida_const_has_float(consts, 0.18):
-        return False, "literal_missing:0.18_fast_ratio"
-    if not _aida_const_has_string(consts, "page_create_floor_s"):
-        return False, "marker_string_missing:page_create_floor_s"
-    if not _aida_const_has_string(consts, "page_create_ceiling_s"):
-        return False, "marker_string_missing:page_create_ceiling_s"
-    if not _aida_const_has_string(consts, "page_create_timeout_s"):
-        return False, "marker_string_missing:page_create_timeout_s"
-    if not _aida_const_has_string(consts, "launch_budget_allocation"):
-        return False, "marker_string_missing:launch_budget_allocation"
-    return True, "co_located"
-
-
-def _aida_launch_co_locate_late_page(launch_code):
-    if not isinstance(launch_code, types.CodeType):
-        return False, "launch_code_missing"
-    consts = tuple(launch_code.co_consts or ())
-    if not _aida_const_has_string(consts, "late_page_wait_s"):
-        return False, "marker_string_missing:late_page_wait_s"
-    if not _aida_const_has_float(consts, 8.0):
-        return False, "literal_missing:8.0_late_page_cap"
-    if not _aida_const_has_float(consts, 0.12):
-        return False, "literal_missing:0.12_late_page_ratio"
-    if not _aida_const_has_string(consts, "launch_budget_allocation"):
-        return False, "marker_string_missing:launch_budget_allocation"
-    return True, "co_located"
+def _aida_browser_policy_invariants(browser_module):
+    details = {
+        "ok": False,
+        "marker": ("fail", "missing"),
+        "max": ("fail", "missing"),
+        "defaults": ("fail", "missing"),
+        "clamp": ("fail", "missing"),
+        "phase_bounds": ("fail", "missing"),
+        "page_order": ("fail", "missing"),
+        "retry": ("fail", "missing"),
+        "failures": [],
+    }
+    marker = str(browser_module.get("AIDA_LAUNCH_BUDGET_POLICY_MARKER", "") if isinstance(browser_module, dict) else getattr(browser_module, "AIDA_LAUNCH_BUDGET_POLICY_MARKER", ""))
+    resolver = browser_module.get("aida_resolve_launch_budget_policy") if isinstance(browser_module, dict) else getattr(browser_module, "aida_resolve_launch_budget_policy", None)
+    validator = browser_module.get("aida_validate_launch_budget_policy") if isinstance(browser_module, dict) else getattr(browser_module, "aida_validate_launch_budget_policy", None)
+    retry_resolver = browser_module.get("aida_retry_launch_timeout_ms") if isinstance(browser_module, dict) else getattr(browser_module, "aida_retry_launch_timeout_ms", None)
+    failures = []
+    if marker == AIDA_LAUNCH_BUDGET_POLICY_V1:
+        details["marker"] = ("pass", marker)
+    else:
+        failures.append("policy_marker_missing")
+    if not callable(resolver):
+        failures.append("resolver_missing")
+    if not callable(validator):
+        failures.append("validator_missing")
+    if not callable(retry_resolver):
+        failures.append("retry_resolver_missing")
+    validation = validator() if callable(validator) else {}
+    invariants = validation.get("invariants", {}) if isinstance(validation, dict) else {}
+    max_ok = bool(invariants.get("policy_max_not_above_40000"))
+    defaults_ok = bool(
+        invariants.get("policy_floor_positive")
+        and invariants.get("default_bundled_visible_within_bounds")
+        and invariants.get("default_fast_probe_within_bounds")
+        and invariants.get("default_normal_within_bounds")
+    )
+    clamp_ok = bool(invariants.get("requested_timeout_clamps_to_policy_max") and invariants.get("requested_timeout_clamps_to_policy_floor"))
+    phase_ok = all(bool(invariants.get(name)) for name in (
+        "fast_probe_phase_budgets_nonnegative",
+        "fast_probe_phase_budgets_within_launch_timeout",
+        "bundled_visible_phase_budgets_nonnegative",
+        "bundled_visible_phase_budgets_within_launch_timeout",
+        "normal_phase_budgets_nonnegative",
+        "normal_phase_budgets_within_launch_timeout",
+        "oversized_phase_budgets_nonnegative",
+        "oversized_phase_budgets_within_launch_timeout",
+        "undersized_phase_budgets_nonnegative",
+        "undersized_phase_budgets_within_launch_timeout",
+    ))
+    page_order_ok = bool(invariants.get("bundled_visible_page_budget_lower_than_normal"))
+    retry_ok = bool(
+        invariants.get("retry_never_exceeds_original_timeout")
+        and invariants.get("retry_never_exceeds_remaining_budget")
+        and invariants.get("retry_rejects_budget_below_floor")
+    )
+    if callable(resolver):
+        oversized = resolver(999999, bundled_visible_launch=True, fast_probe=False)
+        normal = resolver(None, bundled_visible_launch=False, fast_probe=False)
+        bundled = resolver(None, bundled_visible_launch=True, fast_probe=False)
+        clamp_ok = clamp_ok and int(oversized.get("launch_timeout_ms", 0)) <= 40000 and int(oversized.get("launch_timeout_ms", 0)) == int(oversized.get("max_ms", 0))
+        page_order_ok = page_order_ok and float(bundled.get("page_create_timeout_s", 0.0)) < float(normal.get("page_create_timeout_s", 0.0))
+    if callable(retry_resolver):
+        retry_ok = retry_ok and 0 <= int(retry_resolver(40000, 16000)) <= 15500
+    checks = {
+        "max": max_ok,
+        "defaults": defaults_ok,
+        "clamp": clamp_ok,
+        "phase_bounds": phase_ok,
+        "page_order": page_order_ok,
+        "retry": retry_ok,
+    }
+    for name, ok in checks.items():
+        details[name] = ("pass" if ok else "fail", "policy_invariant")
+        if not ok:
+            failures.append(name)
+    details["failures"] = failures
+    details["validation"] = validation
+    details["ok"] = not failures
+    return details
 
 
 def _aida_launch_co_locate_self_pages(browser_module):
@@ -1316,6 +1376,13 @@ def _aida_launch_budget_contract_probe():
         "page_create_floor_present": False,
         "page_create_ceiling_present": False,
         "page_create_ratio_present": False,
+        "policy_marker_present": False,
+        "policy_max_ok": False,
+        "policy_floor_defaults_ok": False,
+        "requested_timeout_clamp_ok": False,
+        "phase_budget_bounds_ok": False,
+        "bundled_visible_page_budget_lower_ok": False,
+        "retry_budget_contract_ok": False,
         "primary_wait_until_downgrade_present": True,
         "wait_for_late_page_self_pages_present": False,
         "late_page_wait_floor_present": False,
@@ -1347,10 +1414,25 @@ def _aida_launch_budget_contract_probe():
             diagnostics["browser_probe_mode"] = "source"
             with open(browser_spec.origin, "r", encoding="utf-8") as handle:
                 browser_text = handle.read()
-            diagnostics["page_create_floor_present"] = "page_create_floor_s = 12.0 if fast_probe else 25.0" in browser_text
-            diagnostics["page_create_ceiling_present"] = "page_create_ceiling_s = 18.0 if fast_probe else 35.0" in browser_text
-            diagnostics["page_create_ratio_present"] = "launch_timeout_s * (0.18 if fast_probe else 0.40)" in browser_text
-            diagnostics["late_page_wait_floor_present"] = "late_page_wait_s = 1.0 if fast_probe else min(8.0, max(2.0, launch_timeout_s * 0.12))" in browser_text
+            policy_namespace, tree = _aida_launch_budget_policy_namespace_from_source(browser_text, browser_spec.origin)
+            policy_details = _aida_browser_policy_invariants(policy_namespace)
+            diagnostics["browser_probe_details"]["policy"] = policy_details
+            diagnostics["policy_marker_present"] = policy_details["marker"][0] == "pass"
+            diagnostics["policy_max_ok"] = policy_details["max"][0] == "pass"
+            diagnostics["policy_floor_defaults_ok"] = policy_details["defaults"][0] == "pass"
+            diagnostics["requested_timeout_clamp_ok"] = policy_details["clamp"][0] == "pass"
+            diagnostics["phase_budget_bounds_ok"] = policy_details["phase_bounds"][0] == "pass"
+            diagnostics["bundled_visible_page_budget_lower_ok"] = policy_details["page_order"][0] == "pass"
+            diagnostics["retry_budget_contract_ok"] = policy_details["retry"][0] == "pass"
+            diagnostics["page_create_floor_present"] = policy_details["defaults"][0] == "pass"
+            diagnostics["page_create_ceiling_present"] = policy_details["max"][0] == "pass" and policy_details["clamp"][0] == "pass"
+            diagnostics["page_create_ratio_present"] = policy_details["phase_bounds"][0] == "pass" and policy_details["page_order"][0] == "pass"
+            diagnostics["late_page_wait_floor_present"] = policy_details["phase_bounds"][0] == "pass"
+            if not policy_details.get("ok"):
+                diagnostics["errors"].append({"module": "browser", "error_type": "PolicyInvariantError", "error": ",".join(policy_details.get("failures") or [])})
+            for marker_text in ("AIDA_LAUNCH_BUDGET_POLICY_MARKER", "aida_resolve_launch_budget_policy", "aida_validate_launch_budget_policy", "aida_retry_launch_timeout_ms", "launch_budget_policy", "launch_budget_allocation"):
+                if marker_text not in browser_text:
+                    diagnostics["errors"].append({"module": "browser", "error_type": "PolicyMarkerError", "error": f"missing source marker {marker_text}"})
             diagnostics["addon_policy_marker_present"] = AIDA_DEFAULT_ADDON_POLICY_V1 in browser_text
             diagnostics["addon_policy_log_present"] = "launch_options_addon_policy" in browser_text
             diagnostics["addon_invalid_diagnostic_present"] = "launch_options_addon_invalid" in browser_text
@@ -1363,7 +1445,6 @@ def _aida_launch_budget_contract_probe():
             diagnostics["fast_visible_forbidden_return_absent"] = "return _flag_enabled(requested)" not in browser_text and 'return bool(cfg.get("aida_fast_visible_launch", True))' not in browser_text
             diagnostics["fast_visible_compat_path_absent"] = "fast_visible_firefox_compat" not in browser_text and "launch_fast_visible_compat_selected" not in browser_text
             diagnostics["fast_visible_selected_async_present"] = 'selected_launch_path = "async_camoufox"' in browser_text or 'selected_launch_path="async_camoufox"' in browser_text
-            tree = ast.parse(browser_text, filename=browser_spec.origin)
             for node in ast.walk(tree):
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "_wait_for_late_page":
                     references = [
@@ -1423,21 +1504,28 @@ def _aida_launch_budget_contract_probe():
                     diagnostics["errors"].append({"module": "browser", "error_type": "ProbeError", "error": "BrowserManager.launch code object unavailable"})
                 else:
                     details["launch_code_resolved"] = True
-                    ok_floor, reason_floor = _aida_launch_co_locate_floor(launch_code)
-                    ok_ceiling, reason_ceiling = _aida_launch_co_locate_ceiling(launch_code)
-                    ok_ratio, reason_ratio = _aida_launch_co_locate_ratio(launch_code)
-                    ok_late, reason_late = _aida_launch_co_locate_late_page(launch_code)
+                    policy_details = _aida_browser_policy_invariants(browser_module)
                     ok_self, reason_self = _aida_launch_co_locate_self_pages(browser_module)
-                    diagnostics["page_create_floor_present"] = ok_floor
-                    diagnostics["page_create_ceiling_present"] = ok_ceiling
-                    diagnostics["page_create_ratio_present"] = ok_ratio
-                    diagnostics["late_page_wait_floor_present"] = ok_late
+                    diagnostics["policy_marker_present"] = policy_details["marker"][0] == "pass"
+                    diagnostics["policy_max_ok"] = policy_details["max"][0] == "pass"
+                    diagnostics["policy_floor_defaults_ok"] = policy_details["defaults"][0] == "pass"
+                    diagnostics["requested_timeout_clamp_ok"] = policy_details["clamp"][0] == "pass"
+                    diagnostics["phase_budget_bounds_ok"] = policy_details["phase_bounds"][0] == "pass"
+                    diagnostics["bundled_visible_page_budget_lower_ok"] = policy_details["page_order"][0] == "pass"
+                    diagnostics["retry_budget_contract_ok"] = policy_details["retry"][0] == "pass"
+                    diagnostics["page_create_floor_present"] = policy_details["defaults"][0] == "pass"
+                    diagnostics["page_create_ceiling_present"] = policy_details["max"][0] == "pass" and policy_details["clamp"][0] == "pass"
+                    diagnostics["page_create_ratio_present"] = policy_details["phase_bounds"][0] == "pass" and policy_details["page_order"][0] == "pass"
+                    diagnostics["late_page_wait_floor_present"] = policy_details["phase_bounds"][0] == "pass"
                     diagnostics["wait_for_late_page_self_pages_present"] = ok_self
-                    details["floor"] = ("pass" if ok_floor else "fail", reason_floor)
-                    details["ceiling"] = ("pass" if ok_ceiling else "fail", reason_ceiling)
-                    details["ratio"] = ("pass" if ok_ratio else "fail", reason_ratio)
-                    details["late_page"] = ("pass" if ok_late else "fail", reason_late)
+                    details["floor"] = policy_details["defaults"]
+                    details["ceiling"] = ("pass" if diagnostics["page_create_ceiling_present"] else "fail", "policy_max_and_clamp")
+                    details["ratio"] = ("pass" if diagnostics["page_create_ratio_present"] else "fail", "policy_phase_bounds_and_page_order")
+                    details["late_page"] = policy_details["phase_bounds"]
                     details["self_pages"] = ("pass" if ok_self else "fail", reason_self)
+                    details["policy"] = policy_details
+                    if not policy_details.get("ok"):
+                        diagnostics["errors"].append({"module": "browser", "error_type": "PolicyInvariantError", "error": ",".join(policy_details.get("failures") or [])})
             except Exception as inner_exc:
                 diagnostics["errors"].append({"module": "browser", "error_type": type(inner_exc).__name__, "error": str(inner_exc)[:300]})
             diagnostics["browser_probe_details"] = details
@@ -1494,6 +1582,13 @@ def _aida_launch_budget_contract_probe():
         and diagnostics["navigation_module"]
         and diagnostics["browser_probe_mode"] in ("source", "code_consts")
         and diagnostics["navigation_probe_mode"] in ("source", "code_consts")
+        and diagnostics["policy_marker_present"]
+        and diagnostics["policy_max_ok"]
+        and diagnostics["policy_floor_defaults_ok"]
+        and diagnostics["requested_timeout_clamp_ok"]
+        and diagnostics["phase_budget_bounds_ok"]
+        and diagnostics["bundled_visible_page_budget_lower_ok"]
+        and diagnostics["retry_budget_contract_ok"]
         and diagnostics["page_create_floor_present"]
         and diagnostics["page_create_ceiling_present"]
         and diagnostics["page_create_ratio_present"]
@@ -1544,6 +1639,12 @@ def _run_contract_check():
     probe_log.append(f"addon_policy={'pass' if launch_budget.get('addon_policy_contract_ok') else 'fail'}")
     probe_log.append(f"fast_visible_policy={'pass' if launch_budget.get('fast_visible_policy_contract_ok') else 'fail'}")
     browser_details = launch_budget.get("browser_probe_details") or {}
+    policy_details = browser_details.get("policy") if isinstance(browser_details, dict) else {}
+    if isinstance(policy_details, dict):
+        for key in ("marker", "max", "defaults", "clamp", "phase_bounds", "page_order", "retry"):
+            entry = policy_details.get(key)
+            if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                probe_log.append(f"browser_policy_{key}={entry[0]}:{entry[1]}")
     for key in ("floor", "ceiling", "ratio", "late_page", "self_pages"):
         entry = browser_details.get(key)
         if isinstance(entry, (tuple, list)) and len(entry) == 2:
@@ -1572,6 +1673,14 @@ def _run_contract_check():
         "required_params": ["request_id", "page_id", "marker"],
         "launch_budget_contract": launch_budget,
         "launch_budget_contract_ok": bool(launch_budget.get("ok")),
+        "launch_budget_policy_marker": AIDA_LAUNCH_BUDGET_POLICY_V1,
+        "launch_budget_policy_marker_present": bool(launch_budget.get("policy_marker_present")),
+        "launch_budget_policy_max_ok": bool(launch_budget.get("policy_max_ok")),
+        "launch_budget_policy_floor_defaults_ok": bool(launch_budget.get("policy_floor_defaults_ok")),
+        "launch_budget_requested_timeout_clamp_ok": bool(launch_budget.get("requested_timeout_clamp_ok")),
+        "launch_budget_phase_bounds_ok": bool(launch_budget.get("phase_budget_bounds_ok")),
+        "launch_budget_bundled_visible_page_budget_lower_ok": bool(launch_budget.get("bundled_visible_page_budget_lower_ok")),
+        "launch_budget_retry_contract_ok": bool(launch_budget.get("retry_budget_contract_ok")),
         "page_create_floor_present": bool(launch_budget.get("page_create_floor_present")),
         "page_create_ceiling_present": bool(launch_budget.get("page_create_ceiling_present")),
         "page_create_ratio_present": bool(launch_budget.get("page_create_ratio_present")),
@@ -1804,7 +1913,7 @@ async def _run_live_smoke_async():
         executable = os.path.abspath(os.path.expandvars(os.path.expanduser(executable)))
     if not executable or not os.path.isfile(executable):
         raise FileNotFoundError(f"Camoufox executable is not available: {executable}")
-    timeout_ms = _int_env("AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS", 75000)
+    timeout_ms = _int_env("AIDA_CAMOUFOX_LIVE_SMOKE_TIMEOUT_MS", 40000)
     config = {
         "headless": False,
         "executable_path": executable,

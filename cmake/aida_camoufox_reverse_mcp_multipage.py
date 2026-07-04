@@ -35,12 +35,59 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def _resolved_numeric_assignments(tree: ast.Module) -> dict[str, int | float]:
+    raw: dict[str, int | float | str] = {}
+    for node in tree.body:
+        target = None
+        value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target = node.targets[0].id
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target = node.target.id
+            value = node.value
+        if not target or value is None:
+            continue
+        if isinstance(value, ast.Constant) and isinstance(value.value, (int, float)):
+            raw[target] = value.value
+        elif isinstance(value, ast.Name):
+            raw[target] = value.id
+    resolved: dict[str, int | float] = {}
+
+    def resolve(name: str, seen: set[str] | None = None) -> int | float | None:
+        if name in resolved:
+            return resolved[name]
+        seen = set(seen or ())
+        if name in seen:
+            return None
+        seen.add(name)
+        value = raw.get(name)
+        if isinstance(value, (int, float)):
+            resolved[name] = value
+            return value
+        if isinstance(value, str):
+            nested = resolve(value, seen)
+            if nested is not None:
+                resolved[name] = nested
+            return nested
+        return None
+
+    for key in list(raw.keys()):
+        resolve(key)
+    return resolved
+
+
 def validate_browser_launch_budget_contract(path: pathlib.Path, text: str) -> None:
     required_markers = (
-        "page_create_floor_s = 12.0 if fast_probe else 25.0",
-        "page_create_ceiling_s = 18.0 if fast_probe else 35.0",
-        "launch_timeout_s * (0.18 if fast_probe else 0.40)",
-        "late_page_wait_s = 1.0 if fast_probe else min(8.0, max(2.0, launch_timeout_s * 0.12))",
+        "AIDA_LAUNCH_BUDGET_POLICY_MARKER",
+        "aida_launch_budget_policy_v1",
+        "AIDA_LAUNCH_MAX_TIMEOUT_MS",
+        "AIDA_LAUNCH_FLOOR_MS",
+        "AIDA_LAUNCH_PHASE_POLICY",
+        "def aida_resolve_launch_budget_policy",
+        "def aida_validate_launch_budget_policy",
+        "def aida_retry_launch_timeout_ms",
+        "launch_budget_policy",
         "launch_budget_allocation",
     )
     for marker in required_markers:
@@ -53,6 +100,29 @@ def validate_browser_launch_budget_contract(path: pathlib.Path, text: str) -> No
     for marker in forbidden_markers:
         if marker in text:
             fail(f"browser launch budget contract regression detected ({marker}) in {path}")
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as exc:
+        fail(f"browser launch budget contract could not parse {path}: {exc}")
+    assignments = _resolved_numeric_assignments(tree)
+    max_ms = assignments.get("AIDA_LAUNCH_MAX_TIMEOUT_MS")
+    floor_ms = assignments.get("AIDA_LAUNCH_FLOOR_MS")
+    defaults = (
+        assignments.get("AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS"),
+        assignments.get("AIDA_LAUNCH_DEFAULT_FAST_PROBE_MS"),
+        assignments.get("AIDA_LAUNCH_DEFAULT_NORMAL_MS"),
+    )
+    if max_ms is None or int(max_ms) > 40000:
+        fail(f"browser launch budget policy max is missing or above 40000ms in {path}")
+    if floor_ms is None or int(floor_ms) <= 0:
+        fail(f"browser launch budget policy floor is missing or nonpositive in {path}")
+    for value in defaults:
+        if value is None or int(floor_ms) > int(value) or int(value) > int(max_ms):
+            fail(f"browser launch budget policy default outside floor/max bounds in {path}")
+    functions = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for function_name in ("aida_resolve_launch_budget_policy", "aida_validate_launch_budget_policy", "aida_retry_launch_timeout_ms"):
+        if function_name not in functions:
+            fail(f"browser launch budget policy missing function {function_name} in {path}")
     if "async def _wait_for_late_page" not in text:
         fail(f"browser late page contract missing _wait_for_late_page in {path}")
     late_page_start = text.find("async def _wait_for_late_page")
@@ -905,6 +975,19 @@ def patch_navigation_capture(path: pathlib.Path, text: str) -> str:
             "dom_ready = await _await_no_cancel_wait(page.evaluate(\"document.readyState\"), timeout=3.0)",
             1,
         )
+    if "aida_clamp_navigation_timeout_ms" not in text:
+        if "from ..browser import _await_no_cancel_wait, _camoufox_debug, _safe_text, _target_domain" in text:
+            text = text.replace(
+                "from ..browser import _await_no_cancel_wait, _camoufox_debug, _safe_text, _target_domain",
+                "from ..browser import AIDA_NAVIGATION_DEFAULT_TIMEOUT_MS, aida_clamp_navigation_timeout_ms, _await_no_cancel_wait, _camoufox_debug, _safe_text, _target_domain",
+                1,
+            )
+        elif "from ..browser import _camoufox_debug, _safe_text, _target_domain" in text:
+            text = text.replace(
+                "from ..browser import _camoufox_debug, _safe_text, _target_domain",
+                "from ..browser import AIDA_NAVIGATION_DEFAULT_TIMEOUT_MS, aida_clamp_navigation_timeout_ms, _camoufox_debug, _safe_text, _target_domain",
+                1,
+            )
     if "nav_timeout_ms" not in text:
         if "    wait_until: str = \"load\",\n    pre_inject_hooks:" in text:
             text = text.replace(
@@ -923,9 +1006,9 @@ def patch_navigation_capture(path: pathlib.Path, text: str) -> str:
             "        warnings: list[str] = []\n        hooks_injected: list[str] = []\n",
             "        warnings: list[str] = []\n        hooks_injected: list[str] = []\n"
             "        try:\n"
-            "            nav_timeout_ms = max(1000, min(int(timeout), 120000))\n"
+            "            nav_timeout_ms = aida_clamp_navigation_timeout_ms(timeout)\n"
             "        except Exception:\n"
-            "            nav_timeout_ms = 30000\n",
+            "            nav_timeout_ms = AIDA_NAVIGATION_DEFAULT_TIMEOUT_MS\n",
             "navigation timeout budget",
         )
         text = text.replace("timeout=30000)", "timeout=nav_timeout_ms)", 1)
@@ -1049,11 +1132,17 @@ def _navigation_capture_summary(page_id: str | None, limit: int = _NAVIGATION_CA
 
 
 def patch_navigation_launch_params(path: pathlib.Path, text: str) -> str:
+    if "AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS" not in text and "from ..browser import " in text:
+        text = text.replace(
+            "from ..browser import ",
+            "from ..browser import AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS, ",
+            1,
+        )
     if "profile_dir: str | None = None" not in text:
         text = replace_once(
             text,
             "    launch_timeout_ms: int = 30000,\n) -> dict:\n",
-            "    launch_timeout_ms: int = 30000,\n"
+            "    launch_timeout_ms: int = AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS,\n"
             "    persistent_context: bool = False,\n"
             "    profile_dir: str | None = None,\n"
             "    user_data_dir: str | None = None,\n"
@@ -1202,8 +1291,8 @@ def patch_browser_launch_deadline_diagnostics(text: str) -> str:
             text,
             "        launch_timeout_floor_ms = 5000 if fast_probe else (32000 if bundled_visible_launch else 5000)\n"
             "        launch_timeout_ms = min(max(_int_config(cfg.get(\"launch_timeout_ms\"), 30000), launch_timeout_floor_ms), 120000)\n",
-            "        launch_timeout_floor_ms = 5000 if fast_probe else (32000 if bundled_visible_launch else 5000)\n"
-            "        launch_timeout_ms = min(max(_int_config(cfg.get(\"launch_timeout_ms\"), 30000), launch_timeout_floor_ms), 120000)\n"
+            "        launch_budget_policy = aida_resolve_launch_budget_policy(cfg.get(\"launch_timeout_ms\"), bundled_visible_launch=bundled_visible_launch, fast_probe=fast_probe)\n"
+            "        launch_timeout_ms = int(launch_budget_policy[\"launch_timeout_ms\"])\n"
             "        launch_deadline = time.perf_counter() + (launch_timeout_ms / 1000.0)\n"
             "        launch_generation = str(cfg.get(\"bridge_generation\") or cfg.get(\"generation\") or \"\")\n"
             "        launch_session_id = str(cfg.get(\"bridge_session_id\") or cfg.get(\"session_id\") or self.session_id or \"default\")\n"
@@ -3583,6 +3672,12 @@ def patch_instrumentation(path: pathlib.Path) -> None:
         return
     original_text = read_text(path)
     text = original_text
+    if "aida_clamp_navigation_timeout_ms" not in text and "from ..browser import " in text:
+        text = text.replace(
+            "from ..browser import ",
+            "from ..browser import aida_clamp_navigation_timeout_ms, ",
+            1,
+        )
     if "timeout_ms: int = 60000" not in text:
         text = replace_in_function(
             text,
@@ -3610,7 +3705,7 @@ def patch_instrumentation(path: pathlib.Path) -> None:
             "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\", timeout_ms: int = 60000) -> dict:\n",
             1,
         )
-    if "nav_timeout_ms = max(1000, min(int(timeout_ms), 120000))" not in text:
+    if "nav_timeout_ms = aida_clamp_navigation_timeout_ms(timeout_ms, 60000)" not in text:
         text = text.replace(
             "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\", timeout_ms: int = 60000) -> dict:\n"
             "    try:\n"
@@ -3618,7 +3713,7 @@ def patch_instrumentation(path: pathlib.Path) -> None:
             "async def _reload_with_hooks(clear_log: bool = True, wait_until: str = \"load\", timeout_ms: int = 60000) -> dict:\n"
             "    try:\n"
             "        try:\n"
-            "            nav_timeout_ms = max(1000, min(int(timeout_ms), 120000))\n"
+            "            nav_timeout_ms = aida_clamp_navigation_timeout_ms(timeout_ms, 60000)\n"
             "        except Exception:\n"
             "            nav_timeout_ms = 60000\n"
             "        page = await browser_manager.get_active_page()\n",

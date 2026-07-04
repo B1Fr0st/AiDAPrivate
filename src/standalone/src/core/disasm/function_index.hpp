@@ -2137,7 +2137,7 @@ namespace function_index {
 			if (bytes.empty()) return;
 
 			zydis_detail::ensure_init();
-			ZydisDecoder& dec = zydis_detail::decoder();
+			ZydisDecoder& dec = g_disasm.file.is_64bit ? zydis_detail::decoder64() : zydis_detail::decoder32();
 
 			std::unordered_map<int64_t, var_slot_t> var_map;
 			std::unordered_set<uint64_t> branch_targets;

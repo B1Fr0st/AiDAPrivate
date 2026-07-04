@@ -2536,7 +2536,7 @@ function_snapshot_t extract_function_snapshot_ida(ea_t ea, const extraction_opti
     out.identity.start = address_for(pfn->start_ea, module);
     out.identity.end = address_for(pfn->end_ea, module);
     out.identity.size = pfn->end_ea > pfn->start_ea ? static_cast<std::uint64_t>(pfn->end_ea - pfn->start_ea) : 0;
-    out.identity.flags = pfn->flags;
+    out.identity.flags = static_cast<std::uint32_t>(pfn->flags);
     out.identity.does_return = pfn->does_return();
     out.identity.is_thunk = (pfn->flags & FUNC_THUNK) != 0;
     out.identity.is_tail = (pfn->flags & FUNC_TAIL) != 0;

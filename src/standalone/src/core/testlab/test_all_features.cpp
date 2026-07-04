@@ -55,6 +55,7 @@
 #include <cwchar>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -144,6 +145,7 @@ namespace test_all_features {
 		std::atomic<bool> g_running{ false };
 		std::atomic<bool> g_start_queued{ false };
 		std::atomic<bool> g_cancel_requested{ false };
+		std::atomic<bool> g_interactive_cancel_cleanup_inflight{ false };
 		std::atomic<bool> g_target_unavailable{ false };
 
 		std::atomic<int>  g_total{ 0 };
@@ -4324,7 +4326,70 @@ namespace test_all_features {
 			return true;
 		}
 
-		void cancel_tests_impl() {
+		void run_interactive_cancel_cleanup_worker() {
+			struct inflight_reset_t {
+				~inflight_reset_t() {
+					g_interactive_cancel_cleanup_inflight.store(false, std::memory_order_release);
+				}
+			} inflight_reset;
+
+			try {
+				const ULONGLONG t0 = GetTickCount64();
+				aida::burp::camoufox::force_cleanup("testlab.cancel.interactive.async");
+				diag::log_tagged_fmt("test_all", "interactive cancel cleanup completed elapsed_ms=%llu",
+					static_cast<unsigned long long>(GetTickCount64() - t0));
+			} catch (const std::exception& ex) {
+				diag::log_tagged_fmt("test_all", "interactive cancel cleanup exception: %s", ex.what());
+			} catch (...) {
+				diag::log_tagged("test_all", "interactive cancel cleanup exception: unknown");
+			}
+		}
+
+		enum class interactive_cancel_cleanup_post_t {
+			posted,
+			already_inflight,
+			rejected
+		};
+
+		interactive_cancel_cleanup_post_t post_interactive_cancel_cleanup() {
+			bool expected = false;
+			if (!g_interactive_cancel_cleanup_inflight.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+				return interactive_cancel_cleanup_post_t::already_inflight;
+
+			bool posted = false;
+			try {
+				std::function<void()> task = []() {
+					run_interactive_cancel_cleanup_worker();
+				};
+				posted = work_queue::post_service_labeled("full_test.cancel_cleanup", task);
+				if (!posted)
+					posted = work_queue::post_labeled("full_test.cancel_cleanup", task);
+				if (!posted)
+					posted = critical_work_queue::post_labeled("full_test.cancel_cleanup", std::move(task));
+			} catch (...) {
+				posted = false;
+			}
+
+			if (!posted) {
+				g_interactive_cancel_cleanup_inflight.store(false, std::memory_order_release);
+				return interactive_cancel_cleanup_post_t::rejected;
+			}
+			return interactive_cancel_cleanup_post_t::posted;
+		}
+
+		void request_interactive_cancel() {
+			g_cancel_requested.store(true, std::memory_order_release);
+			set_phase("Cancelling...");
+			const interactive_cancel_cleanup_post_t post_state = post_interactive_cancel_cleanup();
+			if (post_state == interactive_cancel_cleanup_post_t::posted)
+				set_step("cancel cleanup queued");
+			else if (post_state == interactive_cancel_cleanup_post_t::already_inflight)
+				set_step("cancel cleanup already queued");
+			else
+				set_step("cancel cleanup queue unavailable");
+		}
+
+		void cancel_tests_blocking_shutdown_impl() {
 			g_cancel_requested.store(true, std::memory_order_release);
 			diag::log_tagged_fmt("test_all", "user cancelled Test All Features");
 			try {
@@ -4346,6 +4411,48 @@ namespace test_all_features {
 		return queue_start_tests_impl("ui_start_tests");
 	}
 
+	bool post_hotkey_trigger(const char* source) {
+		static std::atomic<bool> s_hotkey_task_inflight{ false };
+		static std::atomic<std::uint64_t> s_last_hotkey_post_ms{ 0 };
+		const char* tag_ptr = source && source[0] ? source : "ctrl_shift_t";
+		const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+		const std::uint64_t last_ms = s_last_hotkey_post_ms.load(std::memory_order_acquire);
+		if (last_ms != 0 && now_ms >= last_ms && now_ms - last_ms < 750ULL) {
+			diag::log_tagged_fmt("ui", "test_all_hotkey_deduped source=%s age_ms=%llu", tag_ptr, static_cast<unsigned long long>(now_ms - last_ms));
+			return false;
+		}
+		bool expected = false;
+		if (!s_hotkey_task_inflight.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+			diag::log_tagged_fmt("ui", "test_all_hotkey_deduped_inflight source=%s", tag_ptr);
+			return false;
+		}
+		s_last_hotkey_post_ms.store(now_ms, std::memory_order_release);
+		std::string tag(tag_ptr);
+		std::function<void()> task = [tag]() {
+			try {
+				const bool accepted = trigger_from_hotkey(tag.c_str());
+				diag::log_tagged_fmt("ui", "test_all_hotkey_worker_done source=%s accepted=%d", tag.c_str(), accepted ? 1 : 0);
+			} catch (const std::exception& e) {
+				diag::log_tagged_fmt("ui", "test_all_hotkey_worker_exception source=%s what=%s", tag.c_str(), e.what());
+			} catch (...) {
+				diag::log_tagged_fmt("ui", "test_all_hotkey_worker_exception source=%s what=<unknown>", tag.c_str());
+			}
+			s_hotkey_task_inflight.store(false, std::memory_order_release);
+		};
+		bool posted = work_queue::post_service_labeled("full_test.hotkey", task);
+		if (!posted)
+			posted = work_queue::post_labeled("full_test.hotkey", task);
+		if (!posted)
+			posted = critical_work_queue::post_labeled("full_test.hotkey", std::move(task));
+		if (!posted) {
+			s_hotkey_task_inflight.store(false, std::memory_order_release);
+			diag::log_tagged_critical_fmt("ui", "test_all_hotkey_post_failed source=%s", tag_ptr);
+			return false;
+		}
+		diag::log_tagged_fmt("ui", "test_all_hotkey_posted source=%s", tag_ptr);
+		return true;
+	}
+
 	bool trigger_from_hotkey(const char* source) {
 		const char* tag = source && source[0] ? source : "ctrl_shift_t";
 		globals::ui::test_all_visible = true;
@@ -4353,12 +4460,21 @@ namespace test_all_features {
 		format_debug_snapshot(snap_before, sizeof(snap_before));
 		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s before={%s}", tag, snap_before);
 		diag::log_tagged_fmt("parser_proof", "%s pressed; starting full Test Lab before={%s}", tag, snap_before);
-		run_parser_proof_smoke();
+		auto proof_task = [] {
+			run_parser_proof_smoke();
+		};
+		bool proof_posted = work_queue::post_service_labeled("parser_proof.hotkey", proof_task);
+		if (!proof_posted)
+			proof_posted = work_queue::post_labeled("parser_proof.hotkey", proof_task);
+		if (!proof_posted)
+			proof_posted = critical_work_queue::post_labeled("parser_proof.hotkey", std::move(proof_task));
+		if (!proof_posted)
+			diag::log_tagged("parser_proof", "hotkey parser proof smoke post failed");
 		bool accepted = queue_start_tests_impl(tag);
 		char snap_after[1200] = {};
 		format_debug_snapshot(snap_after, sizeof(snap_after));
-		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s accepted=%d after={%s}", tag, accepted ? 1 : 0, snap_after);
-		diag::log_tagged_fmt("parser_proof", "%s start_tests accepted=%d after={%s}", tag, accepted ? 1 : 0, snap_after);
+		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s accepted=%d proof_posted=%d after={%s}", tag, accepted ? 1 : 0, proof_posted ? 1 : 0, snap_after);
+		diag::log_tagged_fmt("parser_proof", "%s start_tests accepted=%d proof_posted=%d after={%s}", tag, accepted ? 1 : 0, proof_posted ? 1 : 0, snap_after);
 		return accepted;
 	}
 
@@ -4381,7 +4497,7 @@ namespace test_all_features {
 	}
 
 	void cancel_tests() {
-		cancel_tests_impl();
+		cancel_tests_blocking_shutdown_impl();
 	}
 
 	bool is_running() {
@@ -4507,7 +4623,7 @@ namespace test_all_features {
 
 			if (!running) ImGui::BeginDisabled();
 			if (ImGui::Button("Cancel", ImVec2(100.f, 30.f))) {
-				cancel_tests_impl();
+				request_interactive_cancel();
 			}
 			if (!running) ImGui::EndDisabled();
 

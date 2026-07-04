@@ -31,6 +31,7 @@
 #include <exception>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -226,11 +227,14 @@ uint64_t next_request_id()
 constexpr int kToolListWaitMaxMs = 5000;
 constexpr int kLaunchWaitMinMs = 5000;
 constexpr int kLaunchWaitMaxMs = 120000;
-constexpr int kBundledVisibleLaunchWaitMinMs = 60000;
-constexpr int kBundledVisibleLaunchWaitMaxMs = 120000;
-constexpr int kTestLabLaunchWaitDefaultMs = 45000;
-constexpr int kTestLabLaunchWaitMaxMs = 45000;
+constexpr int kBundledVisibleReadinessMaxMs = 40000;
+constexpr int kBundledVisibleLaunchWaitMinMs = 5000;
+constexpr int kBundledVisibleLaunchWaitMaxMs = kBundledVisibleReadinessMaxMs;
+constexpr int kTestLabLaunchWaitDefaultMs = 40000;
+constexpr int kTestLabLaunchWaitMaxMs = 40000;
 constexpr int kStrictLaunchBudgetMs = 135000;
+constexpr uint64_t kLaunchWaitLogIntervalMs = 5000;
+constexpr uint64_t kLaunchWaitTreeLogIntervalMs = 10000;
 constexpr DWORD kDependencyProbeTimeoutMs = 9000;
 constexpr int kReadinessProbeTimeoutMs = 10000;
 constexpr int kNavigationWaitMaxMs = 50000;
@@ -3569,6 +3573,38 @@ int effective_launch_wait_ms(const launch_config_t& cfg, bool bundled_visible_la
     return wait_ms;
 }
 
+int apply_visible_readiness_budget_ms(int launch_wait_ms,
+                                      bool bundled_visible_launch,
+                                      uint64_t start_ms,
+                                      const char* phase,
+                                      uint64_t generation,
+                                      uint32_t child_pid)
+{
+    if (!bundled_visible_launch)
+        return launch_wait_ms;
+    const uint64_t elapsed_ms = now_ms() - start_ms;
+    const uint64_t remaining_ms = elapsed_ms >= static_cast<uint64_t>(kBundledVisibleReadinessMaxMs)
+        ? 0
+        : static_cast<uint64_t>(kBundledVisibleReadinessMaxMs) - elapsed_ms;
+    const int bounded_ms = remaining_ms > static_cast<uint64_t>(std::numeric_limits<int>::max())
+        ? launch_wait_ms
+        : std::min<int>(launch_wait_ms, static_cast<int>(remaining_ms));
+    if (bounded_ms != launch_wait_ms)
+    {
+        diag::log_tagged_fmt("camoufox",
+            "visible_readiness_budget_clamped phase=%s generation=%llu child_pid=%lu elapsed_ms=%llu remaining_ms=%llu requested_launch_wait_ms=%d bounded_launch_wait_ms=%d max_total_ms=%d",
+            phase && phase[0] ? phase : "<unknown>",
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(child_pid),
+            static_cast<unsigned long long>(elapsed_ms),
+            static_cast<unsigned long long>(remaining_ms),
+            launch_wait_ms,
+            bounded_ms,
+            kBundledVisibleReadinessMaxMs);
+    }
+    return std::max(0, bounded_ms);
+}
+
 int clamp_navigation_call_wait_ms(int requested)
 {
     int wait_ms = requested > 0 ? requested + 5000 : 35000;
@@ -6469,6 +6505,8 @@ std::string sidecar_timeout_phase_from_event(const nlohmann::json& event, const 
         return "page_creation_timeout";
     if (name.find("page_closed_during_launch") != std::string::npos)
         return "page_closed_during_launch";
+    if (name.find("launch_terminal_event") != std::string::npos)
+        return json_string_or(event, "reason", std::string("launch_terminal_event"));
     if (name.find("privacy_verify") != std::string::npos || phase == "privacy_verify")
         return "privacy_verify";
     if (name.find("browser_disconnected") != std::string::npos)
@@ -6478,6 +6516,69 @@ std::string sidecar_timeout_phase_from_event(const nlohmann::json& event, const 
     if (!phase.empty())
         return phase == "new_page" ? "page_creation_timeout" : phase;
     return fallback;
+}
+
+bool sidecar_launch_terminal_event(const nlohmann::json& event, std::string& reason)
+{
+    reason.clear();
+    if (!event.is_object())
+        return false;
+    const std::string name = json_string_or(event, "event", std::string());
+    const std::string phase = json_string_or(event, "phase", std::string());
+    const std::string active_phase = json_string_or(event, "active_launch_phase", std::string());
+    const std::string error_kind = json_string_or(event, "error_kind", std::string());
+    if (name.empty() && phase.empty() && active_phase.empty() && error_kind.empty())
+        return false;
+    if (name == "launch_ready" || active_phase == "launch_ready")
+        return false;
+    if (name == "page_closed_during_launch")
+    {
+        reason = "page_closed_during_launch";
+        return true;
+    }
+    if (name == "launch_terminal_event")
+    {
+        reason = json_string_or(event, "reason", std::string("launch_terminal_event"));
+        return true;
+    }
+    if (name == "browser_disconnected")
+    {
+        reason = "browser_disconnected";
+        return true;
+    }
+    if (name == "subprocess_exit")
+    {
+        const int exit_code = json_int_or(event, "exit_code", static_cast<int>(STILL_ACTIVE));
+        if (exit_code != static_cast<int>(STILL_ACTIVE))
+        {
+            reason = std::string("subprocess_exit_") + std::to_string(exit_code);
+            return true;
+        }
+    }
+    if (name == "launch_error" || name.find("launch_error_") == 0)
+    {
+        reason = name;
+        return true;
+    }
+    if (error_kind == "target_closed" ||
+        error_kind == "browser_disconnected" ||
+        error_kind == "browser_closed" ||
+        error_kind == "context_closed" ||
+        error_kind == "page_crash")
+    {
+        reason = error_kind;
+        return true;
+    }
+    if (!active_phase.empty() && active_phase != "launch_ready")
+    {
+        auto browser_connected_it = event.find("browser_connected");
+        if (browser_connected_it != event.end() && browser_connected_it->is_boolean() && !browser_connected_it->get<bool>())
+        {
+            reason = "browser_disconnected_during_" + active_phase;
+            return true;
+        }
+    }
+    return false;
 }
 
 void attach_debug_log_snapshot_locked(nlohmann::json& out,
@@ -8487,6 +8588,49 @@ bool start_bridge(const launch_config_t& cfg)
     const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
     const bool testlab_fast_probe = test_lab_launch_fail_fast_enabled(effective_cfg);
     int launch_wait_ms = effective_launch_wait_ms(effective_cfg, bundled_visible_launch);
+    launch_wait_ms = apply_visible_readiness_budget_ms(launch_wait_ms, bundled_visible_launch, bridge_start_ms, "start_bridge_pre_launch", start_generation, sg().child_pid);
+    if (bundled_visible_launch && launch_wait_ms < kLaunchWaitMinMs)
+    {
+        auto failed_client = sg().client;
+        const uint32_t failed_pid = sg().child_pid;
+        sg().client.reset();
+        clear_page_state_locked();
+        sg().child_pid = 0;
+        sg().state = bridge_state_t::error;
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        sg().last_error = "camoufox visible readiness budget exhausted before launch_browser";
+        block_auto_restart_locked("visible_readiness_budget_exhausted", start_generation, kAutoRestartBlockMs);
+        mark_cleanup_started_locked(start_generation, failed_pid, "visible_readiness_budget_exhausted");
+        const std::string debug_tail = read_file_tail_for_log(child_debug_log, 4000);
+        const std::vector<process_tree_entry_t> budget_tree_entries = failed_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(failed_pid);
+        sg().last_launch_diagnostics = {
+            {"status", "timeout"},
+            {"phase", "visible_readiness_budget"},
+            {"transport_phase", "pre_launch"},
+            {"caller", "start_bridge"},
+            {"cancellation_source", "visible_readiness_budget_exhausted"},
+            {"generation", start_generation},
+            {"attempt_id", std::to_string(start_generation) + "-" + std::to_string(now_ms())},
+            {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
+            {"child_pid", failed_pid},
+            {"child_alive", failed_pid != 0 && process_alive(failed_pid)},
+            {"elapsed_ms", sg().last_launch_ms},
+            {"requested_ms", cfg.launch_timeout_ms},
+            {"effective_ms", launch_wait_ms},
+            {"visible_readiness_max_ms", kBundledVisibleReadinessMaxMs},
+            {"process_tree", compact_process_tree_with_exit(budget_tree_entries)},
+            {"process_tree_count", budget_tree_entries.size()},
+            {"debug_tail_len", debug_tail.size()},
+            {"stderr_last_frame", debug_tail},
+            {"stderr_last_frame_len", debug_tail.size()}
+        };
+        attach_debug_log_snapshot_locked(sg().last_launch_diagnostics, failed_pid, child_debug_log, debug_tail);
+        const std::string state_error = sg().last_error;
+        finish_start_bridge_failure_cleanup_locked(lk, failed_client, failed_pid, "visible_readiness_budget_exhausted", start_generation, state_error);
+        publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "visible_readiness_budget", failed_pid);
+        return false;
+    }
     int wait_ms = launch_wait_ms / 4;
     if (wait_ms < 5000) wait_ms = 5000;
     if (wait_ms > kToolListWaitMaxMs) wait_ms = kToolListWaitMaxMs;
@@ -8567,6 +8711,50 @@ bool start_bridge(const launch_config_t& cfg)
         return false;
     }
 
+    launch_wait_ms = apply_visible_readiness_budget_ms(launch_wait_ms, bundled_visible_launch, bridge_start_ms, "start_bridge_launch_rpc", start_generation, sg().child_pid);
+    if (bundled_visible_launch && launch_wait_ms < kLaunchWaitMinMs)
+    {
+        auto failed_client = sg().client;
+        const uint32_t failed_pid = sg().child_pid;
+        sg().client.reset();
+        clear_page_state_locked();
+        sg().child_pid = 0;
+        sg().state = bridge_state_t::error;
+        sg().last_launch_ms = now_ms() - bridge_start_ms;
+        sg().last_error = "camoufox visible readiness budget exhausted before launch_browser";
+        block_auto_restart_locked("visible_readiness_budget_exhausted_after_tools", start_generation, kAutoRestartBlockMs);
+        mark_cleanup_started_locked(start_generation, failed_pid, "visible_readiness_budget_exhausted_after_tools");
+        const std::string debug_tail = read_file_tail_for_log(child_debug_log, 4000);
+        const std::vector<process_tree_entry_t> budget_tree_entries = failed_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(failed_pid);
+        sg().last_launch_diagnostics = {
+            {"status", "timeout"},
+            {"phase", "visible_readiness_budget"},
+            {"transport_phase", "pre_launch"},
+            {"caller", "start_bridge"},
+            {"cancellation_source", "visible_readiness_budget_exhausted_after_tools"},
+            {"generation", start_generation},
+            {"attempt_id", std::to_string(start_generation) + "-" + std::to_string(now_ms())},
+            {"session_id", effective_cfg.session_id.empty() ? std::string("default") : effective_cfg.session_id},
+            {"child_pid", failed_pid},
+            {"child_alive", failed_pid != 0 && process_alive(failed_pid)},
+            {"elapsed_ms", sg().last_launch_ms},
+            {"requested_ms", cfg.launch_timeout_ms},
+            {"effective_ms", launch_wait_ms},
+            {"visible_readiness_max_ms", kBundledVisibleReadinessMaxMs},
+            {"process_tree", compact_process_tree_with_exit(budget_tree_entries)},
+            {"process_tree_count", budget_tree_entries.size()},
+            {"debug_tail_len", debug_tail.size()},
+            {"stderr_last_frame", debug_tail},
+            {"stderr_last_frame_len", debug_tail.size()}
+        };
+        attach_debug_log_snapshot_locked(sg().last_launch_diagnostics, failed_pid, child_debug_log, debug_tail);
+        const std::string state_error = sg().last_error;
+        finish_start_bridge_failure_cleanup_locked(lk, failed_client, failed_pid, "visible_readiness_budget_exhausted_after_tools", start_generation, state_error);
+        publish_state(bridge_state_t::error, sg().last_error);
+        emit_stage_timing(false, "visible_readiness_budget", failed_pid);
+        return false;
+    }
+
     sg().active_cfg     = effective_cfg;
     const uint64_t sb_launch_rpc_start_ms = now_ms();
 
@@ -8614,7 +8802,8 @@ bool start_bridge(const launch_config_t& cfg)
     }
     const uint64_t launch_call_start_ms = launch_attempt_ms;
     const uint64_t strict_launch_deadline_ms = launch_call_start_ms + static_cast<uint64_t>(kStrictLaunchBudgetMs);
-    uint64_t last_launch_wait_log_ms = launch_call_start_ms;
+    uint64_t last_launch_wait_log_ms = 0;
+    uint64_t last_launch_debug_poll_ms = 0;
     uint64_t last_launch_tree_log_ms = 0;
     diag::log_tagged_fmt("camoufox", "start_bridge strict_launch_watchdog_armed generation=%llu child_pid=%lu caller_pid=%lu caller_tid=%lu launch_call_start_ms=%llu deadline_ms=%llu budget_ms=%d effective_wait_ms=%d requested_ms=%d bundled_visible=%d testlab_fast_probe=%d",
         static_cast<unsigned long long>(start_generation),
@@ -8689,6 +8878,11 @@ bool start_bridge(const launch_config_t& cfg)
     std::string launch_strict_last_phase;
     std::string launch_strict_last_event;
     std::string launch_strict_sidecar_phase;
+    bool launch_sidecar_terminal = false;
+    uint64_t launch_sidecar_terminal_elapsed_ms = 0;
+    std::string launch_sidecar_terminal_reason;
+    std::string launch_sidecar_terminal_event;
+    std::string launch_sidecar_terminal_phase;
     {
         std::unique_lock<std::mutex> launch_lk(launch_state->mtx);
         const uint64_t launch_wait_start_ms = now_ms();
@@ -8702,22 +8896,58 @@ bool start_bridge(const launch_config_t& cfg)
             }
             const uint64_t elapsed = now_ms() - launch_wait_start_ms;
             const uint64_t wall_elapsed = now_ms() - launch_call_start_ms;
-            if (wall_elapsed == 0 || now_ms() - last_launch_wait_log_ms >= 1000)
+            const uint64_t now_loop = now_ms();
+            nlohmann::json wait_debug_event = nlohmann::json::object();
+            std::string wait_debug_event_name;
+            std::string wait_sidecar_phase;
+            std::string wait_debug_tail;
+            if (last_launch_debug_poll_ms == 0 || now_loop - last_launch_debug_poll_ms >= 1000)
             {
-                const uint64_t now_wait_log = now_ms();
+                wait_debug_tail = read_file_tail_for_log(child_debug_log, 2000);
+                wait_debug_event = last_camoufox_debug_event_json_from_tail(wait_debug_tail);
+                wait_debug_event_name = json_string_or(wait_debug_event, "event", std::string());
+                wait_sidecar_phase = sidecar_timeout_phase_from_event(wait_debug_event, std::string());
+                std::string terminal_reason;
+                if (sidecar_launch_terminal_event(wait_debug_event, terminal_reason))
+                {
+                    launch_sidecar_terminal = true;
+                    launch_sidecar_terminal_elapsed_ms = wall_elapsed;
+                    launch_sidecar_terminal_reason = terminal_reason;
+                    launch_sidecar_terminal_event = wait_debug_event_name;
+                    launch_sidecar_terminal_phase = wait_sidecar_phase;
+                    diag::log_tagged_critical_fmt("camoufox", "launch_browser sidecar_terminal generation=%llu child_pid=%lu elapsed_ms=%llu reason=%s event=%s phase=%s debug_tail_len=%zu",
+                        static_cast<unsigned long long>(start_generation),
+                        static_cast<unsigned long>(launch_child_pid),
+                        static_cast<unsigned long long>(wall_elapsed),
+                        launch_sidecar_terminal_reason.empty() ? "<empty>" : launch_sidecar_terminal_reason.c_str(),
+                        launch_sidecar_terminal_event.empty() ? "<none>" : launch_sidecar_terminal_event.c_str(),
+                        launch_sidecar_terminal_phase.empty() ? "<none>" : launch_sidecar_terminal_phase.c_str(),
+                        wait_debug_tail.size());
+                    launch_state->cancelled = true;
+                    break;
+                }
+                last_launch_debug_poll_ms = now_loop;
+            }
+            const bool log_due = last_launch_wait_log_ms == 0 || now_loop - last_launch_wait_log_ms >= kLaunchWaitLogIntervalMs;
+            if (log_due)
+            {
+                const uint64_t now_wait_log = now_loop;
                 const uint64_t remaining_ms = elapsed >= static_cast<uint64_t>(launch_wait_ms)
                     ? 0 : static_cast<uint64_t>(launch_wait_ms) - elapsed;
-                const bool tree_due = last_launch_tree_log_ms == 0 || now_wait_log - last_launch_tree_log_ms >= 5000;
+                const bool tree_due = last_launch_tree_log_ms == 0 || now_wait_log - last_launch_tree_log_ms >= kLaunchWaitTreeLogIntervalMs;
                 std::string tree_text;
                 if (tree_due && launch_child_pid != 0)
                 {
-                    tree_text = compact_process_tree(enumerate_process_tree(launch_child_pid));
+                    tree_text = compact_process_tree_with_exit(enumerate_process_tree(launch_child_pid));
                     last_launch_tree_log_ms = now_wait_log;
                 }
-                const std::string wait_debug_tail = read_file_tail_for_log(child_debug_log, 2000);
-                const nlohmann::json wait_debug_event = last_camoufox_debug_event_json_from_tail(wait_debug_tail);
-                const std::string wait_debug_event_name = json_string_or(wait_debug_event, "event", std::string());
-                const std::string wait_sidecar_phase = sidecar_timeout_phase_from_event(wait_debug_event, std::string());
+                if (wait_debug_tail.empty())
+                {
+                    wait_debug_tail = read_file_tail_for_log(child_debug_log, 2000);
+                    wait_debug_event = last_camoufox_debug_event_json_from_tail(wait_debug_tail);
+                    wait_debug_event_name = json_string_or(wait_debug_event, "event", std::string());
+                    wait_sidecar_phase = sidecar_timeout_phase_from_event(wait_debug_event, std::string());
+                }
                 diag::log_tagged_fmt("camoufox", "launch_browser wait generation=%llu child_pid=%lu elapsed_ms=%llu remaining_ms=%llu stop_requested=%d worker_done=%d active=%lu cleanup_pending=%d cleanup_generation=%llu cleanup_child_pid=%lu cleanup_reason=%s debug_tail_len=%zu sidecar_event=%s sidecar_phase=%s sidecar_elapsed_ms=%d sidecar_remaining_ms=%d sidecar_browser_open=%d sidecar_browser_connected=%d sidecar_page_count=%d sidecar_registered_pages=%d sidecar_active_page=%s process_tree=%s",
                     static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(launch_child_pid),
                     static_cast<unsigned long long>(wall_elapsed), static_cast<unsigned long long>(remaining_ms),
@@ -8810,7 +9040,15 @@ bool start_bridge(const launch_config_t& cfg)
             clear_page_state_locked();
             sg().child_pid = 0;
             sg().state = bridge_state_t::error;
-            if (launch_strict_budget_blown)
+            if (launch_sidecar_terminal)
+            {
+                sg().last_error = std::string("launch_browser sidecar terminal event reason=") +
+                    (launch_sidecar_terminal_reason.empty() ? std::string("<empty>") : launch_sidecar_terminal_reason) +
+                    " event=" + (launch_sidecar_terminal_event.empty() ? std::string("<none>") : launch_sidecar_terminal_event) +
+                    " phase=" + (launch_sidecar_terminal_phase.empty() ? std::string("<none>") : launch_sidecar_terminal_phase) +
+                    " elapsed_ms=" + std::to_string(launch_sidecar_terminal_elapsed_ms);
+            }
+            else if (launch_strict_budget_blown)
             {
                 sg().last_error = std::string("launch_browser strict_launch_budget_blown elapsed_ms=") +
                     std::to_string(launch_strict_elapsed_ms) +
@@ -8827,25 +9065,38 @@ bool start_bridge(const launch_config_t& cfg)
                     : std::string("launch_browser timeout after ") + std::to_string(launch_wait_ms) + "ms";
             }
             sg().last_launch_ms = now_ms() - bridge_start_ms;
-            const std::string cleanup_reason = launch_strict_budget_blown
+            const std::string cleanup_reason = launch_sidecar_terminal
+                ? std::string("launch_browser_sidecar_terminal_") + (launch_sidecar_terminal_reason.empty() ? std::string("unknown") : launch_sidecar_terminal_reason)
+                : (launch_strict_budget_blown
                 ? std::string("launch_browser_strict_budget_blown")
-                : (launch_cancelled_by_stop ? std::string("launch_browser_cancelled") : std::string("launch_browser_timeout"));
+                : (launch_cancelled_by_stop ? std::string("launch_browser_cancelled") : std::string("launch_browser_timeout")));
             if (!launch_cancelled_by_stop)
                 block_auto_restart_locked(cleanup_reason, start_generation, kAutoRestartBlockMs);
             mark_cleanup_started_locked(start_generation, timed_out_pid, cleanup_reason);
             const std::vector<process_tree_entry_t> timeout_tree_entries = timed_out_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(timed_out_pid);
-            const std::string timeout_tree = compact_process_tree(timeout_tree_entries);
+            const std::string timeout_tree = compact_process_tree_with_exit(timeout_tree_entries);
             const std::string debug_tail = read_file_tail_for_log(child_debug_log, 6000);
             const nlohmann::json debug_event = last_camoufox_debug_event_json_from_tail(debug_tail);
             const std::string debug_phase = last_camoufox_debug_event_from_tail(debug_tail);
             const std::string sidecar_timeout_phase = sidecar_timeout_phase_from_event(debug_event, "mcp_response_wait");
+            const char* failure_status = launch_sidecar_terminal
+                ? "sidecar_terminal"
+                : (launch_strict_budget_blown ? "strict_budget_blown" : (launch_cancelled_by_stop ? "cancelled" : "timeout"));
+            const char* cancellation_source = launch_sidecar_terminal
+                ? "sidecar_terminal_event"
+                : (launch_strict_budget_blown ? "strict_launch_budget_blown" : (launch_cancelled_by_stop ? "stop_requested" : "launch_deadline"));
             sg().last_launch_diagnostics = {
-                {"status", launch_strict_budget_blown ? "strict_budget_blown" : (launch_cancelled_by_stop ? "cancelled" : "timeout")},
+                {"status", failure_status},
                 {"phase", "mcp_response_wait"},
                 {"transport_phase", "mcp_response_wait"},
                 {"sidecar_timeout_phase", sidecar_timeout_phase},
                 {"caller", "start_bridge"},
-                {"cancellation_source", launch_strict_budget_blown ? "strict_launch_budget_blown" : (launch_cancelled_by_stop ? "stop_requested" : "launch_deadline")},
+                {"cancellation_source", cancellation_source},
+                {"sidecar_terminal_event", launch_sidecar_terminal},
+                {"sidecar_terminal_reason", launch_sidecar_terminal_reason},
+                {"sidecar_terminal_event_name", launch_sidecar_terminal_event},
+                {"sidecar_terminal_phase", launch_sidecar_terminal_phase},
+                {"sidecar_terminal_elapsed_ms", launch_sidecar_terminal_elapsed_ms},
                 {"strict_launch_budget_blown", launch_strict_budget_blown},
                 {"strict_launch_budget_ms", kStrictLaunchBudgetMs},
                 {"strict_launch_elapsed_ms", launch_strict_elapsed_ms},
@@ -8883,19 +9134,19 @@ bool start_bridge(const launch_config_t& cfg)
                 {"process_tree", timeout_tree},
                 {"process_tree_count", timeout_tree_entries.size()},
                 {"debug_tail_len", debug_tail.size()},
-                {"stdout_last_frame", launch_cancelled_by_stop ? "launch_browser RPC cancelled before response" : "launch_browser RPC deadline expired before response"},
+                {"stdout_last_frame", launch_sidecar_terminal ? "launch_browser RPC cancelled after sidecar terminal event" : (launch_cancelled_by_stop ? "launch_browser RPC cancelled before response" : "launch_browser RPC deadline expired before response")},
                 {"stderr_last_frame", debug_tail},
                 {"stderr_last_frame_len", debug_tail.size()}
             };
             attach_debug_log_snapshot_locked(sg().last_launch_diagnostics, timed_out_pid, child_debug_log, debug_tail);
             diag::log_tagged_fmt("camoufox", "launch_browser_debug_tail_read reason=%s generation=%llu child_pid=%lu debug_phase=%s debug_tail_len=%zu",
-                launch_cancelled_by_stop ? "cancelled" : "timeout",
+                failure_status,
                 static_cast<unsigned long long>(start_generation),
                 static_cast<unsigned long>(timed_out_pid),
                 debug_phase.empty() ? "<none>" : debug_phase.c_str(),
                 debug_tail.size());
             diag::log_tagged_fmt("camoufox", "launch_browser %s generation=%llu child_pid=%lu elapsed_ms=%llu requested_ms=%d effective_ms=%d stop_requested=%d active=%lu cleanup_pending=%d debug_phase=%s process_tree=%s debug_tail_len=%zu debug_tail=%.6000s",
-                launch_cancelled_by_stop ? "cancelled" : "timeout",
+                failure_status,
                 static_cast<unsigned long long>(start_generation), static_cast<unsigned long>(timed_out_pid),
                 static_cast<unsigned long long>(sg().last_launch_ms), cfg.launch_timeout_ms, launch_wait_ms,
                 sg().stop_requested.load(std::memory_order_acquire) ? 1 : 0,
@@ -8940,7 +9191,7 @@ bool start_bridge(const launch_config_t& cfg)
             }
             publish_state(bridge_state_t::error, sg().last_error.empty() ? state_error : sg().last_error);
             sb_launch_rpc_ms = now_ms() - sb_launch_rpc_start_ms;
-            emit_stage_timing(false, "launch_rpc_timeout", timed_out_pid);
+            emit_stage_timing(false, launch_sidecar_terminal ? "launch_rpc_sidecar_terminal" : "launch_rpc_timeout", timed_out_pid);
             return false;
         }
         launch = std::move(launch_state->result);
@@ -9013,6 +9264,7 @@ bool start_bridge(const launch_config_t& cfg)
         sg().state = bridge_state_t::error;
         clear_page_state_locked();
         sg().last_launch_ms = now_ms() - bridge_start_ms;
+        block_auto_restart_locked(native_exception ? "launch_browser_native_exception" : "launch_browser_failed", start_generation, kAutoRestartBlockMs);
         mark_cleanup_started_locked(start_generation, failed_pid, native_exception ? "launch_browser_native_exception" : "launch_browser_failed");
         if (native_exception)
         {
@@ -9112,6 +9364,7 @@ bool start_bridge(const launch_config_t& cfg)
             sg().state = bridge_state_t::error;
             clear_page_state_locked();
             sg().last_launch_ms = now_ms() - bridge_start_ms;
+            block_auto_restart_locked("launch_browser_returned_error", start_generation, kAutoRestartBlockMs);
             mark_cleanup_started_locked(start_generation, failed_pid, "launch_browser_returned_error");
             const std::string state_error = sg().last_error;
             finish_start_bridge_failure_cleanup_locked(lk, failed_client, failed_pid, "launch_browser_returned_error", start_generation, state_error);
@@ -11134,6 +11387,57 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     const bool bundled_visible_launch = !effective_cfg.headless && !effective_cfg.browser_executable.empty();
     const bool testlab_fast_probe = test_lab_launch_fail_fast_enabled(effective_cfg);
     int launch_wait_ms = effective_launch_wait_ms(effective_cfg, bundled_visible_launch);
+    launch_wait_ms = apply_visible_readiness_budget_ms(launch_wait_ms, bundled_visible_launch, t0, "managed_start_pre_launch", managed_generation, cli->child_process_id());
+    if (bundled_visible_launch && launch_wait_ms < kLaunchWaitMinMs)
+    {
+        const uint32_t pid = cli->child_process_id();
+        const uint64_t elapsed_ms = now_ms() - t0;
+        const std::string debug_tail = read_file_tail_for_log(child_debug_log, 4000);
+        const std::vector<process_tree_entry_t> budget_tree_entries = pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(pid);
+        {
+            std::lock_guard<std::recursive_mutex> glk(sg().mtx);
+            block_auto_restart_locked("managed_visible_readiness_budget_exhausted", managed_generation, kAutoRestartBlockMs);
+        }
+        log_managed_failure_diagnostics("visible_readiness_budget_exhausted", pid, "managed visible readiness budget exhausted before launch_browser", debug_tail);
+        cleanup_managed_process("visible_readiness_budget_exhausted", pid, std::string("managed_visible_readiness_budget_exhausted_") + sid);
+        cli->disconnect();
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        session->client.reset();
+        session->child_pid = 0;
+        session->state = bridge_state_t::error;
+        session->last_error = "camoufox managed visible readiness budget exhausted before launch_browser";
+        session->last_launch_ms = elapsed_ms;
+        session->last_launch_diagnostics = {
+            {"status", "timeout"},
+            {"phase", "visible_readiness_budget"},
+            {"transport_phase", "pre_launch"},
+            {"caller", "managed_start"},
+            {"cancellation_source", "visible_readiness_budget_exhausted"},
+            {"generation", managed_generation},
+            {"session_id", sid},
+            {"child_pid", pid},
+            {"child_alive", pid != 0 && process_alive(pid)},
+            {"elapsed_ms", elapsed_ms},
+            {"requested_ms", cfg.launch_timeout_ms},
+            {"effective_ms", launch_wait_ms},
+            {"visible_readiness_max_ms", kBundledVisibleReadinessMaxMs},
+            {"process_tree", compact_process_tree_with_exit(budget_tree_entries)},
+            {"process_tree_count", budget_tree_entries.size()},
+            {"debug_tail_len", debug_tail.size()},
+            {"stderr_last_frame", debug_tail},
+            {"stderr_last_frame_len", debug_tail.size()}
+        };
+        diag::log_tagged_fmt("camoufox", "managed_start stage_timing ok=0 phase=visible_readiness_budget session_id=%s preflight_ms=%llu connect_ms=%llu tools_ms=%llu launch_rpc_ms=%llu readiness_probe_ms=%llu visible_window_ms=%llu total_ms=%llu",
+            sid.c_str(),
+            static_cast<unsigned long long>(preflight_ms),
+            static_cast<unsigned long long>(connect_ms),
+            static_cast<unsigned long long>(tools_ms),
+            static_cast<unsigned long long>(launch_rpc_ms),
+            static_cast<unsigned long long>(readiness_probe_ms),
+            static_cast<unsigned long long>(visible_window_ms),
+            static_cast<unsigned long long>(now_ms() - t0));
+        return false;
+    }
     if (effective_cfg.launch_timeout_ms != launch_wait_ms || testlab_fast_probe)
     {
         diag::log_tagged_fmt("camoufox", "managed_start launch_timeout_clamped session_id=%s requested_ms=%d effective_ms=%d bundled_visible=%d testlab_fast_probe=%d",
@@ -11331,6 +11635,10 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 attach_sticky_setup_failure(session->last_launch_diagnostics, managed_sticky);
         }
         log_managed_failure_diagnostics("launch_browser_failed", pid, managed_launch_error_text, launch.text);
+        {
+            std::lock_guard<std::recursive_mutex> glk(sg().mtx);
+            block_auto_restart_locked("managed_launch_browser_failed", managed_generation, kAutoRestartBlockMs);
+        }
         cleanup_managed_process("launch_browser_failed", pid, std::string("managed_launch_failed_") + sid);
         cli->disconnect();
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
@@ -11425,6 +11733,10 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
                 attach_sticky_setup_failure(session->last_launch_diagnostics, managed_sticky);
         }
         log_managed_failure_diagnostics("launch_browser_returned_error", pid, failure_text, launch.text);
+        {
+            std::lock_guard<std::recursive_mutex> glk(sg().mtx);
+            block_auto_restart_locked("managed_launch_browser_returned_error", managed_generation, kAutoRestartBlockMs);
+        }
         cleanup_managed_process("launch_browser_returned_error", pid, std::string("managed_launch_returned_error_") + sid);
         cli->disconnect();
         std::lock_guard<std::recursive_mutex> lk(session->mtx);

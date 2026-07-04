@@ -476,6 +476,7 @@ namespace file_browser
 	void toggle_dir(int idx);
 	void open_file(int idx);
 	void open_path(const std::string& path);
+	void request_open_confirmation(const std::string& path);
 	void render_pending_confirm_modal();
 	void record_recent_workspace(const std::string& path);
 	void tick_watcher();

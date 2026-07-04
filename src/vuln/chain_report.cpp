@@ -34,14 +34,14 @@ constexpr enum_name_t<report_acceptance_t> k_acceptance_names[] = {
     {report_acceptance_t::blocked, "blocked"},
 };
 
-constexpr enum_name_t<proof_level_t> k_proof_level_names[] = {
-    {proof_level_t::p0_schema, "p0_schema"},
-    {proof_level_t::p1_corpus, "p1_corpus"},
-    {proof_level_t::p2_extraction, "p2_extraction"},
-    {proof_level_t::p3_path, "p3_path"},
-    {proof_level_t::p4_state, "p4_state"},
-    {proof_level_t::p5_solver, "p5_solver"},
-    {proof_level_t::p6_goal, "p6_goal"},
+constexpr enum_name_t<report_proof_level_t> k_proof_level_names[] = {
+    {report_proof_level_t::p0_schema, "p0_schema"},
+    {report_proof_level_t::p1_corpus, "p1_corpus"},
+    {report_proof_level_t::p2_extraction, "p2_extraction"},
+    {report_proof_level_t::p3_path, "p3_path"},
+    {report_proof_level_t::p4_state, "p4_state"},
+    {report_proof_level_t::p5_solver, "p5_solver"},
+    {report_proof_level_t::p6_goal, "p6_goal"},
 };
 
 constexpr enum_name_t<confidence_policy_t> k_confidence_policy_names[] = {
@@ -234,7 +234,7 @@ const char* to_string(report_acceptance_t value)
     return enum_to_string(value, k_acceptance_names, "blocked");
 }
 
-const char* to_string(proof_level_t value)
+const char* to_string(report_proof_level_t value)
 {
     return enum_to_string(value, k_proof_level_names, "p0_schema");
 }
@@ -254,7 +254,7 @@ std::optional<report_acceptance_t> report_acceptance_from_string(const std::stri
     return enum_from_string(value, k_acceptance_names);
 }
 
-std::optional<proof_level_t> proof_level_from_string(const std::string& value)
+std::optional<report_proof_level_t> proof_level_from_string(const std::string& value)
 {
     return enum_from_string(value, k_proof_level_names);
 }
@@ -392,7 +392,7 @@ failure_record_t failure_from_validation(const validation_error_t& value)
 chain_report_t make_schema_report(const chain_document_t& document, const validation_result_t& validation)
 {
     chain_report_t report = make_report_skeleton(document, "schema");
-    report.proof_level_reached = proof_level_t::p0_schema;
+    report.proof_level_reached = report_proof_level_t::p0_schema;
     report.verdict = validation.ok() ? chain_verdict_t::inconclusive : chain_verdict_t::unsupported;
     phase_status_t phase;
     phase.phase = "schema";
@@ -499,7 +499,7 @@ void finalize_report_acceptance(chain_report_t& report)
         if (all_objectives_confirmed)
         {
             report.acceptance = report_acceptance_t::accepted;
-            report.proof_level_reached = proof_level_t::p6_goal;
+            report.proof_level_reached = report_proof_level_t::p6_goal;
             if (report.summary.empty())
                 report.summary = "Chain confirmed with all critical objectives proven";
             return;

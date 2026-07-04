@@ -1990,7 +1990,7 @@ void helpers::render_title()
 		}
 
 		if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_T, false)) {
-			test_all_features::trigger_from_hotkey("imgui_ctrl_shift_t");
+			test_all_features::post_hotkey_trigger("imgui_ctrl_shift_t");
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {

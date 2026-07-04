@@ -89,11 +89,11 @@ function Invoke-CmdStep {
     $started = Get-Date
     Write-Host "[$($started.ToString('HH:mm:ss'))] START $($Step.Name)"
     Write-Host "[$($started.ToString('HH:mm:ss'))] LOG   $($Step.Log)"
-    $cmdLine = "call `"$VsVars`" && cd /d `"$Root`" && $($Step.Command)"
+    $cmdLine = "(call `"$VsVars`" && cd /d `"$Root`" && $($Step.Command)) > `"$($Step.Log)`" 2>&1"
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $env:ComSpec /d /s /c $cmdLine *> $Step.Log
+        & $env:ComSpec /d /s /c $cmdLine
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference

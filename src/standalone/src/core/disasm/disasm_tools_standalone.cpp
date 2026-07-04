@@ -181,6 +181,23 @@ static bool read_routed_process_bytes(uint64_t address, size_t size, std::vector
     return driver_bridge::read_memory(address, size, out) && !out.empty();
 }
 
+static bool decode_is_64bit_for_address(uint64_t address)
+{
+    if (!g_disasm.live_mode && g_disasm.file.loaded && g_disasm.file.image_base != 0) {
+        uint64_t image_size = static_analysis::total_image_size(g_disasm.file);
+        if (image_size != 0 &&
+            address >= g_disasm.file.image_base &&
+            address < g_disasm.file.image_base + image_size)
+            return g_disasm.file.is_64bit;
+    }
+    if (g_disasm.live_mode &&
+        g_disasm.live_base != 0 &&
+        address >= g_disasm.live_base &&
+        address < g_disasm.live_base + g_disasm.live_size)
+        return g_disasm.file.is_64bit;
+    return true;
+}
+
 static bool decode_instruction_at(uint64_t address, AsmInstr& out)
 {
     std::vector<uint8_t> bytes;
@@ -189,7 +206,7 @@ static bool decode_instruction_at(uint64_t address, AsmInstr& out)
     const int avail = static_cast<int>(std::min<size_t>(bytes.size(), 16));
     if (avail <= 0)
         return false;
-    out = zydis_decode_one(bytes.data(), avail, address);
+    out = zydis_decode_one(bytes.data(), avail, address, decode_is_64bit_for_address(address));
     return true;
 }
 
@@ -278,7 +295,7 @@ static bool decode_function_end(uint64_t start, uint64_t max_end, uint64_t& out_
         const int avail = static_cast<int>(std::min<size_t>(bytes.size() - off, 16));
         if (avail <= 0)
             break;
-        AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, start + off);
+        AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, start + off, decode_is_64bit_for_address(start + off));
         const int ins_len = std::max(1, ins.len);
         if (off + static_cast<size_t>(ins_len) > bytes.size())
             break;
@@ -553,7 +570,7 @@ static tool_result_t handle_get_function_disassembly(const json& params)
             if (va >= fn.end)
                 break;
             const int avail = static_cast<int>(std::min<size_t>(bytes.size() - off, 16));
-            AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, va);
+            AsmInstr ins = zydis_decode_one(bytes.data() + off, avail, va, decode_is_64bit_for_address(va));
             const int ins_len = std::max(1, ins.len);
             if (off + static_cast<size_t>(ins_len) > bytes.size())
                 break;

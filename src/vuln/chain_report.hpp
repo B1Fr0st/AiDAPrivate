@@ -9,6 +9,7 @@
 
 #include "chain_schema.hpp"
 #include "chain_state.hpp"
+#include "chain_state_contracts.hpp"
 
 namespace aida
 {
@@ -17,15 +18,6 @@ namespace vuln
 namespace chain
 {
 
-enum class chain_verdict_t
-{
-    confirmed,
-    refuted,
-    inconclusive,
-    timeout,
-    unsupported
-};
-
 enum class report_acceptance_t
 {
     accepted,
@@ -33,7 +25,7 @@ enum class report_acceptance_t
     blocked
 };
 
-enum class proof_level_t
+enum class report_proof_level_t
 {
     p0_schema,
     p1_corpus,
@@ -98,7 +90,7 @@ struct link_report_t
     std::string link_id;
     link_role_t role = link_role_t::generic_transition;
     chain_verdict_t verdict = chain_verdict_t::inconclusive;
-    proof_level_t proof_level = proof_level_t::p0_schema;
+    report_proof_level_t proof_level = report_proof_level_t::p0_schema;
     nlohmann::json entry_state_summary = nlohmann::json::object();
     nlohmann::json path_corridors = nlohmann::json::array();
     nlohmann::json branches = nlohmann::json::array();
@@ -132,7 +124,7 @@ struct chain_report_t
     chain_verdict_t verdict = chain_verdict_t::inconclusive;
     report_acceptance_t acceptance = report_acceptance_t::blocked;
     confidence_policy_t confidence = confidence_policy_t::strict_proof_only;
-    proof_level_t proof_level_reached = proof_level_t::p0_schema;
+    report_proof_level_t proof_level_reached = report_proof_level_t::p0_schema;
     std::string refutation_level;
     std::string summary;
     failure_record_t first_failure;
@@ -153,12 +145,12 @@ struct chain_report_t
 
 const char* to_string(chain_verdict_t value);
 const char* to_string(report_acceptance_t value);
-const char* to_string(proof_level_t value);
+const char* to_string(report_proof_level_t value);
 const char* to_string(confidence_policy_t value);
 
 std::optional<chain_verdict_t> chain_verdict_from_string(const std::string& value);
 std::optional<report_acceptance_t> report_acceptance_from_string(const std::string& value);
-std::optional<proof_level_t> proof_level_from_string(const std::string& value);
+std::optional<report_proof_level_t> proof_level_from_string(const std::string& value);
 std::optional<confidence_policy_t> confidence_policy_from_string(const std::string& value);
 
 nlohmann::json to_json(const failure_record_t& value);

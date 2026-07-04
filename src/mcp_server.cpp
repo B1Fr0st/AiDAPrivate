@@ -523,10 +523,10 @@ static const std::string& get_mcp_server_instructions()
 {
     static const std::string instructions =
         "AiDA IDA Pro Plugin MCP is self-describing. Do not expect external markdown files such as TOOLS.md; shipped users normally receive only AiDA.dll and AiDAStandalone.exe. Learn the available surface from this initialize response, `tools/list`, and targeted tool-schema discovery.\n\n"
-        "AiDA IDA Pro Plugin - STATIC zero-day analysis for binaries loaded in IDA Pro. This plugin performs ONLY static analysis. Runtime, debugger, kernel-memory, number/address conversion, sandbox, browser, and network-interception capabilities live in AiDAStandalone and are NOT available here.\n\n"
+        "AiDA IDA Pro Plugin - IDB-centered zero-day analysis for binaries loaded in IDA Pro. This plugin performs static analysis against the database and exposes debugger-backed process module inventory when IDA has an active debug session. Kernel-memory, number/address conversion, sandbox, browser, and network-interception capabilities live in AiDAStandalone and are NOT available here.\n\n"
         "Number, endian, VA, RVA, and file-offset conversions are handled by AiDAStandalone's `convert_number` tool. This IDA plugin does not expose `convert_number`; use IDA addresses as database EAs and prefer IDA segment/image-base evidence when reporting offsets.\n\n"
         "Capability families exposed by this plugin:\n"
-        "- Function, decompilation, xref, type, and segment introspection over the loaded IDB.\n"
+        "- Function, decompilation, xref, type, segment, and static/dynamic module introspection over the loaded IDB and the active IDA debugger module list when present.\n"
         "- Pattern-based searches: strings, byte patterns, immediate values, and instruction patterns.\n"
         "- Static analysis: control flow, complexity metrics, obfuscation patterns, anti-analysis detection, PE parsing and entropy, indirect-call classification, vtable reconstruction, and VM-handler mapping.\n"
         "- Static deobfuscation: control-flow flattening unflattening, opaque predicate solving, stack-string decoding, anti-debug NOP patching of the in-memory IDB, import reconstruction, and section unpacking — all performed statically against the database.\n"

@@ -3939,7 +3939,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         OBFSTR("dbg_get_modules_detail"), OBFSTR("debugger"),
         OBFSTR("Get detailed module information with PE analysis including exports and imports."),
         {{OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional module name filter"), false},
+         {OBFSTR("module_filter"), OBFSTR("string"), OBFSTR("Alias for module_name"), false},
+         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Alias for module_name"), false},
          {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum modules to inspect deeply"), false},
+         {OBFSTR("include_pe"), OBFSTR("boolean"), OBFSTR("Parse PE headers/sections for broad requests; focused module requests include PE details by default"), false},
          {OBFSTR("max_exports"), OBFSTR("number"), OBFSTR("Maximum exports per module"), false},
          {OBFSTR("max_imports"), OBFSTR("number"), OBFSTR("Maximum imports per module"), false},
          {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum elapsed time before returning partial results"), false},
@@ -3958,15 +3961,23 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             };
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: entry");
             if (auto err = ensure_attached(params)) return *err;
-            const int timeout_ms = int_param_clamped(params, "timeout_ms", 5000, 500, 60000);
             std::string filter;
             if (params.contains("module_name") && params["module_name"].is_string())
                 filter = params["module_name"].get<std::string>();
-            const int default_modules = filter.empty() ? 8 : 1;
+            else if (params.contains("module_filter") && params["module_filter"].is_string())
+                filter = params["module_filter"].get<std::string>();
+            else if (params.contains("filter") && params["filter"].is_string())
+                filter = params["filter"].get<std::string>();
+            else if (params.contains("name") && params["name"].is_string())
+                filter = params["name"].get<std::string>();
+            filter = trim_ascii(filter);
+            const int timeout_ms = int_param_clamped(params, "timeout_ms", filter.empty() ? 5000 : 15000, 500, 60000);
+            const int default_modules = filter.empty() ? 256 : 1;
             const int max_modules = int_param_clamped(params, "max_modules", default_modules, 1, 256);
-            const int max_exports = int_param_clamped(params, "max_exports", 50, 0, 1000);
-            const int max_imports = int_param_clamped(params, "max_imports", 50, 0, 1000);
+            const int max_exports = int_param_clamped(params, "max_exports", filter.empty() ? 0 : 50, 0, 1000);
+            const int max_imports = int_param_clamped(params, "max_imports", filter.empty() ? 0 : 50, 0, 1000);
             const bool allow_partial = params.value("allow_partial", false);
+            const bool include_pe = params.value("include_pe", !filter.empty());
             const bool focused_single = !filter.empty() && max_modules == 1;
             auto deadline = handler_start + std::chrono::milliseconds(timeout_ms);
 
@@ -3978,8 +3989,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             long long refresh_ms = 0;
             bool loading_after_refresh = module_view::g_ui.loading.load(std::memory_order_acquire);
             bool refresh_skipped = false;
+            const char* refresh_skip_reason = "none";
 
-            if (focused_single) {
+            if (!include_pe || focused_single) {
                 const auto enum_start = std::chrono::steady_clock::now();
                 auto direct = driver_bridge::enumerate_modules();
                 enumeration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -3989,6 +4001,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     mods = std::move(direct);
                     direct_used = true;
                     refresh_skipped = true;
+                    refresh_skip_reason = focused_single ? "focused_direct" : "summary_direct";
                     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
                 }
             }
@@ -4025,7 +4038,8 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     cached_count = module_view::g_ui.modules.size();
                 }
                 diag::log_tagged_fmt("dbg_tools",
-                    "dbg_get_modules_detail: refresh_skipped reason=focused_direct filter=%s direct=%zu loading=%d enum_ms=%lld total_ms=%lld",
+                    "dbg_get_modules_detail: refresh_skipped reason=%s filter=%s direct=%zu loading=%d enum_ms=%lld total_ms=%lld",
+                    refresh_skip_reason,
                     filter.c_str(),
                     direct_count,
                     loading_after_refresh ? 1 : 0,
@@ -4121,6 +4135,61 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     "exports_first",
                     deadline_remaining_ms(deadline),
                     elapsed_ms());
+                if (!include_pe) {
+                    mj["pe_parsed"] = false;
+                    mj["pe_omitted_by_request"] = true;
+                    mj["pe_omitted_reason"] = "summary_only";
+                    mj["entry_point"] = nullptr;
+                    mj["is_64bit"] = nullptr;
+                    mj["sections"] = json::array();
+                    mj["export_count"] = 0;
+                    mj["import_count"] = 0;
+                    mj["exports_truncated"] = false;
+                    mj["imports_truncated"] = false;
+                    mj["exports_omitted_by_request"] = true;
+                    mj["imports_omitted_by_request"] = true;
+                    mj["exports_omitted_by_deadline"] = false;
+                    mj["imports_omitted_by_deadline"] = false;
+                    mj["exports_parse_ok"] = true;
+                    mj["imports_parse_ok"] = true;
+                    mj["exports_detail_complete"] = true;
+                    mj["imports_detail_complete"] = true;
+                    mj["exports_omitted_reason"] = "include_pe_false";
+                    mj["imports_omitted_reason"] = "include_pe_false";
+                    mj["exports"] = json::array();
+                    mj["imports"] = json::array();
+                    const long long module_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - module_start).count();
+                    json phase;
+                    phase["module"] = m.name;
+                    phase["base"] = sa_format_address(m.base);
+                    phase["pe_ms"] = 0;
+                    phase["export_ms"] = 0;
+                    phase["import_ms"] = 0;
+                    phase["module_ms"] = module_ms;
+                    phase["export_count"] = 0;
+                    phase["import_count"] = 0;
+                    phase["exports_parse_ok"] = true;
+                    phase["imports_parse_ok"] = true;
+                    phase["exports_detail_complete"] = true;
+                    phase["imports_detail_complete"] = true;
+                    phase["exports_truncated"] = false;
+                    phase["imports_truncated"] = false;
+                    phase["exports_deadline"] = false;
+                    phase["imports_deadline"] = false;
+                    phase["exports_omitted_by_deadline"] = false;
+                    phase["imports_omitted_by_deadline"] = false;
+                    phase["deadline_after_module"] = false;
+                    phase_timings.push_back(std::move(phase));
+                    diag::log_tagged_fmt("dbg_tools",
+                        "dbg_get_modules_detail: module_summary_only name=%s base=0x%llX size=%llu include_pe=0 total_ms=%lld",
+                        m.name.c_str(),
+                        static_cast<unsigned long long>(m.base),
+                        static_cast<unsigned long long>(m.size),
+                        elapsed_ms());
+                    arr.push_back(std::move(mj));
+                    continue;
+                }
                 pe_parser::pe_info_t pe;
                 std::vector<std::uint8_t> module_image;
                 bool module_image_ok = false;
@@ -4562,6 +4631,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["request"] = {
                 {"module_name", filter},
                 {"max_modules", max_modules},
+                {"include_pe", include_pe},
                 {"max_exports", max_exports},
                 {"max_imports", max_imports},
                 {"timeout_ms", timeout_ms},

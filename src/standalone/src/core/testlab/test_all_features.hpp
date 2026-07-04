@@ -6,6 +6,7 @@
 namespace test_all_features {
 
 	bool start_tests();
+	bool post_hotkey_trigger(const char* source);
 	bool trigger_from_hotkey(const char* source);
 	void cancel_tests();
 	void begin_test_guard(const char* source);

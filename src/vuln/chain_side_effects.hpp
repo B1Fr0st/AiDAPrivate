@@ -14,7 +14,7 @@ namespace vuln
 namespace chain
 {
 
-enum class side_effect_kind_t
+enum class extracted_side_effect_kind_t
 {
     read,
     write,
@@ -53,7 +53,7 @@ struct value_expr_t
 
 struct extracted_side_effect_t
 {
-    side_effect_kind_t kind = side_effect_kind_t::unknown;
+    extracted_side_effect_kind_t kind = extracted_side_effect_kind_t::unknown;
     address_identity_t location;
     value_expr_t destination;
     value_expr_t source;
@@ -69,7 +69,7 @@ struct extracted_side_effect_t
 
 std::vector<extracted_side_effect_t> classify_side_effects(const function_snapshot_t& snapshot);
 
-nlohmann::json to_json(side_effect_kind_t kind);
+nlohmann::json to_json(extracted_side_effect_kind_t kind);
 nlohmann::json to_json(const value_expr_t& value);
 nlohmann::json to_json(const extracted_side_effect_t& effect);
 

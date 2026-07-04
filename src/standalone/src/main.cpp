@@ -51,7 +51,7 @@
 #include "core/testlab/test_all_features.hpp"
 #include "core/network/burp/camoufox_bridge.hpp"
 #include "helpers/stb_image.h"
-#include <dxgi1_3.h>
+#include <dxgi.h>
 
 #include "embedded_resources.hpp"
 #include "helpers/diag_log.hpp"
@@ -88,6 +88,8 @@ namespace test_all_features {
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <mutex>
+#include <utility>
 #if defined(_M_X64)
 #include <intrin.h>
 #endif
@@ -487,8 +489,6 @@ static bootstrap_t g_bootstrap;
 ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
-static HANDLE                   g_FrameLatencyWaitableObject = nullptr;
-static UINT                     g_SwapChainResizeFlags = 0;
 static bool                     g_SwapChainOccluded = false;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
@@ -500,6 +500,7 @@ HWND g_hwnd = nullptr;
 static constexpr const wchar_t* kAidaWindowTitle = L"AiDA Standalone";
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
 static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE;
+static constexpr UINT kAidaQueuedNoSendPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT;
 static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
@@ -507,21 +508,30 @@ static constexpr DWORD kAidaInteractiveQueueBits = QS_INPUT | QS_POSTMESSAGE | Q
 static constexpr UINT kAidaPresentSyncInterval = 1;
 static constexpr UINT kAidaPresentFlags = 0;
 static constexpr DWORD kAidaInteractiveWaitMs = 1;
-static constexpr DWORD kAidaForegroundActiveWaitMs = 8;
-static constexpr DWORD kAidaForegroundIdleWaitMs = 24;
-static constexpr DWORD kAidaBackgroundActiveWaitMs = 16;
-static constexpr DWORD kAidaBackgroundIdleWaitMs = 75;
+static constexpr DWORD kAidaActiveWaitMs = 8;
+static constexpr DWORD kAidaIdleWaitMs = 16;
 static constexpr DWORD kAidaPreRenderWaitMs = 16;
-static constexpr uint64_t kAidaRecentInputWakeMs = 100ULL;
+static constexpr uint64_t kAidaOcclusionInteractiveLogIntervalMs = 5000ULL;
+static constexpr DWORD kAidaMessagePumpBudgetMs = 4;
+static constexpr DWORD kAidaMidFramePumpBudgetMs = 2;
+static constexpr uint32_t kAidaMessagePumpBudgetMessages = 192;
+static constexpr uint32_t kAidaMidFramePumpBudgetMessages = 32;
+static constexpr uint64_t kAidaRecentInputWakeMs = 250ULL;
+static constexpr uint64_t kAidaInteractiveRenderCadenceMs = 16ULL;
+static constexpr uint64_t kAidaInteractiveBlurPressureMs = 180ULL;
 static constexpr DWORD kAidaResizeCoalesceMs = 16;
 static constexpr uint64_t kAidaResizeChurnWindowMs = 1000ULL;
 static constexpr uint32_t kAidaResizeChurnThreshold = 4;
 static constexpr uint64_t kAidaRuntimeAcceptanceLogIntervalMs = 30000ULL;
-static constexpr uint64_t kAidaForegroundIdleHeartbeatMs = 250ULL;
-static constexpr uint64_t kAidaBackgroundIdleHeartbeatMs = 1000ULL;
+static constexpr uint64_t kAidaIdleHeartbeatMs = 250ULL;
 static constexpr uint64_t kAidaFullTestHeartbeatMs = 250ULL;
 static constexpr uint64_t kAidaModalHeartbeatMs = 16ULL;
-static constexpr uint64_t kAidaFramePacingLogIntervalMs = 10000ULL;
+static constexpr uint64_t kAidaFramePacingLogIntervalMs = 30000ULL;
+static constexpr uint64_t kAidaPacingAnomalyLogIntervalMs = 30000ULL;
+static constexpr uint64_t kAidaInputMotionLogIntervalMs = 1000ULL;
+static constexpr uint64_t kAidaInputMotionLagLogIntervalMs = 250ULL;
+static constexpr uint64_t kAidaExpectedCallbackLogIntervalMs = 30000ULL;
+static constexpr uint64_t kAidaDirtySkipAnomalyLogIntervalMs = 30000ULL;
 static constexpr uint32_t kAidaDirtyStartup = 0x00000001u;
 static constexpr uint32_t kAidaDirtyMessage = 0x00000002u;
 static constexpr uint32_t kAidaDirtyResize = 0x00000004u;
@@ -535,6 +545,7 @@ static constexpr uint32_t kAidaDirtyProgress = 0x00000200u;
 static constexpr uint32_t kAidaDirtyHeartbeat = 0x00000400u;
 static constexpr uint32_t kAidaDirtyWork = 0x00000800u;
 static constexpr uint32_t kAidaDirtySecurity = 0x00001000u;
+static constexpr uint32_t kAidaDirtyInteractiveCadence = 0x00002000u;
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -560,6 +571,144 @@ struct resize_perf_state_t {
 };
 
 static resize_perf_state_t g_resize_perf;
+
+static uint64_t g_last_input_event_tick_ms = 0;
+static DWORD g_last_input_msg_time = 0;
+static UINT g_last_input_msg = 0;
+static uint64_t g_input_event_count = 0;
+
+static bool aida_is_input_or_attention_message(UINT message)
+{
+    switch (message) {
+    case WM_MOUSEMOVE:
+    case WM_NCMOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONUP:
+    case WM_NCLBUTTONDBLCLK:
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_CHAR:
+    case WM_HOTKEY:
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    case WM_ACTIVATE:
+    case WM_ACTIVATEAPP:
+    case WM_CAPTURECHANGED:
+    case WM_MOUSEACTIVATE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool aida_is_resize_message(UINT message)
+{
+    return message == WM_SIZE || message == WM_MOVE || message == WM_DPICHANGED;
+}
+
+static bool aida_is_paint_message(UINT message)
+{
+    return message == WM_PAINT || message == WM_NCPAINT || message == WM_ERASEBKGND;
+}
+
+static void aida_record_input_message(const MSG& msg, uint64_t now_ms)
+{
+    g_last_input_event_tick_ms = now_ms;
+    g_last_input_msg_time = msg.time;
+    g_last_input_msg = msg.message;
+    ++g_input_event_count;
+}
+
+struct aida_message_pump_slice_t {
+    uint32_t messages = 0;
+    uint32_t input_messages = 0;
+    uint32_t resize_messages = 0;
+    uint32_t paint_messages = 0;
+    bool quit = false;
+    bool budget_exhausted = false;
+};
+
+static aida_message_pump_slice_t aida_pump_messages_budgeted(const char* reason, uint32_t message_budget, DWORD time_budget_ms)
+{
+    aida_message_pump_slice_t out{};
+    MSG msg{};
+    const uint64_t start_ms = static_cast<uint64_t>(GetTickCount64());
+    const uint32_t max_messages = message_budget == 0 ? 1u : message_budget;
+    for (;;) {
+        DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
+        const DWORD queue_current = HIWORD(queue_status_before);
+        const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
+        const bool non_send_pending = (queue_current & kAidaNonSendQueueBits) != 0;
+        if (send_message_pending && !non_send_pending) {
+            MSG sent_probe{};
+            (void)::PeekMessage(&sent_probe, nullptr, 0U, 0U, kAidaSendOnlyPeekFlags);
+            if (static_cast<uint64_t>(GetTickCount64()) - start_ms >= time_budget_ms) {
+                out.budget_exhausted = true;
+                break;
+            }
+            continue;
+        }
+
+        const UINT peek_flags = (send_message_pending && non_send_pending) ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
+        BOOL has_message = ::PeekMessage(&msg, nullptr, 0U, 0U, peek_flags);
+        if (!has_message)
+            break;
+
+        ++out.messages;
+        if (aida_is_input_or_attention_message(msg.message)) {
+            ++out.input_messages;
+            aida_record_input_message(msg, static_cast<uint64_t>(GetTickCount64()));
+        } else if (aida_is_resize_message(msg.message)) {
+            ++out.resize_messages;
+        } else if (aida_is_paint_message(msg.message)) {
+            ++out.paint_messages;
+        }
+
+        ::TranslateMessage(&msg);
+        ::DispatchMessage(&msg);
+        if (msg.message == WM_QUIT) {
+            out.quit = true;
+            break;
+        }
+
+        const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - start_ms;
+        if (out.messages >= max_messages || elapsed_ms >= time_budget_ms) {
+            out.budget_exhausted = true;
+            break;
+        }
+    }
+
+    if (out.budget_exhausted) {
+        static uint64_t s_last_budget_log_ms = 0;
+        const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+        if (s_last_budget_log_ms == 0 || now_ms - s_last_budget_log_ms >= 1000ULL) {
+            s_last_budget_log_ms = now_ms;
+            diag::log_tagged_fmt("msgpump",
+                "pump_slice_budget_exhausted reason=%s messages=%u input=%u resize=%u paint=%u budget_messages=%u budget_ms=%lu qs=0x%08lX",
+                reason && reason[0] ? reason : "unknown",
+                out.messages,
+                out.input_messages,
+                out.resize_messages,
+                out.paint_messages,
+                max_messages,
+                static_cast<unsigned long>(time_budget_ms),
+                static_cast<unsigned long>(::GetQueueStatus(QS_ALLINPUT)));
+        }
+    }
+    return out;
+}
 
 struct gpu_frame_sample_t {
     bool available = false;
@@ -1376,26 +1525,8 @@ namespace aida_tracer {
         g_peek_filter_hwnd.store(reinterpret_cast<UINT_PTR>(filter_hwnd), std::memory_order_release);
     }
 
-    inline bool should_log_wndproc_input_message(UINT msg) {
-        switch (msg) {
-        case WM_MOUSEACTIVATE:
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONUP:
-        case WM_LBUTTONDBLCLK:
-        case WM_RBUTTONDOWN:
-        case WM_RBUTTONUP:
-        case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONUP:
-        case WM_MOUSEWHEEL:
-        case WM_MOUSEHWHEEL:
-        case WM_XBUTTONDOWN:
-        case WM_XBUTTONUP:
-        case WM_CAPTURECHANGED:
-            return true;
-        default:
-            return false;
-        }
+    inline bool should_log_wndproc_input_message(UINT) {
+        return false;
     }
 
     inline bool should_log_wndproc_completion(UINT msg, uint64_t elapsed_ms) {
@@ -1408,11 +1539,6 @@ namespace aida_tracer {
         case WM_QUERYENDSESSION:
         case WM_ENDSESSION:
         case WM_SYSCOMMAND:
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONUP:
-        case WM_NCLBUTTONDOWN:
-        case WM_NCLBUTTONUP:
-        case WM_MOUSEACTIVATE:
         case WM_DPICHANGED:
         case WM_SETTINGCHANGE:
             return true;
@@ -1724,7 +1850,7 @@ namespace aida_tracer {
         mark_render_phase(stage);
     }
 
-    inline uint32_t inspect_dx11_draw_data(ImDrawData* dd, uint64_t frame) {
+    inline uint32_t inspect_dx11_draw_data(ImDrawData* dd, uint64_t frame, bool full_walk) {
         uint64_t draw_cmds = 0;
         uint64_t user_callbacks = 0;
         uint64_t reset_callbacks = 0;
@@ -1761,6 +1887,22 @@ namespace aida_tracer {
             }
             if (dd->CmdLists.Size != dd->CmdListsCount) {
                 bad_flags |= 0x00000100u;
+            }
+            if (!full_walk && bad_flags == 0) {
+                g_dx11_draw_cmd_count.store(0, std::memory_order_release);
+                g_dx11_user_callback_count.store(0, std::memory_order_release);
+                g_dx11_reset_callback_count.store(0, std::memory_order_release);
+                g_dx11_expected_blur_callback_count.store(0, std::memory_order_release);
+                g_dx11_unexpected_callback_count.store(0, std::memory_order_release);
+                g_dx11_first_callback.store(0, std::memory_order_release);
+                g_dx11_first_callback_data.store(0, std::memory_order_release);
+                g_dx11_first_texture.store(0, std::memory_order_release);
+                g_dx11_texture_hash.store(texture_hash, std::memory_order_release);
+                g_dx11_max_elem_count.store(0, std::memory_order_release);
+                g_dx11_bad_flags.store(0, std::memory_order_release);
+                g_dx11_bad_list.store(-1, std::memory_order_release);
+                g_dx11_bad_cmd.store(-1, std::memory_order_release);
+                return 0;
             }
             int list_count = dd->CmdListsCount;
             if (list_count < 0) list_count = 0;
@@ -1898,18 +2040,16 @@ namespace aida_tracer {
             callback_hash = mix_u64(callback_hash, expected_blur_callbacks);
             callback_hash = mix_u64(callback_hash, reset_callbacks);
             callback_hash = mix_u64(callback_hash, first_callback);
-            callback_hash = mix_u64(callback_hash, first_texture);
-            callback_hash = mix_u64(callback_hash, texture_hash);
             callback_hash = mix_u64(callback_hash, max_elem_count);
             const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
             const uint64_t last_hash = s_last_expected_callback_hash.load(std::memory_order_acquire);
             const uint64_t last_log_ms = s_last_expected_callback_log_ms.load(std::memory_order_acquire);
-            if (last_log_ms == 0 || callback_hash != last_hash || now_ms - last_log_ms >= 30000ULL) {
+            if (last_log_ms == 0 || now_ms - last_log_ms >= kAidaExpectedCallbackLogIntervalMs) {
                 const uint64_t suppressed = s_expected_callback_suppressed.exchange(0, std::memory_order_acq_rel);
                 s_last_expected_callback_hash.store(callback_hash, std::memory_order_release);
                 s_last_expected_callback_log_ms.store(now_ms, std::memory_order_release);
                 diag::log_tagged_fmt("render",
-                    "dx11_drawdata_callbacks frame=%llu callbacks=%llu expected_blur_callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX tex_hash=0x%016llX max_elem=%llu suppressed=%llu full_test=%d",
+                    "dx11_drawdata_callbacks_summary frame=%llu callbacks=%llu expected_blur_callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX tex_hash=0x%016llX max_elem=%llu suppressed=%llu full_test=%d",
                     static_cast<unsigned long long>(frame),
                     static_cast<unsigned long long>(user_callbacks),
                     static_cast<unsigned long long>(expected_blur_callbacks),
@@ -1923,6 +2063,8 @@ namespace aida_tracer {
                     test_all_features::is_running() ? 1 : 0);
             } else {
                 s_expected_callback_suppressed.fetch_add(1, std::memory_order_acq_rel);
+                if (callback_hash != last_hash)
+                    s_last_expected_callback_hash.store(callback_hash, std::memory_order_release);
             }
         }
         return bad_flags;
@@ -2686,7 +2828,11 @@ __declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd, uint64_t
             g_pd3dDeviceContext,
             g_mainRenderTargetView,
             removed);
-        uint32_t draw_bad = aida_tracer::inspect_dx11_draw_data(dd, frame_number);
+        const bool inspect_full_walk =
+            frame_number < 5ULL ||
+            (frame_number % 120ULL) == 0ULL ||
+            test_all_features::is_running();
+        uint32_t draw_bad = aida_tracer::inspect_dx11_draw_data(dd, frame_number, inspect_full_walk);
         if (draw_bad != 0) {
             diag::log_tagged_critical_fmt("render",
                 "imgui_dx11_render_skipped_invalid_draw_data frame=%llu bad=0x%08lX",
@@ -2754,7 +2900,7 @@ __declspec(noinline) static DWORD seh_win32_new_frame()
     return 0;
 }
 
-__declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRESULT* hr_out, uint64_t frame_number)
+__declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRESULT* hr_out, uint64_t frame_number, UINT sync_interval, UINT present_flags)
 {
     aida_tracer::set_present_state("present_enter", frame_number, sc, hr_out ? *hr_out : E_POINTER);
     if (!sc || !hr_out) {
@@ -2765,44 +2911,13 @@ __declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRES
     }
     __try {
         aida_tracer::set_present_state("present_call", frame_number, sc, hr_out ? *hr_out : E_POINTER);
-        *hr_out = sc->Present(kAidaPresentSyncInterval, kAidaPresentFlags);
+        *hr_out = sc->Present(sync_interval, present_flags);
         aida_tracer::set_present_state("present_returned", frame_number, sc, *hr_out);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         aida_tracer::set_present_state("present_seh", frame_number, sc, hr_out ? *hr_out : E_POINTER);
         return GetExceptionCode();
     }
     return 0;
-}
-
-static void configure_frame_latency_waitable()
-{
-    if (g_FrameLatencyWaitableObject) {
-        CloseHandle(g_FrameLatencyWaitableObject);
-        g_FrameLatencyWaitableObject = nullptr;
-    }
-    if (!g_pSwapChain)
-        return;
-    IDXGISwapChain2* sc2 = nullptr;
-    HRESULT qi = g_pSwapChain->QueryInterface(__uuidof(IDXGISwapChain2), reinterpret_cast<void**>(&sc2));
-    if (FAILED(qi) || !sc2) {
-        diag::log_tagged_fmt("render", "frame_latency_waitable_unavailable qi=0x%08X", static_cast<unsigned>(qi));
-        return;
-    }
-    HRESULT set_hr = sc2->SetMaximumFrameLatency(1);
-    HANDLE waitable = sc2->GetFrameLatencyWaitableObject();
-    if (SUCCEEDED(set_hr) && waitable) {
-        g_FrameLatencyWaitableObject = waitable;
-        diag::log_tagged_critical_fmt("render", "frame_latency_waitable_enabled handle=0x%llX set_hr=0x%08X flags=0x%08X",
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(waitable)),
-            static_cast<unsigned>(set_hr),
-            g_SwapChainResizeFlags);
-    } else {
-        diag::log_tagged_fmt("render", "frame_latency_waitable_disabled set_hr=0x%08X handle=0x%llX flags=0x%08X",
-            static_cast<unsigned>(set_hr),
-            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(waitable)),
-            g_SwapChainResizeFlags);
-    }
-    sc2->Release();
 }
 
 static bool aida_cursor_over_window(HWND hwnd)
@@ -2834,7 +2949,7 @@ __declspec(noinline) static DWORD seh_resize_buffers(IDXGISwapChain* sc, UINT w,
         return 0;
     }
     __try {
-        *hr_out = sc->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, g_SwapChainResizeFlags);
+        *hr_out = sc->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
@@ -3488,14 +3603,90 @@ static defender_process_snapshot_t sample_defender_processes()
     return out;
 }
 
+struct render_diag_cached_snapshot_t {
+    uint64_t sample_ms = 0;
+    uint64_t sequence = 0;
+    DWORD thread_err = 0;
+    DWORD thread_count = 0;
+    process_cpu_delta_t cpu;
+    process_io_delta_t proc_io;
+    log_file_delta_snapshot_t log_files;
+    defender_process_snapshot_t defender;
+    work_queue::stats_t wq;
+    work_queue::stats_t svc;
+    critical_work_queue::stats_t cq;
+};
+
+static std::mutex g_render_diag_cache_mutex;
+static render_diag_cached_snapshot_t g_render_diag_cache;
+static std::atomic<bool> g_render_diag_sample_inflight{false};
+static std::atomic<uint64_t> g_render_diag_last_request_ms{0};
+static std::atomic<uint64_t> g_render_diag_sequence{0};
+
+static void publish_render_diag_snapshot(render_diag_cached_snapshot_t&& snapshot)
+{
+    snapshot.sequence = g_render_diag_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::lock_guard<std::mutex> lock(g_render_diag_cache_mutex);
+    g_render_diag_cache = std::move(snapshot);
+}
+
+static render_diag_cached_snapshot_t latest_render_diag_snapshot()
+{
+    std::lock_guard<std::mutex> lock(g_render_diag_cache_mutex);
+    return g_render_diag_cache;
+}
+
+static void request_render_diag_snapshot_async(uint64_t now_ms, bool force)
+{
+    const uint64_t previous_request = g_render_diag_last_request_ms.load(std::memory_order_acquire);
+    if (!force && previous_request != 0 && now_ms >= previous_request && now_ms - previous_request < 1000ULL)
+        return;
+    if (g_render_diag_sample_inflight.exchange(true, std::memory_order_acq_rel))
+        return;
+    g_render_diag_last_request_ms.store(now_ms, std::memory_order_release);
+    std::function<void()> task = [] {
+        try {
+            render_diag_cached_snapshot_t snapshot;
+            snapshot.sample_ms = static_cast<uint64_t>(GetTickCount64());
+            snapshot.thread_count = count_current_process_threads(&snapshot.thread_err);
+            snapshot.wq = work_queue::stats();
+            snapshot.svc = work_queue::service_stats();
+            snapshot.cq = critical_work_queue::stats();
+            snapshot.cpu = sample_current_process_cpu(snapshot.sample_ms);
+            snapshot.proc_io = sample_process_io_delta(snapshot.sample_ms);
+            snapshot.log_files = sample_log_file_deltas();
+            snapshot.defender = sample_defender_processes();
+            publish_render_diag_snapshot(std::move(snapshot));
+        } catch (const std::exception& e) {
+            diag::log_tagged_critical_fmt("render", "render_diag_sample_exception what=%.180s", e.what());
+        } catch (...) {
+            diag::log_tagged_critical("render", "render_diag_sample_exception what=<unknown>");
+        }
+        g_render_diag_sample_inflight.store(false, std::memory_order_release);
+    };
+    bool posted = work_queue::post_service_labeled("render.diagnostics.sample", task);
+    if (!posted)
+        posted = work_queue::post_labeled("render.diagnostics.sample", std::move(task));
+    if (!posted) {
+        g_render_diag_sample_inflight.store(false, std::memory_order_release);
+        static std::atomic<uint64_t> s_last_diag_post_fail_ms{0};
+        const uint64_t last_fail_ms = s_last_diag_post_fail_ms.load(std::memory_order_acquire);
+        if (last_fail_ms == 0 || now_ms - last_fail_ms >= 5000ULL) {
+            s_last_diag_post_fail_ms.store(now_ms, std::memory_order_release);
+            diag::log_tagged_critical_fmt("render",
+                "render_diag_sample_post_failed force=%d now_ms=%llu last_request_ms=%llu",
+                force ? 1 : 0,
+                static_cast<unsigned long long>(now_ms),
+                static_cast<unsigned long long>(previous_request));
+        }
+    }
+}
+
 struct frame_wait_result_t {
     DWORD requested_ms = 0;
     DWORD actual_ms = 0;
     DWORD result = WAIT_TIMEOUT;
     DWORD gle = 0;
-    std::uint64_t immediate_timeout_streak = 0;
-    bool waitable_present = false;
-    bool frame_latency_signaled = false;
     bool input_available = false;
 };
 
@@ -3503,28 +3694,13 @@ static frame_wait_result_t wait_for_frame_latency_or_input(DWORD requested_ms)
 {
     frame_wait_result_t out{};
     out.requested_ms = requested_ms;
-    HANDLE waitable = g_FrameLatencyWaitableObject;
-    out.waitable_present = waitable != nullptr;
     const uint64_t wait_start_ms = static_cast<uint64_t>(GetTickCount64());
     SetLastError(0);
-    if (waitable) {
-        HANDLE handles[1] = { waitable };
-        out.result = MsgWaitForMultipleObjectsEx(1, handles, requested_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        out.frame_latency_signaled = out.result == WAIT_OBJECT_0;
-        out.input_available = out.result == WAIT_OBJECT_0 + 1;
-    } else {
-        out.result = MsgWaitForMultipleObjectsEx(0, nullptr, requested_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        out.input_available = out.result == WAIT_OBJECT_0;
-    }
+    out.result = MsgWaitForMultipleObjectsEx(0, nullptr, requested_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    out.input_available = out.result == WAIT_OBJECT_0;
     if (out.result == WAIT_FAILED)
         out.gle = GetLastError();
     out.actual_ms = static_cast<DWORD>(std::min<uint64_t>(static_cast<uint64_t>(GetTickCount64()) - wait_start_ms, 0xFFFFFFFFULL));
-    static std::atomic<std::uint64_t> s_immediate_timeout_streak{0};
-    const bool immediate_timeout = out.waitable_present && requested_ms != 0 && out.result == WAIT_TIMEOUT && out.actual_ms == 0 && !out.input_available && !out.frame_latency_signaled;
-    if (immediate_timeout)
-        out.immediate_timeout_streak = s_immediate_timeout_streak.fetch_add(1, std::memory_order_acq_rel) + 1;
-    else
-        s_immediate_timeout_streak.store(0, std::memory_order_release);
     return out;
 }
 
@@ -3537,9 +3713,10 @@ struct draw_data_metrics_t {
     int unexpected_callbacks = 0;
     int total_vtx = 0;
     int total_idx = 0;
+    bool full_walk = false;
 };
 
-static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data)
+static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data, bool full_walk)
 {
     draw_data_metrics_t out{};
     if (!draw_data)
@@ -3547,9 +3724,18 @@ static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data)
     out.draw_lists = draw_data->CmdListsCount;
     out.total_vtx = draw_data->TotalVtxCount;
     out.total_idx = draw_data->TotalIdxCount;
+    out.full_walk = full_walk;
     if (draw_data->CmdListsCount > 0 && !draw_data->CmdLists.Data)
         return out;
     const int list_count = draw_data->CmdListsCount > 0 ? draw_data->CmdListsCount : 0;
+    if (!full_walk) {
+        for (int list_index = 0; list_index < list_count; ++list_index) {
+            const ImDrawList* list = draw_data->CmdLists[list_index];
+            if (list)
+                out.draw_cmds += list->CmdBuffer.Size;
+        }
+        return out;
+    }
     ImDrawCallback expected_blur_callback = Blur::ExpectedCallback();
     for (int list_index = 0; list_index < list_count; ++list_index) {
         const ImDrawList* list = draw_data->CmdLists[list_index];
@@ -3767,6 +3953,103 @@ static std::atomic<bool> g_authorized_features_initialized{false};
 static std::atomic<bool> g_authorized_features_posted{false};
 static std::atomic<bool> g_camoufox_prewarm_posted{false};
 static std::atomic<bool> g_script_engine_startup_init_posted{false};
+static std::atomic<int> g_arc_startup_gate_state{0};
+static std::atomic<bool> g_arc_startup_gate_posted{false};
+
+static void post_arc_startup_gate_unseal()
+{
+    int state = g_arc_startup_gate_state.load(std::memory_order_acquire);
+    if (state == 1 || state == 2)
+        return;
+    bool expected = false;
+    if (!g_arc_startup_gate_posted.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    g_arc_startup_gate_state.store(1, std::memory_order_release);
+    globals::ui::arc_unseal_phase.store(1, std::memory_order_release);
+    const uint64_t queued_at = static_cast<uint64_t>(GetTickCount64());
+    bool posted = false;
+    try {
+        posted = critical_work_queue::post_labeled("license.arc_startup_gate_unseal", [queued_at]() {
+        uint8_t gate_nonce[32] = {};
+        uint8_t poly_seed[32] = {};
+        uint32_t poly_seed_len = 0;
+        bool unseal_ok = false;
+        size_t bind_token_len = 0;
+        size_t cp = 0;
+        try {
+            std::string sess_tok = standalone_license::get_arc_bind_token();
+            if (sess_tok.empty())
+                sess_tok = standalone_license::get_session_token();
+            bind_token_len = sess_tok.size();
+            cp = sess_tok.size();
+            if (cp > sizeof(gate_nonce))
+                cp = sizeof(gate_nonce);
+            if (cp > 0)
+                memcpy(gate_nonce, sess_tok.data(), cp);
+            const uint64_t gate_nonce_hash = diag_fnv1a64(gate_nonce, sizeof(gate_nonce));
+            diag::log_tagged_critical_fmt("license",
+                "arc_render_gate_nonce_source_async bind_token_len=%zu used_len=%zu nonce_hash=0x%016llX queued_ms=%llu",
+                bind_token_len,
+                cp,
+                static_cast<unsigned long long>(gate_nonce_hash),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
+
+            constexpr uint32_t kPolymorphismSeedFeatureId = 1u;
+            unseal_ok = standalone_license::arc_unseal_feature_blocking(
+                kPolymorphismSeedFeatureId,
+                gate_nonce, sizeof(gate_nonce),
+                poly_seed, &poly_seed_len, sizeof(poly_seed));
+        } catch (const std::exception& e) {
+            diag::log_tagged_critical_fmt("license",
+                "arc_render_gate_unseal_exception what=%.180s bind_token_len=%zu used_len=%zu elapsed_ms=%llu",
+                e.what(),
+                bind_token_len,
+                cp,
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
+        } catch (...) {
+            diag::log_tagged_critical_fmt("license",
+                "arc_render_gate_unseal_exception what=<unknown> bind_token_len=%zu used_len=%zu elapsed_ms=%llu",
+                bind_token_len,
+                cp,
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
+        }
+
+        if (!unseal_ok || poly_seed_len != 32) {
+            diag::log_tagged_critical_fmt("license",
+                "arc_render_gate_unseal_FAIL_ASYNC unseal_ok=%d poly_seed_len=%u bind_token_len=%zu elapsed_ms=%llu",
+                unseal_ok ? 1 : 0,
+                poly_seed_len,
+                bind_token_len,
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
+            globals::ui::arc_unseal_phase.store(3, std::memory_order_release);
+            g_arc_startup_gate_state.store(3, std::memory_order_release);
+            SecureZeroMemory(poly_seed, sizeof(poly_seed));
+            SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+            __fastfail(0xA1DAFA17u);
+        }
+
+        SecureZeroMemory(poly_seed, sizeof(poly_seed));
+        SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
+        g_arc_startup_gate_state.store(2, std::memory_order_release);
+        globals::ui::arc_unseal_phase.store(2, std::memory_order_release);
+        diag::log_tagged_critical_fmt("license",
+            "arc_render_gate_unseal_OK_ASYNC elapsed_ms=%llu bind_token_len=%zu",
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at),
+            bind_token_len);
+        });
+    } catch (const std::exception& e) {
+        diag::log_tagged_critical_fmt("license", "arc_render_gate_unseal_post_exception what=%.180s", e.what());
+    } catch (...) {
+        diag::log_tagged_critical("license", "arc_render_gate_unseal_post_exception what=<unknown>");
+    }
+    if (!posted) {
+        g_arc_startup_gate_posted.store(false, std::memory_order_release);
+        g_arc_startup_gate_state.store(3, std::memory_order_release);
+        globals::ui::arc_unseal_phase.store(3, std::memory_order_release);
+        diag::log_tagged_critical("license", "arc_render_gate_unseal_post_failed");
+        __fastfail(0xA1DAFA18u);
+    }
+}
 
 static void post_script_engine_startup_initialize()
 {
@@ -5342,14 +5625,10 @@ int main(int, char**)
         uint32_t pumped_input_messages = 0;
         uint32_t pumped_resize_messages = 0;
         uint32_t pumped_paint_messages = 0;
-        static uint64_t s_last_input_event_tick_ms = 0;
-        static DWORD s_last_input_msg_time = 0;
-        static UINT s_last_input_msg = 0;
-        static uint64_t s_input_event_count = 0;
         static uint64_t s_last_input_event_log_ms = 0;
-        static POINT s_last_input_cursor{};
-        static bool s_last_input_cursor_valid = false;
-        const uint64_t input_events_at_frame_start = s_input_event_count;
+        static uint64_t s_suppressed_pointer_motion_events = 0;
+        static uint64_t s_suppressed_pointer_motion_max_age_ms = 0;
+        const uint64_t input_events_at_frame_start = g_input_event_count;
         aida_tracer::render_pulse(frame_number);
         aida_tracer::mark_render_phase("frame_top");
         if (frame_number < 5)
@@ -5420,9 +5699,28 @@ int main(int, char**)
                         kAidaSendOnlyPeekFlags,
                         stall_context[0] ? stall_context : "<empty>");
                 }
+                const uint64_t pump_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - frame_start_tick_ms;
+                if (pump_elapsed_ms >= kAidaMessagePumpBudgetMs) {
+                    static uint64_t s_last_send_only_budget_log_ms = 0;
+                    const uint64_t budget_now_ms = static_cast<uint64_t>(GetTickCount64());
+                    if (s_last_send_only_budget_log_ms == 0 || budget_now_ms - s_last_send_only_budget_log_ms >= 1000ULL) {
+                        s_last_send_only_budget_log_ms = budget_now_ms;
+                        diag::log_tagged_fmt("msgpump",
+                            "send_only_pump_budget_yield frame=%llu elapsed_ms=%llu budget_ms=%lu qs=0x%08lX current=0x%04lX changed=0x%04lX result=%d gle=%lu",
+                            static_cast<unsigned long long>(frame_number),
+                            static_cast<unsigned long long>(pump_elapsed_ms),
+                            static_cast<unsigned long>(kAidaMessagePumpBudgetMs),
+                            static_cast<unsigned long>(queue_status_before),
+                            static_cast<unsigned long>(queue_current),
+                            static_cast<unsigned long>(queue_changed),
+                            sent_probe_result ? 1 : 0,
+                            static_cast<unsigned long>(sent_probe_gle));
+                    }
+                    break;
+                }
                 continue;
             }
-            const UINT peek_remove_flags = kAidaQueuedPeekFlags;
+            const UINT peek_remove_flags = sent_deferred_for_queued ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
             HWND peek_filter = nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
@@ -5433,7 +5731,7 @@ int main(int, char**)
                     sent_with_queued_last_log_ms = now_ms;
                     aida_tracer::mark_render_phase("peek_message_queued_before_send");
                     diag::log_tagged_critical_fmt("msgpump",
-                        "send_deferred_for_queued frame=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX non_send=0x%04lX send=0x%04lX flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
+                        "send_deferred_for_queued frame=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX non_send=0x%04lX send=0x%04lX flags=0x%08X canonical_flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
                         (unsigned long long)frame_number,
                         static_cast<unsigned long>(queue_status_before),
                         static_cast<unsigned long>(queue_current),
@@ -5441,6 +5739,7 @@ int main(int, char**)
                         static_cast<unsigned long>(queue_current & kAidaNonSendQueueBits),
                         static_cast<unsigned long>(queue_current & QS_SENDMESSAGE),
                         peek_remove_flags,
+                        kAidaQueuedPeekFlags,
                         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
                         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
                         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
@@ -5488,49 +5787,13 @@ int main(int, char**)
 
             ++pumped_messages;
             bool input_message = false;
-            switch (msg.message) {
-            case WM_MOUSEMOVE:
-            case WM_NCMOUSEMOVE:
-            case WM_LBUTTONDOWN:
-            case WM_LBUTTONUP:
-            case WM_LBUTTONDBLCLK:
-            case WM_RBUTTONDOWN:
-            case WM_RBUTTONUP:
-            case WM_RBUTTONDBLCLK:
-            case WM_MBUTTONDOWN:
-            case WM_MBUTTONUP:
-            case WM_XBUTTONDOWN:
-            case WM_XBUTTONUP:
-            case WM_NCLBUTTONDOWN:
-            case WM_NCLBUTTONUP:
-            case WM_NCLBUTTONDBLCLK:
-            case WM_MOUSEWHEEL:
-            case WM_MOUSEHWHEEL:
-            case WM_KEYDOWN:
-            case WM_KEYUP:
-            case WM_CHAR:
-            case WM_HOTKEY:
-            case WM_SETFOCUS:
-            case WM_KILLFOCUS:
-            case WM_ACTIVATE:
-            case WM_ACTIVATEAPP:
-            case WM_CAPTURECHANGED:
-            case WM_MOUSEACTIVATE:
+            if (aida_is_input_or_attention_message(msg.message)) {
                 input_message = true;
                 ++pumped_input_messages;
-                break;
-            case WM_SIZE:
-            case WM_MOVE:
-            case WM_DPICHANGED:
+            } else if (aida_is_resize_message(msg.message)) {
                 ++pumped_resize_messages;
-                break;
-            case WM_PAINT:
-            case WM_NCPAINT:
-            case WM_ERASEBKGND:
+            } else if (aida_is_paint_message(msg.message)) {
                 ++pumped_paint_messages;
-                break;
-            default:
-                break;
             }
             if (input_message) {
                 const uint64_t input_now_ms = static_cast<uint64_t>(GetTickCount64());
@@ -5538,18 +5801,22 @@ int main(int, char**)
                 POINT input_cursor{};
                 const bool input_cursor_ok = GetCursorPos(&input_cursor) != FALSE;
                 const bool pointer_motion_msg = msg.message == WM_MOUSEMOVE || msg.message == WM_NCMOUSEMOVE;
-                const bool cursor_changed = input_cursor_ok && (!s_last_input_cursor_valid || input_cursor.x != s_last_input_cursor.x || input_cursor.y != s_last_input_cursor.y);
-                s_last_input_event_tick_ms = input_now_ms;
-                s_last_input_msg_time = msg.time;
-                s_last_input_msg = msg.message;
-                ++s_input_event_count;
-                LARGE_INTEGER qpc{};
-                QueryPerformanceCounter(&qpc);
-                const bool log_input_event = !pointer_motion_msg || cursor_changed || input_now_ms - s_last_input_event_log_ms >= 500ULL;
+                aida_record_input_message(msg, input_now_ms);
+                const bool delayed_pointer_motion = pointer_motion_msg && input_msg_age_ms >= kAidaInputMotionLagLogIntervalMs;
+                const uint64_t pointer_motion_interval_ms = delayed_pointer_motion ? kAidaInputMotionLagLogIntervalMs : kAidaInputMotionLogIntervalMs;
+                const bool pointer_motion_summary_due = pointer_motion_msg &&
+                    (s_last_input_event_log_ms == 0 || input_now_ms - s_last_input_event_log_ms >= pointer_motion_interval_ms);
+                const bool log_input_event = !pointer_motion_msg || pointer_motion_summary_due;
                 if (log_input_event) {
+                    LARGE_INTEGER qpc{};
+                    QueryPerformanceCounter(&qpc);
+                    const uint64_t suppressed_pointer_motion = s_suppressed_pointer_motion_events;
+                    const uint64_t suppressed_pointer_motion_max_age = s_suppressed_pointer_motion_max_age_ms;
+                    s_suppressed_pointer_motion_events = 0;
+                    s_suppressed_pointer_motion_max_age_ms = 0;
                     s_last_input_event_log_ms = input_now_ms;
                     diag::log_tagged_fmt("msgpump",
-                        "input_event_received frame=%llu msg=%s(0x%04X) msg_time=%lu age_ms=%lu qpc=%lld tick=%llu hwnd=0x%llX wp=0x%llX lp=0x%llX cursor_ok=%d cursor=%ld,%ld qs=0x%08lX pumped=%u pumped_input=%u",
+                        "input_event_received frame=%llu msg=%s(0x%04X) msg_time=%lu age_ms=%lu qpc=%lld tick=%llu hwnd=0x%llX wp=0x%llX lp=0x%llX cursor_ok=%d cursor=%ld,%ld qs=0x%08lX pumped=%u pumped_input=%u pointer_suppressed=%llu pointer_max_age_ms=%llu",
                         static_cast<unsigned long long>(frame_number),
                         aida_tracer::message_name(msg.message),
                         msg.message,
@@ -5565,19 +5832,19 @@ int main(int, char**)
                         input_cursor_ok ? input_cursor.y : 0,
                         static_cast<unsigned long>(GetQueueStatus(kAidaInteractiveQueueBits)),
                         pumped_messages,
-                        pumped_input_messages);
-                }
-                if (input_cursor_ok) {
-                    s_last_input_cursor = input_cursor;
-                    s_last_input_cursor_valid = true;
+                        pumped_input_messages,
+                        static_cast<unsigned long long>(suppressed_pointer_motion),
+                        static_cast<unsigned long long>(suppressed_pointer_motion_max_age));
+                } else if (pointer_motion_msg) {
+                    ++s_suppressed_pointer_motion_events;
+                    if (input_msg_age_ms > s_suppressed_pointer_motion_max_age_ms)
+                        s_suppressed_pointer_motion_max_age_ms = input_msg_age_ms;
                 }
             }
 
             bool close_related_msg = msg.message == WM_CLOSE || msg.message == WM_DESTROY ||
                 msg.message == WM_NCDESTROY || msg.message == WM_QUIT ||
-                msg.message == WM_SYSCOMMAND || msg.message == WM_LBUTTONDOWN ||
-                msg.message == WM_LBUTTONUP || msg.message == WM_NCLBUTTONDOWN ||
-                msg.message == WM_NCLBUTTONUP || msg.message == WM_MOUSEACTIVATE;
+                msg.message == WM_SYSCOMMAND;
             if (close_related_msg) {
                 POINT cursor{};
                 GetCursorPos(&cursor);
@@ -5629,15 +5896,64 @@ int main(int, char**)
             aida_tracer::clear_dispatch_state();
             if (msg.message == WM_QUIT)
                 done = true;
+            const uint64_t pump_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - frame_start_tick_ms;
+            if (!done && (pumped_messages >= kAidaMessagePumpBudgetMessages || pump_elapsed_ms >= kAidaMessagePumpBudgetMs)) {
+                static uint64_t s_last_top_pump_budget_log_ms = 0;
+                const uint64_t budget_now_ms = static_cast<uint64_t>(GetTickCount64());
+                if (s_last_top_pump_budget_log_ms == 0 || budget_now_ms - s_last_top_pump_budget_log_ms >= 1000ULL) {
+                    s_last_top_pump_budget_log_ms = budget_now_ms;
+                    diag::log_tagged_fmt("msgpump",
+                        "top_pump_budget_yield frame=%llu messages=%u input=%u resize=%u paint=%u elapsed_ms=%llu budget_messages=%u budget_ms=%lu qs=0x%08lX",
+                        static_cast<unsigned long long>(frame_number),
+                        pumped_messages,
+                        pumped_input_messages,
+                        pumped_resize_messages,
+                        pumped_paint_messages,
+                        static_cast<unsigned long long>(pump_elapsed_ms),
+                        kAidaMessagePumpBudgetMessages,
+                        static_cast<unsigned long>(kAidaMessagePumpBudgetMs),
+                        static_cast<unsigned long>(::GetQueueStatus(QS_ALLINPUT)));
+                }
+                break;
+            }
         }
         aida_tracer::mark_render_phase("peek_message_done");
         if (done)
             break;
 
-        if (g_SwapChainOccluded && g_pSwapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED)
+        if (g_SwapChainOccluded && g_pSwapChain)
         {
-            ::Sleep(10);
-            continue;
+            const HRESULT occlusion_hr = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
+            if (occlusion_hr == DXGI_STATUS_OCCLUDED) {
+                const uint64_t occlusion_now_ms = static_cast<uint64_t>(GetTickCount64());
+                const DWORD occlusion_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
+                const uint64_t occlusion_input_age_ms = g_last_input_event_tick_ms != 0 && occlusion_now_ms >= g_last_input_event_tick_ms ? occlusion_now_ms - g_last_input_event_tick_ms : UINT64_MAX;
+                const bool occlusion_interactive =
+                    (HIWORD(occlusion_qs) & kAidaInteractiveQueueBits) != 0 ||
+                    occlusion_input_age_ms <= kAidaRecentInputWakeMs ||
+                    aida_focus_monitor::focused() ||
+                    aida_cursor_over_window(hwnd);
+                if (occlusion_interactive) {
+                    static uint64_t s_last_occlusion_interactive_log_ms = 0;
+                    if (s_last_occlusion_interactive_log_ms == 0 || occlusion_now_ms - s_last_occlusion_interactive_log_ms >= kAidaOcclusionInteractiveLogIntervalMs) {
+                        s_last_occlusion_interactive_log_ms = occlusion_now_ms;
+                        diag::log_tagged_fmt("render",
+                            "occlusion_interactive_wait frame=%llu hr=0x%08X qs=0x%08lX input_age_ms=%llu foreground=%d cursor_over=%d wait_ms=%lu",
+                            static_cast<unsigned long long>(frame_number),
+                            static_cast<unsigned>(occlusion_hr),
+                            static_cast<unsigned long>(occlusion_qs),
+                            static_cast<unsigned long long>(occlusion_input_age_ms == UINT64_MAX ? 0ULL : occlusion_input_age_ms),
+                            aida_focus_monitor::focused() ? 1 : 0,
+                            aida_cursor_over_window(hwnd) ? 1 : 0,
+                            (HIWORD(occlusion_qs) & kAidaInteractiveQueueBits) != 0 || occlusion_input_age_ms <= kAidaRecentInputWakeMs ? 0UL : 1UL);
+                    }
+                    if ((HIWORD(occlusion_qs) & kAidaInteractiveQueueBits) == 0 && occlusion_input_age_ms > kAidaRecentInputWakeMs)
+                        MsgWaitForMultipleObjectsEx(0, nullptr, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                } else {
+                    ::Sleep(10);
+                }
+                continue;
+            }
         }
         g_SwapChainOccluded = false;
 
@@ -5650,24 +5966,27 @@ int main(int, char**)
             const uint64_t resize_age_ms = g_ResizeRequestTickMs != 0 && resize_now_ms >= g_ResizeRequestTickMs ? resize_now_ms - g_ResizeRequestTickMs : kAidaResizeCoalesceMs;
             const DWORD resize_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
             const bool resize_input_pending = (HIWORD(resize_qs) & kAidaInteractiveQueueBits) != 0;
-            if (resize_age_ms < kAidaResizeCoalesceMs && resize_input_pending) {
+            const uint64_t resize_input_age_ms = g_last_input_event_tick_ms != 0 && resize_now_ms >= g_last_input_event_tick_ms ? resize_now_ms - g_last_input_event_tick_ms : UINT64_MAX;
+            const bool resize_fresh_input = resize_input_age_ms <= kAidaRecentInputWakeMs;
+            if (resize_age_ms < kAidaResizeCoalesceMs && resize_input_pending && !resize_fresh_input) {
                 ++g_resize_perf.coalesced;
                 static uint64_t s_last_resize_coalesce_log_ms = 0;
                 if (resize_now_ms - s_last_resize_coalesce_log_ms >= 1000ULL) {
                     s_last_resize_coalesce_log_ms = resize_now_ms;
                     diag::log_tagged_fmt("render",
-                        "resize_coalesce w=%u h=%u age_ms=%llu frame=%llu qs=0x%08lX requests=%llu coalesced=%llu applied=%llu skipped=%llu",
+                        "resize_coalesce w=%u h=%u age_ms=%llu frame=%llu qs=0x%08lX input_age_ms=%llu requests=%llu coalesced=%llu applied=%llu skipped=%llu",
                         resize_w,
                         resize_h,
                         static_cast<unsigned long long>(resize_age_ms),
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long>(resize_qs),
+                        static_cast<unsigned long long>(resize_input_age_ms == UINT64_MAX ? 0ULL : resize_input_age_ms),
                         static_cast<unsigned long long>(g_resize_perf.requests),
                         static_cast<unsigned long long>(g_resize_perf.coalesced),
                         static_cast<unsigned long long>(g_resize_perf.applied),
                         static_cast<unsigned long long>(g_resize_perf.skipped_redundant));
                 }
-                Sleep(1);
+                MsgWaitForMultipleObjectsEx(0, nullptr, 1, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 continue;
             }
             diag::log_tagged_critical_fmt("render", "resize_pre w=%u h=%u frame=%llu",
@@ -5724,45 +6043,12 @@ int main(int, char**)
         bool state_changed = (cur_state != prev_state);
         if (state_changed) prev_state = cur_state;
 
-        static bool s_arc_startup_gate_passed = false;
-        if (!s_arc_startup_gate_passed && cur_state == 3 && standalone_license::is_arc_loaded())
-        {
-            globals::ui::arc_unseal_phase.store(1, std::memory_order_release);
-            uint8_t gate_nonce[32] = {};
-            std::string sess_tok = standalone_license::get_arc_bind_token();
-            if (sess_tok.empty())
-                sess_tok = standalone_license::get_session_token();
-            size_t cp = sess_tok.size();
-            if (cp > sizeof(gate_nonce)) cp = sizeof(gate_nonce);
-            if (cp > 0)
-                memcpy(gate_nonce, sess_tok.data(), cp);
-            const uint64_t gate_nonce_hash = diag_fnv1a64(gate_nonce, sizeof(gate_nonce));
-            diag::log_tagged_critical_fmt("license",
-                "arc_render_gate_nonce_source bind_token_len=%zu used_len=%zu nonce_hash=0x%016llX",
-                sess_tok.size(), cp,
-                static_cast<unsigned long long>(gate_nonce_hash));
-
-            uint8_t poly_seed[32] = {};
-            uint32_t poly_seed_len = 0;
-            constexpr uint32_t kPolymorphismSeedFeatureId = 1u;
-            bool unseal_ok = standalone_license::arc_unseal_feature_blocking(
-                kPolymorphismSeedFeatureId,
-                gate_nonce, sizeof(gate_nonce),
-                poly_seed, &poly_seed_len, sizeof(poly_seed));
-            if (!unseal_ok || poly_seed_len != 32) {
-                diag::log_tagged_critical_fmt("license",
-                    "arc_render_gate_unseal_FAIL unseal_ok=%d poly_seed_len=%u bind_token_len=%zu",
-                    unseal_ok ? 1 : 0, poly_seed_len, sess_tok.size());
-                globals::ui::arc_unseal_phase.store(3, std::memory_order_release);
-                SecureZeroMemory(poly_seed, sizeof(poly_seed));
-                SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
-                __fastfail(0xA1DAFA17u);
-            }
-            SecureZeroMemory(poly_seed, sizeof(poly_seed));
-            SecureZeroMemory(gate_nonce, sizeof(gate_nonce));
-            s_arc_startup_gate_passed = true;
-            globals::ui::arc_unseal_phase.store(2, std::memory_order_release);
-        }
+        if (cur_state == 3 && standalone_license::is_arc_loaded())
+            post_arc_startup_gate_unseal();
+        const int arc_startup_gate_state = g_arc_startup_gate_state.load(std::memory_order_acquire);
+        if (arc_startup_gate_state == 3)
+            __fastfail(0xA1DAFA17u);
+        const bool s_arc_startup_gate_passed = arc_startup_gate_state == 2;
         if (s_arc_startup_gate_passed && license_ready) {
             if (!g_authorized_features_initialized.load(std::memory_order_acquire) &&
                 !g_authorized_features_posted.exchange(true, std::memory_order_acq_rel))
@@ -5872,6 +6158,7 @@ int main(int, char**)
         static bool last_bulk_busy = false;
         static bool last_activation_progress = false;
         static bool last_ai_thinking = false;
+        static uint64_t last_rendered_input_events = 0;
         static POINT last_cursor_pos{};
         static bool last_cursor_valid = false;
         static bool last_cursor_over = false;
@@ -5919,9 +6206,11 @@ int main(int, char**)
             pre_frame_io.KeyShift ||
             pre_frame_io.KeyAlt ||
             pre_frame_io.KeySuper;
-        const bool last_input_seen_pre = s_last_input_event_tick_ms != 0;
-        const uint64_t last_input_age_pre_ms = last_input_seen_pre && dirty_now_ms >= s_last_input_event_tick_ms ? dirty_now_ms - s_last_input_event_tick_ms : 0ULL;
+        const bool last_input_seen_pre = g_last_input_event_tick_ms != 0;
+        const uint64_t last_input_age_pre_ms = last_input_seen_pre && dirty_now_ms >= g_last_input_event_tick_ms ? dirty_now_ms - g_last_input_event_tick_ms : 0ULL;
         const bool recent_input_pre = last_input_seen_pre && last_input_age_pre_ms <= kAidaRecentInputWakeMs;
+        const uint64_t input_events_seen_pre = g_input_event_count;
+        const bool unrendered_input_pre = !dirty_state_initialized || input_events_seen_pre != last_rendered_input_events;
         uint32_t dirty_mask = 0;
         if (!dirty_state_initialized || frame_number < 5)
             dirty_mask |= kAidaDirtyStartup;
@@ -5931,7 +6220,7 @@ int main(int, char**)
             dirty_mask |= kAidaDirtyResize;
         if (cur_state != last_dirty_state)
             dirty_mask |= kAidaDirtyState;
-        if (pumped_input_messages != 0 || interactive_pending_pre || input_active_pre)
+        if (pumped_input_messages != 0 || interactive_pending_pre || input_active_pre || unrendered_input_pre)
             dirty_mask |= kAidaDirtyInput;
         if (cursor_over_changed || cursor_motion_relevant)
             dirty_mask |= kAidaDirtyCursor;
@@ -5950,69 +6239,88 @@ int main(int, char**)
         if (bulk_busy_pre != last_bulk_busy)
             dirty_mask |= kAidaDirtyWork;
         const uint64_t since_render_ms = last_render_tick_ms != 0 && dirty_now_ms >= last_render_tick_ms ? dirty_now_ms - last_render_tick_ms : 0;
-        uint64_t heartbeat_ms = foreground_like_pre ? kAidaForegroundIdleHeartbeatMs : kAidaBackgroundIdleHeartbeatMs;
+        const bool interactive_cadence_due_pre = recent_input_pre && since_render_ms >= kAidaInteractiveRenderCadenceMs;
+        if (interactive_cadence_due_pre)
+            dirty_mask |= kAidaDirtyInteractiveCadence;
+        uint64_t heartbeat_ms = kAidaIdleHeartbeatMs;
         if (full_test_running_pre || bulk_busy_pre)
             heartbeat_ms = kAidaFullTestHeartbeatMs;
         if (modal_or_animation_pre || activation_progress_pre || ai_thinking_pre)
             heartbeat_ms = kAidaModalHeartbeatMs;
         if (!dirty_state_initialized || since_render_ms >= heartbeat_ms)
             dirty_mask |= kAidaDirtyHeartbeat | kAidaDirtySecurity;
-        const bool dirty_fast_mask_pre = (dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage)) != 0;
+        const bool dirty_fast_mask_pre = (dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage | kAidaDirtyInteractiveCadence)) != 0;
         const bool wake_fast_pre =
             dirty_fast_mask_pre ||
             interactive_pending_pre ||
             input_active_pre ||
             recent_input_pre ||
+            unrendered_input_pre ||
             pumped_messages != 0 ||
             modal_or_animation_pre ||
+            activation_progress_pre ||
+            ai_thinking_pre;
+        const bool blur_pressure_pre =
+            wake_fast_pre ||
+            cursor_over_aida_pre ||
+            full_test_running_pre ||
+            bulk_busy_pre ||
             activation_progress_pre;
-        DWORD idle_wait_request_ms = kAidaBackgroundIdleWaitMs;
+        if (blur_pressure_pre)
+            Blur::SetInteractionPressure(true, dirty_now_ms + kAidaInteractiveBlurPressureMs);
+        else
+            Blur::SetInteractionPressure(false, dirty_now_ms);
+        DWORD idle_wait_request_ms = kAidaIdleWaitMs;
         if (wake_fast_pre)
             idle_wait_request_ms = kAidaInteractiveWaitMs;
-        else if (foreground_like_pre)
-            idle_wait_request_ms = (full_test_running_pre || bulk_busy_pre || activation_progress_pre) ? kAidaForegroundActiveWaitMs : kAidaForegroundIdleWaitMs;
         else if (full_test_running_pre || bulk_busy_pre)
-            idle_wait_request_ms = kAidaBackgroundActiveWaitMs;
+            idle_wait_request_ms = kAidaActiveWaitMs;
         frame_wait_result_t pre_render_wait{};
         if (dirty_mask == 0) {
             aida_tracer::mark_render_phase("idle_frame_wait");
             const frame_wait_result_t idle_wait = wait_for_frame_latency_or_input(idle_wait_request_ms);
             ++skipped_render_frames;
             static uint64_t s_last_skip_wait_log_ms = 0;
-            const bool skip_wait_anomaly = idle_wait.result == WAIT_FAILED || (idle_wait.waitable_present && idle_wait.actual_ms == 0 && !idle_wait.input_available && !idle_wait.frame_latency_signaled);
-            if (skip_wait_anomaly && dirty_now_ms - s_last_skip_wait_log_ms >= 5000ull) {
-                s_last_skip_wait_log_ms = dirty_now_ms;
-                diag::log_tagged_fmt("render",
-                    "dirty_skip_anomaly skipped=%llu waitable=%d request_ms=%lu actual_ms=%lu result=0x%08lX gle=%lu input=%d signaled=%d immediate_timeout_streak=%llu qs=0x%08lX foreground=%d cursor_over=%d recent_input=%d input_seen=%d last_input_msg=0x%04X last_input_age_ms=%llu full_test=%d bulk_busy=%d",
-                    static_cast<unsigned long long>(skipped_render_frames),
-                    idle_wait.waitable_present ? 1 : 0,
-                    static_cast<unsigned long>(idle_wait.requested_ms),
-                    static_cast<unsigned long>(idle_wait.actual_ms),
-                    static_cast<unsigned long>(idle_wait.result),
-                    static_cast<unsigned long>(idle_wait.gle),
-                    idle_wait.input_available ? 1 : 0,
-                    idle_wait.frame_latency_signaled ? 1 : 0,
-                    static_cast<unsigned long long>(idle_wait.immediate_timeout_streak),
-                    static_cast<unsigned long>(dirty_qs),
-                    foreground_pre ? 1 : 0,
-                    cursor_over_aida_pre ? 1 : 0,
-                    recent_input_pre ? 1 : 0,
-                    last_input_seen_pre ? 1 : 0,
-                    static_cast<unsigned>(s_last_input_msg),
-                    static_cast<unsigned long long>(last_input_age_pre_ms),
-                    full_test_running_pre ? 1 : 0,
-                    bulk_busy_pre ? 1 : 0);
+            static uint64_t s_skip_wait_anomaly_suppressed = 0;
+            const bool skip_wait_anomaly = idle_wait.result == WAIT_FAILED;
+            if (skip_wait_anomaly) {
+                if (s_last_skip_wait_log_ms == 0 || dirty_now_ms - s_last_skip_wait_log_ms >= kAidaDirtySkipAnomalyLogIntervalMs) {
+                    const uint64_t suppressed = s_skip_wait_anomaly_suppressed;
+                    s_skip_wait_anomaly_suppressed = 0;
+                    s_last_skip_wait_log_ms = dirty_now_ms;
+                    diag::log_tagged_fmt("render",
+                        "dirty_skip_anomaly skipped=%llu request_ms=%lu actual_ms=%lu result=0x%08lX gle=%lu input=%d qs=0x%08lX foreground=%d cursor_over=%d recent_input=%d input_seen=%d unrendered_input=%d last_input_msg=0x%04X last_input_age_ms=%llu full_test=%d bulk_busy=%d suppressed=%llu",
+                        static_cast<unsigned long long>(skipped_render_frames),
+                        static_cast<unsigned long>(idle_wait.requested_ms),
+                        static_cast<unsigned long>(idle_wait.actual_ms),
+                        static_cast<unsigned long>(idle_wait.result),
+                        static_cast<unsigned long>(idle_wait.gle),
+                        idle_wait.input_available ? 1 : 0,
+                        static_cast<unsigned long>(dirty_qs),
+                        foreground_pre ? 1 : 0,
+                        cursor_over_aida_pre ? 1 : 0,
+                        recent_input_pre ? 1 : 0,
+                        last_input_seen_pre ? 1 : 0,
+                        unrendered_input_pre ? 1 : 0,
+                        static_cast<unsigned>(g_last_input_msg),
+                        static_cast<unsigned long long>(last_input_age_pre_ms),
+                        full_test_running_pre ? 1 : 0,
+                        bulk_busy_pre ? 1 : 0,
+                        static_cast<unsigned long long>(suppressed));
+                } else {
+                    ++s_skip_wait_anomaly_suppressed;
+                }
             }
             aida_tracer::mark_render_phase("idle_frame_skipped");
             continue;
         }
         DWORD pre_render_wait_ms = kAidaPreRenderWaitMs;
-        if ((dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage)) != 0)
+        if (wake_fast_pre)
             pre_render_wait_ms = 0;
         aida_tracer::mark_render_phase("pre_render_wait");
         pre_render_wait = wait_for_frame_latency_or_input(pre_render_wait_ms);
         aida_tracer::mark_render_phase("pre_render_wait_done");
-        if (pre_render_wait.input_available && (dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage)) == 0) {
+        if (pre_render_wait.input_available && (dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage | kAidaDirtyInteractiveCadence)) == 0) {
             ++skipped_render_frames;
             aida_tracer::mark_render_phase("pre_render_input_requeue");
             continue;
@@ -6122,6 +6430,18 @@ int main(int, char**)
                 crash_log_write("toast_done");
         }
 
+        {
+            const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("post_imgui_build", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
+            pumped_messages += mid_pump.messages;
+            pumped_input_messages += mid_pump.input_messages;
+            pumped_resize_messages += mid_pump.resize_messages;
+            pumped_paint_messages += mid_pump.paint_messages;
+            if (mid_pump.quit) {
+                done = true;
+                break;
+            }
+        }
+
         const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
         if (frame_number < 5)
@@ -6146,7 +6466,7 @@ int main(int, char**)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_render code=0x%08X frame=%llu",
                 seh_ir, (unsigned long long)frame_number);
         ImDrawData* draw_data = ImGui::GetDrawData();
-        const draw_data_metrics_t draw_metrics = collect_draw_data_metrics(draw_data);
+        draw_data_metrics_t draw_metrics = collect_draw_data_metrics(draw_data, frame_number < 5ULL || (frame_number % 120ULL) == 0ULL);
         begin_gpu_frame_query(frame_number);
         aida_tracer::mark_render_phase("imgui_dx11_render");
         DWORD seh_idr = seh_imgui_dx11_render(draw_data, frame_number);
@@ -6156,10 +6476,24 @@ int main(int, char**)
         g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
         end_gpu_frame_query(frame_number);
 
+        {
+            const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("pre_present", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
+            pumped_messages += mid_pump.messages;
+            pumped_input_messages += mid_pump.input_messages;
+            pumped_resize_messages += mid_pump.resize_messages;
+            pumped_paint_messages += mid_pump.paint_messages;
+            if (mid_pump.quit) {
+                done = true;
+                break;
+            }
+        }
+
         aida_tracer::mark_render_phase("present");
         HRESULT hr = S_OK;
+        const UINT present_sync_interval = kAidaPresentSyncInterval;
+        const UINT present_flags = kAidaPresentFlags;
         const uint64_t present_start_tick_ms = static_cast<uint64_t>(GetTickCount64());
-        DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr, frame_number);
+        DWORD seh_present = seh_swapchain_present(g_pSwapChain, &hr, frame_number, present_sync_interval, present_flags);
         const uint64_t present_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - present_start_tick_ms;
         collect_gpu_frame_query(frame_number);
         if (seh_present != 0)
@@ -6172,12 +6506,26 @@ int main(int, char**)
                 hr, (unsigned long long)frame_number);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
+        {
+            const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("post_present", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
+            pumped_messages += mid_pump.messages;
+            pumped_input_messages += mid_pump.input_messages;
+            pumped_resize_messages += mid_pump.resize_messages;
+            pumped_paint_messages += mid_pump.paint_messages;
+            if (mid_pump.quit) {
+                done = true;
+                break;
+            }
+        }
+
         const uint64_t timing_now_ms = static_cast<uint64_t>(GetTickCount64());
         const uint64_t frame_elapsed_ms = timing_now_ms - frame_start_tick_ms;
-        const bool input_seen_present = s_last_input_event_tick_ms != 0;
-        const uint64_t input_age_present_ms = input_seen_present && timing_now_ms >= s_last_input_event_tick_ms ? timing_now_ms - s_last_input_event_tick_ms : 0ULL;
-        const uint64_t input_events_this_frame = s_input_event_count >= input_events_at_frame_start ? s_input_event_count - input_events_at_frame_start : 0ULL;
+        const bool input_seen_present = g_last_input_event_tick_ms != 0;
+        const uint64_t input_age_present_ms = input_seen_present && timing_now_ms >= g_last_input_event_tick_ms ? timing_now_ms - g_last_input_event_tick_ms : 0ULL;
+        const uint64_t input_events_this_frame = g_input_event_count >= input_events_at_frame_start ? g_input_event_count - input_events_at_frame_start : 0ULL;
         const bool present_failed = (hr & 0x80000000u) || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
+        if (!present_failed && hr != DXGI_STATUS_OCCLUDED)
+            last_rendered_input_events = input_events_seen_pre;
         const bool frame_slow = frame_elapsed_ms >= 250ULL || present_elapsed_ms >= 100ULL;
         if (frame_number < 5)
             crash_log_fmt("frame_end #%llu", frame_number);
@@ -6185,20 +6533,22 @@ int main(int, char**)
             static uint64_t s_last_frame_timing_log_ms = 0;
             if ((present_failed || frame_slow) && (timing_now_ms - s_last_frame_timing_log_ms) >= 5000ULL) {
                 s_last_frame_timing_log_ms = timing_now_ms;
+                request_render_diag_snapshot_async(timing_now_ms, false);
+                const render_diag_cached_snapshot_t timing_diag = latest_render_diag_snapshot();
                 const DWORD timing_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
                 diag::log_tagged_fmt("render",
                     "frame_timing_sample frame=%llu frame_ms=%llu present_ms=%llu sync=%u flags=0x%08X hr=0x%08X cursor_over=%d foreground=%d interactive_pending=%d qs=0x%08lX threads_active=%lu tid=%lu",
                     static_cast<unsigned long long>(frame_number),
                     static_cast<unsigned long long>(frame_elapsed_ms),
                     static_cast<unsigned long long>(present_elapsed_ms),
-                    static_cast<unsigned>(kAidaPresentSyncInterval),
-                    static_cast<unsigned>(kAidaPresentFlags),
+                    static_cast<unsigned>(present_sync_interval),
+                    static_cast<unsigned>(present_flags),
                     static_cast<unsigned>(hr),
                     aida_cursor_over_window(hwnd) ? 1 : 0,
                     aida_focus_monitor::focused() ? 1 : 0,
                     (HIWORD(timing_qs) & kAidaInteractiveQueueBits) != 0 ? 1 : 0,
                     static_cast<unsigned long>(timing_qs),
-                    static_cast<unsigned long>(count_current_process_threads(nullptr)),
+                    static_cast<unsigned long>(timing_diag.thread_count),
                     ::GetCurrentThreadId());
             }
         }
@@ -6222,11 +6572,13 @@ int main(int, char**)
             static uint64_t s_last_idle_pacing_log_ms = 0;
             if (tick_now_ms - s_last_idle_pacing_probe_ms >= 5000ULL) {
                 s_last_idle_pacing_probe_ms = tick_now_ms;
-                DWORD thread_err = 0;
-                const DWORD thread_count = count_current_process_threads(&thread_err);
-                const auto wq = work_queue::stats();
-                const auto svc = work_queue::service_stats();
-                const auto cq = critical_work_queue::stats();
+                request_render_diag_snapshot_async(tick_now_ms, false);
+                const render_diag_cached_snapshot_t diag_snapshot = latest_render_diag_snapshot();
+                const DWORD thread_err = diag_snapshot.thread_err;
+                const DWORD thread_count = diag_snapshot.thread_count;
+                const auto wq = diag_snapshot.wq;
+                const auto svc = diag_snapshot.svc;
+                const auto cq = diag_snapshot.cq;
                 const bool idle_unhealthy =
                     thread_err != 0 ||
                     wq.pending != 0 ||
@@ -6316,9 +6668,16 @@ int main(int, char**)
                         static_cast<unsigned>(cq.not_queryable_workers),
                         cq.top_cpu_labels.empty() ? "<none>" : cq.top_cpu_labels.c_str(),
                         cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
-                    work_queue::log_stuck_workers(30000ULL, 8);
-                    work_queue::log_service_stuck_workers(30000ULL, 8);
-                    critical_work_queue::log_stuck_workers(30000ULL, 8);
+                    std::function<void()> stuck_log_task = [] {
+                        work_queue::log_stuck_workers(30000ULL, 8);
+                        work_queue::log_service_stuck_workers(30000ULL, 8);
+                        critical_work_queue::log_stuck_workers(30000ULL, 8);
+                    };
+                    bool stuck_log_posted = work_queue::post_service_labeled("render.idle_stuck_worker_log", stuck_log_task);
+                    if (!stuck_log_posted)
+                        stuck_log_posted = work_queue::post_labeled("render.idle_stuck_worker_log", std::move(stuck_log_task));
+                    if (!stuck_log_posted)
+                        diag::log_tagged_fmt("render", "idle_pacing_stuck_worker_log_post_failed frame=%llu", static_cast<unsigned long long>(frame_number));
                 }
             }
             static uint64_t s_last_frame_pacing_log_ms = 0;
@@ -6330,34 +6689,37 @@ int main(int, char**)
                 s_last_frame_pacing_log_ms = tick_now_ms;
                 s_last_frame_pacing_frame = frame_number;
                 s_last_frame_pacing_skipped = skipped_render_frames;
-                s_last_frame_pacing_input_events = s_input_event_count;
-                (void)sample_current_process_cpu(tick_now_ms);
-                (void)sample_process_io_delta(tick_now_ms);
-                (void)sample_log_file_deltas();
+                s_last_frame_pacing_input_events = g_input_event_count;
+                request_render_diag_snapshot_async(tick_now_ms, true);
             } else {
                 const uint64_t since_pacing_log_ms = tick_now_ms >= s_last_frame_pacing_log_ms ? tick_now_ms - s_last_frame_pacing_log_ms : 0ULL;
                 const bool pacing_due = since_pacing_log_ms >= kAidaFramePacingLogIntervalMs;
-                const bool pacing_anomaly = wait_failed || present_failed || frame_slow || (pre_render_wait.waitable_present && pre_render_wait.requested_ms != 0 && pre_render_wait.actual_ms == 0 && !pre_render_wait.frame_latency_signaled);
-                if (pacing_due || (pacing_anomaly && since_pacing_log_ms >= 5000ULL)) {
-                    DWORD thread_err = 0;
-                    const DWORD thread_count = count_current_process_threads(&thread_err);
-                    const auto wq = work_queue::stats();
-                    const auto svc = work_queue::service_stats();
-                    const auto cq = critical_work_queue::stats();
-                    const process_cpu_delta_t cpu = sample_current_process_cpu(tick_now_ms);
-                    const process_io_delta_t proc_io = sample_process_io_delta(tick_now_ms);
-                    const log_file_delta_snapshot_t log_files = sample_log_file_deltas();
-                    const defender_process_snapshot_t defender = sample_defender_processes();
+                const bool pacing_anomaly = wait_failed || present_failed || frame_slow;
+                const bool pacing_anomaly_due = pacing_anomaly && since_pacing_log_ms >= kAidaPacingAnomalyLogIntervalMs;
+                if (pacing_due || pacing_anomaly_due) {
+                    request_render_diag_snapshot_async(tick_now_ms, true);
+                    if (!draw_metrics.full_walk)
+                        draw_metrics = collect_draw_data_metrics(draw_data, true);
+                    const render_diag_cached_snapshot_t diag_snapshot = latest_render_diag_snapshot();
+                    const DWORD thread_err = diag_snapshot.thread_err;
+                    const DWORD thread_count = diag_snapshot.thread_count;
+                    const auto wq = diag_snapshot.wq;
+                    const auto svc = diag_snapshot.svc;
+                    const auto cq = diag_snapshot.cq;
+                    const process_cpu_delta_t cpu = diag_snapshot.cpu;
+                    const process_io_delta_t proc_io = diag_snapshot.proc_io;
+                    const log_file_delta_snapshot_t log_files = diag_snapshot.log_files;
+                    const defender_process_snapshot_t defender = diag_snapshot.defender;
                     const uint64_t frame_delta = frame_number >= s_last_frame_pacing_frame ? frame_number - s_last_frame_pacing_frame : 0ULL;
                     const uint64_t skipped_delta = skipped_render_frames >= s_last_frame_pacing_skipped ? skipped_render_frames - s_last_frame_pacing_skipped : 0ULL;
-                    const uint64_t input_events_delta = s_input_event_count >= s_last_frame_pacing_input_events ? s_input_event_count - s_last_frame_pacing_input_events : 0ULL;
+                    const uint64_t input_events_delta = g_input_event_count >= s_last_frame_pacing_input_events ? g_input_event_count - s_last_frame_pacing_input_events : 0ULL;
                     const double fps = since_pacing_log_ms != 0 ? (static_cast<double>(frame_delta) * 1000.0) / static_cast<double>(since_pacing_log_ms) : 0.0;
                     const auto overlay_perf = test_all_features::overlay_perf_snapshot();
                     const gpu_frame_sample_t gpu = latest_gpu_frame_sample(frame_number);
                     const auto log_stats = diag::async_log_stats();
                     const auto blur_stats = Blur::SnapshotStats();
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu waitable=%d pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d pre_wait_signaled=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu wq_healthy_long=%u wq_hot=%u wq_not_queryable=%u svc_active=%u svc_pending=%zu svc_oldest_ms=%llu svc_healthy_long=%u svc_hot=%u svc_not_queryable=%u cq_active=%u cq_pending=%zu cq_oldest_ms=%llu cq_healthy_long=%u cq_hot=%u cq_not_queryable=%u",
+                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu wq_healthy_long=%u wq_hot=%u wq_not_queryable=%u svc_active=%u svc_pending=%zu svc_oldest_ms=%llu svc_healthy_long=%u svc_hot=%u svc_not_queryable=%u cq_active=%u cq_pending=%zu cq_oldest_ms=%llu cq_healthy_long=%u cq_hot=%u cq_not_queryable=%u",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long long>(frame_delta),
                         static_cast<unsigned long long>(skipped_delta),
@@ -6381,17 +6743,15 @@ int main(int, char**)
                         static_cast<unsigned long long>(gpu.frequency),
                         static_cast<unsigned long long>(gpu.samples),
                         static_cast<unsigned long long>(gpu.misses),
-                        static_cast<unsigned>(kAidaPresentSyncInterval),
-                        static_cast<unsigned>(kAidaPresentFlags),
+                        static_cast<unsigned>(present_sync_interval),
+                        static_cast<unsigned>(present_flags),
                         static_cast<unsigned long long>(frame_elapsed_ms),
                         static_cast<unsigned long long>(present_elapsed_ms),
-                        pre_render_wait.waitable_present ? 1 : 0,
                         static_cast<unsigned long>(pre_render_wait.requested_ms),
                         static_cast<unsigned long>(pre_render_wait.actual_ms),
                         static_cast<unsigned long>(pre_render_wait.result),
                         static_cast<unsigned long>(pre_render_wait.gle),
                         pre_render_wait.input_available ? 1 : 0,
-                        pre_render_wait.frame_latency_signaled ? 1 : 0,
                         static_cast<unsigned>(dirty_mask),
                         static_cast<unsigned long>(idle_wait_request_ms),
                         foreground_pre ? 1 : 0,
@@ -6453,13 +6813,12 @@ int main(int, char**)
                         static_cast<unsigned>(cq.hot_workers),
                         static_cast<unsigned>(cq.not_queryable_workers));
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_io frame=%llu present_hr=0x%08X wait_immediate_timeout_streak=%llu input_seen=%d last_input_msg=0x%04X last_input_msg_time=%lu last_input_age_newframe_ms=%llu input_to_present_ms=%llu input_events_delta=%llu input_events_this_frame=%llu proc_io_valid=%d proc_io_gle=%lu proc_io_wall_ms=%llu proc_read_ops_delta=%llu proc_write_ops_delta=%llu proc_other_ops_delta=%llu proc_read_bytes_delta=%llu proc_write_bytes_delta=%llu proc_other_bytes_delta=%llu proc_total_read_bytes=%llu proc_total_write_bytes=%llu debug_log_valid=%d debug_log_size=%llu debug_log_delta=%llu debug_log_reset=%d debug_log_gle=%lu kernel_log_valid=%d kernel_log_size=%llu kernel_log_delta=%llu kernel_log_reset=%d kernel_log_gle=%lu full_test_log_valid=%d full_test_log_size=%llu full_test_log_delta=%llu full_test_log_reset=%d full_test_log_gle=%lu camoufox_log_valid=%d camoufox_log_size=%llu camoufox_log_delta=%llu camoufox_log_reset=%d camoufox_log_gle=%lu defender_valid=%d defender_gle=%lu defender_msmpeng=%u defender_mpcmdrun=%u log_started=%d log_start_failed=%d log_queue_depth=%llu log_max_queue_depth=%llu log_queue_lock_busy=%d log_file_lock_busy=%d log_queued=%llu log_queued_bytes=%llu log_written=%llu log_written_bytes=%llu log_direct=%llu log_force_batches=%llu log_force_flushes=%llu log_normal_flushes=%llu log_flush_ms_total=%llu log_flush_ms_max=%llu log_flush_failures=%llu log_last_flush_error=%llu log_pending_flush_bytes=%llu log_tag_events=%llu log_tag_bytes=%llu log_tag_forced=%llu log_coalesced_success=%llu log_coalesced_bytes=%llu log_coalesced_summaries=%llu log_force_downgraded=%llu",
+                        "frame_pacing_io frame=%llu present_hr=0x%08X input_seen=%d last_input_msg=0x%04X last_input_msg_time=%lu last_input_age_newframe_ms=%llu input_to_present_ms=%llu input_events_delta=%llu input_events_this_frame=%llu proc_io_valid=%d proc_io_gle=%lu proc_io_wall_ms=%llu proc_read_ops_delta=%llu proc_write_ops_delta=%llu proc_other_ops_delta=%llu proc_read_bytes_delta=%llu proc_write_bytes_delta=%llu proc_other_bytes_delta=%llu proc_total_read_bytes=%llu proc_total_write_bytes=%llu debug_log_valid=%d debug_log_size=%llu debug_log_delta=%llu debug_log_reset=%d debug_log_gle=%lu kernel_log_valid=%d kernel_log_size=%llu kernel_log_delta=%llu kernel_log_reset=%d kernel_log_gle=%lu full_test_log_valid=%d full_test_log_size=%llu full_test_log_delta=%llu full_test_log_reset=%d full_test_log_gle=%lu camoufox_log_valid=%d camoufox_log_size=%llu camoufox_log_delta=%llu camoufox_log_reset=%d camoufox_log_gle=%lu defender_valid=%d defender_gle=%lu defender_msmpeng=%u defender_mpcmdrun=%u log_started=%d log_start_failed=%d log_queue_depth=%llu log_max_queue_depth=%llu log_queue_lock_busy=%d log_file_lock_busy=%d log_queued=%llu log_queued_bytes=%llu log_written=%llu log_written_bytes=%llu log_direct=%llu log_force_batches=%llu log_force_flushes=%llu log_normal_flushes=%llu log_flush_ms_total=%llu log_flush_ms_max=%llu log_flush_failures=%llu log_last_flush_error=%llu log_pending_flush_bytes=%llu log_tag_events=%llu log_tag_bytes=%llu log_tag_forced=%llu log_coalesced_success=%llu log_coalesced_bytes=%llu log_coalesced_summaries=%llu log_force_downgraded=%llu",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned>(hr),
-                        static_cast<unsigned long long>(pre_render_wait.immediate_timeout_streak),
                         input_seen_present ? 1 : 0,
-                        static_cast<unsigned>(s_last_input_msg),
-                        static_cast<unsigned long>(s_last_input_msg_time),
+                        static_cast<unsigned>(g_last_input_msg),
+                        static_cast<unsigned long>(g_last_input_msg_time),
                         static_cast<unsigned long long>(last_input_age_pre_ms),
                         static_cast<unsigned long long>(input_age_present_ms),
                         static_cast<unsigned long long>(input_events_delta),
@@ -6530,7 +6889,7 @@ int main(int, char**)
                         static_cast<unsigned long long>(frame_number),
                         log_stats.top_tags.empty() ? "<none>" : log_stats.top_tags.c_str());
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_blur frame=%llu callbacks=%d expected_blur_callbacks=%d unexpected_callbacks=%d reset_callbacks=%d draw_requests=%llu blur_callbacks=%llu suppressed_full_test=%llu slow=%llu slow_suppressed=%llu cache_reuse=%llu adaptive_fallback=%llu last_cache_age_ms=%llu pressure_until_ms=%llu invalid=%llu no_rtv=%llu total_area=%llu last_area=%llu total_ms=%llu copy_ms=%llu h_ms=%llu v_ms=%llu restore_ms=%llu last_total_ms=%llu last_copy_ms=%llu last_h_ms=%llu last_v_ms=%llu last_restore_ms=%llu removed=0x%08lX",
+                        "frame_pacing_blur frame=%llu callbacks=%d expected_blur_callbacks=%d unexpected_callbacks=%d reset_callbacks=%d draw_requests=%llu blur_callbacks=%llu suppressed_full_test=%llu slow=%llu slow_suppressed=%llu cache_reuse=%llu adaptive_fallback=%llu interactive_fallback=%llu throttle_fallback=%llu last_cache_age_ms=%llu pressure_until_ms=%llu input_pressure_until_ms=%llu invalid=%llu no_rtv=%llu total_area=%llu last_area=%llu total_ms=%llu copy_ms=%llu h_ms=%llu v_ms=%llu restore_ms=%llu last_total_ms=%llu last_copy_ms=%llu last_h_ms=%llu last_v_ms=%llu last_restore_ms=%llu removed=0x%08lX",
                         static_cast<unsigned long long>(frame_number),
                         draw_metrics.callbacks,
                         draw_metrics.expected_blur_callbacks,
@@ -6543,8 +6902,11 @@ int main(int, char**)
                         static_cast<unsigned long long>(blur_stats.slow_suppressed),
                         static_cast<unsigned long long>(blur_stats.cache_reuse),
                         static_cast<unsigned long long>(blur_stats.adaptive_fallback),
+                        static_cast<unsigned long long>(blur_stats.interactive_fallback),
+                        static_cast<unsigned long long>(blur_stats.throttle_fallback),
                         static_cast<unsigned long long>(blur_stats.last_cache_age_ms),
                         static_cast<unsigned long long>(blur_stats.pressure_until_ms),
+                        static_cast<unsigned long long>(blur_stats.input_pressure_until_ms),
                         static_cast<unsigned long long>(blur_stats.invalid_callbacks),
                         static_cast<unsigned long long>(blur_stats.no_rtv),
                         static_cast<unsigned long long>(blur_stats.total_area),
@@ -6641,12 +7003,12 @@ int main(int, char**)
                     s_last_frame_pacing_log_ms = tick_now_ms;
                     s_last_frame_pacing_frame = frame_number;
                     s_last_frame_pacing_skipped = skipped_render_frames;
-                    s_last_frame_pacing_input_events = s_input_event_count;
+                    s_last_frame_pacing_input_events = g_input_event_count;
                     static uint64_t s_last_runtime_acceptance_log_ms = 0;
                     if (s_last_runtime_acceptance_log_ms == 0 || tick_now_ms - s_last_runtime_acceptance_log_ms >= kAidaRuntimeAcceptanceLogIntervalMs) {
                         s_last_runtime_acceptance_log_ms = tick_now_ms;
                         diag::log_tagged_fmt("render",
-                            "runtime_acceptance_sample frame=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f sync=%u flags=0x%08X waitable=%d dirty_mask=0x%08X skipped_total=%llu overlay_visible=%d overlay_running=%d overlay_rendered=%zu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu wq_active=%u wq_pending=%zu svc_active=%u svc_pending=%zu cq_active=%u cq_pending=%zu",
+                            "runtime_acceptance_sample frame=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f sync=%u flags=0x%08X dirty_mask=0x%08X skipped_total=%llu overlay_visible=%d overlay_running=%d overlay_rendered=%zu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu wq_active=%u wq_pending=%zu svc_active=%u svc_pending=%zu cq_active=%u cq_pending=%zu",
                             static_cast<unsigned long long>(frame_number),
                             fps,
                             cpu.cpu_percent,
@@ -6655,9 +7017,8 @@ int main(int, char**)
                             gpu.valid ? 1 : 0,
                             gpu.pending ? 1 : 0,
                             gpu.gpu_ms,
-                            static_cast<unsigned>(kAidaPresentSyncInterval),
-                            static_cast<unsigned>(kAidaPresentFlags),
-                            pre_render_wait.waitable_present ? 1 : 0,
+                            static_cast<unsigned>(present_sync_interval),
+                            static_cast<unsigned>(present_flags),
                             static_cast<unsigned>(dirty_mask),
                             static_cast<unsigned long long>(skipped_render_frames),
                             overlay_perf.visible ? 1 : 0,
@@ -6825,33 +7186,16 @@ bool CreateDeviceD3D(HWND hWnd)
 
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
-    DXGI_SWAP_CHAIN_DESC optimized_sd = sd;
-    optimized_sd.BufferDesc.RefreshRate.Numerator = 0;
-    optimized_sd.BufferDesc.RefreshRate.Denominator = 1;
-    optimized_sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-#if defined(DXGI_SWAP_EFFECT_FLIP_DISCARD)
-    optimized_sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-#else
-    optimized_sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-#endif
-    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &optimized_sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
-    if (res == DXGI_ERROR_UNSUPPORTED)
-        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &optimized_sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
     if (FAILED(res)) {
         if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
         if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
         if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
-        g_SwapChainResizeFlags = 0;
-        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
-        if (res == DXGI_ERROR_UNSUPPORTED)
-            res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
-    } else {
-        g_SwapChainResizeFlags = optimized_sd.Flags;
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
     }
-    if (res != S_OK)
+    if (FAILED(res))
         return false;
 
-    configure_frame_latency_waitable();
     CreateRenderTarget();
     initialize_gpu_frame_queries();
     return true;
@@ -6861,11 +7205,9 @@ void CleanupDeviceD3D()
 {
     release_gpu_frame_queries();
     CleanupRenderTarget();
-    if (g_FrameLatencyWaitableObject) { CloseHandle(g_FrameLatencyWaitableObject); g_FrameLatencyWaitableObject = nullptr; }
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
-    g_SwapChainResizeFlags = 0;
     g_resize_perf.blur_w = 0;
     g_resize_perf.blur_h = 0;
 }
@@ -7065,8 +7407,8 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hWnd)));
         if (!foreground)
             return finish("hotkey_full_test_ignored_foreground", 0);
-        const bool accepted = test_all_features::trigger_from_hotkey("win32_ctrl_shift_t");
-        return finish(accepted ? "hotkey_full_test_accepted" : "hotkey_full_test_rejected", 0);
+        const bool posted = test_all_features::post_hotkey_trigger("win32_ctrl_shift_t");
+        return finish(posted ? "hotkey_full_test_posted" : "hotkey_full_test_not_posted", 0);
     }
 
     if (msg == WM_CLOSE ||

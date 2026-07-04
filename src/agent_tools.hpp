@@ -6,6 +6,7 @@
 #include <optional>
 #include <map>
 
+#include <nlohmann/json.hpp>
 #include <ida.hpp>
 #include <funcs.hpp>
 #include <bytes.hpp>
@@ -20,7 +21,6 @@
 #include <entry.hpp>
 #include <lines.hpp>
 #include <auto.hpp>
-#include <nlohmann/json.hpp>
 
 namespace agent_tools
 {

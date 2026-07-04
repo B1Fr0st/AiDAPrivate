@@ -3,9 +3,9 @@
 #include <string>
 #include <utility>
 
+#include <nlohmann/json.hpp>
 #include <ida.hpp>
 #include <typeinf.hpp>
-#include <nlohmann/json.hpp>
 
 class settings_t;
 

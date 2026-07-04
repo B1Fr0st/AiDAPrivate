@@ -4,6 +4,7 @@
 #include "microcode_engine.hpp"
 #include "vuln_signatures.hpp"
 
+#include <nlohmann/json.hpp>
 #include <ida.hpp>
 #include <funcs.hpp>
 #include <bytes.hpp>
@@ -18,7 +19,6 @@
 #include <allins.hpp>
 #include <hexrays.hpp>
 #include <demangle.hpp>
-#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>

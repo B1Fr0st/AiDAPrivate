@@ -28,10 +28,14 @@ std::atomic<std::uint64_t> g_blur_slow_callbacks{0};
 std::atomic<std::uint64_t> g_blur_slow_suppressed{0};
 std::atomic<std::uint64_t> g_blur_cache_reuse{0};
 std::atomic<std::uint64_t> g_blur_adaptive_fallback{0};
+std::atomic<std::uint64_t> g_blur_interactive_fallback{0};
+std::atomic<std::uint64_t> g_blur_throttle_fallback{0};
 std::atomic<std::uint64_t> g_blur_cache_rect_key{0};
 std::atomic<std::uint64_t> g_blur_cache_last_ms{0};
 std::atomic<std::uint64_t> g_blur_last_cache_age_ms{0};
 std::atomic<std::uint64_t> g_blur_pressure_until_ms{0};
+std::atomic<std::uint64_t> g_blur_input_pressure_until_ms{0};
+std::atomic<std::uint64_t> g_blur_last_compute_ms{0};
 std::atomic<std::uint64_t> g_blur_total_area{0};
 std::atomic<std::uint64_t> g_blur_last_area{0};
 std::atomic<std::uint64_t> g_blur_total_elapsed_ms{0};
@@ -269,8 +273,9 @@ static void BlurCallback(const ImDrawList*, const ImDrawCmd* cmd)
         g_blur_cache_rect_key.store(blur_rect_key(data->min, data->max, Blur::s_w, Blur::s_h), std::memory_order_release);
         g_blur_cache_last_ms.store(now_ms, std::memory_order_release);
         g_blur_last_cache_age_ms.store(0, std::memory_order_release);
+        g_blur_last_compute_ms.store(now_ms, std::memory_order_release);
         if (elapsed >= 8)
-            g_blur_pressure_until_ms.store(now_ms + 250ULL, std::memory_order_release);
+            g_blur_pressure_until_ms.store(now_ms + 2000ULL, std::memory_order_release);
     }
     if (elapsed >= 8) {
         const std::uint64_t slow_count = g_blur_slow_callbacks.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -341,8 +346,11 @@ void Blur::Draw(ImDrawList* dl, ImVec2 min, ImVec2 max)
     const std::uint64_t cached_key = g_blur_cache_rect_key.load(std::memory_order_acquire);
     const std::uint64_t cached_ms = g_blur_cache_last_ms.load(std::memory_order_acquire);
     const std::uint64_t pressure_until = g_blur_pressure_until_ms.load(std::memory_order_acquire);
+    const std::uint64_t input_pressure_until = g_blur_input_pressure_until_ms.load(std::memory_order_acquire);
+    const std::uint64_t last_compute_ms = g_blur_last_compute_ms.load(std::memory_order_acquire);
     const bool cache_usable = cached_key == rect_key && cached_ms != 0 && now_ms >= cached_ms && now_ms - cached_ms <= 250ULL;
-    if (cache_usable && now_ms < pressure_until) {
+    const bool interactive_pressure = input_pressure_until != 0 && now_ms < input_pressure_until;
+    if (cache_usable && (now_ms < pressure_until || interactive_pressure)) {
         const std::uint64_t cache_age_ms = now_ms - cached_ms;
         g_blur_cache_reuse.fetch_add(1, std::memory_order_acq_rel);
         g_blur_last_cache_age_ms.store(cache_age_ms, std::memory_order_release);
@@ -352,23 +360,45 @@ void Blur::Draw(ImDrawList* dl, ImVec2 min, ImVec2 max)
         dl->AddLine(ImVec2(min.x + 2, min.y + 1), ImVec2(max.x - 2, min.y + 1), aida::ui::with_alpha(th.border_strong, 1.5f));
         return;
     }
-    if (now_ms < pressure_until && cached_ms == 0) {
+    if (interactive_pressure) {
+        g_blur_interactive_fallback.fetch_add(1, std::memory_order_acq_rel);
+        blur_draw_fallback(dl, min, max, 0.30f);
+        return;
+    }
+    if (now_ms < pressure_until) {
         g_blur_adaptive_fallback.fetch_add(1, std::memory_order_acq_rel);
         static ULONGLONG s_last_fallback_log = 0;
         ULONGLONG now = GetTickCount64();
         if (s_last_fallback_log == 0 || now - s_last_fallback_log >= 5000) {
             s_last_fallback_log = now;
             diag::log_tagged_fmt("render",
-                "blur_adaptive_fallback reason=no_cache min=%d,%d max=%d,%d w=%d h=%d pressure_remaining_ms=%llu",
+                "blur_adaptive_fallback reason=pressure min=%d,%d max=%d,%d w=%d h=%d pressure_remaining_ms=%llu cache_age_ms=%llu cached_key_match=%d",
                 static_cast<int>(min.x),
                 static_cast<int>(min.y),
                 static_cast<int>(max.x),
                 static_cast<int>(max.y),
                 s_w,
                 s_h,
-                static_cast<unsigned long long>(pressure_until - now_ms));
+                static_cast<unsigned long long>(pressure_until - now_ms),
+                cached_ms != 0 && now_ms >= cached_ms ? static_cast<unsigned long long>(now_ms - cached_ms) : 0ULL,
+                cached_key == rect_key ? 1 : 0);
         }
         blur_draw_fallback(dl, min, max, 0.30f);
+        return;
+    }
+    if (last_compute_ms != 0 && now_ms >= last_compute_ms && now_ms - last_compute_ms < 250ULL) {
+        g_blur_throttle_fallback.fetch_add(1, std::memory_order_acq_rel);
+        if (cache_usable) {
+            const std::uint64_t cache_age_ms = now_ms - cached_ms;
+            g_blur_cache_reuse.fetch_add(1, std::memory_order_acq_rel);
+            g_blur_last_cache_age_ms.store(cache_age_ms, std::memory_order_release);
+            dl->AddImage((ImTextureID)s_srv[2], min, max);
+            blur_draw_fallback(dl, min, max, 2.0f);
+            const auto& th = aida::ui::resolved();
+            dl->AddLine(ImVec2(min.x + 2, min.y + 1), ImVec2(max.x - 2, min.y + 1), aida::ui::with_alpha(th.border_strong, 1.5f));
+        } else {
+            blur_draw_fallback(dl, min, max, 0.30f);
+        }
         return;
     }
 
@@ -399,8 +429,11 @@ Blur::Stats Blur::SnapshotStats()
     s.slow_suppressed = g_blur_slow_suppressed.load(std::memory_order_acquire);
     s.cache_reuse = g_blur_cache_reuse.load(std::memory_order_acquire);
     s.adaptive_fallback = g_blur_adaptive_fallback.load(std::memory_order_acquire);
+    s.interactive_fallback = g_blur_interactive_fallback.load(std::memory_order_acquire);
+    s.throttle_fallback = g_blur_throttle_fallback.load(std::memory_order_acquire);
     s.last_cache_age_ms = g_blur_last_cache_age_ms.load(std::memory_order_acquire);
     s.pressure_until_ms = g_blur_pressure_until_ms.load(std::memory_order_acquire);
+    s.input_pressure_until_ms = g_blur_input_pressure_until_ms.load(std::memory_order_acquire);
     s.total_area = g_blur_total_area.load(std::memory_order_acquire);
     s.last_area = g_blur_last_area.load(std::memory_order_acquire);
     s.total_elapsed_ms = g_blur_total_elapsed_ms.load(std::memory_order_acquire);
@@ -426,6 +459,8 @@ void Blur::Resize(int w, int h)
     g_blur_cache_last_ms.store(0, std::memory_order_release);
     g_blur_last_cache_age_ms.store(0, std::memory_order_release);
     g_blur_pressure_until_ms.store(0, std::memory_order_release);
+    g_blur_input_pressure_until_ms.store(0, std::memory_order_release);
+    g_blur_last_compute_ms.store(0, std::memory_order_release);
 
     if (s_copy) { s_copy->Release(); s_copy = nullptr; }
     if (s_pingpong[0]) { s_pingpong[0]->Release(); s_pingpong[0] = nullptr; }
@@ -463,6 +498,8 @@ void Blur::Shutdown()
     g_blur_cache_last_ms.store(0, std::memory_order_release);
     g_blur_last_cache_age_ms.store(0, std::memory_order_release);
     g_blur_pressure_until_ms.store(0, std::memory_order_release);
+    g_blur_input_pressure_until_ms.store(0, std::memory_order_release);
+    g_blur_last_compute_ms.store(0, std::memory_order_release);
     if (s_copy) { s_copy->Release();        s_copy = nullptr; }
     if (s_pingpong[0]) { s_pingpong[0]->Release(); s_pingpong[0] = nullptr; }
     if (s_pingpong[1]) { s_pingpong[1]->Release(); s_pingpong[1] = nullptr; }
@@ -473,4 +510,24 @@ void Blur::Shutdown()
     if (s_vs) { s_vs->Release();     s_vs = nullptr; }
     if (s_sampler) { s_sampler->Release(); s_sampler = nullptr; }
     if (s_cb) { s_cb->Release();     s_cb = nullptr; }
+}
+
+void Blur::SetInteractionPressure(bool active, std::uint64_t until_ms)
+{
+    if (!active) {
+        const std::uint64_t current = g_blur_input_pressure_until_ms.load(std::memory_order_acquire);
+        if (current <= until_ms)
+            g_blur_input_pressure_until_ms.store(0, std::memory_order_release);
+        return;
+    }
+    std::uint64_t observed = g_blur_input_pressure_until_ms.load(std::memory_order_acquire);
+    while (observed < until_ms &&
+        !g_blur_input_pressure_until_ms.compare_exchange_weak(observed, until_ms, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+bool Blur::InteractionPressureActive()
+{
+    const std::uint64_t until_ms = g_blur_input_pressure_until_ms.load(std::memory_order_acquire);
+    return until_ms != 0 && static_cast<std::uint64_t>(GetTickCount64()) < until_ms;
 }

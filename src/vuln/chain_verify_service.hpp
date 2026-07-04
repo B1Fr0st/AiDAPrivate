@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 
+#include <ida.hpp>
 #include <kernwin.hpp>
 
 namespace aida

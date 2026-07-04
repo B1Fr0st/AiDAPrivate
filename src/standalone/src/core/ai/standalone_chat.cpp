@@ -238,14 +238,16 @@ std::string get_chat_last_assistant_message_id_locked()
 
 
 mcp_standalone::server_t s_mcp_server;
-bool                     s_server_started = false;
-bool                     s_initialized    = false;
-bool                     s_mcp_tools_registered = false;
+std::atomic<bool>        s_server_started{false};
+std::atomic<bool>        s_initialized{false};
+std::atomic<bool>        s_mcp_tools_registered{false};
 std::atomic<bool>        s_ide_ready_for_mcp_services{false};
 std::atomic<bool>        s_mcp_shutdown_in_flight{false};
+std::atomic<bool>        s_mcp_start_in_flight{false};
+std::atomic<uint64_t>    s_mcp_start_last_post_ms{0};
 
 
-bool                  s_mcp_clients_connected = false;
+std::atomic<bool>        s_mcp_clients_connected{false};
 
 
 struct tool_approval_t {
@@ -348,6 +350,158 @@ void queue_mcp_services_shutdown(const char* reason, bool stop_server, bool disc
             stop_server ? 1 : 0,
             disconnect_clients ? 1 : 0);
     }
+}
+
+struct mcp_start_in_flight_guard_t
+{
+    ~mcp_start_in_flight_guard_t()
+    {
+        s_mcp_start_in_flight.store(false, std::memory_order_release);
+    }
+};
+
+void start_authorized_mcp_services_worker()
+{
+    mcp_start_in_flight_guard_t guard;
+    const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+
+    if (s_mcp_shutdown_in_flight.load(std::memory_order_acquire)) {
+        diag::log_tagged("init_chat", "authorized_mcp_services_start_worker_deferred_shutdown_in_flight");
+        return;
+    }
+
+    if (!anti_tamper::mcp_posture::is_current_posture_trusted())
+    {
+        mcp_standalone::set_ide_lifecycle_ready(false);
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_services_blocked_mcp_posture summary_hash=0x%016llX",
+            static_cast<unsigned long long>(anti_tamper::mcp_posture::cached_summary_hash()));
+        return;
+    }
+
+    std::string missing_exports;
+    const bool ide_ready = s_ide_ready_for_mcp_services.load(std::memory_order_acquire);
+    const bool valid = license::validated && standalone_license::is_valid();
+    const bool arc_loaded = standalone_license::is_arc_loaded();
+    const bool exports_ok = valid && arc_loaded && standalone_license::validate_arc_required_exports(missing_exports);
+    if (!ide_ready || !valid || !arc_loaded || !exports_ok)
+    {
+        mcp_standalone::set_ide_lifecycle_ready(false);
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_services_blocked ide=%d validated=%d valid=%d arc=%d exports=%d missing='%.160s'",
+            ide_ready ? 1 : 0,
+            license::validated ? 1 : 0,
+            standalone_license::is_valid() ? 1 : 0,
+            standalone_license::is_arc_loaded() ? 1 : 0,
+            exports_ok ? 1 : 0,
+            missing_exports.c_str());
+        return;
+    }
+
+    mcp_standalone::set_ide_lifecycle_ready(true);
+
+    bool tools_expected = false;
+    if (s_mcp_tools_registered.compare_exchange_strong(tools_expected, true, std::memory_order_acq_rel))
+    {
+        try {
+            diag::log_tagged("init_chat", "authorized_mcp_register_tools_start");
+            mcp_standalone::register_standalone_tools(s_mcp_server);
+            diag::log_tagged("init_chat", "authorized_mcp_register_tools_done");
+        } catch (const std::exception& e) {
+            s_mcp_tools_registered.store(false, std::memory_order_release);
+            diag::log_tagged_fmt("init_chat", "authorized_mcp_register_tools_exception what=%s", e.what());
+            return;
+        } catch (...) {
+            s_mcp_tools_registered.store(false, std::memory_order_release);
+            diag::log_tagged("init_chat", "authorized_mcp_register_tools_exception what=<unknown>");
+            return;
+        }
+    }
+
+    if (s_mcp_shutdown_in_flight.load(std::memory_order_acquire)) {
+        diag::log_tagged("init_chat", "authorized_mcp_services_start_worker_cancelled_after_register_shutdown_in_flight");
+        return;
+    }
+
+    if (g_sa_settings.mcp_enabled && !s_server_started.load(std::memory_order_acquire))
+    {
+        static auto s_last_start_attempt = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (s_last_start_attempt != std::chrono::steady_clock::time_point{} &&
+            std::chrono::duration_cast<std::chrono::seconds>(now - s_last_start_attempt).count() < 2)
+        {
+            return;
+        }
+        s_last_start_attempt = now;
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_server_start port=%d ide=%d validated=%d valid=%d arc=%d exports=%d tid=%lu",
+            g_sa_settings.mcp_port,
+            ide_ready ? 1 : 0,
+            license::validated ? 1 : 0,
+            standalone_license::is_valid() ? 1 : 0,
+            standalone_license::is_arc_loaded() ? 1 : 0,
+            exports_ok ? 1 : 0,
+            GetCurrentThreadId());
+        bool server_start_result = false;
+        try {
+            server_start_result = s_mcp_server.start(g_sa_settings.mcp_port);
+        } catch (const std::exception& e) {
+            diag::log_tagged_fmt("init_chat", "authorized_mcp_server_start_exception what=%s", e.what());
+        } catch (...) {
+            diag::log_tagged("init_chat", "authorized_mcp_server_start_exception what=<unknown>");
+        }
+        if (server_start_result)
+        {
+            s_server_started.store(true, std::memory_order_release);
+            bool posted = critical_work_queue::post_labeled("authorized_mcp_write_client_configs", [] {
+                try {
+                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_start");
+                    s_mcp_server.write_client_configs();
+                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_done");
+                } catch (const std::exception& e) {
+                    diag::log_tagged_fmt("init_chat", "authorized_mcp_write_client_configs_cpp_exception what=%s", e.what());
+                } catch (...) {
+                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_cpp_exception what=<unknown>");
+                }
+            });
+            if (!posted)
+                diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_critical_post_failed");
+        }
+        diag::log_tagged_fmt("init_chat",
+            "authorized_mcp_server_start_done started=%d elapsed_ms=%llu",
+            s_server_started.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+    }
+
+    if (!s_mcp_clients_connected.load(std::memory_order_acquire))
+    {
+        try {
+            diag::log_tagged("init_chat", "authorized_mcp_client_connect_all_start");
+            s_mcp_client_mgr.connect_all();
+            auto installed = mcp_marketplace::get_installed();
+            for (auto& srv : installed)
+            {
+                if (srv.enabled && srv.auto_connect)
+                    mcp_marketplace::activate_server(srv);
+            }
+            s_mcp_clients_connected.store(true, std::memory_order_release);
+            diag::log_tagged_fmt("init_chat", "authorized_marketplace_autoconnect_done count=%zu", installed.size());
+            diag::log_tagged("init_chat", "authorized_mcp_client_connect_all_done");
+        } catch (const std::exception& e) {
+            s_mcp_clients_connected.store(false, std::memory_order_release);
+            diag::log_tagged_fmt("init_chat", "authorized_mcp_client_connect_all_exception what=%s", e.what());
+        } catch (...) {
+            s_mcp_clients_connected.store(false, std::memory_order_release);
+            diag::log_tagged("init_chat", "authorized_mcp_client_connect_all_exception what=<unknown>");
+        }
+    }
+
+    diag::log_tagged_fmt("init_chat",
+        "authorized_mcp_services_start_worker_exit server=%d clients=%d tools=%d elapsed_ms=%llu",
+        s_server_started.load(std::memory_order_acquire) ? 1 : 0,
+        s_mcp_clients_connected.load(std::memory_order_acquire) ? 1 : 0,
+        s_mcp_tools_registered.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
 }
 
 const std::string& tool_approval_last_deny_reason()
@@ -2273,7 +2427,7 @@ __declspec(noinline) static DWORD seh_restore_workspace_state()
 
 void init_standalone_chat()
 {
-    if (s_initialized) return;
+    if (s_initialized.load(std::memory_order_acquire)) return;
 
     const std::string run_id = standalone_license::run_correlation_id();
     diag::log_tagged_fmt("init_chat", "startup_context run_id=%s pid=%lu tid=%lu",
@@ -2490,16 +2644,16 @@ void init_standalone_chat()
 
     output_log::push(bottom_tab_t::output, "[init] AiDA Standalone initialized");
     output_log::push(bottom_tab_t::output, "[init] License: " + std::string(license::validated ? "valid" : "not validated"));
-    if (s_server_started)
+    if (s_server_started.load(std::memory_order_acquire))
         output_log::push(bottom_tab_t::mcp_log, "[mcp-server] Started on port " + std::to_string(g_sa_settings.mcp_port));
     output_log::push(bottom_tab_t::driver_log, "[driver] Bridge initialized");
 
-    s_initialized = true;
+    s_initialized.store(true, std::memory_order_release);
 }
 
 void start_authorized_mcp_services()
 {
-    if (!s_initialized)
+    if (!s_initialized.load(std::memory_order_acquire))
         return;
 
     if (s_mcp_shutdown_in_flight.load(std::memory_order_acquire)) {
@@ -2558,66 +2712,46 @@ void start_authorized_mcp_services()
 
     mcp_standalone::set_ide_lifecycle_ready(true);
 
-    if (!s_mcp_tools_registered)
+    const bool server_ready = !g_sa_settings.mcp_enabled || s_server_started.load(std::memory_order_acquire);
+    const bool tools_ready = s_mcp_tools_registered.load(std::memory_order_acquire);
+    const bool clients_ready = s_mcp_clients_connected.load(std::memory_order_acquire);
+    if (tools_ready && server_ready && clients_ready)
+        return;
+
+    const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+    const uint64_t last_post_ms = s_mcp_start_last_post_ms.load(std::memory_order_acquire);
+    if (last_post_ms != 0 && now_ms >= last_post_ms && now_ms - last_post_ms < 2000ULL)
+        return;
+
+    bool expected = false;
+    if (!s_mcp_start_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
     {
-        diag::log_tagged("init_chat", "authorized_mcp_register_tools_start");
-        mcp_standalone::register_standalone_tools(s_mcp_server);
-        s_mcp_tools_registered = true;
-        diag::log_tagged("init_chat", "authorized_mcp_register_tools_done");
+        static std::atomic<uint64_t> s_last_in_flight_log_ms{0};
+        const uint64_t last_log_ms = s_last_in_flight_log_ms.load(std::memory_order_acquire);
+        if (last_log_ms == 0 || now_ms - last_log_ms >= 2000ULL) {
+            s_last_in_flight_log_ms.store(now_ms, std::memory_order_release);
+            diag::log_tagged("init_chat", "authorized_mcp_services_start_already_in_flight");
+        }
+        return;
     }
 
-    if (g_sa_settings.mcp_enabled && !s_server_started)
-    {
-        static auto s_last_start_attempt = std::chrono::steady_clock::time_point{};
-        auto now = std::chrono::steady_clock::now();
-        if (s_last_start_attempt != std::chrono::steady_clock::time_point{} &&
-            std::chrono::duration_cast<std::chrono::seconds>(now - s_last_start_attempt).count() < 2)
-        {
-            return;
-        }
-        s_last_start_attempt = now;
-        diag::log_tagged_fmt("init_chat",
-            "authorized_mcp_server_start port=%d ide=%d validated=%d valid=%d arc=%d exports=%d",
-            g_sa_settings.mcp_port,
-            ide_ready ? 1 : 0,
-            license::validated ? 1 : 0,
-            standalone_license::is_valid() ? 1 : 0,
-            standalone_license::is_arc_loaded() ? 1 : 0,
-            exports_ok ? 1 : 0);
-        if (s_mcp_server.start(g_sa_settings.mcp_port))
-        {
-            s_server_started = true;
-            bool posted = critical_work_queue::post([] {
-                try {
-                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_start");
-                    s_mcp_server.write_client_configs();
-                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_done");
-                } catch (const std::exception& e) {
-                    diag::log_tagged_fmt("init_chat", "authorized_mcp_write_client_configs_cpp_exception what=%s", e.what());
-                } catch (...) {
-                    diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_cpp_exception what=<unknown>");
-                }
-            });
-            if (!posted)
-                diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_critical_post_failed");
-        }
-        diag::log_tagged_fmt("init_chat", "authorized_mcp_server_start_done started=%d", s_server_started ? 1 : 0);
+    s_mcp_start_last_post_ms.store(now_ms, std::memory_order_release);
+    bool posted = work_queue::post_service_labeled("authorized_mcp_services_start", [] {
+        start_authorized_mcp_services_worker();
+    });
+    if (!posted) {
+        posted = critical_work_queue::post_labeled("authorized_mcp_services_start", [] {
+            start_authorized_mcp_services_worker();
+        });
     }
-
-    if (!s_mcp_clients_connected)
-    {
-        diag::log_tagged("init_chat", "authorized_mcp_client_connect_all_start");
-        s_mcp_client_mgr.connect_all();
-        s_mcp_clients_connected = true;
-        diag::log_tagged("init_chat", "authorized_mcp_client_connect_all_done");
-
-        auto installed = mcp_marketplace::get_installed();
-        for (auto& srv : installed)
-        {
-            if (srv.enabled && srv.auto_connect)
-                mcp_marketplace::activate_server(srv);
-        }
-        diag::log_tagged_fmt("init_chat", "authorized_marketplace_autoconnect_done count=%zu", installed.size());
+    if (!posted) {
+        posted = work_queue::post_labeled("authorized_mcp_services_start", [] {
+            start_authorized_mcp_services_worker();
+        });
+    }
+    if (!posted) {
+        s_mcp_start_in_flight.store(false, std::memory_order_release);
+        diag::log_tagged("init_chat", "authorized_mcp_services_start_post_failed");
     }
 }
 
@@ -2645,14 +2779,14 @@ void shutdown_standalone_chat()
     }
     ULONGLONG producer_start = shutdown_phase_begin("producer_stop");
     s_mcp_server.stop();
-    s_server_started = false;
+    s_server_started.store(false, std::memory_order_release);
     mcp_standalone::set_ide_lifecycle_ready(false);
     s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
 
 
-    if (s_mcp_clients_connected) {
+    if (s_mcp_clients_connected.load(std::memory_order_acquire)) {
         s_mcp_client_mgr.disconnect_all();
-        s_mcp_clients_connected = false;
+        s_mcp_clients_connected.store(false, std::memory_order_release);
     }
 
 
@@ -2707,7 +2841,7 @@ void shutdown_standalone_chat()
     g_sa_ai_client.reset();
     shutdown_phase_done("persist_state", persist_start);
 
-    s_initialized = false;
+    s_initialized.store(false, std::memory_order_release);
     log_shutdown_queue_snapshot("shutdown_done");
     shutdown_phase_done("shutdown_standalone_chat", shutdown_start);
     diag::log_tagged_critical("chat", "shutdown_standalone_chat done");
@@ -2716,7 +2850,7 @@ void shutdown_standalone_chat()
 
 void tick_ai_chat()
 {
-    if (!s_initialized) return;
+    if (!s_initialized.load(std::memory_order_acquire)) return;
     if (g_chat_messages.empty()) return;
 
     auto& last = g_chat_messages.back();
@@ -2912,7 +3046,7 @@ void tick_ai_chat()
 
 void poll_ai_chat()
 {
-    if (!s_initialized) return;
+    if (!s_initialized.load(std::memory_order_acquire)) return;
 
     if (license::validated && !standalone_license::is_valid()) {
         const bool runtime_locked = anti_tamper::state::get().violation_latched.load(std::memory_order_acquire);
@@ -2936,10 +3070,8 @@ void poll_ai_chat()
                 GetCurrentThreadId(), runtime_locked ? 1 : 0, license::error_msg.c_str());
             mcp_standalone::set_ide_lifecycle_ready(false);
             s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
-            const bool stop_server = s_server_started;
-            const bool disconnect_clients = s_mcp_clients_connected;
-            s_server_started = false;
-            s_mcp_clients_connected = false;
+            const bool stop_server = s_server_started.exchange(false, std::memory_order_acq_rel);
+            const bool disconnect_clients = s_mcp_clients_connected.exchange(false, std::memory_order_acq_rel);
             if (stop_server) {
                 diag::log_tagged("init_chat", "authorized_mcp_server_stop_auth_lost");
             }
@@ -2952,7 +3084,7 @@ void poll_ai_chat()
 
     {
         std::string lifecycle_reason;
-        if ((s_server_started || s_mcp_clients_connected) &&
+        if ((s_server_started.load(std::memory_order_acquire) || s_mcp_clients_connected.load(std::memory_order_acquire)) &&
             !mcp_standalone::lifecycle_authorized(&lifecycle_reason))
         {
             diag::log_tagged_fmt("init_chat",
@@ -2960,10 +3092,8 @@ void poll_ai_chat()
                 lifecycle_reason.c_str());
             mcp_standalone::set_ide_lifecycle_ready(false);
             s_ide_ready_for_mcp_services.store(false, std::memory_order_release);
-            const bool stop_server = s_server_started;
-            const bool disconnect_clients = s_mcp_clients_connected;
-            s_server_started = false;
-            s_mcp_clients_connected = false;
+            const bool stop_server = s_server_started.exchange(false, std::memory_order_acq_rel);
+            const bool disconnect_clients = s_mcp_clients_connected.exchange(false, std::memory_order_acq_rel);
             queue_mcp_services_shutdown(lifecycle_reason.c_str(), stop_server, disconnect_clients);
         }
     }

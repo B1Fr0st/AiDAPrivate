@@ -85,6 +85,9 @@ static std::atomic<uint64_t> s_render_log_rows_accum{0};
 static std::atomic<uint64_t> s_bytes_overflow_log_last_ns{0};
 static std::atomic<uint64_t> s_bytes_overflow_log_seen{0};
 static std::atomic<uint32_t> s_bytes_overflow_log_max_len{0};
+static bool s_rebase_popup_open = false;
+static char s_rebase_buf[64] = {};
+static std::string s_rebase_error;
 
 static inline uint64_t now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -180,6 +183,118 @@ static void copy_text_to_clipboard(const std::string& text)
 #else
     (void)text;
 #endif
+}
+
+static std::string trim_ascii_local(std::string s)
+{
+    auto is_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    };
+    while (!s.empty() && is_ws(s.front()))
+        s.erase(s.begin());
+    while (!s.empty() && is_ws(s.back()))
+        s.pop_back();
+    return s;
+}
+
+static bool parse_hex_u64_text(const char* text, uint64_t& out)
+{
+    out = 0;
+    if (!text) return false;
+    std::string s = trim_ascii_local(text);
+    if (s.empty()) return false;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        s = s.substr(2);
+    if (s.empty()) return false;
+    for (char c : s) {
+        bool is_hex = (c >= '0' && c <= '9') ||
+                      (c >= 'a' && c <= 'f') ||
+                      (c >= 'A' && c <= 'F');
+        if (!is_hex) return false;
+    }
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(s.c_str(), &end, 16);
+    if (!end || *end != '\0')
+        return false;
+    out = static_cast<uint64_t>(parsed);
+    return out != 0;
+}
+
+static bool shift_va(uint64_t& value, uint64_t old_base, uint64_t new_base)
+{
+    if (value == 0) return true;
+    if (new_base >= old_base) {
+        uint64_t delta = new_base - old_base;
+        if (value > UINT64_MAX - delta)
+            return false;
+        value += delta;
+        return true;
+    }
+    uint64_t delta = old_base - new_base;
+    if (value < delta)
+        return false;
+    value -= delta;
+    return true;
+}
+
+void bump_format_generation();
+static void clear_rebase_caches();
+
+static bool rebase_loaded_file(DisasmState& disasm, uint64_t new_base)
+{
+    if (disasm.live_mode || !disasm.file.loaded || disasm.file.sections.empty() || new_base == 0)
+        return false;
+    DisasmFile& file = disasm.file;
+    const uint64_t old_base = file.image_base;
+    if (old_base == 0)
+        return false;
+    if (old_base == new_base)
+        return true;
+
+    DisasmFile rebased = file;
+    rebased.image_base = new_base;
+    if (!shift_va(rebased.entry_point, old_base, new_base) ||
+        !shift_va(rebased.text_va, old_base, new_base))
+        return false;
+    for (auto& section : rebased.sections) {
+        if (!shift_va(section.va, old_base, new_base))
+            return false;
+    }
+    disasm::decode_section(rebased);
+    file = std::move(rebased);
+    function_index::on_file_loaded();
+    xref_index::on_file_loaded();
+    aida::events::binary_loaded_t payload;
+    payload.binary_path = file.path;
+    payload.image_base = file.image_base;
+    uint64_t total = 0;
+    for (const auto& sec : file.sections)
+        total += static_cast<uint64_t>(sec.bytes.size());
+    payload.image_size = (total > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(total);
+    aida::events::publish(aida::events::event_binary_loaded, payload);
+    clear_rebase_caches();
+    diag::log_tagged_fmt("disasm_view", "rebase_applied old_base=0x%llX new_base=0x%llX instrs=%zu",
+        static_cast<unsigned long long>(old_base),
+        static_cast<unsigned long long>(new_base),
+        file.instrs.size());
+    return true;
+}
+
+static bool can_rebase_disasm(const DisasmState& disasm)
+{
+    return !disasm.live_mode &&
+           disasm.file.loaded &&
+           disasm.file.image_base != 0 &&
+           !disasm.file.sections.empty();
+}
+
+static void open_rebase_popup(const DisasmFile& file)
+{
+    std::snprintf(s_rebase_buf, sizeof(s_rebase_buf), "0x%llX",
+        static_cast<unsigned long long>(file.image_base));
+    s_rebase_error.clear();
+    s_rebase_popup_open = true;
+    ImGui::OpenPopup("Rebase###disasm_rebase_modal");
 }
 
 struct colored_run_t {
@@ -363,6 +478,20 @@ struct line_layout_t {
 
 static line_layout_t s_layout;
 static constexpr int kVirtualFlatStaticLayoutThreshold = 250000;
+
+static void clear_rebase_caches()
+{
+    s_instr_cache_hot.clear();
+    s_instr_cache_cold.clear();
+    s_row_hover.clear();
+    s_banner_row_hover.clear();
+    s_row_entrance.clear();
+    s_banner_cache.clear();
+    s_banner_cache_signature.store(0, std::memory_order_release);
+    s_layout.ready = false;
+    s_last_known_n = 0;
+    bump_format_generation();
+}
 
 template <typename T>
 static void release_layout_vector(std::vector<T>& v) {
@@ -4785,6 +4914,17 @@ void render(float pos_x, float pos_y, float width, float height,
     float oy_content = oy + nav_band_h;
     float content_height = height - nav_band_h;
 
+    if (can_rebase_disasm(disasm)) {
+        ImGui::SetCursorScreenPos(ImVec2(ox + width - 92.f, oy_content + 8.f));
+        ImGui::PushID("##disasm_rebase_button");
+        if (aida::ui::components::button("Rebase", aida::ui::components::button_kind_t::secondary,
+                                          aida::ui::components::size_t_::sm,
+                                          ImVec2(78.f, 0.f))) {
+            open_rebase_popup(file);
+        }
+        ImGui::PopID();
+    }
+
     {
         uint64_t fmb_state = static_cast<uint64_t>(
             file_metadata_banner::detail::cache().state.load(std::memory_order_acquire));
@@ -6901,6 +7041,19 @@ void render(float pos_x, float pos_y, float width, float height,
         if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false))
             st.goto_visible = !st.goto_visible;
 
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            bool locked = io.WantTextInput || ImGui::IsAnyItemActive();
+            if (can_rebase_disasm(disasm)
+                && io.KeyCtrl
+                && !io.KeyShift
+                && !io.KeyAlt
+                && !locked
+                && ImGui::IsKeyPressed(ImGuiKey_R, false))
+            {
+                open_rebase_popup(file);
+            }
+        }
 
         if (ImGui::GetIO().KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
             navigate_back();
@@ -7131,6 +7284,62 @@ void render(float pos_x, float pos_y, float width, float height,
             if (copy_hk_io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
                 dump_full_listing_to_file();
             }
+        }
+    }
+
+
+    if (s_rebase_popup_open) {
+        ImGui::SetNextWindowSize(ImVec2(420.f, 0.f), ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        bool open_flag = true;
+        if (ImGui::BeginPopupModal("Rebase###disasm_rebase_modal", &open_flag,
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::TextUnformatted("Image base");
+            ImGui::PushItemWidth(300.f);
+            if (ImGui::IsWindowAppearing())
+                ImGui::SetKeyboardFocusHere();
+            bool apply_rebase = ImGui::InputTextWithHint("##rebase_image_base",
+                "0x140000000",
+                s_rebase_buf,
+                sizeof(s_rebase_buf),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::PopItemWidth();
+            if (!s_rebase_error.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.error));
+                ImGui::TextWrapped("%s", s_rebase_error.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::Spacing();
+            if (aida::ui::components::button("Apply", aida::ui::components::button_kind_t::primary,
+                                              aida::ui::components::size_t_::sm))
+                apply_rebase = true;
+            ImGui::SameLine();
+            bool cancel_rebase = aida::ui::components::button("Cancel", aida::ui::components::button_kind_t::secondary,
+                                                              aida::ui::components::size_t_::sm)
+                || ImGui::IsKeyPressed(ImGuiKey_Escape, false)
+                || !open_flag;
+
+            if (apply_rebase) {
+                uint64_t new_base = 0;
+                if (!parse_hex_u64_text(s_rebase_buf, new_base)) {
+                    s_rebase_error = "Invalid image base.";
+                } else if (!rebase_loaded_file(disasm, new_base)) {
+                    s_rebase_error = "Rebase failed.";
+                } else {
+                    s_rebase_popup_open = false;
+                    ImGui::CloseCurrentPopup();
+                }
+            } else if (cancel_rebase) {
+                s_rebase_popup_open = false;
+                s_rebase_error.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        } else if (!open_flag) {
+            s_rebase_popup_open = false;
+            s_rebase_error.clear();
         }
     }
 

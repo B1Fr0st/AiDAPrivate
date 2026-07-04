@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <ida.hpp>
 #include <kernwin.hpp>
-#include <nlohmann/json.hpp>
 
 namespace aida
 {

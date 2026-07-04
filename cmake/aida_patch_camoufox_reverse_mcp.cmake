@@ -110,6 +110,10 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "def _mark_page_terminal"
         "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK"
         "aida_camoufox_bridge_20260620_crash_diag_1"
+        "aida_launch_budget_policy_v1"
+        "aida_resolve_launch_budget_policy"
+        "aida_validate_launch_budget_policy"
+        "aida_retry_launch_timeout_ms"
         "aida_bridge_patch_active"
         "aida_launch_policy_resolved"
         "context_close_event"
@@ -140,6 +144,9 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
     foreach(AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER IN ITEMS
         "_aida_apply_playwright_pageerror_patch"
         "patch_playwright_pageerror"
+        "aida_launch_budget_policy_v1"
+        "launch_budget_policy_marker_present"
+        "launch_budget_retry_contract_ok"
         "playwright_patch=playwright_patch")
         string(FIND "${AIDA_CAMOUFOX_REPO_MAIN_CONTENT}" "${AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER}" AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER_POS)
         if(AIDA_CAMOUFOX_REQUIRED_MAIN_MARKER_POS EQUAL -1)
@@ -176,6 +183,8 @@ if(EXISTS "${AIDA_CAMOUFOX_REPO_BROWSER_PATH}" AND EXISTS "${AIDA_CAMOUFOX_REPO_
         "node_exit_code"
         "camoufox_child_exits"
         "cloudflare"
+        "aida_clamp_navigation_timeout_ms"
+        "aida_resolve_launch_budget_policy"
         "nav_timeout_ms"
         "\"timeout_ms\": nav_timeout_ms"
         "_await_no_cancel_wait(page.evaluate(\"document.readyState\")"
@@ -284,6 +293,13 @@ foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
     set(AIDA_CAMOUFOX_NAV_ORIGINAL "${AIDA_CAMOUFOX_NAV_CONTENT}")
     string(REPLACE "\r\n" "\n" AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
     string(REPLACE "\r" "\n" AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+
+    if(NOT AIDA_CAMOUFOX_NAV_CONTENT MATCHES "AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS")
+        string(REPLACE
+            "from ..browser import "
+            "from ..browser import AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS, "
+            AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
+    endif()
 
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "service_workers: str | None = None" AIDA_CAMOUFOX_NAV_SERVICE_WORKERS_SIG_POS)
     if(AIDA_CAMOUFOX_NAV_SERVICE_WORKERS_SIG_POS EQUAL -1)
@@ -1035,10 +1051,8 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         if not headless:
             kwargs["window"] = window_size
         fast_probe = bool(cfg.get("aida_testlab_fast_probe") or cfg.get("testlab_fast_probe")) or str(_os.environ.get("AIDA_CAMOUFOX_TESTLAB_FAST_PROBE", "")).lower() in {"1", "true", "yes", "on"}
-        launch_timeout_floor_ms = 5000
-        launch_timeout_ceiling_ms = 120000 if bundled_visible_launch else (70000 if fast_probe else 120000)
-        launch_timeout_default_ms = 75000 if bundled_visible_launch else (70000 if fast_probe else 30000)
-        launch_timeout_ms = min(max(_int_config(cfg.get("launch_timeout_ms"), launch_timeout_default_ms), launch_timeout_floor_ms), launch_timeout_ceiling_ms)]=]
+        launch_budget_policy = aida_resolve_launch_budget_policy(cfg.get("launch_timeout_ms"), bundled_visible_launch=bundled_visible_launch, fast_probe=fast_probe)
+        launch_timeout_ms = int(launch_budget_policy["launch_timeout_ms"])]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
 
@@ -1102,13 +1116,13 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
                     ctx = self.browser.contexts[0]
                 else:
                     _camoufox_debug("launch_new_context_begin")
-                    ctx, _, _ = await _create_camoufox_safe_context(self.browser, {}, min(max(8.0, max(5.0, launch_timeout_ms / 1000.0) * 0.50), max(5.0, launch_timeout_ms / 1000.0)), "launch_new_context", None, launch_started)
+                    ctx, _, _ = await _create_camoufox_safe_context(self.browser, {}, float(launch_budget_policy["context_create_timeout_s"]), "launch_new_context", None, launch_started)
                     _camoufox_debug("launch_new_context_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
 
         string(REPLACE
             "            page = ctx.pages[0] if ctx.pages else await ctx.new_page()"
-            "            if ctx.pages:\n                page = ctx.pages[0]\n            else:\n                _camoufox_debug(\"launch_new_page_begin\")\n                page = await asyncio.wait_for(ctx.new_page(), timeout=min(max(15.0, max(5.0, launch_timeout_ms / 1000.0) * 0.75), max(5.0, launch_timeout_ms / 1000.0)))\n                _camoufox_debug(\"launch_new_page_ok\", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))\n            privacy_info = await _verify_page_privacy(page, self._context_plan)\n            _camoufox_debug(\"launch_privacy_verified\", **privacy_info)\n            if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n                raise RuntimeError(\"Camoufox privacy verification failed\")"
+            "            if ctx.pages:\n                page = ctx.pages[0]\n            else:\n                _camoufox_debug(\"launch_new_page_begin\")\n                page = await asyncio.wait_for(ctx.new_page(), timeout=float(launch_budget_policy[\"page_create_timeout_s\"]))\n                _camoufox_debug(\"launch_new_page_ok\", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))\n            privacy_info = await _verify_page_privacy(page, self._context_plan)\n            _camoufox_debug(\"launch_privacy_verified\", **privacy_info)\n            if not privacy_info.get(\"webrtc_blocked\") or not privacy_info.get(\"ice_probe_ok\") or privacy_info.get(\"ice_candidate_leak_detected\"):\n                raise RuntimeError(\"Camoufox privacy verification failed\")"
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
 
         string(REPLACE [=[                error_len=len(str(exc)),
@@ -1529,7 +1543,7 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
                 page = ctx.pages[0]
             else:
                 _camoufox_debug("launch_new_page_begin")
-                page = await asyncio.wait_for(ctx.new_page(), timeout=min(max(15.0, max(5.0, launch_timeout_ms / 1000.0) * 0.75), max(5.0, launch_timeout_ms / 1000.0)))
+                page = await asyncio.wait_for(ctx.new_page(), timeout=float(launch_budget_policy["page_create_timeout_s"]))
                 _camoufox_debug("launch_new_page_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))
             privacy_info = await _verify_page_privacy(page, self._context_plan)
             _camoufox_debug("launch_privacy_verified", **privacy_info)
@@ -2293,7 +2307,8 @@ foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "launch_timeout_ms: int" AIDA_CAMOUFOX_NAV_TIMEOUT_POS)
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "config[\"executable_path\"] = executable_path" AIDA_CAMOUFOX_NAV_CONFIG_EXECUTABLE_POS)
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "config[\"ff_version\"] = int(ff_version)" AIDA_CAMOUFOX_NAV_CONFIG_VERSION_POS)
-    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "\"launch_timeout_ms\": launch_timeout_ms" AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "int(launch_policy" AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "\"aida_launch_budget_policy\": launch_policy" AIDA_CAMOUFOX_NAV_CONFIG_POLICY_POS)
 
     if(AIDA_CAMOUFOX_NAV_EXECUTABLE_POS EQUAL -1)
         string(REPLACE
@@ -2304,7 +2319,7 @@ foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
     window_height: int = 900,
     executable_path: str | None = None,
     ff_version: int | None = None,
-    launch_timeout_ms: int = 30000,
+    launch_timeout_ms: int = AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS,
 ) -> dict:"
             AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
     endif()
@@ -2314,13 +2329,14 @@ foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
 "    ff_version: int | None = None,
 ) -> dict:"
 "    ff_version: int | None = None,
-    launch_timeout_ms: int = 30000,
+    launch_timeout_ms: int = AIDA_LAUNCH_DEFAULT_BUNDLED_VISIBLE_MS,
 ) -> dict:"
             AIDA_CAMOUFOX_NAV_CONTENT "${AIDA_CAMOUFOX_NAV_CONTENT}")
     endif()
 
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "config[\"executable_path\"] = executable_path" AIDA_CAMOUFOX_NAV_CONFIG_EXECUTABLE_POS)
-    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "\"launch_timeout_ms\": launch_timeout_ms" AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "\"launch_timeout_ms\": int(launch_policy[\"launch_timeout_ms\"])" AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "\"aida_launch_budget_policy\": launch_policy" AIDA_CAMOUFOX_NAV_CONFIG_POLICY_POS)
     if(AIDA_CAMOUFOX_NAV_CONFIG_EXECUTABLE_POS EQUAL -1)
         string(REPLACE
 "            \"enable_trace\": enable_trace,
@@ -2402,9 +2418,11 @@ foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "launch_timeout_ms: int" AIDA_CAMOUFOX_NAV_TIMEOUT_POS)
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "config[\"executable_path\"] = executable_path" AIDA_CAMOUFOX_NAV_CONFIG_EXECUTABLE_POS)
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "config[\"ff_version\"] = int(ff_version)" AIDA_CAMOUFOX_NAV_CONFIG_VERSION_POS)
-    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "\"launch_timeout_ms\": launch_timeout_ms" AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS)
-    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "bounds = await browser_manager._page_bounds(page)
-        title = \"\"" AIDA_CAMOUFOX_NAV_SAFE_PAGE_INFO_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "int(launch_policy" AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "aida_launch_budget_policy" AIDA_CAMOUFOX_NAV_CONFIG_POLICY_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "bounds = await browser_manager._page_bounds(page)" AIDA_CAMOUFOX_NAV_PAGE_BOUNDS_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "title_error = None" AIDA_CAMOUFOX_NAV_TITLE_ERROR_INIT_POS)
+    string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "out[\"title_error\"] = title_error" AIDA_CAMOUFOX_NAV_TITLE_ERROR_OUT_POS)
     string(FIND "${AIDA_CAMOUFOX_NAV_CONTENT}" "return {\"url\": page.url, \"title\": await page.title()}" AIDA_CAMOUFOX_NAV_UNSAFE_TITLE_POS)
     if(AIDA_CAMOUFOX_NAV_EXECUTABLE_POS EQUAL -1
         OR AIDA_CAMOUFOX_NAV_VERSION_POS EQUAL -1
@@ -2412,9 +2430,12 @@ foreach(AIDA_CAMOUFOX_NAV_PATCH_FILE IN LISTS AIDA_CAMOUFOX_NAV_PATCH_FILES)
         OR AIDA_CAMOUFOX_NAV_CONFIG_EXECUTABLE_POS EQUAL -1
         OR AIDA_CAMOUFOX_NAV_CONFIG_VERSION_POS EQUAL -1
         OR AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS EQUAL -1
-        OR AIDA_CAMOUFOX_NAV_SAFE_PAGE_INFO_POS EQUAL -1
+        OR AIDA_CAMOUFOX_NAV_CONFIG_POLICY_POS EQUAL -1
+        OR AIDA_CAMOUFOX_NAV_PAGE_BOUNDS_POS EQUAL -1
+        OR AIDA_CAMOUFOX_NAV_TITLE_ERROR_INIT_POS EQUAL -1
+        OR AIDA_CAMOUFOX_NAV_TITLE_ERROR_OUT_POS EQUAL -1
         OR AIDA_CAMOUFOX_NAV_UNSAFE_TITLE_POS GREATER -1)
-        message(FATAL_ERROR "Failed to patch ${AIDA_CAMOUFOX_NAV_PATCH_FILE}")
+        message(FATAL_ERROR "Failed to patch ${AIDA_CAMOUFOX_NAV_PATCH_FILE} markers executable=${AIDA_CAMOUFOX_NAV_EXECUTABLE_POS} version=${AIDA_CAMOUFOX_NAV_VERSION_POS} timeout_arg=${AIDA_CAMOUFOX_NAV_TIMEOUT_POS} config_executable=${AIDA_CAMOUFOX_NAV_CONFIG_EXECUTABLE_POS} config_version=${AIDA_CAMOUFOX_NAV_CONFIG_VERSION_POS} config_timeout=${AIDA_CAMOUFOX_NAV_CONFIG_TIMEOUT_POS} config_policy=${AIDA_CAMOUFOX_NAV_CONFIG_POLICY_POS} page_bounds=${AIDA_CAMOUFOX_NAV_PAGE_BOUNDS_POS} title_error_init=${AIDA_CAMOUFOX_NAV_TITLE_ERROR_INIT_POS} title_error_out=${AIDA_CAMOUFOX_NAV_TITLE_ERROR_OUT_POS} unsafe_title=${AIDA_CAMOUFOX_NAV_UNSAFE_TITLE_POS}")
     endif()
 
     if(NOT AIDA_CAMOUFOX_NAV_CONTENT STREQUAL AIDA_CAMOUFOX_NAV_ORIGINAL)
@@ -2446,6 +2467,10 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
             "launch_new_page_task_result"
             "privacy_verify_exception"
             "page_closed_during_launch"
+            "aida_launch_budget_policy_v1"
+            "aida_resolve_launch_budget_policy"
+            "aida_validate_launch_budget_policy"
+            "aida_retry_launch_timeout_ms"
             "cmdline_sha256"
             "subprocess_diagnostics_installed"
             "stdout_capture"
@@ -2469,6 +2494,9 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
         foreach(AIDA_CAMOUFOX_STAGE_MAIN_MARKER IN ITEMS
             "_aida_apply_playwright_pageerror_patch"
             "patch_playwright_pageerror"
+            "aida_launch_budget_policy_v1"
+            "launch_budget_policy_marker_present"
+            "launch_budget_retry_contract_ok"
             "playwright_patch=playwright_patch")
             string(FIND "${AIDA_CAMOUFOX_STAGE_MAIN_CONTENT}" "${AIDA_CAMOUFOX_STAGE_MAIN_MARKER}" AIDA_CAMOUFOX_STAGE_MAIN_MARKER_POS)
             if(AIDA_CAMOUFOX_STAGE_MAIN_MARKER_POS EQUAL -1)
@@ -2515,6 +2543,8 @@ foreach(AIDA_CAMOUFOX_STAGE_MCP_ROOT IN LISTS AIDA_CAMOUFOX_STAGE_MCP_ROOTS)
             "node_exit_code"
             "camoufox_child_exits"
             "cloudflare"
+            "aida_clamp_navigation_timeout_ms"
+            "aida_resolve_launch_budget_policy"
             "nav_timeout_ms"
             "\"timeout_ms\": nav_timeout_ms"
             "_await_no_cancel_wait(page.evaluate(\"document.readyState\")"

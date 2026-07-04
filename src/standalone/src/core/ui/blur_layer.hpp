@@ -35,8 +35,9 @@ namespace aida::ui::blur {
 		int observed = detail::s_frame_index.load(std::memory_order_acquire);
 		if (observed != frame && detail::s_frame_index.compare_exchange_strong(observed, frame, std::memory_order_acq_rel))
 			detail::s_frame_draws.store(0, std::memory_order_release);
+		const int max_draws = Blur::InteractionPressureActive() ? 1 : detail::k_max_blur_draws_per_frame;
 		int draw_index = detail::s_frame_draws.fetch_add(1, std::memory_order_acq_rel);
-		if (draw_index >= detail::k_max_blur_draws_per_frame) {
+		if (draw_index >= max_draws) {
 			detail::s_dropped_draws.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}

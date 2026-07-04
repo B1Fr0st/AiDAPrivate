@@ -88,7 +88,7 @@ value_expr_t unknown_value(const address_identity_t& location, const std::string
     return out;
 }
 
-extracted_side_effect_t make_effect(side_effect_kind_t kind,
+extracted_side_effect_t make_effect(extracted_side_effect_kind_t kind,
                           const instruction_fact_t& ins,
                           const std::string& operation,
                           const std::string& reason)
@@ -112,7 +112,7 @@ void append_read_write_effects(const instruction_fact_t& ins, std::vector<extrac
     const bool load_like = contains_any(mnemonic, {"mov", "lea", "lods", "cmp", "test", "add", "sub", "and", "or", "xor"});
     if (store_like && operand_is_memory(ins.operands.front()))
     {
-        extracted_side_effect_t effect = make_effect(side_effect_kind_t::write, ins, mnemonic, "memory_destination_operand");
+        extracted_side_effect_t effect = make_effect(extracted_side_effect_kind_t::write, ins, mnemonic, "memory_destination_operand");
         effect.destination = value_from_operand(ins.operands.front());
         if (ins.operands.size() > 1)
             effect.source = value_from_operand(ins.operands[1]);
@@ -129,59 +129,59 @@ void append_read_write_effects(const instruction_fact_t& ins, std::vector<extrac
             continue;
         if (!load_like && !ins.is_call && !ins.is_branch)
             continue;
-        extracted_side_effect_t effect = make_effect(side_effect_kind_t::read, ins, mnemonic, "memory_source_operand");
+        extracted_side_effect_t effect = make_effect(extracted_side_effect_kind_t::read, ins, mnemonic, "memory_source_operand");
         effect.source = value_from_operand(op);
         out.push_back(std::move(effect));
     }
 }
 
-side_effect_kind_t helper_kind(const std::string& name)
+extracted_side_effect_kind_t helper_kind(const std::string& name)
 {
     if (contains_any(name, {"memset", "rtlzeromemory", "zeromemory", "bzero"}))
-        return side_effect_kind_t::memory_set;
+        return extracted_side_effect_kind_t::memory_set;
     if (contains_any(name, {"memcpy", "memmove", "rtlmove", "rtlcopymemory", "copy_memory", "copybytes", "copyfrom", "copyto", "setbitmapbits"}))
-        return side_effect_kind_t::memory_copy;
+        return extracted_side_effect_kind_t::memory_copy;
     if (contains_any(name, {"exallocate", "allocate", "malloc", "new", "heapalloc", "poolalloc"}))
-        return side_effect_kind_t::allocation;
+        return extracted_side_effect_kind_t::allocation;
     if (contains_any(name, {"exfree", "free", "delete", "heapfree", "poolfree"}))
-        return side_effect_kind_t::free_object;
+        return extracted_side_effect_kind_t::free_object;
     if (contains_any(name, {"interlocked", "cmpxchg", "xadd", "lock"}))
-        return side_effect_kind_t::interlocked;
+        return extracted_side_effect_kind_t::interlocked;
     if (contains_any(name, {"insertheadlist", "inserttaillist", "removeentrylist", "removelist", "list_entry"}))
-        return side_effect_kind_t::list_operation;
+        return extracted_side_effect_kind_t::list_operation;
     if (contains_any(name, {"obfreference", "obdereference", "reference", "dereference", "addref", "release"}))
-        return side_effect_kind_t::refcount;
+        return extracted_side_effect_kind_t::refcount;
     if (contains_any(name, {"callback", "dispatch", "notify", "invoke", "callout"}))
-        return side_effect_kind_t::callback_dispatch;
+        return extracted_side_effect_kind_t::callback_dispatch;
     if (contains_any(name, {"fastfail", "bugcheck", "failfast", "__report_gsfailure", "abort"}))
-        return side_effect_kind_t::poisoned_terminal;
-    return side_effect_kind_t::direct_call;
+        return extracted_side_effect_kind_t::poisoned_terminal;
+    return extracted_side_effect_kind_t::direct_call;
 }
 
 void append_call_effect(const call_fact_t& call, std::vector<extracted_side_effect_t>& out)
 {
     extracted_side_effect_t effect;
-    effect.kind = call.kind == "indirect" ? side_effect_kind_t::indirect_call : helper_kind(call.callee_name);
+    effect.kind = call.kind == "indirect" ? extracted_side_effect_kind_t::indirect_call : helper_kind(call.callee_name);
     effect.location = call.callsite;
     effect.operation = call.callee_name.empty() ? call.kind : call.callee_name;
     effect.provenance = call.callsite.symbol_name;
     effect.reason = call.resolved ? "resolved_call_target" : "unresolved_call_target";
     effect.source_layer = "call";
     effect.unresolved = !call.resolved || call.kind == "indirect";
-    effect.terminal = !call.does_return || effect.kind == side_effect_kind_t::poisoned_terminal;
+    effect.terminal = !call.does_return || effect.kind == extracted_side_effect_kind_t::poisoned_terminal;
     if (!call.arguments.empty())
         effect.destination = value_from_operand(call.arguments[0]);
     if (call.arguments.size() > 1)
         effect.source = value_from_operand(call.arguments[1]);
     if (call.arguments.size() > 2)
         effect.size = value_from_operand(call.arguments[2]);
-    if (effect.kind == side_effect_kind_t::memory_set)
+    if (effect.kind == extracted_side_effect_kind_t::memory_set)
     {
         effect.source.value_origin = "constant_zero";
         if (call.arguments.size() > 1 && call.arguments[1].type == "imm" && call.arguments[1].value != 0)
             effect.source.value_origin = "constant_nonzero";
     }
-    if (effect.kind == side_effect_kind_t::memory_copy)
+    if (effect.kind == extracted_side_effect_kind_t::memory_copy)
     {
         effect.source.value_origin = "copied_from_memory";
         if (effect.source.controlled_by_input || effect.destination.controlled_by_input)
@@ -189,7 +189,7 @@ void append_call_effect(const call_fact_t& call, std::vector<extracted_side_effe
         if (contains_any(call.callee_name, {"setbitmapbits"}))
             effect.tags.push_back("case_study_pvscan0_setbitmapbits_write");
     }
-    if (effect.kind == side_effect_kind_t::indirect_call)
+    if (effect.kind == extracted_side_effect_kind_t::indirect_call)
         effect.tags.push_back("indirect_target_required");
     if (effect.destination.kind != "unknown" && effect.destination.alias_class.find("mem:") == 0)
         effect.tags.push_back("write_indirect_destination_value");
@@ -199,7 +199,7 @@ void append_call_effect(const call_fact_t& call, std::vector<extracted_side_effe
 void append_branch_effect(const branch_fact_t& branch, std::vector<extracted_side_effect_t>& out)
 {
     extracted_side_effect_t effect;
-    effect.kind = branch.kind == "return" ? side_effect_kind_t::return_value : side_effect_kind_t::branch;
+    effect.kind = branch.kind == "return" ? extracted_side_effect_kind_t::return_value : extracted_side_effect_kind_t::branch;
     effect.location = branch.branch;
     effect.operation = branch.kind;
     effect.provenance = branch.predicate_text;
@@ -215,7 +215,7 @@ void append_instruction_specials(const instruction_fact_t& ins, std::vector<extr
     const std::string m = lower_ascii(ins.mnemonic + " " + ins.disassembly);
     if (contains_any(m, {"lock", "xadd", "cmpxchg", "xchg"}))
     {
-        extracted_side_effect_t effect = make_effect(side_effect_kind_t::interlocked, ins, ins.mnemonic, "atomic_instruction");
+        extracted_side_effect_t effect = make_effect(extracted_side_effect_kind_t::interlocked, ins, ins.mnemonic, "atomic_instruction");
         if (!ins.operands.empty())
             effect.destination = value_from_operand(ins.operands.front());
         if (ins.operands.size() > 1)
@@ -224,7 +224,7 @@ void append_instruction_specials(const instruction_fact_t& ins, std::vector<extr
     }
     if (contains_any(m, {"int 29h", "__fastfail", "ud2", "int 3"}))
     {
-        extracted_side_effect_t effect = make_effect(side_effect_kind_t::poisoned_terminal, ins, ins.mnemonic, "poisoned_terminal_instruction");
+        extracted_side_effect_t effect = make_effect(extracted_side_effect_kind_t::poisoned_terminal, ins, ins.mnemonic, "poisoned_terminal_instruction");
         effect.terminal = true;
         out.push_back(std::move(effect));
     }
@@ -261,26 +261,26 @@ std::vector<extracted_side_effect_t> classify_side_effects(const function_snapsh
     return deduped;
 }
 
-nlohmann::json to_json(side_effect_kind_t kind)
+nlohmann::json to_json(extracted_side_effect_kind_t kind)
 {
     switch (kind)
     {
-    case side_effect_kind_t::read:              return "read";
-    case side_effect_kind_t::write:             return "write";
-    case side_effect_kind_t::interlocked:       return "interlocked";
-    case side_effect_kind_t::memory_copy:       return "memory_copy";
-    case side_effect_kind_t::memory_set:        return "memory_set";
-    case side_effect_kind_t::allocation:        return "allocation";
-    case side_effect_kind_t::free_object:       return "free";
-    case side_effect_kind_t::refcount:          return "refcount";
-    case side_effect_kind_t::list_operation:    return "list_operation";
-    case side_effect_kind_t::callback_dispatch: return "callback_dispatch";
-    case side_effect_kind_t::direct_call:       return "direct_call";
-    case side_effect_kind_t::indirect_call:     return "indirect_call";
-    case side_effect_kind_t::branch:            return "branch";
-    case side_effect_kind_t::return_value:      return "return";
-    case side_effect_kind_t::poisoned_terminal: return "poisoned_terminal";
-    case side_effect_kind_t::unknown:           return "unknown";
+    case extracted_side_effect_kind_t::read:              return "read";
+    case extracted_side_effect_kind_t::write:             return "write";
+    case extracted_side_effect_kind_t::interlocked:       return "interlocked";
+    case extracted_side_effect_kind_t::memory_copy:       return "memory_copy";
+    case extracted_side_effect_kind_t::memory_set:        return "memory_set";
+    case extracted_side_effect_kind_t::allocation:        return "allocation";
+    case extracted_side_effect_kind_t::free_object:       return "free";
+    case extracted_side_effect_kind_t::refcount:          return "refcount";
+    case extracted_side_effect_kind_t::list_operation:    return "list_operation";
+    case extracted_side_effect_kind_t::callback_dispatch: return "callback_dispatch";
+    case extracted_side_effect_kind_t::direct_call:       return "direct_call";
+    case extracted_side_effect_kind_t::indirect_call:     return "indirect_call";
+    case extracted_side_effect_kind_t::branch:            return "branch";
+    case extracted_side_effect_kind_t::return_value:      return "return";
+    case extracted_side_effect_kind_t::poisoned_terminal: return "poisoned_terminal";
+    case extracted_side_effect_kind_t::unknown:           return "unknown";
     }
     return "unknown";
 }

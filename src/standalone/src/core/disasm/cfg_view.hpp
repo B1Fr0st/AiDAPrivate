@@ -138,9 +138,10 @@ inline float estimate_text_width_for_cfg(const std::string& text, float font_siz
 
 inline bool safe_decode_for_cfg(const uint8_t* code, int avail, uint64_t va, AsmInstr& out)
 {
+	const bool is_64bit = g_disasm.file.is_64bit;
 #if defined(_MSC_VER)
 	__try {
-		out = zydis_decode_one(code, avail, va);
+		out = zydis_decode_one(code, avail, va, is_64bit);
 		return true;
 	} __except (EXCEPTION_EXECUTE_HANDLER) {
 		std::snprintf(out.mnem, sizeof(out.mnem), "db");
@@ -152,7 +153,7 @@ inline bool safe_decode_for_cfg(const uint8_t* code, int avail, uint64_t va, Asm
 		return false;
 	}
 #else
-	out = zydis_decode_one(code, avail, va);
+	out = zydis_decode_one(code, avail, va, is_64bit);
 	return true;
 #endif
 }

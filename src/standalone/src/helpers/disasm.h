@@ -38,6 +38,8 @@ struct DisasmFile
     std::string            filename;
     uint64_t               image_base = 0;
     uint64_t               text_va    = 0;
+    uint16_t               machine = IMAGE_FILE_MACHINE_AMD64;
+    bool                   is_64bit = true;
     std::vector<PESection> sections;
     std::vector<AsmInstr>  instrs;
     bool                   loaded = false;
@@ -769,16 +771,44 @@ namespace disasm
 
         auto* dos = (IMAGE_DOS_HEADER*)raw.data();
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) { out.err = "Not a PE file"; return false; }
-        if ((DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > fsz) { out.err = "Corrupt PE"; return false; }
+        if (dos->e_lfanew < 0) { out.err = "Corrupt PE"; return false; }
+        uint64_t nt_off = static_cast<uint64_t>(dos->e_lfanew);
+        uint64_t file_header_off = nt_off + sizeof(DWORD);
+        if (file_header_off + sizeof(IMAGE_FILE_HEADER) > fsz) { out.err = "Corrupt PE"; return false; }
 
-        auto* nt = (IMAGE_NT_HEADERS64*)(raw.data() + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) { out.err = "Not a PE file"; return false; }
-        if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) { out.err = "Not x64 PE"; return false; }
+        auto* nt_base = raw.data() + nt_off;
+        DWORD signature = 0;
+        std::memcpy(&signature, nt_base, sizeof(signature));
+        if (signature != IMAGE_NT_SIGNATURE) { out.err = "Not a PE file"; return false; }
 
-        out.image_base = nt->OptionalHeader.ImageBase;
+        auto* fh = reinterpret_cast<IMAGE_FILE_HEADER*>(raw.data() + file_header_off);
+        uint64_t opt_off = file_header_off + sizeof(IMAGE_FILE_HEADER);
+        if (fh->SizeOfOptionalHeader < sizeof(WORD) || opt_off + fh->SizeOfOptionalHeader > fsz) {
+            out.err = "Corrupt PE"; return false;
+        }
+        WORD opt_magic = 0;
+        std::memcpy(&opt_magic, raw.data() + opt_off, sizeof(opt_magic));
+        bool is_pe64 = fh->Machine == IMAGE_FILE_MACHINE_AMD64 && opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+        bool is_pe32 = fh->Machine == IMAGE_FILE_MACHINE_I386 && opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+        if (!is_pe64 && !is_pe32) { out.err = "Unsupported PE architecture"; return false; }
 
-        auto* sec = IMAGE_FIRST_SECTION(nt);
-        WORD nsec = nt->FileHeader.NumberOfSections;
+        out.machine = fh->Machine;
+        out.is_64bit = is_pe64;
+        if (is_pe64) {
+            if (fh->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) { out.err = "Corrupt PE"; return false; }
+            auto* opt64 = reinterpret_cast<IMAGE_OPTIONAL_HEADER64*>(raw.data() + opt_off);
+            out.image_base = opt64->ImageBase;
+        } else {
+            if (fh->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32)) { out.err = "Corrupt PE"; return false; }
+            auto* opt32 = reinterpret_cast<IMAGE_OPTIONAL_HEADER32*>(raw.data() + opt_off);
+            out.image_base = opt32->ImageBase;
+        }
+
+        auto* sec = reinterpret_cast<IMAGE_SECTION_HEADER*>(raw.data() + opt_off + fh->SizeOfOptionalHeader);
+        WORD nsec = fh->NumberOfSections;
+        if (nsec == 0 || opt_off + fh->SizeOfOptionalHeader + static_cast<uint64_t>(nsec) * sizeof(IMAGE_SECTION_HEADER) > fsz) {
+            out.err = "Corrupt PE"; return false;
+        }
 
         for (WORD i = 0; i < nsec; i++) {
             bool is_exec = (sec[i].Characteristics & IMAGE_SCN_CNT_CODE) ||
@@ -814,7 +844,13 @@ namespace disasm
                 char mn[24]={}, op[64]={};
                 bool br=false, ca=false, rt=false;
                 int avail = std::min(sz - off, 15);
-                int len = x64_decode_one(data + off, avail, va + off, mn, op, br, ca, rt);
+                int len = 1;
+                if (file.is_64bit) {
+                    len = x64_decode_one(data + off, avail, va + off, mn, op, br, ca, rt);
+                } else {
+                    snprintf(mn, sizeof(mn), "db");
+                    snprintf(op, sizeof(op), "0x%02X", data[off]);
+                }
                 if (len <= 0) len = 1;
                 ins.len = len;
                 memcpy(ins.raw, data + off, std::min(len, 15));

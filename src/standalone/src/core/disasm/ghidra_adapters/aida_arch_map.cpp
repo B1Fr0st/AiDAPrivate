@@ -17,6 +17,8 @@ uint16_t read_pe_machine(const DisasmFile& file)
 {
 	if (!file.loaded || file.sections.empty())
 		return 0;
+	if (file.machine != 0)
+		return file.machine;
 
 	uint64_t base = file.image_base;
 	for (auto& s : file.sections) {

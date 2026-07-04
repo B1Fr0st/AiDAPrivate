@@ -2757,8 +2757,11 @@ elseif(APPLE)
     set_target_properties(AiDA PROPERTIES SUFFIX ".dylib")
 endif()
 
-target_include_directories(AiDA PRIVATE
+target_include_directories(AiDA SYSTEM PRIVATE
     "${IDASDK_DIR}/include"
+)
+
+target_include_directories(AiDA PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -2838,6 +2841,7 @@ if(WIN32)
     aida_use_static_msvc_runtime(AiDA)
 
     target_precompile_headers(AiDA PRIVATE
+        <nlohmann/json.hpp>
         <Windows.h>
         <vector>
         <string>
