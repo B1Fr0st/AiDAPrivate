@@ -887,12 +887,24 @@ namespace test_all_features {
 				return;
 			const uint64_t t0 = now_ms_tick();
 			const bool cleaned = aida::burp::camoufox::force_cleanup(reason ? reason : "testlab.start_tests_preflight");
-			const bool idle = aida::burp::camoufox::wait_until_idle(15000, reason ? reason : "testlab.start_tests_preflight");
+			const bool starting_without_child = before.state == aida::burp::camoufox::bridge_state_t::starting &&
+				before.child_pid == 0 &&
+				!before.child_alive &&
+				!before.browser_open;
+			const uint32_t idle_wait_ms = starting_without_child ? 1000u : 15000u;
+			log_msg(hf, "camoufox-cleanup", "preflight_force_cleanup_done reason=%s cleaned=%d wait_ms=%u starting_without_child=%d elapsed_ms=%llu",
+				reason ? reason : "unspecified",
+				cleaned ? 1 : 0,
+				idle_wait_ms,
+				starting_without_child ? 1 : 0,
+				static_cast<unsigned long long>(now_ms_tick() - t0));
+			const bool idle = aida::burp::camoufox::wait_until_idle(idle_wait_ms, reason ? reason : "testlab.start_tests_preflight");
 			auto after = aida::burp::camoufox::get_status();
-			log_msg(hf, "camoufox-cleanup", "preflight_done reason=%s cleaned=%d idle=%d state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d elapsed_ms=%llu last_error_len=%zu",
+			log_msg(hf, "camoufox-cleanup", "preflight_done reason=%s cleaned=%d idle=%d wait_ms=%u state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d elapsed_ms=%llu last_error_len=%zu",
 				reason ? reason : "unspecified",
 				cleaned ? 1 : 0,
 				idle ? 1 : 0,
+				idle_wait_ms,
 				camoufox_bridge_state_name(after.state),
 				after.child_pid,
 				after.child_alive ? 1 : 0,
@@ -3752,6 +3764,8 @@ namespace test_all_features {
 				static_cast<unsigned long>(GetCurrentThreadId()),
 				log_path());
 			log_msg(hf, "run", "test_target_log_path=%s", target_log_path());
+			set_step("run_all preflight: camoufox cleanup");
+			cleanup_camoufox_for_full_test_start(hf, "testlab.run_all_preflight");
 			const auto& features = test_lab::all_features();
 			int testlab_count = static_cast<int>(features.size());
 			int total_estimate =
@@ -4160,8 +4174,7 @@ namespace test_all_features {
 			diag::log_tagged_fmt("test_all", "user triggered Test All Features");
 			{
 				HANDLE hf = open_log_file();
-				begin_test_guard_impl("start_tests_impl queued", hf);
-				cleanup_camoufox_for_full_test_start(hf, "testlab.start_tests_preflight");
+				log_msg(hf, "start", "admission accepted; preflight deferred to full-test run worker");
 				if (hf != INVALID_HANDLE_VALUE) {
 					flush_full_test_log(hf);
 					CloseHandle(hf);
@@ -4188,7 +4201,8 @@ namespace test_all_features {
 					HANDLE hf = open_log_file();
 					g_failed.fetch_add(1);
 					g_running.store(false, std::memory_order_release);
-					end_test_guard_impl("critical_queue post failed", true, hf);
+					set_full_test_env(hf, false, "critical_queue post failed");
+					anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
 					set_phase("Idle");
 					set_step("critical_queue post failed");
 					if (hf != INVALID_HANDLE_VALUE) {
@@ -4204,7 +4218,8 @@ namespace test_all_features {
 				log_resource_snapshot(hf, "start", "worker start exception", err);
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
-				end_test_guard_impl("worker start exception", true, hf);
+				set_full_test_env(hf, false, "worker start exception");
+				anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
 				set_phase("Idle");
 				set_step("worker start exception");
 				if (hf != INVALID_HANDLE_VALUE) {
@@ -4220,7 +4235,8 @@ namespace test_all_features {
 				log_resource_snapshot(hf, "start", "worker start unknown exception", err);
 				g_failed.fetch_add(1);
 				g_running.store(false, std::memory_order_release);
-				end_test_guard_impl("worker start unknown exception", true, hf);
+				set_full_test_env(hf, false, "worker start unknown exception");
+				anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
 				set_phase("Idle");
 				set_step("worker start unknown exception");
 				if (hf != INVALID_HANDLE_VALUE) {

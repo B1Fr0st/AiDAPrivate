@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "ole32.lib")
@@ -203,6 +204,30 @@ std::string format_error(const char* step, DWORD gle) {
 		step ? step : "step", static_cast<unsigned long>(gle), m.c_str());
 	return std::string(buf);
 }
+
+struct async_create_process_state_t {
+	std::vector<wchar_t> cmd_buf;
+	std::wstring cwd;
+	STARTUPINFOW si{};
+	PROCESS_INFORMATION pi{};
+	DWORD flags = 0;
+	HANDLE done = nullptr;
+	std::atomic<bool> abandoned{ false };
+	BOOL ok = FALSE;
+	DWORD gle = 0;
+	std::atomic<DWORD> worker_tid{ 0 };
+
+	~async_create_process_state_t() {
+		if (abandoned.load(std::memory_order_acquire)) {
+			if (pi.hProcess) TerminateProcess(pi.hProcess, 0xC0FFEEu);
+			if (pi.hThread) CloseHandle(pi.hThread);
+			if (pi.hProcess) CloseHandle(pi.hProcess);
+		}
+		if (done) CloseHandle(done);
+	}
+};
+
+constexpr DWORD kCreateProcessDeadlineMs = 15000;
 
 uint32_t get_windows_build_number() {
 	HMODULE h = GetModuleHandleW(L"ntdll.dll");
@@ -1353,16 +1378,97 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 		args_utf8.c_str(),
 		cwd_ptr ? cwd_utf8.c_str() : "<inherit>");
 
-	BOOL cp_ok = CreateProcessW(
-		nullptr,
-		cmd_buf.data(),
-		nullptr, nullptr, FALSE,
-		flags,
-		nullptr,
-		cwd_ptr,
-		&si,
-		&pi);
-	DWORD cp_gle = cp_ok ? 0 : GetLastError();
+	auto cp_state = std::make_shared<async_create_process_state_t>();
+	cp_state->cmd_buf = std::move(cmd_buf);
+	cp_state->cwd = opts.working_dir;
+	cp_state->si = si;
+	cp_state->flags = flags;
+	cp_state->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (!cp_state->done) {
+		DWORD gle = GetLastError();
+		out.error = format_error("CreateEventW(CreateProcess deadline)", gle);
+		log_fail("CreateEventW.CreateProcessDeadline", gle);
+		CloseHandle(job);
+		return false;
+	}
+	try {
+		std::thread([cp_state]() {
+			cp_state->worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
+			const wchar_t* async_cwd = cp_state->cwd.empty() ? nullptr : cp_state->cwd.c_str();
+			PROCESS_INFORMATION local_pi{};
+			BOOL local_ok = CreateProcessW(
+				nullptr,
+				cp_state->cmd_buf.data(),
+				nullptr, nullptr, FALSE,
+				cp_state->flags,
+				nullptr,
+				async_cwd,
+				&cp_state->si,
+				&local_pi);
+			cp_state->gle = local_ok ? 0 : GetLastError();
+			cp_state->ok = local_ok;
+			cp_state->pi = local_pi;
+			if (cp_state->abandoned.load(std::memory_order_acquire)) {
+				if (local_ok) {
+					TerminateProcess(local_pi.hProcess, 0xC0FFEEu);
+					CloseHandle(local_pi.hThread);
+					CloseHandle(local_pi.hProcess);
+					cp_state->pi = PROCESS_INFORMATION{};
+				}
+				diag::log_tagged_critical_fmt("run",
+					"CreateProcessW.late_result ok=%d pid=%lu tid=%lu gle=%lu worker_tid=%lu",
+					local_ok ? 1 : 0,
+					local_ok ? local_pi.dwProcessId : 0u,
+					local_ok ? local_pi.dwThreadId : 0u,
+					static_cast<unsigned long>(cp_state->gle),
+					static_cast<unsigned long>(cp_state->worker_tid.load(std::memory_order_acquire)));
+			}
+			SetEvent(cp_state->done);
+		}).detach();
+	} catch (const std::exception& ex) {
+		out.error = std::string("CreateProcessW worker start failed: ") + ex.what();
+		diag::log_tagged_critical_fmt("run_target",
+			"launch_FAILED step=CreateProcessWWorkerStart exception='%s'",
+			ex.what());
+		CloseHandle(job);
+		return false;
+	} catch (...) {
+		out.error = "CreateProcessW worker start failed: unknown exception";
+		diag::log_tagged_critical("run_target",
+			"launch_FAILED step=CreateProcessWWorkerStart exception='<unknown>'");
+		CloseHandle(job);
+		return false;
+	}
+
+	const DWORD cp_wait = WaitForSingleObject(cp_state->done, kCreateProcessDeadlineMs);
+	if (cp_wait != WAIT_OBJECT_0) {
+		DWORD wait_gle = cp_wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
+		cp_state->abandoned.store(true, std::memory_order_release);
+		char err[512];
+		std::snprintf(err, sizeof(err),
+			"CreateProcessW did not return within %lu ms (wait=0x%08lX gle=%lu worker_tid=%lu)",
+			static_cast<unsigned long>(kCreateProcessDeadlineMs),
+			static_cast<unsigned long>(cp_wait),
+			static_cast<unsigned long>(wait_gle),
+			static_cast<unsigned long>(cp_state->worker_tid.load(std::memory_order_acquire)));
+		out.error = err;
+		diag::log_tagged_critical_fmt("run",
+			"CreateProcessW.timeout elapsed_ms=%lu wait=0x%08lX gle=%lu worker_tid=%lu flags=0x%08lX exe='%s' cwd='%s'",
+			static_cast<unsigned long>(kCreateProcessDeadlineMs),
+			static_cast<unsigned long>(cp_wait),
+			static_cast<unsigned long>(wait_gle),
+			static_cast<unsigned long>(cp_state->worker_tid.load(std::memory_order_acquire)),
+			static_cast<unsigned long>(flags),
+			exe_utf8.c_str(),
+			cwd_ptr ? cwd_utf8.c_str() : "<inherit>");
+		CloseHandle(job);
+		return false;
+	}
+
+	BOOL cp_ok = cp_state->ok;
+	DWORD cp_gle = cp_ok ? 0 : cp_state->gle;
+	pi = cp_state->pi;
+	cp_state->pi = PROCESS_INFORMATION{};
 	diag::log_tagged_critical_fmt("run",
 		"CreateProcessW.result ok=%d pid=%lu tid=%lu gle=%lu flags=0x%08lX",
 		cp_ok ? 1 : 0,

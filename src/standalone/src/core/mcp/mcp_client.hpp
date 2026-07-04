@@ -217,7 +217,7 @@ private:
 
 
     bool send_http(json& out, const json& request, int read_timeout_sec = 30);
-    bool send_stdio(json& out, const json& request);
+    bool send_stdio(json& out, const json& request, int read_timeout_sec);
 
     bool perform_remote_handshake();
     bool perform_initialize_locked();
@@ -234,7 +234,7 @@ private:
 
     bool  launch_stdio_process();
     void  kill_stdio_process();
-    bool  read_line_from_stdout(std::string& out);
+    bool  read_line_from_stdout(std::string& out, std::uint32_t timeout_ms);
     bool  write_to_stdin(const std::string& data);
 
 

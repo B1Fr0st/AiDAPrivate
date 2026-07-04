@@ -8531,15 +8531,50 @@ bool start_bridge(const launch_config_t& cfg)
     sb_resolve_ms = now_ms() - sb_resolve_start_ms;
     const uint64_t sb_spawn_start_ms = now_ms();
     bool connect_ok = false;
+    auto connecting_client = sg().client;
     {
         scoped_child_error_mode_t mcp_child_error_mode("start_bridge_mcp_connect", mcp_create_flags, scfg.command.c_str());
-        connect_ok = sg().client->connect(scfg);
+        lk.unlock();
+        connect_ok = connecting_client->connect(scfg);
+        lk.lock();
     }
     sb_spawn_ms = now_ms() - sb_spawn_start_ms;
     sb_connect_ms = sb_spawn_ms;
+    if (sg().client != connecting_client ||
+        sg().stop_epoch.load(std::memory_order_acquire) != start_stop_epoch ||
+        sg().stop_requested.load(std::memory_order_acquire))
+    {
+        const uint32_t cancelled_pid = connecting_client ? connecting_client->child_process_id() : 0;
+        diag::log_tagged_critical_fmt("camoufox", "start_bridge connect_cancelled generation=%llu connect_ok=%d child_pid=%lu stop_epoch_start=%llu stop_epoch_now=%llu stop_requested=%d client_changed=%d elapsed_ms=%llu",
+            static_cast<unsigned long long>(start_generation),
+            connect_ok ? 1 : 0,
+            static_cast<unsigned long>(cancelled_pid),
+            static_cast<unsigned long long>(start_stop_epoch),
+            static_cast<unsigned long long>(sg().stop_epoch.load(std::memory_order_acquire)),
+            sg().stop_requested.load(std::memory_order_acquire) ? 1 : 0,
+            sg().client != connecting_client ? 1 : 0,
+            static_cast<unsigned long long>(sb_connect_ms));
+        if (sg().client == connecting_client)
+        {
+            sg().client.reset();
+            clear_page_state_locked();
+            sg().child_pid = 0;
+            sg().state = bridge_state_t::error;
+            sg().last_error = "camoufox bridge connect cancelled by cleanup request";
+            sg().last_launch_ms = now_ms() - bridge_start_ms;
+            mark_cleanup_started_locked(start_generation, cancelled_pid, "start_bridge_connect_cancelled");
+        }
+        lk.unlock();
+        if (connecting_client)
+            cleanup_client_reap_now_detach_disconnect(connecting_client, cancelled_pid, "start_bridge_connect_cancelled", start_generation);
+        lk.lock();
+        publish_state(bridge_state_t::error, "camoufox bridge connect cancelled by cleanup request");
+        emit_stage_timing(false, "connect_cancelled", cancelled_pid);
+        return false;
+    }
     if (!connect_ok)
     {
-        std::string inner = sg().client->last_error();
+        std::string inner = connecting_client ? connecting_client->last_error() : std::string();
         const bool process_init_failure = use_server_executable && reports_process_initialization_failure(inner);
         if (process_init_failure)
             block_launch_after_process_init_failure_locked(scfg.command, start_generation, inner);
@@ -8569,7 +8604,7 @@ bool start_bridge(const launch_config_t& cfg)
     sg().server_command = use_server_executable
         ? server_executable
         : python_path + " -m " + (effective_cfg.server_module.empty() ? std::string("camoufox_reverse_mcp") : effective_cfg.server_module);
-    sg().child_pid      = sg().client ? sg().client->child_process_id() : 0;
+    sg().child_pid      = connecting_client ? connecting_client->child_process_id() : 0;
     sg().tracked_child_pid.store(sg().child_pid, std::memory_order_release);
     sg().launched_ms    = now_ms();
     diag::log_tagged_fmt("camoufox", "start_bridge connected generation=%llu mode=%s child_pid=%lu command=%s args=%zu cwd=%s workdir=%s profile_root=%s debug_log=%s timeout_ms=%d last_gle=%lu",
@@ -9890,6 +9925,14 @@ bool force_cleanup(const char* reason)
         sg().active_profile_generated = false;
         lk.unlock();
     }
+    else
+    {
+        diag::log_tagged_critical_fmt("camoufox", "force_cleanup_state_lock_busy epoch=%llu reason=%s lock_elapsed_ms=%llu tracked_child_pid=%lu",
+            static_cast<unsigned long long>(epoch),
+            cleanup_reason,
+            static_cast<unsigned long long>(now_ms() - lock_start),
+            static_cast<unsigned long>(child_pid));
+    }
 
     const std::vector<process_tree_entry_t> before_tree = child_pid == 0 ? std::vector<process_tree_entry_t>() : enumerate_process_tree(child_pid);
     const size_t descendants_before = before_tree.size() > 0 ? before_tree.size() - 1 : 0;
@@ -9916,7 +9959,7 @@ bool force_cleanup(const char* reason)
     else if (child_pid != 0 && reap.alive_after == 0 && sg().tracked_child_pid.load(std::memory_order_acquire) == child_pid)
         sg().tracked_child_pid.store(0, std::memory_order_release);
 
-    const bool success = child_pid == 0 || reap.alive_after == 0;
+    const bool success = state_locked && (child_pid == 0 || reap.alive_after == 0);
     publish_state(bridge_state_t::stopped, std::string());
     diag::log_tagged_critical_fmt("camoufox", "force_cleanup_end epoch=%llu generation=%llu reason=%s success=%d child_pid=%lu descendants_before=%zu alive_after=%zu profile_dir=%s elapsed_ms=%llu",
         static_cast<unsigned long long>(epoch), static_cast<unsigned long long>(generation), cleanup_reason,
@@ -9943,19 +9986,28 @@ bool wait_until_idle(uint32_t timeout_ms, const char* reason)
         bool cleanup_pending = false;
         bool child_alive = false;
         size_t err_len = 0;
+        bool state_locked = false;
         {
-            std::lock_guard<std::recursive_mutex> lk(sg().mtx);
-            state = sg().state;
-            generation = sg().generation;
-            child_pid = sg().child_pid != 0 ? sg().child_pid : sg().cleanup_child_pid;
-            cleanup_pending = sg().cleanup_pending;
-            err_len = sg().last_error.size();
+            std::unique_lock<std::recursive_mutex> lk(sg().mtx, std::try_to_lock);
+            state_locked = lk.owns_lock();
+            if (state_locked)
+            {
+                state = sg().state;
+                generation = sg().generation;
+                child_pid = sg().child_pid != 0 ? sg().child_pid : sg().cleanup_child_pid;
+                cleanup_pending = sg().cleanup_pending;
+                err_len = sg().last_error.size();
+            }
+            else
+            {
+                child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+            }
         }
-        if (operation_idle && active == 0 && !cleanup_pending)
+        if (operation_idle && active == 0 && state_locked && !cleanup_pending)
         {
             child_alive = process_alive(child_pid);
-            diag::log_tagged_fmt("camoufox", "wait_until_idle ok reason=%s elapsed_ms=%llu state=%d generation=%llu child_pid=%lu child_alive=%d err_len=%zu",
-                wait_reason, static_cast<unsigned long long>(now - t0), static_cast<int>(state),
+            diag::log_tagged_fmt("camoufox", "wait_until_idle ok reason=%s elapsed_ms=%llu state_locked=%d state=%d generation=%llu child_pid=%lu child_alive=%d err_len=%zu",
+                wait_reason, static_cast<unsigned long long>(now - t0), 1, static_cast<int>(state),
                 static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 child_alive ? 1 : 0, err_len);
             return true;
@@ -9963,9 +10015,9 @@ bool wait_until_idle(uint32_t timeout_ms, const char* reason)
         if (now - t0 >= limit_ms)
         {
             child_alive = process_alive(child_pid);
-            diag::log_tagged_fmt("camoufox", "wait_until_idle timeout reason=%s elapsed_ms=%llu limit_ms=%llu operation_idle=%d active=%lu state=%d generation=%llu child_pid=%lu child_alive=%d cleanup_pending=%d err_len=%zu",
+            diag::log_tagged_fmt("camoufox", "wait_until_idle timeout reason=%s elapsed_ms=%llu limit_ms=%llu operation_idle=%d active=%lu state_locked=%d state=%d generation=%llu child_pid=%lu child_alive=%d cleanup_pending=%d err_len=%zu",
                 wait_reason, static_cast<unsigned long long>(now - t0), static_cast<unsigned long long>(limit_ms),
-                operation_idle ? 1 : 0, static_cast<unsigned long>(active), static_cast<int>(state),
+                operation_idle ? 1 : 0, static_cast<unsigned long>(active), state_locked ? 1 : 0, static_cast<int>(state),
                 static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 child_alive ? 1 : 0, cleanup_pending ? 1 : 0, err_len);
             return false;
@@ -9973,9 +10025,9 @@ bool wait_until_idle(uint32_t timeout_ms, const char* reason)
         if (now - last_log_ms >= 1000)
         {
             child_alive = process_alive(child_pid);
-            diag::log_tagged_fmt("camoufox", "wait_until_idle wait reason=%s elapsed_ms=%llu limit_ms=%llu operation_idle=%d active=%lu state=%d generation=%llu child_pid=%lu child_alive=%d cleanup_pending=%d err_len=%zu",
+            diag::log_tagged_fmt("camoufox", "wait_until_idle wait reason=%s elapsed_ms=%llu limit_ms=%llu operation_idle=%d active=%lu state_locked=%d state=%d generation=%llu child_pid=%lu child_alive=%d cleanup_pending=%d err_len=%zu",
                 wait_reason, static_cast<unsigned long long>(now - t0), static_cast<unsigned long long>(limit_ms),
-                operation_idle ? 1 : 0, static_cast<unsigned long>(active), static_cast<int>(state),
+                operation_idle ? 1 : 0, static_cast<unsigned long>(active), state_locked ? 1 : 0, static_cast<int>(state),
                 static_cast<unsigned long long>(generation), static_cast<unsigned long>(child_pid),
                 child_alive ? 1 : 0, cleanup_pending ? 1 : 0, err_len);
             last_log_ms = now;

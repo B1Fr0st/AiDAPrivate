@@ -1761,7 +1761,7 @@ bool client_t::send_rpc(json& out, const json& request, int http_read_timeout_se
     case transport_type_t::http_sse:
         return send_http(out, request, http_read_timeout_sec);
     case transport_type_t::stdio:
-        return send_stdio(out, request);
+        return send_stdio(out, request, http_read_timeout_sec);
     default:
         _last_error = "Unsupported transport type";
         return false;
@@ -2149,7 +2149,7 @@ bool client_t::poll_notifications()
     if (bytes_avail == 0) return false;
 
     std::string line;
-    if (!read_line_from_stdout(line))
+    if (!read_line_from_stdout(line, 1000))
         return false;
     if (line.empty()) return false;
     json maybe = json::parse(line, nullptr, false);
@@ -2351,7 +2351,7 @@ void client_t::kill_stdio_process()
     }
 }
 
-bool client_t::read_line_from_stdout(std::string& out)
+bool client_t::read_line_from_stdout(std::string& out, std::uint32_t timeout_ms)
 {
     out.clear();
 
@@ -2360,10 +2360,36 @@ bool client_t::read_line_from_stdout(std::string& out)
         return false;
     }
 
-    char ch;
-    DWORD read_bytes;
+    const uint64_t start_ms = GetTickCount64();
+    const uint64_t limit_ms = timeout_ms == 0 ? 1ULL : static_cast<uint64_t>(timeout_ms);
 
     while (true) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(static_cast<HANDLE>(_child_stdout_r), nullptr, 0, nullptr, &available, nullptr)) {
+            if (out.empty()) {
+                _last_error = "stdio: failed to inspect child stdout";
+                return false;
+            }
+            break;
+        }
+        if (available == 0) {
+            DWORD exit_code = STILL_ACTIVE;
+            if (_child_process &&
+                GetExitCodeProcess(static_cast<HANDLE>(_child_process), &exit_code) &&
+                exit_code != STILL_ACTIVE) {
+                _last_error = "stdio: child process exited while waiting for stdout code=" + std::to_string(exit_code);
+                return false;
+            }
+            const uint64_t elapsed = GetTickCount64() - start_ms;
+            if (elapsed >= limit_ms) {
+                _last_error = "stdio: timed out waiting for child stdout after " + std::to_string(elapsed) + "ms";
+                return false;
+            }
+            Sleep(10);
+            continue;
+        }
+        char ch = 0;
+        DWORD read_bytes = 0;
         BOOL ok = ReadFile(static_cast<HANDLE>(_child_stdout_r), &ch, 1, &read_bytes, nullptr);
         if (!ok || read_bytes == 0) {
             if (out.empty()) {
@@ -2403,10 +2429,15 @@ bool client_t::write_to_stdin(const std::string& data)
     return true;
 }
 
-bool client_t::send_stdio(json& out, const json& request)
+bool client_t::send_stdio(json& out, const json& request, int read_timeout_sec)
 {
     const std::string body = json_dump_safe(request);
     const std::string method = request_method_for_log(request);
+    if (read_timeout_sec < 1)
+        read_timeout_sec = 1;
+    if (read_timeout_sec > 300)
+        read_timeout_sec = 300;
+    const std::uint32_t read_timeout_ms = static_cast<std::uint32_t>(read_timeout_sec) * 1000u;
     diag::log_tagged_fmt("mcp_stdio", "send request server='%s' method='%s' has_id=%d body_bytes=%zu",
         _cfg.name.c_str(), method.c_str(), request.contains("id") ? 1 : 0, body.size());
     if (!write_to_stdin(body)) {
@@ -2422,7 +2453,7 @@ bool client_t::send_stdio(json& out, const json& request)
 
     while (true) {
         std::string response_str;
-        if (!read_line_from_stdout(response_str)) {
+        if (!read_line_from_stdout(response_str, read_timeout_ms)) {
             diag::log_tagged_fmt("mcp_stdio", "recv failed server='%s' method='%s' err='%s'",
                 _cfg.name.c_str(), method.c_str(), compact_log_text(_last_error, 500).c_str());
             return false;

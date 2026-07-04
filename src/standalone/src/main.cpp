@@ -526,6 +526,7 @@ static constexpr uint64_t kAidaRuntimeAcceptanceLogIntervalMs = 30000ULL;
 static constexpr uint64_t kAidaIdleHeartbeatMs = 250ULL;
 static constexpr uint64_t kAidaFullTestHeartbeatMs = 250ULL;
 static constexpr uint64_t kAidaModalHeartbeatMs = 16ULL;
+static constexpr uint64_t kAidaMenuPopupHeartbeatMs = 125ULL;
 static constexpr uint64_t kAidaFramePacingLogIntervalMs = 30000ULL;
 static constexpr uint64_t kAidaPacingAnomalyLogIntervalMs = 30000ULL;
 static constexpr uint64_t kAidaInputMotionLogIntervalMs = 1000ULL;
@@ -546,6 +547,30 @@ static constexpr uint32_t kAidaDirtyHeartbeat = 0x00000400u;
 static constexpr uint32_t kAidaDirtyWork = 0x00000800u;
 static constexpr uint32_t kAidaDirtySecurity = 0x00001000u;
 static constexpr uint32_t kAidaDirtyInteractiveCadence = 0x00002000u;
+
+static bool aida_key_down(int vk)
+{
+    return (::GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+static bool aida_ctrl_shift_t_chord_down()
+{
+    return aida_key_down(VK_CONTROL) && aida_key_down(VK_SHIFT) && aida_key_down('T');
+}
+
+static bool aida_key_only_queue(DWORD queue_current, DWORD queue_changed)
+{
+    const DWORD observed = queue_current | queue_changed;
+    return (observed & QS_KEY) != 0 &&
+        (queue_current & ~static_cast<DWORD>(QS_KEY)) == 0 &&
+        (queue_changed & ~static_cast<DWORD>(QS_KEY)) == 0;
+}
+
+static bool aida_full_test_key_only_queue(DWORD queue_current, DWORD queue_changed)
+{
+    return test_all_features::is_running() && aida_key_only_queue(queue_current, queue_changed);
+}
+
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -648,9 +673,14 @@ static aida_message_pump_slice_t aida_pump_messages_budgeted(const char* reason,
     const uint32_t max_messages = message_budget == 0 ? 1u : message_budget;
     for (;;) {
         DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
+        const DWORD queue_changed = LOWORD(queue_status_before);
         const DWORD queue_current = HIWORD(queue_status_before);
+        if ((queue_current & QS_KEY) != 0 && aida_ctrl_shift_t_chord_down())
+            break;
+        if (aida_full_test_key_only_queue(queue_current, queue_changed))
+            break;
         const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
-        const bool non_send_pending = (queue_current & kAidaNonSendQueueBits) != 0;
+        const bool non_send_pending = ((queue_current | queue_changed) & kAidaNonSendQueueBits) != 0;
         if (send_message_pending && !non_send_pending) {
             MSG sent_probe{};
             (void)::PeekMessage(&sent_probe, nullptr, 0U, 0U, kAidaSendOnlyPeekFlags);
@@ -661,7 +691,7 @@ static aida_message_pump_slice_t aida_pump_messages_budgeted(const char* reason,
             continue;
         }
 
-        const UINT peek_flags = (send_message_pending && non_send_pending) ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
+        const UINT peek_flags = non_send_pending ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
         BOOL has_message = ::PeekMessage(&msg, nullptr, 0U, 0U, peek_flags);
         if (!has_message)
             break;
@@ -2362,6 +2392,158 @@ namespace aida_focus_monitor {
 
     inline bool focused() {
         return g_focused.load(std::memory_order_acquire);
+    }
+}
+
+namespace aida_hotkey_monitor {
+    inline std::atomic<bool> g_started{ false };
+    inline std::atomic<bool> g_stop{ false };
+    inline std::atomic<bool> g_registered{ false };
+    inline std::atomic<DWORD> g_thread_id{ 0 };
+    inline std::atomic<std::uint64_t> g_last_trigger_ms{ 0 };
+
+    inline bool trigger(HWND hwnd, const char* source, WORD mods, WORD vk, DWORD queue_status) {
+        const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+        const std::uint64_t last_ms = g_last_trigger_ms.load(std::memory_order_acquire);
+        if (last_ms != 0 && now_ms >= last_ms && now_ms - last_ms < 750ULL)
+            return false;
+        const bool foreground = aida_focus_monitor::foreground_belongs_to_process(hwnd);
+        diag::log_tagged_critical_fmt("ui",
+            "test_all_start hotkey=%s id=0x%X mods=0x%04X vk=0x%04X foreground=%d hwnd=0x%llX queue=0x%08lX caller_tid=%lu registered=%d running=%d",
+            source && source[0] ? source : "ctrl_shift_t",
+            kAidaFullTestHotkeyId,
+            static_cast<unsigned>(mods),
+            static_cast<unsigned>(vk),
+            foreground ? 1 : 0,
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+            static_cast<unsigned long>(queue_status),
+            GetCurrentThreadId(),
+            g_registered.load(std::memory_order_acquire) ? 1 : 0,
+            test_all_features::is_running() ? 1 : 0);
+        if (!foreground)
+            return false;
+        const bool posted = test_all_features::post_hotkey_trigger(source && source[0] ? source : "ctrl_shift_t");
+        if (posted)
+            g_last_trigger_ms.store(now_ms, std::memory_order_release);
+        return posted;
+    }
+
+    inline void run(HWND hwnd) {
+        aida::manual_map_tls::ensure_current_thread();
+        const DWORD tid = GetCurrentThreadId();
+        g_thread_id.store(tid, std::memory_order_release);
+        startup_log_critical_fmt("hotkey_monitor_worker_enter hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+            GetCurrentProcessId(),
+            tid,
+            static_cast<unsigned long long>(GetTickCount64()));
+        MSG init_msg{};
+        (void)::PeekMessageW(&init_msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+        ::SetLastError(0);
+        const BOOL registered = ::RegisterHotKey(nullptr,
+            kAidaFullTestHotkeyId,
+            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+            'T');
+        const DWORD register_gle = ::GetLastError();
+        g_registered.store(registered != FALSE, std::memory_order_release);
+        startup_log_critical_fmt("hotkey_register ctrl_shift_t worker ok=%d id=0x%X tid=%lu gle=%lu hwnd=0x%llX",
+            registered ? 1 : 0,
+            kAidaFullTestHotkeyId,
+            tid,
+            static_cast<unsigned long>(register_gle),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)));
+        bool chord_latched = false;
+        while (!g_stop.load(std::memory_order_acquire)) {
+            const DWORD wait_result = ::MsgWaitForMultipleObjectsEx(0, nullptr, 25, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (wait_result == WAIT_OBJECT_0) {
+                for (unsigned drained = 0; drained < 32; ++drained) {
+                    MSG msg{};
+                    ::SetLastError(0);
+                    if (!::PeekMessageW(&msg, nullptr, 0U, 0U, PM_REMOVE))
+                        break;
+                    if (msg.message == WM_QUIT) {
+                        g_stop.store(true, std::memory_order_release);
+                        break;
+                    }
+                    if (msg.message == WM_HOTKEY && static_cast<int>(msg.wParam) == kAidaFullTestHotkeyId) {
+                        const WORD mods = LOWORD(msg.lParam);
+                        const WORD vk = HIWORD(msg.lParam);
+                        (void)trigger(hwnd, "worker_wm_hotkey_ctrl_shift_t", mods, vk, ::GetQueueStatus(QS_ALLINPUT));
+                        continue;
+                    }
+                    if (msg.hwnd) {
+                        ::TranslateMessage(&msg);
+                        ::DispatchMessageW(&msg);
+                    }
+                }
+            }
+            const bool chord_down = aida_ctrl_shift_t_chord_down();
+            if (chord_down && !chord_latched)
+                (void)trigger(hwnd, "worker_async_ctrl_shift_t", static_cast<WORD>(MOD_CONTROL | MOD_SHIFT), 'T', ::GetQueueStatus(QS_ALLINPUT));
+            chord_latched = chord_down;
+        }
+        if (g_registered.exchange(false, std::memory_order_acq_rel)) {
+            ::SetLastError(0);
+            const BOOL unregistered = ::UnregisterHotKey(nullptr, kAidaFullTestHotkeyId);
+            startup_log_critical_fmt("hotkey_unregister ctrl_shift_t worker ok=%d id=0x%X tid=%lu gle=%lu",
+                unregistered ? 1 : 0,
+                kAidaFullTestHotkeyId,
+                tid,
+                static_cast<unsigned long>(GetLastError()));
+        }
+        g_thread_id.store(0, std::memory_order_release);
+        g_started.store(false, std::memory_order_release);
+        startup_log_critical_fmt("hotkey_monitor_worker_exit hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+            GetCurrentProcessId(),
+            tid,
+            static_cast<unsigned long long>(GetTickCount64()));
+    }
+
+    inline void start(HWND hwnd) {
+        const uint64_t start_tick = static_cast<uint64_t>(GetTickCount64());
+        startup_log_critical_fmt("hotkey_monitor_start_pre hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(start_tick));
+        bool expected = false;
+        if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            startup_log_critical_fmt("hotkey_monitor_start_already_active hwnd=0x%llX worker_tid=%lu",
+                static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+                g_thread_id.load(std::memory_order_acquire));
+            return;
+        }
+        g_stop.store(false, std::memory_order_release);
+        bool posted = work_queue::post_service_labeled("hotkey_monitor", [hwnd]() {
+            run(hwnd);
+        });
+        if (!posted) {
+            g_started.store(false, std::memory_order_release);
+            g_stop.store(true, std::memory_order_release);
+        }
+        startup_log_critical_fmt("hotkey_monitor_start_post posted=%d elapsed_ms=%llu hwnd=0x%llX worker_tid=%lu",
+            posted ? 1 : 0,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_tick),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+            g_thread_id.load(std::memory_order_acquire));
+    }
+
+    inline void stop() {
+        g_stop.store(true, std::memory_order_release);
+        const DWORD tid = g_thread_id.load(std::memory_order_acquire);
+        BOOL posted = FALSE;
+        DWORD gle = 0;
+        if (tid != 0) {
+            ::SetLastError(0);
+            posted = ::PostThreadMessageW(tid, WM_QUIT, 0, 0);
+            gle = ::GetLastError();
+        }
+        startup_log_critical_fmt("hotkey_monitor_stop tid=%lu posted=%d gle=%lu registered=%d",
+            tid,
+            posted ? 1 : 0,
+            static_cast<unsigned long>(gle),
+            g_registered.load(std::memory_order_acquire) ? 1 : 0);
     }
 }
 
@@ -5077,14 +5259,7 @@ int main(int, char**)
     startup_log_critical_fmt("show_window_post hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
-    ::SetLastError(0);
-    const BOOL full_test_hotkey_ok = ::RegisterHotKey(hwnd, kAidaFullTestHotkeyId,
-        MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'T');
-    startup_log_critical_fmt("hotkey_register ctrl_shift_t ok=%d id=0x%X hwnd=0x%llX gle=%lu",
-        full_test_hotkey_ok ? 1 : 0,
-        kAidaFullTestHotkeyId,
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-        static_cast<unsigned long>(GetLastError()));
+    aida_hotkey_monitor::start(hwnd);
     crash_log_write("window_shown_acrylic_set");
 
     {
@@ -5659,18 +5834,48 @@ int main(int, char**)
         aida_tracer::mark_render_phase("peek_message_begin");
         MSG msg;
         static uint64_t sent_with_queued_last_log_ms = 0;
+        static bool ctrl_shift_t_chord_latched = false;
         for (;;)
         {
             aida_tracer::mark_render_phase("peek_message_probe");
             DWORD queue_status_before = ::GetQueueStatus(QS_ALLINPUT);
             const DWORD queue_changed = LOWORD(queue_status_before);
             const DWORD queue_current = HIWORD(queue_status_before);
+            const bool ctrl_shift_t_chord_active = (queue_current & QS_KEY) != 0 && aida_ctrl_shift_t_chord_down();
+            if (ctrl_shift_t_chord_active) {
+                aida_tracer::mark_render_phase("peek_message_hotkey_chord_defer");
+                if (!ctrl_shift_t_chord_latched)
+                    (void)aida_hotkey_monitor::trigger(hwnd, "ui_prepeek_ctrl_shift_t", static_cast<WORD>(MOD_CONTROL | MOD_SHIFT), 'T', queue_status_before);
+                ctrl_shift_t_chord_latched = true;
+                break;
+            }
+            ctrl_shift_t_chord_latched = false;
+            if (aida_full_test_key_only_queue(queue_current, queue_changed)) {
+                static uint64_t s_full_test_key_only_last_log_ms = 0;
+                const uint64_t now_key_defer_ms = static_cast<uint64_t>(GetTickCount64());
+                aida_tracer::set_peek_state(queue_status_before, 0);
+                aida_tracer::set_peek_call_shape(0, nullptr);
+                aida_tracer::mark_render_phase("peek_message_full_test_key_only_defer");
+                if (s_full_test_key_only_last_log_ms == 0 || now_key_defer_ms - s_full_test_key_only_last_log_ms >= 1000ULL) {
+                    s_full_test_key_only_last_log_ms = now_key_defer_ms;
+                    diag::log_tagged_critical_fmt("msgpump",
+                        "full_test_key_only_peek_deferred frame=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX flags=0x%08X hwnd=0x%llX tid=%lu",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long>(queue_status_before),
+                        static_cast<unsigned long>(queue_current),
+                        static_cast<unsigned long>(queue_changed),
+                        0U,
+                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+                        ::GetCurrentThreadId());
+                }
+                break;
+            }
             if (queue_current == 0) {
                 aida_tracer::set_peek_state(queue_status_before, 0);
                 aida_tracer::set_peek_call_shape(kAidaQueuedPeekFlags, nullptr);
             }
             const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
-            const bool non_send_pending = (queue_current & kAidaNonSendQueueBits) != 0;
+            const bool non_send_pending = ((queue_current | queue_changed) & kAidaNonSendQueueBits) != 0;
             const bool send_only_pending = send_message_pending && !non_send_pending;
             const bool sent_deferred_for_queued = send_message_pending && non_send_pending;
             if (send_only_pending) {
@@ -5720,7 +5925,7 @@ int main(int, char**)
                 }
                 continue;
             }
-            const UINT peek_remove_flags = sent_deferred_for_queued ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
+            const UINT peek_remove_flags = non_send_pending ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
             HWND peek_filter = nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
@@ -6186,16 +6391,17 @@ int main(int, char**)
             license::activation_worker_active.load(std::memory_order_acquire) ||
             standalone_license::is_arc_download_in_progress() ||
             standalone_license::is_arc_transfer_in_progress();
-        const bool modal_or_animation_pre =
+        const bool menu_popup_open_pre = menu_bar::any_open;
+        const bool active_modal_or_animation_pre =
             globals::ui::command_palette_open ||
             globals::ui::process_attach_open ||
             globals::ui::driver_status_open ||
             globals::ui::shortcuts_dialog_open ||
             g_settings_open ||
-            menu_bar::any_open ||
             aida::agent_picker::is_open() ||
             source_reconstruct_view::is_open() ||
             theme_animation_pre;
+        const bool modal_or_animation_pre = active_modal_or_animation_pre || menu_popup_open_pre;
         const bool input_active_pre =
             cursor_motion_relevant ||
             pre_frame_io.MouseWheel != 0.0f ||
@@ -6211,6 +6417,20 @@ int main(int, char**)
         const bool recent_input_pre = last_input_seen_pre && last_input_age_pre_ms <= kAidaRecentInputWakeMs;
         const uint64_t input_events_seen_pre = g_input_event_count;
         const bool unrendered_input_pre = !dirty_state_initialized || input_events_seen_pre != last_rendered_input_events;
+        const uint64_t since_render_ms = last_render_tick_ms != 0 && dirty_now_ms >= last_render_tick_ms ? dirty_now_ms - last_render_tick_ms : 0;
+        const bool menu_popup_interactive_pre =
+            menu_popup_open_pre &&
+            (pumped_messages != 0 ||
+             pumped_input_messages != 0 ||
+             interactive_pending_pre ||
+             input_active_pre ||
+             recent_input_pre ||
+             unrendered_input_pre ||
+             cursor_motion_relevant);
+        const bool menu_popup_heartbeat_due_pre =
+            menu_popup_open_pre &&
+            !menu_popup_interactive_pre &&
+            since_render_ms >= kAidaMenuPopupHeartbeatMs;
         uint32_t dirty_mask = 0;
         if (!dirty_state_initialized || frame_number < 5)
             dirty_mask |= kAidaDirtyStartup;
@@ -6228,7 +6448,7 @@ int main(int, char**)
             dirty_mask |= kAidaDirtyOverlay;
         if (themes::changed || theme_generation != last_theme_generation || theme_animation_pre)
             dirty_mask |= kAidaDirtyTheme;
-        if (modal_or_animation_pre)
+        if (active_modal_or_animation_pre || menu_popup_interactive_pre || menu_popup_heartbeat_due_pre)
             dirty_mask |= kAidaDirtyModal;
         if (full_test_running_pre != last_full_test_running ||
             activation_progress_pre != last_activation_progress ||
@@ -6238,14 +6458,15 @@ int main(int, char**)
             dirty_mask |= kAidaDirtyProgress;
         if (bulk_busy_pre != last_bulk_busy)
             dirty_mask |= kAidaDirtyWork;
-        const uint64_t since_render_ms = last_render_tick_ms != 0 && dirty_now_ms >= last_render_tick_ms ? dirty_now_ms - last_render_tick_ms : 0;
         const bool interactive_cadence_due_pre = recent_input_pre && since_render_ms >= kAidaInteractiveRenderCadenceMs;
         if (interactive_cadence_due_pre)
             dirty_mask |= kAidaDirtyInteractiveCadence;
         uint64_t heartbeat_ms = kAidaIdleHeartbeatMs;
         if (full_test_running_pre || bulk_busy_pre)
             heartbeat_ms = kAidaFullTestHeartbeatMs;
-        if (modal_or_animation_pre || activation_progress_pre || ai_thinking_pre)
+        if (menu_popup_open_pre)
+            heartbeat_ms = kAidaMenuPopupHeartbeatMs;
+        if (active_modal_or_animation_pre || activation_progress_pre || ai_thinking_pre)
             heartbeat_ms = kAidaModalHeartbeatMs;
         if (!dirty_state_initialized || since_render_ms >= heartbeat_ms)
             dirty_mask |= kAidaDirtyHeartbeat | kAidaDirtySecurity;
@@ -6257,7 +6478,8 @@ int main(int, char**)
             recent_input_pre ||
             unrendered_input_pre ||
             pumped_messages != 0 ||
-            modal_or_animation_pre ||
+            active_modal_or_animation_pre ||
+            menu_popup_interactive_pre ||
             activation_progress_pre ||
             ai_thinking_pre;
         const bool blur_pressure_pre =
@@ -6421,6 +6643,7 @@ int main(int, char**)
             if (frame_number < 5)
                 crash_log_write("source_reconstruct_done");
 
+            aida_tracer::mark_render_phase("render_toast");
             DWORD seh_toast = seh_render_toast(frame_number);
             if (seh_toast != 0)
                 diag::log_tagged_critical_fmt("render", "SEH_in_toast code=0x%08X frame=%llu",
@@ -6431,14 +6654,30 @@ int main(int, char**)
         }
 
         {
-            const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("post_imgui_build", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
-            pumped_messages += mid_pump.messages;
-            pumped_input_messages += mid_pump.input_messages;
-            pumped_resize_messages += mid_pump.resize_messages;
-            pumped_paint_messages += mid_pump.paint_messages;
-            if (mid_pump.quit) {
-                done = true;
-                break;
+            const ImGuiIO& mid_frame_io = ImGui::GetIO();
+            const bool defer_post_build_pump =
+                menu_bar::any_open ||
+                globals::ui::command_palette_open ||
+                globals::ui::process_attach_open ||
+                globals::ui::driver_status_open ||
+                globals::ui::shortcuts_dialog_open ||
+                g_settings_open ||
+                aida::agent_picker::is_open() ||
+                mid_frame_io.WantTextInput ||
+                mid_frame_io.WantCaptureKeyboard;
+            if (defer_post_build_pump) {
+                aida_tracer::mark_render_phase("post_imgui_build_pump_deferred");
+            } else {
+                aida_tracer::mark_render_phase("post_imgui_build_pump");
+                const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("post_imgui_build", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
+                pumped_messages += mid_pump.messages;
+                pumped_input_messages += mid_pump.input_messages;
+                pumped_resize_messages += mid_pump.resize_messages;
+                pumped_paint_messages += mid_pump.paint_messages;
+                if (mid_pump.quit) {
+                    done = true;
+                    break;
+                }
             }
         }
 
@@ -6446,6 +6685,7 @@ int main(int, char**)
 
         if (frame_number < 5)
             crash_log_write("render_submit");
+        aida_tracer::mark_render_phase("clear_render_target");
         HRESULT clear_removed = S_OK;
         DWORD seh_clear = seh_clear_main_render_target(g_pd3dDeviceContext, g_mainRenderTargetView, clear_color_with_alpha, &clear_removed, frame_number);
         if (seh_clear != 0) {
@@ -6465,6 +6705,7 @@ int main(int, char**)
         if (seh_ir != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_render code=0x%08X frame=%llu",
                 seh_ir, (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("collect_draw_data");
         ImDrawData* draw_data = ImGui::GetDrawData();
         draw_data_metrics_t draw_metrics = collect_draw_data_metrics(draw_data, frame_number < 5ULL || (frame_number % 120ULL) == 0ULL);
         begin_gpu_frame_query(frame_number);
@@ -6473,10 +6714,12 @@ int main(int, char**)
         if (seh_idr != 0)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_dx11_render code=0x%08X frame=%llu",
                 seh_idr, (unsigned long long)frame_number);
+        aida_tracer::mark_render_phase("dx11_blend_state");
         g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
         end_gpu_frame_query(frame_number);
 
         {
+            aida_tracer::mark_render_phase("pre_present_pump");
             const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("pre_present", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
             pumped_messages += mid_pump.messages;
             pumped_input_messages += mid_pump.input_messages;
@@ -6507,6 +6750,7 @@ int main(int, char**)
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
         {
+            aida_tracer::mark_render_phase("post_present_pump");
             const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("post_present", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
             pumped_messages += mid_pump.messages;
             pumped_input_messages += mid_pump.input_messages;
@@ -7067,6 +7311,9 @@ int main(int, char**)
     } catch (...) {
         diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_exception");
     }
+    aida_shutdown_diag::mark("shutdown_hotkey_monitor");
+    aida_hotkey_monitor::stop();
+    diag::log_tagged_critical("main", "shutdown_hotkey_monitor_done");
     aida_shutdown_diag::mark("shutdown_focus_monitor");
     aida_focus_monitor::stop();
     diag::log_tagged_critical("main", "shutdown_focus_monitor_done");
@@ -7143,12 +7390,6 @@ int main(int, char**)
     aida_shutdown_diag::mark("shutdown_d3d");
     CleanupDeviceD3D();
     diag::log_tagged_critical("main", "shutdown_d3d_done");
-    aida_shutdown_diag::mark("shutdown_hotkey_unregister");
-    ::SetLastError(0);
-    BOOL hotkey_unregistered = ::UnregisterHotKey(hwnd, kAidaFullTestHotkeyId);
-    diag::log_tagged_critical_fmt("main", "shutdown_hotkey_unregister ok=%d gle=%lu",
-        hotkey_unregistered ? 1 : 0,
-        static_cast<unsigned long>(GetLastError()));
     aida_shutdown_diag::mark("shutdown_destroy_window");
     ::DestroyWindow(hwnd);
     diag::log_tagged_critical("main", "shutdown_destroy_window_done");
