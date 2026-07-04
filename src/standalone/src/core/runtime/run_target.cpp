@@ -34,8 +34,8 @@
 #include <locale>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
-#include <thread>
 #include <vector>
 
 #pragma comment(lib, "ole32.lib")
@@ -228,6 +228,46 @@ struct async_create_process_state_t {
 };
 
 constexpr DWORD kCreateProcessDeadlineMs = 15000;
+constexpr SIZE_T kCreateProcessWorkerStackReserve = 256u * 1024u;
+
+DWORD WINAPI create_process_worker_proc(void* param)
+{
+	std::unique_ptr<std::shared_ptr<async_create_process_state_t>> owner(
+		static_cast<std::shared_ptr<async_create_process_state_t>*>(param));
+	std::shared_ptr<async_create_process_state_t> cp_state = *owner;
+	cp_state->worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
+	const wchar_t* async_cwd = cp_state->cwd.empty() ? nullptr : cp_state->cwd.c_str();
+	PROCESS_INFORMATION local_pi{};
+	BOOL local_ok = CreateProcessW(
+		nullptr,
+		cp_state->cmd_buf.data(),
+		nullptr, nullptr, FALSE,
+		cp_state->flags,
+		nullptr,
+		async_cwd,
+		&cp_state->si,
+		&local_pi);
+	cp_state->gle = local_ok ? 0 : GetLastError();
+	cp_state->ok = local_ok;
+	cp_state->pi = local_pi;
+	if (cp_state->abandoned.load(std::memory_order_acquire)) {
+		if (local_ok) {
+			TerminateProcess(local_pi.hProcess, 0xC0FFEEu);
+			CloseHandle(local_pi.hThread);
+			CloseHandle(local_pi.hProcess);
+			cp_state->pi = PROCESS_INFORMATION{};
+		}
+		diag::log_tagged_critical_fmt("run",
+			"CreateProcessW.late_result ok=%d pid=%lu tid=%lu gle=%lu worker_tid=%lu",
+			local_ok ? 1 : 0,
+			local_ok ? local_pi.dwProcessId : 0u,
+			local_ok ? local_pi.dwThreadId : 0u,
+			static_cast<unsigned long>(cp_state->gle),
+			static_cast<unsigned long>(cp_state->worker_tid.load(std::memory_order_acquire)));
+	}
+	SetEvent(cp_state->done);
+	return 0;
+}
 
 uint32_t get_windows_build_number() {
 	HMODULE h = GetModuleHandleW(L"ntdll.dll");
@@ -1391,54 +1431,43 @@ bool launch_jobbed(const launch_options_t& opts, launch_result_t& out, bool /*in
 		CloseHandle(job);
 		return false;
 	}
-	try {
-		std::thread([cp_state]() {
-			cp_state->worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
-			const wchar_t* async_cwd = cp_state->cwd.empty() ? nullptr : cp_state->cwd.c_str();
-			PROCESS_INFORMATION local_pi{};
-			BOOL local_ok = CreateProcessW(
-				nullptr,
-				cp_state->cmd_buf.data(),
-				nullptr, nullptr, FALSE,
-				cp_state->flags,
-				nullptr,
-				async_cwd,
-				&cp_state->si,
-				&local_pi);
-			cp_state->gle = local_ok ? 0 : GetLastError();
-			cp_state->ok = local_ok;
-			cp_state->pi = local_pi;
-			if (cp_state->abandoned.load(std::memory_order_acquire)) {
-				if (local_ok) {
-					TerminateProcess(local_pi.hProcess, 0xC0FFEEu);
-					CloseHandle(local_pi.hThread);
-					CloseHandle(local_pi.hProcess);
-					cp_state->pi = PROCESS_INFORMATION{};
-				}
-				diag::log_tagged_critical_fmt("run",
-					"CreateProcessW.late_result ok=%d pid=%lu tid=%lu gle=%lu worker_tid=%lu",
-					local_ok ? 1 : 0,
-					local_ok ? local_pi.dwProcessId : 0u,
-					local_ok ? local_pi.dwThreadId : 0u,
-					static_cast<unsigned long>(cp_state->gle),
-					static_cast<unsigned long>(cp_state->worker_tid.load(std::memory_order_acquire)));
-			}
-			SetEvent(cp_state->done);
-		}).detach();
-	} catch (const std::exception& ex) {
-		out.error = std::string("CreateProcessW worker start failed: ") + ex.what();
+	auto* worker_owner = new (std::nothrow) std::shared_ptr<async_create_process_state_t>(cp_state);
+	if (!worker_owner) {
+		out.error = "CreateProcessW worker start failed: shared state allocation failed";
 		diag::log_tagged_critical_fmt("run_target",
-			"launch_FAILED step=CreateProcessWWorkerStart exception='%s'",
-			ex.what());
-		CloseHandle(job);
-		return false;
-	} catch (...) {
-		out.error = "CreateProcessW worker start failed: unknown exception";
-		diag::log_tagged_critical("run_target",
-			"launch_FAILED step=CreateProcessWWorkerStart exception='<unknown>'");
+			"launch_FAILED step=CreateProcessWWorkerStateAlloc exe='%s' cwd='%s'",
+			exe_utf8.c_str(),
+			cwd_ptr ? cwd_utf8.c_str() : "<inherit>");
 		CloseHandle(job);
 		return false;
 	}
+	DWORD create_thread_id = 0;
+	SetLastError(0);
+	HANDLE create_thread = CreateThread(
+		nullptr,
+		kCreateProcessWorkerStackReserve,
+		create_process_worker_proc,
+		worker_owner,
+		STACK_SIZE_PARAM_IS_A_RESERVATION,
+		&create_thread_id);
+	DWORD create_thread_gle = create_thread ? 0 : GetLastError();
+	diag::log_tagged_critical_fmt("run",
+		"CreateProcessW.worker_start thread=0x%p tid=%lu gle=%lu stack_reserve=%llu flags=0x%08lX exe='%s' cwd='%s'",
+		static_cast<void*>(create_thread),
+		static_cast<unsigned long>(create_thread_id),
+		static_cast<unsigned long>(create_thread_gle),
+		static_cast<unsigned long long>(kCreateProcessWorkerStackReserve),
+		static_cast<unsigned long>(flags),
+		exe_utf8.c_str(),
+		cwd_ptr ? cwd_utf8.c_str() : "<inherit>");
+	if (!create_thread) {
+		delete worker_owner;
+		out.error = format_error("CreateThread(CreateProcess worker)", create_thread_gle);
+		log_fail("CreateThread.CreateProcessWorker", create_thread_gle);
+		CloseHandle(job);
+		return false;
+	}
+	CloseHandle(create_thread);
 
 	const DWORD cp_wait = WaitForSingleObject(cp_state->done, kCreateProcessDeadlineMs);
 	if (cp_wait != WAIT_OBJECT_0) {

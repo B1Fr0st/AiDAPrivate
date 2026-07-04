@@ -558,17 +558,12 @@ static bool aida_ctrl_shift_t_chord_down()
     return aida_key_down(VK_CONTROL) && aida_key_down(VK_SHIFT) && aida_key_down('T');
 }
 
-static bool aida_key_only_queue(DWORD queue_current, DWORD queue_changed)
+static bool aida_input_only_queue(DWORD queue_current, DWORD queue_changed)
 {
     const DWORD observed = queue_current | queue_changed;
-    return (observed & QS_KEY) != 0 &&
-        (queue_current & ~static_cast<DWORD>(QS_KEY)) == 0 &&
-        (queue_changed & ~static_cast<DWORD>(QS_KEY)) == 0;
-}
-
-static bool aida_full_test_key_only_queue(DWORD queue_current, DWORD queue_changed)
-{
-    return test_all_features::is_running() && aida_key_only_queue(queue_current, queue_changed);
+    return (observed & QS_INPUT) != 0 &&
+        (queue_current & ~static_cast<DWORD>(QS_INPUT)) == 0 &&
+        (queue_changed & ~static_cast<DWORD>(QS_INPUT)) == 0;
 }
 
 bool CreateDeviceD3D(HWND hWnd);
@@ -677,8 +672,25 @@ static aida_message_pump_slice_t aida_pump_messages_budgeted(const char* reason,
         const DWORD queue_current = HIWORD(queue_status_before);
         if ((queue_current & QS_KEY) != 0 && aida_ctrl_shift_t_chord_down())
             break;
-        if (aida_full_test_key_only_queue(queue_current, queue_changed))
+        if (aida_input_only_queue(queue_current, queue_changed)) {
+            static uint64_t s_budget_input_only_last_log_ms = 0;
+            const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+            if (s_budget_input_only_last_log_ms == 0 || now_ms - s_budget_input_only_last_log_ms >= 1000ULL) {
+                s_budget_input_only_last_log_ms = now_ms;
+                diag::log_tagged_critical_fmt("msgpump",
+                    "budget_input_only_peek_deferred reason=%s qs=0x%08lX current=0x%04lX changed=0x%04lX input=0x%04lX mouse=0x%04lX key=0x%04lX running=%d tid=%lu",
+                    reason && reason[0] ? reason : "<none>",
+                    static_cast<unsigned long>(queue_status_before),
+                    static_cast<unsigned long>(queue_current),
+                    static_cast<unsigned long>(queue_changed),
+                    static_cast<unsigned long>((queue_current | queue_changed) & QS_INPUT),
+                    static_cast<unsigned long>((queue_current | queue_changed) & QS_MOUSE),
+                    static_cast<unsigned long>((queue_current | queue_changed) & QS_KEY),
+                    test_all_features::is_running() ? 1 : 0,
+                    ::GetCurrentThreadId());
+            }
             break;
+        }
         const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
         const bool non_send_pending = ((queue_current | queue_changed) & kAidaNonSendQueueBits) != 0;
         if (send_message_pending && !non_send_pending) {
@@ -2247,7 +2259,7 @@ namespace aida_tracer {
                         GetCurrentThreadId(),
                         stall_context[0] ? stall_context : "<empty>");
                     const bool shutdown_context = is_shutdown_stall_context(phase_name, dispatch_msg, wndproc_msg);
-                    const bool sustained_hang = age_ms >= 10000ULL && (stall_streak == 32ULL || (stall_streak % 120ULL) == 0ULL);
+                    const bool sustained_hang = age_ms >= 2500ULL && (stall_streak == 1ULL || (stall_streak % 20ULL) == 0ULL);
                     if (render_tid != 0 && sustained_hang && !shutdown_context)
                         capture_render_thread_snapshot(render_tid, age_ms);
                 }
@@ -5850,23 +5862,31 @@ int main(int, char**)
                 break;
             }
             ctrl_shift_t_chord_latched = false;
-            if (aida_full_test_key_only_queue(queue_current, queue_changed)) {
-                static uint64_t s_full_test_key_only_last_log_ms = 0;
-                const uint64_t now_key_defer_ms = static_cast<uint64_t>(GetTickCount64());
+            if (aida_input_only_queue(queue_current, queue_changed)) {
+                static uint64_t s_input_only_last_log_ms = 0;
+                const uint64_t now_input_defer_ms = static_cast<uint64_t>(GetTickCount64());
                 aida_tracer::set_peek_state(queue_status_before, 0);
                 aida_tracer::set_peek_call_shape(0, nullptr);
-                aida_tracer::mark_render_phase("peek_message_full_test_key_only_defer");
-                if (s_full_test_key_only_last_log_ms == 0 || now_key_defer_ms - s_full_test_key_only_last_log_ms >= 1000ULL) {
-                    s_full_test_key_only_last_log_ms = now_key_defer_ms;
+                aida_tracer::mark_render_phase("peek_message_input_only_defer");
+                if (s_input_only_last_log_ms == 0 || now_input_defer_ms - s_input_only_last_log_ms >= 1000ULL) {
+                    s_input_only_last_log_ms = now_input_defer_ms;
+                    char stall_context[4600] = {};
+                    format_message_pump_stall_context(stall_context, sizeof(stall_context));
                     diag::log_tagged_critical_fmt("msgpump",
-                        "full_test_key_only_peek_deferred frame=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX flags=0x%08X hwnd=0x%llX tid=%lu",
+                        "input_only_peek_deferred frame=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX input=0x%04lX mouse=0x%04lX key=0x%04lX flags=0x%08X hwnd=0x%llX running=%d chord=%d tid=%lu ctx={%.3600s}",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long>(queue_status_before),
                         static_cast<unsigned long>(queue_current),
                         static_cast<unsigned long>(queue_changed),
+                        static_cast<unsigned long>((queue_current | queue_changed) & QS_INPUT),
+                        static_cast<unsigned long>((queue_current | queue_changed) & QS_MOUSE),
+                        static_cast<unsigned long>((queue_current | queue_changed) & QS_KEY),
                         0U,
                         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-                        ::GetCurrentThreadId());
+                        test_all_features::is_running() ? 1 : 0,
+                        aida_ctrl_shift_t_chord_down() ? 1 : 0,
+                        ::GetCurrentThreadId(),
+                        stall_context[0] ? stall_context : "<empty>");
                 }
                 break;
             }
