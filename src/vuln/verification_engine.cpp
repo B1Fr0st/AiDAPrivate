@@ -26,7 +26,6 @@
 
 #include <funcs.hpp>
 #include <hexrays.hpp>
-#include <kernwin.hpp>
 #include <nalt.hpp>
 #include <netnode.hpp>
 #include <tryblks.hpp>
@@ -66,7 +65,7 @@ std::string ea_to_hex(ea_t ea)
 
 bool should_cancel()
 {
-    return g_verify_cancel.load(std::memory_order_relaxed) || user_cancelled();
+    return g_verify_cancel.load(std::memory_order_relaxed);
 }
 
 struct inflight_guard_t
@@ -80,21 +79,6 @@ struct inflight_guard_t
     ~inflight_guard_t()
     {
         g_verify_in_flight.fetch_sub(1, std::memory_order_relaxed);
-    }
-};
-
-struct wait_box_guard_t
-{
-    bool shown = false;
-    explicit wait_box_guard_t(const char* text)
-    {
-        show_wait_box("NODELAY\n%s", text);
-        shown = true;
-    }
-    ~wait_box_guard_t()
-    {
-        if (shown)
-            hide_wait_box();
     }
 };
 
@@ -620,7 +604,6 @@ path_verification_t VerificationEngine::verify_taint_path(ea_t source_ea,
                                                           uint32_t timeout_ms)
 {
     inflight_guard_t in_flight;
-    wait_box_guard_t wait("Verifying taint path with SMT");
     path_verification_t out;
     if (!m_impl)
     {
@@ -783,7 +766,6 @@ exploit_input_t VerificationEngine::solve_for_exploit_input(ea_t source_ea,
                                                             const exploit_constraints_t& input_shape)
 {
     inflight_guard_t in_flight;
-    wait_box_guard_t wait("Solving exploit input with SMT");
     exploit_input_t out;
     if (!m_impl)
     {
@@ -971,7 +953,6 @@ loop_bound_proof_t VerificationEngine::prove_loop_bound(ea_t loop_func_ea,
                                                         uint32_t timeout_ms)
 {
     inflight_guard_t in_flight;
-    wait_box_guard_t wait("Proving loop bound with SMT");
     loop_bound_proof_t out;
     out.buffer_size = buffer_size;
 
@@ -1140,7 +1121,6 @@ symbolic::alias_proof_t VerificationEngine::prove_pointer_alias(ea_t func_ea,
                                                                 uint32_t timeout_ms)
 {
     inflight_guard_t in_flight;
-    wait_box_guard_t wait("Proving pointer aliasing with SMT");
     symbolic::alias_proof_t out;
     if (!m_impl || !is_available())
     {
@@ -1324,7 +1304,6 @@ triage_result_t VerificationEngine::triage_sink(ea_t source_ea,
                                                 const std::string& stop_at)
 {
     inflight_guard_t in_flight;
-    wait_box_guard_t wait("Triaging sink with symbolic verification");
     triage_result_t out;
     out.stage_reached = "sat_check";
     if (!m_impl || !is_available())

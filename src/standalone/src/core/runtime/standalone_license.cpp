@@ -2305,6 +2305,10 @@ namespace
     };
     std::vector<code_section_hash_t> s_code_hashes;
     std::mutex s_code_hash_mtx;
+    std::atomic<uint64_t> s_code_hash_baseline_epoch_ms{0};
+    std::atomic<uint64_t> s_code_hash_baseline_activation_ms{0};
+    std::atomic<uint64_t> s_code_hash_baseline_module_base{0};
+    std::atomic<uint64_t> s_code_hash_baseline_session_hash{0};
 
     constexpr DWORD kHeartbeatComposeLockTimeoutMs = 2000;
 
@@ -10279,6 +10283,180 @@ namespace standalone_license
         return verify_runtime_gate_state(slot);
     }
 
+    uint64_t current_session_token_hash_for_diag()
+    {
+        std::string token_copy;
+        {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            token_copy = s_cached_session_token;
+        }
+        return token_copy.empty() ? 0 : fnv1a_str(token_copy);
+    }
+
+    uint64_t safe_prefix_hash_for_diag(const void* data, size_t len, bool& ok)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        ok = false;
+        __try
+        {
+            const auto* p = static_cast<const uint8_t*>(data);
+            for (size_t i = 0; i < len; ++i)
+            {
+                h ^= p[i];
+                h *= 1099511628211ULL;
+            }
+            ok = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            h = 0;
+            ok = false;
+        }
+        return h;
+    }
+
+    bool safe_read_dos_magic_for_diag(const IMAGE_DOS_HEADER* dos, WORD& value) noexcept
+    {
+        __try
+        {
+            value = dos->e_magic;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            value = 0;
+            return false;
+        }
+    }
+
+    bool safe_read_lfanew_for_diag(const IMAGE_DOS_HEADER* dos, LONG& value) noexcept
+    {
+        __try
+        {
+            value = dos->e_lfanew;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            value = 0;
+            return false;
+        }
+    }
+
+    bool safe_read_nt_signature_for_diag(const IMAGE_NT_HEADERS* nt, DWORD& value) noexcept
+    {
+        __try
+        {
+            value = nt->Signature;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            value = 0;
+            return false;
+        }
+    }
+
+    struct protected_header_baseline_state_t
+    {
+        bool baseline_exists = false;
+        bool baseline_module_same = false;
+        bool activation_epoch_ok = false;
+        bool session_ok = false;
+        bool protected_state_active = false;
+        bool loader_snapshot_valid = false;
+        bool loader_snapshot_base_same = false;
+        bool loader_snapshot_size_ok = false;
+        uintptr_t loader_snapshot_base = 0;
+        DWORD loader_snapshot_size = 0;
+        uint64_t baseline_epoch_ms = 0;
+        uint64_t baseline_activation_ms = 0;
+        uint64_t baseline_module_base = 0;
+        uint64_t baseline_session_hash = 0;
+        uint64_t current_activation_ms = 0;
+        uint64_t current_session_hash = 0;
+        bool arc_loaded = false;
+        bool arc_unloading = false;
+        bool activation_hardening_done = false;
+        bool driver_hardening_done = false;
+    };
+
+    protected_header_baseline_state_t capture_protected_header_baseline_state(HMODULE hMod)
+    {
+        protected_header_baseline_state_t state{};
+        state.baseline_epoch_ms = s_code_hash_baseline_epoch_ms.load(std::memory_order_acquire);
+        state.baseline_activation_ms = s_code_hash_baseline_activation_ms.load(std::memory_order_acquire);
+        state.baseline_module_base = s_code_hash_baseline_module_base.load(std::memory_order_acquire);
+        state.baseline_session_hash = s_code_hash_baseline_session_hash.load(std::memory_order_acquire);
+        state.current_activation_ms = s_activation_completed_at_ms.load(std::memory_order_acquire);
+        state.current_session_hash = current_session_token_hash_for_diag();
+        state.arc_loaded = s_arc_loaded.load(std::memory_order_acquire);
+        state.arc_unloading = s_arc_unloading.load(std::memory_order_acquire);
+        const auto& rt = anti_tamper::state::get();
+        state.activation_hardening_done = rt.activation_hardening_done.load(std::memory_order_acquire);
+        state.driver_hardening_done = rt.driver_hardening_done.load(std::memory_order_acquire);
+        {
+            std::lock_guard<std::mutex> header_lk(aida::runtime::loader_header_invariant::header_mutex());
+            const auto& snap = aida::runtime::loader_header_invariant::cached_snapshot();
+            state.loader_snapshot_valid = snap.valid;
+            state.loader_snapshot_base = snap.base;
+            state.loader_snapshot_size = snap.header_size;
+        }
+        state.baseline_exists = state.baseline_epoch_ms != 0 && state.baseline_module_base != 0;
+        state.baseline_module_same = state.baseline_module_base == reinterpret_cast<uintptr_t>(hMod);
+        state.loader_snapshot_base_same =
+            state.loader_snapshot_valid &&
+            state.loader_snapshot_base == reinterpret_cast<uintptr_t>(hMod);
+        state.loader_snapshot_size_ok = state.loader_snapshot_valid && state.loader_snapshot_size != 0;
+        state.activation_epoch_ok =
+            state.baseline_activation_ms != 0 &&
+            state.current_activation_ms != 0 &&
+            state.baseline_activation_ms == state.current_activation_ms;
+        state.session_ok =
+            state.baseline_session_hash != 0 &&
+            state.current_session_hash != 0 &&
+            state.baseline_session_hash == state.current_session_hash;
+        state.protected_state_active =
+            state.current_activation_ms != 0 &&
+            state.arc_loaded &&
+            !state.arc_unloading &&
+            state.loader_snapshot_valid &&
+            state.loader_snapshot_base_same &&
+            state.loader_snapshot_size_ok &&
+            (state.activation_hardening_done || state.driver_hardening_done);
+        return state;
+    }
+
+    const char* protected_header_preserve_reject_reason(const protected_header_baseline_state_t& state)
+    {
+        if (!state.baseline_exists)
+            return "no_same_run_baseline";
+        if (!state.baseline_module_same)
+            return "baseline_module_mismatch";
+        if (!state.loader_snapshot_valid)
+            return "loader_snapshot_missing";
+        if (!state.loader_snapshot_base_same)
+            return "loader_snapshot_module_mismatch";
+        if (!state.loader_snapshot_size_ok)
+            return "loader_snapshot_header_size_zero";
+        if (!state.protected_state_active)
+            return "protected_state_inactive";
+        if (!state.activation_epoch_ok)
+            return "activation_epoch_mismatch";
+        if (!state.session_ok)
+            return "session_mismatch";
+        return "accepted";
+    }
+
+    bool protected_header_preserve_allowed(const protected_header_baseline_state_t& state)
+    {
+        return state.baseline_exists &&
+            state.baseline_module_same &&
+            state.protected_state_active &&
+            state.activation_epoch_ok &&
+            state.session_ok;
+    }
+
 
     bool snapshot_code_hashes()
     {
@@ -10288,40 +10466,146 @@ namespace standalone_license
         if (!hMod) {
             char dbg[96];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "snapshot_code_hashes_no_module preserved=%zu", s_code_hashes.size());
+                "snapshot_code_hashes_no_module preserved=%zu fail_closed=1", s_code_hashes.size());
             lic_log(dbg);
-            return !s_code_hashes.empty();
+            return false;
         }
 
         auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        WORD dos_magic = 0;
+        const bool dos_read_ok = safe_read_dos_magic_for_diag(dos, dos_magic);
+        if (!dos_read_ok || dos_magic != IMAGE_DOS_SIGNATURE) {
             MEMORY_BASIC_INFORMATION mbi{};
             const bool have_mbi = VirtualQuery(hMod, &mbi, sizeof(mbi)) != 0;
-            char dbg[320];
+            bool first_hash_ok = false;
+            const uint64_t first_hash = safe_prefix_hash_for_diag(hMod, 16, first_hash_ok);
+            char path_buf[MAX_PATH * 4] = {};
+            const DWORD path_len = GetModuleFileNameA(hMod, path_buf, static_cast<DWORD>(sizeof(path_buf)));
+            const bool have_path = path_len != 0 && path_len < static_cast<DWORD>(sizeof(path_buf));
+            const uint64_t path_hash = have_path ? fnv1a(path_buf, path_len) : 0;
+            const protected_header_baseline_state_t ph = capture_protected_header_baseline_state(hMod);
+            const bool preserve_ok = protected_header_preserve_allowed(ph);
+            const char* preserve_reason = protected_header_preserve_reject_reason(ph);
+            char dbg[1536];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "snapshot_code_hashes_bad_dos_magic value=0x%04X preserved=%zu mbi=%d base=0x%016llX alloc=0x%016llX protect=0x%08lX state=0x%08lX type=0x%08lX",
-                static_cast<unsigned>(dos->e_magic),
+                "snapshot_code_hashes_bad_dos_magic value=0x%04X read_ok=%d preserved=%zu preserve_ok=%d classify=%s mbi=%d base=0x%016llX alloc=0x%016llX region=0x%016llX protect=0x%08lX alloc_protect=0x%08lX state=0x%08lX type=0x%08lX first16_ok=%d first16_hash=0x%016llX image_path_hash=0x%016llX image_path='%.180s' arc_loaded=%d arc_unloading=%d activation_ms=%llu activation_hardening=%d driver_hardening=%d loader_snapshot=%d loader_base_same=%d loader_header_ok=%d loader_base=0x%016llX loader_header=0x%08lX baseline_epoch_ms=%llu baseline_activation_ms=%llu baseline_base=0x%016llX baseline_session_hash=0x%016llX current_session_hash=0x%016llX baseline_exists=%d baseline_module_same=%d activation_epoch_ok=%d session_ok=%d protected_state_active=%d",
+                static_cast<unsigned>(dos_magic),
+                dos_read_ok ? 1 : 0,
                 s_code_hashes.size(),
+                preserve_ok ? 1 : 0,
+                preserve_ok ? "protected_header_preserved_baseline_ok" : preserve_reason,
                 have_mbi ? 1 : 0,
                 have_mbi ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(mbi.BaseAddress)) : 0ull,
                 have_mbi ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(mbi.AllocationBase)) : 0ull,
+                have_mbi ? static_cast<unsigned long long>(mbi.RegionSize) : 0ull,
                 have_mbi ? static_cast<unsigned long>(mbi.Protect) : 0ul,
+                have_mbi ? static_cast<unsigned long>(mbi.AllocationProtect) : 0ul,
                 have_mbi ? static_cast<unsigned long>(mbi.State) : 0ul,
-                have_mbi ? static_cast<unsigned long>(mbi.Type) : 0ul);
+                have_mbi ? static_cast<unsigned long>(mbi.Type) : 0ul,
+                first_hash_ok ? 1 : 0,
+                static_cast<unsigned long long>(first_hash),
+                static_cast<unsigned long long>(path_hash),
+                have_path ? path_buf : "?",
+                ph.arc_loaded ? 1 : 0,
+                ph.arc_unloading ? 1 : 0,
+                static_cast<unsigned long long>(ph.current_activation_ms),
+                ph.activation_hardening_done ? 1 : 0,
+                ph.driver_hardening_done ? 1 : 0,
+                ph.loader_snapshot_valid ? 1 : 0,
+                ph.loader_snapshot_base_same ? 1 : 0,
+                ph.loader_snapshot_size_ok ? 1 : 0,
+                static_cast<unsigned long long>(ph.loader_snapshot_base),
+                static_cast<unsigned long>(ph.loader_snapshot_size),
+                static_cast<unsigned long long>(ph.baseline_epoch_ms),
+                static_cast<unsigned long long>(ph.baseline_activation_ms),
+                static_cast<unsigned long long>(ph.baseline_module_base),
+                static_cast<unsigned long long>(ph.baseline_session_hash),
+                static_cast<unsigned long long>(ph.current_session_hash),
+                ph.baseline_exists ? 1 : 0,
+                ph.baseline_module_same ? 1 : 0,
+                ph.activation_epoch_ok ? 1 : 0,
+                ph.session_ok ? 1 : 0,
+                ph.protected_state_active ? 1 : 0);
             lic_log(dbg);
-            return !s_code_hashes.empty();
+            return preserve_ok && !s_code_hashes.empty();
+        }
+
+        LONG e_lfanew = 0;
+        const bool e_lfanew_ok = safe_read_lfanew_for_diag(dos, e_lfanew);
+        if (!e_lfanew_ok || !aida::runtime::loader_header_invariant::valid_lfanew(e_lfanew)) {
+            const protected_header_baseline_state_t ph = capture_protected_header_baseline_state(hMod);
+            const bool preserve_ok = protected_header_preserve_allowed(ph);
+            const char* preserve_reason = protected_header_preserve_reject_reason(ph);
+            char dbg[1024];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "snapshot_code_hashes_bad_lfanew value=0x%08lX read_ok=%d preserved=%zu preserve_ok=%d classify=%s arc_loaded=%d arc_unloading=%d activation_ms=%llu activation_hardening=%d driver_hardening=%d loader_snapshot=%d loader_base_same=%d loader_header_ok=%d loader_base=0x%016llX loader_header=0x%08lX baseline_epoch_ms=%llu baseline_activation_ms=%llu baseline_base=0x%016llX baseline_session_hash=0x%016llX current_session_hash=0x%016llX baseline_exists=%d baseline_module_same=%d activation_epoch_ok=%d session_ok=%d protected_state_active=%d",
+                static_cast<unsigned long>(static_cast<uint32_t>(e_lfanew)),
+                e_lfanew_ok ? 1 : 0,
+                s_code_hashes.size(),
+                preserve_ok ? 1 : 0,
+                preserve_ok ? "protected_header_preserved_baseline_ok" : preserve_reason,
+                ph.arc_loaded ? 1 : 0,
+                ph.arc_unloading ? 1 : 0,
+                static_cast<unsigned long long>(ph.current_activation_ms),
+                ph.activation_hardening_done ? 1 : 0,
+                ph.driver_hardening_done ? 1 : 0,
+                ph.loader_snapshot_valid ? 1 : 0,
+                ph.loader_snapshot_base_same ? 1 : 0,
+                ph.loader_snapshot_size_ok ? 1 : 0,
+                static_cast<unsigned long long>(ph.loader_snapshot_base),
+                static_cast<unsigned long>(ph.loader_snapshot_size),
+                static_cast<unsigned long long>(ph.baseline_epoch_ms),
+                static_cast<unsigned long long>(ph.baseline_activation_ms),
+                static_cast<unsigned long long>(ph.baseline_module_base),
+                static_cast<unsigned long long>(ph.baseline_session_hash),
+                static_cast<unsigned long long>(ph.current_session_hash),
+                ph.baseline_exists ? 1 : 0,
+                ph.baseline_module_same ? 1 : 0,
+                ph.activation_epoch_ok ? 1 : 0,
+                ph.session_ok ? 1 : 0,
+                ph.protected_state_active ? 1 : 0);
+            lic_log(dbg);
+            return preserve_ok && !s_code_hashes.empty();
         }
 
         auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-            reinterpret_cast<const uint8_t*>(hMod) + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) {
-            char dbg[128];
+            reinterpret_cast<const uint8_t*>(hMod) + e_lfanew);
+        DWORD nt_signature = 0;
+        const bool nt_read_ok = safe_read_nt_signature_for_diag(nt, nt_signature);
+        if (!nt_read_ok || nt_signature != IMAGE_NT_SIGNATURE) {
+            const protected_header_baseline_state_t ph = capture_protected_header_baseline_state(hMod);
+            const bool preserve_ok = protected_header_preserve_allowed(ph);
+            const char* preserve_reason = protected_header_preserve_reject_reason(ph);
+            char dbg[1024];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "snapshot_code_hashes_bad_nt_sig value=0x%08X preserved=%zu",
-                static_cast<unsigned>(nt->Signature),
-                s_code_hashes.size());
+                "snapshot_code_hashes_bad_nt_sig value=0x%08X read_ok=%d preserved=%zu preserve_ok=%d classify=%s arc_loaded=%d arc_unloading=%d activation_ms=%llu activation_hardening=%d driver_hardening=%d loader_snapshot=%d loader_base_same=%d loader_header_ok=%d loader_base=0x%016llX loader_header=0x%08lX baseline_epoch_ms=%llu baseline_activation_ms=%llu baseline_base=0x%016llX baseline_session_hash=0x%016llX current_session_hash=0x%016llX baseline_exists=%d baseline_module_same=%d activation_epoch_ok=%d session_ok=%d protected_state_active=%d",
+                static_cast<unsigned>(nt_signature),
+                nt_read_ok ? 1 : 0,
+                s_code_hashes.size(),
+                preserve_ok ? 1 : 0,
+                preserve_ok ? "protected_header_preserved_baseline_ok" : preserve_reason,
+                ph.arc_loaded ? 1 : 0,
+                ph.arc_unloading ? 1 : 0,
+                static_cast<unsigned long long>(ph.current_activation_ms),
+                ph.activation_hardening_done ? 1 : 0,
+                ph.driver_hardening_done ? 1 : 0,
+                ph.loader_snapshot_valid ? 1 : 0,
+                ph.loader_snapshot_base_same ? 1 : 0,
+                ph.loader_snapshot_size_ok ? 1 : 0,
+                static_cast<unsigned long long>(ph.loader_snapshot_base),
+                static_cast<unsigned long>(ph.loader_snapshot_size),
+                static_cast<unsigned long long>(ph.baseline_epoch_ms),
+                static_cast<unsigned long long>(ph.baseline_activation_ms),
+                static_cast<unsigned long long>(ph.baseline_module_base),
+                static_cast<unsigned long long>(ph.baseline_session_hash),
+                static_cast<unsigned long long>(ph.current_session_hash),
+                ph.baseline_exists ? 1 : 0,
+                ph.baseline_module_same ? 1 : 0,
+                ph.activation_epoch_ok ? 1 : 0,
+                ph.session_ok ? 1 : 0,
+                ph.protected_state_active ? 1 : 0);
             lic_log(dbg);
-            return !s_code_hashes.empty();
+            return preserve_ok && !s_code_hashes.empty();
         }
 
         std::vector<code_section_hash_t> fresh;
@@ -10416,9 +10700,23 @@ namespace standalone_license
                     s_code_hashes.size());
             } else {
                 s_code_hashes.swap(fresh);
+                s_code_hash_baseline_epoch_ms.store(license_now_ms(), std::memory_order_release);
+                s_code_hash_baseline_activation_ms.store(
+                    s_activation_completed_at_ms.load(std::memory_order_acquire),
+                    std::memory_order_release);
+                s_code_hash_baseline_module_base.store(
+                    reinterpret_cast<uintptr_t>(hMod),
+                    std::memory_order_release);
+                s_code_hash_baseline_session_hash.store(
+                    current_session_token_hash_for_diag(),
+                    std::memory_order_release);
                 _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "snapshot_code_hashes_done captured=%zu",
-                    s_code_hashes.size());
+                    "snapshot_code_hashes_done captured=%zu baseline_epoch_ms=%llu baseline_activation_ms=%llu baseline_base=0x%016llX baseline_session_hash=0x%016llX",
+                    s_code_hashes.size(),
+                    static_cast<unsigned long long>(s_code_hash_baseline_epoch_ms.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(s_code_hash_baseline_activation_ms.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(s_code_hash_baseline_module_base.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(s_code_hash_baseline_session_hash.load(std::memory_order_acquire)));
             }
             lic_log(dbg);
         }

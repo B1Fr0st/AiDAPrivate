@@ -512,6 +512,7 @@ static constexpr DWORD kAidaForegroundIdleWaitMs = 24;
 static constexpr DWORD kAidaBackgroundActiveWaitMs = 16;
 static constexpr DWORD kAidaBackgroundIdleWaitMs = 75;
 static constexpr DWORD kAidaPreRenderWaitMs = 16;
+static constexpr uint64_t kAidaRecentInputWakeMs = 100ULL;
 static constexpr DWORD kAidaResizeCoalesceMs = 16;
 static constexpr uint64_t kAidaResizeChurnWindowMs = 1000ULL;
 static constexpr uint32_t kAidaResizeChurnThreshold = 4;
@@ -1236,6 +1237,8 @@ namespace aida_tracer {
     inline std::atomic<uint64_t> g_dx11_draw_cmd_count{0};
     inline std::atomic<uint64_t> g_dx11_user_callback_count{0};
     inline std::atomic<uint64_t> g_dx11_reset_callback_count{0};
+    inline std::atomic<uint64_t> g_dx11_expected_blur_callback_count{0};
+    inline std::atomic<uint64_t> g_dx11_unexpected_callback_count{0};
     inline std::atomic<UINT_PTR> g_dx11_first_callback{0};
     inline std::atomic<UINT_PTR> g_dx11_first_callback_data{0};
     inline std::atomic<UINT_PTR> g_dx11_first_texture{0};
@@ -1725,14 +1728,19 @@ namespace aida_tracer {
         uint64_t draw_cmds = 0;
         uint64_t user_callbacks = 0;
         uint64_t reset_callbacks = 0;
+        uint64_t expected_blur_callbacks = 0;
+        uint64_t unexpected_callbacks = 0;
         UINT_PTR first_callback = 0;
         UINT_PTR first_callback_data = 0;
+        UINT_PTR first_unexpected_callback = 0;
+        UINT_PTR first_unexpected_callback_data = 0;
         UINT_PTR first_texture = 0;
         uint64_t texture_hash = 14695981039346656037ULL;
         uint64_t max_elem_count = 0;
         uint32_t bad_flags = 0;
         int bad_list = -1;
         int bad_cmd = -1;
+        ImDrawCallback expected_blur_callback = Blur::ExpectedCallback();
 
         if (!dd) {
             bad_flags |= 0x00000001u;
@@ -1809,11 +1817,23 @@ namespace aida_tracer {
                     if (cmd.UserCallback) {
                         if (cmd.UserCallback == ImDrawCallback_ResetRenderState) {
                             ++reset_callbacks;
-                        } else {
+                        } else if (expected_blur_callback && cmd.UserCallback == expected_blur_callback) {
                             ++user_callbacks;
+                            ++expected_blur_callbacks;
                             if (first_callback == 0) {
                                 first_callback = reinterpret_cast<UINT_PTR>(cmd.UserCallback);
                                 first_callback_data = reinterpret_cast<UINT_PTR>(cmd.UserCallbackData);
+                            }
+                        } else {
+                            ++user_callbacks;
+                            ++unexpected_callbacks;
+                            if (first_callback == 0) {
+                                first_callback = reinterpret_cast<UINT_PTR>(cmd.UserCallback);
+                                first_callback_data = reinterpret_cast<UINT_PTR>(cmd.UserCallbackData);
+                            }
+                            if (first_unexpected_callback == 0) {
+                                first_unexpected_callback = reinterpret_cast<UINT_PTR>(cmd.UserCallback);
+                                first_unexpected_callback_data = reinterpret_cast<UINT_PTR>(cmd.UserCallbackData);
                             }
                         }
                     }
@@ -1824,6 +1844,8 @@ namespace aida_tracer {
         g_dx11_draw_cmd_count.store(draw_cmds, std::memory_order_release);
         g_dx11_user_callback_count.store(user_callbacks, std::memory_order_release);
         g_dx11_reset_callback_count.store(reset_callbacks, std::memory_order_release);
+        g_dx11_expected_blur_callback_count.store(expected_blur_callbacks, std::memory_order_release);
+        g_dx11_unexpected_callback_count.store(unexpected_callbacks, std::memory_order_release);
         g_dx11_first_callback.store(first_callback, std::memory_order_release);
         g_dx11_first_callback_data.store(first_callback_data, std::memory_order_release);
         g_dx11_first_texture.store(first_texture, std::memory_order_release);
@@ -1833,9 +1855,9 @@ namespace aida_tracer {
         g_dx11_bad_list.store(bad_list, std::memory_order_release);
         g_dx11_bad_cmd.store(bad_cmd, std::memory_order_release);
 
-        if (bad_flags != 0 || user_callbacks != 0) {
+        if (bad_flags != 0 || unexpected_callbacks != 0) {
             diag::log_tagged_critical_fmt("render",
-                "dx11_drawdata_inspect frame=%llu bad=0x%08lX bad_list=%d bad_cmd=%d lists=%d total_vtx=%d total_idx=%d draw_cmds=%llu callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX first_tex=0x%llX tex_hash=0x%016llX max_elem=%llu full_test=%d",
+                "dx11_drawdata_inspect frame=%llu bad=0x%08lX bad_list=%d bad_cmd=%d lists=%d total_vtx=%d total_idx=%d draw_cmds=%llu callbacks=%llu expected_blur_callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX first_unexpected_cb=0x%llX unexpected_cb_data=0x%llX first_tex=0x%llX tex_hash=0x%016llX max_elem=%llu full_test=%d",
                 static_cast<unsigned long long>(frame),
                 static_cast<unsigned long>(bad_flags),
                 bad_list,
@@ -1845,13 +1867,63 @@ namespace aida_tracer {
                 dd ? dd->TotalIdxCount : -1,
                 static_cast<unsigned long long>(draw_cmds),
                 static_cast<unsigned long long>(user_callbacks),
+                static_cast<unsigned long long>(expected_blur_callbacks),
+                static_cast<unsigned long long>(unexpected_callbacks),
                 static_cast<unsigned long long>(reset_callbacks),
                 static_cast<unsigned long long>(first_callback),
                 static_cast<unsigned long long>(first_callback_data),
+                static_cast<unsigned long long>(first_unexpected_callback),
+                static_cast<unsigned long long>(first_unexpected_callback_data),
                 static_cast<unsigned long long>(first_texture),
                 static_cast<unsigned long long>(texture_hash),
                 static_cast<unsigned long long>(max_elem_count),
                 test_all_features::is_running() ? 1 : 0);
+            if (unexpected_callbacks != 0 && first_unexpected_callback != 0) {
+                char cb_desc[1200] = {};
+                describe_address(static_cast<uint64_t>(first_unexpected_callback), cb_desc, sizeof(cb_desc));
+                diag::log_tagged_critical_fmt("render",
+                    "dx11_drawdata_unexpected_callback frame=%llu callbacks=%llu first_unexpected_cb=0x%llX cb_data=0x%llX desc={%.1000s}",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(unexpected_callbacks),
+                    static_cast<unsigned long long>(first_unexpected_callback),
+                    static_cast<unsigned long long>(first_unexpected_callback_data),
+                    cb_desc[0] ? cb_desc : "<empty>");
+            }
+        } else if (user_callbacks != 0 || reset_callbacks != 0) {
+            static std::atomic<uint64_t> s_last_expected_callback_hash{0};
+            static std::atomic<uint64_t> s_last_expected_callback_log_ms{0};
+            static std::atomic<uint64_t> s_expected_callback_suppressed{0};
+            uint64_t callback_hash = 14695981039346656037ULL;
+            callback_hash = mix_u64(callback_hash, user_callbacks);
+            callback_hash = mix_u64(callback_hash, expected_blur_callbacks);
+            callback_hash = mix_u64(callback_hash, reset_callbacks);
+            callback_hash = mix_u64(callback_hash, first_callback);
+            callback_hash = mix_u64(callback_hash, first_texture);
+            callback_hash = mix_u64(callback_hash, texture_hash);
+            callback_hash = mix_u64(callback_hash, max_elem_count);
+            const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+            const uint64_t last_hash = s_last_expected_callback_hash.load(std::memory_order_acquire);
+            const uint64_t last_log_ms = s_last_expected_callback_log_ms.load(std::memory_order_acquire);
+            if (last_log_ms == 0 || callback_hash != last_hash || now_ms - last_log_ms >= 30000ULL) {
+                const uint64_t suppressed = s_expected_callback_suppressed.exchange(0, std::memory_order_acq_rel);
+                s_last_expected_callback_hash.store(callback_hash, std::memory_order_release);
+                s_last_expected_callback_log_ms.store(now_ms, std::memory_order_release);
+                diag::log_tagged_fmt("render",
+                    "dx11_drawdata_callbacks frame=%llu callbacks=%llu expected_blur_callbacks=%llu unexpected_callbacks=%llu reset_callbacks=%llu first_cb=0x%llX cb_data=0x%llX tex_hash=0x%016llX max_elem=%llu suppressed=%llu full_test=%d",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(user_callbacks),
+                    static_cast<unsigned long long>(expected_blur_callbacks),
+                    static_cast<unsigned long long>(unexpected_callbacks),
+                    static_cast<unsigned long long>(reset_callbacks),
+                    static_cast<unsigned long long>(first_callback),
+                    static_cast<unsigned long long>(first_callback_data),
+                    static_cast<unsigned long long>(texture_hash),
+                    static_cast<unsigned long long>(max_elem_count),
+                    static_cast<unsigned long long>(suppressed),
+                    test_all_features::is_running() ? 1 : 0);
+            } else {
+                s_expected_callback_suppressed.fetch_add(1, std::memory_order_acq_rel);
+            }
         }
         return bad_flags;
     }
@@ -3246,11 +3318,182 @@ static process_cpu_delta_t sample_current_process_cpu(uint64_t now_ms)
     return out;
 }
 
+struct process_io_delta_t {
+    bool valid = false;
+    DWORD gle = 0;
+    std::uint64_t wall_ms = 0;
+    std::uint64_t read_ops_delta = 0;
+    std::uint64_t write_ops_delta = 0;
+    std::uint64_t other_ops_delta = 0;
+    std::uint64_t read_bytes_delta = 0;
+    std::uint64_t write_bytes_delta = 0;
+    std::uint64_t other_bytes_delta = 0;
+    std::uint64_t total_read_bytes = 0;
+    std::uint64_t total_write_bytes = 0;
+};
+
+static process_io_delta_t sample_process_io_delta(uint64_t now_ms)
+{
+    static IO_COUNTERS s_last{};
+    static uint64_t s_last_ms = 0;
+    process_io_delta_t out{};
+    IO_COUNTERS cur{};
+    SetLastError(0);
+    if (!GetProcessIoCounters(GetCurrentProcess(), &cur)) {
+        out.gle = GetLastError();
+        return out;
+    }
+    out.total_read_bytes = static_cast<std::uint64_t>(cur.ReadTransferCount);
+    out.total_write_bytes = static_cast<std::uint64_t>(cur.WriteTransferCount);
+    if (s_last_ms != 0 && now_ms >= s_last_ms &&
+        cur.ReadTransferCount >= s_last.ReadTransferCount &&
+        cur.WriteTransferCount >= s_last.WriteTransferCount &&
+        cur.OtherTransferCount >= s_last.OtherTransferCount) {
+        out.valid = true;
+        out.wall_ms = now_ms - s_last_ms;
+        out.read_ops_delta = static_cast<std::uint64_t>(cur.ReadOperationCount - s_last.ReadOperationCount);
+        out.write_ops_delta = static_cast<std::uint64_t>(cur.WriteOperationCount - s_last.WriteOperationCount);
+        out.other_ops_delta = static_cast<std::uint64_t>(cur.OtherOperationCount - s_last.OtherOperationCount);
+        out.read_bytes_delta = static_cast<std::uint64_t>(cur.ReadTransferCount - s_last.ReadTransferCount);
+        out.write_bytes_delta = static_cast<std::uint64_t>(cur.WriteTransferCount - s_last.WriteTransferCount);
+        out.other_bytes_delta = static_cast<std::uint64_t>(cur.OtherTransferCount - s_last.OtherTransferCount);
+    }
+    s_last = cur;
+    s_last_ms = now_ms;
+    return out;
+}
+
+struct file_delta_t {
+    bool valid = false;
+    bool reset = false;
+    DWORD gle = 0;
+    std::uint64_t size = 0;
+    std::uint64_t delta = 0;
+};
+
+struct log_file_delta_snapshot_t {
+    file_delta_t debug_log;
+    file_delta_t kernel_log;
+    file_delta_t full_test_log;
+    file_delta_t camoufox_log;
+};
+
+static bool query_file_size_bytes(const char* path, std::uint64_t& size, DWORD& gle)
+{
+    size = 0;
+    gle = 0;
+    if (!path || !*path) {
+        gle = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    SetLastError(0);
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) {
+        gle = GetLastError();
+        return false;
+    }
+    ULARGE_INTEGER v{};
+    v.LowPart = data.nFileSizeLow;
+    v.HighPart = data.nFileSizeHigh;
+    size = v.QuadPart;
+    return true;
+}
+
+static file_delta_t sample_one_file_delta(const char* path, std::uint64_t& previous_size, bool& previous_valid)
+{
+    file_delta_t out{};
+    std::uint64_t size = 0;
+    DWORD gle = 0;
+    if (!query_file_size_bytes(path, size, gle)) {
+        out.gle = gle;
+        previous_valid = false;
+        previous_size = 0;
+        return out;
+    }
+    out.valid = true;
+    out.size = size;
+    if (previous_valid) {
+        if (size >= previous_size) {
+            out.delta = size - previous_size;
+        } else {
+            out.reset = true;
+            out.delta = size;
+        }
+    }
+    previous_valid = true;
+    previous_size = size;
+    return out;
+}
+
+static log_file_delta_snapshot_t sample_log_file_deltas()
+{
+    static std::uint64_t s_debug_size = 0;
+    static std::uint64_t s_kernel_size = 0;
+    static std::uint64_t s_full_test_size = 0;
+    static std::uint64_t s_camoufox_size = 0;
+    static bool s_debug_valid = false;
+    static bool s_kernel_valid = false;
+    static bool s_full_test_valid = false;
+    static bool s_camoufox_valid = false;
+    char log_dir[MAX_PATH] = {};
+    _snprintf_s(log_dir, sizeof(log_dir), _TRUNCATE, "%s", diag::resolve_log_dir());
+    char debug_path[MAX_PATH] = {};
+    const char* cached_debug = diag::cached_log_path();
+    if (cached_debug && cached_debug[0])
+        _snprintf_s(debug_path, sizeof(debug_path), _TRUNCATE, "%s", cached_debug);
+    else
+        _snprintf_s(debug_path, sizeof(debug_path), _TRUNCATE, "%saida_debug.log", log_dir);
+    char full_test_path[MAX_PATH] = {};
+    char camoufox_path[MAX_PATH] = {};
+    _snprintf_s(full_test_path, sizeof(full_test_path), _TRUNCATE, "%saida_full_test.log", log_dir);
+    _snprintf_s(camoufox_path, sizeof(camoufox_path), _TRUNCATE, "%saida_camoufox_debug.log", log_dir);
+    log_file_delta_snapshot_t out{};
+    out.debug_log = sample_one_file_delta(debug_path, s_debug_size, s_debug_valid);
+    out.kernel_log = sample_one_file_delta("C:\\Users\\Public\\Desktop\\aida_kernel.log", s_kernel_size, s_kernel_valid);
+    out.full_test_log = sample_one_file_delta(full_test_path, s_full_test_size, s_full_test_valid);
+    out.camoufox_log = sample_one_file_delta(camoufox_path, s_camoufox_size, s_camoufox_valid);
+    return out;
+}
+
+struct defender_process_snapshot_t {
+    bool valid = false;
+    DWORD gle = 0;
+    std::uint32_t msmpeng = 0;
+    std::uint32_t mpcmdrun = 0;
+};
+
+static defender_process_snapshot_t sample_defender_processes()
+{
+    defender_process_snapshot_t out{};
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        out.gle = GetLastError();
+        return out;
+    }
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (!Process32FirstW(snap, &pe)) {
+        out.gle = GetLastError();
+        CloseHandle(snap);
+        return out;
+    }
+    do {
+        if (_wcsicmp(pe.szExeFile, L"MsMpEng.exe") == 0)
+            ++out.msmpeng;
+        else if (_wcsicmp(pe.szExeFile, L"MpCmdRun.exe") == 0)
+            ++out.mpcmdrun;
+    } while (Process32NextW(snap, &pe));
+    CloseHandle(snap);
+    out.valid = true;
+    return out;
+}
+
 struct frame_wait_result_t {
     DWORD requested_ms = 0;
     DWORD actual_ms = 0;
     DWORD result = WAIT_TIMEOUT;
     DWORD gle = 0;
+    std::uint64_t immediate_timeout_streak = 0;
     bool waitable_present = false;
     bool frame_latency_signaled = false;
     bool input_available = false;
@@ -3276,6 +3519,12 @@ static frame_wait_result_t wait_for_frame_latency_or_input(DWORD requested_ms)
     if (out.result == WAIT_FAILED)
         out.gle = GetLastError();
     out.actual_ms = static_cast<DWORD>(std::min<uint64_t>(static_cast<uint64_t>(GetTickCount64()) - wait_start_ms, 0xFFFFFFFFULL));
+    static std::atomic<std::uint64_t> s_immediate_timeout_streak{0};
+    const bool immediate_timeout = out.waitable_present && requested_ms != 0 && out.result == WAIT_TIMEOUT && out.actual_ms == 0 && !out.input_available && !out.frame_latency_signaled;
+    if (immediate_timeout)
+        out.immediate_timeout_streak = s_immediate_timeout_streak.fetch_add(1, std::memory_order_acq_rel) + 1;
+    else
+        s_immediate_timeout_streak.store(0, std::memory_order_release);
     return out;
 }
 
@@ -3284,6 +3533,8 @@ struct draw_data_metrics_t {
     int draw_cmds = 0;
     int callbacks = 0;
     int reset_callbacks = 0;
+    int expected_blur_callbacks = 0;
+    int unexpected_callbacks = 0;
     int total_vtx = 0;
     int total_idx = 0;
 };
@@ -3299,6 +3550,7 @@ static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data)
     if (draw_data->CmdListsCount > 0 && !draw_data->CmdLists.Data)
         return out;
     const int list_count = draw_data->CmdListsCount > 0 ? draw_data->CmdListsCount : 0;
+    ImDrawCallback expected_blur_callback = Blur::ExpectedCallback();
     for (int list_index = 0; list_index < list_count; ++list_index) {
         const ImDrawList* list = draw_data->CmdLists[list_index];
         if (!list)
@@ -3310,8 +3562,13 @@ static draw_data_metrics_t collect_draw_data_metrics(ImDrawData* draw_data)
                 continue;
             if (cmd.UserCallback == ImDrawCallback_ResetRenderState)
                 ++out.reset_callbacks;
-            else
+            else {
                 ++out.callbacks;
+                if (expected_blur_callback && cmd.UserCallback == expected_blur_callback)
+                    ++out.expected_blur_callbacks;
+                else
+                    ++out.unexpected_callbacks;
+            }
         }
     }
     return out;
@@ -5085,6 +5342,14 @@ int main(int, char**)
         uint32_t pumped_input_messages = 0;
         uint32_t pumped_resize_messages = 0;
         uint32_t pumped_paint_messages = 0;
+        static uint64_t s_last_input_event_tick_ms = 0;
+        static DWORD s_last_input_msg_time = 0;
+        static UINT s_last_input_msg = 0;
+        static uint64_t s_input_event_count = 0;
+        static uint64_t s_last_input_event_log_ms = 0;
+        static POINT s_last_input_cursor{};
+        static bool s_last_input_cursor_valid = false;
+        const uint64_t input_events_at_frame_start = s_input_event_count;
         aida_tracer::render_pulse(frame_number);
         aida_tracer::mark_render_phase("frame_top");
         if (frame_number < 5)
@@ -5222,14 +5487,23 @@ int main(int, char**)
                 break;
 
             ++pumped_messages;
+            bool input_message = false;
             switch (msg.message) {
             case WM_MOUSEMOVE:
+            case WM_NCMOUSEMOVE:
             case WM_LBUTTONDOWN:
             case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK:
             case WM_RBUTTONDOWN:
             case WM_RBUTTONUP:
+            case WM_RBUTTONDBLCLK:
             case WM_MBUTTONDOWN:
             case WM_MBUTTONUP:
+            case WM_XBUTTONDOWN:
+            case WM_XBUTTONUP:
+            case WM_NCLBUTTONDOWN:
+            case WM_NCLBUTTONUP:
+            case WM_NCLBUTTONDBLCLK:
             case WM_MOUSEWHEEL:
             case WM_MOUSEHWHEEL:
             case WM_KEYDOWN:
@@ -5240,6 +5514,9 @@ int main(int, char**)
             case WM_KILLFOCUS:
             case WM_ACTIVATE:
             case WM_ACTIVATEAPP:
+            case WM_CAPTURECHANGED:
+            case WM_MOUSEACTIVATE:
+                input_message = true;
                 ++pumped_input_messages;
                 break;
             case WM_SIZE:
@@ -5254,6 +5531,46 @@ int main(int, char**)
                 break;
             default:
                 break;
+            }
+            if (input_message) {
+                const uint64_t input_now_ms = static_cast<uint64_t>(GetTickCount64());
+                const DWORD input_msg_age_ms = static_cast<DWORD>(GetTickCount() - msg.time);
+                POINT input_cursor{};
+                const bool input_cursor_ok = GetCursorPos(&input_cursor) != FALSE;
+                const bool pointer_motion_msg = msg.message == WM_MOUSEMOVE || msg.message == WM_NCMOUSEMOVE;
+                const bool cursor_changed = input_cursor_ok && (!s_last_input_cursor_valid || input_cursor.x != s_last_input_cursor.x || input_cursor.y != s_last_input_cursor.y);
+                s_last_input_event_tick_ms = input_now_ms;
+                s_last_input_msg_time = msg.time;
+                s_last_input_msg = msg.message;
+                ++s_input_event_count;
+                LARGE_INTEGER qpc{};
+                QueryPerformanceCounter(&qpc);
+                const bool log_input_event = !pointer_motion_msg || cursor_changed || input_now_ms - s_last_input_event_log_ms >= 500ULL;
+                if (log_input_event) {
+                    s_last_input_event_log_ms = input_now_ms;
+                    diag::log_tagged_fmt("msgpump",
+                        "input_event_received frame=%llu msg=%s(0x%04X) msg_time=%lu age_ms=%lu qpc=%lld tick=%llu hwnd=0x%llX wp=0x%llX lp=0x%llX cursor_ok=%d cursor=%ld,%ld qs=0x%08lX pumped=%u pumped_input=%u",
+                        static_cast<unsigned long long>(frame_number),
+                        aida_tracer::message_name(msg.message),
+                        msg.message,
+                        static_cast<unsigned long>(msg.time),
+                        static_cast<unsigned long>(input_msg_age_ms),
+                        static_cast<long long>(qpc.QuadPart),
+                        static_cast<unsigned long long>(input_now_ms),
+                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(msg.hwnd)),
+                        static_cast<unsigned long long>(static_cast<UINT_PTR>(msg.wParam)),
+                        static_cast<unsigned long long>(static_cast<LONG_PTR>(msg.lParam)),
+                        input_cursor_ok ? 1 : 0,
+                        input_cursor_ok ? input_cursor.x : 0,
+                        input_cursor_ok ? input_cursor.y : 0,
+                        static_cast<unsigned long>(GetQueueStatus(kAidaInteractiveQueueBits)),
+                        pumped_messages,
+                        pumped_input_messages);
+                }
+                if (input_cursor_ok) {
+                    s_last_input_cursor = input_cursor;
+                    s_last_input_cursor_valid = true;
+                }
             }
 
             bool close_related_msg = msg.message == WM_CLOSE || msg.message == WM_DESTROY ||
@@ -5602,6 +5919,9 @@ int main(int, char**)
             pre_frame_io.KeyShift ||
             pre_frame_io.KeyAlt ||
             pre_frame_io.KeySuper;
+        const bool last_input_seen_pre = s_last_input_event_tick_ms != 0;
+        const uint64_t last_input_age_pre_ms = last_input_seen_pre && dirty_now_ms >= s_last_input_event_tick_ms ? dirty_now_ms - s_last_input_event_tick_ms : 0ULL;
+        const bool recent_input_pre = last_input_seen_pre && last_input_age_pre_ms <= kAidaRecentInputWakeMs;
         uint32_t dirty_mask = 0;
         if (!dirty_state_initialized || frame_number < 5)
             dirty_mask |= kAidaDirtyStartup;
@@ -5637,10 +5957,12 @@ int main(int, char**)
             heartbeat_ms = kAidaModalHeartbeatMs;
         if (!dirty_state_initialized || since_render_ms >= heartbeat_ms)
             dirty_mask |= kAidaDirtyHeartbeat | kAidaDirtySecurity;
+        const bool dirty_fast_mask_pre = (dirty_mask & (kAidaDirtyInput | kAidaDirtyCursor | kAidaDirtyResize | kAidaDirtyMessage)) != 0;
         const bool wake_fast_pre =
-            cursor_over_aida_pre ||
+            dirty_fast_mask_pre ||
             interactive_pending_pre ||
             input_active_pre ||
+            recent_input_pre ||
             pumped_messages != 0 ||
             modal_or_animation_pre ||
             activation_progress_pre;
@@ -5661,7 +5983,7 @@ int main(int, char**)
             if (skip_wait_anomaly && dirty_now_ms - s_last_skip_wait_log_ms >= 5000ull) {
                 s_last_skip_wait_log_ms = dirty_now_ms;
                 diag::log_tagged_fmt("render",
-                    "dirty_skip_anomaly skipped=%llu waitable=%d request_ms=%lu actual_ms=%lu result=0x%08lX gle=%lu input=%d signaled=%d qs=0x%08lX foreground=%d cursor_over=%d full_test=%d bulk_busy=%d",
+                    "dirty_skip_anomaly skipped=%llu waitable=%d request_ms=%lu actual_ms=%lu result=0x%08lX gle=%lu input=%d signaled=%d immediate_timeout_streak=%llu qs=0x%08lX foreground=%d cursor_over=%d recent_input=%d input_seen=%d last_input_msg=0x%04X last_input_age_ms=%llu full_test=%d bulk_busy=%d",
                     static_cast<unsigned long long>(skipped_render_frames),
                     idle_wait.waitable_present ? 1 : 0,
                     static_cast<unsigned long>(idle_wait.requested_ms),
@@ -5670,9 +5992,14 @@ int main(int, char**)
                     static_cast<unsigned long>(idle_wait.gle),
                     idle_wait.input_available ? 1 : 0,
                     idle_wait.frame_latency_signaled ? 1 : 0,
+                    static_cast<unsigned long long>(idle_wait.immediate_timeout_streak),
                     static_cast<unsigned long>(dirty_qs),
                     foreground_pre ? 1 : 0,
                     cursor_over_aida_pre ? 1 : 0,
+                    recent_input_pre ? 1 : 0,
+                    last_input_seen_pre ? 1 : 0,
+                    static_cast<unsigned>(s_last_input_msg),
+                    static_cast<unsigned long long>(last_input_age_pre_ms),
                     full_test_running_pre ? 1 : 0,
                     bulk_busy_pre ? 1 : 0);
             }
@@ -5847,6 +6174,9 @@ int main(int, char**)
 
         const uint64_t timing_now_ms = static_cast<uint64_t>(GetTickCount64());
         const uint64_t frame_elapsed_ms = timing_now_ms - frame_start_tick_ms;
+        const bool input_seen_present = s_last_input_event_tick_ms != 0;
+        const uint64_t input_age_present_ms = input_seen_present && timing_now_ms >= s_last_input_event_tick_ms ? timing_now_ms - s_last_input_event_tick_ms : 0ULL;
+        const uint64_t input_events_this_frame = s_input_event_count >= input_events_at_frame_start ? s_input_event_count - input_events_at_frame_start : 0ULL;
         const bool present_failed = (hr & 0x80000000u) || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
         const bool frame_slow = frame_elapsed_ms >= 250ULL || present_elapsed_ms >= 100ULL;
         if (frame_number < 5)
@@ -5885,6 +6215,8 @@ int main(int, char**)
             if (cursor_over_aida_pre) idle_block_mask |= 0x00000020u;
             if (modal_or_animation_pre) idle_block_mask |= 0x00000040u;
             if (wake_fast_pre) idle_block_mask |= 0x00000080u;
+            if (recent_input_pre) idle_block_mask |= 0x00000100u;
+            if (dirty_fast_mask_pre) idle_block_mask |= 0x00000200u;
 
             static uint64_t s_last_idle_pacing_probe_ms = 0;
             static uint64_t s_last_idle_pacing_log_ms = 0;
@@ -5906,7 +6238,7 @@ int main(int, char**)
                 if (idle_unhealthy && tick_now_ms - s_last_idle_pacing_log_ms >= 30000ULL) {
                     s_last_idle_pacing_log_ms = tick_now_ms;
                     diag::log_tagged_fmt("render",
-                        "idle_pacing_anomaly frame=%llu pre_render_wait_ms=%lu idle_wait_request_ms=%lu dirty_mask=0x%08X block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX bulk_busy=%d full_test=%d skipped=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                        "idle_pacing_anomaly frame=%llu pre_render_wait_ms=%lu idle_wait_request_ms=%lu dirty_mask=0x%08X block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d recent_input=%d last_input_age_ms=%llu interactive_pending=%d qs=0x%08lX bulk_busy=%d full_test=%d skipped=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long>(pre_render_wait.actual_ms),
                         static_cast<unsigned long>(idle_wait_request_ms),
@@ -5915,6 +6247,8 @@ int main(int, char**)
                         foreground_pre ? 1 : 0,
                         foreground_like_pre ? 1 : 0,
                         cursor_over_aida_pre ? 1 : 0,
+                        recent_input_pre ? 1 : 0,
+                        static_cast<unsigned long long>(last_input_age_pre_ms),
                         interactive_pending_pre ? 1 : 0,
                         static_cast<unsigned long>(dirty_qs),
                         bulk_busy_pre ? 1 : 0,
@@ -5931,17 +6265,75 @@ int main(int, char**)
                         static_cast<unsigned>(cq.active),
                         cq.pending,
                         static_cast<unsigned long long>(cq.oldest_active_ms));
+                    diag::log_tagged_fmt("render",
+                        "idle_pacing_queue frame=%llu queue=general attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long long>(wq.post_attempts),
+                        static_cast<unsigned long long>(wq.posted),
+                        static_cast<unsigned long long>(wq.rejected),
+                        static_cast<unsigned long long>(wq.started),
+                        static_cast<unsigned long long>(wq.finished),
+                        static_cast<unsigned>(wq.active),
+                        wq.pending,
+                        static_cast<unsigned long long>(wq.oldest_active_ms),
+                        static_cast<unsigned>(wq.active_label_count),
+                        static_cast<unsigned>(wq.healthy_long_lived),
+                        static_cast<unsigned>(wq.hot_workers),
+                        static_cast<unsigned>(wq.not_queryable_workers),
+                        wq.top_cpu_labels.empty() ? "<none>" : wq.top_cpu_labels.c_str(),
+                        wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str());
+                    diag::log_tagged_fmt("render",
+                        "idle_pacing_queue frame=%llu queue=service attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long long>(svc.post_attempts),
+                        static_cast<unsigned long long>(svc.posted),
+                        static_cast<unsigned long long>(svc.rejected),
+                        static_cast<unsigned long long>(svc.started),
+                        static_cast<unsigned long long>(svc.finished),
+                        static_cast<unsigned>(svc.active),
+                        svc.pending,
+                        static_cast<unsigned long long>(svc.oldest_active_ms),
+                        static_cast<unsigned>(svc.active_label_count),
+                        static_cast<unsigned>(svc.healthy_long_lived),
+                        static_cast<unsigned>(svc.hot_workers),
+                        static_cast<unsigned>(svc.not_queryable_workers),
+                        svc.top_cpu_labels.empty() ? "<none>" : svc.top_cpu_labels.c_str(),
+                        svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
+                    diag::log_tagged_fmt("render",
+                        "idle_pacing_queue frame=%llu queue=critical attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long long>(cq.post_attempts),
+                        static_cast<unsigned long long>(cq.posted),
+                        static_cast<unsigned long long>(cq.rejected),
+                        static_cast<unsigned long long>(cq.started),
+                        static_cast<unsigned long long>(cq.finished),
+                        static_cast<unsigned>(cq.active),
+                        cq.pending,
+                        static_cast<unsigned long long>(cq.oldest_active_ms),
+                        static_cast<unsigned>(cq.active_label_count),
+                        static_cast<unsigned>(cq.healthy_long_lived),
+                        static_cast<unsigned>(cq.hot_workers),
+                        static_cast<unsigned>(cq.not_queryable_workers),
+                        cq.top_cpu_labels.empty() ? "<none>" : cq.top_cpu_labels.c_str(),
+                        cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
+                    work_queue::log_stuck_workers(30000ULL, 8);
+                    work_queue::log_service_stuck_workers(30000ULL, 8);
+                    critical_work_queue::log_stuck_workers(30000ULL, 8);
                 }
             }
             static uint64_t s_last_frame_pacing_log_ms = 0;
             static uint64_t s_last_frame_pacing_frame = 0;
             static uint64_t s_last_frame_pacing_skipped = 0;
+            static uint64_t s_last_frame_pacing_input_events = 0;
             const bool wait_failed = pre_render_wait.result == WAIT_FAILED;
             if (s_last_frame_pacing_log_ms == 0) {
                 s_last_frame_pacing_log_ms = tick_now_ms;
                 s_last_frame_pacing_frame = frame_number;
                 s_last_frame_pacing_skipped = skipped_render_frames;
+                s_last_frame_pacing_input_events = s_input_event_count;
                 (void)sample_current_process_cpu(tick_now_ms);
+                (void)sample_process_io_delta(tick_now_ms);
+                (void)sample_log_file_deltas();
             } else {
                 const uint64_t since_pacing_log_ms = tick_now_ms >= s_last_frame_pacing_log_ms ? tick_now_ms - s_last_frame_pacing_log_ms : 0ULL;
                 const bool pacing_due = since_pacing_log_ms >= kAidaFramePacingLogIntervalMs;
@@ -5953,13 +6345,19 @@ int main(int, char**)
                     const auto svc = work_queue::service_stats();
                     const auto cq = critical_work_queue::stats();
                     const process_cpu_delta_t cpu = sample_current_process_cpu(tick_now_ms);
+                    const process_io_delta_t proc_io = sample_process_io_delta(tick_now_ms);
+                    const log_file_delta_snapshot_t log_files = sample_log_file_deltas();
+                    const defender_process_snapshot_t defender = sample_defender_processes();
                     const uint64_t frame_delta = frame_number >= s_last_frame_pacing_frame ? frame_number - s_last_frame_pacing_frame : 0ULL;
                     const uint64_t skipped_delta = skipped_render_frames >= s_last_frame_pacing_skipped ? skipped_render_frames - s_last_frame_pacing_skipped : 0ULL;
+                    const uint64_t input_events_delta = s_input_event_count >= s_last_frame_pacing_input_events ? s_input_event_count - s_last_frame_pacing_input_events : 0ULL;
                     const double fps = since_pacing_log_ms != 0 ? (static_cast<double>(frame_delta) * 1000.0) / static_cast<double>(since_pacing_log_ms) : 0.0;
                     const auto overlay_perf = test_all_features::overlay_perf_snapshot();
                     const gpu_frame_sample_t gpu = latest_gpu_frame_sample(frame_number);
+                    const auto log_stats = diag::async_log_stats();
+                    const auto blur_stats = Blur::SnapshotStats();
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu waitable=%d pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d pre_wait_signaled=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu waitable=%d pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d pre_wait_signaled=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu wq_healthy_long=%u wq_hot=%u wq_not_queryable=%u svc_active=%u svc_pending=%zu svc_oldest_ms=%llu svc_healthy_long=%u svc_hot=%u svc_not_queryable=%u cq_active=%u cq_pending=%zu cq_oldest_ms=%llu cq_healthy_long=%u cq_hot=%u cq_not_queryable=%u",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long long>(frame_delta),
                         static_cast<unsigned long long>(skipped_delta),
@@ -6039,15 +6437,211 @@ int main(int, char**)
                         static_cast<unsigned>(wq.active),
                         wq.pending,
                         static_cast<unsigned long long>(wq.oldest_active_ms),
+                        static_cast<unsigned>(wq.healthy_long_lived),
+                        static_cast<unsigned>(wq.hot_workers),
+                        static_cast<unsigned>(wq.not_queryable_workers),
                         static_cast<unsigned>(svc.active),
                         svc.pending,
                         static_cast<unsigned long long>(svc.oldest_active_ms),
+                        static_cast<unsigned>(svc.healthy_long_lived),
+                        static_cast<unsigned>(svc.hot_workers),
+                        static_cast<unsigned>(svc.not_queryable_workers),
                         static_cast<unsigned>(cq.active),
                         cq.pending,
-                        static_cast<unsigned long long>(cq.oldest_active_ms));
+                        static_cast<unsigned long long>(cq.oldest_active_ms),
+                        static_cast<unsigned>(cq.healthy_long_lived),
+                        static_cast<unsigned>(cq.hot_workers),
+                        static_cast<unsigned>(cq.not_queryable_workers));
+                    diag::log_tagged_fmt("render",
+                        "frame_pacing_io frame=%llu present_hr=0x%08X wait_immediate_timeout_streak=%llu input_seen=%d last_input_msg=0x%04X last_input_msg_time=%lu last_input_age_newframe_ms=%llu input_to_present_ms=%llu input_events_delta=%llu input_events_this_frame=%llu proc_io_valid=%d proc_io_gle=%lu proc_io_wall_ms=%llu proc_read_ops_delta=%llu proc_write_ops_delta=%llu proc_other_ops_delta=%llu proc_read_bytes_delta=%llu proc_write_bytes_delta=%llu proc_other_bytes_delta=%llu proc_total_read_bytes=%llu proc_total_write_bytes=%llu debug_log_valid=%d debug_log_size=%llu debug_log_delta=%llu debug_log_reset=%d debug_log_gle=%lu kernel_log_valid=%d kernel_log_size=%llu kernel_log_delta=%llu kernel_log_reset=%d kernel_log_gle=%lu full_test_log_valid=%d full_test_log_size=%llu full_test_log_delta=%llu full_test_log_reset=%d full_test_log_gle=%lu camoufox_log_valid=%d camoufox_log_size=%llu camoufox_log_delta=%llu camoufox_log_reset=%d camoufox_log_gle=%lu defender_valid=%d defender_gle=%lu defender_msmpeng=%u defender_mpcmdrun=%u log_started=%d log_start_failed=%d log_queue_depth=%llu log_max_queue_depth=%llu log_queue_lock_busy=%d log_file_lock_busy=%d log_queued=%llu log_queued_bytes=%llu log_written=%llu log_written_bytes=%llu log_direct=%llu log_force_batches=%llu log_force_flushes=%llu log_normal_flushes=%llu log_flush_ms_total=%llu log_flush_ms_max=%llu log_flush_failures=%llu log_last_flush_error=%llu log_pending_flush_bytes=%llu log_tag_events=%llu log_tag_bytes=%llu log_tag_forced=%llu log_coalesced_success=%llu log_coalesced_bytes=%llu log_coalesced_summaries=%llu log_force_downgraded=%llu",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned>(hr),
+                        static_cast<unsigned long long>(pre_render_wait.immediate_timeout_streak),
+                        input_seen_present ? 1 : 0,
+                        static_cast<unsigned>(s_last_input_msg),
+                        static_cast<unsigned long>(s_last_input_msg_time),
+                        static_cast<unsigned long long>(last_input_age_pre_ms),
+                        static_cast<unsigned long long>(input_age_present_ms),
+                        static_cast<unsigned long long>(input_events_delta),
+                        static_cast<unsigned long long>(input_events_this_frame),
+                        proc_io.valid ? 1 : 0,
+                        static_cast<unsigned long>(proc_io.gle),
+                        static_cast<unsigned long long>(proc_io.wall_ms),
+                        static_cast<unsigned long long>(proc_io.read_ops_delta),
+                        static_cast<unsigned long long>(proc_io.write_ops_delta),
+                        static_cast<unsigned long long>(proc_io.other_ops_delta),
+                        static_cast<unsigned long long>(proc_io.read_bytes_delta),
+                        static_cast<unsigned long long>(proc_io.write_bytes_delta),
+                        static_cast<unsigned long long>(proc_io.other_bytes_delta),
+                        static_cast<unsigned long long>(proc_io.total_read_bytes),
+                        static_cast<unsigned long long>(proc_io.total_write_bytes),
+                        log_files.debug_log.valid ? 1 : 0,
+                        static_cast<unsigned long long>(log_files.debug_log.size),
+                        static_cast<unsigned long long>(log_files.debug_log.delta),
+                        log_files.debug_log.reset ? 1 : 0,
+                        static_cast<unsigned long>(log_files.debug_log.gle),
+                        log_files.kernel_log.valid ? 1 : 0,
+                        static_cast<unsigned long long>(log_files.kernel_log.size),
+                        static_cast<unsigned long long>(log_files.kernel_log.delta),
+                        log_files.kernel_log.reset ? 1 : 0,
+                        static_cast<unsigned long>(log_files.kernel_log.gle),
+                        log_files.full_test_log.valid ? 1 : 0,
+                        static_cast<unsigned long long>(log_files.full_test_log.size),
+                        static_cast<unsigned long long>(log_files.full_test_log.delta),
+                        log_files.full_test_log.reset ? 1 : 0,
+                        static_cast<unsigned long>(log_files.full_test_log.gle),
+                        log_files.camoufox_log.valid ? 1 : 0,
+                        static_cast<unsigned long long>(log_files.camoufox_log.size),
+                        static_cast<unsigned long long>(log_files.camoufox_log.delta),
+                        log_files.camoufox_log.reset ? 1 : 0,
+                        static_cast<unsigned long>(log_files.camoufox_log.gle),
+                        defender.valid ? 1 : 0,
+                        static_cast<unsigned long>(defender.gle),
+                        static_cast<unsigned>(defender.msmpeng),
+                        static_cast<unsigned>(defender.mpcmdrun),
+                        log_stats.started ? 1 : 0,
+                        log_stats.start_failed ? 1 : 0,
+                        static_cast<unsigned long long>(log_stats.queue_depth),
+                        static_cast<unsigned long long>(log_stats.max_queue_depth),
+                        log_stats.queue_lock_busy ? 1 : 0,
+                        log_stats.file_lock_busy ? 1 : 0,
+                        static_cast<unsigned long long>(log_stats.queued_items),
+                        static_cast<unsigned long long>(log_stats.queued_bytes),
+                        static_cast<unsigned long long>(log_stats.written_items),
+                        static_cast<unsigned long long>(log_stats.written_bytes),
+                        static_cast<unsigned long long>(log_stats.direct_items),
+                        static_cast<unsigned long long>(log_stats.force_batches),
+                        static_cast<unsigned long long>(log_stats.force_flushes),
+                        static_cast<unsigned long long>(log_stats.normal_flushes),
+                        static_cast<unsigned long long>(log_stats.flush_elapsed_ms_total),
+                        static_cast<unsigned long long>(log_stats.flush_elapsed_ms_max),
+                        static_cast<unsigned long long>(log_stats.flush_failures),
+                        static_cast<unsigned long long>(log_stats.last_flush_error),
+                        static_cast<unsigned long long>(log_stats.bytes_pending_flush),
+                        static_cast<unsigned long long>(log_stats.tag_metric_events),
+                        static_cast<unsigned long long>(log_stats.tag_metric_bytes),
+                        static_cast<unsigned long long>(log_stats.tag_metric_forced),
+                        static_cast<unsigned long long>(log_stats.coalesced_success_events),
+                        static_cast<unsigned long long>(log_stats.coalesced_success_bytes),
+                        static_cast<unsigned long long>(log_stats.coalesced_success_summaries),
+                        static_cast<unsigned long long>(log_stats.coalesced_success_force_downgrades));
+                    diag::log_tagged_fmt("render",
+                        "frame_pacing_log_tags frame=%llu top_tags={%.900s}",
+                        static_cast<unsigned long long>(frame_number),
+                        log_stats.top_tags.empty() ? "<none>" : log_stats.top_tags.c_str());
+                    diag::log_tagged_fmt("render",
+                        "frame_pacing_blur frame=%llu callbacks=%d expected_blur_callbacks=%d unexpected_callbacks=%d reset_callbacks=%d draw_requests=%llu blur_callbacks=%llu suppressed_full_test=%llu slow=%llu slow_suppressed=%llu cache_reuse=%llu adaptive_fallback=%llu last_cache_age_ms=%llu pressure_until_ms=%llu invalid=%llu no_rtv=%llu total_area=%llu last_area=%llu total_ms=%llu copy_ms=%llu h_ms=%llu v_ms=%llu restore_ms=%llu last_total_ms=%llu last_copy_ms=%llu last_h_ms=%llu last_v_ms=%llu last_restore_ms=%llu removed=0x%08lX",
+                        static_cast<unsigned long long>(frame_number),
+                        draw_metrics.callbacks,
+                        draw_metrics.expected_blur_callbacks,
+                        draw_metrics.unexpected_callbacks,
+                        draw_metrics.reset_callbacks,
+                        static_cast<unsigned long long>(blur_stats.draw_requests),
+                        static_cast<unsigned long long>(blur_stats.callbacks),
+                        static_cast<unsigned long long>(blur_stats.suppressed_full_test),
+                        static_cast<unsigned long long>(blur_stats.slow_callbacks),
+                        static_cast<unsigned long long>(blur_stats.slow_suppressed),
+                        static_cast<unsigned long long>(blur_stats.cache_reuse),
+                        static_cast<unsigned long long>(blur_stats.adaptive_fallback),
+                        static_cast<unsigned long long>(blur_stats.last_cache_age_ms),
+                        static_cast<unsigned long long>(blur_stats.pressure_until_ms),
+                        static_cast<unsigned long long>(blur_stats.invalid_callbacks),
+                        static_cast<unsigned long long>(blur_stats.no_rtv),
+                        static_cast<unsigned long long>(blur_stats.total_area),
+                        static_cast<unsigned long long>(blur_stats.last_area),
+                        static_cast<unsigned long long>(blur_stats.total_elapsed_ms),
+                        static_cast<unsigned long long>(blur_stats.copy_elapsed_ms),
+                        static_cast<unsigned long long>(blur_stats.horizontal_elapsed_ms),
+                        static_cast<unsigned long long>(blur_stats.vertical_elapsed_ms),
+                        static_cast<unsigned long long>(blur_stats.restore_elapsed_ms),
+                        static_cast<unsigned long long>(blur_stats.last_elapsed_ms),
+                        static_cast<unsigned long long>(blur_stats.last_copy_ms),
+                        static_cast<unsigned long long>(blur_stats.last_horizontal_ms),
+                        static_cast<unsigned long long>(blur_stats.last_vertical_ms),
+                        static_cast<unsigned long long>(blur_stats.last_restore_ms),
+                        static_cast<unsigned long>(blur_stats.last_device_removed));
+                    diag::log_tagged_fmt("render",
+                        "frame_pacing_queue frame=%llu queue=general attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long long>(wq.post_attempts),
+                        static_cast<unsigned long long>(wq.posted),
+                        static_cast<unsigned long long>(wq.rejected),
+                        static_cast<unsigned long long>(wq.started),
+                        static_cast<unsigned long long>(wq.finished),
+                        static_cast<unsigned>(wq.active),
+                        wq.pending,
+                        static_cast<unsigned long long>(wq.oldest_active_ms),
+                        static_cast<unsigned>(wq.active_label_count),
+                        static_cast<unsigned>(wq.healthy_long_lived),
+                        static_cast<unsigned>(wq.hot_workers),
+                        static_cast<unsigned>(wq.not_queryable_workers),
+                        wq.top_cpu_labels.empty() ? "<none>" : wq.top_cpu_labels.c_str(),
+                        wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str());
+                    diag::log_tagged_fmt("render",
+                        "frame_pacing_queue frame=%llu queue=service attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long long>(svc.post_attempts),
+                        static_cast<unsigned long long>(svc.posted),
+                        static_cast<unsigned long long>(svc.rejected),
+                        static_cast<unsigned long long>(svc.started),
+                        static_cast<unsigned long long>(svc.finished),
+                        static_cast<unsigned>(svc.active),
+                        svc.pending,
+                        static_cast<unsigned long long>(svc.oldest_active_ms),
+                        static_cast<unsigned>(svc.active_label_count),
+                        static_cast<unsigned>(svc.healthy_long_lived),
+                        static_cast<unsigned>(svc.hot_workers),
+                        static_cast<unsigned>(svc.not_queryable_workers),
+                        svc.top_cpu_labels.empty() ? "<none>" : svc.top_cpu_labels.c_str(),
+                        svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
+                    diag::log_tagged_fmt("render",
+                        "frame_pacing_queue frame=%llu queue=critical attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        static_cast<unsigned long long>(frame_number),
+                        static_cast<unsigned long long>(cq.post_attempts),
+                        static_cast<unsigned long long>(cq.posted),
+                        static_cast<unsigned long long>(cq.rejected),
+                        static_cast<unsigned long long>(cq.started),
+                        static_cast<unsigned long long>(cq.finished),
+                        static_cast<unsigned>(cq.active),
+                        cq.pending,
+                        static_cast<unsigned long long>(cq.oldest_active_ms),
+                        static_cast<unsigned>(cq.active_label_count),
+                        static_cast<unsigned>(cq.healthy_long_lived),
+                        static_cast<unsigned>(cq.hot_workers),
+                        static_cast<unsigned>(cq.not_queryable_workers),
+                        cq.top_cpu_labels.empty() ? "<none>" : cq.top_cpu_labels.c_str(),
+                        cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
+                    static uint64_t s_last_post_test_cpu_correlation_ms = 0;
+                    const bool post_test_cpu_pressure = !full_test_running_pre && cpu.valid && cpu.cpu_percent >= 25.0;
+                    if (post_test_cpu_pressure && (s_last_post_test_cpu_correlation_ms == 0 || tick_now_ms - s_last_post_test_cpu_correlation_ms >= 10000ULL)) {
+                        s_last_post_test_cpu_correlation_ms = tick_now_ms;
+                        diag::log_tagged_fmt("render",
+                            "post_test_cpu_correlation frame=%llu cpu_pct=%.2f cpu_wall_ms=%llu cpu_busy_100ns=%llu proc_io_valid=%d proc_write_bytes_delta=%llu proc_read_bytes_delta=%llu debug_log_delta=%llu kernel_log_delta=%llu full_test_log_delta=%llu camoufox_log_delta=%llu defender_valid=%d defender_msmpeng=%u defender_mpcmdrun=%u wq_top_cpu={%.700s} svc_top_cpu={%.700s} cq_top_cpu={%.700s} wq_labels={%.900s} svc_labels={%.900s} cq_labels={%.900s}",
+                            static_cast<unsigned long long>(frame_number),
+                            cpu.cpu_percent,
+                            static_cast<unsigned long long>(cpu.wall_ms),
+                            static_cast<unsigned long long>(cpu.busy_100ns),
+                            proc_io.valid ? 1 : 0,
+                            static_cast<unsigned long long>(proc_io.write_bytes_delta),
+                            static_cast<unsigned long long>(proc_io.read_bytes_delta),
+                            static_cast<unsigned long long>(log_files.debug_log.delta),
+                            static_cast<unsigned long long>(log_files.kernel_log.delta),
+                            static_cast<unsigned long long>(log_files.full_test_log.delta),
+                            static_cast<unsigned long long>(log_files.camoufox_log.delta),
+                            defender.valid ? 1 : 0,
+                            static_cast<unsigned>(defender.msmpeng),
+                            static_cast<unsigned>(defender.mpcmdrun),
+                            wq.top_cpu_labels.empty() ? "<none>" : wq.top_cpu_labels.c_str(),
+                            svc.top_cpu_labels.empty() ? "<none>" : svc.top_cpu_labels.c_str(),
+                            cq.top_cpu_labels.empty() ? "<none>" : cq.top_cpu_labels.c_str(),
+                            wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
+                            svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str(),
+                            cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
+                    }
                     s_last_frame_pacing_log_ms = tick_now_ms;
                     s_last_frame_pacing_frame = frame_number;
                     s_last_frame_pacing_skipped = skipped_render_frames;
+                    s_last_frame_pacing_input_events = s_input_event_count;
                     static uint64_t s_last_runtime_acceptance_log_ms = 0;
                     if (s_last_runtime_acceptance_log_ms == 0 || tick_now_ms - s_last_runtime_acceptance_log_ms >= kAidaRuntimeAcceptanceLogIntervalMs) {
                         s_last_runtime_acceptance_log_ms = tick_now_ms;

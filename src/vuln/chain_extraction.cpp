@@ -594,7 +594,9 @@ extraction_stop_t stop_state(std::uint64_t start_ms, const extraction_options_t&
 {
     if (options.timeout_ms != 0 && now_ms() - start_ms >= options.timeout_ms)
         return extraction_stop_t::timeout;
-    if (user_cancelled())
+    if (options.cancellation_requested && options.cancellation_requested())
+        return extraction_stop_t::cancelled;
+    if (options.allow_interactive_cancel && user_cancelled())
         return extraction_stop_t::cancelled;
     return extraction_stop_t::none;
 }
@@ -3020,7 +3022,13 @@ function_batch_result_t extract_function_batch_ida(const std::vector<ea_t>& func
             out.reason = "timeout";
             break;
         }
-        if (user_cancelled())
+        if (options.cancellation_requested && options.cancellation_requested())
+        {
+            out.cancelled = true;
+            out.reason = "cancelled";
+            break;
+        }
+        if (options.allow_interactive_cancel && user_cancelled())
         {
             out.cancelled = true;
             out.reason = "cancelled";

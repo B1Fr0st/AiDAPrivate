@@ -65,6 +65,8 @@ static bool registry_migration_destructive_name(const std::string& name)
 {
     return name == "delete_function"
         || name == "delete_stack_var"
+        || name == "rename_function"
+        || name == "set_function_signature"
         || name == "patch_bytes"
         || name == "undefine"
         || name == "write_memory"
@@ -74,6 +76,9 @@ static bool registry_migration_destructive_name(const std::string& name)
         || name == "patch_asm"
         || name == "put_int"
         || name == "set_comments"
+        || name == "set_comment"
+        || name == "set_repeatable_comment"
+        || name == "set_function_comment"
         || name == "append_comments"
         || name == "rename"
         || name == "define_func"
@@ -81,12 +86,116 @@ static bool registry_migration_destructive_name(const std::string& name)
         || name == "declare_stack"
         || name == "delete_stack"
         || name == "declare_type"
+        || name == "apply_type"
         || name == "enum_upsert"
+        || name == "create_enum"
+        || name == "create_struct"
+        || name == "add_struct_member"
+        || name == "create_stack_var"
+        || name == "create_segment"
         || name == "set_type"
         || name == "type_apply_batch"
         || name == "py_eval"
         || name == "py_exec_file"
         || name == "apply_callee_prototype";
+}
+
+static std::pair<std::string, std::string> registry_migration_deprecated_target(const std::string& name)
+{
+    static const std::map<std::string, std::pair<std::string, std::string>> targets = {
+        {"get_binary_info", {"ida_discover_manage", "module"}},
+        {"list_functions", {"ida_discover_manage", "functions"}},
+        {"list_funcs", {"ida_discover_manage", "functions"}},
+        {"get_function", {"ida_discover_manage", "function"}},
+        {"decompile_function", {"ida_extract_manage", "decompile"}},
+        {"decompile", {"ida_extract_manage", "decompile"}},
+        {"disassemble_function", {"ida_extract_manage", "instructions"}},
+        {"disasm", {"ida_extract_manage", "instructions"}},
+        {"get_xrefs_to", {"ida_extract_manage", "xrefs"}},
+        {"get_xrefs_from", {"ida_extract_manage", "xrefs"}},
+        {"xrefs_to", {"ida_extract_manage", "xrefs"}},
+        {"list_imports", {"ida_discover_manage", "imports"}},
+        {"imports", {"ida_discover_manage", "imports"}},
+        {"list_exports", {"ida_discover_manage", "exports"}},
+        {"export_funcs", {"ida_discover_manage", "exports"}},
+        {"list_segments", {"ida_discover_manage", "segments"}},
+        {"get_address_info", {"ida_discover_manage", "address"}},
+        {"build_call_graph", {"ida_analysis_manage", "callgraph"}},
+        {"callgraph", {"ida_analysis_manage", "callgraph"}},
+        {"analyze_function", {"ida_analysis_manage", "function"}},
+        {"analyze_batch", {"ida_analysis_manage", "batch"}},
+        {"analyze_component", {"ida_analysis_manage", "component"}},
+        {"analyze_control_flow", {"ida_analysis_manage", "control_flow"}},
+        {"analyze_data_flow", {"ida_analysis_manage", "data_flow"}},
+        {"run_taint_analysis", {"ida_analysis_manage", "taint"}},
+        {"index_status", {"ida_diagnostics_manage", "index_status"}},
+        {"build_index", {"ida_cache_manage", "build"}},
+        {"list_outputs", {"ida_cache_manage", "output_cache"}},
+        {"server_health", {"ida_diagnostics_manage", "health"}},
+        {"rename_function", {"ida_mutation_manage", "rename_function"}},
+        {"rename", {"ida_mutation_manage", "batch_apply"}},
+        {"batch_rename", {"ida_mutation_manage", "batch_apply"}},
+        {"set_function_signature", {"ida_mutation_manage", "set_function_signature"}},
+        {"apply_type", {"ida_mutation_manage", "apply_type"}},
+        {"set_type", {"ida_mutation_manage", "apply_type"}},
+        {"type_apply_batch", {"ida_mutation_manage", "batch_apply"}},
+        {"declare_type", {"ida_mutation_manage", "declare_type"}},
+        {"set_comment", {"ida_mutation_manage", "set_comment"}},
+        {"set_repeatable_comment", {"ida_mutation_manage", "set_comment"}},
+        {"set_function_comment", {"ida_mutation_manage", "set_comment"}},
+        {"set_decompiler_comment", {"ida_mutation_manage", "set_comment"}},
+        {"set_comments", {"ida_mutation_manage", "batch_apply"}},
+        {"append_comments", {"ida_mutation_manage", "batch_apply"}},
+        {"patch_bytes", {"ida_mutation_manage", "patch_bytes"}},
+        {"patch", {"ida_mutation_manage", "batch_apply"}},
+        {"patch_asm", {"ida_mutation_manage", "batch_apply"}},
+        {"put_int", {"ida_mutation_manage", "batch_apply"}},
+        {"idb_save", {"ida_mutation_manage", "idb_save"}},
+        {"define_func", {"ida_mutation_manage", "batch_apply"}},
+        {"define_code", {"ida_mutation_manage", "batch_apply"}},
+        {"delete_function", {"ida_mutation_manage", "delete_function"}}
+    };
+    auto it = targets.find(name);
+    if (it == targets.end())
+        return {};
+    return it->second;
+}
+
+static json operation_metadata_to_json(const tool_operation_t& op)
+{
+    json j;
+    j["operation"] = op.name;
+    j["description"] = op.description;
+    j["read_only"] = op.read_only;
+    j["destructive"] = op.destructive;
+    j["deterministic"] = op.deterministic;
+    j["job_mode"] = op.job_mode;
+    j["cache_policy"] = op.cache_policy;
+    j["default_timeout_ms"] = op.default_timeout_ms;
+    j["hard_timeout_ms"] = op.hard_timeout_ms;
+    j["required_indices"] = op.required_indices;
+    if (!op.input_schema.is_null() && !op.input_schema.empty())
+        j["input_schema"] = op.input_schema;
+    if (!op.output_schema.is_null() && !op.output_schema.empty())
+        j["output_schema"] = op.output_schema;
+    return j;
+}
+
+static tool_result_t attach_deprecated_metadata(const tool_definition_t& tool, tool_result_t result)
+{
+    if (tool.deprecated_by_tool.empty())
+        return result;
+    json dep;
+    dep["tool"] = tool.deprecated_by_tool;
+    dep["operation"] = tool.deprecated_by_operation.empty() ? json(nullptr) : json(tool.deprecated_by_operation);
+    dep["visibility"] = "legacy";
+    if (result.data.is_null() || result.data.empty())
+        result.data = json::object();
+    if (result.data.is_object())
+        result.data["deprecated_by"] = dep;
+    else
+        result.data = json{{"legacy_result", result.data}, {"deprecated_by", dep}};
+    return result;
 }
 
 void ToolRegistry::register_tool(const tool_definition_t& tool)
@@ -110,11 +219,26 @@ void ToolRegistry::register_tool(const tool_definition_t& tool)
     }
 
     tool_definition_t normalized = tool;
+    if (normalized.visibility.empty())
+        normalized.visibility = "legacy";
+    const bool manage_name = normalized.name.size() > 11
+        && normalized.name.rfind("ida_", 0) == 0
+        && normalized.name.compare(normalized.name.size() - 7, 7, "_manage") == 0;
+    if (manage_name)
+        normalized.visibility = "public";
+    if (normalized.category == "session")
+        normalized.visibility = "internal";
     if (registry_migration_destructive_name(normalized.name))
     {
         normalized.read_only = false;
         normalized.destructive = true;
         normalized.deterministic = false;
+    }
+    auto dep = registry_migration_deprecated_target(normalized.name);
+    if (normalized.deprecated_by_tool.empty() && !dep.first.empty())
+    {
+        normalized.deprecated_by_tool = dep.first;
+        normalized.deprecated_by_operation = dep.second;
     }
 
     if (normalized.read_only && normalized.destructive)
@@ -183,6 +307,20 @@ json ToolRegistry::generate_tools_schema() const
         tool_json["destructive"] = tool.destructive;
         tool_json["deterministic"] = tool.deterministic;
         tool_json["required_indices"] = tool.required_indices;
+        tool_json["visibility"] = tool.visibility;
+        if (!tool.deprecated_by_tool.empty())
+        {
+            tool_json["deprecated_by"] = {
+                {"tool", tool.deprecated_by_tool},
+                {"operation", tool.deprecated_by_operation.empty() ? json(nullptr) : json(tool.deprecated_by_operation)}
+            };
+        }
+        if (!tool.operations.empty())
+        {
+            tool_json["operations"] = json::array();
+            for (const auto& op : tool.operations)
+                tool_json["operations"].push_back(operation_metadata_to_json(op));
+        }
         if (!tool.output_schema.is_null() && !tool.output_schema.empty())
             tool_json["output_schema"] = tool.output_schema;
 
@@ -306,11 +444,11 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
 
     try
     {
-        return tool->handler(sanitized_params);
+        return attach_deprecated_metadata(*tool, tool->handler(sanitized_params));
     }
     catch (const std::exception& e)
     {
-        return tool_result_t::error(OBFSTR("Tool execution error: ") + e.what());
+        return attach_deprecated_metadata(*tool, tool_result_t::error(OBFSTR("Tool execution error: ") + e.what()));
     }
 }
 

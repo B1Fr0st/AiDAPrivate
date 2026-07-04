@@ -6,7 +6,12 @@
 #include "../multibinary_project.hpp"
 #include "chain_extraction.hpp"
 #include "chain_path_trace.hpp"
+#include "chain_report.hpp"
+#include "chain_schema.hpp"
+#include "chain_store.hpp"
 #include "chain_verifier.hpp"
+#include "chain_verification_engine.hpp"
+#include "ida_gateway.hpp"
 #include "verification_engine.hpp"
 
 #include <auto.hpp>
@@ -29,17 +34,21 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -90,6 +99,7 @@ struct request_ctx_t
     std::string tool;
     std::string operation;
     std::string request_id;
+    std::string job_id;
     std::string job_mode;
     std::string idempotency_key;
     std::string cursor;
@@ -101,23 +111,31 @@ struct request_ctx_t
 struct job_record_t
 {
     std::string job_id;
+    std::string project_id;
     std::string tool;
     std::string operation;
     std::string state;
     std::string report_id;
     std::string error_code;
     std::string error_message;
+    std::string idempotency_key;
+    std::string idempotency_scope;
+    std::string generation;
+    std::string runtime_epoch;
     uint64_t created_at_ms = 0;
     uint64_t updated_at_ms = 0;
     double progress = 0.0;
+    bool cancel_requested = false;
     json request;
     json result;
     json events = json::array();
+    json resources = json::array();
 };
 
 struct report_record_t
 {
     std::string report_id;
+    std::string project_id;
     std::string job_id;
     std::string chain_id;
     uint64_t created_at_ms = 0;
@@ -140,6 +158,11 @@ struct state_t
     std::unordered_map<std::string, job_record_t> jobs;
     std::unordered_map<std::string, report_record_t> reports;
     std::unordered_map<std::string, index_record_t> indices;
+    std::unordered_map<std::string, std::string> idempotency_jobs;
+    std::unordered_map<std::string, aida::vuln::chain::cancellation_token_t> cancellation_tokens;
+    std::unordered_map<std::string, std::shared_ptr<std::atomic_bool>> gateway_cancel_flags;
+    std::unordered_set<std::string> hydrated_job_projects;
+    std::unordered_set<std::string> hydrated_report_projects;
     json corpus_manifest = json::object();
     std::atomic<uint64_t> next_job{1};
     std::atomic<uint64_t> next_report{1};
@@ -155,6 +178,17 @@ uint64_t now_ms()
 {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+std::string runtime_epoch_id()
+{
+    static const std::string epoch = []() {
+        std::ostringstream ss;
+        ss << "mcp-runtime-" << std::hex << now_ms() << "-"
+           << std::chrono::steady_clock::now().time_since_epoch().count();
+        return ss.str();
+    }();
+    return epoch;
 }
 
 std::string hex_lower(const uint8_t* data, size_t n)
@@ -737,6 +771,7 @@ json job_to_json(const job_record_t& j)
 {
     json out;
     out["job_id"] = j.job_id;
+    out["project_id"] = j.project_id.empty() ? json(nullptr) : json(j.project_id);
     out["tool"] = j.tool;
     out["operation"] = j.operation;
     out["state"] = j.state;
@@ -744,93 +779,866 @@ json job_to_json(const job_record_t& j)
     out["created_at_ms"] = j.created_at_ms;
     out["updated_at_ms"] = j.updated_at_ms;
     out["progress"] = j.progress;
+    out["idempotency_key"] = j.idempotency_key.empty() ? json(nullptr) : json(j.idempotency_key);
+    out["idempotency_scope"] = j.idempotency_scope.empty() ? json(nullptr) : json(j.idempotency_scope);
+    out["generation"] = j.generation;
+    out["runtime_epoch"] = j.runtime_epoch.empty() ? json(nullptr) : json(j.runtime_epoch);
+    out["stale_generation"] = !j.generation.empty() && j.generation != generation_id();
+    out["cancel_requested"] = j.cancel_requested;
     out["error_code"] = j.error_code.empty() ? json(nullptr) : json(j.error_code);
     out["error_message"] = j.error_message.empty() ? json(nullptr) : json(j.error_message);
     out["events"] = j.events;
+    out["resources"] = j.resources;
     return out;
 }
 
-std::string create_job(const request_ctx_t& ctx)
+struct job_create_result_t
+{
+    std::string job_id;
+    bool reused = false;
+    job_record_t snapshot;
+};
+
+std::string idempotency_scope(const request_ctx_t& ctx, const std::string& generation)
+{
+    if (ctx.idempotency_key.empty())
+        return std::string();
+    return generation + "|" + ctx.tool + "|" + ctx.operation + "|" + ctx.idempotency_key;
+}
+
+json job_resource_manifest(const std::string& job_id)
+{
+    return json::array({
+        {{"uri", "ida://jobs/" + job_id + "/result"}, {"kind", "job_result"}, {"job_id", job_id}},
+        {{"uri", "ida://jobs/" + job_id + "/events"}, {"kind", "job_events"}, {"job_id", job_id}}
+    });
+}
+
+bool active_job_state(const std::string& state_name)
+{
+    return state_name == "queued" || state_name == "running" || state_name == "cancelling";
+}
+
+std::string project_id_from_ctx(const request_ctx_t& ctx)
+{
+    const std::string captured_project = ctx.payload.value("_aida_project_id", std::string());
+    if (!captured_project.empty())
+        return aida::vuln::chain::sanitize_store_component(captured_project);
+    const std::string explicit_project = ctx.payload.value("project_id", std::string());
+    if (!explicit_project.empty())
+        return aida::vuln::chain::sanitize_store_component(explicit_project);
+    return aida::vuln::chain::sanitize_store_component(aida::multibinary::default_project_id_for_current_idb());
+}
+
+json job_store_json(const job_record_t& j)
+{
+    return {
+        {"schema", "aida_mcp_job_record_v1"},
+        {"job_id", j.job_id},
+        {"project_id", j.project_id},
+        {"tool", j.tool},
+        {"operation", j.operation},
+        {"state", j.state},
+        {"report_id", j.report_id},
+        {"created_at_ms", j.created_at_ms},
+        {"updated_at_ms", j.updated_at_ms},
+        {"progress", j.progress},
+        {"idempotency_key", j.idempotency_key},
+        {"idempotency_scope", j.idempotency_scope},
+        {"generation", j.generation},
+        {"runtime_epoch", j.runtime_epoch},
+        {"cancel_requested", j.cancel_requested},
+        {"error_code", j.error_code},
+        {"error_message", j.error_message},
+        {"events", j.events},
+        {"resources", j.resources},
+        {"request", j.request},
+        {"result", j.result}
+    };
+}
+
+std::string json_string_field(const json& v, const char* key, const std::string& fallback = std::string())
+{
+    if (!v.contains(key) || !v.at(key).is_string())
+        return fallback;
+    return v.at(key).get<std::string>();
+}
+
+uint64_t json_u64_field(const json& v, const char* key, uint64_t fallback = 0)
+{
+    if (!v.contains(key))
+        return fallback;
+    const json& item = v.at(key);
+    if (item.is_number_unsigned())
+        return item.get<uint64_t>();
+    if (item.is_number_integer())
+    {
+        const int64_t signed_value = item.get<int64_t>();
+        return signed_value < 0 ? fallback : static_cast<uint64_t>(signed_value);
+    }
+    return fallback;
+}
+
+double json_double_field(const json& v, const char* key, double fallback = 0.0)
+{
+    if (!v.contains(key) || !v.at(key).is_number())
+        return fallback;
+    return v.at(key).get<double>();
+}
+
+std::optional<job_record_t> job_from_store_json(const json& v)
+{
+    if (!v.is_object())
+        return std::nullopt;
+    job_record_t j;
+    j.job_id = json_string_field(v, "job_id");
+    if (j.job_id.empty())
+        return std::nullopt;
+    j.project_id = json_string_field(v, "project_id");
+    j.tool = json_string_field(v, "tool");
+    j.operation = json_string_field(v, "operation");
+    j.state = json_string_field(v, "state", "failed");
+    j.report_id = json_string_field(v, "report_id");
+    j.error_code = json_string_field(v, "error_code");
+    j.error_message = json_string_field(v, "error_message");
+    j.idempotency_key = json_string_field(v, "idempotency_key");
+    j.idempotency_scope = json_string_field(v, "idempotency_scope");
+    j.generation = json_string_field(v, "generation");
+    j.runtime_epoch = json_string_field(v, "runtime_epoch");
+    j.created_at_ms = json_u64_field(v, "created_at_ms");
+    j.updated_at_ms = json_u64_field(v, "updated_at_ms", j.created_at_ms);
+    j.progress = json_double_field(v, "progress", active_job_state(j.state) ? 0.01 : 1.0);
+    j.cancel_requested = v.value("cancel_requested", false);
+    j.request = v.value("request", json::object());
+    j.result = v.value("result", json::object());
+    j.events = v.value("events", json::array());
+    j.resources = v.value("resources", json::array());
+    if (j.project_id.empty() && j.request.is_object())
+        j.project_id = j.request.value("project_id", std::string());
+    if (j.project_id.empty())
+        j.project_id = "default";
+    if (j.runtime_epoch != runtime_epoch_id() && active_job_state(j.state))
+    {
+        const uint64_t ts = now_ms();
+        j.state = "failed";
+        j.error_code = "runtime_interrupted";
+        j.error_message = "job was interrupted before this plugin runtime started";
+        j.updated_at_ms = ts;
+        j.progress = 1.0;
+        j.events.push_back({{"ts_ms", ts}, {"state", "failed"}, {"event", "runtime_interrupted"}, {"previous_runtime_epoch", j.runtime_epoch}});
+    }
+    return j;
+}
+
+json report_store_json(const report_record_t& r)
+{
+    return {
+        {"schema", "aida_mcp_report_record_v1"},
+        {"report_id", r.report_id},
+        {"project_id", r.project_id},
+        {"job_id", r.job_id},
+        {"chain_id", r.chain_id},
+        {"created_at_ms", r.created_at_ms},
+        {"content_hash", r.content_hash},
+        {"report", r.report}
+    };
+}
+
+std::optional<report_record_t> report_from_store_json(const json& v)
+{
+    if (!v.is_object())
+        return std::nullopt;
+    report_record_t r;
+    r.report_id = json_string_field(v, "report_id");
+    if (r.report_id.empty())
+        return std::nullopt;
+    r.project_id = json_string_field(v, "project_id", "default");
+    r.job_id = json_string_field(v, "job_id");
+    r.chain_id = json_string_field(v, "chain_id");
+    r.created_at_ms = json_u64_field(v, "created_at_ms");
+    r.content_hash = json_string_field(v, "content_hash");
+    r.report = v.value("report", json::object());
+    if (r.content_hash.empty())
+        r.content_hash = hash_text(r.report.dump());
+    return r;
+}
+
+void cache_job_record_locked(state_t& s, const job_record_t& j)
+{
+    s.jobs[j.job_id] = j;
+    if (!j.idempotency_scope.empty())
+        s.idempotency_jobs[j.idempotency_scope] = j.job_id;
+    auto tok = s.cancellation_tokens.find(j.job_id);
+    if (tok == s.cancellation_tokens.end())
+        tok = s.cancellation_tokens.emplace(j.job_id, aida::vuln::chain::cancellation_token_t()).first;
+    auto flag = s.gateway_cancel_flags.find(j.job_id);
+    if (flag == s.gateway_cancel_flags.end())
+        flag = s.gateway_cancel_flags.emplace(j.job_id, std::make_shared<std::atomic_bool>(false)).first;
+    if (j.cancel_requested)
+    {
+        tok->second.cancel();
+        flag->second->store(true, std::memory_order_release);
+    }
+}
+
+void persist_job_record(const job_record_t& j)
+{
+    if (j.project_id.empty() || j.job_id.empty())
+        return;
+    aida::vuln::chain::save_chain_job_record(j.project_id, j.job_id, job_store_json(j));
+}
+
+void persist_report_record(const report_record_t& r)
+{
+    if (r.project_id.empty() || r.report_id.empty())
+        return;
+    aida::vuln::chain::save_chain_report_record(r.project_id, r.report_id, report_store_json(r));
+}
+
+void hydrate_jobs_for_project(const std::string& project_id)
+{
+    if (project_id.empty())
+        return;
+    auto& s = state();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.hydrated_job_projects.find(project_id) != s.hydrated_job_projects.end())
+            return;
+        s.hydrated_job_projects.insert(project_id);
+    }
+    auto loaded = aida::vuln::chain::list_chain_job_records(project_id);
+    std::vector<job_record_t> changed;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        for (const auto& record : loaded.records)
+        {
+            auto parsed = job_from_store_json(record);
+            if (!parsed)
+                continue;
+            cache_job_record_locked(s, *parsed);
+            if (parsed->error_code == "runtime_interrupted")
+                changed.push_back(*parsed);
+        }
+    }
+    for (const auto& j : changed)
+        persist_job_record(j);
+}
+
+void hydrate_reports_for_project(const std::string& project_id)
+{
+    if (project_id.empty())
+        return;
+    auto& s = state();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.hydrated_report_projects.find(project_id) != s.hydrated_report_projects.end())
+            return;
+        s.hydrated_report_projects.insert(project_id);
+    }
+    auto loaded = aida::vuln::chain::list_chain_report_records(project_id);
+    std::lock_guard<std::mutex> lock(s.mutex);
+    for (const auto& record : loaded.records)
+    {
+        auto parsed = report_from_store_json(record);
+        if (!parsed)
+            continue;
+        s.reports[parsed->report_id] = *parsed;
+    }
+}
+
+std::optional<job_record_t> load_job_record_from_store(const std::string& project_id, const std::string& job_id)
+{
+    if (project_id.empty() || job_id.empty())
+        return std::nullopt;
+    auto loaded = aida::vuln::chain::load_chain_job_record(project_id, job_id);
+    if (!loaded.ok)
+        return std::nullopt;
+    auto parsed = job_from_store_json(loaded.record);
+    if (!parsed)
+        return std::nullopt;
+    auto& s = state();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        cache_job_record_locked(s, *parsed);
+    }
+    if (parsed->error_code == "runtime_interrupted")
+        persist_job_record(*parsed);
+    return parsed;
+}
+
+std::optional<report_record_t> load_report_record_from_store(const std::string& project_id, const std::string& report_id)
+{
+    if (project_id.empty() || report_id.empty())
+        return std::nullopt;
+    auto loaded = aida::vuln::chain::load_chain_report_record(project_id, report_id);
+    if (!loaded.ok)
+        return std::nullopt;
+    auto parsed = report_from_store_json(loaded.record);
+    if (!parsed)
+        return std::nullopt;
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.reports[parsed->report_id] = *parsed;
+    return parsed;
+}
+
+job_create_result_t create_job(const request_ctx_t& ctx)
 {
     auto& s = state();
+    const std::string project_id = project_id_from_ctx(ctx);
+    hydrate_jobs_for_project(project_id);
+    const std::string gen = ctx.payload.value("_aida_generation", std::string()).empty() ? generation_id() : ctx.payload.value("_aida_generation", std::string());
+    const std::string idem = idempotency_scope(ctx, gen);
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!idem.empty())
+    {
+        auto found = s.idempotency_jobs.find(idem);
+        if (found != s.idempotency_jobs.end())
+        {
+            auto jit = s.jobs.find(found->second);
+            if (jit != s.jobs.end())
+                return {jit->second.job_id, true, jit->second};
+        }
+    }
     const uint64_t id = s.next_job.fetch_add(1);
     std::ostringstream ss;
-    ss << "ida-job-" << id;
+    ss << "ida-job-" << std::hex << fnv1a64(gen + runtime_epoch_id()) << "-" << now_ms() << "-" << id;
     job_record_t j;
     j.job_id = ss.str();
+    j.project_id = project_id;
     j.tool = ctx.tool;
     j.operation = ctx.operation;
-    j.state = "running";
+    j.state = "queued";
+    j.idempotency_key = ctx.idempotency_key;
+    j.idempotency_scope = idem;
+    j.generation = gen;
+    j.runtime_epoch = runtime_epoch_id();
     j.created_at_ms = now_ms();
     j.updated_at_ms = j.created_at_ms;
-    j.progress = 0.01;
+    j.progress = 0.0;
+    j.resources = job_resource_manifest(j.job_id);
     j.request = {
         {"tool", ctx.tool},
         {"operation", ctx.operation},
         {"request_id", ctx.request_id},
+        {"project_id", project_id},
         {"payload", ctx.payload},
         {"budget", ctx.budget},
-        {"job_mode", ctx.job_mode}
+        {"job_mode", ctx.job_mode},
+        {"idempotency_key", ctx.idempotency_key},
+        {"idempotency_scope", idem},
+        {"runtime_epoch", j.runtime_epoch},
+        {"generation", gen}
     };
-    j.events.push_back({{"ts_ms", j.created_at_ms}, {"state", "running"}});
-    std::lock_guard<std::mutex> lock(s.mutex);
-    s.jobs.emplace(j.job_id, std::move(j));
-    return ss.str();
+    j.events.push_back({{"ts_ms", j.created_at_ms}, {"state", "queued"}, {"event", "job_queued"}, {"generation", gen}});
+    const std::string job_id = j.job_id;
+    job_record_t snapshot = j;
+    s.jobs.emplace(job_id, std::move(j));
+    s.cancellation_tokens[job_id] = aida::vuln::chain::cancellation_token_t();
+    s.gateway_cancel_flags[job_id] = std::make_shared<std::atomic_bool>(false);
+    if (!idem.empty())
+        s.idempotency_jobs[idem] = job_id;
+    persist_job_record(snapshot);
+    return {job_id, false, snapshot};
 }
 
-void finish_job(const std::string& job_id, const std::string& state_name, const json& result, const std::string& report_id = std::string(), const std::string& err_code = std::string(), const std::string& err_msg = std::string())
+void append_job_event(const std::string& job_id, const std::string& event, const json& details = json::object())
+{
+    auto& s = state();
+    std::optional<job_record_t> changed;
+    std::lock_guard<std::mutex> lock(s.mutex);
+    auto it = s.jobs.find(job_id);
+    if (it == s.jobs.end())
+        return;
+    json e;
+    e["ts_ms"] = now_ms();
+    e["event"] = event;
+    if (!details.is_null() && !details.empty())
+        e["details"] = details;
+    it->second.events.push_back(std::move(e));
+    while (it->second.events.size() > 256)
+        it->second.events.erase(it->second.events.begin());
+    it->second.updated_at_ms = now_ms();
+    changed = it->second;
+    if (changed)
+        persist_job_record(*changed);
+}
+
+bool mark_job_running(const std::string& job_id)
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    auto it = s.jobs.find(job_id);
+    if (it == s.jobs.end())
+        return false;
+    if (it->second.cancel_requested)
+        return false;
+    it->second.state = "running";
+    it->second.updated_at_ms = now_ms();
+    it->second.progress = std::max(it->second.progress, 0.01);
+    it->second.events.push_back({{"ts_ms", it->second.updated_at_ms}, {"state", "running"}, {"event", "job_running"}});
+    persist_job_record(it->second);
+    return true;
+}
+
+void finish_job(const std::string& job_id,
+                const std::string& state_name,
+                const json& result,
+                const std::string& report_id = std::string(),
+                const std::string& err_code = std::string(),
+                const std::string& err_msg = std::string(),
+                const json& resources = json::array())
 {
     auto& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     auto it = s.jobs.find(job_id);
     if (it == s.jobs.end())
         return;
-    it->second.state = state_name;
+    std::string final_state = state_name;
+    std::string final_error_code = err_code;
+    std::string final_error_message = err_msg;
+    if (it->second.cancel_requested && state_name == "completed")
+    {
+        final_state = "cancelled";
+        final_error_code = "cancelled";
+        final_error_message = "job was cancelled before completion was published";
+    }
+    it->second.state = final_state;
     it->second.updated_at_ms = now_ms();
-    it->second.progress = state_name == "completed" ? 1.0 : it->second.progress;
+    it->second.progress = final_state == "completed" || final_state == "failed" || final_state == "cancelled" ? 1.0 : it->second.progress;
     it->second.result = result;
     it->second.report_id = report_id;
-    it->second.error_code = err_code;
-    it->second.error_message = err_msg;
-    it->second.events.push_back({{"ts_ms", it->second.updated_at_ms}, {"state", state_name}});
+    it->second.error_code = final_error_code;
+    it->second.error_message = final_error_message;
+    if (!resources.is_null() && !resources.empty())
+        it->second.resources = resources;
+    it->second.events.push_back({{"ts_ms", it->second.updated_at_ms}, {"state", final_state}, {"event", "job_" + final_state}});
+    persist_job_record(it->second);
 }
 
-std::optional<job_record_t> get_job(const std::string& job_id)
+std::optional<job_record_t> get_job(const std::string& job_id, const std::string& project_id = std::string())
+{
+    auto& s = state();
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto it = s.jobs.find(job_id);
+        if (it != s.jobs.end())
+            return it->second;
+    }
+    if (!project_id.empty())
+        return load_job_record_from_store(project_id, job_id);
+    return std::nullopt;
+}
+
+bool job_cancel_requested(const std::string& job_id)
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    auto it = s.jobs.find(job_id);
+    return it != s.jobs.end() && it->second.cancel_requested;
+}
+
+aida::vuln::chain::cancellation_token_t cancellation_token_for_job(const std::string& job_id)
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.cancellation_tokens[job_id];
+}
+
+std::shared_ptr<std::atomic_bool> gateway_cancel_flag_for_job(const std::string& job_id)
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    auto it = s.gateway_cancel_flags.find(job_id);
+    if (it != s.gateway_cancel_flags.end())
+        return it->second;
+    auto flag = std::make_shared<std::atomic_bool>(false);
+    s.gateway_cancel_flags[job_id] = flag;
+    return flag;
+}
+
+bool cancel_job_record(const std::string& job_id)
 {
     auto& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     auto it = s.jobs.find(job_id);
     if (it == s.jobs.end())
-        return std::nullopt;
-    return it->second;
+        return false;
+    it->second.cancel_requested = true;
+    const bool was_active = it->second.state == "running" || it->second.state == "cancelling";
+    it->second.state = was_active ? "cancelling" : "cancelled";
+    it->second.updated_at_ms = now_ms();
+    if (!was_active)
+        it->second.progress = 1.0;
+    it->second.events.push_back({{"ts_ms", it->second.updated_at_ms}, {"state", it->second.state}, {"event", was_active ? "job_cancelling" : "job_cancelled"}});
+    auto tok = s.cancellation_tokens.find(job_id);
+    if (tok != s.cancellation_tokens.end())
+        tok->second.cancel();
+    auto flag = s.gateway_cancel_flags.find(job_id);
+    if (flag != s.gateway_cancel_flags.end() && flag->second)
+        flag->second->store(true, std::memory_order_release);
+    persist_job_record(it->second);
+    return true;
 }
 
-std::string store_report(const std::string& job_id, const std::string& chain_id, const json& report)
+json cancel_all_job_records()
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    json ids = json::array();
+    const uint64_t ts = now_ms();
+    for (auto& kv : s.jobs)
+    {
+        job_record_t& j = kv.second;
+        if (j.state == "completed" || j.state == "failed" || j.state == "cancelled")
+            continue;
+        j.cancel_requested = true;
+        const bool was_active = j.state == "running" || j.state == "cancelling";
+        j.state = was_active ? "cancelling" : "cancelled";
+        j.updated_at_ms = ts;
+        if (!was_active)
+            j.progress = 1.0;
+        j.events.push_back({{"ts_ms", ts}, {"state", j.state}, {"event", was_active ? "job_cancelling" : "job_cancelled"}});
+        ids.push_back(j.job_id);
+        auto tok = s.cancellation_tokens.find(j.job_id);
+        if (tok != s.cancellation_tokens.end())
+            tok->second.cancel();
+        auto flag = s.gateway_cancel_flags.find(j.job_id);
+        if (flag != s.gateway_cancel_flags.end() && flag->second)
+            flag->second->store(true, std::memory_order_release);
+        persist_job_record(j);
+    }
+    return {{"cancelled", !ids.empty()}, {"cancelled_count", ids.size()}, {"job_ids", ids}};
+}
+
+std::string store_report(const std::string& project_id, const std::string& job_id, const std::string& chain_id, const json& report)
 {
     auto& s = state();
     const uint64_t id = s.next_report.fetch_add(1);
     std::ostringstream ss;
-    ss << "ida-report-" << id;
+    ss << "ida-report-" << std::hex << fnv1a64(job_id + report.dump()) << "-" << id;
     report_record_t r;
     r.report_id = ss.str();
+    r.project_id = project_id.empty() ? std::string("default") : project_id;
     r.job_id = job_id;
     r.chain_id = chain_id;
     r.created_at_ms = now_ms();
     r.report = report;
-    r.content_hash = hash_text(report.dump());
+    r.report["report_id"] = r.report_id;
+    r.content_hash = hash_text(r.report.dump());
     std::lock_guard<std::mutex> lock(s.mutex);
     s.reports.emplace(r.report_id, std::move(r));
+    auto it = s.reports.find(ss.str());
+    if (it != s.reports.end())
+        persist_report_record(it->second);
     return ss.str();
 }
 
-std::optional<report_record_t> get_report_record(const std::string& report_id)
+std::optional<report_record_t> get_report_record(const std::string& report_id, const std::string& project_id = std::string())
 {
     auto& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    auto it = s.reports.find(report_id);
-    if (it == s.reports.end())
-        return std::nullopt;
-    return it->second;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto it = s.reports.find(report_id);
+        if (it != s.reports.end())
+            return it->second;
+    }
+    if (!project_id.empty())
+        return load_report_record_from_store(project_id, report_id);
+    return std::nullopt;
+}
+
+struct queued_job_result_t
+{
+    bool ok = false;
+    json data = json::object();
+    std::string report_id;
+    std::string error_code;
+    std::string error_message;
+    json resources = json::array();
+};
+
+json chain_document_from_ctx(const request_ctx_t& ctx, const json& module_override);
+queued_job_result_t execute_queued_mcp_job(const request_ctx_t& ctx, const job_record_t& job);
+
+struct async_context_capture_t
+{
+    bool ok = false;
+    std::string error_code;
+    std::string error_message;
+    json data = json::object();
+};
+
+class mcp_job_runtime_t
+{
+public:
+    mcp_job_runtime_t()
+    {
+        gateway.start();
+        worker = std::thread([this]() { worker_loop(); });
+    }
+
+    ~mcp_job_runtime_t()
+    {
+        shutdown(2000);
+    }
+
+    mcp_job_runtime_t(const mcp_job_runtime_t&) = delete;
+    mcp_job_runtime_t& operator=(const mcp_job_runtime_t&) = delete;
+
+    async_context_capture_t capture_context(const request_ctx_t& ctx)
+    {
+        gateway.start();
+        ida_gateway_request_t request;
+        request.domain = ida_gateway_domain_t::mixed;
+        request.phase = "mcp_job";
+        request.operation = "capture_context";
+        request.mff_flags = MFF_READ;
+        request.deadline_ms = 10000;
+        ida_gateway_result_t result = gateway.execute(request, [ctx](const ida_gateway_context_t&) {
+            const std::string explicit_project = ctx.payload.value("project_id", std::string());
+            const std::string project_id = explicit_project.empty()
+                ? aida::multibinary::default_project_id_for_current_idb()
+                : explicit_project;
+            return json{
+                {"generation", generation_id()},
+                {"project_id", aida::vuln::chain::sanitize_store_component(project_id)},
+                {"module", module_identity()}
+            };
+        });
+        async_context_capture_t capture;
+        capture.ok = result.ok;
+        capture.data = result.data;
+        if (!result.ok)
+        {
+            capture.error_code = result.stale_generation ? "stale_generation" : (result.timed_out ? "timeout" : (result.cancelled ? "cancelled" : "idb_unavailable"));
+            capture.error_message = result.error.empty() ? "failed to capture async job context through IDA gateway" : result.error;
+        }
+        return capture;
+    }
+
+    bool enqueue(const request_ctx_t& ctx, const std::string& job_id, std::string& error)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping.load(std::memory_order_acquire))
+            {
+                error = "runtime_stopping";
+                return false;
+            }
+            if (queue.size() >= k_max_queue_depth)
+            {
+                error = "queue_full";
+                return false;
+            }
+            queue.push_back({ctx, job_id});
+        }
+        cv.notify_one();
+        return true;
+    }
+
+    json diagnostics()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return {
+            {"runtime_epoch", runtime_epoch_id()},
+            {"stopping", stopping.load(std::memory_order_acquire)},
+            {"queue_depth", queue.size()},
+            {"active_job_id", active_job_id.empty() ? json(nullptr) : json(active_job_id)},
+            {"max_queue_depth", k_max_queue_depth},
+            {"gateway", gateway.metrics_json()}
+        };
+    }
+
+    ida_gateway_result_t execute_ida_job(const request_ctx_t& ctx,
+                                         const std::string& job_id,
+                                         int mff_flags,
+                                         uint32_t deadline_ms,
+                                         const std::function<json()>& body)
+    {
+        ida_gateway_request_t request;
+        request.domain = ida_gateway_domain_t::mixed;
+        request.phase = "mcp_job";
+        request.operation = ctx.operation;
+        request.mff_flags = mff_flags;
+        request.deadline_ms = deadline_ms;
+        request.modal_policy = ida_gateway_modal_policy_t::defer_if_modal;
+        request.cancellation = gateway_cancel_flag_for_job(job_id);
+        return gateway.execute(request, [body](const ida_gateway_context_t&) {
+            return body();
+        });
+    }
+
+    void shutdown(uint32_t join_timeout_ms)
+    {
+        const bool already = stopping.exchange(true, std::memory_order_acq_rel);
+        if (!already)
+        {
+            cancel_all_job_records();
+            gateway.cancel_all();
+        }
+        cv.notify_all();
+        if (worker.joinable())
+        {
+#ifdef _WIN32
+            HANDLE handle = static_cast<HANDLE>(worker.native_handle());
+            DWORD wait_rc = WaitForSingleObject(handle, join_timeout_ms);
+            if (wait_rc == WAIT_OBJECT_0)
+                worker.join();
+            else
+                worker.detach();
+#else
+            worker.join();
+#endif
+        }
+        gateway.stop();
+    }
+
+private:
+    struct queued_job_t
+    {
+        request_ctx_t ctx;
+        std::string job_id;
+    };
+
+    static constexpr std::size_t k_max_queue_depth = 8;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<queued_job_t> queue;
+    std::thread worker;
+    ida_gateway_t gateway;
+    std::atomic_bool stopping{false};
+    std::string active_job_id;
+
+    async_context_capture_t current_generation()
+    {
+        ida_gateway_request_t request;
+        request.domain = ida_gateway_domain_t::mixed;
+        request.phase = "mcp_job";
+        request.operation = "generation_check";
+        request.mff_flags = MFF_READ;
+        request.deadline_ms = 10000;
+        ida_gateway_result_t result = gateway.execute(request, [](const ida_gateway_context_t&) {
+            return json{{"generation", generation_id()}};
+        });
+        async_context_capture_t capture;
+        capture.ok = result.ok;
+        capture.data = result.data;
+        if (!result.ok)
+        {
+            capture.error_code = result.stale_generation ? "stale_generation" : (result.timed_out ? "timeout" : (result.cancelled ? "cancelled" : "idb_unavailable"));
+            capture.error_message = result.error.empty() ? "failed to check generation through IDA gateway" : result.error;
+        }
+        return capture;
+    }
+
+    bool generation_matches(const job_record_t& job, queued_job_result_t& failure)
+    {
+        async_context_capture_t current = current_generation();
+        if (!current.ok)
+        {
+            failure.ok = false;
+            failure.error_code = current.error_code;
+            failure.error_message = current.error_message;
+            failure.data = current.data;
+            return false;
+        }
+        const std::string now_generation = current.data.value("generation", std::string());
+        if (!job.generation.empty() && now_generation != job.generation)
+        {
+            failure.ok = false;
+            failure.error_code = "stale_generation";
+            failure.error_message = "IDB generation changed while the job was queued or running";
+            failure.data = {{"submitted_generation", job.generation}, {"current_generation", now_generation}};
+            return false;
+        }
+        return true;
+    }
+
+    void worker_loop()
+    {
+        while (true)
+        {
+            queued_job_t item;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [this]() { return stopping.load(std::memory_order_acquire) || !queue.empty(); });
+                if (stopping.load(std::memory_order_acquire) && queue.empty())
+                    break;
+                item = queue.front();
+                queue.pop_front();
+                active_job_id = item.job_id;
+            }
+
+            auto job = get_job(item.job_id, project_id_from_ctx(item.ctx));
+            if (!job)
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                active_job_id.clear();
+                continue;
+            }
+            if (!mark_job_running(item.job_id))
+            {
+                finish_job(item.job_id, "cancelled", {{"cancelled", true}}, std::string(), "cancelled", "job was cancelled before execution");
+                std::lock_guard<std::mutex> lock(mutex);
+                active_job_id.clear();
+                continue;
+            }
+            queued_job_result_t stale_failure;
+            if (!generation_matches(*job, stale_failure))
+            {
+                finish_job(item.job_id, "failed", stale_failure.data, std::string(), stale_failure.error_code, stale_failure.error_message);
+                std::lock_guard<std::mutex> lock(mutex);
+                active_job_id.clear();
+                continue;
+            }
+
+            queued_job_result_t result;
+            try
+            {
+                result = execute_queued_mcp_job(item.ctx, *job);
+            }
+            catch (const std::exception& ex)
+            {
+                result.ok = false;
+                result.error_code = "internal_error";
+                result.error_message = ex.what();
+            }
+            catch (...)
+            {
+                result.ok = false;
+                result.error_code = "internal_error";
+                result.error_message = "unknown async job exception";
+            }
+
+            auto after = get_job(item.job_id, project_id_from_ctx(item.ctx));
+            if (after && after->cancel_requested)
+            {
+                finish_job(item.job_id, "cancelled", result.data, result.report_id, "cancelled", "job cancellation was requested", result.resources);
+            }
+            else
+            {
+                queued_job_result_t publish_failure;
+                if (after && !generation_matches(*after, publish_failure))
+                    finish_job(item.job_id, "failed", result.data.empty() ? publish_failure.data : result.data, result.report_id, publish_failure.error_code, publish_failure.error_message, result.resources);
+                else
+                    finish_job(item.job_id, result.ok ? "completed" : "failed", result.data, result.report_id, result.error_code, result.error_message, result.resources);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                active_job_id.clear();
+            }
+        }
+    }
+};
+
+mcp_job_runtime_t& job_runtime()
+{
+    (void)state();
+    static mcp_job_runtime_t runtime;
+    return runtime;
 }
 
 json resource_for_report(const report_record_t& r, const std::string& format)
@@ -1236,31 +2044,8 @@ json wrapped_tool_result(const std::string& tool_name, const agent_tools::tool_r
     return d;
 }
 
-json verify_link_data(const json& payload, agent_tools::tool_result_t& failure, const request_ctx_t& ctx)
-{
-    auto source = payload_location(payload, "source");
-    auto sink = payload_location(payload, "sink");
-    if (!source || !sink)
-    {
-        failure = error_envelope(ctx, "bad_param", "source and sink locations are required",
-                                 json{{"required", json::array({"source", "sink"})}});
-        return json::object();
-    }
-    const int timeout_ms = int_param(payload, "timeout_ms", 5000, 100, 60000);
-    json p;
-    p["source"] = fmt_ea(*source);
-    p["sink"] = fmt_ea(*sink);
-    p["timeout_ms"] = timeout_ms;
-    auto r = invoke_registered("verify_taint_path", p);
-    json out = wrapped_tool_result("verify_taint_path", r);
-    if (!r.success)
-        out["data"] = json::object({{"verdict", "unsupported"}, {"rationale", r.output}, {"error_code", r.error_code.empty() ? "internal_error" : r.error_code}});
-    out["source"] = fmt_ea(*source);
-    out["sink"] = fmt_ea(*sink);
-    out["link_id"] = payload.value("link_id", std::string("link:" + fmt_ea(*source) + "->" + fmt_ea(*sink)));
-    failure = agent_tools::tool_result_t{};
-    return out;
-}
+json chain_document_from_ctx(const request_ctx_t& ctx);
+aida::vuln::chain::budget_limits_t budget_limits_from_ctx(const request_ctx_t& ctx);
 
 json boundary_match_data(const json& payload)
 {
@@ -1432,213 +2217,166 @@ json trigger_confirm_data(const json& payload)
     return out;
 }
 
-json chain_validation_data(const json& chain)
+json validation_errors_to_json(const std::vector<aida::vuln::chain::failure_code_t>& failures)
+{
+    json arr = json::array();
+    for (auto f : failures)
+        arr.push_back(aida::vuln::chain::failure_code_str(f));
+    return arr;
+}
+
+aida::vuln::chain::budget_limits_t budget_limits_from_ctx(const request_ctx_t& ctx)
+{
+    aida::vuln::chain::budget_limits_t limits;
+    json b = ctx.budget.is_object() ? ctx.budget : json::object();
+    limits.total_timeout_ms = static_cast<uint32_t>(int_param(b, "total_timeout_ms", int_param(ctx.payload, "timeout_ms", static_cast<int>(limits.total_timeout_ms), 100, 600000), 100, 600000));
+    limits.solver_timeout_ms = static_cast<uint32_t>(int_param(b, "solver_timeout_ms", static_cast<int>(limits.solver_timeout_ms), 100, 120000));
+    limits.max_functions = static_cast<size_t>(int_param(b, "max_functions", static_cast<int>(limits.max_functions), 1, 1000000));
+    limits.max_links = static_cast<size_t>(int_param(b, "max_links", static_cast<int>(limits.max_links), 1, 100000));
+    limits.max_paths_per_link = static_cast<size_t>(int_param(b, "max_paths_per_link", static_cast<int>(limits.max_paths_per_link), 1, 100000));
+    limits.max_branch_obligations = static_cast<size_t>(int_param(b, "max_branch_obligations", static_cast<int>(limits.max_branch_obligations), 1, 100000));
+    limits.max_call_obligations = static_cast<size_t>(int_param(b, "max_call_obligations", static_cast<int>(limits.max_call_obligations), 1, 100000));
+    limits.max_solver_queries = static_cast<size_t>(int_param(b, "max_solver_queries", static_cast<int>(limits.max_solver_queries), 1, 1000000));
+    limits.max_facts = static_cast<size_t>(int_param(b, "max_facts", static_cast<int>(limits.max_facts), 1, 1000000));
+    limits.max_report_events = static_cast<size_t>(int_param(b, "max_report_events", static_cast<int>(limits.max_report_events), 1, 1000000));
+    return limits;
+}
+
+json current_corpus_for_engine(const json& m)
+{
+    return {
+        {"corpus_id", m.value("corpus_id", std::string("current"))},
+        {"kind", "binary"},
+        {"availability", "loaded"},
+        {"trust", "ida_extracted"},
+        {"chain_critical", true},
+        {"identity", m}
+    };
+}
+
+json current_corpus_for_engine()
+{
+    return current_corpus_for_engine(module_identity());
+}
+
+json chain_document_from_ctx(const request_ctx_t& ctx, const json& module_override)
+{
+    if (ctx.payload.contains("chain") && ctx.payload["chain"].is_object())
+        return ctx.payload["chain"];
+    json doc;
+    doc["schema"] = kChainSchema;
+    doc["chain_id"] = ctx.payload.value("chain_id", std::string("chain:" + ctx.request_id));
+    doc["title"] = "AiDA MCP shorthand chain request";
+    doc["corpus"] = json::array({current_corpus_for_engine(module_override.is_object() ? module_override : module_identity())});
+    json link;
+    link["link_id"] = ctx.payload.value("link_id", std::string("link:0"));
+    link["role"] = "transition";
+    if (ctx.payload.contains("source"))
+        link["source"] = ctx.payload["source"];
+    if (ctx.payload.contains("sink"))
+        link["sink"] = ctx.payload["sink"];
+    link["metadata"] = {{"mcp_shorthand", true}};
+    doc["links"] = json::array({link});
+    json objective;
+    objective["contract_id"] = "objective:source_to_sink";
+    objective["dimension"] = "final_objective";
+    objective["subject"] = "chain";
+    objective["predicate"] = "source_reaches_sink";
+    objective["required"] = {{"source", ctx.payload.value("source", json(nullptr))}, {"sink", ctx.payload.value("sink", json(nullptr))}, {"achieved", true}};
+    objective["proof_state"] = "unknown";
+    objective["criticality"] = "objective_critical";
+    doc["objectives"] = json::array({objective});
+    return doc;
+}
+
+json chain_document_from_ctx(const request_ctx_t& ctx)
+{
+    return chain_document_from_ctx(ctx, module_identity());
+}
+
+json strict_chain_validation_data(const json& chain)
 {
     json out;
-    out["schema"] = "aida.ida.chain.validation.v1";
-    out["valid"] = true;
+    out["schema"] = "aida.ida.chain.validation.v2";
+    out["valid"] = false;
     out["errors"] = json::array();
-    out["normalized"] = chain;
-    if (!chain.is_object())
+    out["warnings"] = json::array();
+    out["normalized"] = json::object();
+    out["engine_normalized"] = json::object();
+
+    aida::vuln::chain::parse_chain_document_result_t parsed = aida::vuln::chain::parse_chain_document(chain);
+    out["valid"] = parsed.ok;
+    out["migrated"] = parsed.migrated;
+    out["schema_validation"] = aida::vuln::chain::to_json(parsed.validation);
+    out["normalized"] = parsed.normalized;
+    if (!parsed.validation.errors.empty())
     {
-        out["valid"] = false;
-        out["errors"].push_back({{"field", "chain"}, {"message", "chain must be an object"}});
-        return out;
+        for (const auto& e : parsed.validation.errors)
+            out["errors"].push_back(aida::vuln::chain::to_json(e));
     }
-    if (chain.value("schema", std::string(kChainSchema)) != kChainSchema)
-    {
-        out["valid"] = false;
-        out["errors"].push_back({{"field", "chain.schema"}, {"message", "schema must be aida_chain_document_v2"}});
-    }
-    if (!chain.contains("links") || !chain["links"].is_array())
-    {
-        out["valid"] = false;
-        out["errors"].push_back({{"field", "chain.links"}, {"message", "links array is required"}});
-    }
-    else
-    {
-        for (size_t i = 0; i < chain["links"].size(); ++i)
-        {
-            const json& link = chain["links"].at(i);
-            if (!link.is_object())
-            {
-                out["valid"] = false;
-                out["errors"].push_back({{"field", "chain.links[" + std::to_string(i) + "]"}, {"message", "link must be an object"}});
-                continue;
-            }
-            if (!link.contains("source") && !link.contains("entry") && !link.contains("producer"))
-            {
-                out["valid"] = false;
-                out["errors"].push_back({{"field", "chain.links[" + std::to_string(i) + "]"}, {"message", "source, entry, or producer is required"}});
-            }
-            if (!link.contains("sink") && !link.contains("target") && !link.contains("consumer"))
-            {
-                out["valid"] = false;
-                out["errors"].push_back({{"field", "chain.links[" + std::to_string(i) + "]"}, {"message", "sink, target, or consumer is required"}});
-            }
-        }
-    }
+
+    aida::vuln::chain::verification_document_t normalized;
+    std::vector<aida::vuln::chain::failure_code_t> failures;
+    std::string error;
+    bool engine_ok = aida::vuln::chain::engine().normalize_document(chain, normalized, failures, error);
+    out["engine_valid"] = engine_ok;
+    out["engine_failures"] = validation_errors_to_json(failures);
+    out["engine_error"] = error.empty() ? json(nullptr) : json(error);
+    if (engine_ok)
+        out["engine_normalized"] = aida::vuln::chain::to_json(normalized);
+    if (!engine_ok && out["errors"].empty())
+        out["errors"].push_back({{"code", "engine_normalization_failed"}, {"message", error}, {"failures", validation_errors_to_json(failures)}, {"acceptance_blocker", true}});
+    out["valid"] = parsed.ok && engine_ok;
     return out;
 }
 
-json build_chain_report(const request_ctx_t& ctx, const std::string& job_id)
+json chain_validation_data(const json& chain)
 {
-    json chain = ctx.payload.contains("chain") ? ctx.payload["chain"] : json::object();
-    if (chain.empty())
-    {
-        chain["schema"] = kChainSchema;
-        chain["chain_id"] = ctx.payload.value("chain_id", std::string("chain:" + ctx.request_id));
-        chain["links"] = json::array({{
-            {"link_id", "link:0"},
-            {"source", ctx.payload.value("source", json())},
-            {"sink", ctx.payload.value("sink", json())}
-        }});
-    }
-    const std::string chain_id = chain.value("chain_id", std::string("chain:" + ctx.request_id));
-    json report;
+    return strict_chain_validation_data(chain);
+}
+
+json build_chain_report(const request_ctx_t& ctx,
+                        const std::string& job_id,
+                        const json& module_override = json(),
+                        const std::string& generation_override = std::string())
+{
+    json chain = chain_document_from_ctx(ctx, module_override);
+    json validation = strict_chain_validation_data(chain);
+    aida::vuln::chain::verification_request_t request;
+    request.document = chain;
+    request.limits = budget_limits_from_ctx(ctx);
+    request.capture_idb_snapshot = module_override.is_null() || module_override.empty();
+    request.cancellation = cancellation_token_for_job(job_id);
+    append_job_event(job_id, "chain_verify_start", {{"chain_id", chain.value("chain_id", std::string())}, {"validation", validation.value("valid", false)}});
+    aida::vuln::chain::verification_report_t engine_report = aida::vuln::chain::engine().verify(request);
+    json report = aida::vuln::chain::to_json(engine_report);
     report["schema"] = kReportSchema;
-    report["report_id"] = nullptr;
-    report["chain_id"] = chain_id;
+    report["version"] = 2;
     report["job_id"] = job_id;
-    report["verdict"] = "inconclusive";
-    report["acceptance"] = "not_accepted";
-    report["confidence"] = "plausible";
-    report["summary"] = "Chain verification completed with current IDA plugin evidence producers.";
-    report["first_failure"] = nullptr;
+    report["engine"] = "ChainVerificationEngine";
+    report["validation"] = validation;
+    report["acceptance"] = report.value("verdict", std::string()) == "confirmed" ? "accepted" : (report.value("verdict", std::string()) == "refuted" ? "rejected" : "not_accepted");
+    report["confidence"] = report.value("verdict", std::string()) == "confirmed" ? "proven" : "strict_unaccepted";
+    report["summary"] = report.value("verdict", std::string()) == "confirmed"
+        ? "Chain confirmed by the universal verifier."
+        : "Chain was not accepted by the universal verifier.";
+    report["phase_status"] = json::array({{{"phase", "validate_spec"}, {"ok", validation.value("valid", false)}, {"details", validation}}});
     report["unproven_critical_facts"] = json::array();
-    report["corpus"] = json::array({module_identity()});
-    report["phase_status"] = json::array();
-    report["links"] = json::array();
-    report["boundaries"] = json::array();
-    report["objectives"] = json::array();
-    report["trace_manifest"] = json::object();
-    report["fact_manifest"] = json::object();
-    report["solver_manifest"] = json::object();
+    if (report.contains("failures") && report["failures"].is_array())
+    {
+        for (const auto& f : report["failures"])
+            report["unproven_critical_facts"].push_back({{"failure", f}, {"acceptance_blocker", true}});
+    }
+    report["first_failure"] = report["unproven_critical_facts"].empty() ? json(nullptr) : report["unproven_critical_facts"].front();
+    report["corpus"] = json::array({module_override.is_object() && !module_override.empty() ? module_override : module_identity()});
     report["resource_manifest"] = json::array();
-    report["generation_manifest"] = json::array({generation_id()});
-    report["budget_manifest"] = ctx.budget;
-    report["diagnostics"] = json::object({{"auto_analysis_ok", auto_is_ok()}, {"engine", verify::engine().verdict_summary()}});
-
-    json validation = chain_validation_data(chain);
-    report["phase_status"].push_back({{"phase", "validate_spec"}, {"ok", validation.value("valid", false)}, {"details", validation}});
-    if (!validation.value("valid", false))
-    {
-        report["verdict"] = "unsupported";
-        report["first_failure"] = validation["errors"].empty() ? json(nullptr) : validation["errors"].front();
-        report["unproven_critical_facts"] = validation["errors"];
-        return report;
-    }
-
-    int confirmed = 0;
-    int refuted = 0;
-    int timeout = 0;
-    int unsupported = 0;
-    int inconclusive = 0;
-    const json& links = chain["links"];
-    for (size_t i = 0; i < links.size(); ++i)
-    {
-        json link_payload = links.at(i);
-        if (!link_payload.contains("link_id"))
-            link_payload["link_id"] = "link:" + std::to_string(i);
-        if (ctx.payload.contains("timeout_ms") && !link_payload.contains("timeout_ms"))
-            link_payload["timeout_ms"] = ctx.payload["timeout_ms"];
-        if (link_payload.contains("target") && !link_payload.contains("sink"))
-            link_payload["sink"] = link_payload["target"];
-        agent_tools::tool_result_t failure;
-        json link_result;
-        if (link_payload.contains("source") && link_payload.contains("sink"))
-            link_result = verify_link_data(link_payload, failure, ctx);
-        else
-        {
-            link_result["success"] = false;
-            link_result["data"] = json::object({{"verdict", "inconclusive"}, {"rationale", "link lacks source/sink verification endpoints"}});
-        }
-        json link_report;
-        link_report["link_id"] = link_payload.value("link_id", std::string("link:" + std::to_string(i)));
-        link_report["role"] = link_payload.value("role", std::string("transition"));
-        link_report["verification"] = link_result;
-        std::string verdict = "inconclusive";
-        if (link_result.contains("data") && link_result["data"].is_object())
-        {
-            const json& data = link_result["data"];
-            if (data.contains("verdict") && data["verdict"].is_string())
-                verdict = data["verdict"].get<std::string>();
-        }
-        link_report["verdict"] = verdict;
-        link_report["proof_level"] = verdict == "confirmed" ? "link_path_sat" : "not_confirmed";
-        link_report["unproven_facts"] = json::array();
-        link_report["refutations"] = json::array();
-        if (verdict == "confirmed")
-            ++confirmed;
-        else if (verdict == "refuted")
-        {
-            ++refuted;
-            link_report["refutations"].push_back(link_result);
-        }
-        else if (verdict == "timeout")
-            ++timeout;
-        else if (verdict == "unsupported")
-            ++unsupported;
-        else
-            ++inconclusive;
-        if (verdict != "confirmed")
-            link_report["unproven_facts"].push_back({{"link_id", link_report["link_id"]}, {"verdict", verdict}, {"acceptance_blocker", true}});
-        report["links"].push_back(link_report);
-    }
-
-    for (size_t i = 1; i < links.size(); ++i)
-    {
-        json b_payload;
-        b_payload["producer"] = links.at(i - 1);
-        b_payload["consumer"] = links.at(i);
-        json b = boundary_match_data(b_payload);
-        b["producer_link"] = links.at(i - 1).value("link_id", std::string("link:" + std::to_string(i - 1)));
-        b["consumer_link"] = links.at(i).value("link_id", std::string("link:" + std::to_string(i)));
-        report["boundaries"].push_back(b);
-        if (b.value("verdict", std::string()) == "refuted")
-            ++refuted;
-        else if (b.value("verdict", std::string()) != "confirmed")
-            ++inconclusive;
-    }
-
-    if (refuted > 0)
-    {
-        report["verdict"] = "refuted";
-        report["acceptance"] = "rejected";
-    }
-    else if (timeout > 0)
-    {
-        report["verdict"] = "timeout";
-        report["acceptance"] = "not_accepted";
-    }
-    else if (unsupported > 0)
-    {
-        report["verdict"] = "unsupported";
-        report["acceptance"] = "not_accepted";
-    }
-    else if (inconclusive > 0 || confirmed == 0)
-    {
-        report["verdict"] = "inconclusive";
-        report["acceptance"] = "not_accepted";
-    }
-    else
-    {
-        report["verdict"] = "confirmed";
-        report["acceptance"] = "accepted";
-        report["confidence"] = "proven";
-    }
-
-    for (const auto& l : report["links"])
-    {
-        if (l.value("verdict", std::string()) != "confirmed")
-        {
-            report["unproven_critical_facts"].push_back({{"link_id", l["link_id"]}, {"verdict", l["verdict"]}, {"acceptance_blocker", true}});
-            if (report["first_failure"].is_null())
-                report["first_failure"] = report["unproven_critical_facts"].back();
-        }
-    }
-    if (report["first_failure"].is_null() && report["verdict"] != "confirmed")
-        report["first_failure"] = {{"reason", "chain did not reach complete proof acceptance"}};
+    report["generation_manifest"] = json::array({generation_override.empty() ? generation_id() : generation_override});
+    report["budget_manifest"] = aida::vuln::chain::to_json(request.limits);
+    if (!report.contains("diagnostics") || !report["diagnostics"].is_object())
+        report["diagnostics"] = json::object();
+    report["diagnostics"]["legacy_local_report_removed"] = true;
+    report["diagnostics"]["verify_engine"] = verify::engine().verdict_summary();
+    append_job_event(job_id, "chain_verify_end", {{"verdict", report.value("verdict", std::string())}, {"acceptance", report["acceptance"]}});
     return report;
 }
 
@@ -1705,6 +2443,67 @@ json export_report_data(const report_record_t& r, const std::string& format)
     return d;
 }
 
+bool prepare_async_job_context(request_ctx_t& ctx, agent_tools::tool_result_t& failure)
+{
+    async_context_capture_t capture = job_runtime().capture_context(ctx);
+    if (!capture.ok)
+    {
+        failure = error_envelope(ctx,
+                                 capture.error_code.empty() ? std::string("idb_unavailable") : capture.error_code,
+                                 capture.error_message.empty() ? std::string("failed to capture async job context") : capture.error_message,
+                                 capture.data);
+        return false;
+    }
+    ctx.payload["_aida_generation"] = capture.data.value("generation", std::string());
+    ctx.payload["_aida_project_id"] = capture.data.value("project_id", std::string("default"));
+    ctx.payload["_aida_module_identity"] = capture.data.value("module", json::object());
+    if (ctx.tool == "ida_chain_manage"
+        && (ctx.operation == "submit" || ctx.operation == "start" || ctx.operation == "verify_link")
+        && (!ctx.payload.contains("chain") || !ctx.payload["chain"].is_object()))
+    {
+        ctx.payload["chain"] = chain_document_from_ctx(ctx, ctx.payload["_aida_module_identity"]);
+    }
+    failure = agent_tools::tool_result_t{};
+    return true;
+}
+
+agent_tools::tool_result_t enqueue_async_job(request_ctx_t& ctx)
+{
+    agent_tools::tool_result_t failure;
+    if (!prepare_async_job_context(ctx, failure))
+        return failure;
+    job_create_result_t created = create_job(ctx);
+    request_ctx_t job_ctx = ctx;
+    job_ctx.job_id = created.job_id;
+    if (created.reused)
+    {
+        return ok_envelope(job_ctx,
+                           {{"job", job_to_json(created.snapshot)}, {"reused", true}, {"result", created.snapshot.result}},
+                           job_to_json(created.snapshot),
+                           json(),
+                           json::array(),
+                           created.snapshot.resources);
+    }
+    std::string enqueue_error;
+    if (!job_runtime().enqueue(job_ctx, created.job_id, enqueue_error))
+    {
+        finish_job(created.job_id, "failed", {{"enqueue_error", enqueue_error}}, std::string(), "queue_full", enqueue_error.empty() ? "job queue is full" : enqueue_error);
+        auto failed = get_job(created.job_id, project_id_from_ctx(job_ctx));
+        return error_envelope(job_ctx,
+                              enqueue_error == "runtime_stopping" ? "cancelled" : "rate_limited",
+                              enqueue_error.empty() ? "job queue is full" : enqueue_error,
+                              {{"job", failed ? job_to_json(*failed) : job_to_json(created.snapshot)}});
+    }
+    auto queued = get_job(created.job_id, project_id_from_ctx(job_ctx));
+    const json job_json = queued ? job_to_json(*queued) : job_to_json(created.snapshot);
+    return ok_envelope(job_ctx,
+                       {{"queued", true}, {"job_id", created.job_id}, {"job", job_json}},
+                       job_json,
+                       json(),
+                       json::array(),
+                       queued ? queued->resources : created.snapshot.resources);
+}
+
 bool json_contains_evidence(const json& node, const std::string& evidence_id, const std::string& address, json& out)
 {
     if (node.is_object())
@@ -1764,10 +2563,10 @@ const std::vector<operation_meta_t>& chain_ops()
         {"submit", "Validate, verify, ledger, and report a chain verification request.", false, false, false, true, "ledger", 120000, 600000, {"taint_engine", "symbolic_engine", "smt_solver"}, {{"chain", "object", false, {}}, {"chain_id", "string", false, {}}, {"source", "location", false, {}}, {"sink", "location", false, {}}, {"timeout_ms", "number", false, {}}}, true},
         {"start", "Alias for submit with job semantics.", false, false, false, true, "ledger", 120000, 600000, {"taint_engine", "symbolic_engine", "smt_solver"}, {{"chain", "object", false, {}}, {"chain_id", "string", false, {}}, {"source", "location", false, {}}, {"sink", "location", false, {}}, {"timeout_ms", "number", false, {}}}, true},
         {"status", "Return verifier engine status or one chain job status.", true, false, false, false, "none", 500, 2000, {}, {{"job_id", "string", false, {}}}, false},
-        {"cancel", "Cancel one chain job when job_id is supplied or request global verifier cancellation.", false, false, false, false, "job_state", 500, 2000, {}, {{"job_id", "string", false, {}}}, false},
+        {"cancel", "Cancel one chain job when job_id is supplied, otherwise cancel plugin-owned chain jobs through their job tokens.", false, false, false, false, "job_state", 500, 2000, {}, {{"job_id", "string", false, {}}}, false},
         {"resume", "Resume a cancelled or failed chain job from its saved request payload.", false, false, false, true, "ledger", 120000, 600000, {"taint_engine", "symbolic_engine", "smt_solver"}, {{"job_id", "string", true, {}}}, false},
         {"export", "Export a chain report by report_id or job_id in json, markdown, or sarif format.", true, false, true, false, "report", 1000, 10000, {}, {{"report_id", "string", false, {}}, {"job_id", "string", false, {}}, {"format", "string", false, {"json", "markdown", "sarif"}}}, false},
-        {"verify_link", "Verify a source-to-sink link with the existing SMT-backed verifier.", false, false, false, true, "verdict_cache", 5000, 60000, {"taint_engine", "symbolic_engine", "smt_solver"}, {{"source", "location", true, {}}, {"sink", "location", true, {}}, {"timeout_ms", "number", false, {}}, {"link_id", "string", false, {}}}, false},
+        {"verify_link", "Verify a source-to-sink link through the strict chain verifier without modal UI.", false, false, false, true, "verdict_cache", 5000, 60000, {"chain_verification_engine"}, {{"source", "location", true, {}}, {"sink", "location", true, {}}, {"timeout_ms", "number", false, {}}, {"link_id", "string", false, {}}}, false},
         {"boundary_match", "Compare producer and consumer facts and extract wire constraints where source/sink are supplied.", true, false, true, false, "none", 1000, 30000, {"symbolic_engine"}, {{"producer", "object", false, {}}, {"consumer", "object", false, {}}, {"source", "location", false, {}}, {"sink", "location", false, {}}, {"max_branches", "number", false, {}}}, false},
         {"trigger_confirm", "Confirm or refute a bounded static trigger path from entry/trigger to target/sink.", true, false, true, false, "none", 2000, 30000, {"cfg_engine"}, {{"entry", "location", false, {}}, {"trigger", "location", false, {}}, {"target", "location", false, {}}, {"sink", "location", false, {}}, {"max_depth", "number", false, {}}, {"max_functions", "number", false, {}}}, false},
         {"get_report", "Fetch a stored chain verification report.", true, false, true, false, "report", 1000, 10000, {}, {{"report_id", "string", false, {}}, {"job_id", "string", false, {}}}, false},
@@ -1784,7 +2583,7 @@ const std::vector<operation_meta_t>& project_ops()
     static const std::vector<operation_meta_t> ops = {
         {"capabilities", "Return project, corpus, and index operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
         {"inventory_current", "Return deterministic current-IDB inventory with module identity, hashes, segments, imports, entries, and counts.", true, false, true, false, "none", 500, 5000, {}, {{"include_segments", "boolean", false, {}}, {"include_imports", "boolean", false, {}}, {"include_entries", "boolean", false, {}}, {"max_rows", "number", false, {}}}, false},
-        {"inventory_all", "Merge supplied query_all_instances inventory responses when present; otherwise return local inventory plus fail-closed peer_data_missing gaps for live peers that were not supplied.", true, false, false, false, "none", 1000, 30000, {}, {{"include_segments", "boolean", false, {}}, {"include_imports", "boolean", false, {}}, {"include_entries", "boolean", false, {}}, {"max_rows", "number", false, {}}, {"fanout_result", "object", false, {}}, {"inventories", "array", false, {}}}, true},
+        {"inventory_all", "Return local inventory merged with MCP-router fanout results when called over MCP, or with supplied inventory documents for direct in-process callers.", true, false, false, false, "none", 1000, 30000, {}, {{"include_segments", "boolean", false, {}}, {"include_imports", "boolean", false, {}}, {"include_entries", "boolean", false, {}}, {"max_rows", "number", false, {}}, {"fanout_result", "object", false, {}}, {"inventories", "array", false, {}}}, true},
         {"list", "List durable multibinary projects under the IDA user directory.", true, false, true, false, "project", 500, 5000, {}, {}, false},
         {"load", "Load one durable project manifest and module records.", true, false, true, false, "project", 500, 10000, {}, {{"project_id", "string", true, {}}}, false},
         {"save", "Create or update a durable project from supplied module records or inventory/fanout data.", false, false, false, true, "project", 1000, 60000, {}, {{"project_id", "string", false, {}}, {"modules", "array", false, {}}, {"fanout_result", "object", false, {}}, {"inventories", "array", false, {}}, {"force_lock", "boolean", false, {}}}, true},
@@ -1799,8 +2598,8 @@ const std::vector<operation_meta_t>& project_ops()
         {"index_page", "Load one durable index page by family/module/page_index or by returned cursor.", true, false, true, false, "index", 500, 30000, {}, {{"project_id", "string", false, {}}, {"module_id", "string", false, {}}, {"family", "string", false, {}}, {"cursor", "string", false, {}}, {"page_index", "number", false, {}}}, false},
         {"resolve_cross_edges", "Resolve and persist the project cross-module import/export/forwarder graph.", false, false, false, true, "index", 1000, 120000, {}, {{"project_id", "string", false, {}}}, false},
         {"resolve_reference", "Resolve one module/name, module/ordinal, import, or module_id+rva reference through the durable project graph.", true, false, true, false, "index", 1000, 30000, {}, {{"project_id", "string", false, {}}, {"reference", "object", true, {}}}, false},
-        {"verify_chain", "Verify a chain against durable project modules, normalized addresses, cross edges, and link boundary facts with fail-closed confirmation rules.", true, false, false, true, "project_verifier", 5000, 600000, {}, {{"project_id", "string", false, {}}, {"chain", "object", true, {}}, {"options", "object", false, {}}}, true},
-        {"case_study_regressions", "Run source-backed NTFS/AFD/pvScan0 project semantics over supplied chain/source evidence without synthetic passes.", true, false, false, true, "project_verifier", 5000, 600000, {}, {{"project_id", "string", false, {}}, {"chain", "object", false, {}}, {"source_checks", "array", false, {}}, {"options", "object", false, {}}}, true}
+        {"verify_chain", "Verify a chain against durable project modules, normalized addresses, cross edges, and link boundary facts with fail-closed confirmation rules.", false, false, false, true, "project_verifier", 5000, 600000, {}, {{"project_id", "string", false, {}}, {"chain", "object", true, {}}, {"options", "object", false, {}}}, true},
+        {"case_study_regressions", "Run source-backed NTFS/AFD/pvScan0 project semantics over supplied chain/source evidence without synthetic passes.", false, false, false, true, "project_verifier", 5000, 600000, {}, {{"project_id", "string", false, {}}, {"chain", "object", false, {}}, {"source_checks", "array", false, {}}, {"options", "object", false, {}}}, true}
     };
     return ops;
 }
@@ -1845,7 +2644,7 @@ const std::vector<operation_meta_t>& report_ops()
         {"ledger_status", "Return verifier ledger summary.", true, false, false, false, "ledger", 500, 5000, {}, {}, false},
         {"ledger_save", "Persist verifier ledger through the existing netnode-backed engine path.", false, false, false, false, "ledger", 1000, 10000, {}, {}, false},
         {"ledger_load", "Load verifier ledger through the existing netnode-backed engine path.", false, false, false, false, "ledger", 1000, 10000, {}, {}, false},
-        {"ledger_clear", "Clear verifier ledger through the existing engine path.", false, false, false, false, "ledger", 1000, 10000, {}, {{"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false}
+        {"ledger_clear", "Clear verifier ledger through the existing engine path.", false, true, false, false, "ledger", 1000, 10000, {}, {{"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false}
     };
     return ops;
 }
@@ -1854,13 +2653,100 @@ const std::vector<operation_meta_t>& job_ops()
 {
     static const std::vector<operation_meta_t> ops = {
         {"capabilities", "Return job and diagnostics operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
-        {"list", "List plugin-owned jobs.", true, false, false, false, "job_state", 1000, 10000, {}, {{"state", "string", false, {"running", "completed", "cancelled", "failed"}}}, false},
+        {"list", "List plugin-owned jobs.", true, false, false, false, "job_state", 1000, 10000, {}, {{"state", "string", false, {"queued", "running", "cancelling", "completed", "cancelled", "failed"}}}, false},
         {"status", "Return one job status.", true, false, false, false, "job_state", 500, 5000, {}, {{"job_id", "string", true, {}}}, false},
-        {"result", "Return one job result with report resources.", true, false, true, false, "job_state", 1000, 10000, {}, {{"job_id", "string", true, {}}}, false},
-        {"cancel", "Cancel one job and request verifier engine cancellation.", false, false, false, false, "job_state", 500, 5000, {}, {{"job_id", "string", true, {}}}, false},
+        {"result", "Return one job result with report resources.", true, false, true, false, "job_state", 1000, 10000, {}, {{"job_id", "string", true, {}}, {"page_path", "string", false, {}}}, true},
+        {"events", "Return one job event ring.", true, false, true, false, "job_state", 1000, 10000, {}, {{"job_id", "string", true, {}}}, false},
+        {"cancel", "Cancel one plugin-owned job through its job runtime token.", false, false, false, false, "job_state", 500, 5000, {}, {{"job_id", "string", true, {}}}, false},
         {"resume", "Resume a chain job from stored request data.", false, false, false, true, "job_state", 1000, 600000, {}, {{"job_id", "string", true, {}}}, false},
         {"diagnostics", "Return job counts, report counts, engine status, index state, and modal-safety evidence.", true, false, false, false, "diagnostics", 1000, 10000, {}, {}, false},
-        {"prune", "Prune completed/cancelled/failed jobs older than a supplied age.", false, false, false, false, "job_state", 1000, 10000, {}, {{"older_than_ms", "number", false, {}}, {"state", "string", false, {"completed", "cancelled", "failed", "all"}}}, false}
+        {"prune", "Prune inactive jobs older than a supplied age.", false, true, false, false, "job_state", 1000, 10000, {}, {{"older_than_ms", "number", false, {}}, {"state", "string", false, {"completed", "cancelled", "failed", "all"}}}, false}
+    };
+    return ops;
+}
+
+const std::vector<operation_meta_t>& discover_ops()
+{
+    static const std::vector<operation_meta_t> ops = {
+        {"capabilities", "Return discovery operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
+        {"catalog", "Return the compact public MCP catalog with legacy compatibility counts.", true, false, false, false, "registry", 500, 5000, {}, {}, false},
+        {"resources", "List MCP resources and templates emitted by the plugin.", true, false, false, false, "resources", 500, 5000, {}, {}, false},
+        {"instances", "Return live IDA instance routing inventory.", true, false, false, false, "instances", 1000, 10000, {}, {}, false},
+        {"module", "Return current module identity and binary metadata.", true, false, false, false, "module", 500, 5000, {}, {}, false},
+        {"functions", "List functions with cursor pagination.", true, false, true, false, "idb_snapshot", 1000, 30000, {}, {{"filter", "string", false, {}}, {"include_segments", "boolean", false, {}}}, false},
+        {"function", "Resolve one function by address.", true, false, true, false, "idb_snapshot", 1000, 10000, {}, {{"address", "location", true, {}}, {"include_xrefs", "boolean", false, {}}}, false},
+        {"address", "Resolve one address.", true, false, true, false, "idb_snapshot", 1000, 10000, {}, {{"address", "location", true, {}}}, false},
+        {"imports", "List imports with cursor pagination.", true, false, true, false, "idb_snapshot", 1000, 30000, {}, {{"filter", "string", false, {}}}, false},
+        {"exports", "List exports with cursor pagination.", true, false, true, false, "idb_snapshot", 1000, 30000, {}, {{"filter", "string", false, {}}}, false},
+        {"segments", "List current IDB segments.", true, false, true, false, "idb_snapshot", 1000, 10000, {}, {}, false}
+    };
+    return ops;
+}
+
+const std::vector<operation_meta_t>& analysis_ops()
+{
+    static const std::vector<operation_meta_t> ops = {
+        {"capabilities", "Return analysis operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
+        {"status", "Return analysis engine readiness and cache state.", true, false, false, false, "diagnostics", 500, 5000, {}, {}, false},
+        {"build_index", "Warm one or more analysis indices through the existing index builder.", false, false, false, true, "index", 10000, 600000, {}, {{"indices", "array", false, {}}, {"max_seconds", "number", false, {}}}, true},
+        {"function", "Return composite function analysis.", true, false, true, false, "analysis", 2000, 60000, {}, {{"address", "location", true, {}}, {"limit", "number", false, {}}}, false},
+        {"batch", "Analyze multiple functions.", true, false, true, false, "analysis", 5000, 120000, {}, {{"functions", "array", false, {}}, {"addrs", "array", false, {}}}, true},
+        {"component", "Analyze a component represented by functions.", true, false, true, false, "analysis", 5000, 120000, {}, {{"functions", "array", true, {}}}, true},
+        {"control_flow", "Return control-flow analysis for one function.", true, false, true, false, "analysis", 2000, 60000, {"cfg_engine"}, {{"address", "location", true, {}}}, false},
+        {"data_flow", "Return local data-flow analysis around one address.", true, false, true, false, "analysis", 2000, 60000, {"taint_engine"}, {{"address", "location", true, {}}, {"max_depth", "number", false, {}}}, false},
+        {"callgraph", "Build a bounded call graph.", true, false, true, false, "analysis", 2000, 60000, {"cfg_engine"}, {{"address", "location", true, {}}, {"depth", "number", false, {}}}, false},
+        {"taint", "Run taint path analysis.", true, false, false, true, "analysis", 5000, 120000, {"taint_engine"}, {{"max_paths", "number", false, {}}}, true},
+        {"vulnerability", "Run a named vulnerability analysis tool through the consolidated analysis surface.", true, false, false, true, "analysis", 5000, 120000, {"taint_engine", "microcode_engine", "cfg_engine"}, {{"tool", "string", true, {}}, {"arguments", "object", false, {}}}, true}
+    };
+    return ops;
+}
+
+const std::vector<operation_meta_t>& cache_ops()
+{
+    static const std::vector<operation_meta_t> ops = {
+        {"capabilities", "Return cache operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
+        {"status", "Return extraction, index, output, and job cache status.", true, false, false, false, "cache", 500, 10000, {}, {}, false},
+        {"build", "Build project/index cache pages.", false, false, false, true, "index", 10000, 600000, {}, {{"project_id", "string", false, {}}, {"indices", "array", false, {}}, {"force", "boolean", false, {}}}, true},
+        {"index_status", "Return project index status.", true, false, false, false, "index", 500, 10000, {}, {{"project_id", "string", false, {}}}, false},
+        {"index_page", "Load one persisted project index page.", true, false, true, false, "index", 1000, 30000, {}, {{"project_id", "string", false, {}}, {"module_id", "string", false, {}}, {"family", "string", false, {}}, {"cursor", "string", false, {}}, {"page_index", "number", false, {}}}, false},
+        {"extraction_status", "Return extraction cache counters.", true, false, true, false, "extraction_cache", 500, 5000, {}, {}, false},
+        {"invalidate_extraction", "Clear extraction cache.", false, true, true, false, "extraction_cache", 500, 10000, {}, {{"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"output_cache", "List, inspect, or evict MCP output cache entries.", false, false, false, false, "output_cache", 500, 10000, {}, {{"op", "string", false, {"list", "stats", "evict"}}, {"output_id", "string", false, {}}, {"all", "boolean", false, {}}}, false},
+        {"prune_jobs", "Prune completed job records.", false, true, false, false, "job_state", 500, 10000, {}, {{"older_than_ms", "number", false, {}}, {"state", "string", false, {"completed", "cancelled", "failed", "all"}}}, false}
+    };
+    return ops;
+}
+
+const std::vector<operation_meta_t>& mutation_ops()
+{
+    static const std::vector<operation_meta_t> ops = {
+        {"capabilities", "Return mutation operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
+        {"preview", "Preview one mutation and return a receipt without modifying the IDB.", true, false, false, false, "idb_snapshot", 1000, 10000, {}, {{"mutation", "object", true, {}}}, true},
+        {"batch_preview", "Preview multiple mutations and return receipts without modifying the IDB.", true, false, false, false, "idb_snapshot", 2000, 30000, {}, {{"items", "array", true, {}}}, true},
+        {"batch_apply", "Apply multiple confirmed mutations with receipts.", false, true, false, false, "idb_write", 5000, 120000, {}, {{"items", "array", true, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, true},
+        {"rename_function", "Rename one function with expected-old-name stale checking.", false, true, false, false, "idb_write", 1000, 10000, {}, {{"address", "location", true, {}}, {"new_name", "string", true, {}}, {"expected_old_name", "string", false, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"set_function_signature", "Apply one function signature.", false, true, false, false, "idb_write", 1000, 10000, {}, {{"address", "location", true, {}}, {"signature", "string", true, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"apply_type", "Apply one type declaration to an address.", false, true, false, false, "idb_write", 1000, 10000, {}, {{"address", "location", true, {}}, {"type", "string", true, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"declare_type", "Declare one or more C types in the local type library.", false, true, false, false, "idb_write", 1000, 10000, {}, {{"declaration", "string", true, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"set_comment", "Set one address comment with expected-old-comment stale checking.", false, true, false, false, "idb_write", 1000, 10000, {}, {{"address", "location", true, {}}, {"comment", "string", true, {}}, {"repeatable", "boolean", false, {}}, {"expected_old_comment", "string", false, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"patch_bytes", "Patch bytes with mandatory expected-old-bytes stale checking.", false, true, false, false, "idb_write", 1000, 10000, {}, {{"address", "location", true, {}}, {"bytes", "string", true, {}}, {"expected_old_bytes", "string", true, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"delete_function", "Delete one function with expected-old-name stale checking.", false, true, false, false, "idb_write", 1000, 10000, {}, {{"address", "location", true, {}}, {"expected_old_name", "string", false, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false},
+        {"idb_save", "Save the IDB with a destructive receipt.", false, true, false, false, "idb_write", 1000, 60000, {}, {{"path", "string", false, {}}, {"backup", "boolean", false, {}}, {"compact", "boolean", false, {}}, {"confirm_destructive", "boolean", true, {}}, {"reason", "string", true, {}}}, false}
+    };
+    return ops;
+}
+
+const std::vector<operation_meta_t>& diagnostics_ops()
+{
+    static const std::vector<operation_meta_t> ops = {
+        {"capabilities", "Return diagnostics operation schemas.", true, false, true, false, "schema", 500, 2000, {}, {}, false},
+        {"health", "Return server and plugin health.", true, false, false, false, "diagnostics", 500, 5000, {}, {}, false},
+        {"tool_registry", "Return registry counts, public manage surface, hidden legacy tools, and operation metadata.", true, false, false, false, "registry", 500, 5000, {}, {}, false},
+        {"index_status", "Return analysis index readiness.", true, false, false, false, "diagnostics", 500, 5000, {}, {}, false},
+        {"jobs", "Return job runtime diagnostics.", true, false, false, false, "diagnostics", 500, 10000, {}, {}, false},
+        {"chain", "Return chain verifier diagnostics.", true, false, false, false, "diagnostics", 500, 10000, {}, {}, false},
+        {"resources", "Return resource catalog diagnostics.", true, false, false, false, "resources", 500, 5000, {}, {}, false},
+        {"self_check", "Return source-owned self-checks for chain schema, report, store, and runtime invariants.", true, false, false, false, "diagnostics", 1000, 10000, {}, {}, false}
     };
     return ops;
 }
@@ -1871,14 +2757,14 @@ agent_tools::tool_result_t handle_report_fetch_like(const request_ctx_t& ctx, bo
     const std::string job_id = ctx.payload.value("job_id", std::string());
     if (report_id.empty() && !job_id.empty())
     {
-        auto job = get_job(job_id);
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
         if (!job)
             return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
         report_id = job->report_id;
     }
     if (report_id.empty())
         return error_envelope(ctx, "bad_param", "report_id or job_id is required", {{"required", json::array({"report_id", "job_id"})}});
-    auto rec = get_report_record(report_id);
+    auto rec = get_report_record(report_id, project_id_from_ctx(ctx));
     if (!rec)
         return error_envelope(ctx, "job_not_found", "report_id was not found", {{"report_id", report_id}});
     json resources = json::array({resource_for_report(*rec, "json"), resource_for_report(*rec, "markdown"), resource_for_report(*rec, "sarif")});
@@ -1911,7 +2797,7 @@ agent_tools::tool_result_t handle_evidence_fetch(const request_ctx_t& ctx)
     const std::string job_id = ctx.payload.value("job_id", std::string());
     if (report_id.empty() && !job_id.empty())
     {
-        auto job = get_job(job_id);
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
         if (!job)
             return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
         report_id = job->report_id;
@@ -1928,7 +2814,7 @@ agent_tools::tool_result_t handle_evidence_fetch(const request_ctx_t& ctx)
     }
     if (!report_id.empty())
     {
-        auto rec = get_report_record(report_id);
+        auto rec = get_report_record(report_id, project_id_from_ctx(ctx));
         if (!rec)
             return error_envelope(ctx, "job_not_found", "report_id was not found", {{"report_id", report_id}});
         json found;
@@ -1979,7 +2865,7 @@ agent_tools::tool_result_t handle_chain_manage(const json& params)
         const std::string job_id = ctx.payload.value("job_id", std::string());
         if (!job_id.empty())
         {
-            auto job = get_job(job_id);
+            auto job = get_job(job_id, project_id_from_ctx(ctx));
             if (!job)
                 return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
             return ok_envelope(ctx, {{"job", job_to_json(*job)}, {"result_available", !job->result.is_null() && !job->result.empty()}}, job_to_json(*job));
@@ -1988,72 +2874,30 @@ agent_tools::tool_result_t handle_chain_manage(const json& params)
     }
     if (ctx.operation == "cancel")
     {
-        verify::engine().cancel();
         const std::string job_id = ctx.payload.value("job_id", std::string());
         if (!job_id.empty())
         {
-            auto& s = state();
-            std::lock_guard<std::mutex> lock(s.mutex);
-            auto it = s.jobs.find(job_id);
-            if (it == s.jobs.end())
+            if (!get_job(job_id, project_id_from_ctx(ctx)))
                 return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
-            it->second.state = "cancelled";
-            it->second.updated_at_ms = now_ms();
-            it->second.events.push_back({{"ts_ms", it->second.updated_at_ms}, {"state", "cancelled"}});
-            return ok_envelope(ctx, {{"cancelled", true}, {"job", job_to_json(it->second)}}, job_to_json(it->second));
+            if (!cancel_job_record(job_id))
+                return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
+            auto job = get_job(job_id, project_id_from_ctx(ctx));
+            return ok_envelope(ctx, {{"cancelled", true}, {"job", job ? job_to_json(*job) : json::object()}}, job ? job_to_json(*job) : json());
         }
-        return ok_envelope(ctx, {{"cancelled", true}, {"in_flight_count", verify::engine().in_flight_count()}});
+        return ok_envelope(ctx, cancel_all_job_records());
     }
     if (ctx.operation == "verify_link")
-    {
-        const std::string job_id = create_job(ctx);
-        agent_tools::tool_result_t link_failure;
-        json d = verify_link_data(ctx.payload, link_failure, ctx);
-        if (!link_failure.output.empty() || !link_failure.data.is_null())
-        {
-            finish_job(job_id, "failed", link_failure.data, std::string(), "bad_param", link_failure.output);
-            return link_failure;
-        }
-        finish_job(job_id, "completed", d);
-        auto job = get_job(job_id);
-        return ok_envelope(ctx, d, job ? job_to_json(*job) : json());
-    }
+        return enqueue_async_job(ctx);
     if (ctx.operation == "boundary_match")
         return ok_envelope(ctx, boundary_match_data(ctx.payload));
     if (ctx.operation == "trigger_confirm")
         return ok_envelope(ctx, trigger_confirm_data(ctx.payload));
     if (ctx.operation == "submit" || ctx.operation == "start")
-    {
-        const std::string job_id = create_job(ctx);
-        json report = build_chain_report(ctx, job_id);
-        const std::string chain_id = report.value("chain_id", std::string("chain:" + ctx.request_id));
-        const std::string report_id = store_report(job_id, chain_id, report);
-        auto rec = get_report_record(report_id);
-        if (rec)
-        {
-            rec->report["report_id"] = report_id;
-            {
-                auto& s = state();
-                std::lock_guard<std::mutex> lock(s.mutex);
-                auto it = s.reports.find(report_id);
-                if (it != s.reports.end())
-                {
-                    it->second.report["report_id"] = report_id;
-                    it->second.content_hash = hash_text(it->second.report.dump());
-                }
-            }
-        }
-        json data = get_report_record(report_id)->report;
-        finish_job(job_id, "completed", data, report_id);
-        auto job = get_job(job_id);
-        auto fresh = get_report_record(report_id);
-        json resources = fresh ? json::array({resource_for_report(*fresh, "json"), resource_for_report(*fresh, "markdown"), resource_for_report(*fresh, "sarif")}) : json::array();
-        return ok_envelope(ctx, {{"report_id", report_id}, {"report", data}}, job ? job_to_json(*job) : json(), json(), json::array(), resources);
-    }
+        return enqueue_async_job(ctx);
     if (ctx.operation == "resume")
     {
         const std::string job_id = ctx.payload.value("job_id", std::string());
-        auto job = get_job(job_id);
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
         if (!job)
             return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
         if (!job->request.contains("payload"))
@@ -2077,6 +2921,9 @@ agent_tools::tool_result_t handle_chain_manage(const json& params)
     {
         json arr = json::array();
         const std::string verdict = ctx.payload.value("verdict", std::string());
+        hydrate_reports_for_project(project_id_from_ctx(ctx));
+        if (ctx.payload.value("include_jobs", false))
+            hydrate_jobs_for_project(project_id_from_ctx(ctx));
         {
             auto& s = state();
             std::lock_guard<std::mutex> lock(s.mutex);
@@ -2111,7 +2958,10 @@ agent_tools::tool_result_t handle_chain_manage(const json& params)
         d["engine"] = verify::engine().verdict_summary();
         d["in_flight_count"] = verify::engine().in_flight_count();
         d["auto_analysis_ok"] = auto_is_ok();
-        d["modal_safety"] = {{"new_manage_tools_modal_waitbox_api", false}, {"new_manage_tools_ui_cancel_api", false}};
+        d["modal_safety"] = {{"manage_waitbox_free", true}, {"manage_ui_cancel_free", true}, {"interactive_cancel_requires_explicit_option", true}};
+        d["job_runtime"] = job_runtime().diagnostics();
+        hydrate_jobs_for_project(project_id_from_ctx(ctx));
+        hydrate_reports_for_project(project_id_from_ctx(ctx));
         {
             auto& s = state();
             std::lock_guard<std::mutex> lock(s.mutex);
@@ -2139,6 +2989,8 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
     };
     if (ctx.operation == "capabilities")
         return ok_envelope(ctx, make_capabilities(ctx.tool, project_ops()));
+    if (ctx.operation == "save" || ctx.operation == "index_build" || ctx.operation == "resolve_cross_edges" || ctx.operation == "verify_chain" || ctx.operation == "case_study_regressions")
+        return enqueue_async_job(ctx);
     if (ctx.operation == "inventory_current")
     {
         const int max_rows = int_param(ctx.payload, "max_rows", 256, 1, 100000);
@@ -2155,6 +3007,7 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
                                                              ctx.payload.value("include_imports", true),
                                                              ctx.payload.value("include_entries", true),
                                                              static_cast<std::size_t>(max_rows));
+        const bool has_supplied_fanout = ctx.payload.contains("fanout_result") || ctx.payload.contains("inventories");
         json supplied = json::object();
         if (ctx.payload.contains("fanout_result"))
             supplied["fanout_result"] = ctx.payload["fanout_result"];
@@ -2207,11 +3060,12 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
         {
             d["peer_data_gaps"].push_back({{"kind", "peer_registry_unavailable"}, {"error_code", live_instances.error_code}, {"message", live_instances.output}});
         }
-        d["fanout"] = {
-            {"tool", "query_all_instances"},
-            {"arguments", {{"tool", "ida_project_manage"}, {"arguments", {{"operation", "inventory_current"}, {"payload", ctx.payload}}}}},
-            {"reason", "query_all_instances owns network peer routing; pass its result back as payload.fanout_result to merge and persist without self-deadlock"}
-        };
+        d["fanout"] = has_supplied_fanout
+            ? json({{"executed", true}, {"executed_by_router", ctx.payload.value("fanout_executed_by_router", false)}, {"tool", "query_all_instances"}})
+            : json({{"executed", false},
+                    {"tool", "query_all_instances"},
+                    {"arguments", {{"tool", "ida_project_manage"}, {"arguments", {{"operation", "inventory_current"}, {"payload", ctx.payload}}}}},
+                    {"reason", "direct fanout is only safe from the MCP routing layer; direct in-process callers must supply payload.fanout_result"}});
         d["instances_routing_compatible"] = true;
         return ok_envelope(ctx, d);
     }
@@ -2219,19 +3073,6 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
         return project_result(aida::multibinary::list_projects());
     if (ctx.operation == "load")
         return project_result(aida::multibinary::load_project_modules(ctx.payload.value("project_id", std::string())));
-    if (ctx.operation == "save")
-    {
-        if (ctx.payload.contains("modules") && ctx.payload["modules"].is_array())
-            return project_result(aida::multibinary::save_or_update_project(ctx.payload.value("project_id", std::string()),
-                                                                            ctx.payload["modules"],
-                                                                            ctx.payload));
-        const int max_rows = int_param(ctx.payload, "max_rows", 100000, 1, 1000000);
-        json local = aida::multibinary::current_idb_inventory(true, true, true, static_cast<std::size_t>(max_rows));
-        return project_result(aida::multibinary::bind_current_inventory_to_project(ctx.payload.value("project_id", std::string()),
-                                                                                  local,
-                                                                                  ctx.payload,
-                                                                                  ctx.payload));
-    }
     if (ctx.operation == "delete")
     {
         if (!ctx.payload.value("confirm_destructive", false) || ctx.payload.value("reason", std::string()).empty())
@@ -2289,23 +3130,6 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
         json manifest = s.corpus_manifest.empty() ? json::object({{"corpus_id", "current"}, {"modules", json::array({module_identity()})}, {"generation", generation_id()}}) : s.corpus_manifest;
         return ok_envelope(ctx, {{"format", "json"}, {"manifest", manifest}, {"content_hash", hash_text(manifest.dump())}});
     }
-    if (ctx.operation == "index_build")
-    {
-        const std::string job_id = create_job(ctx);
-        json indices = ctx.payload.contains("indices") && ctx.payload["indices"].is_array() ? ctx.payload["indices"] : json::array({"functions", "segments", "imports", "entries", "verifier"});
-        aida::multibinary::index_build_options_t options = aida::multibinary::index_options_from_json(ctx.payload);
-        options.force = ctx.payload.value("force", options.force);
-        aida::multibinary::project_io_result_t built = aida::multibinary::build_current_module_index(ctx.payload.value("project_id", std::string()), indices, options);
-        if (!built.ok)
-        {
-            finish_job(job_id, "failed", built.data, std::string(), built.error_code, built.error_message);
-            return project_result(built);
-        }
-        json result = built.data;
-        finish_job(job_id, "completed", result);
-        auto job = get_job(job_id);
-        return ok_envelope(ctx, result, job ? job_to_json(*job) : json());
-    }
     if (ctx.operation == "index_status")
     {
         const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
@@ -2326,29 +3150,139 @@ agent_tools::tool_result_t handle_project_manage(const json& params)
                                                                  ctx.payload.value("cursor", std::string()),
                                                                  page_index));
     }
-    if (ctx.operation == "resolve_cross_edges")
-    {
-        const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
-        return project_result(aida::multibinary::resolve_project_cross_edges(project_id));
-    }
     if (ctx.operation == "resolve_reference")
     {
         const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
         return project_result(aida::multibinary::resolve_project_reference(project_id, ctx.payload.value("reference", json::object())));
     }
-    if (ctx.operation == "verify_chain")
-    {
-        const std::string project_id = ctx.payload.value("project_id", std::string());
-        return project_result(aida::vuln::chain_verifier::verify_project_chain(project_id,
-                                                                               ctx.payload.value("chain", json::object()),
-                                                                               ctx.payload.value("options", json::object())));
-    }
-    if (ctx.operation == "case_study_regressions")
-    {
-        const std::string project_id = ctx.payload.value("project_id", std::string());
-        return project_result(aida::vuln::chain_verifier::run_case_study_regressions(project_id, ctx.payload));
-    }
     return error_envelope(ctx, "unknown_operation", "unhandled operation", {{"operation", ctx.operation}});
+}
+
+json project_io_result_json(const aida::multibinary::project_io_result_t& r)
+{
+    return {
+        {"ok", r.ok},
+        {"data", r.data},
+        {"error_code", r.error_code},
+        {"error_message", r.error_message}
+    };
+}
+
+queued_job_result_t queued_chain_report_job(const request_ctx_t& ctx, const job_record_t& job)
+{
+    queued_job_result_t out;
+    const json module = ctx.payload.value("_aida_module_identity", json::object());
+    const std::string generation = ctx.payload.value("_aida_generation", job.generation);
+    json report = build_chain_report(ctx, job.job_id, module, generation);
+    const std::string chain_id = report.value("chain_id", std::string("chain:" + ctx.request_id));
+    const std::string report_id = store_report(job.project_id, job.job_id, chain_id, report);
+    auto rec = get_report_record(report_id, job.project_id);
+    json resources = rec ? json::array({resource_for_report(*rec, "json"), resource_for_report(*rec, "markdown"), resource_for_report(*rec, "sarif")}) : json::array();
+    for (const auto& item : job_resource_manifest(job.job_id))
+        resources.push_back(item);
+    out.ok = true;
+    out.report_id = report_id;
+    out.resources = resources;
+    json stored_report = rec ? rec->report : report;
+    if (ctx.operation == "verify_link")
+    {
+        out.data = {
+            {"schema", kReportSchema},
+            {"engine", "ChainVerificationEngine"},
+            {"legacy_tool", nullptr},
+            {"report_id", report_id},
+            {"data", stored_report},
+            {"verdict", stored_report.value("verdict", std::string("inconclusive"))},
+            {"acceptance", stored_report.value("verdict", std::string()) == "confirmed" ? "accepted" : (stored_report.value("verdict", std::string()) == "refuted" ? "rejected" : "not_accepted")},
+            {"link_report", stored_report.contains("links") && stored_report["links"].is_array() && !stored_report["links"].empty() ? stored_report["links"].front() : json::object()},
+            {"link_id", ctx.payload.value("link_id", std::string("link:0"))}
+        };
+    }
+    else
+    {
+        out.data = {{"report_id", report_id}, {"report", stored_report}};
+    }
+    return out;
+}
+
+queued_job_result_t queued_project_job(const request_ctx_t& ctx, const job_record_t& job)
+{
+    const int flags = (ctx.operation == "save" || ctx.operation == "index_build" || ctx.operation == "resolve_cross_edges") ? MFF_WRITE : MFF_READ;
+    ida_gateway_result_t gateway_result = job_runtime().execute_ida_job(ctx, job.job_id, flags, 600000, [ctx]() {
+        if (ctx.operation == "save")
+        {
+            if (ctx.payload.contains("modules") && ctx.payload["modules"].is_array())
+                return project_io_result_json(aida::multibinary::save_or_update_project(ctx.payload.value("project_id", std::string()),
+                                                                                       ctx.payload["modules"],
+                                                                                       ctx.payload));
+            const int max_rows = int_param(ctx.payload, "max_rows", 100000, 1, 1000000);
+            json local = aida::multibinary::current_idb_inventory(true, true, true, static_cast<std::size_t>(max_rows));
+            return project_io_result_json(aida::multibinary::bind_current_inventory_to_project(ctx.payload.value("project_id", std::string()),
+                                                                                              local,
+                                                                                              ctx.payload,
+                                                                                              ctx.payload));
+        }
+        if (ctx.operation == "index_build")
+        {
+            json indices = ctx.payload.contains("indices") && ctx.payload["indices"].is_array() ? ctx.payload["indices"] : json::array({"functions", "segments", "imports", "entries", "verifier"});
+            aida::multibinary::index_build_options_t options = aida::multibinary::index_options_from_json(ctx.payload);
+            options.force = ctx.payload.value("force", options.force);
+            return project_io_result_json(aida::multibinary::build_current_module_index(ctx.payload.value("project_id", std::string()), indices, options));
+        }
+        if (ctx.operation == "resolve_cross_edges")
+        {
+            const std::string project_id = ctx.payload.value("project_id", aida::multibinary::default_project_id_for_current_idb());
+            return project_io_result_json(aida::multibinary::resolve_project_cross_edges(project_id));
+        }
+        if (ctx.operation == "verify_chain")
+        {
+            const std::string project_id = ctx.payload.value("project_id", std::string());
+            return project_io_result_json(aida::vuln::chain_verifier::verify_project_chain(project_id,
+                                                                                          ctx.payload.value("chain", json::object()),
+                                                                                          ctx.payload.value("options", json::object())));
+        }
+        if (ctx.operation == "case_study_regressions")
+        {
+            const std::string project_id = ctx.payload.value("project_id", std::string());
+            return project_io_result_json(aida::vuln::chain_verifier::run_case_study_regressions(project_id, ctx.payload));
+        }
+        return json{{"ok", false}, {"data", json::object()}, {"error_code", "unknown_operation"}, {"error_message", "unsupported queued project operation"}};
+    });
+
+    queued_job_result_t out;
+    if (!gateway_result.ok)
+    {
+        out.ok = false;
+        out.error_code = gateway_result.stale_generation ? "stale_generation" : (gateway_result.timed_out ? "timeout" : (gateway_result.cancelled ? "cancelled" : "idb_unavailable"));
+        out.error_message = gateway_result.error.empty() ? "project job gateway execution failed" : gateway_result.error;
+        out.data = gateway_result.data;
+        return out;
+    }
+    out.ok = gateway_result.data.value("ok", false);
+    out.data = gateway_result.data.value("data", json::object());
+    out.error_code = gateway_result.data.value("error_code", std::string());
+    out.error_message = gateway_result.data.value("error_message", std::string());
+    out.resources = job_resource_manifest(job.job_id);
+    const std::string project_id = ctx.payload.value("project_id", job.project_id);
+    if (!project_id.empty())
+    {
+        out.resources.push_back({{"uri", "ida://projects/" + project_id + "/index/status"}, {"kind", "index_status"}, {"project_id", project_id}});
+        out.resources.push_back({{"uri", "ida://projects/" + project_id + "/index/pages"}, {"kind", "index_pages"}, {"project_id", project_id}});
+    }
+    return out;
+}
+
+queued_job_result_t execute_queued_mcp_job(const request_ctx_t& ctx, const job_record_t& job)
+{
+    if (ctx.tool == "ida_chain_manage" && (ctx.operation == "submit" || ctx.operation == "start" || ctx.operation == "verify_link"))
+        return queued_chain_report_job(ctx, job);
+    if (ctx.tool == "ida_project_manage" && (ctx.operation == "save" || ctx.operation == "index_build" || ctx.operation == "resolve_cross_edges" || ctx.operation == "verify_chain" || ctx.operation == "case_study_regressions"))
+        return queued_project_job(ctx, job);
+    queued_job_result_t out;
+    out.ok = false;
+    out.error_code = "unknown_operation";
+    out.error_message = "queued job operation is not supported";
+    return out;
 }
 
 std::vector<std::string> strings_from_array_field(const json& payload, const char* key)
@@ -2394,6 +3328,13 @@ aida::vuln::chain::extraction_options_t extraction_options_from_ctx(const reques
     options.max_module_items = static_cast<std::size_t>(int_param(ctx.payload, "max_module_items", static_cast<int>(options.max_module_items), 1, 1000000));
     if (ctx.payload.contains("timeout_ms") || ctx.budget.contains("timeout_ms"))
         options.timeout_ms = static_cast<std::uint64_t>(int_param(ctx.payload.contains("timeout_ms") ? ctx.payload : ctx.budget, "timeout_ms", 0, 0, 600000));
+    if (!ctx.job_id.empty())
+    {
+        const std::string job_id = ctx.job_id;
+        options.cancellation_requested = [job_id]() {
+            return job_cancel_requested(job_id);
+        };
+    }
     std::vector<std::string> maturities = strings_from_array_field(ctx.payload, "maturities");
     if (!maturities.empty())
         options.microcode_maturities = maturities;
@@ -2607,7 +3548,7 @@ json cross_reachability_data(const request_ctx_t& ctx,
             out["cutoff_reason"] = "timeout";
             break;
         }
-        if (user_cancelled())
+        if (!ctx.job_id.empty() && job_cancel_requested(ctx.job_id))
         {
             cutoff = true;
             out["cutoff_reason"] = "cancelled";
@@ -3280,6 +4221,7 @@ agent_tools::tool_result_t handle_report_manage(const json& params)
     {
         json arr = json::array();
         const std::string verdict = ctx.payload.value("verdict", std::string());
+        hydrate_reports_for_project(project_id_from_ctx(ctx));
         {
             auto& s = state();
             std::lock_guard<std::mutex> lock(s.mutex);
@@ -3325,7 +4267,7 @@ agent_tools::tool_result_t handle_job_manage(const json& params)
     if (ctx.operation == "status")
     {
         const std::string job_id = ctx.payload.value("job_id", std::string());
-        auto job = get_job(job_id);
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
         if (!job)
             return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
         return ok_envelope(ctx, {{"job", job_to_json(*job)}}, job_to_json(*job));
@@ -3333,22 +4275,37 @@ agent_tools::tool_result_t handle_job_manage(const json& params)
     if (ctx.operation == "result")
     {
         const std::string job_id = ctx.payload.value("job_id", std::string());
-        auto job = get_job(job_id);
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
         if (!job)
             return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
         json resources = json::array();
         if (!job->report_id.empty())
         {
-            auto rec = get_report_record(job->report_id);
+            auto rec = get_report_record(job->report_id, job->project_id);
             if (rec)
                 resources = json::array({resource_for_report(*rec, "json"), resource_for_report(*rec, "markdown"), resource_for_report(*rec, "sarif")});
         }
-        return ok_envelope(ctx, {{"job", job_to_json(*job)}, {"result", job->result}}, job_to_json(*job), json(), json::array(), resources);
+        for (const auto& r : job->resources)
+            resources.push_back(r);
+        json data = {{"job", job_to_json(*job)}, {"result", job->result}};
+        json page;
+        if (!apply_nested_pagination(ctx, "job_result", data, "/result", page))
+            return error_envelope(ctx, page.value("error", std::string("bad_page_path")), "nested page path is invalid", page);
+        return ok_envelope(ctx, data, job_to_json(*job), page, json::array(), resources);
+    }
+    if (ctx.operation == "events")
+    {
+        const std::string job_id = ctx.payload.value("job_id", std::string());
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
+        if (!job)
+            return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
+        return ok_envelope(ctx, {{"job_id", job_id}, {"events", job->events}, {"stale_generation", !job->generation.empty() && job->generation != generation_id()}}, job_to_json(*job));
     }
     if (ctx.operation == "list")
     {
         json all = json::array();
         const std::string state_filter = ctx.payload.value("state", std::string());
+        hydrate_jobs_for_project(project_id_from_ctx(ctx));
         {
             auto& s = state();
             std::lock_guard<std::mutex> lock(s.mutex);
@@ -3368,21 +4325,17 @@ agent_tools::tool_result_t handle_job_manage(const json& params)
     if (ctx.operation == "cancel")
     {
         const std::string job_id = ctx.payload.value("job_id", std::string());
-        verify::engine().cancel();
-        auto& s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
-        auto it = s.jobs.find(job_id);
-        if (it == s.jobs.end())
+        if (!get_job(job_id, project_id_from_ctx(ctx)))
             return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
-        it->second.state = "cancelled";
-        it->second.updated_at_ms = now_ms();
-        it->second.events.push_back({{"ts_ms", it->second.updated_at_ms}, {"state", "cancelled"}});
-        return ok_envelope(ctx, {{"cancelled", true}, {"job", job_to_json(it->second)}}, job_to_json(it->second));
+        if (!cancel_job_record(job_id))
+            return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
+        return ok_envelope(ctx, {{"cancelled", true}, {"job", job ? job_to_json(*job) : json::object()}}, job ? job_to_json(*job) : json());
     }
     if (ctx.operation == "resume")
     {
         const std::string job_id = ctx.payload.value("job_id", std::string());
-        auto job = get_job(job_id);
+        auto job = get_job(job_id, project_id_from_ctx(ctx));
         if (!job)
             return error_envelope(ctx, "job_not_found", "job_id was not found", {{"job_id", job_id}});
         if (job->tool != "ida_chain_manage" || !job->request.contains("payload"))
@@ -3400,8 +4353,11 @@ agent_tools::tool_result_t handle_job_manage(const json& params)
         d["engine"] = verify::engine().verdict_summary();
         d["in_flight_count"] = verify::engine().in_flight_count();
         d["auto_analysis_ok"] = auto_is_ok();
-        d["modal_safety"] = {{"new_manage_tools_modal_waitbox_api", false}, {"new_manage_tools_ui_cancel_api", false}};
+        d["modal_safety"] = {{"manage_waitbox_free", true}, {"manage_ui_cancel_free", true}, {"interactive_cancel_requires_explicit_option", true}};
+        d["job_runtime"] = job_runtime().diagnostics();
         json states = json::object();
+        hydrate_jobs_for_project(project_id_from_ctx(ctx));
+        hydrate_reports_for_project(project_id_from_ctx(ctx));
         {
             auto& s = state();
             std::lock_guard<std::mutex> lock(s.mutex);
@@ -3420,20 +4376,529 @@ agent_tools::tool_result_t handle_job_manage(const json& params)
         const std::string sf = ctx.payload.value("state", std::string("all"));
         const uint64_t cutoff = now_ms() > age ? now_ms() - age : 0;
         size_t removed = 0;
+        json removed_ids = json::array();
+        hydrate_jobs_for_project(project_id_from_ctx(ctx));
         auto& s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         for (auto it = s.jobs.begin(); it != s.jobs.end(); )
         {
             const bool state_ok = sf == "all" || it->second.state == sf;
-            if (state_ok && it->second.updated_at_ms < cutoff && it->second.state != "running")
+            if (state_ok && it->second.updated_at_ms < cutoff && !active_job_state(it->second.state))
             {
+                const std::string project_id = it->second.project_id;
+                const std::string job_id = it->second.job_id;
+                if (!it->second.idempotency_scope.empty())
+                    s.idempotency_jobs.erase(it->second.idempotency_scope);
+                s.cancellation_tokens.erase(it->second.job_id);
+                s.gateway_cancel_flags.erase(it->second.job_id);
                 it = s.jobs.erase(it);
+                aida::vuln::chain::delete_chain_job_record(project_id, job_id);
+                removed_ids.push_back(job_id);
                 ++removed;
             }
             else
                 ++it;
         }
-        return ok_envelope(ctx, {{"removed", removed}});
+        return ok_envelope(ctx, {{"removed", removed}, {"job_ids", removed_ids}});
+    }
+    return error_envelope(ctx, "unknown_operation", "unhandled operation", {{"operation", ctx.operation}});
+}
+
+json forward_params(const request_ctx_t& ctx, const std::string& operation, const json& payload)
+{
+    json p;
+    p["operation"] = operation;
+    p["request_id"] = ctx.request_id;
+    p["job_mode"] = ctx.job_mode;
+    p["idempotency_key"] = ctx.idempotency_key;
+    p["cursor"] = ctx.cursor;
+    p["limit"] = ctx.limit;
+    p["budget"] = ctx.budget;
+    p["payload"] = payload;
+    return p;
+}
+
+agent_tools::tool_result_t adopt_manage_result(const request_ctx_t& ctx, const agent_tools::tool_result_t& nested)
+{
+    if (nested.data.is_object() && nested.data.contains("ok"))
+    {
+        if (nested.success)
+            return ok_envelope(ctx,
+                               nested.data.value("data", json(nullptr)),
+                               nested.data.value("job", json()),
+                               nested.data.value("page", json()),
+                               nested.data.value("warnings", json::array()),
+                               nested.data.value("resources", json::array()));
+        json err = nested.data.value("error", json::object());
+        return error_envelope(ctx,
+                              err.value("code", nested.error_code.empty() ? std::string("nested_error") : nested.error_code),
+                              err.value("message", nested.output),
+                              err.value("details", nested.data),
+                              err.value("retryable", false));
+    }
+    if (nested.success)
+        return ok_envelope(ctx, wrapped_tool_result(ctx.operation, nested));
+    return error_envelope(ctx, nested.error_code.empty() ? "nested_error" : nested.error_code, nested.output, nested.data);
+}
+
+json registry_catalog_data()
+{
+    json data;
+    data["schema"] = "aida.ida.mcp.registry.v1";
+    data["public_tools"] = json::array();
+    data["legacy_tools"] = json::array();
+    data["internal_tools"] = json::array();
+    data["counts"] = json::object({{"public", 0}, {"legacy", 0}, {"internal", 0}});
+    for (const auto* tool : agent_tools::ToolRegistry::instance().get_all_tools())
+    {
+        if (!tool)
+            continue;
+        json entry;
+        entry["name"] = tool->name;
+        entry["category"] = tool->category;
+        entry["read_only"] = tool->read_only;
+        entry["destructive"] = tool->destructive;
+        entry["deterministic"] = tool->deterministic;
+        entry["visibility"] = tool->visibility;
+        entry["required_indices"] = tool->required_indices;
+        if (!tool->deprecated_by_tool.empty())
+            entry["deprecated_by"] = {{"tool", tool->deprecated_by_tool}, {"operation", tool->deprecated_by_operation}};
+        if (!tool->operations.empty())
+        {
+            entry["operations"] = json::array();
+            for (const auto& op : tool->operations)
+            {
+                json oj;
+                oj["operation"] = op.name;
+                oj["description"] = op.description;
+                oj["read_only"] = op.read_only;
+                oj["destructive"] = op.destructive;
+                oj["deterministic"] = op.deterministic;
+                oj["job_mode"] = op.job_mode;
+                oj["cache_policy"] = op.cache_policy;
+                oj["default_timeout_ms"] = op.default_timeout_ms;
+                oj["hard_timeout_ms"] = op.hard_timeout_ms;
+                oj["required_indices"] = op.required_indices;
+                oj["input_schema"] = op.input_schema;
+                oj["output_schema"] = op.output_schema;
+                entry["operations"].push_back(oj);
+            }
+        }
+        if (tool->visibility == "public")
+        {
+            data["public_tools"].push_back(entry);
+            data["counts"]["public"] = data["counts"].value("public", 0) + 1;
+        }
+        else if (tool->visibility == "internal")
+        {
+            data["internal_tools"].push_back(entry);
+            data["counts"]["internal"] = data["counts"].value("internal", 0) + 1;
+        }
+        else
+        {
+            data["legacy_tools"].push_back(entry);
+            data["counts"]["legacy"] = data["counts"].value("legacy", 0) + 1;
+        }
+    }
+    return data;
+}
+
+json resource_catalog_data()
+{
+    json data;
+    data["resources"] = json::array({
+        {{"uri", "ida://binary-info"}, {"kind", "static"}},
+        {{"uri", "ida://database-info"}, {"kind", "static"}},
+        {{"uri", "ida://segments"}, {"kind", "static"}},
+        {{"uri", "ida://imports"}, {"kind", "static"}},
+        {{"uri", "ida://exports"}, {"kind", "static"}},
+        {{"uri", "ida://corpus/current/manifest"}, {"kind", "corpus_manifest"}},
+        {{"uri", "ida://cache/status"}, {"kind", "cache_status"}},
+        {{"uri", "ida://jobs"}, {"kind", "job_list"}},
+        {{"uri", "ida://chain/reports"}, {"kind", "report_list"}}
+    });
+    data["templates"] = json::array({
+        "ida://function/{address}",
+        "ida://address/{address}",
+        "ida://struct/{name}",
+        "ida://import/{name}",
+        "ida://export/{name}",
+        "ida://xrefs/from/{addr}",
+        "ida://chain/reports/{report_id}?format={format}",
+        "ida://reports/exports/{report_id}.{format}",
+        "ida://jobs/{job_id}/result",
+        "ida://jobs/{job_id}/events",
+        "ida://corpus/{project_id}/manifest",
+        "ida://cache/{area}/status",
+        "ida://evidence/{report_id}/{evidence_id}"
+    });
+    return data;
+}
+
+agent_tools::tool_result_t handle_discover_manage(const json& params)
+{
+    agent_tools::tool_result_t failure;
+    request_ctx_t ctx = parse_request("ida_discover_manage", params, discover_ops(), failure);
+    if (!failure.output.empty() || !failure.data.is_null())
+        return failure;
+    if (ctx.operation == "capabilities")
+        return ok_envelope(ctx, make_capabilities(ctx.tool, discover_ops()));
+    if (ctx.operation == "catalog")
+        return ok_envelope(ctx, registry_catalog_data());
+    if (ctx.operation == "resources")
+        return ok_envelope(ctx, resource_catalog_data());
+    if (ctx.operation == "instances")
+        return ok_envelope(ctx, wrapped_tool_result("list_ida_instances", invoke_registered("list_ida_instances", json::object())));
+    if (ctx.operation == "module")
+    {
+        json d;
+        d["module"] = module_identity();
+        d["binary_info"] = wrapped_tool_result("get_binary_info", invoke_registered("get_binary_info", json::object()));
+        return ok_envelope(ctx, d, json(), json(), json::array(), json::array({{{"uri", "ida://corpus/current/manifest"}, {"kind", "corpus_manifest"}}}));
+    }
+    if (ctx.operation == "functions")
+        return adopt_manage_result(ctx, handle_extract_manage(forward_params(ctx, "functions", ctx.payload)));
+    if (ctx.operation == "function")
+        return adopt_manage_result(ctx, handle_extract_manage(forward_params(ctx, "function", ctx.payload)));
+    if (ctx.operation == "imports")
+        return adopt_manage_result(ctx, handle_extract_manage(forward_params(ctx, "imports", ctx.payload)));
+    if (ctx.operation == "exports")
+        return adopt_manage_result(ctx, handle_extract_manage(forward_params(ctx, "exports", ctx.payload)));
+    if (ctx.operation == "segments")
+        return adopt_manage_result(ctx, handle_extract_manage(forward_params(ctx, "segments", ctx.payload)));
+    if (ctx.operation == "address")
+    {
+        auto ea = payload_location(ctx.payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "payload.address"}});
+        return ok_envelope(ctx, wrapped_tool_result("get_address_info", invoke_registered("get_address_info", {{"address", fmt_ea(*ea)}})));
+    }
+    return error_envelope(ctx, "unknown_operation", "unhandled operation", {{"operation", ctx.operation}});
+}
+
+agent_tools::tool_result_t handle_analysis_manage(const json& params)
+{
+    agent_tools::tool_result_t failure;
+    request_ctx_t ctx = parse_request("ida_analysis_manage", params, analysis_ops(), failure);
+    if (!failure.output.empty() || !failure.data.is_null())
+        return failure;
+    if (ctx.operation == "capabilities")
+        return ok_envelope(ctx, make_capabilities(ctx.tool, analysis_ops()));
+    if (ctx.operation == "status")
+        return ok_envelope(ctx, {{"index_status", wrapped_tool_result("index_status", invoke_registered("index_status", json::object()))}, {"chain", verify::engine().verdict_summary()}});
+    if (ctx.operation == "build_index")
+    {
+        json p;
+        if (ctx.payload.contains("indices"))
+            p["indices"] = ctx.payload["indices"];
+        if (ctx.payload.contains("max_seconds"))
+            p["max_seconds"] = ctx.payload["max_seconds"];
+        return ok_envelope(ctx, wrapped_tool_result("build_index", invoke_registered("build_index", p)));
+    }
+    if (ctx.operation == "function")
+    {
+        auto ea = payload_location(ctx.payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "payload.address"}});
+        return ok_envelope(ctx, wrapped_tool_result("analyze_function", invoke_registered("analyze_function", {{"addr", fmt_ea(*ea)}, {"limit", ctx.payload.value("limit", 100)}})));
+    }
+    if (ctx.operation == "batch" || ctx.operation == "component")
+        return ok_envelope(ctx, wrapped_tool_result(ctx.operation == "component" ? "analyze_component" : "analyze_batch", invoke_registered(ctx.operation == "component" ? "analyze_component" : "analyze_batch", ctx.payload)));
+    if (ctx.operation == "control_flow" || ctx.operation == "data_flow" || ctx.operation == "callgraph")
+    {
+        auto ea = payload_location(ctx.payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "payload.address"}});
+        std::string tool = ctx.operation == "control_flow" ? "analyze_control_flow" : (ctx.operation == "data_flow" ? "analyze_data_flow" : "build_call_graph");
+        json p = ctx.payload;
+        p["address"] = fmt_ea(*ea);
+        return ok_envelope(ctx, wrapped_tool_result(tool, invoke_registered(tool, p)));
+    }
+    if (ctx.operation == "taint")
+        return ok_envelope(ctx, wrapped_tool_result("run_taint_analysis", invoke_registered("run_taint_analysis", ctx.payload)));
+    if (ctx.operation == "vulnerability")
+    {
+        const std::string tool = ctx.payload.value("tool", std::string());
+        json arguments = ctx.payload.value("arguments", json::object());
+        if (tool.empty())
+            return error_envelope(ctx, "bad_param", "payload.tool is required");
+        const auto* def = agent_tools::ToolRegistry::instance().get_tool(tool);
+        if (!def || def->destructive)
+            return error_envelope(ctx, "bad_param", "payload.tool must name a registered read-only analysis tool", {{"tool", tool}});
+        return ok_envelope(ctx, wrapped_tool_result(tool, invoke_registered(tool, arguments)));
+    }
+    return error_envelope(ctx, "unknown_operation", "unhandled operation", {{"operation", ctx.operation}});
+}
+
+agent_tools::tool_result_t handle_cache_manage(const json& params)
+{
+    agent_tools::tool_result_t failure;
+    request_ctx_t ctx = parse_request("ida_cache_manage", params, cache_ops(), failure);
+    if (!failure.output.empty() || !failure.data.is_null())
+        return failure;
+    if (ctx.operation == "capabilities")
+        return ok_envelope(ctx, make_capabilities(ctx.tool, cache_ops()));
+    if (ctx.operation == "status")
+    {
+        json d;
+        d["extraction"] = aida::vuln::chain::extraction_cache_status();
+        d["output_cache"] = wrapped_tool_result("list_outputs", invoke_registered("list_outputs", {{"op", "stats"}}));
+        d["index"] = handle_project_manage(forward_params(ctx, "index_status", ctx.payload)).data;
+        d["jobs"] = handle_job_manage(forward_params(ctx, "diagnostics", json::object())).data;
+        return ok_envelope(ctx, d, json(), json(), json::array(), json::array({{{"uri", "ida://cache/status"}, {"kind", "cache_status"}}}));
+    }
+    if (ctx.operation == "build")
+        return adopt_manage_result(ctx, handle_project_manage(forward_params(ctx, "index_build", ctx.payload)));
+    if (ctx.operation == "index_status")
+        return adopt_manage_result(ctx, handle_project_manage(forward_params(ctx, "index_status", ctx.payload)));
+    if (ctx.operation == "index_page")
+        return adopt_manage_result(ctx, handle_project_manage(forward_params(ctx, "index_page", ctx.payload)));
+    if (ctx.operation == "extraction_status")
+        return adopt_manage_result(ctx, handle_extract_manage(forward_params(ctx, "extraction_cache_status", ctx.payload)));
+    if (ctx.operation == "invalidate_extraction")
+        return adopt_manage_result(ctx, handle_extract_manage(forward_params(ctx, "invalidate_extraction_cache", ctx.payload)));
+    if (ctx.operation == "output_cache")
+        return ok_envelope(ctx, wrapped_tool_result("list_outputs", invoke_registered("list_outputs", ctx.payload)));
+    if (ctx.operation == "prune_jobs")
+        return adopt_manage_result(ctx, handle_job_manage(forward_params(ctx, "prune", ctx.payload)));
+    return error_envelope(ctx, "unknown_operation", "unhandled operation", {{"operation", ctx.operation}});
+}
+
+std::string compact_hex(std::string text)
+{
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text)
+    {
+        if (std::isxdigit(static_cast<unsigned char>(c)))
+            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+std::string read_bytes_compact_hex(ea_t ea, size_t count)
+{
+    std::vector<uint8_t> bytes(count);
+    ssize_t got = get_bytes(bytes.data(), bytes.size(), ea);
+    if (got <= 0)
+        return std::string();
+    std::ostringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (ssize_t i = 0; i < got; ++i)
+        ss << std::setw(2) << static_cast<unsigned>(bytes[static_cast<size_t>(i)]);
+    return ss.str();
+}
+
+bool destructive_confirmed(const request_ctx_t& ctx, const json& payload)
+{
+    return (payload.value("confirm_destructive", false) || ctx.payload.value("confirm_destructive", false))
+        && !payload.value("reason", ctx.payload.value("reason", std::string())).empty();
+}
+
+json mutation_receipt(const std::string& action, const json& payload, const json& before, bool applied)
+{
+    json r;
+    r["receipt_id"] = hash_text(action + "|" + payload.dump() + "|" + before.dump() + "|" + generation_id());
+    r["action"] = action;
+    r["payload"] = payload;
+    r["before"] = before;
+    r["applied"] = applied;
+    r["generation"] = generation_id();
+    return r;
+}
+
+agent_tools::tool_result_t apply_or_preview_mutation(const request_ctx_t& ctx, const json& payload, bool apply)
+{
+    const std::string action = payload.value("operation", payload.value("action", std::string()));
+    if (action.empty())
+        return error_envelope(ctx, "bad_param", "mutation action is required");
+    if (apply && !destructive_confirmed(ctx, payload))
+        return error_envelope(ctx, "destructive_denied", "mutation requires confirm_destructive=true and a non-empty reason");
+
+    json before = json::object();
+    json direct_params = json::object();
+    std::string direct_tool;
+    if (action == "rename_function")
+    {
+        auto ea = payload_location(payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "address"}});
+        func_t* fn = get_func(*ea);
+        if (!fn)
+            return error_envelope(ctx, "bad_param", "no function contains address", {{"address", fmt_ea(*ea)}});
+        qstring old_name;
+        get_func_name(&old_name, fn->start_ea);
+        before["address"] = fmt_ea(fn->start_ea);
+        before["name"] = old_name.c_str();
+        if (payload.contains("expected_old_name") && payload["expected_old_name"].is_string() && payload["expected_old_name"].get<std::string>() != before.value("name", std::string()))
+            return error_envelope(ctx, "stale_generation", "expected_old_name does not match current function name", {{"expected", payload["expected_old_name"]}, {"actual", before["name"]}});
+        direct_tool = "rename_function";
+        direct_params = {{"address", fmt_ea(fn->start_ea)}, {"new_name", payload.value("new_name", std::string())}};
+    }
+    else if (action == "set_function_signature")
+    {
+        auto ea = payload_location(payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "address"}});
+        before["address"] = fmt_ea(*ea);
+        direct_tool = "set_function_signature";
+        direct_params = {{"address", fmt_ea(*ea)}, {"signature", payload.value("signature", std::string())}};
+    }
+    else if (action == "apply_type")
+    {
+        auto ea = payload_location(payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "address"}});
+        before["address"] = fmt_ea(*ea);
+        direct_tool = "apply_type";
+        direct_params = {{"address", fmt_ea(*ea)}, {"type", payload.value("type", std::string())}};
+    }
+    else if (action == "declare_type")
+    {
+        before["type_library"] = "local";
+        direct_tool = "declare_type";
+        direct_params = {{"declaration", payload.value("declaration", std::string())}};
+    }
+    else if (action == "set_comment")
+    {
+        auto ea = payload_location(payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "address"}});
+        const bool repeatable = payload.value("repeatable", false);
+        qstring old_comment;
+        get_cmt(&old_comment, *ea, repeatable);
+        before["address"] = fmt_ea(*ea);
+        before["comment"] = old_comment.c_str();
+        before["repeatable"] = repeatable;
+        if (payload.contains("expected_old_comment") && payload["expected_old_comment"].is_string() && payload["expected_old_comment"].get<std::string>() != before.value("comment", std::string()))
+            return error_envelope(ctx, "stale_generation", "expected_old_comment does not match current comment", {{"expected", payload["expected_old_comment"]}, {"actual", before["comment"]}});
+        direct_tool = repeatable ? "set_repeatable_comment" : "set_comment";
+        direct_params = {{"address", fmt_ea(*ea)}, {"comment", payload.value("comment", std::string())}};
+    }
+    else if (action == "patch_bytes")
+    {
+        auto ea = payload_location(payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "address"}});
+        const std::string new_bytes = compact_hex(payload.value("bytes", std::string()));
+        const std::string expected = compact_hex(payload.value("expected_old_bytes", std::string()));
+        if ((new_bytes.size() & 1u) != 0 || new_bytes.empty())
+            return error_envelope(ctx, "bad_param", "bytes must be a non-empty even-length hex string");
+        if (apply && expected.empty())
+            return error_envelope(ctx, "bad_param", "patch_bytes requires expected_old_bytes");
+        const std::string current = read_bytes_compact_hex(*ea, expected.empty() ? new_bytes.size() / 2 : expected.size() / 2);
+        before["address"] = fmt_ea(*ea);
+        before["bytes"] = current;
+        if (!expected.empty() && current != expected)
+            return error_envelope(ctx, "stale_generation", "expected_old_bytes does not match current bytes", {{"expected", expected}, {"actual", current}});
+        direct_tool = "patch_bytes";
+        direct_params = {{"address", fmt_ea(*ea)}, {"bytes", new_bytes}};
+    }
+    else if (action == "delete_function")
+    {
+        auto ea = payload_location(payload, "address");
+        if (!ea)
+            return error_envelope(ctx, "bad_param", "address is invalid", {{"field", "address"}});
+        func_t* fn = get_func(*ea);
+        if (!fn)
+            return error_envelope(ctx, "bad_param", "no function contains address", {{"address", fmt_ea(*ea)}});
+        qstring old_name;
+        get_func_name(&old_name, fn->start_ea);
+        before["address"] = fmt_ea(fn->start_ea);
+        before["name"] = old_name.c_str();
+        if (payload.contains("expected_old_name") && payload["expected_old_name"].is_string() && payload["expected_old_name"].get<std::string>() != before.value("name", std::string()))
+            return error_envelope(ctx, "stale_generation", "expected_old_name does not match current function name", {{"expected", payload["expected_old_name"]}, {"actual", before["name"]}});
+        direct_tool = "delete_function";
+        direct_params = {{"address", fmt_ea(fn->start_ea)}};
+    }
+    else if (action == "idb_save")
+    {
+        before["idb_path"] = idb_path();
+        direct_tool = "idb_save";
+        direct_params = payload;
+    }
+    else
+    {
+        return error_envelope(ctx, "unknown_operation", "unsupported mutation action", {{"action", action}});
+    }
+
+    json receipt = mutation_receipt(action, payload, before, apply);
+    if (!apply)
+        return ok_envelope(ctx, {{"receipt", receipt}});
+    agent_tools::tool_result_t applied = invoke_registered(direct_tool, direct_params);
+    json data;
+    data["receipt"] = receipt;
+    data["result"] = wrapped_tool_result(direct_tool, applied);
+    if (!applied.success)
+        return error_envelope(ctx, applied.error_code.empty() ? "mutation_failed" : applied.error_code, applied.output, data);
+    return ok_envelope(ctx, data);
+}
+
+agent_tools::tool_result_t handle_mutation_manage(const json& params)
+{
+    agent_tools::tool_result_t failure;
+    request_ctx_t ctx = parse_request("ida_mutation_manage", params, mutation_ops(), failure);
+    if (!failure.output.empty() || !failure.data.is_null())
+        return failure;
+    if (ctx.operation == "capabilities")
+        return ok_envelope(ctx, make_capabilities(ctx.tool, mutation_ops()));
+    if (ctx.operation == "preview")
+        return apply_or_preview_mutation(ctx, ctx.payload.value("mutation", json::object()), false);
+    if (ctx.operation == "batch_preview" || ctx.operation == "batch_apply")
+    {
+        const bool apply = ctx.operation == "batch_apply";
+        if (apply && !destructive_confirmed(ctx, ctx.payload))
+            return error_envelope(ctx, "destructive_denied", "batch_apply requires confirm_destructive=true and a non-empty reason");
+        json results = json::array();
+        for (const auto& item : ctx.payload.value("items", json::array()))
+        {
+            json p = item;
+            if (apply)
+            {
+                p["confirm_destructive"] = true;
+                p["reason"] = ctx.payload.value("reason", std::string());
+            }
+            request_ctx_t item_ctx = ctx;
+            item_ctx.payload = p;
+            agent_tools::tool_result_t r = apply_or_preview_mutation(item_ctx, p, apply);
+            results.push_back({{"ok", r.success}, {"data", r.data}, {"message", r.output}, {"error_code", r.error_code.empty() ? json(nullptr) : json(r.error_code)}});
+            if (!r.success && apply)
+                return error_envelope(ctx, r.error_code.empty() ? "mutation_failed" : r.error_code, "batch_apply stopped at first failed mutation", {{"results", results}});
+        }
+        return ok_envelope(ctx, {{"results", results}, {"applied", apply}});
+    }
+    return apply_or_preview_mutation(ctx, ctx.payload, true);
+}
+
+agent_tools::tool_result_t handle_diagnostics_manage(const json& params)
+{
+    agent_tools::tool_result_t failure;
+    request_ctx_t ctx = parse_request("ida_diagnostics_manage", params, diagnostics_ops(), failure);
+    if (!failure.output.empty() || !failure.data.is_null())
+        return failure;
+    if (ctx.operation == "capabilities")
+        return ok_envelope(ctx, make_capabilities(ctx.tool, diagnostics_ops()));
+    if (ctx.operation == "health")
+        return ok_envelope(ctx, wrapped_tool_result("server_health", invoke_registered("server_health", json::object())));
+    if (ctx.operation == "tool_registry")
+        return ok_envelope(ctx, registry_catalog_data());
+    if (ctx.operation == "index_status")
+        return ok_envelope(ctx, wrapped_tool_result("index_status", invoke_registered("index_status", json::object())));
+    if (ctx.operation == "jobs")
+        return adopt_manage_result(ctx, handle_job_manage(forward_params(ctx, "diagnostics", json::object())));
+    if (ctx.operation == "chain")
+        return adopt_manage_result(ctx, handle_chain_manage(forward_params(ctx, "diagnostics", json::object())));
+    if (ctx.operation == "resources")
+        return ok_envelope(ctx, resource_catalog_data());
+    if (ctx.operation == "self_check")
+    {
+        json d;
+        d["chain_schema"] = aida::vuln::chain::to_json(aida::vuln::chain::chain_schema_self_check());
+        d["chain_report"] = aida::vuln::chain::to_json(aida::vuln::chain::chain_report_self_check());
+        d["chain_store"] = aida::vuln::chain::to_json(aida::vuln::chain::chain_store_self_check());
+        json registry = registry_catalog_data();
+        d["registry"] = registry["counts"];
+        return ok_envelope(ctx, d);
     }
     return error_envelope(ctx, "unknown_operation", "unhandled operation", {{"operation", ctx.operation}});
 }
@@ -3481,6 +4946,30 @@ void register_one(const std::string& name,
     def.deterministic = deterministic;
     def.output_schema = common_output_schema();
     def.required_indices = {};
+    def.visibility = "public";
+    for (const auto& meta : metas)
+    {
+        if (!meta.read_only)
+            def.read_only = false;
+        if (meta.destructive)
+            def.destructive = true;
+        if (!meta.deterministic)
+            def.deterministic = false;
+        agent_tools::tool_operation_t op;
+        op.name = meta.name;
+        op.description = meta.description;
+        op.read_only = meta.read_only;
+        op.destructive = meta.destructive;
+        op.deterministic = meta.deterministic;
+        op.job_mode = meta.job_mode;
+        op.cache_policy = meta.cache_policy;
+        op.default_timeout_ms = meta.default_timeout_ms;
+        op.hard_timeout_ms = meta.hard_timeout_ms;
+        op.required_indices = meta.required_indices;
+        op.input_schema = payload_schema(meta);
+        op.output_schema = common_output_schema();
+        def.operations.push_back(std::move(op));
+    }
     agent_tools::ToolRegistry::instance().register_tool(def);
 }
 
@@ -3507,6 +4996,41 @@ inline void register_manage_tools()
                  OBFSTR("Consolidated extraction and evidence MCP surface for functions, instructions, xrefs, bytes, decompilation, imports, exports, segments, corpus identity, and evidence fetch."),
                  extract_ops(),
                  handle_extract_manage,
+                 false,
+                 false);
+    register_one(OBFSTR("ida_discover_manage"),
+                 OBFSTR("ida_mcp_manage"),
+                 OBFSTR("Consolidated discovery MCP surface for public catalog, resources, live instances, module identity, functions, imports, exports, segments, and address lookup."),
+                 discover_ops(),
+                 handle_discover_manage,
+                 true,
+                 false);
+    register_one(OBFSTR("ida_analysis_manage"),
+                 OBFSTR("ida_mcp_manage"),
+                 OBFSTR("Consolidated analysis MCP surface for index status/build, function analysis, control/data flow, call graphs, taint analysis, and read-only vulnerability analysis routing."),
+                 analysis_ops(),
+                 handle_analysis_manage,
+                 false,
+                 false);
+    register_one(OBFSTR("ida_cache_manage"),
+                 OBFSTR("ida_mcp_manage"),
+                 OBFSTR("Consolidated cache MCP surface for extraction cache, project index pages, output cache, and job pruning."),
+                 cache_ops(),
+                 handle_cache_manage,
+                 false,
+                 false);
+    register_one(OBFSTR("ida_mutation_manage"),
+                 OBFSTR("ida_mcp_manage"),
+                 OBFSTR("Consolidated destructive IDB mutation MCP surface with previews, receipts, stale expected-old-value checks, confirmation, and reason capture."),
+                 mutation_ops(),
+                 handle_mutation_manage,
+                 false,
+                 false);
+    register_one(OBFSTR("ida_diagnostics_manage"),
+                 OBFSTR("ida_mcp_manage"),
+                 OBFSTR("Consolidated diagnostics MCP surface for health, registry visibility, resources, chain verifier state, index status, jobs, and self-checks."),
+                 diagnostics_ops(),
+                 handle_diagnostics_manage,
                  true,
                  false);
     register_one(OBFSTR("ida_report_manage"),

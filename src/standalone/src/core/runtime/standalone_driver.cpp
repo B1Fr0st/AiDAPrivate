@@ -2,6 +2,7 @@
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
 #include "anti-tamper/orchestrator.hpp"
+#include "anti-tamper/kernel_adbg_classifier.hpp"
 #include "driver_loader.hpp"
 #include "toast_notification.hpp"
 #include "arc/arc.h"
@@ -10269,6 +10270,13 @@ namespace driver_bridge
             static_cast<unsigned long>(ready_gle),
             static_cast<unsigned long long>(GetTickCount64() - ready_start),
             static_cast<unsigned long long>(GetTickCount64() - start));
+        const uint64_t ready_since = ready ? device->sentinel_ready_since_tsc() : 0;
+        diag::log_tagged_fmt("driver",
+            "sentinel_metadata_bridge_summary heartbeat_ok=%d bridge_ready=%d bridge_proof_tsc=%llu mapper_cached_size_authoritative=0 zero_cached_size_security_decision=0 fail_closed_on_bridge_failure=1 fail_closed_on_zero_base=1 total_ms=%llu",
+            hb_ok ? 1 : 0,
+            ready ? 1 : 0,
+            static_cast<unsigned long long>(ready_since),
+            static_cast<unsigned long long>(GetTickCount64() - start));
         SetLastError(ready ? ERROR_SUCCESS : ready_gle);
         return ready;
     }
@@ -10725,6 +10733,27 @@ namespace driver_bridge
                 static_cast<unsigned long long>(out.detected_debugger_pid),
                 static_cast<unsigned long long>(out.dr_clear_count),
                 static_cast<unsigned long long>(elapsed));
+        }
+        if (out.result_flags != 0 || out.detected_debugger_pid != 0) {
+            const DWORD preserved_error = GetLastError();
+            auto input = anti_tamper::kernel_adbg::make_input(out, "driver_bridge", "kernel_anti_debug_query");
+            uint64_t scan_pid = 0;
+            SetLastError(ERROR_SUCCESS);
+            input.scan_sampled = true;
+            input.scan_ok = kernel_anti_debug_scan_debuggers(&scan_pid);
+            const DWORD scan_error = input.scan_ok ? ERROR_SUCCESS : GetLastError();
+            input.scan_pid = scan_pid;
+            const auto decision = anti_tamper::kernel_adbg::classify(input);
+            const std::string line = anti_tamper::kernel_adbg::format_decision(input, decision);
+            driver_critical_fmt("%s", line.c_str());
+            if (!input.scan_ok) {
+                driver_critical_fmt("kernel_adbg_decision_scan_failed err=%lu flags=0x%08X debugger_pid=%llu reason=%s",
+                    static_cast<unsigned long>(scan_error),
+                    out.result_flags,
+                    static_cast<unsigned long long>(out.detected_debugger_pid),
+                    decision.reason ? decision.reason : "unknown");
+            }
+            SetLastError(preserved_error);
         }
         return true;
     }

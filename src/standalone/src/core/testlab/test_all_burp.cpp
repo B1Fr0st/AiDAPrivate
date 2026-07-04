@@ -60,6 +60,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cctype>
 #include <cstdarg>
@@ -196,7 +197,53 @@ namespace {
         return compact_burp_text(value.dump(), cap);
     }
 
+    int camoufox_bridge_visible_window_count_from_status(const aida::burp::camoufox::bridge_status_t& st) {
+        if (!st.last_launch_diagnostics.is_object())
+            return 0;
+        const auto proof_it = st.last_launch_diagnostics.find("visible_window_proof");
+        if (proof_it == st.last_launch_diagnostics.end() || !proof_it->is_object())
+            return 0;
+        const char* keys[] = { "visible_window_count", "visible_windows" };
+        for (const char* key : keys) {
+            const auto count_it = proof_it->find(key);
+            if (count_it == proof_it->end())
+                continue;
+            if (count_it->is_number_unsigned())
+                return static_cast<int>(std::min<uint64_t>(count_it->get<uint64_t>(), static_cast<uint64_t>(INT_MAX)));
+            if (count_it->is_number_integer()) {
+                const auto value = count_it->get<int64_t>();
+                return value > 0 ? static_cast<int>(std::min<int64_t>(value, static_cast<int64_t>(INT_MAX))) : 0;
+            }
+            if (count_it->is_boolean())
+                return count_it->get<bool>() ? 1 : 0;
+        }
+        return 0;
+    }
+
     void log_camoufox_bridge_snapshot(HANDLE hf, const char* tag, const char* label, const aida::burp::camoufox::bridge_status_t& st) {
+        const int visible_windows = camoufox_bridge_visible_window_count_from_status(st);
+        log_msg(hf, tag, "%s status state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d visible_windows=%d cleanup_pending=%d phase=%s readiness_phase=%s error_type=%s error_kind=%s protocol_schema_viewport=%d attempt_started_ms=%llu attempt_elapsed_ms=%llu last_attempt_elapsed_ms=%llu status_age_ms=%llu last_debug_event=%s last_error=%s",
+            label,
+            camoufox_bridge_state_name(st.state),
+            static_cast<unsigned long long>(st.generation),
+            st.child_pid,
+            st.child_alive ? 1 : 0,
+            st.browser_open ? 1 : 0,
+            st.page_verified ? 1 : 0,
+            st.privacy_verified ? 1 : 0,
+            visible_windows,
+            st.cleanup_pending ? 1 : 0,
+            st.phase.empty() ? "<empty>" : compact_burp_text(st.phase, 160).c_str(),
+            st.readiness_phase.empty() ? "<empty>" : compact_burp_text(st.readiness_phase, 160).c_str(),
+            st.error_type.empty() ? "<empty>" : compact_burp_text(st.error_type, 160).c_str(),
+            st.error_kind.empty() ? "<empty>" : compact_burp_text(st.error_kind, 160).c_str(),
+            st.protocol_schema_viewport ? 1 : 0,
+            static_cast<unsigned long long>(st.attempt_started_ms),
+            static_cast<unsigned long long>(st.attempt_elapsed_ms),
+            static_cast<unsigned long long>(st.last_attempt_elapsed_ms),
+            static_cast<unsigned long long>(st.status_age_ms),
+            st.last_debug_event.empty() ? "<empty>" : compact_burp_text(st.last_debug_event, 240).c_str(),
+            st.last_error.empty() ? "<empty>" : compact_burp_text(st.last_error, 360).c_str());
         log_msg(hf, tag, "%s cleanup generation=%llu child_pid=%u started_ms=%llu last_cleanup_ms=%llu reason=%s",
             label,
             static_cast<unsigned long long>(st.cleanup_generation),
@@ -305,6 +352,93 @@ namespace {
             return true;
         }
         return false;
+    }
+
+    bool camoufox_bridge_live_ready(const aida::burp::camoufox::bridge_status_t& st) {
+        return st.state == aida::burp::camoufox::bridge_state_t::ready &&
+            st.child_pid != 0 &&
+            st.child_alive &&
+            st.browser_open &&
+            st.page_verified &&
+            st.privacy_verified &&
+            camoufox_bridge_visible_window_count_from_status(st) > 0 &&
+            !st.cleanup_pending;
+    }
+
+    struct camoufox_bridge_retry_cache_t {
+        bool active = false;
+        uint64_t generation = 0;
+        std::string signature;
+        std::string reason;
+        bool recovery_consumed = false;
+        uint64_t cached_ms = 0;
+    };
+
+    std::mutex& camoufox_bridge_retry_cache_mutex() {
+        static std::mutex m;
+        return m;
+    }
+
+    camoufox_bridge_retry_cache_t& camoufox_bridge_retry_cache() {
+        static camoufox_bridge_retry_cache_t cache;
+        return cache;
+    }
+
+    std::string camoufox_bridge_failure_signature(const aida::burp::camoufox::bridge_status_t& st) {
+        std::ostringstream oss;
+        oss << "state=" << camoufox_bridge_state_name(st.state)
+            << "|generation=" << static_cast<unsigned long long>(st.generation)
+            << "|readiness=" << (st.readiness_phase.empty() ? "<empty>" : compact_burp_text(st.readiness_phase, 180))
+            << "|phase=" << (st.phase.empty() ? "<empty>" : compact_burp_text(st.phase, 180))
+            << "|error_type=" << (st.error_type.empty() ? "<empty>" : compact_burp_text(st.error_type, 180))
+            << "|error_kind=" << (st.error_kind.empty() ? "<empty>" : compact_burp_text(st.error_kind, 180))
+            << "|protocol_schema_viewport=" << (st.protocol_schema_viewport ? 1 : 0)
+            << "|child_pid=" << st.child_pid
+            << "|child_alive=" << (st.child_alive ? 1 : 0)
+            << "|browser_open=" << (st.browser_open ? 1 : 0)
+            << "|page_verified=" << (st.page_verified ? 1 : 0)
+            << "|privacy_verified=" << (st.privacy_verified ? 1 : 0)
+            << "|visible_windows=" << camoufox_bridge_visible_window_count_from_status(st)
+            << "|cleanup_pending=" << (st.cleanup_pending ? 1 : 0)
+            << "|last_debug_event=" << (st.last_debug_event.empty() ? "<empty>" : compact_burp_text(st.last_debug_event, 240))
+            << "|last_error=" << (st.last_error.empty() ? "<empty>" : compact_burp_text(st.last_error, 240));
+        return oss.str();
+    }
+
+    void camoufox_bridge_retry_cache_clear() {
+        std::lock_guard<std::mutex> lk(camoufox_bridge_retry_cache_mutex());
+        camoufox_bridge_retry_cache() = camoufox_bridge_retry_cache_t{};
+    }
+
+    void camoufox_bridge_retry_cache_record(const aida::burp::camoufox::bridge_status_t& st, const std::string& reason, bool recovery_consumed) {
+        std::lock_guard<std::mutex> lk(camoufox_bridge_retry_cache_mutex());
+        auto& cache = camoufox_bridge_retry_cache();
+        const std::string signature = camoufox_bridge_failure_signature(st);
+        const bool same_terminal = cache.active && cache.generation == st.generation && cache.signature == signature;
+        cache.active = true;
+        cache.generation = st.generation;
+        cache.signature = signature;
+        cache.reason = reason.empty() ? std::string("camoufox bridge dependency failed") : reason;
+        cache.recovery_consumed = recovery_consumed || (same_terminal && cache.recovery_consumed);
+        cache.cached_ms = GetTickCount64();
+    }
+
+    bool camoufox_bridge_retry_cache_match(const aida::burp::camoufox::bridge_status_t& st, bool require_recovery_consumed, std::string& reason, std::string& signature) {
+        std::lock_guard<std::mutex> lk(camoufox_bridge_retry_cache_mutex());
+        const auto& cache = camoufox_bridge_retry_cache();
+        signature = camoufox_bridge_failure_signature(st);
+        if (!cache.active || cache.generation != st.generation || cache.signature != signature)
+            return false;
+        if (require_recovery_consumed && !cache.recovery_consumed)
+            return false;
+        std::ostringstream oss;
+        oss << cache.reason
+            << " generation=" << static_cast<unsigned long long>(cache.generation)
+            << " recovery_consumed=" << (cache.recovery_consumed ? 1 : 0)
+            << " age_ms=" << static_cast<unsigned long long>(GetTickCount64() - cache.cached_ms)
+            << " signature=" << compact_burp_text(cache.signature, 700);
+        reason = oss.str();
+        return true;
     }
 
     bool camoufox_install_status_ready(const aida::burp::camoufox::install::status_t& st) {
@@ -3568,14 +3702,22 @@ namespace {
             (st.state == aida::burp::camoufox::bridge_state_t::ready
                 ? (st.child_pid != 0 && st.child_alive && st.browser_open && st.page_verified && st.privacy_verified && !st.cleanup_pending)
                 : true);
-        log_msg(hf, tag, "state=%d browser_open=%s total_calls=%llu total_errors=%llu child_pid=%u child_alive=%d page_verified=%d privacy_verified=%d cleanup_pending=%d",
+        log_msg(hf, tag, "state=%d browser_open=%s total_calls=%llu total_errors=%llu child_pid=%u child_alive=%d page_verified=%d privacy_verified=%d cleanup_pending=%d phase=%s readiness_phase=%s error_type=%s error_kind=%s protocol_schema_viewport=%d attempt_elapsed_ms=%llu status_age_ms=%llu last_debug_event=%s",
             (int)st.state, st.browser_open ? "true" : "false",
             (unsigned long long)st.total_calls, (unsigned long long)st.total_errors,
-            st.child_pid, st.child_alive ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0, st.cleanup_pending ? 1 : 0);
+            st.child_pid, st.child_alive ? 1 : 0, st.page_verified ? 1 : 0, st.privacy_verified ? 1 : 0, st.cleanup_pending ? 1 : 0,
+            st.phase.empty() ? "<empty>" : compact_burp_text(st.phase, 160).c_str(),
+            st.readiness_phase.empty() ? "<empty>" : compact_burp_text(st.readiness_phase, 160).c_str(),
+            st.error_type.empty() ? "<empty>" : compact_burp_text(st.error_type, 160).c_str(),
+            st.error_kind.empty() ? "<empty>" : compact_burp_text(st.error_kind, 160).c_str(),
+            st.protocol_schema_viewport ? 1 : 0,
+            static_cast<unsigned long long>(st.attempt_elapsed_ms),
+            static_cast<unsigned long long>(st.status_age_ms),
+            st.last_debug_event.empty() ? "<empty>" : compact_burp_text(st.last_debug_event, 240).c_str());
         log_camoufox_bridge_snapshot(hf, tag, "status_bridge", st);
         if (!well_formed) {
             fail_empty_evidence(hf, tag, failed,
-                "Camoufox status accessor returned malformed response state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d launch_diag=%s cleanup_diag=%s privacy_diag=%s",
+                "Camoufox status accessor returned malformed response state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d phase=%s readiness_phase=%s error_type=%s error_kind=%s protocol_schema_viewport=%d attempt_elapsed_ms=%llu status_age_ms=%llu launch_diag=%s cleanup_diag=%s privacy_diag=%s",
                 camoufox_bridge_state_name(st.state),
                 st.child_pid,
                 st.child_alive ? 1 : 0,
@@ -3583,6 +3725,13 @@ namespace {
                 st.page_verified ? 1 : 0,
                 st.privacy_verified ? 1 : 0,
                 st.cleanup_pending ? 1 : 0,
+                st.phase.empty() ? "<empty>" : compact_burp_text(st.phase, 160).c_str(),
+                st.readiness_phase.empty() ? "<empty>" : compact_burp_text(st.readiness_phase, 160).c_str(),
+                st.error_type.empty() ? "<empty>" : compact_burp_text(st.error_type, 160).c_str(),
+                st.error_kind.empty() ? "<empty>" : compact_burp_text(st.error_kind, 160).c_str(),
+                st.protocol_schema_viewport ? 1 : 0,
+                static_cast<unsigned long long>(st.attempt_elapsed_ms),
+                static_cast<unsigned long long>(st.status_age_ms),
                 compact_burp_json(st.last_launch_diagnostics, 300).c_str(),
                 compact_burp_json(st.cleanup_diagnostics, 300).c_str(),
                 compact_burp_json(st.privacy_diagnostics, 300).c_str());
@@ -3622,18 +3771,35 @@ namespace {
             before.last_error.empty() ? "<empty>" : compact_burp_text(before.last_error, 700).c_str());
         log_camoufox_bridge_snapshot(hf, tag, "initial_status", before);
         if (ready) {
+            camoufox_bridge_retry_cache_clear();
             log_msg(hf, tag, "PASS -- Camoufox bridge is ready");
             passed.fetch_add(1);
             return;
         }
+        std::string cached_reason;
+        std::string cached_signature;
+        if (camoufox_bridge_retry_cache_match(before, true, cached_reason, cached_signature)) {
+            log_msg(hf, tag, "DEPENDENCY-BLOCKED -- cached Camoufox bridge terminal failure; bounded relaunch suppressed reason=%s",
+                compact_burp_text(cached_reason, 900).c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox cached dependency block; relaunch suppressed reason=%s",
+                compact_burp_text(cached_reason, 900).c_str());
+            return;
+        }
         std::string sticky_marker;
         if (camoufox_bridge_sticky_setup_failure(before, sticky_marker)) {
+            camoufox_bridge_retry_cache_record(before, std::string("sticky setup failure before recovery ") + sticky_marker, true);
             log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox nonretryable setup failure; bounded relaunch suppressed marker=%s",
                 sticky_marker.c_str());
             return;
         }
+        const bool cold_signature_seen = camoufox_bridge_retry_cache_match(before, false, cached_reason, cached_signature);
+        log_msg(hf, tag, "recovery_policy cold_signature_seen=%d generation=%llu signature=%s",
+            cold_signature_seen ? 1 : 0,
+            static_cast<unsigned long long>(before.generation),
+            compact_burp_text(cached_signature, 900).c_str());
         const uint64_t t0 = GetTickCount64();
         static test_lab::bounded_runner_t relaunch_runner(1);
         auto relaunch_state = std::make_shared<std::atomic<bool>>(false);
@@ -3645,6 +3811,7 @@ namespace {
             }
         });
         if (relaunch_result.status == test_lab::bounded_run_status_t::timed_out) {
+            camoufox_bridge_retry_cache_record(before, "bounded ensure_ready timed out", true);
             log_msg(hf, tag, "TIMEOUT -- bounded ensure_ready() relaunch exceeded 60000ms elapsed_ms=%llu",
                 static_cast<unsigned long long>(GetTickCount64() - t0));
             fail_empty_evidence(hf, tag, failed,
@@ -3657,12 +3824,14 @@ namespace {
             return;
         }
         if (relaunch_result.status == test_lab::bounded_run_status_t::saturated) {
+            camoufox_bridge_retry_cache_record(before, "bounded ensure_ready runner saturated", true);
             log_msg(hf, tag, "SATURATED -- bounded relaunch runner saturated");
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox bounded ensure_ready() relaunch saturated; previous timed-out workers still draining");
             return;
         }
         if (relaunch_result.status == test_lab::bounded_run_status_t::exception) {
+            camoufox_bridge_retry_cache_record(before, std::string("bounded ensure_ready exception ") + relaunch_result.error, true);
             log_msg(hf, tag, "EXCEPTION -- bounded relaunch threw: %s",
                 relaunch_result.error.empty() ? "<unknown>" : relaunch_result.error.c_str());
             fail_empty_evidence(hf, tag, failed,
@@ -3671,6 +3840,7 @@ namespace {
             return;
         }
         if (relaunch_result.status == test_lab::bounded_run_status_t::post_failed) {
+            camoufox_bridge_retry_cache_record(before, "bounded ensure_ready post failed", true);
             log_msg(hf, tag, "POST-FAILED -- bounded relaunch could not post to work queue");
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox bounded ensure_ready() relaunch post failed");
@@ -3697,17 +3867,20 @@ namespace {
             after.last_error.empty() ? "<empty>" : compact_burp_text(after.last_error, 700).c_str());
         log_camoufox_bridge_snapshot(hf, tag, "relaunch_status", after);
         if (ready_after) {
+            camoufox_bridge_retry_cache_clear();
             log_msg(hf, tag, "PASS -- Camoufox bridge recovered from initial not-ready state child_pid=%u", after.child_pid);
             passed.fetch_add(1);
             return;
         }
         if (camoufox_bridge_sticky_setup_failure(after, sticky_marker)) {
+            camoufox_bridge_retry_cache_record(after, std::string("sticky setup failure after recovery ") + sticky_marker, true);
             log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox nonretryable setup failure after bounded relaunch marker=%s",
                 sticky_marker.c_str());
             return;
         }
+        camoufox_bridge_retry_cache_record(after, "bounded recovery exhausted with Camoufox bridge still not ready", true);
         fail_empty_evidence(hf, tag, failed,
             "Camoufox readiness is false after relaunch attempt state=%s generation=%llu child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d cleanup_generation=%llu cleanup_child_pid=%u child_processes=%u browser_processes=%u pages=%u cleanup_reason=%s last_error=%s launch_diag=%s cleanup_diag=%s",
             camoufox_bridge_state_name(after.state),
@@ -4878,13 +5051,7 @@ namespace {
             return;
         }
         auto bridge_before = aida::burp::camoufox::get_status();
-        const bool ready_before = bridge_before.state == aida::burp::camoufox::bridge_state_t::ready &&
-            bridge_before.child_pid != 0 &&
-            bridge_before.child_alive &&
-            bridge_before.browser_open &&
-            bridge_before.page_verified &&
-            bridge_before.privacy_verified &&
-            !bridge_before.cleanup_pending;
+        const bool ready_before = camoufox_bridge_live_ready(bridge_before);
         const std::string before_launcher_kind = camoufox_launcher_kind(install_before);
         const std::string before_mcp_executable = camoufox_mcp_executable_label(install_before, &bridge_before);
         log_msg(hf, tag, "before install_state=%s message=%s launcher_kind=%s mcp_executable=%s python_path=%s module=%s browser=%s bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u",
@@ -4906,13 +5073,25 @@ namespace {
             bridge_before.browser_process_count);
         log_camoufox_bridge_snapshot(hf, tag, "before_bridge", bridge_before);
         if (ready_before) {
+            camoufox_bridge_retry_cache_clear();
             log_msg(hf, tag, "PASS -- reused pre-existing live Camoufox bridge child_pid=%u without forcing a cold launch",
                 bridge_before.child_pid);
             passed.fetch_add(1);
             return;
         }
+        std::string cached_reason;
+        std::string cached_signature;
+        if (camoufox_bridge_retry_cache_match(bridge_before, true, cached_reason, cached_signature)) {
+            log_msg(hf, tag, "DEPENDENCY-BLOCKED -- cached Camoufox bridge terminal failure; cold launch suppressed reason=%s",
+                compact_burp_text(cached_reason, 900).c_str());
+            fail_empty_evidence(hf, tag, failed,
+                "Camoufox cached dependency block; cold launch suppressed reason=%s",
+                compact_burp_text(cached_reason, 900).c_str());
+            return;
+        }
         std::string sticky_marker;
         if (camoufox_bridge_sticky_setup_failure(bridge_before, sticky_marker)) {
+            camoufox_bridge_retry_cache_record(bridge_before, std::string("sticky setup failure before cold proof ") + sticky_marker, true);
             log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox nonretryable setup failure; launch suppressed marker=%s",
@@ -4928,13 +5107,7 @@ namespace {
         cfg.testlab_fast_probe = false;
         bool launched = aida::burp::camoufox::start_bridge(cfg);
         auto bridge_after = aida::burp::camoufox::get_status();
-        const bool ready = bridge_after.state == aida::burp::camoufox::bridge_state_t::ready &&
-            bridge_after.child_pid != 0 &&
-            bridge_after.child_alive &&
-            bridge_after.browser_open &&
-            bridge_after.page_verified &&
-            bridge_after.privacy_verified &&
-            !bridge_after.cleanup_pending;
+        const bool ready = camoufox_bridge_live_ready(bridge_after);
         const std::string after_mcp_executable = camoufox_mcp_executable_label(install_before, &bridge_after);
         log_msg(hf, tag, "after launched=%d ready=%d bridge_state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u mcp_executable=%s launched_ms=%llu last_error=%s elapsed_ms=%llu",
             launched ? 1 : 0,
@@ -4955,12 +5128,14 @@ namespace {
         log_camoufox_bridge_snapshot(hf, tag, "after_bridge", bridge_after);
         if (!ready) {
             if (camoufox_bridge_sticky_setup_failure(bridge_after, sticky_marker)) {
+                camoufox_bridge_retry_cache_record(bridge_after, std::string("sticky setup failure after cold proof ") + sticky_marker, true);
                 log_msg(hf, tag, "CAMOUFOX-PREFLIGHT -- sticky setup failure %s", sticky_marker.c_str());
                 fail_empty_evidence(hf, tag, failed,
                     "Camoufox nonretryable setup failure after launch attempt marker=%s",
                     sticky_marker.c_str());
                 return;
             }
+            camoufox_bridge_retry_cache_record(bridge_after, "cold Camoufox launch proof failed; one bounded recovery remains for matching signature", false);
             fail_empty_evidence(hf, tag, failed,
                 "Camoufox browser did not launch into a ready live state state=%s child_pid=%u child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d child_processes=%u browser_processes=%u last_error=%s launch_diag=%s cleanup_diag=%s privacy_diag=%s",
                 camoufox_bridge_state_name(bridge_after.state),
@@ -4984,6 +5159,7 @@ namespace {
                 bridge_after.child_pid,
                 bridge_after.last_error.empty() ? "<empty>" : bridge_after.last_error.c_str());
         }
+        camoufox_bridge_retry_cache_clear();
         log_msg(hf, tag, "PASS -- Camoufox-only browser ready child_pid=%u launched=%d retained_for_downstream=1 elapsed_ms=%llu",
             bridge_after.child_pid,
             launched ? 1 : 0,

@@ -78,6 +78,12 @@ namespace anti_tamper::mcp_posture
         std::size_t files_with_mcp = 0;
         std::size_t servers_seen = 0;
         std::size_t managed_allowed = 0;
+        std::size_t managed_aida_local = 0;
+        std::size_t managed_aida_ida_local = 0;
+        std::size_t managed_internal_camoufox = 0;
+        std::size_t ambient_enabled = 0;
+        std::size_t ambient_disabled = 0;
+        std::size_t ambient_suspicious = 0;
         std::size_t enabled_unknown = 0;
         std::size_t disabled_unknown = 0;
         std::size_t suspicious = 0;
@@ -1921,6 +1927,12 @@ namespace anti_tamper::mcp_posture
             fnv_mix(h, r.files_with_mcp);
             fnv_mix(h, r.servers_seen);
             fnv_mix(h, r.managed_allowed);
+            fnv_mix(h, r.managed_aida_local);
+            fnv_mix(h, r.managed_aida_ida_local);
+            fnv_mix(h, r.managed_internal_camoufox);
+            fnv_mix(h, r.ambient_enabled);
+            fnv_mix(h, r.ambient_disabled);
+            fnv_mix(h, r.ambient_suspicious);
             fnv_mix(h, r.enabled_unknown);
             fnv_mix(h, r.disabled_unknown);
             fnv_mix(h, r.suspicious);
@@ -2077,12 +2089,25 @@ namespace anti_tamper::mcp_posture
             for (const auto& entry : entries) {
                 ++report.servers_seen;
                 finding_t f = detail::evaluate_entry(entry, configured_port, false, false, true);
-                if (f.managed_name && !f.deny)
+                if (f.managed_name && !f.deny) {
                     ++report.managed_allowed;
-                else if (f.enabled && !f.managed_name)
-                    ++report.enabled_unknown;
-                else if (!f.enabled && !f.managed_name)
-                    ++report.disabled_unknown;
+                    if (f.reason == "managed_aida_local" || f.reason == "managed_aida_local_stale_port")
+                        ++report.managed_aida_local;
+                    else if (f.reason == "managed_aida_ida_local")
+                        ++report.managed_aida_ida_local;
+                    else if (f.reason == "managed_internal_camoufox_stdio")
+                        ++report.managed_internal_camoufox;
+                } else if (!f.managed_name) {
+                    if (f.enabled) {
+                        ++report.enabled_unknown;
+                        ++report.ambient_enabled;
+                    } else {
+                        ++report.disabled_unknown;
+                        ++report.ambient_disabled;
+                    }
+                    if (f.deny || f.high_risk_command || f.high_risk_url || f.offensive_tool_metadata)
+                        ++report.ambient_suspicious;
+                }
                 detail::apply_decision(report, std::move(f));
             }
         }
@@ -2103,7 +2128,19 @@ namespace anti_tamper::mcp_posture
         detail::cache_report(report);
         report = cached_report();
         diag::log_tagged_critical_fmt("mcp_posture",
-            "startup_scan_done trusted=%d denied=%d latched=%d files=%zu mcp_files=%zu servers=%zu managed=%zu enabled_unknown=%zu disabled_unknown=%zu suspicious=%zu parse_failures=%zu summary_hash=0x%016llX reason=%s",
+            "startup_posture_scope_summary ambient_user_enabled=%zu ambient_user_disabled=%zu ambient_user_suspicious=%zu managed_total=%zu managed_aida_local=%zu managed_aida_ida_local=%zu managed_camoufox_internal=%zu enabled_unknown=%zu disabled_unknown=%zu name_only_trust=0 summary_hash=0x%016llX",
+            report.ambient_enabled,
+            report.ambient_disabled,
+            report.ambient_suspicious,
+            report.managed_allowed,
+            report.managed_aida_local,
+            report.managed_aida_ida_local,
+            report.managed_internal_camoufox,
+            report.enabled_unknown,
+            report.disabled_unknown,
+            static_cast<unsigned long long>(report.summary_hash));
+        diag::log_tagged_critical_fmt("mcp_posture",
+            "startup_scan_done trusted=%d denied=%d latched=%d files=%zu mcp_files=%zu servers=%zu managed=%zu managed_aida=%zu managed_ida=%zu managed_camoufox=%zu ambient_enabled=%zu ambient_disabled=%zu ambient_suspicious=%zu enabled_unknown=%zu disabled_unknown=%zu suspicious=%zu parse_failures=%zu summary_hash=0x%016llX reason=%s",
             report.trusted ? 1 : 0,
             report.denied ? 1 : 0,
             report.latched ? 1 : 0,
@@ -2111,6 +2148,12 @@ namespace anti_tamper::mcp_posture
             report.files_with_mcp,
             report.servers_seen,
             report.managed_allowed,
+            report.managed_aida_local,
+            report.managed_aida_ida_local,
+            report.managed_internal_camoufox,
+            report.ambient_enabled,
+            report.ambient_disabled,
+            report.ambient_suspicious,
             report.enabled_unknown,
             report.disabled_unknown,
             report.suspicious,
@@ -2144,20 +2187,30 @@ namespace anti_tamper::mcp_posture
                 f.deny = true;
                 f.reason = camoufox_predicate.empty() ? "camoufox_internal_predicate_failed" : camoufox_predicate;
                 const auto browser_it = cfg.env.find("AIDA_CAMOUFOX_EXECUTABLE");
+                const auto mcp_it = cfg.env.find("AIDA_CAMOUFOX_MCP_EXECUTABLE");
+                const auto python_it = cfg.env.find("AIDA_CAMOUFOX_PYTHON");
+                const auto session_it = cfg.env.find("AIDA_CAMOUFOX_SESSION_ID");
                 const auto work_it = cfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
                 const auto profile_it = cfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT");
+                const bool stdio_parent_bound = cfg.transport == mcp_client::transport_type_t::stdio && cfg.url.empty();
                 diag::log_tagged_fmt("mcp_posture",
-                    "runtime_camoufox_internal_reject server_hash=0x%016llX name_len=%zu source_reason=%s predicate=%s command_hash=0x%016llX browser_hash=0x%016llX work_hash=0x%016llX profile_hash=0x%016llX args=%zu env=%zu summary_hash=0x%016llX",
+                    "runtime_camoufox_internal_reject server_hash=0x%016llX name_len=%zu source_reason=%s predicate=%s command_hash=0x%016llX mcp_hash=0x%016llX browser_hash=0x%016llX python_hash=0x%016llX work_hash=0x%016llX profile_hash=0x%016llX session_hash=0x%016llX args=%zu env=%zu stdio_parent_bound=%d trust_by_name_only=0 startup_managed_camoufox=%zu startup_ambient_enabled=%zu summary_hash=0x%016llX",
                     static_cast<unsigned long long>(f.server_hash),
                     f.name_len,
                     source_reason.c_str(),
                     f.reason.c_str(),
                     static_cast<unsigned long long>(detail::fnv1a_string(detail::canonical_lower_path(cfg.command))),
+                    static_cast<unsigned long long>(mcp_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(mcp_it->second))),
                     static_cast<unsigned long long>(browser_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(browser_it->second))),
+                    static_cast<unsigned long long>(python_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(python_it->second))),
                     static_cast<unsigned long long>(work_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(work_it->second))),
                     static_cast<unsigned long long>(profile_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(profile_it->second))),
+                    static_cast<unsigned long long>(session_it == cfg.env.end() ? 0 : detail::fnv1a_string(session_it->second)),
                     cfg.args.size(),
                     cfg.env.size(),
+                    stdio_parent_bound ? 1 : 0,
+                    cached.managed_internal_camoufox,
+                    cached.ambient_enabled,
                     static_cast<unsigned long long>(cached_summary_hash()));
                 detail::apply_decision(cached, f);
                 detail::latch_runtime_denial(f);
@@ -2170,20 +2223,30 @@ namespace anti_tamper::mcp_posture
                 return false;
             }
             const auto browser_it = cfg.env.find("AIDA_CAMOUFOX_EXECUTABLE");
+            const auto mcp_it = cfg.env.find("AIDA_CAMOUFOX_MCP_EXECUTABLE");
+            const auto python_it = cfg.env.find("AIDA_CAMOUFOX_PYTHON");
+            const auto session_it = cfg.env.find("AIDA_CAMOUFOX_SESSION_ID");
             const auto work_it = cfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
             const auto profile_it = cfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT");
+            const bool stdio_parent_bound = cfg.transport == mcp_client::transport_type_t::stdio && cfg.url.empty();
             diag::log_tagged_fmt("mcp_posture",
-                "runtime_camoufox_internal_allow server_hash=0x%016llX name_len=%zu source_reason=%s predicate=%s command_hash=0x%016llX browser_hash=0x%016llX work_hash=0x%016llX profile_hash=0x%016llX args=%zu env=%zu summary_hash=0x%016llX",
+                "runtime_camoufox_internal_allow server_hash=0x%016llX name_len=%zu source_reason=%s predicate=%s command_hash=0x%016llX mcp_hash=0x%016llX browser_hash=0x%016llX python_hash=0x%016llX work_hash=0x%016llX profile_hash=0x%016llX session_hash=0x%016llX args=%zu env=%zu stdio_parent_bound=%d trust_by_name_only=0 startup_managed_camoufox=%zu startup_ambient_enabled=%zu summary_hash=0x%016llX",
                 static_cast<unsigned long long>(f.server_hash),
                 f.name_len,
                 source_reason.c_str(),
                 camoufox_predicate.empty() ? "trusted" : camoufox_predicate.c_str(),
                 static_cast<unsigned long long>(detail::fnv1a_string(detail::canonical_lower_path(cfg.command))),
+                static_cast<unsigned long long>(mcp_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(mcp_it->second))),
                 static_cast<unsigned long long>(browser_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(browser_it->second))),
+                static_cast<unsigned long long>(python_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(python_it->second))),
                 static_cast<unsigned long long>(work_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(work_it->second))),
                 static_cast<unsigned long long>(profile_it == cfg.env.end() ? 0 : detail::fnv1a_string(detail::canonical_lower_path(profile_it->second))),
+                static_cast<unsigned long long>(session_it == cfg.env.end() ? 0 : detail::fnv1a_string(session_it->second)),
                 cfg.args.size(),
                 cfg.env.size(),
+                stdio_parent_bound ? 1 : 0,
+                cached.managed_internal_camoufox,
+                cached.ambient_enabled,
                 static_cast<unsigned long long>(cached_summary_hash()));
             return true;
         }

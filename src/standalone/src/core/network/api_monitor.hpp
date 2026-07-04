@@ -170,6 +170,7 @@ struct state_t {
 inline state_t g_state;
 
 inline nlohmann::json status_json();
+inline uint64_t context_dr_address(const driver_bridge::thread_context_t& ctx, uint32_t slot);
 
 inline bool phase_target_liveness(uint32_t pid) {
     if (pid == 0 || pid == 4)
@@ -1956,23 +1957,82 @@ inline bool arm_breakpoints_for_thread(uint32_t tid) {
     bool armed = false;
     auto targets = targets_snapshot();
     for (const auto& target : targets) {
-        if (driver_bridge::set_hardware_breakpoint(tid, static_cast<int>(target.bp_index), target.address, 0, 0)) {
+        driver_bridge::thread_context_t before{};
+        SetLastError(ERROR_SUCCESS);
+        const bool before_ok = driver_bridge::get_thread_context(tid, before);
+        const DWORD before_gle = before_ok ? ERROR_SUCCESS : GetLastError();
+        const auto dyn_before = driver_bridge::dynamic_ioctl_state();
+        SetLastError(ERROR_SUCCESS);
+        const bool set_ok = driver_bridge::set_hardware_breakpoint(tid, static_cast<int>(target.bp_index), target.address, 0, 0);
+        const DWORD set_gle = set_ok ? ERROR_SUCCESS : GetLastError();
+        const std::string set_status = driver_bridge::status();
+        const std::string set_last_error = driver_bridge::last_error();
+        driver_bridge::thread_context_t after{};
+        SetLastError(ERROR_SUCCESS);
+        const bool after_ok = driver_bridge::get_thread_context(tid, after);
+        const DWORD after_gle = after_ok ? ERROR_SUCCESS : GetLastError();
+        const uint64_t slot_addr = after_ok ? context_dr_address(after, target.bp_index) : 0;
+        const bool slot_enabled = after_ok && target.bp_index <= 3 && ((after.dr7 & (1ull << static_cast<unsigned>(target.bp_index * 2))) != 0);
+        const bool verify_ok = set_ok && after_ok && slot_addr == target.address && slot_enabled;
+        if (verify_ok) {
             mark_thread_armed(target.address, tid);
             armed = true;
+        }
+        diag::log_tagged_fmt("api_monitor",
+            "arm_thread tid=%u slot=%u type=execute len=1 driver_type=%d driver_size=%d api=%s addr=%s set_ok=%d set_gle=%lu before_ok=%d before_gle=%lu after_ok=%d after_gle=%lu verify_ok=%d slot_addr=%s slot_enabled=%d rip=%s dr0=%s dr1=%s dr2=%s dr3=%s dr6=0x%llX dr7=0x%llX dyn_loaded=%d dyn_kernel=%d dyn_connected=%d dyn_ready=%d dyn_instance_server_seed=0x%08X dyn_instance_ioctl_seed=0x%08X dyn_global_server_seed=0x%08X dyn_global_ioctl_seed=0x%08X dyn_ioctl_seed_hash=0x%08X dyn_heartbeat_seed_hash=0x%08X status=%s last_error=%s",
+            tid,
+            target.bp_index,
+            0,
+            0,
+            target.request.original.c_str(),
+            hex_addr(target.address).c_str(),
+            set_ok ? 1 : 0,
+            static_cast<unsigned long>(set_gle),
+            before_ok ? 1 : 0,
+            static_cast<unsigned long>(before_gle),
+            after_ok ? 1 : 0,
+            static_cast<unsigned long>(after_gle),
+            verify_ok ? 1 : 0,
+            hex_addr(slot_addr).c_str(),
+            slot_enabled ? 1 : 0,
+            hex_addr(after.rip).c_str(),
+            hex_addr(after.dr0).c_str(),
+            hex_addr(after.dr1).c_str(),
+            hex_addr(after.dr2).c_str(),
+            hex_addr(after.dr3).c_str(),
+            static_cast<unsigned long long>(after.dr6),
+            static_cast<unsigned long long>(after.dr7),
+            dyn_before.loaded ? 1 : 0,
+            dyn_before.kernel ? 1 : 0,
+            dyn_before.connected ? 1 : 0,
+            dyn_before.ready ? 1 : 0,
+            dyn_before.instance_server_seed,
+            dyn_before.instance_ioctl_seed,
+            dyn_before.global_server_seed,
+            dyn_before.global_ioctl_seed,
+            dyn_before.ioctl_seed_hash,
+            dyn_before.heartbeat_ioctl_seed_hash,
+            set_status.c_str(),
+            set_last_error.c_str());
+        if (set_ok) {
             diag::log_tagged_fmt("api_monitor",
-                "arm_thread tid=%u slot=%u api=%s addr=%s ok=1",
-                tid,
-                target.bp_index,
-                target.request.original.c_str(),
-                hex_addr(target.address).c_str());
-        } else {
-            diag::log_tagged_fmt("api_monitor",
-                "arm_thread tid=%u slot=%u api=%s addr=%s ok=0 gle=%lu",
+                "arm_thread_result tid=%u slot=%u api=%s addr=%s ok=1 verify_ok=%d readback_available=%d",
                 tid,
                 target.bp_index,
                 target.request.original.c_str(),
                 hex_addr(target.address).c_str(),
-                GetLastError());
+                verify_ok ? 1 : 0,
+                after_ok ? 1 : 0);
+        } else {
+            diag::log_tagged_fmt("api_monitor",
+                "arm_thread_result tid=%u slot=%u api=%s addr=%s ok=0 gle=%lu status=%s last_error=%s",
+                tid,
+                target.bp_index,
+                target.request.original.c_str(),
+                hex_addr(target.address).c_str(),
+                static_cast<unsigned long>(set_gle),
+                set_status.c_str(),
+                set_last_error.c_str());
         }
     }
     return armed;
@@ -3036,6 +3096,7 @@ inline bool start(uint32_t requested_pid,
     summary["debug_attached"] = g_state.debug_attached.load();
     summary["debug_loop_running"] = g_state.debug_loop_running.load();
     summary["startup_elapsed_ms"] = GetTickCount64() - start_ms;
+    summary["status"] = status_json();
     diag::log_tagged_fmt("api_monitor",
         "start_exit ok=1 pid=%u resolved=%zu unresolved=%zu armed_thread_breakpoints=%u elapsed_ms=%llu",
         pid,
@@ -3130,6 +3191,7 @@ inline nlohmann::json event_to_json(const api_event_t& event) {
 inline nlohmann::json status_json() {
     nlohmann::json j;
     uint32_t armed = 0;
+    std::vector<std::pair<api_target_t, uint32_t>> readback_requests;
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         j["pid"] = g_state.pid;
@@ -3146,10 +3208,64 @@ inline nlohmann::json status_json() {
             item["active"] = target.active;
             item["armed_thread_count"] = static_cast<int>(target.armed_tids.size());
             item["armed_tids"] = target.armed_tids;
+            for (uint32_t tid : target.armed_tids) {
+                if (readback_requests.size() < 64)
+                    readback_requests.emplace_back(target, tid);
+            }
             targets.push_back(std::move(item));
         }
         j["targets"] = std::move(targets);
     }
+    nlohmann::json armed_readback = nlohmann::json::array();
+    for (const auto& request : readback_requests) {
+        const api_target_t& target = request.first;
+        const uint32_t tid = request.second;
+        driver_bridge::thread_context_t ctx{};
+        SetLastError(ERROR_SUCCESS);
+        const bool got_context = driver_bridge::get_thread_context(tid, ctx);
+        const DWORD gle = got_context ? ERROR_SUCCESS : GetLastError();
+        const uint64_t slot_addr = got_context ? context_dr_address(ctx, target.bp_index) : 0;
+        const bool slot_enabled = got_context && target.bp_index <= 3 && ((ctx.dr7 & (1ull << static_cast<unsigned>(target.bp_index * 2))) != 0);
+        armed_readback.push_back(nlohmann::json{
+            {"api", target.request.original},
+            {"tid", tid},
+            {"slot", target.bp_index},
+            {"type", "execute"},
+            {"length", 1},
+            {"driver_type", 0},
+            {"driver_size", 0},
+            {"requested_address", hex_addr(target.address)},
+            {"got_context", got_context},
+            {"gle", static_cast<unsigned long>(gle)},
+            {"driver_status", driver_bridge::status()},
+            {"driver_last_error", driver_bridge::last_error()},
+            {"rip", hex_addr(ctx.rip)},
+            {"dr0", hex_addr(ctx.dr0)},
+            {"dr1", hex_addr(ctx.dr1)},
+            {"dr2", hex_addr(ctx.dr2)},
+            {"dr3", hex_addr(ctx.dr3)},
+            {"dr6", hex_addr(ctx.dr6)},
+            {"dr7", hex_addr(ctx.dr7)},
+            {"slot_address", hex_addr(slot_addr)},
+            {"slot_matches", slot_addr != 0 && slot_addr == target.address},
+            {"slot_enabled", slot_enabled}
+        });
+    }
+    j["armed_readback"] = std::move(armed_readback);
+    j["armed_readback_count"] = readback_requests.size();
+    const auto dyn = driver_bridge::dynamic_ioctl_state();
+    j["dynamic_ioctl"] = {
+        {"loaded", dyn.loaded},
+        {"kernel", dyn.kernel},
+        {"connected", dyn.connected},
+        {"ready", dyn.ready},
+        {"instance_server_seed", dyn.instance_server_seed},
+        {"instance_ioctl_seed", dyn.instance_ioctl_seed},
+        {"global_server_seed", dyn.global_server_seed},
+        {"global_ioctl_seed", dyn.global_ioctl_seed},
+        {"ioctl_seed_hash", dyn.ioctl_seed_hash},
+        {"heartbeat_ioctl_seed_hash", dyn.heartbeat_ioctl_seed_hash}
+    };
     const auto wq = work_queue::stats();
     const auto sq = work_queue::service_stats();
     j["work_queue"] = {

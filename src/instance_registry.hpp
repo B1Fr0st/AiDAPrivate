@@ -24,6 +24,11 @@ struct ida_instance_record_t
     std::string config_entry_name;
     std::string file_md5;
     std::string file_sha256;
+    std::string module_id;
+    std::string index_generation;
+    std::string image_base;
+    std::string image_min_ea;
+    std::string image_max_ea;
     std::string processor;
     int         bitness = 0;
     std::string hostname;

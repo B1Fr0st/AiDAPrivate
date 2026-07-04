@@ -18,6 +18,7 @@
 #include <deque>
 #include <string>
 #include <utility>
+#include <vector>
 #include <process.h>
 
 #include "../core/runtime/manual_map_tls.hpp"
@@ -226,6 +227,14 @@ inline HANDLE get_cached_log_handle()
     return hf;
 }
 
+inline std::atomic<std::uint64_t>& async_log_force_flushes();
+inline std::atomic<std::uint64_t>& async_log_normal_flushes();
+inline std::atomic<std::uint64_t>& async_log_flush_elapsed_ms_total();
+inline std::atomic<std::uint64_t>& async_log_flush_elapsed_ms_max();
+inline std::atomic<std::uint64_t>& async_log_flush_failures();
+inline std::atomic<std::uint64_t>& async_log_last_flush_error();
+inline void async_log_update_max(std::atomic<std::uint64_t>& slot, std::uint64_t value);
+
 inline void coalesced_flush_log(HANDLE hf, DWORD bytes_written, bool force)
 {
     if (hf == INVALID_HANDLE_VALUE)
@@ -236,8 +245,21 @@ inline void coalesced_flush_log(HANDLE hf, DWORD bytes_written, bool force)
     const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
     bytes_pending += bytes_written;
     if (force || bytes_pending >= 65536u || last_flush == 0 || now - last_flush >= 1000u) {
-        FlushFileBuffers(hf);
-        last_flush = now;
+        const std::uint64_t flush_start = static_cast<std::uint64_t>(GetTickCount64());
+        const BOOL flushed = FlushFileBuffers(hf);
+        const DWORD flush_gle = flushed ? 0 : GetLastError();
+        const std::uint64_t flush_elapsed = static_cast<std::uint64_t>(GetTickCount64()) - flush_start;
+        if (force)
+            async_log_force_flushes().fetch_add(1, std::memory_order_acq_rel);
+        else
+            async_log_normal_flushes().fetch_add(1, std::memory_order_acq_rel);
+        async_log_flush_elapsed_ms_total().fetch_add(flush_elapsed, std::memory_order_acq_rel);
+        async_log_update_max(async_log_flush_elapsed_ms_max(), flush_elapsed);
+        if (!flushed) {
+            async_log_flush_failures().fetch_add(1, std::memory_order_acq_rel);
+            async_log_last_flush_error().store(flush_gle, std::memory_order_release);
+        }
+        last_flush = static_cast<std::uint64_t>(GetTickCount64());
         bytes_pending = 0;
     }
 }
@@ -317,6 +339,72 @@ struct async_log_item_t
     bool force;
 };
 
+struct async_log_stats_t
+{
+    std::uint64_t queued_items = 0;
+    std::uint64_t queued_bytes = 0;
+    std::uint64_t written_items = 0;
+    std::uint64_t written_bytes = 0;
+    std::uint64_t direct_items = 0;
+    std::uint64_t direct_bytes = 0;
+    std::uint64_t batches = 0;
+    std::uint64_t batch_items = 0;
+    std::uint64_t max_batch_items = 0;
+    std::uint64_t force_batches = 0;
+    std::uint64_t force_flushes = 0;
+    std::uint64_t normal_flushes = 0;
+    std::uint64_t flush_elapsed_ms_total = 0;
+    std::uint64_t flush_elapsed_ms_max = 0;
+    std::uint64_t flush_failures = 0;
+    std::uint64_t last_flush_error = 0;
+    std::uint64_t max_queue_depth = 0;
+    std::uint64_t queue_depth = 0;
+    std::uint64_t bytes_pending_flush = 0;
+    std::uint64_t tag_metric_events = 0;
+    std::uint64_t tag_metric_bytes = 0;
+    std::uint64_t tag_metric_forced = 0;
+    std::uint64_t coalesced_success_events = 0;
+    std::uint64_t coalesced_success_bytes = 0;
+    std::uint64_t coalesced_success_summaries = 0;
+    std::uint64_t coalesced_success_force_downgrades = 0;
+    std::string top_tags;
+    bool queue_lock_busy = false;
+    bool file_lock_busy = false;
+    bool started = false;
+    bool start_failed = false;
+    bool shutdown_requested = false;
+};
+
+struct tag_metric_t
+{
+    char tag[32] = {};
+    std::uint64_t events = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t forced = 0;
+    std::uint64_t suppressed = 0;
+};
+
+struct coalesced_success_bucket_t
+{
+    char tag[32] = {};
+    char key[80] = {};
+    char last_msg[640] = {};
+    std::uint64_t first_ms = 0;
+    std::uint64_t last_event_ms = 0;
+    std::uint64_t last_emit_ms = 0;
+    std::uint64_t total_events = 0;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t suppressed_events = 0;
+    std::uint64_t suppressed_bytes = 0;
+    std::uint64_t force_downgrades = 0;
+};
+
+struct pending_coalesced_summary_t
+{
+    char tag[32] = {};
+    std::string msg;
+};
+
 inline std::mutex& async_log_mutex()
 {
     static std::mutex m;
@@ -359,10 +447,511 @@ inline std::atomic<bool>& async_log_shutdown_requested()
     return v;
 }
 
+inline std::atomic<std::uint64_t>& async_log_queued_items()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_queued_bytes()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_written_items()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_written_bytes()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_direct_items()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_direct_bytes()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_batches()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_batch_items()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_max_batch_items()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_force_batches()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_force_flushes()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_normal_flushes()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_flush_elapsed_ms_total()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_flush_elapsed_ms_max()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_flush_failures()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_last_flush_error()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_max_queue_depth()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_tag_metric_events()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_tag_metric_bytes()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_tag_metric_forced()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_coalesced_success_events()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_coalesced_success_bytes()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_coalesced_success_summaries()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<std::uint64_t>& async_log_coalesced_force_downgrades()
+{
+    static std::atomic<std::uint64_t> v{ 0 };
+    return v;
+}
+
+inline std::mutex& async_log_tag_metric_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+inline std::vector<tag_metric_t>& async_log_tag_metrics()
+{
+    static std::vector<tag_metric_t> v;
+    return v;
+}
+
+inline std::mutex& async_log_coalesced_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+inline std::vector<coalesced_success_bucket_t>& async_log_coalesced_buckets()
+{
+    static std::vector<coalesced_success_bucket_t> v;
+    return v;
+}
+
+inline void async_log_update_max(std::atomic<std::uint64_t>& slot, std::uint64_t value)
+{
+    std::uint64_t current = slot.load(std::memory_order_acquire);
+    while (value > current && !slot.compare_exchange_weak(current, value, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+inline bool starts_with_literal(const char* s, const char* prefix)
+{
+    if (!s || !prefix)
+        return false;
+    while (*prefix) {
+        if (*s++ != *prefix++)
+            return false;
+    }
+    return true;
+}
+
+inline bool contains_literal(const char* s, const char* needle)
+{
+    return s && needle && std::strstr(s, needle) != nullptr;
+}
+
+inline bool log_message_has_failure_shape(const char* msg)
+{
+    return contains_literal(msg, "failed") ||
+        contains_literal(msg, "fail") ||
+        contains_literal(msg, "FAIL") ||
+        contains_literal(msg, "ABORT") ||
+        contains_literal(msg, "reject") ||
+        contains_literal(msg, "REJECT") ||
+        contains_literal(msg, "invalid") ||
+        contains_literal(msg, "timeout") ||
+        contains_literal(msg, "stale") ||
+        contains_literal(msg, "denied") ||
+        contains_literal(msg, "exception") ||
+        contains_literal(msg, "seh") ||
+        contains_literal(msg, "tamper") ||
+        contains_literal(msg, "security") ||
+        contains_literal(msg, "kill") ||
+        contains_literal(msg, "mismatch") ||
+        contains_literal(msg, "corrupt") ||
+        contains_literal(msg, "zero");
+}
+
+inline bool expected_success_log_key(const char* tag, const char* msg, char* key, size_t key_size)
+{
+    if (!tag || !msg || !key || key_size == 0)
+        return false;
+    key[0] = '\0';
+    const bool comm_tag = std::strcmp(tag, "comm") == 0;
+    const bool driver_tag = std::strcmp(tag, "driver") == 0;
+    if (!comm_tag && !driver_tag)
+        return false;
+    if (log_message_has_failure_shape(msg))
+        return false;
+    const char* selected = nullptr;
+    if (driver_tag && starts_with_literal(msg, "get_thread_context_kernel_ok "))
+        selected = "driver.get_thread_context_kernel_ok";
+    else if (comm_tag && starts_with_literal(msg, "phys_transfer_read_begin "))
+        selected = "comm.phys_transfer_read_begin";
+    else if (comm_tag && starts_with_literal(msg, "phys_transfer_read_chunk ") && contains_literal(msg, "sent=1 gle=0"))
+        selected = "comm.phys_transfer_read_chunk_ok";
+    else if (comm_tag && starts_with_literal(msg, "phys_transfer_read_done ") && contains_literal(msg, "complete=1"))
+        selected = "comm.phys_transfer_read_done_ok";
+    else if (comm_tag && starts_with_literal(msg, "TCTX get final_ok "))
+        selected = "comm.tctx_get_final_ok";
+    else if (comm_tag && starts_with_literal(msg, "TCTX get initial ") && contains_literal(msg, "ok=1") && contains_literal(msg, "sane=1"))
+        selected = "comm.tctx_get_initial_ok";
+    else if (comm_tag && starts_with_literal(msg, "send_request_in_lock_shared_acquired "))
+        selected = "comm.send_request_shared_acquired";
+    if (!selected)
+        return false;
+    _snprintf_s(key, key_size, _TRUNCATE, "%s", selected);
+    return key[0] != '\0';
+}
+
+inline void record_tag_metric(const char* tag, std::uint64_t bytes, bool force, bool suppressed)
+{
+    async_log_tag_metric_events().fetch_add(1, std::memory_order_acq_rel);
+    async_log_tag_metric_bytes().fetch_add(bytes, std::memory_order_acq_rel);
+    if (force)
+        async_log_tag_metric_forced().fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard<std::mutex> lk(async_log_tag_metric_mutex());
+    auto& metrics = async_log_tag_metrics();
+    tag_metric_t* slot = nullptr;
+    for (auto& item : metrics) {
+        if (std::strcmp(item.tag, tag ? tag : "diag") == 0) {
+            slot = &item;
+            break;
+        }
+    }
+    if (!slot) {
+        if (metrics.size() < 48) {
+            tag_metric_t item;
+            _snprintf_s(item.tag, sizeof(item.tag), _TRUNCATE, "%s", tag ? tag : "diag");
+            metrics.push_back(item);
+            slot = &metrics.back();
+        } else {
+            slot = &metrics.front();
+            for (auto& item : metrics) {
+                if (item.events < slot->events)
+                    slot = &item;
+            }
+            _snprintf_s(slot->tag, sizeof(slot->tag), _TRUNCATE, "%s", tag ? tag : "diag");
+            slot->events = 0;
+            slot->bytes = 0;
+            slot->forced = 0;
+            slot->suppressed = 0;
+        }
+    }
+    ++slot->events;
+    slot->bytes += bytes;
+    if (force)
+        ++slot->forced;
+    if (suppressed)
+        ++slot->suppressed;
+}
+
+inline std::string format_top_tag_metrics()
+{
+    tag_metric_t top[5] = {};
+    std::size_t top_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(async_log_tag_metric_mutex());
+        for (const auto& item : async_log_tag_metrics()) {
+            std::size_t pos = top_count;
+            while (pos > 0 && item.events > top[pos - 1].events)
+                --pos;
+            if (pos >= 5)
+                continue;
+            if (top_count < 5)
+                ++top_count;
+            for (std::size_t j = top_count - 1; j > pos; --j)
+                top[j] = top[j - 1];
+            top[pos] = item;
+        }
+    }
+    char out[900] = {};
+    std::size_t used = 0;
+    for (std::size_t i = 0; i < top_count; ++i) {
+        char item[180] = {};
+        _snprintf_s(item, sizeof(item), _TRUNCATE,
+            "%s%s:events=%llu:bytes=%llu:forced=%llu:suppressed=%llu",
+            i == 0 ? "" : ";",
+            top[i].tag[0] ? top[i].tag : "<empty>",
+            static_cast<unsigned long long>(top[i].events),
+            static_cast<unsigned long long>(top[i].bytes),
+            static_cast<unsigned long long>(top[i].forced),
+            static_cast<unsigned long long>(top[i].suppressed));
+        const std::size_t item_len = std::strlen(item);
+        if (used + item_len + 1 >= sizeof(out))
+            break;
+        std::memcpy(out + used, item, item_len);
+        used += item_len;
+        out[used] = '\0';
+    }
+    return out[0] ? std::string(out) : std::string("<none>");
+}
+
+inline bool collect_coalesced_success_summaries(std::vector<pending_coalesced_summary_t>& out, bool force_all)
+{
+    const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+    std::lock_guard<std::mutex> lk(async_log_coalesced_mutex());
+    for (auto& bucket : async_log_coalesced_buckets()) {
+        if (bucket.suppressed_events == 0)
+            continue;
+        const bool due = force_all || bucket.last_emit_ms == 0 || now_ms - bucket.last_emit_ms >= 5000ULL || bucket.suppressed_events >= 512ULL;
+        if (!due)
+            continue;
+        pending_coalesced_summary_t summary;
+        _snprintf_s(summary.tag, sizeof(summary.tag), _TRUNCATE, "%s", bucket.tag[0] ? bucket.tag : "diag");
+        char msg[1400] = {};
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+            "expected_success_summary key=%s total=%llu suppressed=%llu suppressed_bytes=%llu total_bytes=%llu interval_ms=%llu force_downgraded=%llu last={%.620s}",
+            bucket.key[0] ? bucket.key : "<empty>",
+            static_cast<unsigned long long>(bucket.total_events),
+            static_cast<unsigned long long>(bucket.suppressed_events),
+            static_cast<unsigned long long>(bucket.suppressed_bytes),
+            static_cast<unsigned long long>(bucket.total_bytes),
+            static_cast<unsigned long long>(bucket.last_event_ms >= bucket.last_emit_ms ? bucket.last_event_ms - bucket.last_emit_ms : 0ULL),
+            static_cast<unsigned long long>(bucket.force_downgrades),
+            bucket.last_msg[0] ? bucket.last_msg : "<empty>");
+        summary.msg = msg;
+        out.push_back(std::move(summary));
+        bucket.suppressed_events = 0;
+        bucket.suppressed_bytes = 0;
+        bucket.last_emit_ms = now_ms;
+        async_log_coalesced_success_summaries().fetch_add(1, std::memory_order_acq_rel);
+    }
+    return !out.empty();
+}
+
+inline bool coalesce_expected_success_log(const char* tag, const char* msg, std::uint64_t bytes, bool force, bool& effective_force, char* summary, size_t summary_size)
+{
+    effective_force = force;
+    if (summary && summary_size != 0)
+        summary[0] = '\0';
+    char key[80] = {};
+    if (!expected_success_log_key(tag, msg, key, sizeof(key)))
+        return false;
+    if (force) {
+        effective_force = false;
+        async_log_coalesced_force_downgrades().fetch_add(1, std::memory_order_acq_rel);
+    }
+    async_log_coalesced_success_events().fetch_add(1, std::memory_order_acq_rel);
+    async_log_coalesced_success_bytes().fetch_add(bytes, std::memory_order_acq_rel);
+    const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+    std::lock_guard<std::mutex> lk(async_log_coalesced_mutex());
+    auto& buckets = async_log_coalesced_buckets();
+    coalesced_success_bucket_t* bucket = nullptr;
+    for (auto& item : buckets) {
+        if (std::strcmp(item.key, key) == 0 && std::strcmp(item.tag, tag ? tag : "diag") == 0) {
+            bucket = &item;
+            break;
+        }
+    }
+    if (!bucket) {
+        if (buckets.size() < 32) {
+            coalesced_success_bucket_t item;
+            _snprintf_s(item.tag, sizeof(item.tag), _TRUNCATE, "%s", tag ? tag : "diag");
+            _snprintf_s(item.key, sizeof(item.key), _TRUNCATE, "%s", key);
+            buckets.push_back(item);
+            bucket = &buckets.back();
+        } else {
+            bucket = &buckets.front();
+            for (auto& item : buckets) {
+                if (item.total_events < bucket->total_events)
+                    bucket = &item;
+            }
+            _snprintf_s(bucket->tag, sizeof(bucket->tag), _TRUNCATE, "%s", tag ? tag : "diag");
+            _snprintf_s(bucket->key, sizeof(bucket->key), _TRUNCATE, "%s", key);
+            bucket->first_ms = 0;
+            bucket->last_event_ms = 0;
+            bucket->last_emit_ms = 0;
+            bucket->total_events = 0;
+            bucket->total_bytes = 0;
+            bucket->suppressed_events = 0;
+            bucket->suppressed_bytes = 0;
+            bucket->force_downgrades = 0;
+            bucket->last_msg[0] = '\0';
+        }
+    }
+    if (bucket->total_events == 0) {
+        bucket->first_ms = now_ms;
+        bucket->last_emit_ms = now_ms;
+        bucket->last_event_ms = now_ms;
+        bucket->total_events = 1;
+        bucket->total_bytes = bytes;
+        if (force)
+            bucket->force_downgrades = 1;
+        _snprintf_s(bucket->last_msg, sizeof(bucket->last_msg), _TRUNCATE, "%s", msg ? msg : "");
+        return false;
+    }
+    ++bucket->total_events;
+    bucket->total_bytes += bytes;
+    ++bucket->suppressed_events;
+    bucket->suppressed_bytes += bytes;
+    bucket->last_event_ms = now_ms;
+    if (force)
+        ++bucket->force_downgrades;
+    _snprintf_s(bucket->last_msg, sizeof(bucket->last_msg), _TRUNCATE, "%s", msg ? msg : "");
+    const bool due = now_ms - bucket->last_emit_ms >= 5000ULL || bucket->suppressed_events >= 512ULL;
+    if (!due)
+        return true;
+    if (summary && summary_size != 0) {
+        _snprintf_s(summary, summary_size, _TRUNCATE,
+            "expected_success_summary key=%s total=%llu suppressed=%llu suppressed_bytes=%llu total_bytes=%llu interval_ms=%llu force_downgraded=%llu last={%.620s}",
+            bucket->key,
+            static_cast<unsigned long long>(bucket->total_events),
+            static_cast<unsigned long long>(bucket->suppressed_events),
+            static_cast<unsigned long long>(bucket->suppressed_bytes),
+            static_cast<unsigned long long>(bucket->total_bytes),
+            static_cast<unsigned long long>(now_ms - bucket->last_emit_ms),
+            static_cast<unsigned long long>(bucket->force_downgrades),
+            bucket->last_msg);
+    }
+    bucket->suppressed_events = 0;
+    bucket->suppressed_bytes = 0;
+    bucket->last_emit_ms = now_ms;
+    async_log_coalesced_success_summaries().fetch_add(1, std::memory_order_acq_rel);
+    return false;
+}
+
+inline async_log_stats_t async_log_stats()
+{
+    async_log_stats_t s;
+    s.queued_items = async_log_queued_items().load(std::memory_order_acquire);
+    s.queued_bytes = async_log_queued_bytes().load(std::memory_order_acquire);
+    s.written_items = async_log_written_items().load(std::memory_order_acquire);
+    s.written_bytes = async_log_written_bytes().load(std::memory_order_acquire);
+    s.direct_items = async_log_direct_items().load(std::memory_order_acquire);
+    s.direct_bytes = async_log_direct_bytes().load(std::memory_order_acquire);
+    s.batches = async_log_batches().load(std::memory_order_acquire);
+    s.batch_items = async_log_batch_items().load(std::memory_order_acquire);
+    s.max_batch_items = async_log_max_batch_items().load(std::memory_order_acquire);
+    s.force_batches = async_log_force_batches().load(std::memory_order_acquire);
+    s.force_flushes = async_log_force_flushes().load(std::memory_order_acquire);
+    s.normal_flushes = async_log_normal_flushes().load(std::memory_order_acquire);
+    s.flush_elapsed_ms_total = async_log_flush_elapsed_ms_total().load(std::memory_order_acquire);
+    s.flush_elapsed_ms_max = async_log_flush_elapsed_ms_max().load(std::memory_order_acquire);
+    s.flush_failures = async_log_flush_failures().load(std::memory_order_acquire);
+    s.last_flush_error = async_log_last_flush_error().load(std::memory_order_acquire);
+    s.max_queue_depth = async_log_max_queue_depth().load(std::memory_order_acquire);
+    s.tag_metric_events = async_log_tag_metric_events().load(std::memory_order_acquire);
+    s.tag_metric_bytes = async_log_tag_metric_bytes().load(std::memory_order_acquire);
+    s.tag_metric_forced = async_log_tag_metric_forced().load(std::memory_order_acquire);
+    s.coalesced_success_events = async_log_coalesced_success_events().load(std::memory_order_acquire);
+    s.coalesced_success_bytes = async_log_coalesced_success_bytes().load(std::memory_order_acquire);
+    s.coalesced_success_summaries = async_log_coalesced_success_summaries().load(std::memory_order_acquire);
+    s.coalesced_success_force_downgrades = async_log_coalesced_force_downgrades().load(std::memory_order_acquire);
+    s.top_tags = format_top_tag_metrics();
+    s.started = async_log_started().load(std::memory_order_acquire);
+    s.start_failed = async_log_start_failed().load(std::memory_order_acquire);
+    s.shutdown_requested = async_log_shutdown_requested().load(std::memory_order_acquire);
+    {
+        std::unique_lock<std::mutex> lk(async_log_mutex(), std::try_to_lock);
+        if (lk.owns_lock())
+            s.queue_depth = async_log_queue().size();
+        else
+            s.queue_lock_busy = true;
+    }
+    {
+        std::unique_lock<std::mutex> lk(log_file_mutex(), std::try_to_lock);
+        if (lk.owns_lock())
+            s.bytes_pending_flush = cached_log_bytes_since_flush();
+        else
+            s.file_lock_busy = true;
+    }
+    return s;
+}
+
 inline unsigned __stdcall async_log_thread_main(void*)
 {
     aida::manual_map_tls::ensure_current_thread();
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    std::uint64_t last_metric_summary_ms = 0;
     for (;;) {
         HANDLE ev = async_log_event();
         if (ev)
@@ -381,6 +970,9 @@ inline unsigned __stdcall async_log_thread_main(void*)
                 write_log_path_decision_once(hf);
                 DWORD batch_bytes = 0;
                 bool force_flush = false;
+                async_log_batches().fetch_add(1, std::memory_order_acq_rel);
+                async_log_batch_items().fetch_add(static_cast<std::uint64_t>(batch.size()), std::memory_order_acq_rel);
+                async_log_update_max(async_log_max_batch_items(), static_cast<std::uint64_t>(batch.size()));
                 for (const auto& item : batch) {
                     DWORD written = 0;
                     if (!item.line.empty())
@@ -388,7 +980,74 @@ inline unsigned __stdcall async_log_thread_main(void*)
                     batch_bytes += written;
                     force_flush = force_flush || item.force;
                 }
+                async_log_written_items().fetch_add(static_cast<std::uint64_t>(batch.size()), std::memory_order_acq_rel);
+                async_log_written_bytes().fetch_add(static_cast<std::uint64_t>(batch_bytes), std::memory_order_acq_rel);
+                if (force_flush)
+                    async_log_force_batches().fetch_add(1, std::memory_order_acq_rel);
                 coalesced_flush_log(hf, batch_bytes, force_flush);
+            }
+        }
+
+        std::vector<pending_coalesced_summary_t> summaries;
+        const bool shutdown_now = async_log_shutdown_requested().load(std::memory_order_acquire);
+        collect_coalesced_success_summaries(summaries, shutdown_now);
+        const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+        const bool metric_due = last_metric_summary_ms == 0 || now_ms - last_metric_summary_ms >= 10000ULL || shutdown_now;
+        if (!summaries.empty() || metric_due) {
+            std::lock_guard<std::mutex> lk(log_file_mutex());
+            HANDLE hf = get_cached_log_handle();
+            if (hf != INVALID_HANDLE_VALUE) {
+                write_log_path_decision_once(hf);
+                DWORD summary_bytes = 0;
+                std::uint64_t summary_items = 0;
+                for (const auto& summary : summaries) {
+                    summary_bytes += write_tagged_line(hf, summary.tag[0] ? summary.tag : "diag", summary.msg.c_str());
+                    ++summary_items;
+                }
+                if (metric_due) {
+                    char msg[1400] = {};
+                    const std::string top_tags = format_top_tag_metrics();
+                    std::size_t queue_depth_snapshot = 0;
+                    {
+                        std::unique_lock<std::mutex> qlk(async_log_mutex(), std::try_to_lock);
+                        if (qlk.owns_lock())
+                            queue_depth_snapshot = async_log_queue().size();
+                    }
+                    _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                        "logger_summary queued=%llu queued_bytes=%llu written=%llu written_bytes=%llu direct=%llu direct_bytes=%llu queue_depth=%zu max_queue_depth=%llu batches=%llu batch_items=%llu max_batch=%llu force_batches=%llu force_flushes=%llu normal_flushes=%llu flush_ms_total=%llu flush_ms_max=%llu flush_failures=%llu last_flush_error=%llu pending_flush_bytes=%llu coalesced_success=%llu coalesced_bytes=%llu coalesced_summaries=%llu force_downgraded=%llu top_tags={%.900s}",
+                        static_cast<unsigned long long>(async_log_queued_items().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_queued_bytes().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_written_items().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_written_bytes().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_direct_items().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_direct_bytes().load(std::memory_order_acquire)),
+                        queue_depth_snapshot,
+                        static_cast<unsigned long long>(async_log_max_queue_depth().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_batches().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_batch_items().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_max_batch_items().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_force_batches().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_force_flushes().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_normal_flushes().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_flush_elapsed_ms_total().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_flush_elapsed_ms_max().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_flush_failures().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_last_flush_error().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(cached_log_bytes_since_flush()),
+                        static_cast<unsigned long long>(async_log_coalesced_success_events().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_coalesced_success_bytes().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_coalesced_success_summaries().load(std::memory_order_acquire)),
+                        static_cast<unsigned long long>(async_log_coalesced_force_downgrades().load(std::memory_order_acquire)),
+                        top_tags.c_str());
+                    summary_bytes += write_tagged_line(hf, "diag", msg);
+                    ++summary_items;
+                    last_metric_summary_ms = now_ms;
+                }
+                if (summary_items != 0) {
+                    async_log_written_items().fetch_add(summary_items, std::memory_order_acq_rel);
+                    async_log_written_bytes().fetch_add(static_cast<std::uint64_t>(summary_bytes), std::memory_order_acq_rel);
+                    coalesced_flush_log(hf, summary_bytes, false);
+                }
             }
         }
 
@@ -452,6 +1111,9 @@ inline void log_tagged_direct(const char* tag, const char* msg, bool force)
     if (hf == INVALID_HANDLE_VALUE) return;
     write_log_path_decision_once(hf);
     DWORD written = write_tagged_line(hf, tag, msg);
+    record_tag_metric(tag, static_cast<std::uint64_t>(written), force, false);
+    async_log_direct_items().fetch_add(1, std::memory_order_acq_rel);
+    async_log_direct_bytes().fetch_add(static_cast<std::uint64_t>(written), std::memory_order_acq_rel);
     coalesced_flush_log(hf, written, force);
 }
 
@@ -462,18 +1124,35 @@ inline void log_tagged_async_or_direct(const char* tag, const char* msg, bool fo
         log_tagged_direct(tag, msg, true);
         return;
     }
+    bool effective_force = force;
+    char summary_msg[1400] = {};
+    const char* effective_msg = msg;
+    const std::uint64_t msg_bytes = msg ? static_cast<std::uint64_t>(std::strlen(msg)) : 0ULL;
+    const bool suppressed = coalesce_expected_success_log(tag, msg, msg_bytes, force, effective_force, summary_msg, sizeof(summary_msg));
+    if (suppressed) {
+        record_tag_metric(tag, msg_bytes, effective_force, true);
+        return;
+    }
+    if (summary_msg[0])
+        effective_msg = summary_msg;
     char line[4096];
     DWORD len = 0;
-    if (!format_tagged_line(line, sizeof(line), &len, tag, msg))
+    if (!format_tagged_line(line, sizeof(line), &len, tag, effective_msg))
         return;
     if (!ensure_async_log_thread()) {
-        log_tagged_direct(tag, msg, force);
+        log_tagged_direct(tag, effective_msg, effective_force);
         return;
     }
+    std::size_t queue_depth = 0;
     {
         std::lock_guard<std::mutex> lk(async_log_mutex());
-        async_log_queue().push_back(async_log_item_t{ std::string(line, line + len), force });
+        async_log_queue().push_back(async_log_item_t{ std::string(line, line + len), effective_force });
+        queue_depth = async_log_queue().size();
     }
+    record_tag_metric(tag, static_cast<std::uint64_t>(len), effective_force, false);
+    async_log_queued_items().fetch_add(1, std::memory_order_acq_rel);
+    async_log_queued_bytes().fetch_add(static_cast<std::uint64_t>(len), std::memory_order_acq_rel);
+    async_log_update_max(async_log_max_queue_depth(), static_cast<std::uint64_t>(queue_depth));
     HANDLE ev = async_log_event();
     if (ev)
         SetEvent(ev);

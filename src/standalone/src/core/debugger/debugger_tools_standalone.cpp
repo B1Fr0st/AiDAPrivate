@@ -1796,18 +1796,127 @@ static tool_result_t handle_debugger_get_trace(const json& params)
     return tool_result_t::ok(OBFSTR("Trace returned."), result);
 }
 
+static bool callstack_source_contains(const std::string& source, const char* needle)
+{
+    return needle != nullptr && source.find(needle) != std::string::npos;
+}
+
+static void apply_callstack_resolution(json& frame,
+                                       const debugger_engine::call_stack_symbol_resolution_t& r,
+                                       std::uint32_t pid,
+                                       std::uint32_t tid,
+                                       const char* unwind_status)
+{
+    frame["pid"] = pid;
+    frame["tid"] = tid;
+    frame["address"] = sa_format_address(r.address);
+    if (!r.module_name.empty()) {
+        frame["module"] = r.module_name;
+        frame["module_name"] = r.module_name;
+        frame["symbol_owner"] = r.module_name;
+    }
+    if (!r.module_path.empty())
+        frame["module_path"] = r.module_path;
+    if (r.module_base != 0) {
+        frame["module_base"] = sa_format_address(r.module_base);
+        frame["module_end"] = sa_format_address(r.module_base + r.module_size);
+    }
+    if (r.module_size != 0) {
+        frame["module_size"] = r.module_size;
+        frame["module_size_hex"] = sa_format_address(r.module_size);
+    }
+    frame["module_offset"] = sa_format_address(r.module_offset);
+    if (!r.function_name.empty()) {
+        frame["function"] = r.function_name;
+        frame["function_name"] = r.function_name;
+        frame["symbol"] = r.function_name;
+        if (callstack_source_contains(r.source, "nearest")) {
+            frame["nearest_symbol"] = r.function_name;
+            frame["nearest_symbol_address"] = sa_format_address(r.symbol_address);
+            frame["nearest_symbol_displacement"] = sa_format_address(r.symbol_offset);
+        }
+        if (callstack_source_contains(r.source, "exact"))
+            frame["exact_symbol"] = r.function_name;
+    }
+    if (r.symbol_address != 0)
+        frame["symbol_address"] = sa_format_address(r.symbol_address);
+    frame["symbol_offset"] = sa_format_address(r.symbol_offset);
+    frame["symbol_source"] = r.source;
+    frame["symbol_status"] = r.status;
+    frame["resolution_source"] = r.source;
+    frame["resolution_status"] = r.status;
+    frame["unwind_status"] = unwind_status != nullptr ? unwind_status : "unknown";
+    frame["symbol_resolution"] = json{
+        {"source", r.source},
+        {"status", r.status},
+        {"module", r.module_name},
+        {"module_path", r.module_path},
+        {"module_base", sa_format_address(r.module_base)},
+        {"module_size", r.module_size},
+        {"module_offset", sa_format_address(r.module_offset)},
+        {"function", r.function_name},
+        {"symbol_address", sa_format_address(r.symbol_address)},
+        {"symbol_offset", sa_format_address(r.symbol_offset)},
+        {"nearest_symbol", callstack_source_contains(r.source, "nearest") ? r.function_name : std::string()},
+        {"nearest_symbol_address", callstack_source_contains(r.source, "nearest") ? sa_format_address(r.symbol_address) : std::string()},
+        {"nearest_symbol_displacement", callstack_source_contains(r.source, "nearest") ? sa_format_address(r.symbol_offset) : std::string()},
+        {"elapsed_us", r.elapsed_us},
+        {"nearest", callstack_source_contains(r.source, "nearest")},
+        {"exact", callstack_source_contains(r.source, "exact")},
+        {"module_rva_fallback", r.source == "module_rva"}
+    };
+}
+
+static json make_callstack_failure(std::uint32_t pid,
+                                   std::uint32_t tid,
+                                   const char* reason,
+                                   const std::string& detail,
+                                   DWORD gle,
+                                   bool did_suspend)
+{
+    return json{
+        {"available", false},
+        {"failure_reason", reason != nullptr ? reason : "unknown"},
+        {"detail", detail},
+        {"pid", pid},
+        {"target_pid", pid},
+        {"tid", tid},
+        {"win32_error", static_cast<std::uint64_t>(gle)},
+        {"did_suspend", did_suspend},
+        {"kernel_backend", driver_bridge::using_kernel_driver()},
+        {"driver_status", driver_bridge::status()},
+        {"driver_last_error", driver_bridge::last_error()}
+    };
+}
 
 static tool_result_t handle_debugger_get_callstack_impl(const json& params)
 {
     diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack_impl: entry");
-    if (auto err = ensure_attached(params))
-        return *err;
+    if (auto err = ensure_attached(params)) {
+        json details = make_callstack_failure(
+            driver_bridge::attached_pid(),
+            0,
+            "attach_unavailable",
+            err->text,
+            GetLastError(),
+            false);
+        return tool_result_t::error(err->text, "callstack_attach_unavailable", details);
+    }
 
     auto tid_opt = parse_tid(params);
     if (!tid_opt) {
         diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack_impl: missing tid param");
+        json details = make_callstack_failure(
+            driver_bridge::attached_pid(),
+            0,
+            "missing_tid",
+            OBFSTR("'tid' (thread ID) is required."),
+            ERROR_INVALID_PARAMETER,
+            false);
         return tool_result_t::error(
-            OBFSTR("'tid' (thread ID) is required."));
+            OBFSTR("'tid' (thread ID) is required."),
+            "callstack_missing_tid",
+            details);
     }
     const std::uint32_t tid = *tid_opt;
 
@@ -1834,12 +1943,23 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
             driver_bridge::last_error().c_str());
         if (did_suspend) device->resume_thread(tid);
         SetLastError(gle);
+        json details = make_callstack_failure(
+            driver_bridge::attached_pid(),
+            tid,
+            "thread_context_unavailable",
+            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid),
+            gle,
+            did_suspend);
         return tool_result_t::error(
-            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid),
+            "callstack_thread_context_unavailable",
+            details);
     }
     diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack_impl: thread context RIP=0x%llX RSP=0x%llX RBP=0x%llX", (unsigned long long)ctx.rip, (unsigned long long)ctx.rsp, (unsigned long long)ctx.rbp);
 
     json frames = json::array();
+    std::vector<std::uint64_t> frame_addresses;
+    frame_addresses.reserve(static_cast<std::size_t>(max_depth));
 
 
     {
@@ -1857,6 +1977,7 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
             f["instruction"] = std::string(ins.mnem) + " " + std::string(ins.ops);
         }
         frames.push_back(f);
+        frame_addresses.push_back(static_cast<std::uint64_t>(ctx.rip));
     }
 
 
@@ -1904,6 +2025,7 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
             }
 
             frames.push_back(f);
+            frame_addresses.push_back(ret_addr);
 
 
             if (saved_rbp == rbp || saved_rbp <= rbp)
@@ -1954,6 +2076,7 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
             f["instruction"]  = std::string(ins.mnem) + " " + std::string(ins.ops);
             f["method"]       = "stack_scan";
             frames.push_back(f);
+            frame_addresses.push_back(candidate);
             ++depth;
         }
     }
@@ -1962,12 +2085,90 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
     if (did_suspend)
         device->resume_thread(tid);
 
-    diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack_impl: tid=%u method=%s frames=%zu", tid, rbp_looks_valid ? "rbp_chain" : "stack_scan", frames.size());
+    const std::uint32_t pid = driver_bridge::attached_pid();
+    auto resolutions = debugger_engine::resolve_call_stack_frames(frame_addresses);
+    std::size_t resolved_symbols = 0;
+    std::size_t nearest_symbols = 0;
+    std::size_t exact_symbols = 0;
+    std::size_t module_rva_fallbacks = 0;
+    std::size_t unresolved_frames = 0;
+    const std::string unwind_method = rbp_looks_valid ? "rbp_chain" : "stack_scan";
+    for (std::size_t i = 0; i < frames.size() && i < resolutions.size(); ++i) {
+        auto& r = resolutions[i];
+        const char* frame_unwind_status = i == 0 ? "context" : unwind_method.c_str();
+        apply_callstack_resolution(frames[i], r, pid, tid, frame_unwind_status);
+        const bool has_symbol = !r.function_name.empty();
+        const bool has_module = !r.module_name.empty();
+        if (has_symbol)
+            ++resolved_symbols;
+        if (callstack_source_contains(r.source, "nearest"))
+            ++nearest_symbols;
+        if (callstack_source_contains(r.source, "exact"))
+            ++exact_symbols;
+        if (r.source == "module_rva")
+            ++module_rva_fallbacks;
+        if (!has_symbol || !has_module)
+            ++unresolved_frames;
+    }
+    if (resolutions.size() < frames.size())
+        unresolved_frames += frames.size() - resolutions.size();
+
+    const bool top_available = !frames.empty() &&
+        !resolutions.empty() &&
+        !resolutions.front().module_name.empty() &&
+        !resolutions.front().function_name.empty() &&
+        resolutions.front().address != 0;
+
+    diag::log_tagged_fmt("dbg_tools",
+        "debugger_get_callstack_impl: tid=%u pid=%u method=%s frames=%zu resolved=%zu nearest=%zu exact=%zu module_rva=%zu unresolved=%zu top_available=%d",
+        tid,
+        pid,
+        unwind_method.c_str(),
+        frames.size(),
+        resolved_symbols,
+        nearest_symbols,
+        exact_symbols,
+        module_rva_fallbacks,
+        unresolved_frames,
+        top_available ? 1 : 0);
     json result;
-    result["tid"]         = tid;
+    result["available"] = top_available;
+    result["pid"] = pid;
+    result["target_pid"] = pid;
+    result["tid"] = tid;
+    result["requested_tid"] = tid;
     result["frame_count"] = static_cast<int>(frames.size());
-    result["method"]      = rbp_looks_valid ? "rbp_chain" : "stack_scan";
-    result["frames"]      = frames;
+    result["method"] = unwind_method;
+    result["unwind_method"] = unwind_method;
+    result["unwind_status"] = top_available ? "ok" : (frames.empty() ? "no_frames" : "top_frame_symbol_unavailable");
+    result["top_frame_address"] = (!resolutions.empty() && resolutions.front().address != 0)
+        ? json(sa_format_address(resolutions.front().address))
+        : json(nullptr);
+    result["top_frame_module"] = (!resolutions.empty() ? resolutions.front().module_name : std::string());
+    result["top_frame_function"] = (!resolutions.empty() ? resolutions.front().function_name : std::string());
+    result["symbol_resolution"] = json{
+        {"attempted", resolutions.size()},
+        {"resolved_symbols", resolved_symbols},
+        {"nearest_symbols", nearest_symbols},
+        {"exact_symbols", exact_symbols},
+        {"module_rva_fallbacks", module_rva_fallbacks},
+        {"unresolved_frames", unresolved_frames}
+    };
+    result["frames"] = frames;
+    if (!top_available) {
+        result["failure"] = make_callstack_failure(
+            pid,
+            tid,
+            frames.empty() ? "no_frames" : "top_frame_symbol_unavailable",
+            frames.empty() ? "No callstack frames were produced." : "Top callstack frame could not be tied to module and symbol evidence.",
+            ERROR_NOT_FOUND,
+            did_suspend);
+        return tool_result_t::error(
+            OBFSTR("Call stack evidence is unavailable for TID ") + std::to_string(tid),
+            "callstack_evidence_unavailable",
+            result);
+    }
+    result["failure"] = nullptr;
     return tool_result_t::ok(
         OBFSTR("Call stack for TID ") + std::to_string(tid) +
         OBFSTR(": ") + std::to_string(frames.size()) + OBFSTR(" frame(s)"),

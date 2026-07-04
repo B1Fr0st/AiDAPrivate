@@ -145,7 +145,7 @@ static bool rva_from_ea(ea_t addr, uint64_t& rva)
 static GraphStore::addr_key_t make_addr_key(const std::string& module_key, node_type_t type, ea_t addr, bool prefer_rva, uint64_t supplied_rva)
 {
     GraphStore::addr_key_t key;
-    key.binary_hash = module_key;
+    key.module_id = module_key;
     key.type = type;
     key.has_rva = prefer_rva;
     key.canonical_addr = prefer_rva ? supplied_rva : static_cast<uint64_t>(addr);
@@ -154,10 +154,19 @@ static GraphStore::addr_key_t make_addr_key(const std::string& module_key, node_
 
 static void normalize_graph_node_identity(graph_node_t& node)
 {
-    if (node.module_id.empty())
+    const bool legacy_only = node.module_id.empty() && !node.binary_hash.empty();
+    if (legacy_only)
+    {
         node.module_id = node.binary_hash;
-    if (node.binary_hash.empty())
-        node.binary_hash = node.module_id;
+        node.legacy_binary_hash_alias = true;
+        if (node.identity_source.empty())
+            node.identity_source = "legacy_binary_hash_compat";
+        if (node.confidence > 0.5)
+            node.confidence = 0.5;
+    }
+    node.binary_hash = node.module_id;
+    if (node.identity_source.empty())
+        node.identity_source = "module_id_rva";
     uint64_t computed = 0;
     if (!node.has_rva && rva_from_ea(node.address, computed))
     {
@@ -167,9 +176,49 @@ static void normalize_graph_node_identity(graph_node_t& node)
     if (node.has_rva)
     {
         std::ostringstream ss;
-        ss << node.binary_hash << "+0x" << std::hex << std::nouppercase << node.rva;
+        ss << node.module_id << "+0x" << std::hex << std::nouppercase << node.rva;
         node.address_key = ss.str();
     }
+}
+
+static std::string graph_module_key(const graph_node_t& node)
+{
+    return !node.module_id.empty() ? node.module_id : node.binary_hash;
+}
+
+static void normalize_graph_edge_identity(graph_edge_t& edge,
+                                          const std::unordered_map<int, graph_node_t>& nodes)
+{
+    const bool legacy_only = edge.module_id.empty() && !edge.binary_hash.empty();
+    if (legacy_only)
+        edge.legacy_binary_hash_alias = true;
+    auto sit = nodes.find(edge.source_id);
+    auto tit = nodes.find(edge.target_id);
+    if (edge.module_id.empty())
+    {
+        if (sit != nodes.end() && tit != nodes.end() && graph_module_key(sit->second) == graph_module_key(tit->second))
+            edge.module_id = graph_module_key(sit->second);
+        else if (sit != nodes.end())
+            edge.module_id = graph_module_key(sit->second);
+        else if (tit != nodes.end())
+            edge.module_id = graph_module_key(tit->second);
+        else
+            edge.module_id = edge.binary_hash;
+    }
+    edge.binary_hash = edge.module_id;
+}
+
+static void normalize_community_identity(community_t& comm)
+{
+    const bool legacy_only = comm.module_id.empty() && !comm.binary_hash.empty();
+    if (legacy_only)
+    {
+        comm.module_id = comm.binary_hash;
+        comm.legacy_binary_hash_alias = true;
+    }
+    if (comm.module_id.empty())
+        comm.module_id = comm.binary_hash;
+    comm.binary_hash = comm.module_id;
 }
 
 
@@ -1302,11 +1351,12 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
 
     normalize_graph_node_identity(node);
 
-    addr_key_t key = make_addr_key(node.binary_hash, node.node_type, node.address, node.has_rva, node.rva);
+    const std::string node_key = graph_module_key(node);
+    addr_key_t key = make_addr_key(node_key, node.node_type, node.address, node.has_rva, node.rva);
     auto it = m_addr_index.find(key);
     if (it == m_addr_index.end() && node.has_rva)
     {
-        addr_key_t legacy = make_addr_key(node.binary_hash, node.node_type, node.address, false, 0);
+        addr_key_t legacy = make_addr_key(node_key, node.node_type, node.address, false, 0);
         it = m_addr_index.find(legacy);
     }
 
@@ -1338,11 +1388,12 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
         existing.is_stale = node.is_stale;
         existing.updated_at = ts;
         normalize_graph_node_identity(existing);
-        m_addr_index[make_addr_key(existing.binary_hash, existing.node_type, existing.address, existing.has_rva, existing.rva)] = existing.id;
+        const std::string existing_key = graph_module_key(existing);
+        m_addr_index[make_addr_key(existing_key, existing.node_type, existing.address, existing.has_rva, existing.rva)] = existing.id;
         index_add_node_locked(existing);
-        m_dirty_nodes[existing.binary_hash].insert(existing.id);
+        m_dirty_nodes[existing_key].insert(existing.id);
         if (m_nodes.size() > 10000)
-            save_graph_dirty_set(existing.binary_hash, m_dirty_nodes[existing.binary_hash]);
+            save_graph_dirty_set(existing_key, m_dirty_nodes[existing_key]);
         return &existing;
     }
 
@@ -1350,7 +1401,7 @@ graph_node_t* GraphStore::upsert_node(graph_node_t node)
     node.created_at = ts;
     node.updated_at = ts;
     int id = node.id;
-    const std::string bh = node.binary_hash;
+    const std::string bh = graph_module_key(node);
     m_nodes[id] = std::move(node);
     m_addr_index[key] = id;
     index_add_node_locked(m_nodes[id]);
@@ -1406,28 +1457,18 @@ graph_edge_t* GraphStore::add_edge(graph_edge_t edge)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
 
-    if (edge.binary_hash.empty())
-    {
-        auto sit = m_nodes.find(edge.source_id);
-        auto tit = m_nodes.find(edge.target_id);
-        if (sit != m_nodes.end() && tit != m_nodes.end()
-            && sit->second.binary_hash == tit->second.binary_hash)
-            edge.binary_hash = sit->second.binary_hash;
-        else if (sit != m_nodes.end())
-            edge.binary_hash = sit->second.binary_hash;
-        else if (tit != m_nodes.end())
-            edge.binary_hash = tit->second.binary_hash;
-    }
+    normalize_graph_edge_identity(edge, m_nodes);
 
     for (auto& eid : m_edges_from[edge.source_id])
     {
         auto& e = m_edges[eid];
         if (e.target_id == edge.target_id && e.edge_type == edge.edge_type)
         {
-            if (e.binary_hash.empty() && !edge.binary_hash.empty())
+            if (e.module_id.empty() && !edge.module_id.empty())
             {
-                e.binary_hash = edge.binary_hash;
-                auto& vec = m_edges_by_binary[e.binary_hash];
+                e.module_id = edge.module_id;
+                e.binary_hash = edge.module_id;
+                auto& vec = m_edges_by_binary[e.module_id];
                 if (std::find(vec.begin(), vec.end(), eid) == vec.end())
                     vec.push_back(eid);
             }
@@ -1440,8 +1481,8 @@ graph_edge_t* GraphStore::add_edge(graph_edge_t edge)
     m_edges[id] = std::move(edge);
     m_edges_from[m_edges[id].source_id].push_back(id);
     m_edges_to[m_edges[id].target_id].push_back(id);
-    if (!m_edges[id].binary_hash.empty())
-        m_edges_by_binary[m_edges[id].binary_hash].push_back(id);
+    if (!m_edges[id].module_id.empty())
+        m_edges_by_binary[m_edges[id].module_id].push_back(id);
     return &m_edges[id];
 }
 
@@ -1550,6 +1591,7 @@ std::vector<graph_node_t*> GraphStore::get_callees(const std::string& binary_has
 void GraphStore::add_community(community_t comm)
 {
     std::lock_guard<std::mutex> lk(m_mtx);
+    normalize_community_identity(comm);
     m_communities.push_back(std::move(comm));
 }
 
@@ -1818,6 +1860,9 @@ bool GraphStore::save_to_file(const std::string& path, const std::string& binary
 
     nlohmann::json j;
     j["version"] = 1;
+    j["address_model"] = "module_id+rva";
+    j["legacy_binary_hash_compat"] = true;
+    j["graph_key"] = binary_hash.empty() ? std::string("all_modules") : binary_hash;
     j["next_node_id"] = m_next_node_id;
     j["next_edge_id"] = m_next_edge_id;
 
@@ -1872,6 +1917,9 @@ int GraphStore::save_incremental(const std::string& binary_hash, const std::stri
 
     nlohmann::json j;
     j["version"] = 1;
+    j["address_model"] = "module_id+rva";
+    j["legacy_binary_hash_compat"] = true;
+    j["graph_key"] = binary_hash;
     j["next_node_id"] = m_next_node_id;
     j["next_edge_id"] = m_next_edge_id;
     j["nodes"] = nlohmann::json::array();
@@ -2054,7 +2102,7 @@ bool GraphStore::load_from_file(const std::string& path)
                 graph_node_t n = nj.get<graph_node_t>();
                 normalize_graph_node_identity(n);
                 int id = n.id;
-                addr_key_t key = make_addr_key(n.binary_hash, n.node_type, n.address, n.has_rva, n.rva);
+                addr_key_t key = make_addr_key(graph_module_key(n), n.node_type, n.address, n.has_rva, n.rva);
                 m_addr_index[key] = id;
                 m_nodes[id] = std::move(n);
                 index_add_node_locked(m_nodes[id]);
@@ -2067,33 +2115,26 @@ bool GraphStore::load_from_file(const std::string& path)
             {
                 graph_edge_t e = ej.get<graph_edge_t>();
                 int id = e.id;
-                if (e.binary_hash.empty())
-                {
-                    auto sit = m_nodes.find(e.source_id);
-                    auto tit = m_nodes.find(e.target_id);
-                    if (sit != m_nodes.end() && tit != m_nodes.end()
-                        && sit->second.binary_hash == tit->second.binary_hash)
-                        e.binary_hash = sit->second.binary_hash;
-                    else if (sit != m_nodes.end())
-                        e.binary_hash = sit->second.binary_hash;
-                    else if (tit != m_nodes.end())
-                        e.binary_hash = tit->second.binary_hash;
-                }
+                normalize_graph_edge_identity(e, m_nodes);
                 m_edges_from[e.source_id].push_back(id);
                 m_edges_to[e.target_id].push_back(id);
-                if (!e.binary_hash.empty())
-                    m_edges_by_binary[e.binary_hash].push_back(id);
+                if (!e.module_id.empty())
+                    m_edges_by_binary[e.module_id].push_back(id);
                 m_edges[id] = std::move(e);
             }
         }
 
         if (j.contains("communities"))
+        {
             m_communities = j["communities"].get<std::vector<community_t>>();
+            for (auto& c : m_communities)
+                normalize_community_identity(c);
+        }
 
         std::unordered_set<std::string> hashes;
         for (const auto& kv : m_nodes)
-            if (!kv.second.binary_hash.empty())
-                hashes.insert(kv.second.binary_hash);
+            if (!graph_module_key(kv.second).empty())
+                hashes.insert(graph_module_key(kv.second));
         for (const auto& h : hashes)
         {
             auto recovered = load_graph_dirty_set(h);
@@ -2177,7 +2218,9 @@ graph_node_t* StructureExtractor::extract_function(ea_t func_ea, const std::stri
         node = *existing;
     else
     {
-        node.binary_hash = binary_hash;
+        node.module_id = binary_hash;
+        node.binary_hash = node.module_id;
+        node.identity_source = "module_id_rva";
         node.node_type = node_type_t::FUNCTION;
         node.address = func_ea;
     }
@@ -2248,7 +2291,9 @@ int StructureExtractor::extract_call_edges(ea_t func_ea, const std::string& bina
         if (!callee_node)
         {
             graph_node_t cn;
-            cn.binary_hash = binary_hash;
+            cn.module_id = binary_hash;
+            cn.binary_hash = cn.module_id;
+            cn.identity_source = "module_id_rva";
             cn.node_type = node_type_t::FUNCTION;
             cn.address = callee_ea;
             cn.name = callee_name;
@@ -2257,7 +2302,8 @@ int StructureExtractor::extract_call_edges(ea_t func_ea, const std::string& bina
         }
 
         graph_edge_t edge;
-        edge.binary_hash = binary_hash;
+        edge.module_id = binary_hash;
+        edge.binary_hash = edge.module_id;
         edge.source_id = node.id;
         edge.target_id = callee_node->id;
         edge.edge_type = edge_type_t::CALLS;
@@ -2274,7 +2320,8 @@ int StructureExtractor::extract_call_edges(ea_t func_ea, const std::string& bina
             if (has_risk)
             {
                 graph_edge_t vuln_edge;
-                vuln_edge.binary_hash = binary_hash;
+                vuln_edge.module_id = binary_hash;
+                vuln_edge.binary_hash = vuln_edge.module_id;
                 vuln_edge.source_id = node.id;
                 vuln_edge.target_id = callee_node->id;
                 vuln_edge.edge_type = edge_type_t::CALLS_VULNERABLE;
@@ -2586,7 +2633,8 @@ std::vector<taint_path_t> TaintAnalyzer::find_taint_paths(const std::string& bin
                 for (size_t i = 0; i + 1 < path_ids.size(); ++i)
                 {
                     graph_edge_t edge;
-                    edge.binary_hash = binary_hash;
+                    edge.module_id = binary_hash;
+                    edge.binary_hash = edge.module_id;
                     edge.source_id = path_ids[i];
                     edge.target_id = path_ids[i + 1];
                     edge.edge_type = edge_type_t::TAINT_FLOWS_TO;
@@ -2596,7 +2644,8 @@ std::vector<taint_path_t> TaintAnalyzer::find_taint_paths(const std::string& bin
 
 
                 graph_edge_t vuln_edge;
-                vuln_edge.binary_hash = binary_hash;
+                vuln_edge.module_id = binary_hash;
+                vuln_edge.binary_hash = vuln_edge.module_id;
                 vuln_edge.source_id = source->id;
                 vuln_edge.target_id = sink_node->id;
                 vuln_edge.edge_type = edge_type_t::VULNERABLE_VIA;
@@ -2784,7 +2833,8 @@ int CommunityDetector::detect(const std::string& binary_hash, int min_size,
 
         community_t comm;
         comm.id = comm_id++;
-        comm.binary_hash = binary_hash;
+        comm.module_id = binary_hash;
+        comm.binary_hash = comm.module_id;
         comm.purpose = infer_community_purpose(members);
         comm.label = comm.purpose + "_" + std::to_string(comm.id);
         for (auto* m : members)
@@ -2915,7 +2965,8 @@ NetworkFlowAnalyzer::analyze(const std::string& binary_hash, progress_fn on_prog
             if (!m_store.has_edge(entry->id, fp.target_id, edge_type_t::NETWORK_SEND))
             {
                 graph_edge_t edge;
-                edge.binary_hash = binary_hash;
+                edge.module_id = binary_hash;
+                edge.binary_hash = edge.module_id;
                 edge.source_id = entry->id;
                 edge.target_id = fp.target_id;
                 edge.edge_type = edge_type_t::NETWORK_SEND;
@@ -2954,7 +3005,8 @@ NetworkFlowAnalyzer::analyze(const std::string& binary_hash, progress_fn on_prog
             if (!m_store.has_edge(recv->id, caller->id, edge_type_t::NETWORK_RECV))
             {
                 graph_edge_t edge;
-                edge.binary_hash = binary_hash;
+                edge.module_id = binary_hash;
+                edge.binary_hash = edge.module_id;
                 edge.source_id = recv->id;
                 edge.target_id = caller->id;
                 edge.edge_type = edge_type_t::NETWORK_RECV;

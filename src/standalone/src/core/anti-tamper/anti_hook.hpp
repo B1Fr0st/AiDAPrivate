@@ -369,7 +369,11 @@ namespace detail {
         return nullptr;
     }
 
-    inline bool system_owned_nt_export_wrapper(const char* name, const uint8_t* addr)
+    inline bool system_owned_nt_export_wrapper(const char* name,
+                                               const uint8_t* addr,
+                                               const char* log_tag = "prologue_hash",
+                                               const char* nonfatal_marker = "prologue_mismatch_system_wrapper_nonfatal",
+                                               const char* reject_marker = "prologue_mismatch_system_wrapper_reject")
     {
         if (!name || !addr || !anti_tamper::syscall::detail::nt_export_name(name))
             return false;
@@ -385,6 +389,9 @@ namespace detail {
         SIZE_T vq = VirtualQuery(addr, &mbi, sizeof(mbi));
         bool mem_writable = vq != 0 && anti_tamper::syscall::detail::writable_protection(mbi.Protect);
         bool mem_redirect = anti_tamper::syscall::detail::inline_redirect_bytes(addr);
+        bool mem_syscall = anti_tamper::syscall::detail::standard_x64_syscall_stub_bytes(addr);
+        bool disk_redirect = anti_tamper::syscall::detail::inline_redirect_bytes(disk_bytes);
+        bool disk_syscall = anti_tamper::syscall::detail::standard_x64_syscall_stub_bytes(disk_bytes);
 
         HMODULE owner_mod = nullptr;
         BOOL owner_ok = GetModuleHandleExW(
@@ -402,6 +409,23 @@ namespace detail {
 
         char owner_path[512]{};
         anti_tamper::syscall::detail::narrow_path(owner_path_w, owner_path, sizeof(owner_path));
+        const uint64_t mem_va = reinterpret_cast<uint64_t>(addr);
+        const uint8_t* ntdll_base_ptr = reinterpret_cast<const uint8_t*>(GetModuleHandleW(L"ntdll.dll"));
+        const uint32_t ntdll_size = anti_tamper::syscall::detail::image_size_from_base(ntdll_base_ptr);
+        const uint64_t ntdll_base = reinterpret_cast<uint64_t>(ntdll_base_ptr);
+        const bool in_ntdll_range = ntdll_size != 0 &&
+            mem_va >= ntdll_base &&
+            mem_va < ntdll_base + ntdll_size;
+        const uint64_t mem_rva = in_ntdll_range ? mem_va - ntdll_base : 0;
+        const uint8_t* owner_base_ptr = reinterpret_cast<const uint8_t*>(owner_mod);
+        const uint32_t owner_size = owner_ok && owner_mod
+            ? anti_tamper::syscall::detail::image_size_from_base(owner_base_ptr)
+            : 0;
+        const uint64_t owner_base = reinterpret_cast<uint64_t>(owner_base_ptr);
+        const bool in_owner_range = owner_size != 0 &&
+            mem_va >= owner_base &&
+            mem_va < owner_base + owner_size;
+        const uint64_t owner_rva = in_owner_range ? mem_va - owner_base : 0;
 
         const bool ok =
             vq != 0 &&
@@ -412,27 +436,30 @@ namespace detail {
             owner_ok &&
             owner_system;
 
-        if (!ok)
-        {
-            char wrapper_diag[1024] = {};
-            _snprintf_s(wrapper_diag, sizeof(wrapper_diag), _TRUNCATE,
-                "prologue_mismatch_system_wrapper func=%s ok=%d va=0x%llX vq=%llu protect=0x%lX state=0x%lX type=0x%lX type_name=%s mem_writable=%d mem_redirect=%d owner_ok=%d owner=0x%llX owner_system=%d owner_path=%s",
-                name,
-                ok ? 1 : 0,
-                static_cast<unsigned long long>(reinterpret_cast<uint64_t>(addr)),
-                static_cast<unsigned long long>(vq),
-                vq ? static_cast<unsigned long>(mbi.Protect) : 0ul,
-                vq ? static_cast<unsigned long>(mbi.State) : 0ul,
-                vq ? static_cast<unsigned long>(mbi.Type) : 0ul,
-                vq ? anti_tamper::syscall::detail::memory_type_name(mbi.Type) : "none",
-                mem_writable ? 1 : 0,
-                mem_redirect ? 1 : 0,
-                owner_ok ? 1 : 0,
-                static_cast<unsigned long long>(reinterpret_cast<uint64_t>(owner_mod)),
-                owner_system ? 1 : 0,
-                owner_path[0] ? owner_path : "<none>");
-            webhook::write_log_critical("prologue_hash", wrapper_diag);
-        }
+        anti_tamper::syscall::detail::log_nt_export_wrapper_diag(log_tag,
+            ok ? nonfatal_marker : reject_marker,
+            name,
+            addr,
+            disk_bytes,
+            mem_va,
+            mem_rva,
+            0,
+            vq,
+            mbi,
+            mem_writable,
+            mem_redirect,
+            disk_redirect,
+            mem_syscall,
+            disk_syscall,
+            true,
+            owner_ok,
+            owner_base,
+            owner_size,
+            owner_rva,
+            owner_system,
+            owner_path_w,
+            owner_path,
+            ok);
 
         return ok;
     }
@@ -1177,6 +1204,12 @@ inline bool verify_syscall_stubs()
             detail::bytes16_hex(addr, mem16);
             const uint8_t* disk_bytes = detail::disk_export_bytes(name);
             detail::bytes16_hex(disk_bytes, disk16);
+            if (detail::system_owned_nt_export_wrapper(name,
+                                                       addr,
+                                                       "syscall_hook",
+                                                       "verify_syscall_stub_system_wrapper_nonfatal",
+                                                       "verify_syscall_stub_system_wrapper_reject"))
+                continue;
             bool owner_system = owner_path_len != 0 &&
                 anti_tamper::syscall::detail::system_image_module_path(owner_path_w);
             webhook::write_log_critical_fmt("syscall_hook",

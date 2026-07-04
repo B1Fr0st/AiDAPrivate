@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <utility>
 
@@ -123,6 +124,126 @@ std::string chain_document_path(const std::string& project_id, const std::string
 std::string chain_report_path(const std::string& project_id, const std::string& report_id)
 {
     return join_path(join_path(chain_project_root(project_id), "reports"), sanitize_store_component(report_id) + ".json");
+}
+
+std::string chain_job_record_root(const std::string& project_id)
+{
+    const std::string root = join_path(chain_project_root(project_id), "jobs");
+    ensure_dir_recursive(root);
+    return root;
+}
+
+std::string chain_report_record_root(const std::string& project_id)
+{
+    const std::string root = join_path(chain_project_root(project_id), "report_records");
+    ensure_dir_recursive(root);
+    return root;
+}
+
+std::string chain_job_record_path(const std::string& project_id, const std::string& job_id)
+{
+    return join_path(chain_job_record_root(project_id), sanitize_store_component(job_id) + ".json");
+}
+
+std::string chain_report_record_path(const std::string& project_id, const std::string& report_id)
+{
+    return join_path(chain_report_record_root(project_id), sanitize_store_component(report_id) + ".json");
+}
+
+chain_store_status_t save_json_record(const std::string& action, const std::string& path, const nlohmann::json& record)
+{
+    chain_store_status_t status;
+    status.action = action;
+    status.path = path;
+    if (!record.is_object())
+    {
+        status.validation.add("invalid_type", "/record", "record must be an object");
+        return status;
+    }
+    const std::string text = record.dump(2) + "\n";
+    status.bytes = text.size();
+    status.ok = write_text_atomic(status.path, text);
+    if (!status.ok)
+        status.validation.add("store_write_failed", "/path", "failed to write json record");
+    return status;
+}
+
+chain_json_record_load_result_t load_json_record(const std::string& action, const std::string& path)
+{
+    chain_json_record_load_result_t result;
+    result.action = action;
+    result.path = path;
+    std::string text;
+    if (!read_text_limited(result.path, text, result.validation))
+        return result;
+    try
+    {
+        result.record = nlohmann::json::parse(text);
+    }
+    catch (const std::exception& e)
+    {
+        result.validation.add("corrupt_store", "/json", e.what());
+        return result;
+    }
+    if (!result.record.is_object())
+        result.validation.add("invalid_type", "/record", "record must be an object");
+    result.ok = result.validation.ok();
+    return result;
+}
+
+chain_json_record_list_result_t list_json_records(const std::string& action, const std::string& root)
+{
+    chain_json_record_list_result_t result;
+    result.action = action;
+    result.path = root;
+    ensure_dir_recursive(root);
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::path(root), ec))
+    {
+        if (ec)
+            break;
+        if (entry.is_regular_file(ec) && entry.path().extension() == ".json")
+            files.push_back(entry.path());
+    }
+    if (ec)
+    {
+        result.validation.add("store_list_failed", "/path", ec.message());
+        return result;
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto& file : files)
+    {
+        chain_json_record_load_result_t loaded = load_json_record(action + "_load_item", file.string());
+        if (!loaded.ok)
+        {
+            result.validation.errors.insert(result.validation.errors.end(), loaded.validation.errors.begin(), loaded.validation.errors.end());
+            continue;
+        }
+        result.bytes += static_cast<std::uint64_t>(loaded.record.dump().size());
+        result.records.push_back(std::move(loaded.record));
+    }
+    result.ok = result.validation.ok();
+    return result;
+}
+
+chain_store_status_t delete_json_record(const std::string& action, const std::string& path)
+{
+    chain_store_status_t status;
+    status.action = action;
+    status.path = path;
+    std::error_code ec;
+    if (!std::filesystem::exists(std::filesystem::path(path), ec))
+    {
+        status.ok = !ec;
+        if (ec)
+            status.validation.add("store_delete_failed", "/path", ec.message());
+        return status;
+    }
+    status.ok = std::filesystem::remove(std::filesystem::path(path), ec);
+    if (!status.ok)
+        status.validation.add("store_delete_failed", "/path", ec ? ec.message() : std::string("failed to remove record"));
+    return status;
 }
 
 chain_report_t parse_report_shallow(const nlohmann::json& raw, validation_result_t& validation)
@@ -291,6 +412,32 @@ nlohmann::json to_json(const chain_ledger_result_t& value)
     };
 }
 
+nlohmann::json to_json(const chain_json_record_load_result_t& value)
+{
+    return nlohmann::json{
+        {"ok", value.ok},
+        {"action", value.action},
+        {"path", value.path},
+        {"record", value.ok ? value.record : nlohmann::json::object()},
+        {"validation", to_json(value.validation)},
+    };
+}
+
+nlohmann::json to_json(const chain_json_record_list_result_t& value)
+{
+    nlohmann::json records = nlohmann::json::array();
+    for (const auto& record : value.records)
+        records.push_back(record);
+    return nlohmann::json{
+        {"ok", value.ok},
+        {"action", value.action},
+        {"path", value.path},
+        {"bytes", value.bytes},
+        {"records", std::move(records)},
+        {"validation", to_json(value.validation)},
+    };
+}
+
 bool from_json(const nlohmann::json& value, chain_ledger_record_t& out, validation_result_t& errors, const std::string& path)
 {
     if (!value.is_object())
@@ -336,6 +483,8 @@ std::string chain_project_root(const std::string& project_id)
     ensure_dir_recursive(join_path(root, "reports"));
     ensure_dir_recursive(join_path(root, "traces"));
     ensure_dir_recursive(join_path(root, "resources"));
+    ensure_dir_recursive(join_path(root, "jobs"));
+    ensure_dir_recursive(join_path(root, "report_records"));
     return root;
 }
 
@@ -422,6 +571,46 @@ chain_report_load_result_t load_chain_report(const std::string& project_id, cons
     result.report = parse_report_shallow(result.raw, result.validation);
     result.ok = result.validation.ok();
     return result;
+}
+
+chain_store_status_t save_chain_job_record(const std::string& project_id, const std::string& job_id, const nlohmann::json& record)
+{
+    return save_json_record("save_chain_job_record", chain_job_record_path(project_id, job_id), record);
+}
+
+chain_json_record_load_result_t load_chain_job_record(const std::string& project_id, const std::string& job_id)
+{
+    return load_json_record("load_chain_job_record", chain_job_record_path(project_id, job_id));
+}
+
+chain_json_record_list_result_t list_chain_job_records(const std::string& project_id)
+{
+    return list_json_records("list_chain_job_records", chain_job_record_root(project_id));
+}
+
+chain_store_status_t delete_chain_job_record(const std::string& project_id, const std::string& job_id)
+{
+    return delete_json_record("delete_chain_job_record", chain_job_record_path(project_id, job_id));
+}
+
+chain_store_status_t save_chain_report_record(const std::string& project_id, const std::string& report_id, const nlohmann::json& record)
+{
+    return save_json_record("save_chain_report_record", chain_report_record_path(project_id, report_id), record);
+}
+
+chain_json_record_load_result_t load_chain_report_record(const std::string& project_id, const std::string& report_id)
+{
+    return load_json_record("load_chain_report_record", chain_report_record_path(project_id, report_id));
+}
+
+chain_json_record_list_result_t list_chain_report_records(const std::string& project_id)
+{
+    return list_json_records("list_chain_report_records", chain_report_record_root(project_id));
+}
+
+chain_store_status_t delete_chain_report_record(const std::string& project_id, const std::string& report_id)
+{
+    return delete_json_record("delete_chain_report_record", chain_report_record_path(project_id, report_id));
 }
 
 chain_ledger_record_t ledger_record_from_report(const chain_report_t& report)

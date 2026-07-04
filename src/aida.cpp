@@ -6,6 +6,7 @@
 #include "graphrag.hpp"
 #include "analysis_db.hpp"
 #include "vuln/embedded_libz3.hpp"
+#include "vuln/chain_verify_service.hpp"
 
 #include <delayimp.h>
 
@@ -646,6 +647,11 @@ static int idaapi finish_populating_widget_popup(
         "ai_assistant:copy_context",
         "ai_assistant:save_database_context",
         "ai_assistant:fix_analysis",
+        "aida:chain_verify_open_panel",
+        "aida:chain_verify_current_function_as_link",
+        "aida:chain_verify_start",
+        "aida:chain_verify_cancel",
+        "aida:chain_verify_copy_result_json",
     };
 
     const std::string menu_root = OBFSTR("AiDA/");
@@ -728,10 +734,38 @@ static int idaapi self_analysis_watchdog(void *)
     return 30000;
 }
 
+class chain_verify_action_handler_t final : public action_handler_t
+{
+public:
+    chain_verify_action_handler_t(aida::vuln::chain_verify_action_kind_t action_kind, aida_plugin_t* owner)
+        : kind(action_kind), plugin(owner)
+    {
+    }
+
+    int idaapi activate(action_activation_ctx_t* ctx) override
+    {
+        if (plugin != nullptr)
+            plugin->activate_chain_verify_action(kind, ctx);
+        return 1;
+    }
+
+    action_state_t idaapi update(action_update_ctx_t* ctx) override
+    {
+        if (plugin == nullptr)
+            return AST_DISABLE;
+        return plugin->update_chain_verify_action(kind, ctx);
+    }
+
+private:
+    aida::vuln::chain_verify_action_kind_t kind;
+    aida_plugin_t* plugin = nullptr;
+};
+
 aida_plugin_t::aida_plugin_t(bool standalone_verified, const std::string& standalone_failure)
 {
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
 
+    chain_verifier_service = std::make_unique<aida::vuln::chain_verifier_service_t>();
     register_actions();
 
     if (!standalone_verified)
@@ -896,6 +930,18 @@ bool aida_plugin_t::initialize_operational(bool interactive)
     agent_tools::initialize_all_tools();
     aida_ipc::trace_breadcrumb("initialize_operational_tools_init_done");
 
+    if (!chain_verifier_service)
+        chain_verifier_service = std::make_unique<aida::vuln::chain_verifier_service_t>();
+    aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_begin");
+    if (!chain_verifier_service->start())
+    {
+        chain_verifier_service->stop(4000);
+        set_disabled("Chain verifier service could not start");
+        aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_fail");
+        return false;
+    }
+    aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_done");
+
     g_settings.mcp_enabled = true;
     aida_ipc::trace_breadcrumb("initialize_operational_settings_save_mcp_begin port=%d", g_settings.mcp_port);
     g_settings.save();
@@ -904,6 +950,8 @@ bool aida_plugin_t::initialize_operational(bool interactive)
     aida_ipc::trace_breadcrumb("initialize_operational_mcp_start_begin port=%d", g_settings.mcp_port);
     if (!start_mcp_server())
     {
+        if (chain_verifier_service)
+            chain_verifier_service->stop(4000);
         set_disabled("MCP server could not start");
         aida_ipc::trace_breadcrumb("initialize_operational_mcp_start_fail");
         return false;
@@ -984,6 +1032,12 @@ aida_plugin_t::~aida_plugin_t()
     if (features_initialized)
     {
         aida_ipc::trace_breadcrumb("plugin_destructor_features_shutdown_begin");
+        if (chain_verifier_service)
+        {
+            aida_ipc::trace_breadcrumb("plugin_destructor_chain_verifier_stop_begin");
+            chain_verifier_service->stop(4000);
+            aida_ipc::trace_breadcrumb("plugin_destructor_chain_verifier_stop_done");
+        }
         game_stealth::shutdown();
 
         std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
@@ -998,6 +1052,7 @@ aida_plugin_t::~aida_plugin_t()
         aida_ipc::trace_breadcrumb("plugin_destructor_features_shutdown_done");
     }
     unregister_actions();
+    chain_verifier_service.reset();
 #ifdef __NT__
     aida_ipc::uninstall_crash_breadcrumbs();
 #endif
@@ -1014,6 +1069,20 @@ bool idaapi aida_plugin_t::run(size_t)
 
     info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
     return true;
+}
+
+void aida_plugin_t::activate_chain_verify_action(aida::vuln::chain_verify_action_kind_t kind, action_activation_ctx_t* ctx)
+{
+    if (!is_operational() || !chain_verifier_service)
+        return;
+    chain_verifier_service->activate(kind, ctx);
+}
+
+action_state_t aida_plugin_t::update_chain_verify_action(aida::vuln::chain_verify_action_kind_t kind, const action_update_ctx_t* ctx) const
+{
+    if (!is_operational() || !chain_verifier_service)
+        return AST_DISABLE;
+    return chain_verifier_service->action_state(kind, ctx);
 }
 
 bool aida_plugin_t::start_mcp_server()
@@ -1087,6 +1156,43 @@ void aida_plugin_t::register_actions()
             continue;
         }
         attach_action_to_menu(menu_root.c_str(), def.name.c_str(), SETMENU_APP);
+    }
+
+    struct chain_action_def_t {
+        std::string name;
+        std::string label;
+        aida::vuln::chain_verify_action_kind_t kind;
+        const char* shortcut;
+    };
+
+    const chain_action_def_t chain_action_definitions[] = {
+        {OBFSTR("aida:chain_verify_open_panel"), OBFSTR("Open Chain Verify"), aida::vuln::chain_verify_action_kind_t::open_panel, ""},
+        {OBFSTR("aida:chain_verify_current_function_as_link"), OBFSTR("Current Function As Chain Link"), aida::vuln::chain_verify_action_kind_t::current_function_as_link, "Ctrl+Alt+L"},
+        {OBFSTR("aida:chain_verify_start"), OBFSTR("Start Chain Verification"), aida::vuln::chain_verify_action_kind_t::start, "Ctrl+Alt+V"},
+        {OBFSTR("aida:chain_verify_cancel"), OBFSTR("Cancel Chain Verification"), aida::vuln::chain_verify_action_kind_t::cancel, ""},
+        {OBFSTR("aida:chain_verify_copy_result_json"), OBFSTR("Copy Chain Result JSON"), aida::vuln::chain_verify_action_kind_t::copy_result_json, ""},
+    };
+
+    const std::string chain_menu_root = menu_root + OBFSTR("Chain Verify/");
+    for (const auto& def : chain_action_definitions)
+    {
+        actions_list.push_back() = def.name.c_str();
+        action_desc_t adesc = ACTION_DESC_LITERAL_PLUGMOD(
+            def.name.c_str(),
+            def.label.c_str(),
+            new chain_verify_action_handler_t(def.kind, this),
+            this,
+            def.shortcut,
+            nullptr,
+            -1);
+        adesc.flags |= ADF_OWN_HANDLER;
+
+        if (!register_action(adesc))
+        {
+            msg(OBFSTR_C("Failed to register action %s\n"), def.name.c_str());
+            continue;
+        }
+        attach_action_to_menu(chain_menu_root.c_str(), def.name.c_str(), SETMENU_APP);
     }
     actions_registered = true;
 }

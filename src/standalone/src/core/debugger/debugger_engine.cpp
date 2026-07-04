@@ -25,6 +25,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -127,20 +128,6 @@ bool kernel_target_operations_ready(const char* caller) {
 	return ready;
 }
 
-struct call_stack_symbol_resolution_t {
-	uint64_t address = 0;
-	uint64_t module_base = 0;
-	uint64_t module_size = 0;
-	uint64_t module_offset = 0;
-	uint64_t symbol_address = 0;
-	uint64_t symbol_offset = 0;
-	uint64_t elapsed_us = 0;
-	std::string module_name;
-	std::string function_name;
-	std::string source = "none";
-	std::string status = "not_attempted";
-};
-
 constexpr uint64_t k_call_stack_symbol_max_delta = 0x10000ull;
 constexpr uint32_t k_call_stack_export_max_names = 65536u;
 constexpr uint32_t k_call_stack_export_max_functions = 65536u;
@@ -238,6 +225,7 @@ call_stack_symbol_resolution_t module_rva_resolution(
 	result.address = address;
 	if (module != nullptr) {
 		result.module_name = module->name;
+		result.module_path = module->path;
 		result.module_base = module->base;
 		result.module_size = module->size;
 		result.module_offset = address - module->base;
@@ -1003,9 +991,10 @@ bool resolve_stack_symbol_from_exports(const driver_bridge::module_info_t& modul
 
 void log_call_stack_symbol_resolution(const call_stack_symbol_resolution_t& r) {
 	diag::log_tagged_fmt("dbg_stack_symbol",
-		"resolve addr=0x%llX module=%s base=0x%llX size=0x%llX offset=0x%llX source=%s status=%s function=%s symbol=0x%llX symbol_offset=0x%llX elapsed_us=%llu",
+		"resolve addr=0x%llX module=%s path=%s base=0x%llX size=0x%llX offset=0x%llX source=%s status=%s function=%s symbol=0x%llX symbol_offset=0x%llX elapsed_us=%llu",
 		static_cast<unsigned long long>(r.address),
 		r.module_name.empty() ? "(none)" : r.module_name.c_str(),
+		r.module_path.empty() ? "(none)" : r.module_path.c_str(),
 		static_cast<unsigned long long>(r.module_base),
 		static_cast<unsigned long long>(r.module_size),
 		static_cast<unsigned long long>(r.module_offset),
@@ -1033,6 +1022,7 @@ call_stack_symbol_resolution_t resolve_call_stack_symbol(
 		return result;
 	}
 	result.module_name = module->name;
+	result.module_path = module->path;
 	result.module_base = module->base;
 	result.module_size = module->size;
 	result.module_offset = address - module->base;
@@ -1065,6 +1055,7 @@ call_stack_symbol_resolution_t resolve_call_stack_symbol(
 	if (resolve_stack_symbol_from_local_image(*module, address, result, local_image_status, t0)) {
 		result.address = address;
 		result.module_name = module->name;
+		result.module_path = module->path;
 		result.module_base = module->base;
 		result.module_size = module->size;
 		result.module_offset = address - module->base;
@@ -1126,6 +1117,49 @@ void publish_call_stack_resolutions(const std::vector<call_stack_symbol_resoluti
 	cache.reserve(records.size());
 	for (const auto& r : records)
 		cache[r.address] = r;
+}
+
+void prime_call_stack_symbol_modules(const std::vector<driver_bridge::module_info_t>& modules) {
+	if (modules.empty())
+		return;
+	for (const auto& m : modules) {
+		std::string lower_name = m.name;
+		std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+		if (lower_name.find(".exe") != std::string::npos && !m.path.empty()) {
+			auto parent_dir = std::filesystem::path(m.path).parent_path();
+			if (!parent_dir.empty()) {
+				symbol_store::add_target_module_search_path(parent_dir.string());
+			}
+			break;
+		}
+	}
+	std::vector<driver_bridge::module_info_t> modules_needing_pdb;
+	{
+		std::unique_lock<std::mutex> try_lk(symbol_store::g_state.mutex, std::try_to_lock);
+		if (try_lk.owns_lock()) {
+			for (const auto& m : modules) {
+				std::string lower_name = m.name;
+				std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+				bool worth_loading = (lower_name.find(".exe") != std::string::npos ||
+					lower_name.find("game") != std::string::npos ||
+					lower_name.find("engine") != std::string::npos);
+				if (!worth_loading) continue;
+				auto it = symbol_store::g_state.modules.find(m.name);
+				if (it == symbol_store::g_state.modules.end()) {
+					modules_needing_pdb.push_back(m);
+				}
+			}
+		}
+	}
+	for (const auto& m : modules_needing_pdb) {
+		diag::log_tagged_fmt("dbg_engine",
+			"call_stack_lazy_pdb_load module=%s base=0x%llX size=0x%X path=%s",
+			m.name.c_str(),
+			static_cast<unsigned long long>(m.base),
+			m.size,
+			m.path.c_str());
+		symbol_store::load_pdb_for_module(m.name, m.base, static_cast<uint64_t>(m.size));
+	}
 }
 
 expression_eval::context_t build_eval_context(const register_set_t& regs) {
@@ -1320,6 +1354,7 @@ std::string call_stack_frame_resolver_evidence(uint64_t address) {
 	oss << "source=" << r.source
 		<< " status=" << r.status
 		<< " module=" << (r.module_name.empty() ? "(none)" : r.module_name)
+		<< " path=" << (r.module_path.empty() ? "(none)" : r.module_path)
 		<< " base=0x" << std::hex << std::uppercase << r.module_base
 		<< " address=0x" << r.address
 		<< " offset=0x" << r.module_offset
@@ -1327,6 +1362,69 @@ std::string call_stack_frame_resolver_evidence(uint64_t address) {
 		<< " symbol_offset=0x" << r.symbol_offset
 		<< std::dec << " elapsed_us=" << r.elapsed_us;
 	return oss.str();
+}
+
+std::vector<call_stack_symbol_resolution_t> resolve_call_stack_frames(const std::vector<uint64_t>& addresses) {
+	const auto started = std::chrono::steady_clock::now();
+	auto modules = driver_bridge::enumerate_modules();
+	diag::log_tagged_fmt("dbg_engine",
+		"resolve_call_stack_frames entry count=%zu modules=%zu pid=%u",
+		addresses.size(),
+		modules.size(),
+		driver_bridge::attached_pid());
+	prime_call_stack_symbol_modules(modules);
+	const auto symbol_budget_deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_total_symbol_budget_us);
+	std::vector<call_stack_symbol_resolution_t> records;
+	records.reserve(addresses.size());
+	std::unordered_map<uint64_t, call_stack_symbol_resolution_t> local_resolution_cache;
+	local_resolution_cache.reserve(addresses.size());
+	std::size_t cache_hits = 0;
+	std::size_t zero_addresses = 0;
+	for (uint64_t address : addresses) {
+		if (address == 0) {
+			call_stack_symbol_resolution_t zero;
+			zero.address = address;
+			zero.status = "zero_address";
+			zero.elapsed_us = resolver_elapsed_us(started);
+			records.push_back(std::move(zero));
+			++zero_addresses;
+			continue;
+		}
+		auto cache_it = local_resolution_cache.find(address);
+		if (cache_it != local_resolution_cache.end()) {
+			call_stack_symbol_resolution_t cached = cache_it->second;
+			cached.status += ";batch_cache_hit";
+			cached.elapsed_us = 0;
+			records.push_back(std::move(cached));
+			++cache_hits;
+			continue;
+		}
+		const auto per_frame_deadline = std::min(
+			symbol_budget_deadline,
+			std::chrono::steady_clock::now() + std::chrono::microseconds(k_call_stack_frame_symbol_budget_us));
+		auto resolved = resolve_call_stack_symbol(address, modules, per_frame_deadline);
+		local_resolution_cache.emplace(address, resolved);
+		records.push_back(std::move(resolved));
+	}
+	publish_call_stack_resolutions(records);
+	diag::log_tagged_fmt("dbg_engine",
+		"resolve_call_stack_frames done count=%zu modules=%zu cache_hits=%zu zero_addresses=%zu elapsed_us=%llu",
+		addresses.size(),
+		modules.size(),
+		cache_hits,
+		zero_addresses,
+		static_cast<unsigned long long>(resolver_elapsed_us(started)));
+	return records;
+}
+
+call_stack_symbol_resolution_t resolve_call_stack_frame(uint64_t address) {
+	auto records = resolve_call_stack_frames(std::vector<uint64_t>{address});
+	if (!records.empty())
+		return records.front();
+	call_stack_symbol_resolution_t empty;
+	empty.address = address;
+	empty.status = "resolver_returned_no_records";
+	return empty;
 }
 
 void sync_attached_state();
@@ -3261,47 +3359,7 @@ std::vector<stack_frame_t> get_call_stack() {
 		"get_call_stack: modules count=%zu elapsed_us=%llu",
 		modules.size(),
 		static_cast<unsigned long long>(resolver_elapsed_us(modules_started)));
-	if (!modules.empty()) {
-		for (const auto& m : modules) {
-			std::string lower_name = m.name;
-			std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-			if (lower_name.find(".exe") != std::string::npos && !m.path.empty()) {
-				std::error_code path_ec;
-				auto parent_dir = std::filesystem::path(m.path).parent_path();
-				if (!parent_dir.empty()) {
-					symbol_store::add_target_module_search_path(parent_dir.string());
-				}
-				break;
-			}
-		}
-		std::vector<driver_bridge::module_info_t> modules_needing_pdb;
-		{
-			std::unique_lock<std::mutex> try_lk(symbol_store::g_state.mutex, std::try_to_lock);
-			if (try_lk.owns_lock()) {
-				for (const auto& m : modules) {
-					std::string lower_name = m.name;
-					std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-					bool worth_loading = (lower_name.find(".exe") != std::string::npos ||
-						lower_name.find("game") != std::string::npos ||
-						lower_name.find("engine") != std::string::npos);
-					if (!worth_loading) continue;
-					auto it = symbol_store::g_state.modules.find(m.name);
-					if (it == symbol_store::g_state.modules.end()) {
-						modules_needing_pdb.push_back(m);
-					}
-				}
-			}
-		}
-		for (const auto& m : modules_needing_pdb) {
-			diag::log_tagged_fmt("dbg_engine",
-				"get_call_stack_lazy_pdb_load module=%s base=0x%llX size=0x%X path=%s",
-				m.name.c_str(),
-				static_cast<unsigned long long>(m.base),
-				m.size,
-				m.path.c_str());
-			symbol_store::load_pdb_for_module(m.name, m.base, static_cast<uint64_t>(m.size));
-		}
-	}
+	prime_call_stack_symbol_modules(modules);
 	std::vector<call_stack_symbol_resolution_t> resolution_records;
 	resolution_records.reserve(65);
 	std::unordered_map<uint64_t, call_stack_symbol_resolution_t> local_resolution_cache;
@@ -3377,8 +3435,15 @@ std::vector<stack_frame_t> get_call_stack() {
 			static_cast<unsigned long long>(resolver_elapsed_us(frame_started)),
 			static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(symbol_budget_deadline - std::chrono::steady_clock::now()).count()));
 		f.module_name = symbol.module_name;
+		f.module_path = symbol.module_path;
+		f.module_base = symbol.module_base;
+		f.module_size = symbol.module_size;
 		f.module_offset = symbol.module_offset;
 		f.function_name = symbol.function_name;
+		f.symbol_address = symbol.symbol_address;
+		f.symbol_offset = symbol.symbol_offset;
+		f.symbol_source = symbol.source;
+		f.symbol_status = symbol.status;
 		resolution_records.push_back(std::move(symbol));
 		return f;
 	};

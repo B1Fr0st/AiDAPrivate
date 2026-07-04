@@ -1036,8 +1036,8 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
             kwargs["window"] = window_size
         fast_probe = bool(cfg.get("aida_testlab_fast_probe") or cfg.get("testlab_fast_probe")) or str(_os.environ.get("AIDA_CAMOUFOX_TESTLAB_FAST_PROBE", "")).lower() in {"1", "true", "yes", "on"}
         launch_timeout_floor_ms = 5000
-        launch_timeout_ceiling_ms = 15000 if bundled_visible_launch else (70000 if fast_probe else 120000)
-        launch_timeout_default_ms = 15000 if bundled_visible_launch else (70000 if fast_probe else 30000)
+        launch_timeout_ceiling_ms = 120000 if bundled_visible_launch else (70000 if fast_probe else 120000)
+        launch_timeout_default_ms = 75000 if bundled_visible_launch else (70000 if fast_probe else 30000)
         launch_timeout_ms = min(max(_int_config(cfg.get("launch_timeout_ms"), launch_timeout_default_ms), launch_timeout_floor_ms), launch_timeout_ceiling_ms)]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
     endif()
@@ -1102,7 +1102,7 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
                     ctx = self.browser.contexts[0]
                 else:
                     _camoufox_debug("launch_new_context_begin")
-                    ctx = await asyncio.wait_for(self.browser.new_context(), timeout=min(max(8.0, max(5.0, launch_timeout_ms / 1000.0) * 0.50), max(5.0, launch_timeout_ms / 1000.0)))
+                    ctx, _, _ = await _create_camoufox_safe_context(self.browser, {}, min(max(8.0, max(5.0, launch_timeout_ms / 1000.0) * 0.50), max(5.0, launch_timeout_ms / 1000.0)), "launch_new_context", None, launch_started)
                     _camoufox_debug("launch_new_context_ok", elapsed_ms=int((time.perf_counter() - launch_started) * 1000))]=]
             AIDA_CAMOUFOX_CONTENT "${AIDA_CAMOUFOX_CONTENT}")
 
@@ -1991,6 +1991,11 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_FAST_VISIBLE_FALLBACK"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "AIDA_CAMOUFOX_BRIDGE_PATCH_ID"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_camoufox_bridge_20260620_crash_diag_1"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_context_viewport_sanitizer_v1"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "_sanitize_camoufox_context_options"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "context_options_sanitized"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "page_viewport_set_ok"
+        OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "protocol_schema_viewport"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_bridge_patch_active"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_launch_policy_resolved"
         OR NOT AIDA_CAMOUFOX_CONTENT MATCHES "aida_default_addon_policy_v1"
@@ -2008,6 +2013,20 @@ def _profile_snapshot(profile_dir: str | None) -> dict[str, Any]:
         OR AIDA_CAMOUFOX_CONTENT MATCHES "if explicit_addon_count == 0:"
         OR AIDA_CAMOUFOX_CONTENT MATCHES "context_options: dict\\[str, Any\\] = \\{\"service_workers\": \"block\"\\}"
         OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\(service_workers=\"block\"\\)"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "self\\.browser\\.new_context\\("
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "browser\\.new_context\\(\\)"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\([^\\n\\)]*viewport"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\([^\\n\\)]*screen"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\([^\\n\\)]*device_scale_factor"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\([^\\n\\)]*deviceScaleFactor"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\([^\\n\\)]*is_mobile"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_context\\([^\\n\\)]*isMobile"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_page\\([^\\n\\)]*viewport"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_page\\([^\\n\\)]*screen"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_page\\([^\\n\\)]*device_scale_factor"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_page\\([^\\n\\)]*deviceScaleFactor"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_page\\([^\\n\\)]*is_mobile"
+        OR AIDA_CAMOUFOX_CONTENT MATCHES "new_page\\([^\\n\\)]*isMobile"
         OR AIDA_CAMOUFOX_SHADOWED_ENV_POS GREATER -1)
         message(FATAL_ERROR "Failed to patch ${AIDA_CAMOUFOX_PATCH_FILE}")
     endif()

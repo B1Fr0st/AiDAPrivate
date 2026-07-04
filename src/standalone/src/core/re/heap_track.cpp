@@ -306,10 +306,13 @@ json session_json(const store::heap_session_t& session)
     out["started_ms"] = session.started_ms;
     out["elapsed_ms"] = session.started_ms != 0 && unix_time_ms() >= session.started_ms ? unix_time_ms() - session.started_ms : 0;
     out["rtl_allocate_heap"] = session.rtl_allocate_heap ? json(sa_format_address(session.rtl_allocate_heap)) : json(nullptr);
+    out["allocation_target"] = session.rtl_allocate_heap ? json(sa_format_address(session.rtl_allocate_heap)) : json(nullptr);
     out["hw_slot"] = session.hw_slot >= 0 ? json(session.hw_slot) : json(nullptr);
     out["thread_count"] = session.tids.size();
+    out["armed_tids"] = session.tids;
     out["baseline_count"] = session.baseline.size();
     out["capture_count"] = session.captures.size();
+    out["capture_queue_size"] = session.captures.size();
     out["positive_capture_count"] = session.captures.size();
     out["snapshot_capture_count"] = 0;
     out["event_capture_count"] = session_event_active(session) ? session.captures.size() : 0;
@@ -327,6 +330,13 @@ json session_json(const store::heap_session_t& session)
     out["kernel_context_polling"] = session_event_active(session);
     out["alignment_filter_active"] = session.alignment != 0;
     out["snapshot_diff_available"] = false;
+    out["hwbp_evidence"] = {
+        {"allocation_target", session.rtl_allocate_heap ? json(sa_format_address(session.rtl_allocate_heap)) : json(nullptr)},
+        {"hw_slot", session.hw_slot >= 0 ? json(session.hw_slot) : json(nullptr)},
+        {"armed_tids", session.tids},
+        {"capture_queue_size", session.captures.size()},
+        {"kernel_context_polling", session_event_active(session)}
+    };
     return out;
 }
 
@@ -854,6 +864,11 @@ void heap_debug_loop()
     }
     state.error.store(0, std::memory_order_release);
     state.attached.store(true, std::memory_order_release);
+    diag::log_tagged_fmt("heap_track",
+        "kernel_context_loop_entry pid=%u worker_tid=%lu active_pid=%u",
+        pid,
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        driver_bridge::attached_pid());
     arm_heap_existing_threads(pid);
     std::uint64_t poll_count = 0;
     while (state.polling.load(std::memory_order_acquire))
@@ -873,8 +888,10 @@ void heap_debug_loop()
     }
     if (auto session = event_session_for_pid(pid))
         clear_session_breakpoints(*session);
+    std::size_t pending_cleared = 0;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
+        pending_cleared = state.pending.size();
         state.pending.clear();
     }
     state.attached.store(false, std::memory_order_release);
@@ -882,9 +899,11 @@ void heap_debug_loop()
     state.pid.store(0, std::memory_order_release);
     state.running.store(false, std::memory_order_release);
     diag::log_tagged_fmt("heap_track",
-        "kernel_context_loop_exit pid=%u polls=%llu",
+        "kernel_context_loop_exit pid=%u worker_tid=%lu polls=%llu pending_cleared=%zu",
         pid,
-        static_cast<unsigned long long>(poll_count));
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(poll_count),
+        pending_cleared);
 }
 
 bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
@@ -1420,6 +1439,15 @@ tool_result_t stop_session(const json& params)
         {"bounded_focus_only", focus_only}
     };
     result["breakpoints_cleared_count"] = cleared;
+    result["stop_cleanup"] = {
+        {"scope_ok", scope.ok()},
+        {"breakpoints_clear_attempted", scope.ok()},
+        {"breakpoints_cleared_count", cleared},
+        {"kernel_context_stop_attempted", session.hw_slot >= 0},
+        {"debug_loop_running_after_stop", heap_debug_state().running.load(std::memory_order_acquire)},
+        {"armed_tids_before_stop", session.tids},
+        {"capture_queue_size_at_stop", session.captures.size()}
+    };
     result["elapsed_ms"] = GetTickCount64() - started_ms;
     diag::log_tagged_fmt("heap_track",
         "stop exit session_id=%s ok=%d captures=%zu focused=%d cleared=%zu scope_ok=%d elapsed_ms=%llu",

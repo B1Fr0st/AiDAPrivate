@@ -9820,7 +9820,10 @@ tool_result_t auto_narrow(const json& params)
         bool stop_loop_attempted = false;
         bool stop_loop_completed = true;
         bool stop_loop_timeout = false;
+        bool stop_loop_cancelled = false;
+        bool stop_loop_deadline = false;
         bool breakpoint_timeout = false;
+        bool breakpoint_cancelled = false;
         std::size_t breakpoints_attempted = 0;
         std::size_t breakpoints_skipped = 0;
         frame_tracking_state().enabled.store(false, std::memory_order_release);
@@ -9836,6 +9839,15 @@ tool_result_t auto_narrow(const json& params)
         } else {
             if (state_matches) {
                 while (state.running.load(std::memory_order_acquire) && cleanup_remaining_ms() != 0) {
+                    if (mcp_standalone::current_call_cancelled()) {
+                        stop_loop_cancelled = true;
+                        break;
+                    }
+                    const std::uint64_t outer_deadline = mcp_standalone::current_call_deadline_ms();
+                    if (outer_deadline != 0 && GetTickCount64() >= outer_deadline) {
+                        stop_loop_deadline = true;
+                        break;
+                    }
                     const std::uint64_t slice = std::min<std::uint64_t>(10, cleanup_remaining_ms());
                     if (slice == 0)
                         break;
@@ -9847,6 +9859,8 @@ tool_result_t auto_narrow(const json& params)
         }
         for (const auto& r : prepared) {
             for (auto tid : r.tids) {
+                if (mcp_standalone::current_call_cancelled())
+                    breakpoint_cancelled = true;
                 if (cleanup_remaining_ms() == 0) {
                     ++breakpoints_skipped;
                     breakpoint_timeout = true;
@@ -9857,9 +9871,9 @@ tool_result_t auto_narrow(const json& params)
             }
         }
         const std::uint64_t cleanup_elapsed = GetTickCount64() - cleanup_started;
-        const bool quarantined = stop_loop_timeout || breakpoint_timeout;
+        const bool quarantined = stop_loop_timeout || breakpoint_timeout || stop_loop_cancelled || stop_loop_deadline;
         diag::log_tagged_fmt("dx_hook",
-                             "auto_narrow cleanup_end pid=%u phase=%s prepared=%zu cleanup_elapsed_ms=%llu cleanup_budget_ms=%llu stop_attempted=%d stop_completed=%d stop_timeout=%d breakpoint_attempted=%zu breakpoint_skipped=%zu quarantined=%d total_elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             "auto_narrow cleanup_end pid=%u phase=%s prepared=%zu cleanup_elapsed_ms=%llu cleanup_budget_ms=%llu stop_attempted=%d stop_completed=%d stop_timeout=%d stop_cancelled=%d stop_deadline=%d breakpoint_attempted=%zu breakpoint_skipped=%zu breakpoint_timeout=%d breakpoint_cancelled=%d quarantined=%d total_elapsed_ms=%llu deadline_remaining_ms=%llu",
                              scope.pid(),
                              phase ? phase : "",
                              prepared.size(),
@@ -9868,8 +9882,12 @@ tool_result_t auto_narrow(const json& params)
                              stop_loop_attempted ? 1 : 0,
                              stop_loop_completed ? 1 : 0,
                              stop_loop_timeout ? 1 : 0,
+                             stop_loop_cancelled ? 1 : 0,
+                             stop_loop_deadline ? 1 : 0,
                              breakpoints_attempted,
                              breakpoints_skipped,
+                             breakpoint_timeout ? 1 : 0,
+                             breakpoint_cancelled ? 1 : 0,
                              quarantined ? 1 : 0,
                              static_cast<unsigned long long>(GetTickCount64() - started_ms),
                              static_cast<unsigned long long>(deadline_remaining_ms()));
@@ -9881,9 +9899,12 @@ tool_result_t auto_narrow(const json& params)
                     {"stop_loop_attempted", stop_loop_attempted},
                     {"stop_loop_completed", stop_loop_completed},
                     {"stop_loop_timeout", stop_loop_timeout},
+                    {"stop_loop_cancelled", stop_loop_cancelled},
+                    {"stop_loop_deadline", stop_loop_deadline},
                     {"breakpoints_attempted", breakpoints_attempted},
                     {"breakpoints_skipped", breakpoints_skipped},
                     {"breakpoint_timeout", breakpoint_timeout},
+                    {"breakpoint_cancelled", breakpoint_cancelled},
                     {"cleanup_timeout", quarantined},
                     {"quarantined", quarantined}};
     };
@@ -9961,6 +9982,7 @@ tool_result_t auto_narrow(const json& params)
     }
 
     std::vector<store::dx_hook_record_t> prepared;
+    json arm_evidence = json::array();
     auto arm = [&](const slot_entry_t& target, const std::string& act, int hw_slot) {
         store::dx_hook_record_t rec;
         rec.id = store::next_id("dx");
@@ -9973,9 +9995,82 @@ tool_result_t auto_narrow(const json& params)
         rec.capture_cbuffers = (act == "cbuffer_bind");
         rec.max_captures = 64;
         rec.created_ms = unix_time_ms();
-        for (const auto& th : threads_for(scope.pid()))
-            if (driver_bridge::set_hardware_breakpoint(th.tid, hw_slot, target.target_va, 0, 0))
+        for (const auto& th : threads_for(scope.pid())) {
+            driver_bridge::thread_context_t before_ctx{};
+            SetLastError(ERROR_SUCCESS);
+            const bool before_ok = driver_bridge::get_thread_context(th.tid, before_ctx);
+            const DWORD before_gle = before_ok ? ERROR_SUCCESS : GetLastError();
+            SetLastError(ERROR_SUCCESS);
+            const bool set_ok = driver_bridge::set_hardware_breakpoint(th.tid, hw_slot, target.target_va, 0, 0);
+            const DWORD set_gle = set_ok ? ERROR_SUCCESS : GetLastError();
+            const std::string set_status = driver_bridge::status();
+            const std::string set_last_error = driver_bridge::last_error();
+            driver_bridge::thread_context_t after_ctx{};
+            SetLastError(ERROR_SUCCESS);
+            const bool after_ok = driver_bridge::get_thread_context(th.tid, after_ctx);
+            const DWORD after_gle = after_ok ? ERROR_SUCCESS : GetLastError();
+            const std::uint64_t slot_addr = after_ok ? context_dr_address(after_ctx, hw_slot) : 0;
+            const bool slot_enabled = after_ok && hw_slot >= 0 && hw_slot <= 3 && ((after_ctx.dr7 & (1ull << static_cast<unsigned>(hw_slot * 2))) != 0);
+            const bool verify_ok = set_ok && after_ok && slot_addr == target.target_va && slot_enabled;
+            diag::log_tagged_fmt("dx_hook",
+                                 "auto_narrow arm_thread pid=%u action=%s target=%s tid=%u owner_pid=%u enum_state=%u slot=%d type=execute len=1 driver_type=%d driver_size=%d set_ok=%d set_gle=%lu before_ok=%d before_gle=%lu after_ok=%d after_gle=%lu verify_ok=%d slot_addr=%s slot_enabled=%d rip=%s dr0=%s dr1=%s dr2=%s dr3=%s dr6=0x%llX dr7=0x%llX status=%s last_error=%s",
+                                 scope.pid(),
+                                 act.c_str(),
+                                 sa_format_address(target.target_va).c_str(),
+                                 th.tid,
+                                 th.owner_pid,
+                                 th.state,
+                                 hw_slot,
+                                 0,
+                                 0,
+                                 set_ok ? 1 : 0,
+                                 static_cast<unsigned long>(set_gle),
+                                 before_ok ? 1 : 0,
+                                 static_cast<unsigned long>(before_gle),
+                                 after_ok ? 1 : 0,
+                                 static_cast<unsigned long>(after_gle),
+                                 verify_ok ? 1 : 0,
+                                 sa_format_address(slot_addr).c_str(),
+                                 slot_enabled ? 1 : 0,
+                                 sa_format_address(after_ctx.rip).c_str(),
+                                 sa_format_address(after_ctx.dr0).c_str(),
+                                 sa_format_address(after_ctx.dr1).c_str(),
+                                 sa_format_address(after_ctx.dr2).c_str(),
+                                 sa_format_address(after_ctx.dr3).c_str(),
+                                 static_cast<unsigned long long>(after_ctx.dr6),
+                                 static_cast<unsigned long long>(after_ctx.dr7),
+                                 set_status.c_str(),
+                                 set_last_error.c_str());
+            if (arm_evidence.size() < 96) {
+                arm_evidence.push_back(json{
+                    {"action", act},
+                    {"target", sa_format_address(target.target_va)},
+                    {"tid", th.tid},
+                    {"slot", hw_slot},
+                    {"type", "execute"},
+                    {"length", 1},
+                    {"driver_type", 0},
+                    {"driver_size", 0},
+                    {"set_ok", set_ok},
+                    {"set_gle", static_cast<unsigned long>(set_gle)},
+                    {"before_ok", before_ok},
+                    {"before_gle", static_cast<unsigned long>(before_gle)},
+                    {"after_ok", after_ok},
+                    {"after_gle", static_cast<unsigned long>(after_gle)},
+                    {"verify_ok", verify_ok},
+                    {"slot_address", sa_format_address(slot_addr)},
+                    {"slot_enabled", slot_enabled},
+                    {"dr0", sa_format_address(after_ctx.dr0)},
+                    {"dr1", sa_format_address(after_ctx.dr1)},
+                    {"dr2", sa_format_address(after_ctx.dr2)},
+                    {"dr3", sa_format_address(after_ctx.dr3)},
+                    {"dr6", sa_format_address(after_ctx.dr6)},
+                    {"dr7", sa_format_address(after_ctx.dr7)}
+                });
+            }
+            if (verify_ok)
                 rec.tids.push_back(th.tid);
+        }
         return rec;
     };
 
@@ -9991,6 +10086,7 @@ tool_result_t auto_narrow(const json& params)
         result["failure_reason"] = "hwbp_arming_failed";
         result["capability"] = {{"available", false}, {"reason", "hwbp_arming_failed"}};
         result["resolved_targets"] = resolved_targets_json(present_target, draw_target, cbuffer_target);
+        result["arm_evidence"] = std::move(arm_evidence);
         return tool_result_t::error("Could not arm all 3 HWBPs.", result);
     }
 
@@ -10036,6 +10132,11 @@ tool_result_t auto_narrow(const json& params)
     const std::uint64_t frame_wait_started_ms = GetTickCount64();
     const std::uint64_t frame_deadline_ms = frame_wait_started_ms > std::numeric_limits<std::uint64_t>::max() - frame_wait_budget_ms ? std::numeric_limits<std::uint64_t>::max() : frame_wait_started_ms + frame_wait_budget_ms;
     bool auto_narrow_cancelled = false;
+    bool frame_wait_deadline_expired = false;
+    std::size_t frame_wait_iterations = 0;
+    std::size_t frame_wait_last_batches = 0;
+    std::size_t frame_wait_last_hot_vas = 0;
+    std::size_t frame_wait_last_cbuffer_classifications = 0;
     diag::log_tagged_fmt("dx_hook",
                          "auto_narrow frame_wait_begin pid=%u requested_frames=%u wait_budget_ms=%llu resolved_present=%s resolved_draw=%s resolved_cbuffer=%s elapsed_ms=%llu deadline_remaining_ms=%llu",
                          scope.pid(),
@@ -10046,17 +10147,57 @@ tool_result_t auto_narrow(const json& params)
                          sa_format_address(cbuffer_target->target_va).c_str(),
                          static_cast<unsigned long long>(GetTickCount64() - started_ms),
                          static_cast<unsigned long long>(deadline_remaining_ms()));
-    while (store::list_frame_batches(scope.pid()).size() < capture_frames)
+    for (;;)
     {
-        if (GetTickCount64() > frame_deadline_ms)
+        frame_wait_last_batches = store::list_frame_batches(scope.pid()).size();
+        frame_wait_last_hot_vas = store::list_hot_vas(scope.pid()).size();
+        frame_wait_last_cbuffer_classifications = store::list_cbuffer_classifications(scope.pid()).size();
+        if (frame_wait_last_batches >= capture_frames)
             break;
+        const std::uint64_t now = GetTickCount64();
+        if (now >= frame_deadline_ms) {
+            frame_wait_deadline_expired = true;
+            break;
+        }
         if (dx_call_cancelled("auto_narrow_frame_capture", scope.pid(), started_ms))
         {
             auto_narrow_cancelled = true;
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ++frame_wait_iterations;
+        if (frame_wait_iterations == 1 || (frame_wait_iterations % 10) == 0) {
+            diag::log_tagged_fmt("dx_hook",
+                                 "auto_narrow frame_wait_poll pid=%u iteration=%zu batches=%zu hot_vas=%zu cbuffer_classifications=%zu deadline_remaining_ms=%llu total_elapsed_ms=%llu",
+                                 scope.pid(),
+                                 frame_wait_iterations,
+                                 frame_wait_last_batches,
+                                 frame_wait_last_hot_vas,
+                                 frame_wait_last_cbuffer_classifications,
+                                 static_cast<unsigned long long>(deadline_remaining_ms()),
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        }
+        const std::uint64_t remaining_to_frame_deadline = frame_deadline_ms > now ? frame_deadline_ms - now : 0;
+        const std::uint64_t remaining_to_call_deadline = deadline_remaining_ms();
+        std::uint64_t slice = std::min<std::uint64_t>(50, remaining_to_frame_deadline);
+        if (remaining_to_call_deadline != std::numeric_limits<std::uint64_t>::max())
+            slice = std::min<std::uint64_t>(slice, remaining_to_call_deadline);
+        if (slice == 0) {
+            frame_wait_deadline_expired = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
     }
+    diag::log_tagged_fmt("dx_hook",
+                         "auto_narrow frame_wait_end pid=%u iterations=%zu captured=%zu hot_vas=%zu cbuffer_classifications=%zu cancelled=%d frame_deadline_expired=%d elapsed_ms=%llu deadline_remaining_ms=%llu",
+                         scope.pid(),
+                         frame_wait_iterations,
+                         frame_wait_last_batches,
+                         frame_wait_last_hot_vas,
+                         frame_wait_last_cbuffer_classifications,
+                         auto_narrow_cancelled ? 1 : 0,
+                         frame_wait_deadline_expired ? 1 : 0,
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms),
+                         static_cast<unsigned long long>(deadline_remaining_ms()));
 
     json cleanup = cleanup_prepared(prepared, "frame_wait_complete");
 
@@ -10066,6 +10207,10 @@ tool_result_t auto_narrow(const json& params)
         result["process_id"] = scope.pid();
         result["captured_frames"] = store::list_frame_batches(scope.pid()).size();
         result["cancelled"] = true;
+        result["frame_wait_iterations"] = frame_wait_iterations;
+        result["frame_wait_deadline_expired"] = frame_wait_deadline_expired;
+        result["hot_va_count"] = frame_wait_last_hot_vas;
+        result["cbuffer_classification_count"] = frame_wait_last_cbuffer_classifications;
         result["cleanup"] = std::move(cleanup);
         result["elapsed_ms"] = GetTickCount64() - started_ms;
         return tool_result_t::error("Auto-narrow cancelled during frame capture.", result);
@@ -10090,6 +10235,11 @@ tool_result_t auto_narrow(const json& params)
         result["captured_frames"] = 0;
         result["capture_frames_requested"] = capture_frames;
         result["frame_wait_budget_ms"] = frame_wait_budget_ms;
+        result["frame_wait_iterations"] = frame_wait_iterations;
+        result["frame_wait_deadline_expired"] = frame_wait_deadline_expired;
+        result["hot_va_count"] = frame_wait_last_hot_vas;
+        result["cbuffer_classification_count"] = frame_wait_last_cbuffer_classifications;
+        result["arm_evidence"] = arm_evidence;
         result["failure_reason"] = "no_frame_batches";
         result["phase"] = "frame_wait";
         result["capability"] = {{"available", false}, {"reason", "no_frame_batches"}, {"requires_frame_source", true}};
@@ -10098,10 +10248,14 @@ tool_result_t auto_narrow(const json& params)
         result["deadline_remaining_ms"] = deadline_remaining_ms();
         result["elapsed_ms"] = GetTickCount64() - started_ms;
         diag::log_tagged_fmt("dx_hook",
-                             "auto_narrow no_frame_batches pid=%u requested_frames=%u wait_budget_ms=%llu elapsed_ms=%llu deadline_remaining_ms=%llu",
+                             "auto_narrow no_frame_batches pid=%u requested_frames=%u wait_budget_ms=%llu iterations=%zu hot_vas=%zu cbuffer_classifications=%zu frame_deadline_expired=%d elapsed_ms=%llu deadline_remaining_ms=%llu",
                              scope.pid(),
                              capture_frames,
                              static_cast<unsigned long long>(frame_wait_budget_ms),
+                             frame_wait_iterations,
+                             frame_wait_last_hot_vas,
+                             frame_wait_last_cbuffer_classifications,
+                             frame_wait_deadline_expired ? 1 : 0,
                              static_cast<unsigned long long>(GetTickCount64() - started_ms),
                              static_cast<unsigned long long>(deadline_remaining_ms()));
         return tool_result_t::error("Auto-narrow observed no frame batches before the bounded frame wait elapsed.", result);

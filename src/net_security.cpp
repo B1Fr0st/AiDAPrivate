@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <system_error>
 #include <wincrypt.h>
 #include <shlobj.h>
 #include <bcrypt.h>
@@ -78,6 +79,51 @@ static std::string netsec_sha256_hex(const std::uint8_t* data, std::size_t len) 
 
 static bool netsec_has_nul(const std::string& value) {
     return std::find(value.begin(), value.end(), '\0') != value.end();
+}
+
+static bool netsec_is_local_resource_win32(DWORD error) {
+    switch (error) {
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY:
+    case ERROR_NO_SYSTEM_RESOURCES:
+    case ERROR_NOT_ENOUGH_QUOTA:
+    case ERROR_TOO_MANY_OPEN_FILES:
+    case ERROR_MAX_THRDS_REACHED:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool netsec_is_local_resource_error_code(const std::error_code& ec) {
+    if (ec == std::make_error_code(std::errc::resource_unavailable_try_again) ||
+        ec == std::make_error_code(std::errc::not_enough_memory) ||
+        ec == std::make_error_code(std::errc::too_many_files_open) ||
+        ec == std::make_error_code(std::errc::too_many_files_open_in_system))
+        return true;
+    if (ec.category() == std::system_category())
+        return netsec_is_local_resource_win32(static_cast<DWORD>(ec.value()));
+    return false;
+}
+
+static void netsec_mark_resource_exception(pcap_decrypt_result_t& result,
+                                           const char* stage,
+                                           const std::exception& ex,
+                                           std::uint32_t code,
+                                           bool prelaunch) {
+    result.local_resource_failure = true;
+    result.prelaunch_resource_failure = prelaunch;
+    result.local_exception_stage = stage ? stage : "";
+    result.local_exception_message = ex.what();
+    result.local_exception_code = code;
+    result.win32_error = code;
+    result.error_message = std::string("Local resource failure during tshark ") + result.local_exception_stage + ": " + result.local_exception_message;
+}
+
+static std::string netsec_tail_string(const std::string& value, std::size_t max_len) {
+    if (value.size() <= max_len)
+        return value;
+    return value.substr(value.size() - max_len);
 }
 
 static std::string netsec_trim_copy(const std::string& value) {
@@ -3006,13 +3052,16 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
     cmd += " -o " + netsec_quote_windows_arg("tls.keylog_file:" + keylog_path);
     cmd += " -Y " + netsec_quote_windows_arg(effective_display_filter);
     cmd += " -T json -l";
+    result.command_shape = netsec_quote_windows_arg(tshark) + " -n -r <pcap> -o tls.keylog_file:<keylog> -Y " +
+        netsec_quote_windows_arg(effective_display_filter) + " -T json -l";
 
     std::error_code pcap_ec;
     std::error_code keylog_ec;
     const std::uint64_t pcap_size = std::filesystem::file_size(pcap_path, pcap_ec);
     const std::uint64_t keylog_size = std::filesystem::file_size(keylog_path, keylog_ec);
-    diag::log_tagged_fmt("net_sec", "tshark_decrypt launch_prepare tshark=%s pcap=%s pcap_size=%llu pcap_size_ok=%d keylog=%s keylog_size=%llu keylog_size_ok=%d filter=%s timeout_ms=%u",
+    diag::log_tagged_fmt("net_sec", "tshark_decrypt launch_prepare tshark=%s command_shape=%s pcap=%s pcap_size=%llu pcap_size_ok=%d keylog=%s keylog_size=%llu keylog_size_ok=%d filter=%s timeout_ms=%u",
         tshark.c_str(),
+        result.command_shape.c_str(),
         pcap_path.c_str(),
         static_cast<unsigned long long>(pcap_size),
         pcap_ec ? 0 : 1,
@@ -3022,47 +3071,204 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         effective_display_filter.c_str(),
         result.timeout_ms);
 
+    constexpr std::size_t MAX_OUTPUT = 16 * 1024 * 1024;
+    std::string stdout_output;
+    std::string stderr_output;
+    bool output_buffers_ready = false;
+    for (std::uint32_t attempt = 1; attempt <= 3; ++attempt) {
+        try {
+            result.launch_attempts = attempt;
+            stdout_output.reserve(1024 * 1024);
+            stderr_output.reserve(16 * 1024);
+            output_buffers_ready = true;
+            if (attempt > 1) {
+                result.local_resource_failure = false;
+                result.prelaunch_resource_failure = false;
+                result.error_message.clear();
+                result.local_exception_stage.clear();
+                result.local_exception_message.clear();
+                result.local_exception_code = 0;
+                result.win32_error = 0;
+            }
+            break;
+        } catch (const std::bad_alloc& ex) {
+            netsec_mark_resource_exception(result, "output_buffer_reserve", ex, ERROR_NOT_ENOUGH_MEMORY, true);
+        } catch (const std::system_error& ex) {
+            const std::uint32_t code = static_cast<std::uint32_t>(ex.code().value());
+            netsec_mark_resource_exception(result, "output_buffer_reserve", ex, code, true);
+            result.local_resource_failure = netsec_is_local_resource_error_code(ex.code());
+            result.prelaunch_resource_failure = result.local_resource_failure;
+        }
+        const std::uint64_t elapsed = GetTickCount64() - start_ms;
+        const DWORD sleep_ms = static_cast<DWORD>(std::min<std::uint64_t>(250, 40ull * attempt));
+        const bool can_retry = result.local_resource_failure && attempt < 3 && elapsed + sleep_ms < result.timeout_ms;
+        diag::log_tagged_fmt("net_sec", "tshark_decrypt prelaunch_resource attempt=%u stage=output_buffer_reserve retry=%d sleep_ms=%lu elapsed_ms=%llu error=%s",
+            attempt,
+            can_retry ? 1 : 0,
+            static_cast<unsigned long>(can_retry ? sleep_ms : 0),
+            static_cast<unsigned long long>(elapsed),
+            result.local_exception_message.c_str());
+        if (!can_retry)
+            break;
+        result.prelaunch_retry_sleep_ms += sleep_ms;
+        Sleep(sleep_ms);
+    }
+    if (!output_buffers_ready) {
+        result.retry_exhausted = result.launch_attempts >= 3;
+        result.elapsed_ms = GetTickCount64() - start_ms;
+        return result;
+    }
+
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
     HANDLE hStdoutRead = nullptr, hStdoutWrite = nullptr;
     HANDLE hStderrRead = nullptr, hStderrWrite = nullptr;
-    if (!CreatePipe(&hStdoutRead, &hStdoutWrite, &sa, 0)) {
-        result.error_message = "Failed to create pipe for tshark output";
-        result.win32_error = GetLastError();
-        result.elapsed_ms = GetTickCount64() - start_ms;
-        return result;
-    }
-    if (!CreatePipe(&hStderrRead, &hStderrWrite, &sa, 0)) {
-        result.error_message = "Failed to create pipe for tshark stderr";
-        result.win32_error = GetLastError();
-        CloseHandle(hStdoutRead);
-        CloseHandle(hStdoutWrite);
-        result.elapsed_ms = GetTickCount64() - start_ms;
-        return result;
-    }
-    SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(hStderrRead, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hStdoutWrite;
-    si.hStdError = hStderrWrite;
-
     PROCESS_INFORMATION pi{};
-
-    std::vector<char> cmd_buf(cmd.begin(), cmd.end());
-    cmd_buf.push_back('\0');
-
-    if (!CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        result.win32_error = GetLastError();
-        CloseHandle(hStdoutRead);
-        CloseHandle(hStdoutWrite);
-        CloseHandle(hStderrRead);
-        CloseHandle(hStderrWrite);
-        result.error_message = "Failed to launch tshark: error " + std::to_string(result.win32_error);
+    auto close_launch_handles = [&]() {
+        if (hStdoutRead) { CloseHandle(hStdoutRead); hStdoutRead = nullptr; }
+        if (hStdoutWrite) { CloseHandle(hStdoutWrite); hStdoutWrite = nullptr; }
+        if (hStderrRead) { CloseHandle(hStderrRead); hStderrRead = nullptr; }
+        if (hStderrWrite) { CloseHandle(hStderrWrite); hStderrWrite = nullptr; }
+    };
+    bool process_started = false;
+    for (std::uint32_t attempt = 1; attempt <= 3 && !process_started; ++attempt) {
+        result.launch_attempts = attempt;
+        result.pipe_stdout_created = false;
+        result.pipe_stderr_created = false;
+        result.create_process_attempted = false;
+        result.create_process_ok = false;
+        hStdoutRead = hStdoutWrite = hStderrRead = hStderrWrite = nullptr;
+        pi = PROCESS_INFORMATION{};
+        std::vector<char> cmd_buf;
+        try {
+            cmd_buf.assign(cmd.begin(), cmd.end());
+            cmd_buf.push_back('\0');
+        } catch (const std::bad_alloc& ex) {
+            netsec_mark_resource_exception(result, "command_buffer", ex, ERROR_NOT_ENOUGH_MEMORY, true);
+            result.elapsed_ms = GetTickCount64() - start_ms;
+        } catch (const std::system_error& ex) {
+            const std::uint32_t code = static_cast<std::uint32_t>(ex.code().value());
+            netsec_mark_resource_exception(result, "command_buffer", ex, code, true);
+            result.local_resource_failure = netsec_is_local_resource_error_code(ex.code());
+            result.prelaunch_resource_failure = result.local_resource_failure;
+            result.elapsed_ms = GetTickCount64() - start_ms;
+        }
+        if (!cmd_buf.empty()) {
+            SetLastError(ERROR_SUCCESS);
+            if (!CreatePipe(&hStdoutRead, &hStdoutWrite, &sa, 0)) {
+                const DWORD pipe_error = GetLastError();
+                result.pipe_stdout_error = pipe_error;
+                result.win32_error = pipe_error;
+                result.error_message = "Failed to create pipe for tshark output";
+                result.local_resource_failure = netsec_is_local_resource_win32(pipe_error);
+                result.prelaunch_resource_failure = result.local_resource_failure;
+                diag::log_tagged_fmt("net_sec", "tshark_decrypt pipe_stdout attempt=%u ok=0 gle=%lu resource=%d elapsed_ms=%llu",
+                    attempt,
+                    static_cast<unsigned long>(pipe_error),
+                    result.local_resource_failure ? 1 : 0,
+                    static_cast<unsigned long long>(GetTickCount64() - start_ms));
+            } else {
+                result.pipe_stdout_created = true;
+                result.pipe_stdout_error = ERROR_SUCCESS;
+                SetLastError(ERROR_SUCCESS);
+                if (!CreatePipe(&hStderrRead, &hStderrWrite, &sa, 0)) {
+                    const DWORD pipe_error = GetLastError();
+                    result.pipe_stderr_error = pipe_error;
+                    result.win32_error = pipe_error;
+                    result.error_message = "Failed to create pipe for tshark stderr";
+                    result.local_resource_failure = netsec_is_local_resource_win32(pipe_error);
+                    result.prelaunch_resource_failure = result.local_resource_failure;
+                    diag::log_tagged_fmt("net_sec", "tshark_decrypt pipe_stderr attempt=%u ok=0 gle=%lu resource=%d elapsed_ms=%llu",
+                        attempt,
+                        static_cast<unsigned long>(pipe_error),
+                        result.local_resource_failure ? 1 : 0,
+                        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+                } else {
+                    result.pipe_stderr_created = true;
+                    result.pipe_stderr_error = ERROR_SUCCESS;
+                    const BOOL stdout_inherit_ok = SetHandleInformation(hStdoutRead, HANDLE_FLAG_INHERIT, 0);
+                    const DWORD stdout_inherit_error = stdout_inherit_ok ? ERROR_SUCCESS : GetLastError();
+                    const BOOL stderr_inherit_ok = SetHandleInformation(hStderrRead, HANDLE_FLAG_INHERIT, 0);
+                    const DWORD stderr_inherit_error = stderr_inherit_ok ? ERROR_SUCCESS : GetLastError();
+                    diag::log_tagged_fmt("net_sec", "tshark_decrypt pipes_ready attempt=%u stdout_read=%p stdout_write=%p stderr_read=%p stderr_write=%p stdout_inherit_ok=%d stdout_gle=%lu stderr_inherit_ok=%d stderr_gle=%lu elapsed_ms=%llu",
+                        attempt,
+                        hStdoutRead,
+                        hStdoutWrite,
+                        hStderrRead,
+                        hStderrWrite,
+                        stdout_inherit_ok ? 1 : 0,
+                        static_cast<unsigned long>(stdout_inherit_error),
+                        stderr_inherit_ok ? 1 : 0,
+                        static_cast<unsigned long>(stderr_inherit_error),
+                        static_cast<unsigned long long>(GetTickCount64() - start_ms));
+                    if (!stdout_inherit_ok || !stderr_inherit_ok) {
+                        result.win32_error = !stdout_inherit_ok ? stdout_inherit_error : stderr_inherit_error;
+                        result.error_message = "Failed to set tshark pipe handle inheritance";
+                        result.local_resource_failure = netsec_is_local_resource_win32(result.win32_error);
+                        result.prelaunch_resource_failure = result.local_resource_failure;
+                    } else {
+                        STARTUPINFOA si{};
+                        si.cb = sizeof(si);
+                        si.dwFlags = STARTF_USESTDHANDLES;
+                        si.hStdOutput = hStdoutWrite;
+                        si.hStdError = hStderrWrite;
+                        result.create_process_attempted = true;
+                        SetLastError(ERROR_SUCCESS);
+                        const BOOL created = CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
+                                                            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+                        result.create_process_ok = created != FALSE;
+                        if (!created) {
+                            const DWORD launch_error = GetLastError();
+                            result.win32_error = launch_error;
+                            result.error_message = "Failed to launch tshark: error " + std::to_string(result.win32_error);
+                            result.local_resource_failure = netsec_is_local_resource_win32(launch_error);
+                            result.prelaunch_resource_failure = result.local_resource_failure;
+                            diag::log_tagged_fmt("net_sec", "tshark_decrypt create_process attempt=%u ok=0 gle=%lu resource=%d tshark=%s command_shape=%s elapsed_ms=%llu",
+                                attempt,
+                                static_cast<unsigned long>(launch_error),
+                                result.local_resource_failure ? 1 : 0,
+                                tshark.c_str(),
+                                result.command_shape.c_str(),
+                                static_cast<unsigned long long>(GetTickCount64() - start_ms));
+                        } else {
+                            if (attempt > 1 || result.prelaunch_retry_sleep_ms != 0) {
+                                result.local_resource_failure = false;
+                                result.prelaunch_resource_failure = false;
+                                result.retry_exhausted = false;
+                                result.error_message.clear();
+                                result.local_exception_stage.clear();
+                                result.local_exception_message.clear();
+                                result.local_exception_code = 0;
+                                result.win32_error = 0;
+                            }
+                            process_started = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!process_started) {
+            close_launch_handles();
+            const std::uint64_t elapsed = GetTickCount64() - start_ms;
+            const DWORD sleep_ms = static_cast<DWORD>(std::min<std::uint64_t>(250, 50ull * attempt));
+            const bool can_retry = result.local_resource_failure && attempt < 3 && elapsed + sleep_ms < result.timeout_ms;
+            diag::log_tagged_fmt("net_sec", "tshark_decrypt prelaunch_attempt_failed attempt=%u retry=%d sleep_ms=%lu elapsed_ms=%llu resource=%d error=%s win32=%u",
+                attempt,
+                can_retry ? 1 : 0,
+                static_cast<unsigned long>(can_retry ? sleep_ms : 0),
+                static_cast<unsigned long long>(elapsed),
+                result.local_resource_failure ? 1 : 0,
+                result.error_message.c_str(),
+                result.win32_error);
+            if (!can_retry)
+                break;
+            result.prelaunch_retry_sleep_ms += sleep_ms;
+            Sleep(sleep_ms);
+        }
+    }
+    if (!process_started) {
+        result.retry_exhausted = result.local_resource_failure && result.launch_attempts >= 3;
         result.elapsed_ms = GetTickCount64() - start_ms;
         return result;
     }
@@ -3071,41 +3277,122 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
     result.process_id = pi.dwProcessId;
     result.launch_elapsed_ms = GetTickCount64() - start_ms;
     CloseHandle(hStdoutWrite);
+    hStdoutWrite = nullptr;
     CloseHandle(hStderrWrite);
+    hStderrWrite = nullptr;
     diag::log_tagged_fmt("net_sec", "tshark_decrypt process_started pid=%lu launch_elapsed_ms=%llu timeout_ms=%u",
         static_cast<unsigned long>(pi.dwProcessId),
         static_cast<unsigned long long>(result.launch_elapsed_ms),
         result.timeout_ms);
 
 
-    constexpr std::size_t MAX_OUTPUT = 16 * 1024 * 1024;
-    std::string stdout_output;
-    std::string stderr_output;
-    stdout_output.reserve(1024 * 1024);
-    stderr_output.reserve(16 * 1024);
     std::atomic<std::uint64_t> stdout_bytes{0};
     std::atomic<std::uint64_t> stderr_bytes{0};
     std::atomic<std::uint64_t> first_stdout_ms{0};
     std::atomic<std::uint64_t> first_stderr_ms{0};
+    std::atomic<bool> reader_resource_failure{false};
+    std::mutex reader_error_mutex;
+    std::string reader_error_stage;
+    std::string reader_error_message;
+    std::uint32_t reader_error_code = 0;
+    auto record_reader_error = [&](const char* stage, const std::exception& ex, std::uint32_t code) {
+        reader_resource_failure.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(reader_error_mutex);
+        if (reader_error_stage.empty()) {
+            reader_error_stage = stage ? stage : "";
+            reader_error_message = ex.what();
+            reader_error_code = code;
+        }
+    };
 
     auto drain_pipe = [&](HANDLE pipe, std::string& sink, std::atomic<std::uint64_t>& byte_counter,
                           std::atomic<std::uint64_t>& first_byte_elapsed) {
         char read_buf[8192];
         DWORD bytes_read = 0;
-        while (ReadFile(pipe, read_buf, sizeof(read_buf), &bytes_read, nullptr) && bytes_read > 0) {
-            const std::uint64_t old = byte_counter.fetch_add(bytes_read, std::memory_order_acq_rel);
-            if (old == 0)
-                first_byte_elapsed.store(GetTickCount64() - start_ms, std::memory_order_release);
-            if (sink.size() < MAX_OUTPUT) {
-                const std::size_t room = MAX_OUTPUT - sink.size();
-                sink.append(read_buf, std::min<std::size_t>(room, bytes_read));
+        try {
+            while (ReadFile(pipe, read_buf, sizeof(read_buf), &bytes_read, nullptr) && bytes_read > 0) {
+                const std::uint64_t old = byte_counter.fetch_add(bytes_read, std::memory_order_acq_rel);
+                if (old == 0)
+                    first_byte_elapsed.store(GetTickCount64() - start_ms, std::memory_order_release);
+                if (sink.size() < MAX_OUTPUT) {
+                    const std::size_t room = MAX_OUTPUT - sink.size();
+                    sink.append(read_buf, std::min<std::size_t>(room, bytes_read));
+                }
             }
+        } catch (const std::bad_alloc& ex) {
+            record_reader_error("pipe_reader_buffer_append", ex, ERROR_NOT_ENOUGH_MEMORY);
+        } catch (const std::system_error& ex) {
+            const std::uint32_t code = static_cast<std::uint32_t>(ex.code().value());
+            record_reader_error("pipe_reader_buffer_append", ex, code);
+            if (!netsec_is_local_resource_error_code(ex.code()))
+                reader_resource_failure.store(false, std::memory_order_release);
         }
         CloseHandle(pipe);
     };
 
-    std::thread stdout_thread(drain_pipe, hStdoutRead, std::ref(stdout_output), std::ref(stdout_bytes), std::ref(first_stdout_ms));
-    std::thread stderr_thread(drain_pipe, hStderrRead, std::ref(stderr_output), std::ref(stderr_bytes), std::ref(first_stderr_ms));
+    std::thread stdout_thread;
+    std::thread stderr_thread;
+    auto finish_reader_start_failure = [&](const char* stage, const std::exception& ex, std::uint32_t code) -> pcap_decrypt_result_t {
+        netsec_mark_resource_exception(result, stage, ex, code, false);
+        result.killed_after_reader_failure = true;
+        if (stage && std::strcmp(stage, "stdout_reader_thread") == 0)
+            result.stdout_reader_error = code;
+        else
+            result.stderr_reader_error = code;
+        if (hStdoutRead && !stdout_thread.joinable()) { CloseHandle(hStdoutRead); hStdoutRead = nullptr; }
+        if (hStderrRead && !stderr_thread.joinable()) { CloseHandle(hStderrRead); hStderrRead = nullptr; }
+        TerminateProcess(pi.hProcess, ERROR_NOT_ENOUGH_MEMORY);
+        result.wait_status = WaitForSingleObject(pi.hProcess, 2000);
+        DWORD exit_code = 0;
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+        result.exit_code = exit_code;
+        if (stdout_thread.joinable())
+            stdout_thread.join();
+        if (stderr_thread.joinable())
+            stderr_thread.join();
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        result.stdout_bytes = stdout_bytes.load(std::memory_order_acquire);
+        result.stderr_bytes = stderr_bytes.load(std::memory_order_acquire);
+        result.first_stdout_elapsed_ms = first_stdout_ms.load(std::memory_order_acquire);
+        result.first_stderr_elapsed_ms = first_stderr_ms.load(std::memory_order_acquire);
+        result.raw_output = stdout_output;
+        result.stderr_output = stderr_output.size() > 8192 ? stderr_output.substr(0, 8192) : stderr_output;
+        result.stderr_tail = netsec_tail_string(stderr_output, 2048);
+        result.elapsed_ms = GetTickCount64() - start_ms;
+        diag::log_tagged_fmt("net_sec", "tshark_decrypt reader_start_failed stage=%s code=%u message=%s pid=%u killed=1 wait_status=%u elapsed_ms=%llu stdout_bytes=%llu stderr_bytes=%llu",
+            result.local_exception_stage.c_str(),
+            result.local_exception_code,
+            result.local_exception_message.c_str(),
+            result.process_id,
+            result.wait_status,
+            static_cast<unsigned long long>(result.elapsed_ms),
+            static_cast<unsigned long long>(result.stdout_bytes),
+            static_cast<unsigned long long>(result.stderr_bytes));
+        return result;
+    };
+    try {
+        stdout_thread = std::thread(drain_pipe, hStdoutRead, std::ref(stdout_output), std::ref(stdout_bytes), std::ref(first_stdout_ms));
+        result.stdout_reader_started = true;
+    } catch (const std::system_error& ex) {
+        const std::uint32_t code = static_cast<std::uint32_t>(ex.code().value());
+        pcap_decrypt_result_t failed = finish_reader_start_failure("stdout_reader_thread", ex, code);
+        failed.local_resource_failure = netsec_is_local_resource_error_code(ex.code());
+        return failed;
+    } catch (const std::bad_alloc& ex) {
+        return finish_reader_start_failure("stdout_reader_thread", ex, ERROR_NOT_ENOUGH_MEMORY);
+    }
+    try {
+        stderr_thread = std::thread(drain_pipe, hStderrRead, std::ref(stderr_output), std::ref(stderr_bytes), std::ref(first_stderr_ms));
+        result.stderr_reader_started = true;
+    } catch (const std::system_error& ex) {
+        const std::uint32_t code = static_cast<std::uint32_t>(ex.code().value());
+        pcap_decrypt_result_t failed = finish_reader_start_failure("stderr_reader_thread", ex, code);
+        failed.local_resource_failure = netsec_is_local_resource_error_code(ex.code());
+        return failed;
+    } catch (const std::bad_alloc& ex) {
+        return finish_reader_start_failure("stderr_reader_thread", ex, ERROR_NOT_ENOUGH_MEMORY);
+    }
 
     DWORD wait_status = WAIT_TIMEOUT;
     while (true) {
@@ -3136,6 +3423,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
 
     result.raw_output = stdout_output;
     result.stderr_output = stderr_output.size() > 8192 ? stderr_output.substr(0, 8192) : stderr_output;
+    result.stderr_tail = netsec_tail_string(stderr_output, 2048);
     result.stdout_bytes = stdout_bytes.load(std::memory_order_acquire);
     result.stderr_bytes = stderr_bytes.load(std::memory_order_acquire);
     result.first_stdout_elapsed_ms = first_stdout_ms.load(std::memory_order_acquire);
@@ -3153,6 +3441,36 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         static_cast<unsigned long long>(result.stderr_bytes),
         static_cast<unsigned long long>(result.first_stdout_elapsed_ms),
         static_cast<unsigned long long>(result.first_stderr_elapsed_ms));
+    if (!result.stderr_tail.empty()) {
+        const std::string stderr_log_tail = netsec_tail_string(result.stderr_tail, 512);
+        diag::log_tagged_fmt("net_sec", "tshark_decrypt stderr_tail pid=%u tail=%s",
+            result.process_id,
+            stderr_log_tail.c_str());
+    }
+
+    if (reader_resource_failure.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(reader_error_mutex);
+        result.local_resource_failure = true;
+        result.prelaunch_resource_failure = false;
+        result.local_exception_stage = reader_error_stage;
+        result.local_exception_message = reader_error_message;
+        result.local_exception_code = reader_error_code;
+        result.win32_error = reader_error_code;
+        if (reader_error_stage.find("stdout") != std::string::npos)
+            result.stdout_reader_error = reader_error_code;
+        else
+            result.stderr_reader_error = reader_error_code;
+        result.error_message = std::string("Local resource failure during tshark ") + reader_error_stage + ": " + reader_error_message;
+        diag::log_tagged_fmt("net_sec", "tshark_decrypt reader_resource_failed stage=%s code=%u message=%s pid=%u elapsed_ms=%llu stdout_bytes=%llu stderr_bytes=%llu",
+            result.local_exception_stage.c_str(),
+            result.local_exception_code,
+            result.local_exception_message.c_str(),
+            result.process_id,
+            static_cast<unsigned long long>(result.elapsed_ms),
+            static_cast<unsigned long long>(result.stdout_bytes),
+            static_cast<unsigned long long>(result.stderr_bytes));
+        return result;
+    }
 
     if (result.killed_on_deadline) {
         result.error_message = "tshark exceeded decrypt deadline";
@@ -3166,9 +3484,8 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
         return result;
     }
 
-
+    const ULONGLONG parse_start = GetTickCount64();
     try {
-        const ULONGLONG parse_start = GetTickCount64();
         auto json_arr = nlohmann::json::parse(stdout_output);
         result.json_parse_elapsed_ms = GetTickCount64() - parse_start;
         result.total_packets = static_cast<std::uint32_t>(json_arr.size());
@@ -3244,6 +3561,7 @@ pcap_decrypt_result_t TlsKeyExtractor::decrypt_pcap_with_tshark(
             }
         }
     } catch (const std::exception& ex) {
+        result.json_parse_elapsed_ms = GetTickCount64() - parse_start;
 
         if (result.raw_output.size() < 10) {
             result.error_message = std::string("No packets matched the filter '") + effective_display_filter +

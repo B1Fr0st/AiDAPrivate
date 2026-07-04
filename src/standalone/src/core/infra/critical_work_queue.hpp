@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -40,7 +41,14 @@ struct active_task_t {
     std::uint64_t id = 0;
     std::uint64_t queued_ms = 0;
     std::uint64_t started_ms = 0;
+    std::uint64_t last_cpu_100ns = 0;
+    std::uint64_t last_cpu_sample_ms = 0;
+    std::uint64_t cpu_delta_100ns = 0;
+    std::uint32_t cpu_pct_x100 = 0;
+    DWORD thread_query_gle = 0;
+    DWORD exit_code = 0;
     DWORD tid = 0;
+    bool thread_alive = false;
 };
 
 struct pool_t {
@@ -65,6 +73,123 @@ inline pool_t g_pool;
 
 }
 
+inline std::uint64_t filetime_to_100ns(const FILETIME& ft)
+{
+    ULARGE_INTEGER v{};
+    v.LowPart = ft.dwLowDateTime;
+    v.HighPart = ft.dwHighDateTime;
+    return v.QuadPart;
+}
+
+inline bool sample_thread_cpu_100ns(DWORD tid, std::uint64_t& cpu_100ns, DWORD& gle, DWORD& exit_code)
+{
+    cpu_100ns = 0;
+    gle = 0;
+    exit_code = 0;
+    if (tid == 0) {
+        gle = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!th) {
+        gle = GetLastError();
+        return false;
+    }
+    FILETIME create_time{};
+    FILETIME exit_time{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    SetLastError(0);
+    const BOOL exit_ok = GetExitCodeThread(th, &exit_code);
+    const DWORD exit_gle = exit_ok ? 0UL : GetLastError();
+    SetLastError(0);
+    const BOOL times_ok = GetThreadTimes(th, &create_time, &exit_time, &kernel_time, &user_time);
+    gle = times_ok ? 0UL : GetLastError();
+    CloseHandle(th);
+    if (!exit_ok) {
+        gle = exit_gle;
+        return false;
+    }
+    if (!times_ok)
+        return false;
+    cpu_100ns = filetime_to_100ns(kernel_time) + filetime_to_100ns(user_time);
+    return exit_code == STILL_ACTIVE;
+}
+
+inline const char* classify_worker_label(const std::string& label) {
+    if (label.find("full_test") != std::string::npos || label.find("test_all") != std::string::npos)
+        return "full_test";
+    if (label.find("heartbeat") != std::string::npos || label.find("session_health") != std::string::npos)
+        return "heartbeat";
+    if (label.find("mcp") != std::string::npos || label.find("http") != std::string::npos || label.find("sse") != std::string::npos)
+        return "mcp_or_http";
+    if (label.find("camoufox") != std::string::npos || label.find("browser") != std::string::npos)
+        return "camoufox";
+    if (label.find("driver") != std::string::npos || label.find("kernel") != std::string::npos || label.find("tctx") != std::string::npos)
+        return "driver";
+    if (label.find("scanner") != std::string::npos || label.find("scan") != std::string::npos)
+        return "scanner";
+    if (label.find("ui") != std::string::npos || label.find("render") != std::string::npos || label.find("dialog") != std::string::npos)
+        return "ui_adjacent";
+    if (label.find("service") != std::string::npos || label.find("listener") != std::string::npos || label.find("watch") != std::string::npos)
+        return "long_lived_service";
+    return "critical";
+}
+
+inline bool worker_label_long_lived_hint(const char* label_class) {
+    return label_class &&
+        (std::strcmp(label_class, "heartbeat") == 0 ||
+         std::strcmp(label_class, "mcp_or_http") == 0 ||
+         std::strcmp(label_class, "camoufox") == 0 ||
+         std::strcmp(label_class, "driver") == 0 ||
+         std::strcmp(label_class, "long_lived_service") == 0);
+}
+
+inline const char* worker_lifetime_label(const char* label_class)
+{
+    if (worker_label_long_lived_hint(label_class))
+        return "long_lived_critical";
+    return "bounded_critical";
+}
+
+inline const char* worker_health_label(const char* lifetime, bool thread_alive, std::uint32_t cpu_pct_x100, std::size_t pending, bool shutting_down)
+{
+    if (!thread_alive)
+        return "thread_not_queryable";
+    if (shutting_down)
+        return "shutdown_waiting";
+    if (cpu_pct_x100 >= 2500)
+        return "hot_cpu";
+    if (lifetime && std::strcmp(lifetime, "long_lived_critical") == 0 && pending == 0)
+        return "healthy_long_lived";
+    if (lifetime && std::strcmp(lifetime, "long_lived_critical") == 0)
+        return "critical_backlog";
+    return "needs_progress";
+}
+
+inline void refresh_active_thread_sample(detail::active_task_t& active, std::uint64_t now_ms)
+{
+    std::uint64_t cpu_100ns = 0;
+    DWORD gle = 0;
+    DWORD exit_code = 0;
+    const bool alive = sample_thread_cpu_100ns(active.tid, cpu_100ns, gle, exit_code);
+    active.thread_query_gle = gle;
+    active.exit_code = exit_code;
+    active.thread_alive = alive;
+    if (active.last_cpu_sample_ms != 0 && now_ms > active.last_cpu_sample_ms && cpu_100ns >= active.last_cpu_100ns) {
+        active.cpu_delta_100ns = cpu_100ns - active.last_cpu_100ns;
+        const std::uint64_t wall_100ns = (now_ms - active.last_cpu_sample_ms) * 10000ULL;
+        active.cpu_pct_x100 = wall_100ns != 0 ? static_cast<std::uint32_t>((active.cpu_delta_100ns * 10000ULL) / wall_100ns) : 0U;
+        if (active.cpu_pct_x100 > 10000U)
+            active.cpu_pct_x100 = 10000U;
+    } else {
+        active.cpu_delta_100ns = 0;
+        active.cpu_pct_x100 = 0;
+    }
+    active.last_cpu_100ns = cpu_100ns;
+    active.last_cpu_sample_ms = now_ms;
+}
+
 struct stats_t {
     bool alive = false;
     bool shutting_down = false;
@@ -79,7 +204,11 @@ struct stats_t {
     std::uint64_t finished = 0;
     std::uint64_t oldest_active_ms = 0;
     std::uint32_t active_label_count = 0;
+    std::uint32_t healthy_long_lived = 0;
+    std::uint32_t hot_workers = 0;
+    std::uint32_t not_queryable_workers = 0;
     std::string active_labels;
+    std::string top_cpu_labels;
 };
 
 inline void shutdown(std::uint32_t timeout_ms = 15000);
@@ -100,30 +229,89 @@ inline stats_t stats() {
         std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
         if (!lk.owns_lock()) {
             s.active_labels = "<stats_lock_busy>";
+            s.top_cpu_labels = "<stats_lock_busy>";
             return s;
         }
         s.workers = p.workers.size();
         s.pending = p.tasks.size();
         const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
-        for (const auto& active : p.active_snapshots) {
+        struct top_cpu_item_t {
+            std::uint64_t task_id = 0;
+            std::string label;
+            const char* label_class = "critical";
+            const char* health = "needs_progress";
+            std::uint64_t cpu_delta_100ns = 0;
+            std::uint32_t cpu_pct_x100 = 0;
+        };
+        top_cpu_item_t top_cpu[4];
+        std::size_t top_cpu_count = 0;
+        for (auto& active : p.active_snapshots) {
             if (active.id == 0)
                 continue;
+            refresh_active_thread_sample(active, now);
+            const char* cls = classify_worker_label(active.label);
+            const char* lifetime = worker_lifetime_label(cls);
+            const char* health = worker_health_label(lifetime, active.thread_alive, active.cpu_pct_x100, s.pending, s.shutting_down);
+            if (std::strcmp(health, "healthy_long_lived") == 0)
+                ++s.healthy_long_lived;
+            if (std::strcmp(health, "hot_cpu") == 0)
+                ++s.hot_workers;
+            if (!active.thread_alive)
+                ++s.not_queryable_workers;
             const std::uint64_t age_ms = now >= active.started_ms ? now - active.started_ms : 0;
             if (s.oldest_active_ms < age_ms)
                 s.oldest_active_ms = age_ms;
             ++s.active_label_count;
+            const std::uint64_t queued_age_ms = active.queued_ms != 0 && now >= active.queued_ms ? now - active.queued_ms : 0;
+            if (active.cpu_delta_100ns != 0) {
+                std::size_t pos = top_cpu_count;
+                while (pos > 0 && active.cpu_delta_100ns > top_cpu[pos - 1].cpu_delta_100ns)
+                    --pos;
+                if (pos < 4) {
+                    if (top_cpu_count < 4)
+                        ++top_cpu_count;
+                    for (std::size_t j = top_cpu_count - 1; j > pos; --j)
+                        top_cpu[j] = std::move(top_cpu[j - 1]);
+                    top_cpu[pos].task_id = active.id;
+                    top_cpu[pos].label = active.label;
+                    top_cpu[pos].label_class = cls;
+                    top_cpu[pos].health = health;
+                    top_cpu[pos].cpu_delta_100ns = active.cpu_delta_100ns;
+                    top_cpu[pos].cpu_pct_x100 = active.cpu_pct_x100;
+                }
+            }
             if (s.active_labels.size() < 900) {
-                char item[256];
+                char item[360];
                 _snprintf_s(item, sizeof(item), _TRUNCATE,
-                    "%s#%llu:%s:tid=%lu:age_ms=%llu:queued_ms=%llu",
+                    "%s#%llu:%s:class=%s:life=%s:health=%s:tid=%lu:age_ms=%llu:queued_age_ms=%llu:cpu_delta_100ns=%llu:cpu_pct_x100=%u:alive=%d:gle=%lu",
                     s.active_labels.empty() ? "" : ";",
                     static_cast<unsigned long long>(active.id),
                     active.label.empty() ? "<unnamed>" : active.label.c_str(),
+                    cls,
+                    lifetime,
+                    health,
                     static_cast<unsigned long>(active.tid),
                     static_cast<unsigned long long>(age_ms),
-                    static_cast<unsigned long long>(active.queued_ms));
+                    static_cast<unsigned long long>(queued_age_ms),
+                    static_cast<unsigned long long>(active.cpu_delta_100ns),
+                    static_cast<unsigned>(active.cpu_pct_x100),
+                    active.thread_alive ? 1 : 0,
+                    static_cast<unsigned long>(active.thread_query_gle));
                 s.active_labels += item;
             }
+        }
+        for (std::size_t i = 0; i < top_cpu_count; ++i) {
+            char item[260];
+            _snprintf_s(item, sizeof(item), _TRUNCATE,
+                "%s#%llu:%s:class=%s:cpu_delta_100ns=%llu:cpu_pct_x100=%u:health=%s",
+                s.top_cpu_labels.empty() ? "" : ";",
+                static_cast<unsigned long long>(top_cpu[i].task_id),
+                top_cpu[i].label.empty() ? "<unnamed>" : top_cpu[i].label.c_str(),
+                top_cpu[i].label_class,
+                static_cast<unsigned long long>(top_cpu[i].cpu_delta_100ns),
+                static_cast<unsigned>(top_cpu[i].cpu_pct_x100),
+                top_cpu[i].health);
+            s.top_cpu_labels += item;
         }
     }
     return s;
@@ -132,14 +320,22 @@ inline stats_t stats() {
 struct stuck_worker_diag_t {
     std::uint64_t task_id = 0;
     std::string label;
+    const char* label_class = "critical";
+    const char* lifetime = "bounded_critical";
+    const char* health = "needs_progress";
     DWORD tid = 0;
+    DWORD thread_query_gle = 0;
+    DWORD exit_code = 0;
     std::uint64_t queued_ms = 0;
     std::uint64_t started_ms = 0;
     std::uint64_t active_ms = 0;
+    std::uint64_t cpu_delta_100ns = 0;
+    std::uint32_t cpu_pct_x100 = 0;
     std::size_t worker_index = 0;
+    bool thread_alive = false;
 };
 
-inline std::vector<stuck_worker_diag_t> stuck_workers(std::uint64_t threshold_ms) {
+inline std::vector<stuck_worker_diag_t> stuck_workers(std::uint64_t threshold_ms, std::size_t max_records = 8) {
     std::vector<stuck_worker_diag_t> result;
     auto& p = detail::g_pool;
     const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
@@ -147,39 +343,83 @@ inline std::vector<stuck_worker_diag_t> stuck_workers(std::uint64_t threshold_ms
     if (!lk.owns_lock())
         return result;
     for (std::size_t i = 0; i < p.active_snapshots.size(); ++i) {
-        const auto& active = p.active_snapshots[i];
+        auto& active = p.active_snapshots[i];
         if (active.id == 0)
             continue;
+        if (max_records != 0 && result.size() >= max_records)
+            break;
+        refresh_active_thread_sample(active, now);
         const std::uint64_t age_ms = now >= active.started_ms ? now - active.started_ms : 0;
         if (age_ms >= threshold_ms) {
+            const char* cls = classify_worker_label(active.label);
+            const char* lifetime = worker_lifetime_label(cls);
             stuck_worker_diag_t d;
             d.task_id = active.id;
             d.label = active.label;
+            d.label_class = cls;
+            d.lifetime = lifetime;
+            d.health = worker_health_label(lifetime, active.thread_alive, active.cpu_pct_x100, p.tasks.size(), p.shutting_down.load(std::memory_order_acquire));
             d.tid = active.tid;
+            d.thread_query_gle = active.thread_query_gle;
+            d.exit_code = active.exit_code;
             d.queued_ms = active.queued_ms;
             d.started_ms = active.started_ms;
             d.active_ms = age_ms;
+            d.cpu_delta_100ns = active.cpu_delta_100ns;
+            d.cpu_pct_x100 = active.cpu_pct_x100;
             d.worker_index = i;
+            d.thread_alive = active.thread_alive;
             result.push_back(std::move(d));
         }
     }
     return result;
 }
 
-inline void log_stuck_workers(std::uint64_t threshold_ms) {
-    auto stuck = stuck_workers(threshold_ms);
+inline void log_stuck_workers(std::uint64_t threshold_ms, std::size_t max_records = 8) {
+    auto stuck = stuck_workers(threshold_ms, max_records);
     if (stuck.empty())
         return;
+    auto& p = detail::g_pool;
+    std::size_t pending = 0;
+    bool lock_busy = false;
+    {
+        std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
+        if (lk.owns_lock())
+            pending = p.tasks.size();
+        else
+            lock_busy = true;
+    }
+    const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
     for (const auto& s : stuck) {
+        const std::uint64_t queued_age_ms = s.queued_ms != 0 && now >= s.queued_ms ? now - s.queued_ms : 0;
         diag::log_tagged_fmt("critical_work_queue",
-            "stuck_worker task_id=%llu label=%s worker_index=%zu tid=%lu active_ms=%llu queued_ms=%llu threshold_ms=%llu",
+            "stuck_worker task_id=%llu label=%s class=%s lifetime=%s health=%s long_lived_hint=%d worker_index=%zu tid=%lu thread_alive=%d thread_gle=%lu exit_code=0x%08lX active_ms=%llu queued_age_ms=%llu threshold_ms=%llu cpu_delta_100ns=%llu cpu_pct_x100=%u cancellation=%s active=%u pending=%zu pending_lock_busy=%d post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu shutting_down=%d",
             static_cast<unsigned long long>(s.task_id),
             s.label.empty() ? "<unnamed>" : s.label.c_str(),
+            s.label_class,
+            s.lifetime,
+            s.health,
+            worker_label_long_lived_hint(s.label_class) ? 1 : 0,
             s.worker_index,
             static_cast<unsigned long>(s.tid),
+            s.thread_alive ? 1 : 0,
+            static_cast<unsigned long>(s.thread_query_gle),
+            static_cast<unsigned long>(s.exit_code),
             static_cast<unsigned long long>(s.active_ms),
-            static_cast<unsigned long long>(s.queued_ms),
-            static_cast<unsigned long long>(threshold_ms));
+            static_cast<unsigned long long>(queued_age_ms),
+            static_cast<unsigned long long>(threshold_ms),
+            static_cast<unsigned long long>(s.cpu_delta_100ns),
+            static_cast<unsigned>(s.cpu_pct_x100),
+            p.shutting_down.load(std::memory_order_acquire) ? "shutdown_requested" : "not_requested",
+            static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+            pending,
+            lock_busy ? 1 : 0,
+            static_cast<unsigned long long>(p.post_attempts.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.posted_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.rejected_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
+            p.shutting_down.load(std::memory_order_acquire) ? 1 : 0);
     }
 }
 
@@ -371,6 +611,7 @@ inline void shutdown(std::uint32_t timeout_ms) {
             pending,
             static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)));
+        log_stuck_workers(0ULL, 16);
         w.detach();
 #else
         w.join();

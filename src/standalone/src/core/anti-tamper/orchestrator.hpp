@@ -23,6 +23,7 @@
 #include "../../helpers/diag_log.hpp"
 #include "integrity.hpp"
 #include "anti_debug.hpp"
+#include "kernel_adbg_classifier.hpp"
 #include "anti_vm.hpp"
 #include "anti_hook.hpp"
 #include "anti_emulation.hpp"
@@ -372,12 +373,6 @@ __declspec(noinline) static DWORD seh_snapshot_code(state::code_snapshot_t* snap
     return 0;
 }
 
-inline bool kernel_adbg_hard_flags_present(uint32_t flags)
-{
-    constexpr uint32_t kHardFlags = 0x00000001u | 0x00000008u;
-    return (flags & kHardFlags) != 0;
-}
-
 inline void kernel_debugger_scan_process_names_for_log(DWORD pid, std::string& image, std::string& path)
 {
     image = "?";
@@ -424,8 +419,19 @@ inline bool kernel_debugger_scan_confirmed_for_enforcement(const char* phase,
     const uint64_t started = GetTickCount64();
     const bool query_ok = driver_bridge::kernel_anti_debug_query(query);
     const DWORD query_err = query_ok ? ERROR_SUCCESS : GetLastError();
-    const bool confirmed = query_ok &&
-        (kernel_adbg_hard_flags_present(query.result_flags) || query.detected_debugger_pid != 0);
+    auto input = query_ok
+        ? kernel_adbg::make_input(query, phase ? phase : "guard", source ? source : "scan_confirmation")
+        : kernel_adbg::input_t{};
+    if (!query_ok)
+    {
+        input.native = kernel_adbg::query_native_kernel_debugger_state();
+        input.phase = phase ? phase : "guard";
+        input.source = source ? source : "scan_confirmation";
+    }
+    input.scan_sampled = true;
+    input.scan_ok = true;
+    input.scan_pid = scan_pid;
+    const auto decision = kernel_adbg::classify(input);
     webhook::write_log_critical_fmt(
         phase ? phase : "guard",
         "kernel_debugger_scan_evaluation source=%s scan_pid=%llu scan_image=%s scan_path='%s' query_ok=%d query_err=%lu query_flags=0x%08X query_pid=%llu confirmed=%d elapsed_ms=%llu",
@@ -437,9 +443,11 @@ inline bool kernel_debugger_scan_confirmed_for_enforcement(const char* phase,
         static_cast<unsigned long>(query_err),
         query.result_flags,
         static_cast<unsigned long long>(query.detected_debugger_pid),
-        confirmed ? 1 : 0,
+        decision.enforce ? 1 : 0,
         static_cast<unsigned long long>(GetTickCount64() - started));
-    return confirmed;
+    std::string decision_line = kernel_adbg::format_decision(input, decision);
+    webhook::write_log_critical(phase ? phase : "guard", decision_line.c_str());
+    return decision.enforce;
 }
 
 inline bool kernel_debugger_runtime_scan_retry(const char* phase,
@@ -461,28 +469,62 @@ inline bool kernel_debugger_runtime_scan_retry(const char* phase,
         const uint64_t query_started = GetTickCount64();
         const bool query_ok = driver_bridge::kernel_anti_debug_query(query);
         const DWORD query_err = query_ok ? ERROR_SUCCESS : GetLastError();
-        const bool query_confirmed = query_ok &&
-            (kernel_adbg_hard_flags_present(query.result_flags) || query.detected_debugger_pid != 0);
+        auto input = query_ok
+            ? kernel_adbg::make_input(query, phase ? phase : "guard", "runtime_retry_query")
+            : kernel_adbg::input_t{};
+        if (!query_ok)
+        {
+            input.native = kernel_adbg::query_native_kernel_debugger_state();
+            input.phase = phase ? phase : "guard";
+            input.source = "runtime_retry_query";
+        }
+        uint64_t query_scan_pid = 0;
+        bool query_scan_ok = false;
+        DWORD query_scan_err = ERROR_SUCCESS;
+        if (query_ok && (query.result_flags != 0 || query.detected_debugger_pid != 0 || input.native.active))
+        {
+            SetLastError(ERROR_SUCCESS);
+            query_scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&query_scan_pid);
+            query_scan_err = query_scan_ok ? ERROR_SUCCESS : GetLastError();
+            input.scan_sampled = true;
+            input.scan_ok = query_scan_ok;
+            input.scan_pid = query_scan_pid;
+            final_scan_err = query_scan_err;
+        }
+        const auto decision = kernel_adbg::classify(input);
+        const bool query_confirmed = decision.enforce;
         clean_query_seen = clean_query_seen ||
-            (query_ok && !kernel_adbg_hard_flags_present(query.result_flags) && query.detected_debugger_pid == 0);
+            (query_ok && !decision.enforce && query.detected_debugger_pid == 0);
         webhook::write_log_critical_fmt(
             phase ? phase : "guard",
-            "kernel_debugger_scan_runtime_retry_query attempt=%d first_err=%lu query_ok=%d query_err=%lu query_flags=0x%08X query_pid=%llu query_confirmed=%d clean_query_seen=%d activation_pending=%d runtime_authorized=%d elapsed_ms=%llu",
+            "kernel_debugger_scan_runtime_retry_query attempt=%d first_err=%lu query_ok=%d query_err=%lu query_flags=0x%08X query_pid=%llu query_scan_sampled=%d query_scan_ok=%d query_scan_err=%lu query_scan_pid=%llu query_confirmed=%d clean_query_seen=%d activation_pending=%d runtime_authorized=%d elapsed_ms=%llu",
             attempt,
             static_cast<unsigned long>(first_scan_err),
             query_ok ? 1 : 0,
             static_cast<unsigned long>(query_err),
             query.result_flags,
             static_cast<unsigned long long>(query.detected_debugger_pid),
+            input.scan_sampled ? 1 : 0,
+            query_scan_ok ? 1 : 0,
+            static_cast<unsigned long>(query_scan_err),
+            static_cast<unsigned long long>(query_scan_pid),
             query_confirmed ? 1 : 0,
             clean_query_seen ? 1 : 0,
             activation_pending ? 1 : 0,
             runtime_authorized ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - query_started));
+        std::string decision_line = kernel_adbg::format_decision(input, decision);
+        webhook::write_log_critical(phase ? phase : "guard", decision_line.c_str());
         if (query_confirmed)
         {
-            debugger_pid = query.detected_debugger_pid;
+            debugger_pid = query.detected_debugger_pid != 0 ? query.detected_debugger_pid : query_scan_pid;
             return true;
+        }
+        if (query_scan_ok)
+        {
+            debugger_pid = query_scan_pid;
+            retry_scan_ok = true;
+            return false;
         }
 
         Sleep(static_cast<DWORD>(15 * attempt));
@@ -1043,18 +1085,51 @@ inline bool ensure_driver_hardening(const char* phase)
         enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup, "kernel_debugger_scan_required_op_failed");
         return false;
     }
-    if (debugger_pid != 0)
     {
-        if (kernel_debugger_scan_confirmed_for_enforcement("init", "startup_scan", debugger_pid))
+        driver_bridge::anti_debug_result_t query{};
+        SetLastError(ERROR_SUCCESS);
+        const uint64_t query_tick = GetTickCount64();
+        const bool query_ok = driver_bridge::kernel_anti_debug_query(query);
+        const DWORD query_err = query_ok ? ERROR_SUCCESS : GetLastError();
+        auto input = query_ok
+            ? kernel_adbg::make_input(query, "init", "startup_query")
+            : kernel_adbg::input_t{};
+        if (!query_ok)
         {
-            webhook::send_debug_log("init", "kernel_debugger_detected_pid_" + std::to_string(debugger_pid), true);
-            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup);
+            input.native = kernel_adbg::query_native_kernel_debugger_state();
+            input.phase = "init";
+            input.source = "startup_query";
+        }
+        input.scan_sampled = true;
+        input.scan_ok = scan_ok;
+        input.scan_pid = debugger_pid;
+        const auto decision = kernel_adbg::classify(input);
+        webhook::write_log_critical_fmt("init",
+            "kernel_debugger_startup_query phase=%s query_ok=%d query_err=%lu query_flags=0x%08X query_pid=%llu scan_pid=%llu decision=%s reason=%s elapsed_ms=%llu",
+            phase_name,
+            query_ok ? 1 : 0,
+            static_cast<unsigned long>(query_err),
+            query.result_flags,
+            static_cast<unsigned long long>(query.detected_debugger_pid),
+            static_cast<unsigned long long>(debugger_pid),
+            decision.enforce ? "enforce" : "observe",
+            decision.reason ? decision.reason : "unknown",
+            static_cast<unsigned long long>(GetTickCount64() - query_tick));
+        std::string decision_line = kernel_adbg::format_decision(input, decision);
+        webhook::write_log_critical("init", decision_line.c_str());
+        if (decision.enforce)
+        {
+            webhook::send_debug_log("init", "kernel_debugger_startup_query_enforced", true);
+            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup, decision.reason ? decision.reason : "kernel_debugger_startup_query");
             return false;
         }
-        webhook::write_log_critical_fmt("init",
-            "kernel_debugger_scan_unconfirmed_global_tool_ignored phase=%s debugger_pid=%llu",
-            phase_name,
-            static_cast<unsigned long long>(debugger_pid));
+    }
+    if (debugger_pid != 0)
+    {
+        (void)kernel_debugger_scan_confirmed_for_enforcement("init", "startup_scan", debugger_pid);
+        webhook::send_debug_log("init", "kernel_debugger_detected_pid_" + std::to_string(debugger_pid), true);
+        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_at_startup);
+        return false;
     }
     webhook::write_log("init", "kernel_debugger_scan_ok");
 
@@ -3475,6 +3550,13 @@ inline bool guard()
                     }
                     if (retry_scan_ok)
                     {
+                        if (debugger_pid != 0 &&
+                            kernel_debugger_scan_confirmed_for_enforcement("guard", "runtime_retry_scan_recovered", debugger_pid))
+                        {
+                            webhook::send_debug_log("guard", "kernel_debugger_scan_runtime_retry_scan_confirmed", true);
+                            enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime, "kernel_debugger_scan_runtime_retry_scan_confirmed");
+                            CFF_EXIT(guard_cff);
+                        }
                         webhook::write_log_critical_fmt("guard",
                             "kernel_debugger_scan_runtime_recovered first_err=%lu retry_pid=%llu",
                             static_cast<unsigned long>(scan_err),
@@ -3493,15 +3575,10 @@ inline bool guard()
                 }
                 if (debugger_pid != 0)
                 {
-                    if (kernel_debugger_scan_confirmed_for_enforcement("guard", "runtime_scan", debugger_pid))
-                    {
-                        webhook::send_debug_log("guard", "kernel_debugger_runtime_" + std::to_string(debugger_pid), true);
-                        enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime);
-                        CFF_EXIT(guard_cff);
-                    }
-                    webhook::write_log_critical_fmt("guard",
-                        "kernel_debugger_runtime_unconfirmed_global_tool_ignored debugger_pid=%llu",
-                        static_cast<unsigned long long>(debugger_pid));
+                    (void)kernel_debugger_scan_confirmed_for_enforcement("guard", "runtime_scan", debugger_pid);
+                    webhook::send_debug_log("guard", "kernel_debugger_runtime_" + std::to_string(debugger_pid), true);
+                    enforce_violation_id(aida::reason_ids::reason_id_kernel_debugger_runtime);
+                    CFF_EXIT(guard_cff);
                 }
 
                 if (g_kernel_clear_process_dr_unsupported.load(std::memory_order_acquire))
@@ -3612,37 +3689,39 @@ inline bool guard()
                     CFF_GOTO(guard_cff, 10);
                 }
                 driver_bridge::anti_debug_result_t adbg_result{};
-                if (driver_bridge::kernel_anti_debug_query(adbg_result) &&
-                    adbg_result.result_flags != 0)
+                const bool adbg_query_ok = driver_bridge::kernel_anti_debug_query(adbg_result);
+                if (adbg_query_ok)
                 {
-                    auto& rt = state::get();
+                    auto input = kernel_adbg::make_input(adbg_result, "guard", "runtime_guard");
+                    const bool decision_relevant =
+                        adbg_result.result_flags != 0 ||
+                        adbg_result.detected_debugger_pid != 0 ||
+                        input.native.active;
+                    if (!decision_relevant)
+                    {
+                        rt.last_kernel_flags = 0;
+                        rt.kernel_flag_persist_count = 0;
+                        CFF_GOTO(guard_cff, 10);
+                    }
+
                     char kflag_buf[32];
                     _snprintf_s(kflag_buf, sizeof(kflag_buf), _TRUNCATE,
                         "kernel_detection_flags_0x%x", adbg_result.result_flags);
                     webhook::send_debug_log("guard", kflag_buf, true);
 
-                    char flag_dbg[128];
+                    char flag_dbg[192];
                     _snprintf_s(flag_dbg, sizeof(flag_dbg), _TRUNCATE,
-                        "guard_kernel_flags flags=0x%x last=0x%x persist=%u",
-                        adbg_result.result_flags, rt.last_kernel_flags, rt.kernel_flag_persist_count);
+                        "guard_kernel_flags flags=0x%x last=0x%x persist=%u debugger_pid=%llu dr_clear=%llu",
+                        adbg_result.result_flags,
+                        rt.last_kernel_flags,
+                        rt.kernel_flag_persist_count,
+                        static_cast<unsigned long long>(adbg_result.detected_debugger_pid),
+                        static_cast<unsigned long long>(adbg_result.dr_clear_count));
                     webhook::write_log("guard", flag_dbg);
-
-                    constexpr uint32_t kSoftFlags =
-                        0x00000002u |
-                        0x00000010u |
-                        0x00000040u;
 
                     constexpr uint64_t kKernelDetectionSettleGraceMs = 3000;
 
                     const uint32_t flags = adbg_result.result_flags;
-                    const uint32_t soft_flags = flags & kSoftFlags;
-                    const bool hard_hit  = kernel_adbg_hard_flags_present(flags);
-                    const bool two_soft  = soft_flags != 0 &&
-                                           (soft_flags & (soft_flags - 1)) != 0;
-                    const bool isolated_soft = flags == soft_flags &&
-                                               soft_flags != 0 &&
-                                               (soft_flags & (soft_flags - 1)) == 0;
-
                     uint64_t sentinel_ready_since_tsc = driver_bridge::sentinel_ready_since_tsc();
                     uint64_t now_ms = guard_now_ms();
                     if (sentinel_ready_since_tsc != 0 &&
@@ -3662,42 +3741,78 @@ inline bool guard()
 
                     if (flags == rt.last_kernel_flags && flags != 0) {
                         rt.kernel_flag_persist_count++;
-                    } else {
+                    } else if (flags != 0) {
                         rt.last_kernel_flags = flags;
                         rt.kernel_flag_persist_count = 1;
+                    } else {
+                        rt.last_kernel_flags = 0;
+                        rt.kernel_flag_persist_count = 0;
                     }
 
-                    const bool persist_hit = (rt.kernel_flag_persist_count >= 3) && !isolated_soft;
-                    if (isolated_soft && rt.kernel_flag_persist_count >= 3)
+                    uint64_t scan_pid = 0;
+                    SetLastError(ERROR_SUCCESS);
+                    const bool scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&scan_pid);
+                    const DWORD scan_err = scan_ok ? ERROR_SUCCESS : GetLastError();
+
+                    input.scan_sampled = true;
+                    input.scan_ok = scan_ok;
+                    input.scan_pid = scan_pid;
+                    input.settle_sampled = true;
+                    input.settle_active = settle_active;
+                    input.persistence_sampled = true;
+                    input.persistence_count = rt.kernel_flag_persist_count;
+                    const auto decision = kernel_adbg::classify(input);
+                    std::string decision_line = kernel_adbg::format_decision(input, decision);
+                    webhook::write_log_critical("guard", decision_line.c_str());
+
+                    if (!scan_ok)
                     {
-                        char soft_dbg[192];
-                        _snprintf_s(soft_dbg, sizeof(soft_dbg), _TRUNCATE,
-                            "kernel_flag_isolated_soft_observed flags=0x%x persist=%u debugger_pid=%llu dr_clear=%llu",
+                        char scan_dbg[160];
+                        _snprintf_s(scan_dbg, sizeof(scan_dbg), _TRUNCATE,
+                            "kernel_flag_scan_failed flags=0x%x err=%lu decision=%s reason=%s",
                             flags,
+                            static_cast<unsigned long>(scan_err),
+                            decision.enforce ? "enforce" : "observe",
+                            decision.reason);
+                        webhook::write_log_critical("guard", scan_dbg);
+                    }
+
+                    if (!decision.enforce && decision.isolated_sidt && rt.kernel_flag_persist_count >= 3)
+                    {
+                        char soft_dbg[320];
+                        _snprintf_s(soft_dbg, sizeof(soft_dbg), _TRUNCATE,
+                            "kernel_flag_isolated_soft_observed flags=0x%x decoded=%s persist=%u debugger_pid=%llu scan_pid=%llu dr_clear=%llu reason=%s",
+                            flags,
+                            decision.decoded.c_str(),
                             rt.kernel_flag_persist_count,
                             static_cast<unsigned long long>(adbg_result.detected_debugger_pid),
-                            static_cast<unsigned long long>(adbg_result.dr_clear_count));
+                            static_cast<unsigned long long>(scan_pid),
+                            static_cast<unsigned long long>(adbg_result.dr_clear_count),
+                            decision.reason);
                         webhook::write_log("guard", soft_dbg);
                     }
 
-                    if (settle_active)
+                    if (settle_active && !decision.enforce)
                     {
                         char settle_flag_buf[32];
                         _snprintf_s(settle_flag_buf, sizeof(settle_flag_buf), _TRUNCATE,
                             "0x%x", flags);
                         webhook::send_debug_log("sentinel_settle_flags", settle_flag_buf, true);
-                        char settle_dbg[128];
+                        char settle_dbg[192];
                         _snprintf_s(settle_dbg, sizeof(settle_dbg), _TRUNCATE,
-                            "kernel_flag_settle_active flags=0x%x persist=%u",
-                            flags, rt.kernel_flag_persist_count);
+                            "kernel_flag_settle_active flags=0x%x persist=%u decision=observe reason=%s",
+                            flags,
+                            rt.kernel_flag_persist_count,
+                            decision.reason);
                         webhook::write_log("guard", settle_dbg);
                         CFF_GOTO(guard_cff, 10);
                     }
 
-                    if (hard_hit || two_soft || persist_hit)
+                    if (decision.enforce)
                     {
-                        char extra_buf[16];
-                        _snprintf_s(extra_buf, sizeof(extra_buf), _TRUNCATE, "0x%x", flags);
+                        char extra_buf[96];
+                        _snprintf_s(extra_buf, sizeof(extra_buf), _TRUNCATE,
+                            "0x%x:%s", flags, decision.reason);
                         enforce_violation_id(aida::reason_ids::reason_id_kernel_detection_active, extra_buf);
                         CFF_EXIT(guard_cff);
                     }

@@ -12,6 +12,7 @@
 #include "webhook.hpp"
 #include "syscall.hpp"
 #include "standalone_driver.hpp"
+#include "kernel_adbg_classifier.hpp"
 
 namespace anti_tamper {
 namespace anti_debug {
@@ -344,10 +345,18 @@ inline bool check_kernel_debugger()
 {
     if (!syscall::is_initialized()) return false;
 
-    struct { BOOLEAN KernelDebuggerEnabled; BOOLEAN KernelDebuggerNotPresent; } kd_info{};
-    NTSTATUS st = syscall::NtQuerySystemInformation()(
-        0x23, &kd_info, sizeof(kd_info), nullptr);
-    return (st >= 0 && kd_info.KernelDebuggerEnabled && !kd_info.KernelDebuggerNotPresent);
+    const auto kd = kernel_adbg::query_native_kernel_debugger_state();
+    if (!kd.queried || !kd.ok)
+    {
+        char buf[192];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "native_kernel_debugger_query_failed status=0x%08lX returned=%lu",
+            static_cast<unsigned long>(kd.status),
+            static_cast<unsigned long>(kd.returned));
+        webhook::write_log("anti_debug", buf);
+        return false;
+    }
+    return kd.active;
 }
 
 inline bool check_kd_shared_data()
@@ -412,8 +421,7 @@ inline bool check_branch_miss_flat()
     if (!driver_bridge::kernel_anti_debug_query(kernel))
         return false;
 
-    constexpr uint32_t kernel_detect_timing_attack = 0x00000010u;
-    const bool timing_attack = (kernel.result_flags & kernel_detect_timing_attack) != 0;
+    const bool timing_attack = (kernel.result_flags & kernel_adbg::DETECT_TIMING_ATTACK) != 0;
     timing_ring_push(TIMING_KIND_BRANCH_MISS,
                      timing_attack ? TIMING_FLAG_ANOMALY : 0u,
                      kernel.result_flags,

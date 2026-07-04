@@ -30,6 +30,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -65,6 +66,9 @@ struct singleton_t
     std::string                             server_command;
     uint32_t                                child_pid          = 0;
     uint64_t                                launched_ms        = 0;
+    uint64_t                                attempt_started_ms = 0;
+    uint64_t                                attempt_elapsed_ms = 0;
+    uint64_t                                last_attempt_elapsed_ms = 0;
     uint64_t                                last_call_ms       = 0;
     std::atomic<uint64_t>                   total_calls{0};
     std::atomic<uint64_t>                   total_errors{0};
@@ -134,6 +138,9 @@ struct managed_session_t
     std::string                           server_command;
     uint32_t                              child_pid = 0;
     uint64_t                              launched_ms = 0;
+    uint64_t                              attempt_started_ms = 0;
+    uint64_t                              attempt_elapsed_ms = 0;
+    uint64_t                              last_attempt_elapsed_ms = 0;
     uint64_t                              last_call_ms = 0;
     std::atomic<uint64_t>                 total_calls{0};
     std::atomic<uint64_t>                 total_errors{0};
@@ -6772,6 +6779,200 @@ nlohmann::json managed_launch_failure_diagnostics_snapshot(
     return out;
 }
 
+std::string status_json_string_first(const nlohmann::json& j, std::initializer_list<const char*> keys)
+{
+    if (!j.is_object()) return {};
+    for (const char* key : keys)
+    {
+        auto it = j.find(key);
+        if (it != j.end() && it->is_string())
+        {
+            std::string value = it->get<std::string>();
+            if (!value.empty())
+                return value;
+        }
+    }
+    return {};
+}
+
+nlohmann::json status_last_debug_event_object(const nlohmann::json& diag)
+{
+    if (!diag.is_object()) return nlohmann::json::object();
+    auto it = diag.find("last_debug_event");
+    if (it != diag.end() && it->is_object())
+        return *it;
+    return nlohmann::json::object();
+}
+
+bool status_evidence_contains(const bridge_status_t& s, const nlohmann::json& diag, std::initializer_list<const char*> needles)
+{
+    std::string evidence;
+    evidence.reserve(2048);
+    evidence += s.last_error;
+    evidence.push_back(' ');
+    evidence += s.phase;
+    evidence.push_back(' ');
+    evidence += s.error_type;
+    evidence.push_back(' ');
+    evidence += s.error_kind;
+    evidence.push_back(' ');
+    evidence += s.last_debug_event;
+    if (diag.is_object())
+    {
+        std::string dumped = diag.dump();
+        if (dumped.size() > 12000)
+            dumped.resize(12000);
+        evidence.push_back(' ');
+        evidence += dumped;
+    }
+    evidence = ascii_lower_copy(std::move(evidence));
+    for (const char* needle : needles)
+    {
+        if (needle && needle[0] && evidence.find(ascii_lower_copy(std::string(needle))) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+int status_visible_window_count_from_diag(const nlohmann::json& diag)
+{
+    if (!diag.is_object()) return -1;
+    auto proof_it = diag.find("visible_window_proof");
+    if (proof_it != diag.end() && proof_it->is_object())
+    {
+        const int from_count = json_int_or(*proof_it, "visible_window_count", -1);
+        if (from_count >= 0)
+            return from_count;
+    }
+    return json_int_or(diag, "visible_window_count", -1);
+}
+
+int status_diag_page_count(const bridge_status_t& s, const nlohmann::json& diag, const nlohmann::json& event)
+{
+    int count = json_int_or(diag, "registered_pages", -1);
+    count = std::max(count, json_int_or(diag, "page_count", -1));
+    count = std::max(count, json_int_or(diag, "context_page_count", -1));
+    count = std::max(count, json_int_or(event, "registered_pages", -1));
+    count = std::max(count, json_int_or(event, "page_count", -1));
+    count = std::max(count, json_int_or(event, "context_page_count", -1));
+    if (count < 0 && s.page_count != 0)
+        count = static_cast<int>(s.page_count);
+    return count;
+}
+
+std::string status_derive_readiness_phase(const bridge_status_t& s, const nlohmann::json& diag, const nlohmann::json& event, bool client_connected)
+{
+    const bool fully_ready =
+        s.state == bridge_state_t::ready &&
+        client_connected &&
+        s.child_alive &&
+        s.browser_open &&
+        s.page_verified &&
+        s.privacy_verified &&
+        !s.cleanup_pending &&
+        usable_browser_process_count(s.browser_process_count) &&
+        !is_driver_closed_error(s.last_error);
+    if (fully_ready)
+        return "ready";
+    const int visible_count = status_visible_window_count_from_diag(diag);
+    const bool visible_failed = visible_count == 0 ||
+        status_evidence_contains(s, diag, {"visible_window_missing", "visible window proof", "visible_window_proof_failed"});
+    const bool privacy_failed = status_evidence_contains(s, diag, {"privacy_not_verified", "privacy verification", "privacy_assertion_failed"}) ||
+        (s.browser_open && s.page_verified && !s.privacy_verified);
+    const bool diag_browser_connected = json_bool_or(diag, "browser_connected", false) ||
+        json_bool_or(event, "browser_connected", false) ||
+        json_bool_or(diag, "browser_open", false) ||
+        json_bool_or(event, "browser_open", false);
+    const int diag_pages = status_diag_page_count(s, diag, event);
+    if (s.cleanup_pending)
+        return "cleanup_pending";
+    if (s.protocol_schema_viewport)
+        return "protocol_schema_viewport";
+    if (visible_failed)
+        return "visible_window_proof_failed";
+    if (privacy_failed)
+        return "privacy_proof_failed";
+    if (diag_browser_connected && (diag_pages == 0 || !s.page_verified))
+        return "browser_connected_no_page";
+    if (s.child_pid == 0)
+        return "child_not_launched";
+    if (!s.child_alive)
+        return "child_not_alive";
+    if (!client_connected)
+        return "mcp_client_detached";
+    if (!s.browser_open)
+        return "browser_not_open";
+    if (!s.page_verified)
+        return "page_not_verified";
+    if (!s.privacy_verified)
+        return "privacy_proof_failed";
+    if (!usable_browser_process_count(s.browser_process_count))
+        return "browser_process_tree_empty";
+    if (s.state == bridge_state_t::starting)
+        return "starting";
+    if (s.state == bridge_state_t::stopped)
+        return "stopped";
+    return "error";
+}
+
+void populate_status_diagnostic_fields(bridge_status_t& s, uint64_t sampled_ms, bool client_connected)
+{
+    const nlohmann::json diag = s.last_launch_diagnostics.is_object() ? s.last_launch_diagnostics : nlohmann::json::object();
+    const nlohmann::json event = status_last_debug_event_object(diag);
+    s.phase = status_json_string_first(diag, {"phase", "timeout_phase", "sidecar_timeout_phase", "transport_phase", "active_launch_phase", "status"});
+    if (s.phase.empty())
+        s.phase = status_json_string_first(event, {"phase", "event"});
+    s.error_type = status_json_string_first(diag, {"sidecar_error_type", "error_type", "exception_type"});
+    if (s.error_type.empty())
+        s.error_type = status_json_string_first(event, {"error_type", "exception_type"});
+    s.error_kind = status_json_string_first(diag, {"sidecar_error_kind", "error_kind"});
+    if (s.error_kind.empty())
+        s.error_kind = status_json_string_first(event, {"error_kind"});
+    s.last_debug_event = status_json_string_first(diag, {"last_debug_event_name", "last_debug_event_summary"});
+    if (s.last_debug_event.empty())
+        s.last_debug_event = status_json_string_first(event, {"event", "phase"});
+    s.protocol_schema_viewport =
+        ascii_lower_copy(s.error_kind) == "protocol_schema_viewport" ||
+        status_evidence_contains(s, diag, {"protocol_schema_viewport", "browser.setdefaultviewport", "setdefaultviewport", "deviceScaleFactor", "isMobile"});
+    if (s.attempt_started_ms != 0)
+    {
+        if (s.state == bridge_state_t::starting && sampled_ms >= s.attempt_started_ms)
+            s.attempt_elapsed_ms = sampled_ms - s.attempt_started_ms;
+        else if (s.last_launch_ms != 0)
+            s.attempt_elapsed_ms = s.last_launch_ms;
+        else if (s.attempt_elapsed_ms == 0 && sampled_ms >= s.attempt_started_ms)
+            s.attempt_elapsed_ms = sampled_ms - s.attempt_started_ms;
+    }
+    if (s.state != bridge_state_t::starting && s.last_launch_ms != 0)
+        s.last_attempt_elapsed_ms = s.last_launch_ms;
+    else if (s.last_attempt_elapsed_ms == 0)
+        s.last_attempt_elapsed_ms = s.attempt_elapsed_ms != 0 ? s.attempt_elapsed_ms : s.last_launch_ms;
+    uint64_t age_ref = s.last_verified_ms != 0 ? s.last_verified_ms : s.last_call_ms;
+    if (age_ref == 0)
+        age_ref = s.launched_ms;
+    if (age_ref == 0)
+        age_ref = s.attempt_started_ms;
+    s.status_age_ms = age_ref != 0 && sampled_ms >= age_ref ? sampled_ms - age_ref : 0;
+    s.readiness_phase = status_derive_readiness_phase(s, diag, event, client_connected);
+    if (s.last_launch_diagnostics.is_object())
+    {
+        s.last_launch_diagnostics["attempt_started_ms"] = s.attempt_started_ms;
+        s.last_launch_diagnostics["attempt_elapsed_ms"] = s.attempt_elapsed_ms;
+        s.last_launch_diagnostics["last_attempt_elapsed_ms"] = s.last_attempt_elapsed_ms;
+        s.last_launch_diagnostics["status_age_ms"] = s.status_age_ms;
+        s.last_launch_diagnostics["readiness_phase"] = s.readiness_phase;
+        s.last_launch_diagnostics["protocol_schema_viewport"] = s.protocol_schema_viewport;
+        if (!s.phase.empty())
+            s.last_launch_diagnostics["phase_flat"] = s.phase;
+        if (!s.error_type.empty())
+            s.last_launch_diagnostics["error_type_flat"] = s.error_type;
+        if (!s.error_kind.empty())
+            s.last_launch_diagnostics["error_kind_flat"] = s.error_kind;
+        if (!s.last_debug_event.empty())
+            s.last_launch_diagnostics["last_debug_event_flat"] = s.last_debug_event;
+    }
+}
+
 bool normalize_privacy_ice_fields(nlohmann::json& privacy)
 {
     if (!privacy.is_object())
@@ -7660,6 +7861,8 @@ bool start_bridge(const launch_config_t& cfg)
         static_cast<int>(effective_cfg.headless), effective_cfg.server_module.c_str(),
         effective_cfg.window_width, effective_cfg.window_height, effective_cfg.launch_timeout_ms);
     std::unique_lock<std::recursive_mutex> lk(sg().mtx);
+    sg().attempt_started_ms = bridge_start_ms;
+    sg().attempt_elapsed_ms = 0;
 
     diag::log_tagged_fmt("camoufox", "start_bridge state_snapshot state=%d generation=%llu client=%d browser_open=%d page_verified=%d child_pid=%lu cleanup_pending=%d",
         static_cast<int>(sg().state), static_cast<unsigned long long>(sg().generation),
@@ -10220,6 +10423,9 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
     s.server_command = session->server_command;
     s.child_pid = session->child_pid;
     s.launched_ms = session->launched_ms;
+    s.attempt_started_ms = session->attempt_started_ms;
+    s.attempt_elapsed_ms = session->attempt_elapsed_ms;
+    s.last_attempt_elapsed_ms = session->last_attempt_elapsed_ms;
     s.last_call_ms = session->last_call_ms;
     s.total_calls = session->total_calls.load(std::memory_order_relaxed);
     s.total_errors = session->total_errors.load(std::memory_order_relaxed);
@@ -10248,6 +10454,7 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
     s.session_count = managed_session_count();
     s.child_alive = process_alive(s.child_pid);
     populate_process_counts(s);
+    const bool client_connected = session->client != nullptr;
     if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified || !s.privacy_verified || !usable_browser_process_count(s.browser_process_count)))
     {
         s.state = bridge_state_t::error;
@@ -10271,6 +10478,7 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
             s.privacy_verified ? 1 : 0,
             s.cleanup_pending ? 1 : 0);
     }
+    populate_status_diagnostic_fields(s, now_ms(), client_connected);
     return s;
 }
 
@@ -10307,6 +10515,8 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
     std::string stale_reuse_cleanup_reason;
     {
         std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        session->attempt_started_ms = t0;
+        session->attempt_elapsed_ms = 0;
         const bool child_alive = process_alive(session->child_pid);
         const std::vector<process_tree_entry_t> ready_tree = child_alive ? enumerate_process_tree(session->child_pid) : std::vector<process_tree_entry_t>();
         const uint32_t ready_browser_processes = browser_process_count_from_tree(ready_tree);
@@ -11470,11 +11680,15 @@ bridge_status_t get_status()
         s.session_id = "default";
         s.active_session_id = "default";
         s.session_count = managed_session_count();
+        s.phase = "state_busy";
+        s.readiness_phase = "starting";
+        s.last_debug_event = "get_status_busy";
         populate_process_counts(s);
-        diag::log_tagged_fmt("camoufox", "get_status busy child_pid=%lu child_alive=%d calls=%llu errors=%llu",
+        diag::log_tagged_fmt("camoufox", "get_status busy child_pid=%lu child_alive=%d calls=%llu errors=%llu readiness_phase=%s",
             static_cast<unsigned long>(s.child_pid), s.child_alive ? 1 : 0,
             static_cast<unsigned long long>(s.total_calls),
-            static_cast<unsigned long long>(s.total_errors));
+            static_cast<unsigned long long>(s.total_errors),
+            s.readiness_phase.c_str());
         return s;
     }
     s.state           = sg().state;
@@ -11485,6 +11699,9 @@ bridge_status_t get_status()
     s.server_command  = sg().server_command;
     s.child_pid       = sg().child_pid;
     s.launched_ms     = sg().launched_ms;
+    s.attempt_started_ms = sg().attempt_started_ms;
+    s.attempt_elapsed_ms = sg().attempt_elapsed_ms;
+    s.last_attempt_elapsed_ms = sg().last_attempt_elapsed_ms;
     s.last_call_ms    = sg().last_call_ms;
     s.total_calls     = sg().total_calls.load(std::memory_order_relaxed);
     s.total_errors    = sg().total_errors.load(std::memory_order_relaxed);
@@ -11517,7 +11734,7 @@ bridge_status_t get_status()
     s.last_verified_ms = sg().last_verified_ms;
     s.child_alive     = process_alive(s.child_pid);
     populate_process_counts(s);
-    const bool client_connected = sg().client != nullptr;
+    bool client_connected = sg().client != nullptr;
     std::shared_ptr<mcp_client::client_t> cleanup_client;
     uint32_t cleanup_child_pid = 0;
     uint64_t cleanup_generation = 0;
@@ -11585,6 +11802,7 @@ bridge_status_t get_status()
             s.browser_instance_count = 0;
             s.child_process_count = 0;
             s.browser_process_count = 0;
+            client_connected = sg().client != nullptr;
         }
     }
     if (s.state == bridge_state_t::ready && is_driver_closed_error(s.last_error))
@@ -11665,8 +11883,9 @@ bridge_status_t get_status()
         if (sg().last_error.empty() && s.state != bridge_state_t::ready)
             sg().last_error = s.last_error;
     }
+    populate_status_diagnostic_fields(s, now_ms(), client_connected);
     const url_log_t u = summarize_url_for_log(s.active_page_url);
-    diag::log_tagged_fmt("camoufox", "get_status session_id=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d cleanup_generation=%llu cleanup_child_pid=%lu cleanup_reason=%s calls=%llu errors=%llu profile_dir=%s profile_generated=%d active_page_id=%s page_count=%u browser_instances=%u child_processes=%u browser_processes=%u ua_policy=%s ua_override=%d webrtc_blocked=%d active_host=%s active_path=%s query=%d url_len=%zu title_len=%zu err_len=%zu",
+    diag::log_tagged_fmt("camoufox", "get_status session_id=%s state=%d generation=%llu child_pid=%lu child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d cleanup_generation=%llu cleanup_child_pid=%lu cleanup_reason=%s calls=%llu errors=%llu phase=%s readiness_phase=%s error_type=%s error_kind=%s protocol_schema_viewport=%d attempt_started_ms=%llu attempt_elapsed_ms=%llu last_attempt_elapsed_ms=%llu status_age_ms=%llu last_debug_event=%s profile_dir=%s profile_generated=%d active_page_id=%s page_count=%u browser_instances=%u child_processes=%u browser_processes=%u ua_policy=%s ua_override=%d webrtc_blocked=%d active_host=%s active_path=%s query=%d url_len=%zu title_len=%zu err_len=%zu",
         s.session_id.c_str(),
         static_cast<int>(s.state), static_cast<unsigned long long>(s.generation),
         static_cast<unsigned long>(s.child_pid), static_cast<int>(s.child_alive),
@@ -11676,6 +11895,16 @@ bridge_status_t get_status()
         s.cleanup_reason.empty() ? "<empty>" : s.cleanup_reason.c_str(),
         static_cast<unsigned long long>(s.total_calls),
         static_cast<unsigned long long>(s.total_errors),
+        s.phase.empty() ? "<empty>" : s.phase.c_str(),
+        s.readiness_phase.empty() ? "<empty>" : s.readiness_phase.c_str(),
+        s.error_type.empty() ? "<empty>" : s.error_type.c_str(),
+        s.error_kind.empty() ? "<empty>" : s.error_kind.c_str(),
+        s.protocol_schema_viewport ? 1 : 0,
+        static_cast<unsigned long long>(s.attempt_started_ms),
+        static_cast<unsigned long long>(s.attempt_elapsed_ms),
+        static_cast<unsigned long long>(s.last_attempt_elapsed_ms),
+        static_cast<unsigned long long>(s.status_age_ms),
+        s.last_debug_event.empty() ? "<empty>" : s.last_debug_event.c_str(),
         s.active_profile_dir.empty() ? "<empty>" : s.active_profile_dir.c_str(),
         s.active_profile_generated ? 1 : 0,
         s.active_page_id.c_str(), static_cast<unsigned>(s.page_count),
@@ -12007,6 +12236,16 @@ nlohmann::json new_page_bridge_status_diagnostics(const bridge_status_t& st)
         {"generation", st.generation},
         {"child_pid", st.child_pid},
         {"child_alive", health.child_alive},
+        {"phase", st.phase},
+        {"error_type", st.error_type},
+        {"error_kind", st.error_kind},
+        {"readiness_phase", st.readiness_phase},
+        {"last_debug_event", st.last_debug_event},
+        {"protocol_schema_viewport", st.protocol_schema_viewport},
+        {"attempt_started_ms", st.attempt_started_ms},
+        {"attempt_elapsed_ms", st.attempt_elapsed_ms},
+        {"last_attempt_elapsed_ms", st.last_attempt_elapsed_ms},
+        {"status_age_ms", st.status_age_ms},
         {"browser_open", st.browser_open},
         {"page_verified", st.page_verified},
         {"page_count", st.page_count},

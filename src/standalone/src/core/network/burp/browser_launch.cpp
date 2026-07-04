@@ -481,20 +481,38 @@ bool launch(const browser_launch_config_t& cfg, uint32_t& out_pid)
         install_status.browser_path.c_str(), profile_path.c_str());
     bool started = camoufox::start_bridge(bridge_cfg);
     camoufox::bridge_status_t bridge_status = camoufox::get_status();
-    diag::log_tagged_fmt("browser", "launch camoufox_start_bridge_done ok=%d elapsed_ms=%llu state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d cleanup_pending=%d active_url_len=%zu last_error=%s",
+    diag::log_tagged_fmt("browser", "launch camoufox_start_bridge_done ok=%d elapsed_ms=%llu state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d cleanup_pending=%d phase=%s readiness_phase=%s error_type=%s error_kind=%s protocol_schema_viewport=%d attempt_started_ms=%llu attempt_elapsed_ms=%llu last_attempt_elapsed_ms=%llu status_age_ms=%llu last_debug_event=%s active_url_len=%zu last_error=%s",
         static_cast<int>(started), static_cast<unsigned long long>(now_ms() - launch_start_ms),
         bridge_state_name(bridge_status.state), static_cast<unsigned long>(bridge_status.child_pid),
         static_cast<int>(bridge_status.child_alive), static_cast<int>(bridge_status.browser_open),
-        static_cast<int>(bridge_status.page_verified), static_cast<int>(bridge_status.cleanup_pending),
+        static_cast<int>(bridge_status.page_verified), static_cast<int>(bridge_status.privacy_verified), static_cast<int>(bridge_status.cleanup_pending),
+        bridge_status.phase.empty() ? "<empty>" : bridge_status.phase.c_str(),
+        bridge_status.readiness_phase.empty() ? "<empty>" : bridge_status.readiness_phase.c_str(),
+        bridge_status.error_type.empty() ? "<empty>" : bridge_status.error_type.c_str(),
+        bridge_status.error_kind.empty() ? "<empty>" : bridge_status.error_kind.c_str(),
+        bridge_status.protocol_schema_viewport ? 1 : 0,
+        static_cast<unsigned long long>(bridge_status.attempt_started_ms),
+        static_cast<unsigned long long>(bridge_status.attempt_elapsed_ms),
+        static_cast<unsigned long long>(bridge_status.last_attempt_elapsed_ms),
+        static_cast<unsigned long long>(bridge_status.status_age_ms),
+        bridge_status.last_debug_event.empty() ? "<empty>" : bridge_status.last_debug_event.c_str(),
         bridge_status.active_page_url.size(),
         bridge_status.last_error.empty() ? "<empty>" : bridge_status.last_error.c_str());
     if (!started || bridge_status.child_pid == 0 || !bridge_status.child_alive || !bridge_status.browser_open || !bridge_status.page_verified) {
         std::string err = bridge_status.last_error.empty() ? std::string("camoufox bridge did not become ready") : bridge_status.last_error;
         set_err(err);
-        diag::log_tagged_fmt("browser", "launch fail_closed bridge_not_ready state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d err=%s",
+        diag::log_tagged_fmt("browser", "launch fail_closed bridge_not_ready state=%s child_pid=%lu child_alive=%d browser_open=%d page_verified=%d privacy_verified=%d phase=%s readiness_phase=%s error_type=%s error_kind=%s protocol_schema_viewport=%d attempt_elapsed_ms=%llu last_debug_event=%s err=%s",
             bridge_state_name(bridge_status.state), static_cast<unsigned long>(bridge_status.child_pid),
             static_cast<int>(bridge_status.child_alive), static_cast<int>(bridge_status.browser_open),
-            static_cast<int>(bridge_status.page_verified), err.c_str());
+            static_cast<int>(bridge_status.page_verified), static_cast<int>(bridge_status.privacy_verified),
+            bridge_status.phase.empty() ? "<empty>" : bridge_status.phase.c_str(),
+            bridge_status.readiness_phase.empty() ? "<empty>" : bridge_status.readiness_phase.c_str(),
+            bridge_status.error_type.empty() ? "<empty>" : bridge_status.error_type.c_str(),
+            bridge_status.error_kind.empty() ? "<empty>" : bridge_status.error_kind.c_str(),
+            bridge_status.protocol_schema_viewport ? 1 : 0,
+            static_cast<unsigned long long>(bridge_status.attempt_elapsed_ms),
+            bridge_status.last_debug_event.empty() ? "<empty>" : bridge_status.last_debug_event.c_str(),
+            err.c_str());
         return false;
     }
 

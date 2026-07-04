@@ -1,7 +1,9 @@
 #include "aida_pro.hpp"
 #include "instance_registry.hpp"
 #include "ida_utils.hpp"
+#include "multibinary_project.hpp"
 
+#include <netnode.hpp>
 #include <prodir.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
@@ -88,6 +90,13 @@ std::string get_idb_path_local()
     return std::string(p ? p : "");
 }
 
+std::string hex_u64_local(uint64_t value)
+{
+    char buf[32] = {};
+    qsnprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(value));
+    return std::string(buf);
+}
+
 std::string hex_lower_bytes(const uint8_t* data, size_t n)
 {
     static const char hex[] = "0123456789abcdef";
@@ -99,6 +108,56 @@ std::string hex_lower_bytes(const uint8_t* data, size_t n)
         s.push_back(hex[data[i] & 0x0f]);
     }
     return s;
+}
+
+std::string json_scalar_string(const json& value)
+{
+    if (value.is_string())
+        return value.get<std::string>();
+    if (value.is_number_unsigned())
+        return hex_u64_local(value.get<uint64_t>());
+    if (value.is_number_integer())
+        return hex_u64_local(static_cast<uint64_t>(value.get<int64_t>()));
+    return std::string();
+}
+
+void refresh_multibinary_metadata_local(ida_instance_record_t& rec)
+{
+    rec.image_base = hex_u64_local(static_cast<uint64_t>(get_imagebase()));
+    rec.image_min_ea = hex_u64_local(static_cast<uint64_t>(inf_get_min_ea()));
+    rec.image_max_ea = hex_u64_local(static_cast<uint64_t>(inf_get_max_ea()));
+    rec.module_id = aida::multibinary::canonical_module_id_from_hashes(rec.file_sha256, rec.file_md5, rec.input_basename, rec.input_file);
+    if (rec.index_generation.empty())
+        rec.index_generation = "unindexed:" + rec.module_id;
+    try
+    {
+        netnode nn("$ AiDA.multibinary.module");
+        if (nn == BADNODE)
+            return;
+        qvector<uchar> blob;
+        if (nn.getblob(&blob, 0, 'M') <= 0)
+            return;
+        std::vector<uint8_t> data(blob.begin(), blob.end());
+        json module = json::from_msgpack(data);
+        const std::string module_id = aida::multibinary::canonical_module_id_from_json(module);
+        if (!module_id.empty() && module_id != rec.module_id)
+            return;
+        if (module.contains("index_generation"))
+            rec.index_generation = json_scalar_string(module["index_generation"]);
+        if (module.contains("identity") && module["identity"].is_object())
+        {
+            const json& identity = module["identity"];
+            if (identity.contains("image_base"))
+                rec.image_base = json_scalar_string(identity["image_base"]);
+            if (identity.contains("min_ea"))
+                rec.image_min_ea = json_scalar_string(identity["min_ea"]);
+            if (identity.contains("max_ea"))
+                rec.image_max_ea = json_scalar_string(identity["max_ea"]);
+        }
+    }
+    catch (...)
+    {
+    }
 }
 
 std::string get_hostname_local()
@@ -157,6 +216,11 @@ json ida_instance_record_t::to_json() const
     j["config_entry_name"] = config_entry_name;
     j["file_md5"]          = file_md5;
     j["file_sha256"]       = file_sha256;
+    j["module_id"]         = module_id;
+    j["index_generation"]  = index_generation;
+    j["image_base"]        = image_base;
+    j["image_min_ea"]      = image_min_ea;
+    j["image_max_ea"]      = image_max_ea;
     j["processor"]         = processor;
     j["bitness"]           = bitness;
     j["hostname"]          = hostname;
@@ -182,6 +246,11 @@ ida_instance_record_t ida_instance_record_t::from_json(const json& j)
     r.config_entry_name = j.value("config_entry_name", "");
     r.file_md5          = j.value("file_md5", "");
     r.file_sha256       = j.value("file_sha256", "");
+    r.module_id         = j.value("module_id", "");
+    r.index_generation  = j.value("index_generation", "");
+    r.image_base        = j.value("image_base", "");
+    r.image_min_ea      = j.value("image_min_ea", "");
+    r.image_max_ea      = j.value("image_max_ea", "");
     r.processor         = j.value("processor", "");
     r.bitness           = j.value("bitness", 0);
     r.hostname          = j.value("hostname", "");
@@ -310,6 +379,7 @@ void instance_registry_t::compute_self_identity(int port, const std::string& bas
     uchar sha[32] = {};
     if (retrieve_input_file_sha256(sha))
         _self.file_sha256 = hex_lower_bytes(sha, 32);
+    refresh_multibinary_metadata_local(_self);
 }
 
 std::string instance_registry_t::compute_config_entry_name(const std::string& base)
@@ -402,6 +472,7 @@ void instance_registry_t::heartbeat_thread_func()
         {
             std::lock_guard<std::mutex> lk(_mtx);
             _self.last_heartbeat_ms = now_ms();
+            refresh_multibinary_metadata_local(_self);
             write_self_file();
             prune_stale_locked();
 

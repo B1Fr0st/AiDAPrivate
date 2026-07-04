@@ -314,6 +314,40 @@ std::string fmt_addr(std::uint64_t va)
     return os.str();
 }
 
+nlohmann::json dynamic_ioctl_state_json()
+{
+    const auto dyn = driver_bridge::dynamic_ioctl_state();
+    return nlohmann::json{
+        {"loaded", dyn.loaded},
+        {"kernel", dyn.kernel},
+        {"connected", dyn.connected},
+        {"ready", dyn.ready},
+        {"instance_server_seed", dyn.instance_server_seed},
+        {"instance_ioctl_seed", dyn.instance_ioctl_seed},
+        {"global_server_seed", dyn.global_server_seed},
+        {"global_ioctl_seed", dyn.global_ioctl_seed},
+        {"ioctl_seed_hash", dyn.ioctl_seed_hash},
+        {"heartbeat_ioctl_seed_hash", dyn.heartbeat_ioctl_seed_hash}
+    };
+}
+
+nlohmann::json memory_region_json(bool ok,
+                                  const driver_bridge::memory_region_t& region,
+                                  DWORD gle,
+                                  const std::string& driver_error)
+{
+    return nlohmann::json{
+        {"query_ok", ok},
+        {"gle", static_cast<unsigned long>(gle)},
+        {"driver_error", driver_error},
+        {"base", ok ? nlohmann::json(fmt_addr(region.base)) : nlohmann::json(nullptr)},
+        {"size", ok ? nlohmann::json(region.size) : nlohmann::json(nullptr)},
+        {"state", ok ? nlohmann::json(region.state) : nlohmann::json(nullptr)},
+        {"protect", ok ? nlohmann::json(region.protect) : nlohmann::json(nullptr)},
+        {"type", ok ? nlohmann::json(region.type) : nlohmann::json(nullptr)}
+    };
+}
+
 std::uint16_t be16(const std::uint8_t* p)
 {
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) | p[1]);
@@ -3821,9 +3855,37 @@ bool trace_serializer(const serializer_trace_options_t& input,
         error = "serializer_va is required";
         return false;
     }
+    const std::uint32_t active_pid_entry = driver_bridge::attached_pid();
+    const nlohmann::json dynamic_ioctl_entry = dynamic_ioctl_state_json();
     std::uint32_t pid = 0;
-    if (!ensure_process_context(input.process_id, pid, error))
+    if (!ensure_process_context(input.process_id, pid, error)) {
+        out["process_id"] = input.process_id;
+        out["requested_pid"] = input.process_id;
+        out["active_pid_entry"] = active_pid_entry;
+        out["active_pid_after_context"] = driver_bridge::attached_pid();
+        out["serializer_va"] = fmt_addr(input.serializer_va);
+        out["backend"] = "driver_sniff_net_buffers";
+        out["kernel_only_capture"] = true;
+        out["driver_sniff_attempted"] = false;
+        out["driver_sniff_started"] = false;
+        out["driver_status"] = driver_bridge::status();
+        out["driver_last_error"] = driver_bridge::last_error();
+        out["dynamic_ioctl_entry"] = dynamic_ioctl_entry;
+        out["dynamic_ioctl_after_context"] = dynamic_ioctl_state_json();
+        out["functional_success"] = false;
+        out["zero_capture_reason"] = "process context unavailable before kernel serializer backend start";
+        diag::log_tagged_fmt("net_proto",
+            "trace_serializer context_failed requested_pid=%u active_entry=%u active_after=%u serializer=0x%llX error=%s status=%s last_error=%s",
+            input.process_id,
+            active_pid_entry,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(input.serializer_va),
+            error.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
         return false;
+    }
+    const std::uint32_t active_pid_after_context = driver_bridge::attached_pid();
 
     serializer_trace_options_t options = input;
     if (options.max_captures == 0)
@@ -3869,49 +3931,141 @@ bool trace_serializer(const serializer_trace_options_t& input,
     bool driver_sniff_attempted = true;
     bool driver_sniff_started = false;
     bool driver_sniff_active_after_get = false;
+    driver_bridge::memory_region_t serializer_region{};
+    SetLastError(ERROR_SUCCESS);
+    const bool serializer_region_ok = driver_bridge::query_memory_for(pid, options.serializer_va, serializer_region);
+    const DWORD serializer_region_gle = serializer_region_ok ? ERROR_SUCCESS : GetLastError();
+    const std::string serializer_region_error = driver_bridge::last_error();
+    const nlohmann::json serializer_region_payload = memory_region_json(serializer_region_ok, serializer_region, serializer_region_gle, serializer_region_error);
+    const std::uint32_t active_pid_before_start = driver_bridge::attached_pid();
+    const nlohmann::json dynamic_ioctl_before_start = dynamic_ioctl_state_json();
 
     diag::log_tagged_fmt("net_proto",
-        "trace_serializer begin pid=%u serializer=0x%llX buffer_reg=%s size_reg=%s driver_buf=%u driver_size=%u sample_ms=%u max_captures=%u backend=driver_sniff_net_buffers",
+        "trace_serializer begin pid=%u requested_pid=%u active_entry=%u active_after_context=%u active_before_start=%u serializer=0x%llX region_ok=%d region_base=%s region_size=%llu region_protect=0x%X buffer_reg=%s size_reg=%s driver_buf=%u driver_size=%u tid=%u sample_ms=%u max_captures=%u dyn_ready=%d dyn_ioctl_seed_hash=0x%08X backend=driver_sniff_net_buffers",
         pid,
+        input.process_id,
+        active_pid_entry,
+        active_pid_after_context,
+        active_pid_before_start,
         static_cast<unsigned long long>(options.serializer_va),
+        serializer_region_ok ? 1 : 0,
+        serializer_region_ok ? fmt_addr(serializer_region.base).c_str() : "<none>",
+        static_cast<unsigned long long>(serializer_region_ok ? serializer_region.size : 0),
+        serializer_region_ok ? serializer_region.protect : 0,
         options.buffer_reg.c_str(),
         options.size_reg.c_str(),
         driver_buf_reg,
         driver_size_reg,
+        options.tid,
         options.sample_ms,
-        options.max_captures);
+        options.max_captures,
+        dynamic_ioctl_before_start.value("ready", false) ? 1 : 0,
+        dynamic_ioctl_before_start.value("ioctl_seed_hash", 0u));
 
+    const std::uint64_t start_call_ms = static_cast<std::uint64_t>(GetTickCount64());
+    SetLastError(ERROR_SUCCESS);
     if (!driver_bridge::sniff_net_buffers_start(options.serializer_va,
             driver_buf_reg,
             driver_size_reg,
             options.max_captures,
             options.tid,
             0)) {
+        const DWORD start_gle = GetLastError();
+        const std::uint64_t start_elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_call_ms;
         error = driver_bridge::last_error().empty() ? "failed to start kernel serializer buffer sniffing" : driver_bridge::last_error();
         out["process_id"] = pid;
+        out["requested_pid"] = input.process_id;
         out["serializer_va"] = fmt_addr(options.serializer_va);
         out["buffer_reg"] = options.buffer_reg;
         out["size_reg"] = options.size_reg;
+        out["driver_buf_reg"] = driver_buf_reg;
+        out["driver_size_reg"] = driver_size_reg;
+        out["tid"] = options.tid;
         out["backend"] = backend;
         out["kernel_only_capture"] = true;
         out["driver_sniff_attempted"] = driver_sniff_attempted;
         out["driver_sniff_started"] = driver_sniff_started;
+        out["driver_sniff_start_elapsed_ms"] = start_elapsed_ms;
+        out["driver_sniff_start_gle"] = static_cast<unsigned long>(start_gle);
         out["driver_error"] = error;
+        out["driver_status"] = driver_bridge::status();
+        out["driver_last_error"] = driver_bridge::last_error();
+        out["active_pid_entry"] = active_pid_entry;
+        out["active_pid_after_context"] = active_pid_after_context;
+        out["active_pid_before_start"] = active_pid_before_start;
+        out["active_pid_after_start"] = driver_bridge::attached_pid();
+        out["serializer_region"] = serializer_region_payload;
+        out["dynamic_ioctl_entry"] = dynamic_ioctl_entry;
+        out["dynamic_ioctl_after_context"] = dynamic_ioctl_state_json();
+        out["dynamic_ioctl_before_start"] = dynamic_ioctl_before_start;
+        out["dynamic_ioctl_after_start"] = dynamic_ioctl_state_json();
         out["functional_success"] = false;
         out["zero_capture_reason"] = "kernel serializer buffer sniffing did not start";
+        diag::log_tagged_fmt("net_proto",
+            "trace_serializer start_failed pid=%u active_before_start=%u active_after_start=%u serializer=0x%llX gle=%lu elapsed_ms=%llu error=%s status=%s last_error=%s region_ok=%d dyn_ready=%d",
+            pid,
+            active_pid_before_start,
+            driver_bridge::attached_pid(),
+            static_cast<unsigned long long>(options.serializer_va),
+            static_cast<unsigned long>(start_gle),
+            static_cast<unsigned long long>(start_elapsed_ms),
+            error.c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str(),
+            serializer_region_ok ? 1 : 0,
+            dynamic_ioctl_state_json().value("ready", false) ? 1 : 0);
         return false;
     }
     driver_sniff_started = true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(options.sample_ms));
+    const DWORD start_gle = GetLastError();
+    const std::uint64_t start_elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_call_ms;
+    const std::uint32_t active_pid_after_start = driver_bridge::attached_pid();
+    const nlohmann::json dynamic_ioctl_after_start = dynamic_ioctl_state_json();
+    bool sample_cancelled = false;
+    bool sample_deadline_expired = false;
+    const std::uint64_t sample_started_ms = static_cast<std::uint64_t>(GetTickCount64());
+    const std::uint64_t sample_deadline_ms = sample_started_ms > std::numeric_limits<std::uint64_t>::max() - options.sample_ms
+        ? std::numeric_limits<std::uint64_t>::max()
+        : sample_started_ms + options.sample_ms;
+    while (static_cast<std::uint64_t>(GetTickCount64()) < sample_deadline_ms) {
+        if (mcp_standalone::current_call_cancelled()) {
+            sample_cancelled = true;
+            break;
+        }
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+        if (call_deadline != 0 && now >= call_deadline) {
+            sample_deadline_expired = true;
+            break;
+        }
+        std::uint64_t slice = std::min<std::uint64_t>(50, sample_deadline_ms > now ? sample_deadline_ms - now : 0);
+        if (call_deadline != 0 && call_deadline > now)
+            slice = std::min<std::uint64_t>(slice, call_deadline - now);
+        if (slice == 0) {
+            sample_deadline_expired = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+    }
+    const std::uint64_t sample_elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - sample_started_ms;
     bool active = false;
     auto caps = driver_bridge::sniff_net_buffers_get(active);
+    const std::uint64_t stop_started_ms = static_cast<std::uint64_t>(GetTickCount64());
     driver_bridge::sniff_net_buffers_stop();
+    const std::uint64_t stop_elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - stop_started_ms;
     driver_sniff_active_after_get = active;
     diag::log_tagged_fmt("net_proto",
-        "trace_serializer driver_sniff_done captures=%zu active_after_get=%d sample_ms=%u driver_error=%s",
+        "trace_serializer driver_sniff_done captures=%zu active_after_get=%d active_after_stop=%u start_gle=%lu start_elapsed_ms=%llu sample_ms=%u sample_elapsed_ms=%llu sample_cancelled=%d sample_deadline=%d stop_elapsed_ms=%llu driver_error=%s",
         caps.size(),
         active ? 1 : 0,
+        driver_bridge::attached_pid(),
+        static_cast<unsigned long>(start_gle),
+        static_cast<unsigned long long>(start_elapsed_ms),
         options.sample_ms,
+        static_cast<unsigned long long>(sample_elapsed_ms),
+        sample_cancelled ? 1 : 0,
+        sample_deadline_expired ? 1 : 0,
+        static_cast<unsigned long long>(stop_elapsed_ms),
         driver_bridge::last_error().c_str());
     for (const auto& cap : caps) {
         serializer_sample_t sample;
@@ -3934,9 +4088,13 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;
 
     out["process_id"] = pid;
+    out["requested_pid"] = input.process_id;
     out["serializer_va"] = fmt_addr(options.serializer_va);
     out["buffer_reg"] = options.buffer_reg;
     out["size_reg"] = options.size_reg;
+    out["driver_buf_reg"] = driver_buf_reg;
+    out["driver_size_reg"] = driver_size_reg;
+    out["tid"] = options.tid;
     out["backend"] = backend;
     out["trace_method"] = "output_buffer_sampling";
     out["source_resolution"] = "capture backends provide output-buffer byte provenance, thread, timestamp, and hook RIP when available; memory source addresses require a taint backend and are not claimed here";
@@ -3948,6 +4106,9 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["sample_ms"] = options.sample_ms;
     out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64()) - started;
     out["capture_window_ms"] = options.sample_ms;
+    out["sample_elapsed_ms"] = sample_elapsed_ms;
+    out["sample_cancelled"] = sample_cancelled;
+    out["sample_deadline_expired"] = sample_deadline_expired;
     out["capture_count"] = captures.size();
     out["observed_capture_count"] = captures.size();
     out["saw_serializer_output"] = !samples.empty();
@@ -3957,7 +4118,22 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["user_mode_hook_disabled_reason"] = "kernel_only_stealth_policy";
     out["driver_sniff_attempted"] = driver_sniff_attempted;
     out["driver_sniff_started"] = driver_sniff_started;
+    out["driver_sniff_start_elapsed_ms"] = start_elapsed_ms;
+    out["driver_sniff_start_gle"] = static_cast<unsigned long>(start_gle);
+    out["driver_sniff_stop_elapsed_ms"] = stop_elapsed_ms;
     out["driver_sniff_active_after_get"] = driver_sniff_active_after_get;
+    out["active_pid_entry"] = active_pid_entry;
+    out["active_pid_after_context"] = active_pid_after_context;
+    out["active_pid_before_start"] = active_pid_before_start;
+    out["active_pid_after_start"] = active_pid_after_start;
+    out["active_pid_after_stop"] = driver_bridge::attached_pid();
+    out["serializer_region"] = serializer_region_payload;
+    out["dynamic_ioctl_entry"] = dynamic_ioctl_entry;
+    out["dynamic_ioctl_after_context"] = dynamic_ioctl_state_json();
+    out["dynamic_ioctl_before_start"] = dynamic_ioctl_before_start;
+    out["dynamic_ioctl_after_start"] = dynamic_ioctl_after_start;
+    out["driver_status"] = driver_bridge::status();
+    out["driver_last_error"] = driver_bridge::last_error();
     if (samples.empty())
         out["zero_capture_reason"] = "kernel serializer buffer sniffing completed without observing serializer output";
     out["captures"] = std::move(captures);

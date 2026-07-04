@@ -5,6 +5,7 @@
 #include "aida_ipc.hpp"
 #endif
 
+#include <algorithm>
 #include <queue>
 #include <deque>
 #include <chrono>
@@ -239,6 +240,271 @@ static json mcp_proxy_tools_call_to_peer(const ida_instance_record_t& peer,
             "Remote instance " + peer.instance_id + " returned unexpected payload" } }
     });
     return err;
+}
+
+static json record_to_public_json(const ida_instance_record_t& r);
+static agent_tools::tool_result_t aggregator_query_all(const json& params);
+
+static bool mcp_is_manage_operation(const json& args, const std::string& op)
+{
+    return args.is_object() && args.value("operation", args.value("action", std::string())) == op;
+}
+
+static json mcp_prepare_inventory_all_arguments(const json& args)
+{
+    if (!mcp_is_manage_operation(args, "inventory_all"))
+        return args;
+    json out = args;
+    if (!out.contains("payload") || !out["payload"].is_object())
+        out["payload"] = json::object();
+    json& payload = out["payload"];
+    if (payload.contains("fanout_result") || payload.contains("inventories"))
+        return out;
+    json inventory_payload = payload;
+    inventory_payload.erase("fanout_result");
+    inventory_payload.erase("inventories");
+    json fanout_args = {
+        {"tool", "ida_project_manage"},
+        {"arguments", {{"operation", "inventory_current"}, {"payload", inventory_payload}}},
+        {"timeout_seconds", 60}
+    };
+    agent_tools::tool_result_t fanout = aggregator_query_all(fanout_args);
+    if (fanout.success)
+        payload["fanout_result"] = fanout.data;
+    else
+        payload["fanout_result"] = {{"ok", false}, {"error_code", fanout.error_code}, {"message", fanout.output}};
+    payload["fanout_executed_by_router"] = true;
+    return out;
+}
+
+static std::string mcp_module_id_from_peer_ref(const json& ref)
+{
+    if (!ref.is_object())
+        return std::string();
+    if (ref.contains("peer") && ref["peer"].is_object())
+    {
+        const json& peer = ref["peer"];
+        for (const char* key : {"module_id", "corpus_id", "peer_id", "target_corpus_id"})
+        {
+            std::string value = peer.value(key, std::string());
+            if (!value.empty())
+                return value;
+        }
+    }
+    for (const char* key : {"target_module_id", "module_id", "target_corpus_id", "corpus_id", "peer_id"})
+    {
+        std::string value = ref.value(key, std::string());
+        if (!value.empty())
+            return value;
+    }
+    return std::string();
+}
+
+static bool mcp_peer_matches_module(const ida_instance_record_t& rec, const std::string& module_id)
+{
+    if (module_id.empty())
+        return false;
+    return rec.module_id == module_id
+        || rec.instance_id == module_id
+        || rec.file_sha256 == module_id
+        || rec.input_basename == module_id
+        || rec.input_file == module_id;
+}
+
+static json mcp_address_from_trace_ref(const json& node)
+{
+    if (!node.is_object())
+        return json();
+    for (const char* key : {"address", "target", "callee", "entry", "function"})
+    {
+        if (node.contains(key) && (node[key].is_string() || node[key].is_object() || node[key].is_number()))
+            return node[key];
+    }
+    for (const char* key : {"target_rva", "rva", "callee_rva", "entry_rva"})
+    {
+        if (node.contains(key) && !node[key].is_null())
+            return json::object({{"rva", node[key]}});
+    }
+    return json();
+}
+
+static bool mcp_has_remote_trace_evidence(const json& cross)
+{
+    if (!cross.is_object())
+        return false;
+    if (cross.contains("remote_trace_evidence") && cross["remote_trace_evidence"].is_array() && !cross["remote_trace_evidence"].empty())
+        return true;
+    if (cross.contains("abi") && cross["abi"].is_object()
+        && cross["abi"].contains("remote_trace_evidence")
+        && cross["abi"]["remote_trace_evidence"].is_array()
+        && !cross["abi"]["remote_trace_evidence"].empty())
+        return true;
+    return false;
+}
+
+static void mcp_append_peer_corpus(json& chain, const ida_instance_record_t& peer)
+{
+    if (!chain.contains("corpus") || !chain["corpus"].is_array())
+        chain["corpus"] = json::array();
+    const std::string corpus_id = peer.module_id.empty() ? peer.instance_id : peer.module_id;
+    for (const auto& item : chain["corpus"])
+    {
+        if (!item.is_object())
+            continue;
+        if (item.value("corpus_id", item.value("id", std::string())) == corpus_id)
+            return;
+    }
+    chain["corpus"].push_back({
+        {"corpus_id", corpus_id},
+        {"kind", "binary"},
+        {"availability", "peer_loaded"},
+        {"trust", "ida_peer"},
+        {"chain_critical", true},
+        {"identity", record_to_public_json(peer)}
+    });
+}
+
+static void mcp_merge_remote_trace_for_cross(json& cross,
+                                             const ida_instance_record_t& peer,
+                                             const json& trace,
+                                             const std::string& requested_module)
+{
+    if (!cross.contains("peer") || !cross["peer"].is_object())
+        cross["peer"] = json::object();
+    json& peer_json = cross["peer"];
+    peer_json["peer_id"] = requested_module.empty() ? (peer.module_id.empty() ? peer.instance_id : peer.module_id) : requested_module;
+    peer_json["instance_id"] = peer.instance_id;
+    peer_json["module_id"] = peer.module_id;
+    peer_json["index_generation"] = peer.index_generation;
+    peer_json["image_base"] = peer.image_base;
+    peer_json["image_min_ea"] = peer.image_min_ea;
+    peer_json["image_max_ea"] = peer.image_max_ea;
+    peer_json["missing"] = false;
+    if (peer_json.contains("expected_index_generation") && peer_json["expected_index_generation"].is_string())
+        peer_json["stale_generation"] = peer.index_generation != peer_json["expected_index_generation"].get<std::string>();
+    if (!cross.contains("remote_trace_evidence") || !cross["remote_trace_evidence"].is_array())
+        cross["remote_trace_evidence"] = json::array();
+    cross["remote_trace_evidence"].push_back(trace);
+    if (!cross.contains("abi") || !cross["abi"].is_object())
+        cross["abi"] = json::object();
+    json& abi = cross["abi"];
+    if (!abi.contains("remote_trace_evidence") || !abi["remote_trace_evidence"].is_array())
+        abi["remote_trace_evidence"] = json::array();
+    abi["remote_trace_evidence"].push_back(trace);
+}
+
+static json mcp_remote_trace_request_for_cross(const json& cross)
+{
+    json address = mcp_address_from_trace_ref(cross);
+    if ((address.is_null() || address.empty()) && cross.contains("cross_module_calls") && cross["cross_module_calls"].is_array())
+    {
+        for (const auto& call : cross["cross_module_calls"])
+        {
+            address = mcp_address_from_trace_ref(call);
+            if (!address.is_null() && !address.empty())
+                break;
+        }
+    }
+    if (address.is_null() || address.empty())
+        return json();
+    json payload;
+    payload["address"] = address;
+    payload["layers"] = json::array({"xrefs", "calls", "types"});
+    payload["max_depth"] = 4;
+    payload["max_functions"] = 512;
+    return {{"operation", "extract_xref_graph"}, {"payload", payload}};
+}
+
+static json mcp_remote_trace_result(const ida_instance_record_t& peer, const json& request, int timeout_seconds)
+{
+    json trace;
+    trace["schema"] = "aida_remote_idb_trace_evidence_v1";
+    trace["peer"] = record_to_public_json(peer);
+    trace["request"] = request;
+    trace["ok"] = false;
+    json response = mcp_proxy_tools_call_to_peer(peer, "ida_extract_manage", request, timeout_seconds);
+    trace["response"] = response;
+    const bool is_error = response.contains("isError") && response["isError"].is_boolean() && response["isError"].get<bool>();
+    trace["ok"] = !is_error;
+    if (is_error)
+        trace["reason"] = "remote_trace_request_failed";
+    return trace;
+}
+
+static void mcp_mark_missing_peer(json& cross, const std::string& requested_module)
+{
+    if (!cross.contains("peer") || !cross["peer"].is_object())
+        cross["peer"] = json::object();
+    cross["peer"]["peer_id"] = requested_module;
+    cross["peer"]["missing"] = true;
+    cross["remote_trace_evidence"] = json::array({{{"schema", "aida_remote_idb_trace_evidence_v1"}, {"ok", false}, {"reason", "peer_data_missing"}, {"module_id", requested_module}}});
+}
+
+static json mcp_prepare_chain_arguments_with_remote_evidence(const json& args, instance_registry_t* registry)
+{
+    if (!registry || !args.is_object())
+        return args;
+    const std::string operation = args.value("operation", args.value("action", std::string()));
+    if (operation != "submit" && operation != "start" && operation != "verify_link"
+        && operation != "verify_chain" && operation != "case_study_regressions")
+        return args;
+    if (!args.contains("payload") || !args["payload"].is_object() || !args["payload"].contains("chain") || !args["payload"]["chain"].is_object())
+        return args;
+    json out = args;
+    json& chain = out["payload"]["chain"];
+    if (!chain.contains("links") || !chain["links"].is_array())
+        return out;
+    const std::string self_id = registry->self_instance_id();
+    const auto instances = registry->all_live_instances();
+    for (auto& link : chain["links"])
+    {
+        if (!link.is_object())
+            continue;
+        json* cross = nullptr;
+        for (const char* key : {"cross_domain", "boundary_transition", "cross_transition"})
+        {
+            if (link.contains(key) && link[key].is_object())
+            {
+                cross = &link[key];
+                break;
+            }
+        }
+        if (cross == nullptr || mcp_has_remote_trace_evidence(*cross))
+            continue;
+        const std::string module_id = mcp_module_id_from_peer_ref(*cross);
+        if (module_id.empty())
+            continue;
+        auto peer_it = std::find_if(instances.begin(), instances.end(), [&](const ida_instance_record_t& rec) {
+            return rec.instance_id != self_id && mcp_peer_matches_module(rec, module_id);
+        });
+        if (peer_it == instances.end())
+        {
+            mcp_mark_missing_peer(*cross, module_id);
+            continue;
+        }
+        mcp_append_peer_corpus(chain, *peer_it);
+        json request = mcp_remote_trace_request_for_cross(*cross);
+        if (request.empty())
+        {
+            mcp_merge_remote_trace_for_cross(*cross, *peer_it, {{"schema", "aida_remote_idb_trace_evidence_v1"}, {"ok", false}, {"reason", "target_address_missing"}}, module_id);
+            continue;
+        }
+        json trace = mcp_remote_trace_result(*peer_it, request, 60);
+        mcp_merge_remote_trace_for_cross(*cross, *peer_it, trace, module_id);
+    }
+    return out;
+}
+
+static json mcp_prepare_local_tool_arguments(const std::string& tool_name, const json& args, instance_registry_t* registry)
+{
+    if (tool_name == "ida_project_manage")
+    {
+        json prepared = mcp_prepare_inventory_all_arguments(args);
+        return mcp_prepare_chain_arguments_with_remote_evidence(prepared, registry);
+    }
+    if (tool_name == "ida_chain_manage")
+        return mcp_prepare_chain_arguments_with_remote_evidence(args, registry);
+    return args;
 }
 
 static constexpr int JSONRPC_PARSE_ERROR      = -32700;
@@ -543,6 +809,10 @@ struct mcp_resource_exec_request_t : public exec_request_t
     }
 };
 
+static void progress_begin(const std::string& tool, const std::string& stage);
+static void progress_update(const std::string& tool, const std::string& stage, double fraction);
+static void progress_end(const std::string& tool, const std::string& stage);
+
 struct mcp_batch_exec_request_t : public exec_request_t
 {
     std::vector<std::pair<std::string, json>> calls;
@@ -560,20 +830,19 @@ struct mcp_batch_exec_request_t : public exec_request_t
 
         const bool multi = calls.size() > 1;
         if (multi)
-            show_wait_box("HIDECANCEL\nAiDA MCP: Executing %zu tool(s)...", calls.size());
+            progress_begin("mcp_prompt_batch", "execute");
 
         for (size_t ci = 0; ci < calls.size(); ++ci)
         {
             if (multi)
-                replace_wait_box("HIDECANCEL\nAiDA MCP: [%zu/%zu] %s",
-                    ci + 1, calls.size(), calls[ci].first.c_str());
+                progress_update("mcp_prompt_batch", calls[ci].first, static_cast<double>(ci) / static_cast<double>(calls.size()));
 
             results.push_back(agent_tools::ToolRegistry::instance().execute_tool(
                 calls[ci].first, calls[ci].second));
         }
 
         if (multi)
-            hide_wait_box();
+            progress_end("mcp_prompt_batch", "complete");
 
         if (include_rag && !rag_addr_str.empty())
         {
@@ -753,6 +1022,38 @@ static const std::vector<mcp_resource_def_t>& get_resource_definitions()
             "__databases",
             json::object()
         },
+        {
+            "ida://corpus/current/manifest",
+            "Current Corpus Manifest",
+            "Manifest for the currently loaded IDA module and any bound corpus state",
+            "application/json",
+            "ida_project_manage",
+            json::object({{"operation", "corpus_export"}, {"payload", json::object()}})
+        },
+        {
+            "ida://cache/status",
+            "Cache Status",
+            "Plugin cache, index, extraction, and output-cache status",
+            "application/json",
+            "ida_cache_manage",
+            json::object({{"operation", "status"}, {"payload", json::object()}})
+        },
+        {
+            "ida://jobs",
+            "Jobs",
+            "Plugin-owned MCP job records",
+            "application/json",
+            "ida_job_manage",
+            json::object({{"operation", "list"}, {"payload", json::object()}})
+        },
+        {
+            "ida://chain/reports",
+            "Chain Reports",
+            "Stored chain verification report records",
+            "application/json",
+            "ida_report_manage",
+            json::object({{"operation", "list_reports"}, {"payload", json::object()}})
+        },
     };
     return defs;
 }
@@ -846,6 +1147,132 @@ static bool resolve_mcp_resource_definition(const std::string& uri, mcp_resource
         std::string address = mcp_uri_decode(uri.substr(strlen("ida://xrefs/from/")));
         out = {"ida://xrefs/from/" + address, "Xrefs From", "Cross-references from an address", "application/json", "get_xrefs_from", json::object({{"address", address}, {"limit", 200}})};
         return true;
+    }
+
+    if (mcp_has_prefix(uri, "ida://chain/reports/"))
+    {
+        std::string rest = uri.substr(strlen("ida://chain/reports/"));
+        std::string query;
+        const size_t q = rest.find('?');
+        if (q != std::string::npos)
+        {
+            query = rest.substr(q + 1);
+            rest = rest.substr(0, q);
+        }
+        std::string format = "json";
+        const std::string key = "format=";
+        const size_t fp = query.find(key);
+        if (fp != std::string::npos)
+        {
+            format = mcp_uri_decode(query.substr(fp + key.size()));
+            const size_t amp = format.find('&');
+            if (amp != std::string::npos)
+                format = format.substr(0, amp);
+        }
+        if (format != "json" && format != "markdown" && format != "sarif")
+            format = "json";
+        const std::string report_id = mcp_uri_decode(rest);
+        std::string mime = "application/json";
+        if (format == "markdown")
+            mime = "text/markdown";
+        else if (format == "sarif")
+            mime = "application/sarif+json";
+        out = {uri, "Chain Report", "Stored chain verification report export", mime, "ida_report_manage",
+            json::object({{"operation", "export_report"}, {"payload", {{"report_id", report_id}, {"format", format}}}})};
+        return true;
+    }
+
+    if (mcp_has_prefix(uri, "ida://reports/exports/"))
+    {
+        std::string rest = mcp_uri_decode(uri.substr(strlen("ida://reports/exports/")));
+        std::string format = "json";
+        const size_t dot = rest.find_last_of('.');
+        if (dot != std::string::npos)
+        {
+            format = rest.substr(dot + 1);
+            rest = rest.substr(0, dot);
+        }
+        if (format == "md")
+            format = "markdown";
+        if (format != "json" && format != "markdown" && format != "sarif")
+            format = "json";
+        std::string mime = format == "markdown" ? "text/markdown" : (format == "sarif" ? "application/sarif+json" : "application/json");
+        out = {uri, "Report Export", "Stored report export by report id and format", mime, "ida_report_manage",
+            json::object({{"operation", "export_report"}, {"payload", {{"report_id", rest}, {"format", format}}}})};
+        return true;
+    }
+
+    if (mcp_has_prefix(uri, "ida://jobs/"))
+    {
+        std::string rest = mcp_uri_decode(uri.substr(strlen("ida://jobs/")));
+        const size_t slash = rest.find('/');
+        if (slash != std::string::npos)
+        {
+            const std::string job_id = rest.substr(0, slash);
+            const std::string part = rest.substr(slash + 1);
+            if (part == "result")
+            {
+                out = {uri, "Job Result", "Stored MCP job result page", "application/json", "ida_job_manage",
+                    json::object({{"operation", "result"}, {"payload", {{"job_id", job_id}}}})};
+                return true;
+            }
+            if (part == "events")
+            {
+                out = {uri, "Job Events", "Stored MCP job event ring", "application/json", "ida_job_manage",
+                    json::object({{"operation", "events"}, {"payload", {{"job_id", job_id}}}})};
+                return true;
+            }
+        }
+    }
+
+    if (mcp_has_prefix(uri, "ida://corpus/"))
+    {
+        std::string rest = mcp_uri_decode(uri.substr(strlen("ida://corpus/")));
+        if (rest == "current/manifest")
+        {
+            out = {uri, "Current Corpus Manifest", "Current corpus manifest", "application/json", "ida_project_manage",
+                json::object({{"operation", "corpus_export"}, {"payload", json::object()}})};
+            return true;
+        }
+        const std::string suffix = "/manifest";
+        if (rest.size() > suffix.size() && rest.compare(rest.size() - suffix.size(), suffix.size(), suffix) == 0)
+        {
+            std::string project_id = rest.substr(0, rest.size() - suffix.size());
+            out = {uri, "Corpus Manifest", "Project corpus manifest", "application/json", "ida_project_manage",
+                json::object({{"operation", "corpus_export"}, {"payload", {{"project_id", project_id}}}})};
+            return true;
+        }
+    }
+
+    if (mcp_has_prefix(uri, "ida://cache/"))
+    {
+        std::string rest = mcp_uri_decode(uri.substr(strlen("ida://cache/")));
+        if (rest == "status")
+        {
+            out = {uri, "Cache Status", "Plugin cache status", "application/json", "ida_cache_manage",
+                json::object({{"operation", "status"}, {"payload", json::object()}})};
+            return true;
+        }
+        if (rest == "extraction/status")
+        {
+            out = {uri, "Extraction Cache Status", "Extraction cache status", "application/json", "ida_cache_manage",
+                json::object({{"operation", "extraction_status"}, {"payload", json::object()}})};
+            return true;
+        }
+    }
+
+    if (mcp_has_prefix(uri, "ida://evidence/"))
+    {
+        std::string rest = mcp_uri_decode(uri.substr(strlen("ida://evidence/")));
+        const size_t slash = rest.find('/');
+        if (slash != std::string::npos)
+        {
+            const std::string report_id = rest.substr(0, slash);
+            const std::string evidence_id = rest.substr(slash + 1);
+            out = {uri, "Evidence Record", "Evidence record from a stored chain report", "application/json", "ida_report_manage",
+                json::object({{"operation", "evidence_fetch"}, {"payload", {{"report_id", report_id}, {"evidence_id", evidence_id}}}})};
+            return true;
+        }
     }
 
     return false;
@@ -1148,17 +1575,15 @@ static void mcp_emit_progress(const std::string& tool,
     }
 }
 
-// Lightweight wrappers for heavy tools. Currently progress_update is the
-// primary call site; begin/end are convenience markers.
-static inline void progress_begin(const std::string& tool, const std::string& stage = "begin")
+static void progress_begin(const std::string& tool, const std::string& stage)
 {
     mcp_emit_progress(tool, stage, 0.0);
 }
-static inline void progress_update(const std::string& tool, const std::string& stage, double fraction)
+static void progress_update(const std::string& tool, const std::string& stage, double fraction)
 {
     mcp_emit_progress(tool, stage, fraction);
 }
-static inline void progress_end(const std::string& tool, const std::string& stage = "end")
+static void progress_end(const std::string& tool, const std::string& stage)
 {
     mcp_emit_progress(tool, stage, 1.0);
 }
@@ -1238,13 +1663,6 @@ static inline agent_tools::tool_result_t execute_tool_in_main_thread(
     return execute_tool_in_main_thread(name, params, nullptr);
 }
 
-// ----------------------------------------------------------------------------
-// Slice B2 — internal parallel batch helper.
-// Spawns qthread workers, each of which acquires its own MFF_READ execute_sync
-// slice. A semaphore acts as a completion barrier. user_cancelled() and a wall
-// clock guard control early exit. ALL sub-calls MUST be read-only: the caller
-// is required to enforce this. Mixed-mode batches must use the serial path.
-// ----------------------------------------------------------------------------
 struct mcp_batch_worker_arg_t
 {
     std::string tool_name;
@@ -1339,7 +1757,7 @@ aida_mcp_internal::parallel_batch_outcome_t aida_mcp_internal::run_batch_paralle
     std::vector<mcp_batch_worker_arg_t> args(calls.size());
     std::vector<qthread_t> threads(calls.size(), nullptr);
 
-    show_wait_box("AiDA MCP: tool_batch_call parallel (%zu)...", calls.size());
+    progress_begin("tool_batch_call", "parallel");
 
     for (size_t i = 0; i < calls.size(); ++i)
     {
@@ -1364,30 +1782,24 @@ aida_mcp_internal::parallel_batch_outcome_t aida_mcp_internal::run_batch_paralle
 
     while (finished.load(std::memory_order_acquire) < total)
     {
-        if (user_cancelled())
-        {
-            cancel.store(true, std::memory_order_release);
-            outcome.cancelled = true;
-            break;
-        }
         if (std::chrono::steady_clock::now() >= deadline)
         {
             cancel.store(true, std::memory_order_release);
             outcome.timed_out = true;
             break;
         }
-        // Wait up to 100 ms for a completion to avoid busy-spin.
         qsem_wait(sem, 100);
+        progress_update("tool_batch_call", "parallel", static_cast<double>(finished.load(std::memory_order_acquire)) / static_cast<double>(total));
 
         if (stop_on_error)
         {
-            // Bail out early if any completed worker failed.
             int f = finished.load(std::memory_order_acquire);
             for (int i = 0; i < f; ++i)
             {
                 if (!args[i].result.success && !args[i].result.output.empty())
                 {
                     cancel.store(true, std::memory_order_release);
+                    outcome.cancelled = true;
                     break;
                 }
             }
@@ -1402,13 +1814,12 @@ aida_mcp_internal::parallel_batch_outcome_t aida_mcp_internal::run_batch_paralle
     if (sem)
         qsem_free(sem);
 
-    hide_wait_box();
+    progress_end("tool_batch_call", outcome.timed_out ? "timed_out" : (outcome.cancelled ? "cancelled" : "complete"));
 
     for (size_t i = 0; i < args.size(); ++i)
     {
         if (finished.load() <= (int)i && (outcome.cancelled || outcome.timed_out))
         {
-            // Slot was never filled by its worker.
             args[i].result.success = false;
             args[i].result.output = outcome.timed_out ? "timed out" : "cancelled";
             args[i].result.error_code = "timeout";
@@ -1570,6 +1981,8 @@ static bool is_destructive_tool_legacy(const std::string& name)
 {
     return name == "delete_function"
         || name == "delete_stack_var"
+        || name == "rename_function"
+        || name == "set_function_signature"
         || name == "patch_bytes"
         || name == "undefine"
         || name == "write_memory"
@@ -1579,6 +1992,9 @@ static bool is_destructive_tool_legacy(const std::string& name)
         || name == "patch_asm"
         || name == "put_int"
         || name == "set_comments"
+        || name == "set_comment"
+        || name == "set_repeatable_comment"
+        || name == "set_function_comment"
         || name == "append_comments"
         || name == "rename"
         || name == "define_func"
@@ -1586,7 +2002,13 @@ static bool is_destructive_tool_legacy(const std::string& name)
         || name == "declare_stack"
         || name == "delete_stack"
         || name == "declare_type"
+        || name == "apply_type"
         || name == "enum_upsert"
+        || name == "create_enum"
+        || name == "create_struct"
+        || name == "add_struct_member"
+        || name == "create_stack_var"
+        || name == "create_segment"
         || name == "set_type"
         || name == "type_apply_batch"
         || name == "py_eval"
@@ -1654,9 +2076,34 @@ static void audit_destructive_flag_drift()
     }
 }
 
-static bool is_mcp_exposed_tool(const agent_tools::tool_definition_t* tool)
+static bool is_mcp_public_tool(const agent_tools::tool_definition_t* tool)
 {
-    return tool && tool->category != "session";
+    return tool && tool->category != "session" && tool->visibility == "public";
+}
+
+static bool is_mcp_callable_tool(const agent_tools::tool_definition_t* tool)
+{
+    return tool && tool->category != "session" && tool->visibility != "internal";
+}
+
+static json mcp_operation_metadata_to_json(const agent_tools::tool_operation_t& op)
+{
+    json j;
+    j["operation"] = op.name;
+    j["description"] = op.description;
+    j["read_only"] = op.read_only;
+    j["destructive"] = op.destructive;
+    j["deterministic"] = op.deterministic;
+    j["job_mode"] = op.job_mode;
+    j["cache_policy"] = op.cache_policy;
+    j["default_timeout_ms"] = op.default_timeout_ms;
+    j["hard_timeout_ms"] = op.hard_timeout_ms;
+    j["required_indices"] = op.required_indices;
+    if (!op.input_schema.is_null() && !op.input_schema.empty())
+        j["inputSchema"] = op.input_schema;
+    if (!op.output_schema.is_null() && !op.output_schema.empty())
+        j["outputSchema"] = op.output_schema;
+    return j;
 }
 
 static json build_aggregator_tool_entries()
@@ -1765,7 +2212,7 @@ static json build_mcp_tools_list()
 
     for (const auto* tool : all_tools)
     {
-        if (!is_mcp_exposed_tool(tool))
+        if (!is_mcp_public_tool(tool))
             continue;
         if (tool->category == "instances")
             continue;
@@ -1810,6 +2257,20 @@ static json build_mcp_tools_list()
         t[OBFSTR_C("name")]        = tool->name;
         t[OBFSTR_C("description")] = compact_tool_text(tool->description, 320);
         t[OBFSTR_C("inputSchema")] = input_schema;
+        t["visibility"] = tool->visibility;
+        if (!tool->operations.empty())
+        {
+            t["operations"] = json::array();
+            for (const auto& op : tool->operations)
+                t["operations"].push_back(mcp_operation_metadata_to_json(op));
+        }
+        if (!tool->deprecated_by_tool.empty())
+        {
+            t["deprecated_by"] = {
+                {"tool", tool->deprecated_by_tool},
+                {"operation", tool->deprecated_by_operation.empty() ? json(nullptr) : json(tool->deprecated_by_operation)}
+            };
+        }
         if (!tool->output_schema.is_null() && !tool->output_schema.empty())
         {
             t["outputSchema"] = tool->output_schema;
@@ -1951,19 +2412,21 @@ static json handle_tools_call(const json& id, const json& params)
         return make_jsonrpc_result(id, result);
     }
 
+    json prepared_args = mcp_prepare_local_tool_arguments(tool_name, local_args, registry);
+
     if (tool_name == "list_ida_instances" || tool_name == "query_all_instances"
         || tool_name == "get_local_instance_info")
     {
-        auto tool_result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, local_args);
+        auto tool_result = agent_tools::ToolRegistry::instance().execute_tool(tool_name, prepared_args);
         json result = build_mcp_tool_result_payload(tool_result);
         return make_jsonrpc_result(id, result);
     }
 
     const auto* tool = agent_tools::ToolRegistry::instance().get_tool(tool_name);
-    if (!is_mcp_exposed_tool(tool))
+    if (!is_mcp_callable_tool(tool))
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Tool is not exposed through MCP");
 
-    auto tool_result = execute_tool_in_main_thread(tool_name, local_args);
+    auto tool_result = execute_tool_in_main_thread(tool_name, prepared_args);
     json result = build_mcp_tool_result_payload(tool_result);
     return make_jsonrpc_result(id, result);
 }
@@ -2049,6 +2512,55 @@ static json handle_resources_templates_list(const json& id)
         {"uriTemplate", "ida://xrefs/from/{addr}"},
         {OBFSTR_C("name"), "Xrefs From Address"},
         {OBFSTR_C("description"), "Access outgoing cross-references from an address"},
+        {"mimeType", "application/json"}
+    });
+
+    templates.push_back({
+        {"uriTemplate", "ida://chain/reports/{report_id}?format={format}"},
+        {OBFSTR_C("name"), "Chain Report Export"},
+        {OBFSTR_C("description"), "Read a stored chain report as json, markdown, or sarif"},
+        {"mimeType", "application/json"}
+    });
+
+    templates.push_back({
+        {"uriTemplate", "ida://reports/exports/{report_id}.{format}"},
+        {OBFSTR_C("name"), "Report Export"},
+        {OBFSTR_C("description"), "Read a stored report export by report id and extension"},
+        {"mimeType", "application/json"}
+    });
+
+    templates.push_back({
+        {"uriTemplate", "ida://jobs/{job_id}/result"},
+        {OBFSTR_C("name"), "Job Result"},
+        {OBFSTR_C("description"), "Read a stored MCP job result"},
+        {"mimeType", "application/json"}
+    });
+
+    templates.push_back({
+        {"uriTemplate", "ida://jobs/{job_id}/events"},
+        {OBFSTR_C("name"), "Job Events"},
+        {OBFSTR_C("description"), "Read a stored MCP job event ring"},
+        {"mimeType", "application/json"}
+    });
+
+    templates.push_back({
+        {"uriTemplate", "ida://corpus/{project_id}/manifest"},
+        {OBFSTR_C("name"), "Corpus Manifest"},
+        {OBFSTR_C("description"), "Read a project or current corpus manifest"},
+        {"mimeType", "application/json"}
+    });
+
+    templates.push_back({
+        {"uriTemplate", "ida://cache/{area}/status"},
+        {OBFSTR_C("name"), "Cache Status"},
+        {OBFSTR_C("description"), "Read cache status for extraction, index, output, or all areas"},
+        {"mimeType", "application/json"}
+    });
+
+    templates.push_back({
+        {"uriTemplate", "ida://evidence/{report_id}/{evidence_id}"},
+        {OBFSTR_C("name"), "Evidence Record"},
+        {OBFSTR_C("description"), "Read an evidence record emitted by a stored report"},
         {"mimeType", "application/json"}
     });
 
@@ -2420,6 +2932,12 @@ static json record_to_public_json(const ida_instance_record_t& r)
     j["config_entry_name"] = r.config_entry_name;
     j["file_md5"]          = r.file_md5;
     j["file_sha256"]       = r.file_sha256;
+    j["module_id"]         = r.module_id;
+    j["index_generation"]  = r.index_generation;
+    j["image_base"]        = r.image_base;
+    j["image_min_ea"]      = r.image_min_ea;
+    j["image_max_ea"]      = r.image_max_ea;
+    j["image_bounds"]      = {{"base", r.image_base}, {"min_ea", r.image_min_ea}, {"max_ea", r.image_max_ea}};
     j["processor"]         = r.processor;
     j["bitness"]           = r.bitness;
     j["hostname"]          = r.hostname;
@@ -2488,7 +3006,7 @@ static agent_tools::tool_result_t aggregator_query_all(const json& params)
     }
 
     const auto* tool_def = agent_tools::ToolRegistry::instance().get_tool(tool_name);
-    bool tool_known_locally = is_mcp_exposed_tool(tool_def);
+    bool tool_known_locally = is_mcp_callable_tool(tool_def);
 
     auto all = reg->all_live_instances();
     if (all.empty())
@@ -2646,6 +3164,7 @@ static void register_aggregator_tools_once()
             "file hashes, processor, bitness, port, and base_url. Use the returned instance_id OR pid as the "
             "optional instance_id/pid argument on any tool to target a specific IDA.";
         list_def.read_only = true;
+        list_def.visibility = "public";
         list_def.handler = aggregator_list_instances;
         reg.register_tool(list_def);
 
@@ -2654,6 +3173,7 @@ static void register_aggregator_tools_once()
         info_def.category = "instances";
         info_def.description = "Return the metadata of the IDA instance backing this MCP connection.";
         info_def.read_only = true;
+        info_def.visibility = "public";
         info_def.handler = aggregator_get_local_info;
         reg.register_tool(info_def);
 
@@ -2664,6 +3184,7 @@ static void register_aggregator_tools_once()
             "aggregate the per-instance results. Use this to compare or correlate findings across multiple "
             "binaries open in different IDAs.";
         fan_def.read_only = false;
+        fan_def.visibility = "public";
         agent_tools::tool_param_t p_tool;
         p_tool.name = "tool";
         p_tool.type = "string";
@@ -3045,7 +3566,7 @@ void mcp_server_t::server_thread_func(int port)
         }
 
         const auto* tool = agent_tools::ToolRegistry::instance().get_tool(tool_name);
-        if (!is_mcp_exposed_tool(tool))
+        if (!is_mcp_callable_tool(tool))
         {
             res.status = 403;
             res.set_content(json_dump_safe({{"error", "Tool is not exposed through MCP"}}), "application/json");

@@ -17,6 +17,7 @@
 #include "state.hpp"
 #include "enforcement.hpp"
 #include "anti_debug.hpp"
+#include "kernel_adbg_classifier.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
 #include "../infra/win_thread.hpp"
@@ -256,51 +257,6 @@ namespace detail {
                 ch = '\\';
         }
         return value;
-    }
-
-    struct native_kd_state_t
-    {
-        bool query_ok = false;
-        bool active = false;
-        BOOLEAN enabled = 0;
-        BOOLEAN not_present = 1;
-        LONG status = 0;
-        ULONG returned = 0;
-    };
-
-    inline native_kd_state_t query_native_kernel_debugger_state()
-    {
-        native_kd_state_t state{};
-        using nt_query_system_information_t = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
-        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-        if (!nt)
-        {
-            state.status = static_cast<LONG>(0xC0000135u);
-            return state;
-        }
-        auto query = reinterpret_cast<nt_query_system_information_t>(
-            GetProcAddress(nt, "NtQuerySystemInformation"));
-        if (!query)
-        {
-            state.status = static_cast<LONG>(0xC0000139u);
-            return state;
-        }
-        struct kernel_debugger_information_t
-        {
-            BOOLEAN KernelDebuggerEnabled;
-            BOOLEAN KernelDebuggerNotPresent;
-        } kdi{};
-        ULONG returned = 0;
-        LONG status = query(35, &kdi, sizeof(kdi), &returned);
-        state.status = status;
-        state.returned = returned;
-        if (status < 0)
-            return state;
-        state.query_ok = true;
-        state.enabled = kdi.KernelDebuggerEnabled;
-        state.not_present = kdi.KernelDebuggerNotPresent;
-        state.active = kdi.KernelDebuggerEnabled != 0 && kdi.KernelDebuggerNotPresent == 0;
-        return state;
     }
 
     inline bool trusted_windows_system_owner(const foreign_handle_observation_t& obs)
@@ -1134,27 +1090,28 @@ namespace detail {
 
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() && driver_bridge::dynamic_ioctls_ready()) {
             driver_bridge::anti_debug_result_t ar{};
-            if (driver_bridge::kernel_anti_debug_query(ar)) {
-                if ((ar.result_flags & 0x1u) != 0) {
-                    const native_kd_state_t kd = query_native_kernel_debugger_state();
-                    if (!kd.query_ok || kd.active) {
-                        mask |= SIGNAL_KERNEL_DEBUG;
-                    } else {
-                        char buf[320];
-                        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                            "kernel_debugger_driver_flag_suppressed driver_flags=0x%08X native_ok=%d native_enabled=%u native_not_present=%u native_active=%d native_status=0x%08lX native_returned=%lu debugger_pid=%llu",
-                            ar.result_flags,
-                            kd.query_ok ? 1 : 0,
-                            static_cast<unsigned>(kd.enabled),
-                            static_cast<unsigned>(kd.not_present),
-                            kd.active ? 1 : 0,
-                            static_cast<unsigned long>(kd.status),
-                            static_cast<unsigned long>(kd.returned),
-                            static_cast<unsigned long long>(ar.detected_debugger_pid));
-                        webhook::write_log("re_tick", buf);
-                    }
-                }
+            const bool query_ok = driver_bridge::kernel_anti_debug_query(ar);
+            auto in = query_ok
+                ? kernel_adbg::make_input(ar, "re_tick", "collect_signals")
+                : kernel_adbg::input_t{};
+            if (!query_ok) {
+                in.native = kernel_adbg::query_native_kernel_debugger_state();
+                in.phase = "re_tick";
+                in.source = "collect_signals";
             }
+            uint64_t scan_pid = 0;
+            if (!query_ok || ar.result_flags != 0 || ar.detected_debugger_pid != 0 || in.native.active) {
+                in.scan_sampled = true;
+                in.scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&scan_pid);
+                in.scan_pid = scan_pid;
+            }
+            const auto decision = kernel_adbg::classify(in);
+            if (!query_ok || ar.result_flags != 0 || ar.detected_debugger_pid != 0 || scan_pid != 0 || in.native.active || decision.enforce) {
+                const std::string decision_line = kernel_adbg::format_decision(in, decision);
+                webhook::write_log("re_tick", decision_line.c_str());
+            }
+            if (decision.enforce)
+                mask |= SIGNAL_KERNEL_DEBUG;
         }
 
         if (detect_dr_on_self_text())
@@ -1268,10 +1225,22 @@ namespace detail {
         if (kernel_ready) {
             query_ok = driver_bridge::kernel_anti_debug_query(query);
             scan_ok = driver_bridge::kernel_anti_debug_scan_debuggers(&scan_pid);
-            constexpr uint32_t hard_kernel_flags = 0x00000001u | 0x00000008u;
-            confirmed =
-                query_ok &&
-                (((query.result_flags & hard_kernel_flags) != 0) || query.detected_debugger_pid != 0);
+            auto in = query_ok
+                ? kernel_adbg::make_input(query, path ? path : "re_detect", "foreign_handle_confirmation")
+                : kernel_adbg::input_t{};
+            if (!query_ok) {
+                in.native = kernel_adbg::query_native_kernel_debugger_state();
+                in.phase = path ? path : "re_detect";
+                in.source = "foreign_handle_confirmation";
+            }
+            in.scan_sampled = true;
+            in.scan_ok = scan_ok;
+            in.scan_pid = scan_pid;
+            in.corroborated_hard_signals = mask & ~SIGNAL_FOREIGN_HANDLE;
+            const auto decision = kernel_adbg::classify(in);
+            const std::string decision_line = kernel_adbg::format_decision(in, decision);
+            webhook::write_log(path ? path : "re_detect", decision_line.c_str());
+            confirmed = decision.enforce;
         }
 
         const bool suppress_unconfirmed_system =

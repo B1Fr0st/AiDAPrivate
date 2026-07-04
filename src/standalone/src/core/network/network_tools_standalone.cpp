@@ -356,6 +356,104 @@ static json page_guard_install_failure_payload() {
         {"driver_status", f.remote_call_driver_status},
         {"driver_last_error", f.remote_call_driver_last_error}
     };
+    out["remote_call_lower_phase"] = f.remote_call_lower_phase;
+    out["remote_call_lower_completion_reason"] = f.remote_call_lower_completion_reason;
+    out["remote_call_lower_gle"] = f.remote_call_lower_gle;
+    out["remote_call_lower_worker_tid"] = f.remote_call_lower_worker_tid;
+    out["remote_call_lower_worker_alive"] = f.remote_call_lower_worker_alive != 0;
+    out["remote_call_lower_queue_depth_at_submit"] = f.remote_call_lower_queue_depth_at_submit;
+    out["remote_call_lower_queue_depth_at_start"] = f.remote_call_lower_queue_depth_at_start;
+    out["remote_call_lower_queue_depth_after_pop"] = f.remote_call_lower_queue_depth_after_pop;
+    out["remote_call_lower_inflight_at_submit"] = f.remote_call_lower_inflight_at_submit;
+    out["remote_call_lower_inflight_at_start"] = f.remote_call_lower_inflight_at_start;
+    out["remote_call_lower_inflight_after"] = f.remote_call_lower_inflight_after;
+    out["quarantined"] = f.quarantined != 0;
+    out["quarantine_cleanup_attempted"] = f.quarantine_cleanup_attempted != 0;
+    out["quarantine_id"] = f.quarantine_id;
+    out["kernel_protect"] = json{
+        {"attempted_protect", f.attempted_protect},
+        {"original_protect", f.original_protect},
+        {"proposed_protect", f.proposed_protect},
+        {"region_base", hex_u64(f.region_base)},
+        {"region_size", f.region_size},
+        {"region_state", f.region_state},
+        {"region_protect", f.region_protect},
+        {"region_type", f.region_type}
+    };
+    out["remote_call"]["lower"] = json{
+        {"phase", f.remote_call_lower_phase},
+        {"completion_reason", f.remote_call_lower_completion_reason},
+        {"gle", f.remote_call_lower_gle},
+        {"worker_tid", f.remote_call_lower_worker_tid},
+        {"worker_alive", f.remote_call_lower_worker_alive != 0},
+        {"queue_depth_at_submit", f.remote_call_lower_queue_depth_at_submit},
+        {"queue_depth_at_start", f.remote_call_lower_queue_depth_at_start},
+        {"queue_depth_after_pop", f.remote_call_lower_queue_depth_after_pop},
+        {"inflight_at_submit", f.remote_call_lower_inflight_at_submit},
+        {"inflight_at_start", f.remote_call_lower_inflight_at_start},
+        {"inflight_after", f.remote_call_lower_inflight_after},
+        {"worker_error_value", f.remote_call_lower_worker_error_value},
+        {"worker_error_category", f.remote_call_lower_worker_error_category},
+        {"worker_error_message", f.remote_call_lower_worker_error_message},
+        {"completed", f.remote_call_lower_completed != 0},
+        {"ok", f.remote_call_lower_ok != 0},
+        {"stale_generation", f.remote_call_lower_stale_generation != 0},
+        {"cancelled", f.remote_call_lower_cancelled != 0},
+        {"deadline_expired", f.remote_call_lower_deadline_expired != 0},
+        {"lock_timeout", f.remote_call_lower_lock_timeout != 0},
+        {"worker_exception", f.remote_call_lower_worker_exception != 0},
+        {"worker_creation_failed", f.remote_call_lower_worker_creation_failed != 0},
+        {"late_completion", f.remote_call_lower_late_completion != 0},
+        {"generation_at_entry", f.remote_call_lower_generation_at_entry},
+        {"generation_after", f.remote_call_lower_generation_after},
+        {"queue_wait_ms", f.remote_call_lower_queue_wait_ms},
+        {"elapsed_ms", f.remote_call_lower_elapsed_ms},
+        {"deadline_remaining_at_queue_ms", f.remote_call_lower_deadline_remaining_at_queue_ms},
+        {"deadline_remaining_at_start_ms", f.remote_call_lower_deadline_remaining_at_start_ms},
+        {"deadline_remaining_at_finish_ms", f.remote_call_lower_deadline_remaining_at_finish_ms},
+        {"allow_zero_result", f.remote_call_allow_zero_result != 0},
+        {"zero_result_rejected", f.remote_call_zero_result_rejected != 0},
+        {"caller_abandoned", f.remote_call_caller_abandoned != 0},
+        {"removed_from_queue", f.remote_call_removed_from_queue != 0},
+        {"popped_from_queue", f.remote_call_popped_from_queue != 0},
+        {"execution_started", f.remote_call_execution_started != 0},
+        {"executing_abandoned", f.remote_call_executing_abandoned != 0}
+    };
+    out["remote_call"]["seh"] = json{
+        {"exception", f.remote_call_seh_exception != 0},
+        {"exception_code", f.remote_call_seh_exception_code},
+        {"exception_address", hex_u64(f.remote_call_seh_exception_address)},
+        {"fault_address", hex_u64(f.remote_call_seh_fault_address)},
+        {"rip", hex_u64(f.remote_call_seh_rip)},
+        {"rsp", hex_u64(f.remote_call_seh_rsp)},
+        {"rbp", hex_u64(f.remote_call_seh_rbp)}
+    };
+    out["veh_target"] = json{
+        {"tid", f.veh_target_tid},
+        {"teb_exception_list", hex_u64(f.veh_target_teb_exception_list)},
+        {"peb", hex_u64(f.veh_target_peb)},
+        {"loader_lock", hex_u64(f.veh_target_loader_lock)},
+        {"loader_lock_owner", hex_u64(f.veh_target_loader_lock_owner)},
+        {"loader_lock_count", f.veh_target_loader_lock_count},
+        {"loader_lock_probe_state", f.veh_target_loader_lock_probe_state},
+        {"loader_lock_safe_state", f.veh_target_loader_lock_safe_state},
+        {"last_error_before", f.veh_target_last_error_before},
+        {"last_error_after", f.veh_target_last_error_after},
+        {"wrapper_phase", f.veh_target_wrapper_phase},
+        {"seh_probe_state", f.veh_target_seh_probe_state},
+        {"exception_state", f.veh_target_exception_state},
+        {"exception_code", f.veh_target_exception_code},
+        {"exception_address", hex_u64(f.veh_target_exception_address)}
+    };
+    out["quarantine"] = json{
+        {"active", f.quarantined != 0},
+        {"id", f.quarantine_id},
+        {"cleanup_attempted", f.quarantine_cleanup_attempted != 0},
+        {"veh_remove_attempted", f.quarantine_veh_remove_attempted != 0},
+        {"veh_remove_ok", f.quarantine_veh_remove_ok != 0},
+        {"retained_shellcode", f.quarantine_retained_shellcode != 0},
+        {"retained_ring", f.quarantine_retained_ring != 0}
+    };
     return out;
 }
 
@@ -4024,6 +4122,7 @@ static void attach_redirect_delivery_breadcrumbs(json& r,
                                                  const std::vector<driver_bridge::redirect_rule_info_t>& before,
                                                  const std::vector<driver_bridge::redirect_rule_info_t>& after,
                                                  DWORD gle,
+                                                 int wsa_error,
                                                  std::uint64_t elapsed_ms) {
     r["delivery"] = {
         {"before_rule_count", static_cast<std::uint64_t>(before.size())},
@@ -4034,7 +4133,7 @@ static void attach_redirect_delivery_breadcrumbs(json& r,
         {"fixture", redirect_fixture_counters_json(params)},
         {"win32_error", static_cast<unsigned long>(gle)},
         {"win32_message", win32_error_message(gle)},
-        {"wsa_error", WSAGetLastError()},
+        {"wsa_error", wsa_error},
         {"elapsed_ms", elapsed_ms},
         {"rules_before", redirect_rules_to_json(before)},
         {"rules_after", redirect_rules_to_json(after)}
@@ -4090,6 +4189,7 @@ tool_result_t network_redirect_traffic(const json& params)
         std::uint32_t rule_id = 0;
         bool ok = driver_bridge::traffic_redirect_op(0, 0, protocol, match_port, match_addr, redirect_port, redirect_addr, af, &rule_id, exclude_pid);
         const DWORD gle = GetLastError();
+        const int wsa_error = WSAGetLastError();
         auto remaining = driver_bridge::list_redirect_rules();
         json r;
         r["operation"] = "add";
@@ -4108,13 +4208,13 @@ tool_result_t network_redirect_traffic(const json& params)
         r["rule_visible_after_add"] = redirect_find_rule(remaining, rule_id, after_rule);
         r["rule_after_add"] = after_rule;
         add_driver_request_fields(r, ok, gle);
-        attach_redirect_delivery_breadcrumbs(r, params, before, remaining, gle, GetTickCount64() - start_ms);
+        attach_redirect_delivery_breadcrumbs(r, params, before, remaining, gle, wsa_error, GetTickCount64() - start_ms);
         diag::log_tagged_fmt("net_tools", "network_redirect_traffic add ok=%d rule_id=%u proto=%u match=%s:%u redirect=%s:%u exclude_pid=%u before=%zu after=%zu match_before=%llu match_after=%llu gle=%lu wsa=%d elapsed_ms=%llu",
             ok ? 1 : 0, rule_id, protocol, format_ip(match_addr, af).c_str(), match_port, format_ip(redirect_addr, af).c_str(), redirect_port,
             exclude_pid, before.size(), remaining.size(),
             static_cast<unsigned long long>(redirect_match_total(before)),
             static_cast<unsigned long long>(redirect_match_total(remaining)),
-            static_cast<unsigned long>(gle), WSAGetLastError(),
+            static_cast<unsigned long>(gle), wsa_error,
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
         if (!ok) {
             log_net_tools_failure("network_redirect_traffic_add", gle);
@@ -4133,6 +4233,7 @@ tool_result_t network_redirect_traffic(const json& params)
         json before_rule;
         bool ok = driver_bridge::traffic_redirect_op(1, rule_id);
         const DWORD gle = GetLastError();
+        const int wsa_error = WSAGetLastError();
         auto remaining = driver_bridge::list_redirect_rules();
         json r;
         r["operation"] = "remove";
@@ -4144,12 +4245,12 @@ tool_result_t network_redirect_traffic(const json& params)
         r["rule_visible_after_remove"] = redirect_find_rule(remaining, rule_id, after_rule);
         r["rule_after_remove"] = after_rule;
         add_driver_request_fields(r, ok, gle);
-        attach_redirect_delivery_breadcrumbs(r, params, before, remaining, gle, GetTickCount64() - start_ms);
+        attach_redirect_delivery_breadcrumbs(r, params, before, remaining, gle, wsa_error, GetTickCount64() - start_ms);
         diag::log_tagged_fmt("net_tools", "network_redirect_traffic remove ok=%d rule_id=%u before=%zu after=%zu match_before=%llu match_after=%llu gle=%lu wsa=%d elapsed_ms=%llu",
             ok ? 1 : 0, rule_id, before.size(), remaining.size(),
             static_cast<unsigned long long>(redirect_match_total(before)),
             static_cast<unsigned long long>(redirect_match_total(remaining)),
-            static_cast<unsigned long>(gle), WSAGetLastError(),
+            static_cast<unsigned long>(gle), wsa_error,
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
         if (!ok) {
             log_net_tools_failure("network_redirect_traffic_remove", gle);
@@ -4161,6 +4262,7 @@ tool_result_t network_redirect_traffic(const json& params)
         auto before = driver_bridge::list_redirect_rules();
         bool ok = driver_bridge::traffic_redirect_op(3);
         const DWORD gle = GetLastError();
+        const int wsa_error = WSAGetLastError();
         auto remaining = driver_bridge::list_redirect_rules();
         json r;
         r["operation"] = "clear";
@@ -4170,12 +4272,12 @@ tool_result_t network_redirect_traffic(const json& params)
         r["remaining_count"] = remaining.size();
         r["cleared"] = remaining.empty();
         add_driver_request_fields(r, ok, gle);
-        attach_redirect_delivery_breadcrumbs(r, params, before, remaining, gle, GetTickCount64() - start_ms);
+        attach_redirect_delivery_breadcrumbs(r, params, before, remaining, gle, wsa_error, GetTickCount64() - start_ms);
         diag::log_tagged_fmt("net_tools", "network_redirect_traffic clear ok=%d before=%zu after=%zu match_before=%llu match_after=%llu gle=%lu wsa=%d elapsed_ms=%llu",
             ok ? 1 : 0, before.size(), remaining.size(),
             static_cast<unsigned long long>(redirect_match_total(before)),
             static_cast<unsigned long long>(redirect_match_total(remaining)),
-            static_cast<unsigned long>(gle), WSAGetLastError(),
+            static_cast<unsigned long>(gle), wsa_error,
             static_cast<unsigned long long>(GetTickCount64() - start_ms));
         if (!ok) {
             log_net_tools_failure("network_redirect_traffic_clear", gle);
@@ -4216,6 +4318,7 @@ tool_result_t network_list_redirect_rules(const json&)
 
     auto rules = driver_bridge::list_redirect_rules();
     const DWORD gle = GetLastError();
+    const int wsa_error = WSAGetLastError();
     json out;
     out["rules"] = redirect_rules_to_json(rules);
     out["count"] = static_cast<std::uint64_t>(rules.size());
@@ -4224,12 +4327,12 @@ tool_result_t network_list_redirect_rules(const json&)
     out["pid_filter_fields_available"] = false;
     out["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64() - start_ms);
     add_driver_request_fields(out, true, gle);
-    out["wsa_error"] = WSAGetLastError();
+    out["wsa_error"] = wsa_error;
     diag::log_tagged_fmt("net_tools", "network_list_redirect_rules count=%zu match_total=%llu gle=%lu wsa=%d elapsed_ms=%llu",
         rules.size(),
         static_cast<unsigned long long>(redirect_match_total(rules)),
         static_cast<unsigned long>(gle),
-        WSAGetLastError(),
+        wsa_error,
         static_cast<unsigned long long>(GetTickCount64() - start_ms));
     return tool_result_t::ok(std::to_string(rules.size()) + OBFSTR(" traffic redirect rules"), out);
 }
@@ -5131,6 +5234,8 @@ tool_result_t api_monitor_start(const json& params)
     const int resolved_count = summary.contains("resolved") && summary["resolved"].is_array()
         ? static_cast<int>(summary["resolved"].size()) : 0;
     const json status_after_start = api_monitor::status_json();
+    const std::uint64_t verified_armed_breakpoints = status_after_start.value("armed_thread_breakpoints", 0ull);
+    const std::uint64_t start_event_queue_count = status_after_start.value("event_count", 0ull);
     summary["success"] = true;
     summary["requested_pid"] = pid;
     summary["requested_api_count"] = static_cast<uint64_t>(apis.size());
@@ -5140,12 +5245,16 @@ tool_result_t api_monitor_start(const json& params)
     summary["requested_max_capture_bytes"] = max_capture_bytes;
     summary["requested_max_events"] = static_cast<uint64_t>(max_events);
     summary["install_result"] = "started";
-    summary["hook_install_success"] = resolved_count > 0;
+    summary["hook_install_success"] = verified_armed_breakpoints > 0;
+    summary["hwbp_arming_verified"] = verified_armed_breakpoints > 0;
+    summary["verified_armed_thread_breakpoints"] = verified_armed_breakpoints;
     summary["hook_target_count"] = resolved_count;
     summary["resolved_count"] = resolved_count;
     if (summary.contains("resolved"))
         summary["hook_targets"] = summary["resolved"];
-    summary["event_queue_count"] = status_after_start.value("event_count", 0);
+    summary["event_queue_count"] = start_event_queue_count;
+    summary["capture_success"] = false;
+    summary["capture_event_count"] = start_event_queue_count;
     summary["total_hits"] = status_after_start.value("total_hits", 0ull);
     summary["trigger_attempts_required"] = true;
     summary["functional_proof"] = false;
@@ -6128,10 +6237,11 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                     return network_param_error(error, "max_records_per_drain");
                 const uint32_t max_records = static_cast<uint32_t>(std::min<uint64_t>(max_records_raw, 4096));
                 const bool capture_payloads = params.value("capture_payloads", true);
+                const uint32_t active_pid_before_install = driver_bridge::attached_pid();
                 diag::log_tagged_fmt("net_tools",
                     "network_pg_sniff install_begin pid=%u active_pid=%u address=0x%llX size=0x%llX capture_payloads=%d max_records=%u elapsed_ms=%llu",
                     pid,
-                    driver_bridge::attached_pid(),
+                    active_pid_before_install,
                     static_cast<unsigned long long>(address),
                     static_cast<unsigned long long>(size),
                     capture_payloads ? 1 : 0,
@@ -6149,13 +6259,47 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         }
                     }
                     if (already_attached) {
-                        driver_bridge::set_active_pid(pid);
+                        SetLastError(ERROR_SUCCESS);
+                        const bool active_ok = driver_bridge::set_active_pid(pid);
+                        const DWORD active_gle = active_ok ? ERROR_SUCCESS : GetLastError();
+                        diag::log_tagged_fmt("net_tools",
+                            "network_pg_sniff set_active_pre_install pid=%u active_before=%u ok=%d gle=%lu active_after=%u status=%s last_error=%s",
+                            pid,
+                            active_pid_before_install,
+                            active_ok ? 1 : 0,
+                            static_cast<unsigned long>(active_gle),
+                            driver_bridge::attached_pid(),
+                            driver_bridge::status().c_str(),
+                            driver_bridge::last_error().c_str());
+                        if (!active_ok) {
+                            SetLastError(ERROR_SUCCESS);
+                            const bool attach_ok = driver_bridge::attach(pid);
+                            const DWORD attach_gle = attach_ok ? ERROR_SUCCESS : GetLastError();
+                            diag::log_tagged_fmt("net_tools",
+                                "network_pg_sniff set_active_repair_attach pid=%u ok=%d gle=%lu active_after=%u status=%s last_error=%s",
+                                pid,
+                                attach_ok ? 1 : 0,
+                                static_cast<unsigned long>(attach_gle),
+                                driver_bridge::attached_pid(),
+                                driver_bridge::status().c_str(),
+                                driver_bridge::last_error().c_str());
+                        }
                     } else {
                         diag::log_tagged_fmt("net_tools",
                             "network_pg_sniff attach_pre_check pid=%u active_pid=%u action=explicit_attach",
                             pid,
                             driver_bridge::attached_pid());
-                        driver_bridge::attach(pid);
+                        SetLastError(ERROR_SUCCESS);
+                        const bool attach_ok = driver_bridge::attach(pid);
+                        const DWORD attach_gle = attach_ok ? ERROR_SUCCESS : GetLastError();
+                        diag::log_tagged_fmt("net_tools",
+                            "network_pg_sniff attach_pre_install pid=%u ok=%d gle=%lu active_after=%u status=%s last_error=%s",
+                            pid,
+                            attach_ok ? 1 : 0,
+                            static_cast<unsigned long>(attach_gle),
+                            driver_bridge::attached_pid(),
+                            driver_bridge::status().c_str(),
+                            driver_bridge::last_error().c_str());
                     }
                     if (driver_bridge::attached_pid() != pid) {
                         const uint64_t attach_wait_start = GetTickCount64();
@@ -6180,30 +6324,54 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                             static_cast<unsigned long long>(address),
                             static_cast<unsigned long long>(size));
                         json d{{"pid", pid}, {"address", hex_u64(address)}, {"size", size},
+                               {"active_pid_before_install", active_pid_before_install},
                                {"driver_attached_pid", driver_bridge::attached_pid()},
+                               {"driver_status", driver_bridge::status()},
+                               {"driver_last_error", driver_bridge::last_error()},
                                {"failure", "driver not attached to requested PID before page-guard install"}};
                         add_page_guard_prerequisites(d, "whoswho_driver_page_guard");
                         return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.", "page_guard_attach_failed", d);
                     }
                 }
+                const uint32_t active_pid_after_attach = driver_bridge::attached_pid();
+                const std::string driver_status_before_install = driver_bridge::status();
+                const std::string driver_last_error_before_install = driver_bridge::last_error();
                 const uint32_t sid = page_guard_engine::g_pg_engine.install(pid, address, size, capture_payloads, max_records, true);
                 diag::log_tagged_fmt("net_tools",
-                    "network_pg_sniff install_return sid=%u pid=%u active_pid=%u address=0x%llX size=0x%llX elapsed_ms=%llu",
+                    "network_pg_sniff install_return sid=%u pid=%u active_pid_before=%u active_pid_after_attach=%u active_pid_after=%u address=0x%llX size=0x%llX elapsed_ms=%llu status_before=%s last_error_before=%s",
                     sid,
                     pid,
+                    active_pid_before_install,
+                    active_pid_after_attach,
                     driver_bridge::attached_pid(),
                     static_cast<unsigned long long>(address),
                     static_cast<unsigned long long>(size),
-                    static_cast<unsigned long long>(GetTickCount64() - op_started));
+                    static_cast<unsigned long long>(GetTickCount64() - op_started),
+                    driver_status_before_install.c_str(),
+                    driver_last_error_before_install.c_str());
                 if (sid == 0) {
                     json failure = page_guard_install_failure_payload();
-                    json d{{"pid", pid}, {"address", hex_u64(address)}, {"size", size}, {"capture_payloads", capture_payloads}, {"failure", failure}};
+                    json d{{"pid", pid},
+                           {"requested_pid", pid},
+                           {"address", hex_u64(address)},
+                           {"size", size},
+                           {"capture_payloads", capture_payloads},
+                           {"active_pid_before_install", active_pid_before_install},
+                           {"active_pid_after_attach", active_pid_after_attach},
+                           {"active_pid_after_install", driver_bridge::attached_pid()},
+                           {"driver_status_before_install", driver_status_before_install},
+                           {"driver_last_error_before_install", driver_last_error_before_install},
+                           {"driver_status_after_install", driver_bridge::status()},
+                           {"driver_last_error_after_install", driver_bridge::last_error()},
+                           {"failure", failure}};
                     add_page_guard_prerequisites(d, "whoswho_driver_page_guard");
                     diag::log_tagged_fmt("net_tools",
-                        "network_pg_sniff install_failed pid=%u address=0x%llX size=0x%llX active=%u reason=%s remote_call_id=%llu remote_gle=%lu stale_pid=%d deadline_expired=%d cancelled=%d late_completion=%d error=%s",
+                        "network_pg_sniff install_failed pid=%u address=0x%llX size=0x%llX active_before=%u active_after_attach=%u active_after=%u reason=%s remote_call_id=%llu remote_gle=%lu stale_pid=%d deadline_expired=%d cancelled=%d late_completion=%d lower_phase=%s lower_reason=%s lower_gle=%lu worker_tid=%u queue_submit=%u queue_start=%u queue_after=%u inflight_submit=%u inflight_start=%u inflight_after=%u quarantined=%d quarantine_cleanup=%d error=%s",
                         pid,
                         static_cast<unsigned long long>(address),
                         static_cast<unsigned long long>(size),
+                        active_pid_before_install,
+                        active_pid_after_attach,
                         driver_bridge::attached_pid(),
                         failure.value("reason", std::string()).c_str(),
                         static_cast<unsigned long long>(failure.value("remote_call_id", 0ull)),
@@ -6212,6 +6380,18 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                         failure.value("remote_call_deadline_expired_after", false) ? 1 : 0,
                         failure.value("remote_call_cancelled_after", false) ? 1 : 0,
                         failure.value("remote_call_late_completion", false) ? 1 : 0,
+                        failure.value("remote_call_lower_phase", std::string()).c_str(),
+                        failure.value("remote_call_lower_completion_reason", std::string()).c_str(),
+                        static_cast<unsigned long>(failure.value("remote_call_lower_gle", 0u)),
+                        failure.value("remote_call_lower_worker_tid", 0u),
+                        failure.value("remote_call_lower_queue_depth_at_submit", 0u),
+                        failure.value("remote_call_lower_queue_depth_at_start", 0u),
+                        failure.value("remote_call_lower_queue_depth_after_pop", 0u),
+                        failure.value("remote_call_lower_inflight_at_submit", 0u),
+                        failure.value("remote_call_lower_inflight_at_start", 0u),
+                        failure.value("remote_call_lower_inflight_after", 0u),
+                        failure.value("quarantined", false) ? 1 : 0,
+                        failure.value("quarantine_cleanup_attempted", false) ? 1 : 0,
                         driver_bridge::last_error().c_str());
                     return tool_result_t::error("Failed to install WhosWho driver-backed PAGE_GUARD capture session.", "page_guard_install_failed", d);
                 }

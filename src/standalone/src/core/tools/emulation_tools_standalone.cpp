@@ -65,6 +65,41 @@ static json emulation_region_evidence(std::uint64_t addr)
                 {"type", sa_format_address(region.type)}};
 }
 
+static json handler_module_evidence(std::uint64_t addr, bool kernel_mode)
+{
+    if (addr == 0)
+        return json{{"resolved", false}, {"reason", "zero_address"}};
+    if (kernel_mode)
+        return json{{"resolved", false}, {"reason", "kernel_module_attribution_not_available_here"}};
+    const auto modules = driver_bridge::enumerate_modules();
+    for (const auto& module : modules)
+    {
+        const std::uint64_t base = module.base;
+        const std::uint64_t size = module.size;
+        const std::uint64_t end = base + size;
+        if (base == 0 || size == 0 || end <= base || addr < base || addr >= end)
+            continue;
+        const std::uint64_t rva = addr - base;
+        return json{{"resolved", true},
+                    {"name", module.name},
+                    {"path", module.path},
+                    {"base", sa_format_address(base)},
+                    {"size", size},
+                    {"rva", sa_format_address(rva)}};
+    }
+    return json{{"resolved", false},
+                {"reason", "module_not_found"},
+                {"modules_scanned", modules.size()},
+                {"status", driver_bridge::status()},
+                {"last_error", driver_bridge::last_error()}};
+}
+
+static void append_confidence_feature(json& features, json& reasons, const std::string& name, double weight, const std::string& evidence)
+{
+    features.push_back(json{{"name", name}, {"weight", weight}, {"evidence", evidence}});
+    reasons.push_back(name + ": " + evidence);
+}
+
 static void map_additional_regions(
     emulation::process_snapshot_t& snapshot,
     const json& params,
@@ -628,10 +663,38 @@ tool_result_t analyze_vm_handler(const json& params)
     std::uint32_t max_insns = params.value("max_instructions", 100000);
     if (max_insns > 500000) max_insns = 500000;
 
+    const json handler_region = emulation_region_evidence(*addr);
+    const json module_evidence = handler_module_evidence(*addr, kernel_mode);
+
     auto code = emulation::driver_read_bytes(*addr, handler_size);
     if (code.empty())
+    {
+        json failure;
+        failure["handler_address"] = sa_format_address(*addr);
+        failure["handler_size"] = handler_size;
+        failure["kernel_mode"] = kernel_mode;
+        failure["handler_region"] = handler_region;
+        failure["module"] = module_evidence;
+        failure["partial"] = true;
+        failure["analysis_status"] = {
+            {"complete", false},
+            {"partial", true},
+            {"failure_reason", "handler_bytes_read_failed"},
+            {"missing_fields", json::array({"handler_bytes", "decoded_instruction_count", "confidence"})},
+            {"driver_status", driver_bridge::status()},
+            {"driver_last_error", driver_bridge::last_error()}
+        };
+        diag::log_tagged_fmt("emul_tools", "analyze_vm_handler read_failed addr=0x%llX size=%u kernel=%d region=%s module=%s status='%s' last_error='%s'",
+            static_cast<unsigned long long>(*addr),
+            handler_size,
+            (int)kernel_mode,
+            handler_region.dump().c_str(),
+            module_evidence.dump().c_str(),
+            driver_bridge::status().c_str(),
+            driver_bridge::last_error().c_str());
         return tool_result_t::error(OBFSTR("Failed to read handler bytes at ") +
-                                    sa_format_address(*addr));
+                                    sa_format_address(*addr), failure);
+    }
 
     auto disasm = emulation::disassemble_range(code.data(), code.size(), *addr, 10000);
 
@@ -681,13 +744,13 @@ tool_result_t analyze_vm_handler(const json& params)
     config.analyze_effective_ops = true;
     config.timeout_us            = params.value("timeout_us", 15000000);
 
-    const json handler_region = emulation_region_evidence(*addr);
-    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler emulating addr=0x%llx size=%u kernel=%d code_bytes=%zu decoded=%u snapshot_regions=%zu region=%s status='%s' last_error='%s'",
+    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler emulating addr=0x%llx size=%u kernel=%d code_bytes=%zu decoded=%u snapshot_regions=%zu region=%s module=%s status='%s' last_error='%s'",
         static_cast<unsigned long long>(*addr), handler_size, (int)kernel_mode,
         code.size(),
         total_insns,
         snapshot.regions.size(),
         handler_region.dump().c_str(),
+        module_evidence.dump().c_str(),
         driver_bridge::status().c_str(),
         driver_bridge::last_error().c_str());
     aida::diagnostic_exception_scope::scope_t exception_scope("mcp.analyze_vm_handler");
@@ -707,6 +770,31 @@ tool_result_t analyze_vm_handler(const json& params)
     out["handler_address"]   = sa_format_address(*addr);
     out["handler_size"]      = handler_size;
     out["kernel_mode"]       = kernel_mode;
+    out["decoded_instruction_count"] = total_insns;
+    out["handler_region"] = handler_region;
+    out["module"] = module_evidence;
+    out["handler_location"] = {
+        {"address", sa_format_address(*addr)},
+        {"kernel_mode", kernel_mode},
+        {"memory_region", handler_region},
+        {"module", module_evidence}
+    };
+    if (module_evidence.value("resolved", false))
+    {
+        out["handler_module"] = module_evidence.value("name", std::string());
+        out["handler_module_path"] = module_evidence.value("path", std::string());
+        out["handler_module_base"] = module_evidence.value("base", std::string());
+        out["handler_module_size"] = module_evidence.value("size", 0u);
+        out["handler_rva"] = module_evidence.value("rva", std::string());
+    }
+    else
+    {
+        out["handler_module"] = nullptr;
+        out["handler_module_path"] = nullptr;
+        out["handler_module_base"] = nullptr;
+        out["handler_module_size"] = nullptr;
+        out["handler_rva"] = nullptr;
+    }
 
     json static_info;
     static_info["total_decoded"]     = total_insns;
@@ -764,9 +852,13 @@ tool_result_t analyze_vm_handler(const json& params)
         out["emulation_error"] = emu_result.error;
     }
 
-    double junk_ratio = emu_result.success && emu_result.total_instructions > 0
+    const double junk_ratio = emu_result.success && emu_result.total_instructions > 0
         ? static_cast<double>(emu_result.junk_instruction_count) / emu_result.total_instructions
         : 0.0;
+    const double nop_ratio = total_insns > 0 ? static_cast<double>(nop_count) / total_insns : 0.0;
+    const double branch_ratio = total_insns > 0 ? static_cast<double>(branch_count) / total_insns : 0.0;
+    const double call_ratio = total_insns > 0 ? static_cast<double>(call_count) / total_insns : 0.0;
+    const double privileged_ratio = total_insns > 0 ? static_cast<double>(privileged_count) / total_insns : 0.0;
 
     std::string classification;
     if (junk_ratio > 0.8)
@@ -779,10 +871,114 @@ tool_result_t analyze_vm_handler(const json& params)
         classification = "normal";
 
     out["classification"] = classification;
+    out["handler_classification"] = classification;
+    out["classification_basis"] = emu_result.success ? "static_decode_and_emulation" : "static_decode_only";
 
-    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler ok classification='%s' junk_ratio=%.2f",
-        classification.c_str(), emu_result.success && emu_result.total_instructions > 0
-            ? static_cast<double>(emu_result.junk_instruction_count) / emu_result.total_instructions : 0.0);
+    constexpr double confidence_threshold = 0.50;
+    double confidence = 0.0;
+    json confidence_features = json::array();
+    json confidence_reasons = json::array();
+    json missing_fields = json::array();
+    json partial_reasons = json::array();
+
+    auto add_feature = [&](const std::string& name, double weight, const std::string& evidence) {
+        confidence += weight;
+        append_confidence_feature(confidence_features, confidence_reasons, name, weight, evidence);
+    };
+    auto add_missing = [&](const std::string& field, const std::string& reason) {
+        missing_fields.push_back(field);
+        partial_reasons.push_back(reason);
+    };
+
+    if (total_insns > 0)
+        add_feature("decoded_instruction_count", total_insns >= 8 ? 0.20 : 0.12, std::to_string(total_insns) + " instructions decoded");
+    else
+        add_missing("decoded_instruction_count", "no instructions decoded from handler bytes");
+
+    if (!code.empty())
+        add_feature("handler_bytes_read", 0.10, std::to_string(static_cast<unsigned long long>(code.size())) + " bytes read from live memory");
+    else
+        add_missing("handler_bytes", "handler bytes were not read");
+
+    if (module_evidence.value("resolved", false))
+        add_feature("handler_module", 0.10, module_evidence.value("name", std::string()) + " rva " + module_evidence.value("rva", std::string()));
+    else
+        add_missing("handler_module", module_evidence.value("reason", std::string("module attribution unavailable")));
+
+    if (emu_result.success && emu_result.total_instructions > 0)
+        add_feature("emulation_total_executed", 0.25, std::to_string(emu_result.total_instructions) + " instructions executed");
+    else
+        add_missing("emulation_analysis.total_executed", emu_result.error.empty() ? "emulation produced no executed-instruction evidence" : emu_result.error);
+
+    if (!emu_result.trace.empty())
+        add_feature("emulation_trace", 0.08, std::to_string(static_cast<unsigned long long>(emu_result.trace.size())) + " trace entries captured");
+    else
+        add_missing("emulation_trace", emu_result.success ? "emulation completed without trace entries" : "trace unavailable because emulation failed");
+
+    if (classification == "heavily_virtualized")
+        add_feature("junk_ratio", 0.16, "junk_ratio=" + std::to_string(junk_ratio));
+    else if (classification == "moderately_obfuscated")
+        add_feature("junk_ratio", 0.13, "junk_ratio=" + std::to_string(junk_ratio));
+    else if (classification == "junk_padded")
+        add_feature("nop_ratio", 0.12, "nop_ratio=" + std::to_string(nop_ratio));
+    else if (emu_result.success && total_insns > 0)
+        add_feature("low_obfuscation_indicators", 0.12, "junk_ratio=" + std::to_string(junk_ratio) + " nop_ratio=" + std::to_string(nop_ratio));
+
+    if (branch_count > 0)
+        add_feature("branch_count", std::min(0.06, 0.02 + branch_ratio), std::to_string(branch_count) + " branches decoded");
+    if (call_count > 0)
+        add_feature("call_count", std::min(0.04, 0.015 + call_ratio), std::to_string(call_count) + " calls decoded");
+    if (privileged_count > 0)
+        add_feature("privileged_count", std::min(0.04, 0.015 + privileged_ratio), std::to_string(privileged_count) + " privileged instructions decoded");
+    if (!emu_result.reg_deltas.empty())
+        add_feature("register_deltas", 0.04, std::to_string(static_cast<unsigned long long>(emu_result.reg_deltas.size())) + " register deltas");
+    if (!emu_result.mem_writes.empty())
+        add_feature("memory_writes", 0.04, std::to_string(static_cast<unsigned long long>(emu_result.mem_writes.size())) + " memory writes");
+
+    confidence = std::clamp(confidence, 0.0, 0.99);
+    if (confidence < confidence_threshold)
+        partial_reasons.push_back("confidence_below_threshold");
+
+    const bool partial = !partial_reasons.empty();
+    json failure_reason = nullptr;
+    if (!emu_result.success)
+        failure_reason = emu_result.error.empty() ? "emulation_failed_without_error" : emu_result.error;
+    out["confidence"] = confidence;
+    out["confidence_score"] = confidence;
+    out["confidence_threshold"] = confidence_threshold;
+    out["threshold"] = confidence_threshold;
+    out["confidence_pass"] = confidence >= confidence_threshold;
+    out["confidence_features"] = std::move(confidence_features);
+    out["confidence_reasons"] = std::move(confidence_reasons);
+    out["partial"] = partial;
+    out["missing_fields"] = missing_fields;
+    out["analysis_status"] = {
+        {"complete", !partial},
+        {"partial", partial},
+        {"failure_reason", failure_reason},
+        {"partial_reasons", partial_reasons},
+        {"missing_fields", missing_fields},
+        {"confidence", confidence},
+        {"confidence_threshold", confidence_threshold},
+        {"confidence_below_threshold", confidence < confidence_threshold}
+    };
+    if (partial)
+        out["partial_reason"] = partial_reasons.empty() ? "partial_evidence" : partial_reasons.front().get<std::string>();
+    else
+        out["partial_reason"] = nullptr;
+
+    diag::log_tagged_fmt("emul_tools", "analyze_vm_handler ok classification='%s' confidence=%.3f threshold=%.2f partial=%d decoded=%u total_executed=%u module_resolved=%d junk_ratio=%.3f nop_ratio=%.3f missing=%s reasons=%s",
+        classification.c_str(),
+        confidence,
+        confidence_threshold,
+        partial ? 1 : 0,
+        total_insns,
+        emu_result.total_instructions,
+        module_evidence.value("resolved", false) ? 1 : 0,
+        junk_ratio,
+        nop_ratio,
+        missing_fields.dump().c_str(),
+        out["confidence_reasons"].dump().c_str());
     return tool_result_t::ok(
         OBFSTR("VM handler analysis at ") + sa_format_address(*addr) +
         OBFSTR(": ") + classification +
@@ -1091,7 +1287,8 @@ void register_emulation_tools(mcp_standalone::server_t& srv)
                "Step 2: Emulate the same bytes offline in Unicorn to separate junk from effective operations. "
                "Produces: static instruction counts (nop/branch/call/privileged ratios), "
                "emulation results (register deltas, memory writes, effective ops), "
-               "and an overall classification (heavily_virtualized / moderately_obfuscated / junk_padded / normal). "
+               "handler VA/RVA/module attribution, classification, confidence score, confidence features, threshold, "
+               "and structured partial evidence when required proof is missing. "
                "Use additional_regions to map extra sections for cross-section jumps."),
         {{OBFSTR("address"), OBFSTR("string"), OBFSTR("VM handler entry point address (user-mode or kernel-mode)"), true},
          {OBFSTR("size"), OBFSTR("number"), OBFSTR("Handler size in bytes to read (default 8192)"), false},

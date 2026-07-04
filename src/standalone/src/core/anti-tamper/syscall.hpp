@@ -2,18 +2,25 @@
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <softpub.h>
+#include <wincrypt.h>
+#include <wintrust.h>
 #include <intrin.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <mutex>
+#include <vector>
 
 #include "key_pipeline.hpp"
 #include "webhook.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "wintrust.lib")
 
 namespace anti_tamper {
 namespace syscall {
@@ -834,6 +841,433 @@ namespace detail {
         out[48] = '\0';
     }
 
+    inline uint64_t fnv1a_bytes(const void* data, size_t len)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        const auto* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; ++i)
+        {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    inline void bytes_to_hex(const uint8_t* bytes, size_t len, char* out, size_t out_count)
+    {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        if (!out || out_count == 0) return;
+        out[0] = '\0';
+        if (!bytes || out_count < len * 2 + 1) return;
+        for (size_t i = 0; i < len; ++i)
+        {
+            out[i * 2] = kHex[bytes[i] >> 4];
+            out[i * 2 + 1] = kHex[bytes[i] & 0x0F];
+        }
+        out[len * 2] = '\0';
+    }
+
+    inline bool sha256_hex_bytes(const uint8_t* data, size_t len, char out[65], DWORD& gle)
+    {
+        out[0] = '\0';
+        gle = ERROR_SUCCESS;
+        if (!data && len != 0) {
+            gle = ERROR_INVALID_ADDRESS;
+            return false;
+        }
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        if (st != 0) {
+            gle = static_cast<DWORD>(st);
+            return false;
+        }
+        DWORD object_len = 0;
+        DWORD cb = 0;
+        st = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
+                               reinterpret_cast<PUCHAR>(&object_len),
+                               sizeof(object_len), &cb, 0);
+        if (st != 0 || object_len == 0) {
+            gle = st != 0 ? static_cast<DWORD>(st) : ERROR_INVALID_DATA;
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return false;
+        }
+        std::vector<UCHAR> object(object_len);
+        st = BCryptCreateHash(alg, &hash, object.data(), object_len, nullptr, 0, 0);
+        if (st == 0 && data && len != 0)
+            st = BCryptHashData(hash, const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(data)), static_cast<ULONG>(len), 0);
+        uint8_t digest[32]{};
+        if (st == 0)
+            st = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+        if (hash)
+            BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        if (st != 0) {
+            gle = static_cast<DWORD>(st);
+            return false;
+        }
+        bytes_to_hex(digest, sizeof(digest), out, 65);
+        return true;
+    }
+
+    inline bool sha256_hex_memory16(const uint8_t* data, char out[65], DWORD& gle)
+    {
+        uint8_t local[16]{};
+        __try
+        {
+            memcpy(local, data, sizeof(local));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            out[0] = '\0';
+            gle = GetExceptionCode();
+            return false;
+        }
+        return sha256_hex_bytes(local, sizeof(local), out, gle);
+    }
+
+    inline bool sha256_hex_file(HANDLE hFile, char out[65], DWORD& gle)
+    {
+        out[0] = '\0';
+        gle = ERROR_SUCCESS;
+        if (hFile == INVALID_HANDLE_VALUE || !hFile) {
+            gle = ERROR_INVALID_HANDLE;
+            return false;
+        }
+        LARGE_INTEGER zero{};
+        if (!SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN)) {
+            gle = GetLastError();
+            return false;
+        }
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        NTSTATUS st = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        if (st != 0) {
+            gle = static_cast<DWORD>(st);
+            return false;
+        }
+        DWORD object_len = 0;
+        DWORD cb = 0;
+        st = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH,
+                               reinterpret_cast<PUCHAR>(&object_len),
+                               sizeof(object_len), &cb, 0);
+        if (st != 0 || object_len == 0) {
+            gle = st != 0 ? static_cast<DWORD>(st) : ERROR_INVALID_DATA;
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return false;
+        }
+        std::vector<UCHAR> object(object_len);
+        st = BCryptCreateHash(alg, &hash, object.data(), object_len, nullptr, 0, 0);
+        std::vector<uint8_t> buf(64 * 1024);
+        while (st == 0)
+        {
+            DWORD read = 0;
+            if (!ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &read, nullptr)) {
+                gle = GetLastError();
+                st = static_cast<NTSTATUS>(0xC0000001L);
+                break;
+            }
+            if (read == 0)
+                break;
+            st = BCryptHashData(hash, buf.data(), read, 0);
+        }
+        uint8_t digest[32]{};
+        if (st == 0)
+            st = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+        if (hash)
+            BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        SetFilePointerEx(hFile, zero, nullptr, FILE_BEGIN);
+        if (st != 0) {
+            if (gle == ERROR_SUCCESS)
+                gle = static_cast<DWORD>(st);
+            return false;
+        }
+        bytes_to_hex(digest, sizeof(digest), out, 65);
+        return true;
+    }
+
+    struct image_identity_t
+    {
+        bool opened = false;
+        bool basic_ok = false;
+        bool file_id_ok = false;
+        bool hash_ok = false;
+        bool trust_checked = false;
+        bool trust_ok = false;
+        bool signer_checked = false;
+        bool signer_ok = false;
+        DWORD open_error = ERROR_SUCCESS;
+        DWORD basic_error = ERROR_SUCCESS;
+        DWORD file_id_error = ERROR_SUCCESS;
+        DWORD hash_error = ERROR_SUCCESS;
+        DWORD signer_error = ERROR_SUCCESS;
+        LONG trust_status = 0;
+        DWORD volume_serial = 0;
+        DWORD file_index_high = 0;
+        DWORD file_index_low = 0;
+        ULONGLONG file_size = 0;
+        ULONGLONG last_write_ft = 0;
+        uint64_t file_id_hash = 0;
+        uint64_t signer_subject_hash = 0;
+        uint64_t signer_issuer_hash = 0;
+        char file_sha256[65]{};
+        char signer_subject[192]{};
+        char signer_issuer[192]{};
+    };
+
+    inline void collect_signer_identity(const wchar_t* path, image_identity_t& id)
+    {
+        id.signer_checked = true;
+        HCERTSTORE store = nullptr;
+        HCRYPTMSG msg = nullptr;
+        DWORD encoding = 0;
+        DWORD content_type = 0;
+        DWORD format_type = 0;
+        if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, path,
+                              CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                              CERT_QUERY_FORMAT_FLAG_BINARY, 0,
+                              &encoding, &content_type, &format_type,
+                              &store, &msg, nullptr)) {
+            id.signer_error = GetLastError();
+            return;
+        }
+        DWORD signer_size = 0;
+        if (!CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signer_size) || signer_size == 0) {
+            id.signer_error = GetLastError();
+            if (msg) CryptMsgClose(msg);
+            if (store) CertCloseStore(store, 0);
+            return;
+        }
+        std::vector<uint8_t> signer_buf(signer_size);
+        if (!CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, signer_buf.data(), &signer_size)) {
+            id.signer_error = GetLastError();
+            if (msg) CryptMsgClose(msg);
+            if (store) CertCloseStore(store, 0);
+            return;
+        }
+        auto* signer_info = reinterpret_cast<PCMSG_SIGNER_INFO>(signer_buf.data());
+        CERT_INFO cert_info{};
+        cert_info.Issuer = signer_info->Issuer;
+        cert_info.SerialNumber = signer_info->SerialNumber;
+        PCCERT_CONTEXT cert = CertFindCertificateInStore(store,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_CERT, &cert_info, nullptr);
+        if (!cert) {
+            id.signer_error = GetLastError();
+            if (msg) CryptMsgClose(msg);
+            if (store) CertCloseStore(store, 0);
+            return;
+        }
+        wchar_t subject_w[256]{};
+        wchar_t issuer_w[256]{};
+        DWORD subject_len = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, subject_w, 256);
+        DWORD issuer_len = CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG, nullptr, issuer_w, 256);
+        if (subject_len > 1) {
+            narrow_path(subject_w, id.signer_subject, sizeof(id.signer_subject));
+            id.signer_subject_hash = fnv1a_bytes(subject_w, (subject_len - 1) * sizeof(wchar_t));
+        }
+        if (issuer_len > 1) {
+            narrow_path(issuer_w, id.signer_issuer, sizeof(id.signer_issuer));
+            id.signer_issuer_hash = fnv1a_bytes(issuer_w, (issuer_len - 1) * sizeof(wchar_t));
+        }
+        id.signer_ok = subject_len > 1;
+        id.signer_error = id.signer_ok ? ERROR_SUCCESS : ERROR_NOT_FOUND;
+        CertFreeCertificateContext(cert);
+        if (msg) CryptMsgClose(msg);
+        if (store) CertCloseStore(store, 0);
+    }
+
+    inline LONG verify_file_trust_status(const wchar_t* path, bool& checked)
+    {
+        checked = false;
+        if (!path || !*path)
+            return static_cast<LONG>(ERROR_PATH_NOT_FOUND);
+        WINTRUST_FILE_INFO file_info{};
+        file_info.cbStruct = sizeof(file_info);
+        file_info.pcwszFilePath = path;
+        GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        WINTRUST_DATA data{};
+        data.cbStruct = sizeof(data);
+        data.dwUIChoice = WTD_UI_NONE;
+        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        data.dwUnionChoice = WTD_CHOICE_FILE;
+        data.pFile = &file_info;
+        data.dwStateAction = WTD_STATEACTION_VERIFY;
+        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+        checked = true;
+        LONG status = WinVerifyTrust(nullptr, &action, &data);
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(nullptr, &action, &data);
+        return status;
+    }
+
+    inline image_identity_t collect_image_identity(const wchar_t* path)
+    {
+        image_identity_t id{};
+        if (!path || !*path) {
+            id.open_error = ERROR_PATH_NOT_FOUND;
+            return id;
+        }
+        HANDLE h = CreateFileW(path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                               nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            id.open_error = GetLastError();
+        } else {
+            id.opened = true;
+            BY_HANDLE_FILE_INFORMATION basic{};
+            if (GetFileInformationByHandle(h, &basic)) {
+                id.basic_ok = true;
+                id.volume_serial = basic.dwVolumeSerialNumber;
+                id.file_index_high = basic.nFileIndexHigh;
+                id.file_index_low = basic.nFileIndexLow;
+                id.file_size = (static_cast<ULONGLONG>(basic.nFileSizeHigh) << 32) | basic.nFileSizeLow;
+                id.last_write_ft = (static_cast<ULONGLONG>(basic.ftLastWriteTime.dwHighDateTime) << 32) |
+                    basic.ftLastWriteTime.dwLowDateTime;
+            } else {
+                id.basic_error = GetLastError();
+            }
+            FILE_ID_INFO file_id{};
+            if (GetFileInformationByHandleEx(h, FileIdInfo, &file_id, sizeof(file_id))) {
+                id.file_id_ok = true;
+                id.file_id_hash = fnv1a_bytes(&file_id, sizeof(file_id));
+            } else {
+                id.file_id_error = GetLastError();
+                if (id.basic_ok) {
+                    uint64_t fallback[3] = {
+                        id.volume_serial,
+                        (static_cast<uint64_t>(id.file_index_high) << 32) | id.file_index_low,
+                        id.file_size
+                    };
+                    id.file_id_hash = fnv1a_bytes(fallback, sizeof(fallback));
+                }
+            }
+            id.hash_ok = sha256_hex_file(h, id.file_sha256, id.hash_error);
+            CloseHandle(h);
+        }
+        id.trust_status = verify_file_trust_status(path, id.trust_checked);
+        id.trust_ok = id.trust_checked && id.trust_status == ERROR_SUCCESS;
+        collect_signer_identity(path, id);
+        return id;
+    }
+
+    inline bool basename_equals_i(const wchar_t* path, const wchar_t* expected)
+    {
+        if (!path || !expected || !*path || !*expected)
+            return false;
+        const wchar_t* name = wcsrchr(path, L'\\');
+        const wchar_t* slash = wcsrchr(path, L'/');
+        if (slash && (!name || slash > name))
+            name = slash;
+        name = name ? name + 1 : path;
+        return CompareStringOrdinal(name, -1, expected, -1, TRUE) == CSTR_EQUAL;
+    }
+
+    inline void log_nt_export_wrapper_diag(
+        const char* tag,
+        const char* marker,
+        const char* func_name,
+        const uint8_t* wrapper_bytes,
+        const uint8_t* disk_bytes,
+        uint64_t mem_va,
+        uint64_t mem_rva,
+        uint64_t disk_rva,
+        SIZE_T vq,
+        const MEMORY_BASIC_INFORMATION& mbi,
+        bool mem_writable,
+        bool mem_redirect,
+        bool disk_redirect,
+        bool mem_syscall,
+        bool disk_syscall,
+        bool is_nt_export,
+        BOOL owner_ok,
+        uint64_t owner_base,
+        uint32_t owner_size,
+        uint64_t owner_rva,
+        bool owner_system,
+        const wchar_t* owner_path_w,
+        const char* owner_path,
+        bool allow)
+    {
+        char wrapper_hash[65]{};
+        char disk_hash[65]{};
+        DWORD wrapper_hash_error = ERROR_SUCCESS;
+        DWORD disk_hash_error = ERROR_SUCCESS;
+        const bool wrapper_hash_ok = sha256_hex_memory16(wrapper_bytes, wrapper_hash, wrapper_hash_error);
+        const bool disk_hash_ok = sha256_hex_memory16(disk_bytes, disk_hash, disk_hash_error);
+        image_identity_t image = collect_image_identity(owner_path_w);
+        const bool committed = vq != 0 && mbi.State == MEM_COMMIT;
+        const bool image_type = vq != 0 && mbi.Type == MEM_IMAGE;
+        const bool non_writable = vq != 0 && !mem_writable;
+        const bool non_redirecting = !mem_redirect;
+        const bool apphelp_exact = owner_system && basename_equals_i(owner_path_w, L"apphelp.dll");
+        webhook::write_log_critical_fmt(tag ? tag : "runtime_integrity",
+            "%s func=%s allow=%d criteria_nt_export=%d criteria_disk_syscall=%d criteria_committed=%d criteria_mem_image=%d criteria_non_writable=%d criteria_non_redirecting=%d criteria_owner_ok=%d criteria_owner_system=%d apphelp_exact=%d mem_va=0x%llX mem_rva=0x%llX disk_rva=0x%llX owner_base=0x%llX owner_size=0x%lX owner_rva=0x%llX vq=%llu protect=0x%lX state=0x%lX type=0x%lX type_name=%s mem_writable=%d mem_redirect=%d disk_redirect=%d mem_syscall=%d disk_syscall=%d wrapper_hash_ok=%d wrapper_sha256=%s wrapper_hash_error=0x%08lX disk_hash_ok=%d disk_sha256=%s disk_hash_error=0x%08lX image_open=%d image_open_error=%lu image_basic=%d image_basic_error=%lu image_volume=0x%08lX image_index=0x%08lX%08lX image_size=%llu image_last_write=0x%016llX image_file_id_ok=%d image_file_id_error=%lu image_file_id_hash=0x%016llX image_hash_ok=%d image_hash_error=%lu image_sha256=%s signer_checked=%d signer_ok=%d signer_error=%lu signer_subject_hash=0x%016llX signer_issuer_hash=0x%016llX signer_subject='%.120s' signer_issuer='%.120s' trust_checked=%d trust_ok=%d trust_status=0x%08lX owner_path=%s",
+            marker ? marker : "nt_export_wrapper_diag",
+            func_name ? func_name : "?",
+            allow ? 1 : 0,
+            is_nt_export ? 1 : 0,
+            disk_syscall ? 1 : 0,
+            committed ? 1 : 0,
+            image_type ? 1 : 0,
+            non_writable ? 1 : 0,
+            non_redirecting ? 1 : 0,
+            owner_ok ? 1 : 0,
+            owner_system ? 1 : 0,
+            apphelp_exact ? 1 : 0,
+            static_cast<unsigned long long>(mem_va),
+            static_cast<unsigned long long>(mem_rva),
+            static_cast<unsigned long long>(disk_rva),
+            static_cast<unsigned long long>(owner_base),
+            static_cast<unsigned long>(owner_size),
+            static_cast<unsigned long long>(owner_rva),
+            static_cast<unsigned long long>(vq),
+            vq ? static_cast<unsigned long>(mbi.Protect) : 0ul,
+            vq ? static_cast<unsigned long>(mbi.State) : 0ul,
+            vq ? static_cast<unsigned long>(mbi.Type) : 0ul,
+            vq ? memory_type_name(mbi.Type) : "none",
+            mem_writable ? 1 : 0,
+            mem_redirect ? 1 : 0,
+            disk_redirect ? 1 : 0,
+            mem_syscall ? 1 : 0,
+            disk_syscall ? 1 : 0,
+            wrapper_hash_ok ? 1 : 0,
+            wrapper_hash_ok ? wrapper_hash : "<none>",
+            static_cast<unsigned long>(wrapper_hash_error),
+            disk_hash_ok ? 1 : 0,
+            disk_hash_ok ? disk_hash : "<none>",
+            static_cast<unsigned long>(disk_hash_error),
+            image.opened ? 1 : 0,
+            static_cast<unsigned long>(image.open_error),
+            image.basic_ok ? 1 : 0,
+            static_cast<unsigned long>(image.basic_error),
+            static_cast<unsigned long>(image.volume_serial),
+            static_cast<unsigned long>(image.file_index_high),
+            static_cast<unsigned long>(image.file_index_low),
+            static_cast<unsigned long long>(image.file_size),
+            static_cast<unsigned long long>(image.last_write_ft),
+            image.file_id_ok ? 1 : 0,
+            static_cast<unsigned long>(image.file_id_error),
+            static_cast<unsigned long long>(image.file_id_hash),
+            image.hash_ok ? 1 : 0,
+            static_cast<unsigned long>(image.hash_error),
+            image.hash_ok ? image.file_sha256 : "<none>",
+            image.signer_checked ? 1 : 0,
+            image.signer_ok ? 1 : 0,
+            static_cast<unsigned long>(image.signer_error),
+            static_cast<unsigned long long>(image.signer_subject_hash),
+            static_cast<unsigned long long>(image.signer_issuer_hash),
+            image.signer_subject[0] ? image.signer_subject : "<none>",
+            image.signer_issuer[0] ? image.signer_issuer : "<none>",
+            image.trust_checked ? 1 : 0,
+            image.trust_ok ? 1 : 0,
+            static_cast<unsigned long>(image.trust_status),
+            owner_path && owner_path[0] ? owner_path : "<none>");
+    }
+
     inline bool compare_ntdll_function(const char* func_name, bool& is_hooked)
     {
         is_hooked = false;
@@ -994,11 +1428,30 @@ namespace detail {
                             suspicious_non_nt_target;
                         if (!is_hooked)
                         {
-                            webhook::write_log_critical_fmt("disk_hook",
-                                "ntdll_compare_mismatch_nonfatal func=%s owner_system=%d owner_path=%s",
-                                func_name ? func_name : "?",
-                                owner_system ? 1 : 0,
-                                owner_path[0] ? owner_path : "<none>");
+                            log_nt_export_wrapper_diag("disk_hook",
+                                "ntdll_compare_mismatch_nonfatal",
+                                func_name,
+                                mem_func,
+                                disk_bytes,
+                                mem_va,
+                                mem_rva,
+                                disk_rva,
+                                vq,
+                                mbi,
+                                mem_writable,
+                                mem_redirect,
+                                disk_redirect,
+                                mem_syscall,
+                                disk_syscall,
+                                is_nt_export,
+                                owner_ok,
+                                owner_base,
+                                owner_size,
+                                owner_rva,
+                                owner_system,
+                                owner_path_w,
+                                owner_path,
+                                system_owned_wrapper);
                         }
                     }
                     break;

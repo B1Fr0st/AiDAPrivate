@@ -63,6 +63,22 @@ struct tool_param_t
     nlohmann::json items_schema;
 };
 
+struct tool_operation_t
+{
+    std::string name;
+    std::string description;
+    bool read_only = true;
+    bool destructive = false;
+    bool deterministic = true;
+    bool job_mode = false;
+    std::string cache_policy;
+    int default_timeout_ms = 1000;
+    int hard_timeout_ms = 30000;
+    std::vector<std::string> required_indices;
+    nlohmann::json input_schema;
+    nlohmann::json output_schema;
+};
+
 struct tool_definition_t
 {
     std::string name;
@@ -92,6 +108,10 @@ struct tool_definition_t
     // no precondition. The MCP layer is responsible for warming or short-circuiting
     // with error_code="index_empty".
     std::vector<std::string> required_indices;
+    std::string visibility = "legacy";
+    std::string deprecated_by_tool;
+    std::string deprecated_by_operation;
+    std::vector<tool_operation_t> operations;
 };
 
 class ToolRegistry

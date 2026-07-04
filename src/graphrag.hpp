@@ -128,6 +128,8 @@ struct graph_node_t
     int          id = 0;
     std::string  binary_hash;
     std::string  module_id;
+    bool         legacy_binary_hash_alias = false;
+    std::string  identity_source;
     node_type_t  node_type = node_type_t::FUNCTION;
     ea_t         address = BADADDR;
     uint64_t     rva = 0;
@@ -166,6 +168,8 @@ inline void to_json(nlohmann::json& j, const graph_node_t& n)
     j = {
         {"id", n.id}, {"binary_hash", n.binary_hash},
         {"module_id", n.module_id},
+        {"legacy_binary_hash_alias", n.legacy_binary_hash_alias},
+        {"identity_source", n.identity_source},
         {"node_type", node_type_str(n.node_type)},
         {"address", n.address}, {"rva", n.rva}, {"has_rva", n.has_rva},
         {"address_key", n.address_key}, {"name", n.name},
@@ -190,7 +194,14 @@ inline void from_json(const nlohmann::json& j, graph_node_t& n)
     n.id = j.value("id", 0);
     n.binary_hash = j.value("binary_hash", "");
     n.module_id = j.value("module_id", n.binary_hash);
-    if (n.binary_hash.empty())
+    n.legacy_binary_hash_alias = j.value("legacy_binary_hash_alias", false);
+    n.identity_source = j.value("identity_source", "");
+    if (n.module_id.empty() && !n.binary_hash.empty())
+    {
+        n.module_id = n.binary_hash;
+        n.legacy_binary_hash_alias = true;
+    }
+    if (n.binary_hash.empty() || n.binary_hash != n.module_id)
         n.binary_hash = n.module_id;
     n.node_type = node_type_from_str(j.value("node_type", "FUNCTION"));
     n.address = j.value("address", ea_t(BADADDR));
@@ -225,6 +236,8 @@ struct graph_edge_t
 {
     int         id = 0;
     std::string binary_hash;
+    std::string module_id;
+    bool        legacy_binary_hash_alias = false;
     int         source_id = 0;
     int         target_id = 0;
     edge_type_t edge_type = edge_type_t::CALLS;
@@ -233,7 +246,8 @@ struct graph_edge_t
 
 inline void to_json(nlohmann::json& j, const graph_edge_t& e)
 {
-    j = {{"id", e.id}, {"binary_hash", e.binary_hash},
+    j = {{"id", e.id}, {"binary_hash", e.binary_hash}, {"module_id", e.module_id},
+         {"legacy_binary_hash_alias", e.legacy_binary_hash_alias},
          {"source_id", e.source_id}, {"target_id", e.target_id},
          {"edge_type", edge_type_str(e.edge_type)}, {"weight", e.weight}};
 }
@@ -242,6 +256,15 @@ inline void from_json(const nlohmann::json& j, graph_edge_t& e)
 {
     e.id = j.value("id", 0);
     e.binary_hash = j.value("binary_hash", "");
+    e.module_id = j.value("module_id", e.binary_hash);
+    e.legacy_binary_hash_alias = j.value("legacy_binary_hash_alias", false);
+    if (e.module_id.empty() && !e.binary_hash.empty())
+    {
+        e.module_id = e.binary_hash;
+        e.legacy_binary_hash_alias = true;
+    }
+    if (e.binary_hash.empty() || e.binary_hash != e.module_id)
+        e.binary_hash = e.module_id;
     e.source_id = j.value("source_id", 0);
     e.target_id = j.value("target_id", 0);
     e.edge_type = edge_type_from_str(j.value("edge_type", "CALLS"));
@@ -252,6 +275,8 @@ struct community_t
 {
     int         id = 0;
     std::string binary_hash;
+    std::string module_id;
+    bool        legacy_binary_hash_alias = false;
     std::string label;
     std::string purpose;
     std::vector<int> member_ids;
@@ -259,7 +284,8 @@ struct community_t
 
 inline void to_json(nlohmann::json& j, const community_t& c)
 {
-    j = {{"id", c.id}, {"binary_hash", c.binary_hash},
+    j = {{"id", c.id}, {"binary_hash", c.binary_hash}, {"module_id", c.module_id},
+         {"legacy_binary_hash_alias", c.legacy_binary_hash_alias},
          {"label", c.label}, {"purpose", c.purpose},
          {"member_ids", c.member_ids}};
 }
@@ -268,6 +294,15 @@ inline void from_json(const nlohmann::json& j, community_t& c)
 {
     c.id = j.value("id", 0);
     c.binary_hash = j.value("binary_hash", "");
+    c.module_id = j.value("module_id", c.binary_hash);
+    c.legacy_binary_hash_alias = j.value("legacy_binary_hash_alias", false);
+    if (c.module_id.empty() && !c.binary_hash.empty())
+    {
+        c.module_id = c.binary_hash;
+        c.legacy_binary_hash_alias = true;
+    }
+    if (c.binary_hash.empty() || c.binary_hash != c.module_id)
+        c.binary_hash = c.module_id;
     c.label = j.value("label", "");
     c.purpose = j.value("purpose", "");
     c.member_ids = j.value("member_ids", std::vector<int>{});
@@ -493,20 +528,20 @@ private:
 public:
     struct addr_key_t
     {
-        std::string binary_hash;
+        std::string module_id;
         node_type_t type;
         uint64_t canonical_addr = 0;
         bool has_rva = false;
         bool operator==(const addr_key_t& o) const
         {
-            return binary_hash == o.binary_hash && type == o.type && canonical_addr == o.canonical_addr && has_rva == o.has_rva;
+            return module_id == o.module_id && type == o.type && canonical_addr == o.canonical_addr && has_rva == o.has_rva;
         }
     };
     struct addr_key_hash
     {
         size_t operator()(const addr_key_t& k) const
         {
-            size_t h = std::hash<std::string>{}(k.binary_hash);
+            size_t h = std::hash<std::string>{}(k.module_id);
             h ^= std::hash<int>{}(static_cast<int>(k.type)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<uint64_t>{}(k.canonical_addr) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<bool>{}(k.has_rva) + 0x9e3779b9 + (h << 6) + (h >> 2);

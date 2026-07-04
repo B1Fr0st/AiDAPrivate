@@ -68,9 +68,31 @@ struct register_set_t {
 struct stack_frame_t {
 	uint64_t    address = 0;
 	uint64_t    return_addr = 0;
+	uint64_t    module_base = 0;
+	uint64_t    module_size = 0;
 	std::string module_name;
+	std::string module_path;
 	std::string function_name;
 	uint64_t    module_offset = 0;
+	uint64_t    symbol_address = 0;
+	uint64_t    symbol_offset = 0;
+	std::string symbol_source;
+	std::string symbol_status;
+};
+
+struct call_stack_symbol_resolution_t {
+	uint64_t address = 0;
+	uint64_t module_base = 0;
+	uint64_t module_size = 0;
+	uint64_t module_offset = 0;
+	uint64_t symbol_address = 0;
+	uint64_t symbol_offset = 0;
+	uint64_t elapsed_us = 0;
+	std::string module_name;
+	std::string module_path;
+	std::string function_name;
+	std::string source = "none";
+	std::string status = "not_attempted";
 };
 
 
@@ -304,6 +326,9 @@ bool wait_for_trap(uint64_t expected_address, uint32_t timeout_ms);
 
 
 std::vector<stack_frame_t> get_call_stack();
+std::vector<call_stack_symbol_resolution_t> resolve_call_stack_frames(const std::vector<uint64_t>& addresses);
+call_stack_symbol_resolution_t resolve_call_stack_frame(uint64_t address);
+std::string call_stack_frame_resolver_evidence(uint64_t address);
 
 
 std::vector<memory_region_t> get_memory_map();

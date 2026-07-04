@@ -106,6 +106,9 @@ struct verification_link_report_t
     contract_evaluation_t side_effects;
     std::vector<chain_fact_t> produced_facts;
     std::vector<failure_code_t> failures;
+    nlohmann::json transfer_proof = nlohmann::json::object();
+    nlohmann::json cross_domain_proof = nlohmann::json::object();
+    nlohmann::json proof_completeness = nlohmann::json::object();
 };
 
 struct verification_boundary_report_t
@@ -114,6 +117,7 @@ struct verification_boundary_report_t
     std::string consumer_link;
     chain_verdict_t verdict = chain_verdict_t::inconclusive;
     contract_evaluation_t requirements;
+    nlohmann::json typed_matrix = nlohmann::json::object();
 };
 
 struct verification_objective_report_t

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -48,6 +49,8 @@ struct extraction_options_t
     std::size_t max_module_items = 200000;
     std::uint64_t timeout_ms = 0;
     std::vector<std::string> microcode_maturities = {"calls", "glbopt3", "lvars"};
+    std::function<bool()> cancellation_requested;
+    bool allow_interactive_cancel = false;
 };
 
 struct layer_status_t

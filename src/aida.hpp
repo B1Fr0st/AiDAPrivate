@@ -19,6 +19,15 @@
 
 class mcp_server_t;
 
+namespace aida
+{
+namespace vuln
+{
+class chain_verifier_service_t;
+enum class chain_verify_action_kind_t : unsigned;
+}
+}
+
 struct ui_event_listener_t : public event_listener_t
 {
     ssize_t idaapi on_event(ssize_t code, va_list va) override;
@@ -40,6 +49,8 @@ public:
     bool ensure_operational(bool interactive);
     bool is_operational() const;
     const std::string& disabled_reason() const;
+    void activate_chain_verify_action(aida::vuln::chain_verify_action_kind_t kind, action_activation_ctx_t* ctx);
+    action_state_t update_chain_verify_action(aida::vuln::chain_verify_action_kind_t kind, const action_update_ctx_t* ctx) const;
 
 private:
     void register_actions();
@@ -51,6 +62,7 @@ private:
     bool ui_listener_hooked = false;
     bool actions_registered = false;
     qtimer_t self_watchdog_timer = nullptr;
+    std::unique_ptr<aida::vuln::chain_verifier_service_t> chain_verifier_service;
     std::string disabled_detail;
 #ifdef __NT__
     std::thread public_ip_thread;

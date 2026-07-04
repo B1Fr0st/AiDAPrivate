@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 import sys
@@ -10,6 +11,7 @@ AIDA_INITIATOR_CONTRACT_V2 = "aida_initiator_contract_v2_page_marker"
 AIDA_PLAYWRIGHT_PAGEERROR_PATCH_ID = "aida_playwright_pageerror_location_patch_20260620_1"
 AIDA_DEFAULT_ADDON_POLICY_V1 = "aida_default_addon_policy_v1"
 AIDA_FAST_VISIBLE_POLICY_V1 = "aida_fast_visible_policy_v1"
+AIDA_CONTEXT_VIEWPORT_SANITIZER_V1 = "aida_context_viewport_sanitizer_v1"
 
 
 def fail(message: str) -> None:
@@ -84,6 +86,68 @@ def validate_browser_addon_policy_contract(path: pathlib.Path, text: str) -> Non
             fail(f"browser addon policy contract missing {marker} in {path}")
     if "if explicit_addon_count == 0:" in text:
         fail(f"browser addon policy contract has stale no-explicit-addon UBO exclusion gate in {path}")
+
+
+def validate_browser_context_viewport_contract(path: pathlib.Path, text: str) -> None:
+    required_markers = (
+        AIDA_CONTEXT_VIEWPORT_SANITIZER_V1,
+        "def _sanitize_camoufox_context_options",
+        'sanitized["no_viewport"] = True',
+        "_CONTEXT_VIEWPORT_DEVICE_KEYS",
+        '"viewport"',
+        '"screen"',
+        '"device_scale_factor"',
+        '"deviceScaleFactor"',
+        '"is_mobile"',
+        '"isMobile"',
+        "page.set_viewport_size(target)",
+        "page_viewport_set_ok",
+        "protocol_schema_viewport",
+        "browser.setdefaultviewport",
+    )
+    for marker in required_markers:
+        if marker not in text.lower() and marker.lower() not in text.lower():
+            fail(f"browser context viewport contract missing {marker} in {path}")
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError as exc:
+        fail(f"browser context viewport contract could not parse {path}: {exc}")
+    forbidden = {"viewport", "screen", "device_scale_factor", "deviceScaleFactor", "is_mobile", "isMobile"}
+    safe_expansion_calls = {
+        ("new_context", "_create_camoufox_safe_context"),
+        ("new_context", "_create_private_context"),
+        ("new_page", "_create_private_browser_page_context"),
+    }
+    violations = []
+    function_stack: list[str] = []
+
+    class ContextViewportVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            function_stack.append(node.name)
+            self.generic_visit(node)
+            function_stack.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            function_stack.append(node.name)
+            self.generic_visit(node)
+            function_stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in {"new_context", "new_page"}:
+                owner = function_stack[-1] if function_stack else ""
+                if func.attr == "new_context" and not node.keywords and (func.attr, owner) not in safe_expansion_calls:
+                    violations.append(f"{func.attr}:direct:{getattr(node, 'lineno', 0)}:{owner}")
+                for keyword in node.keywords:
+                    if keyword.arg in forbidden:
+                        violations.append(f"{func.attr}:{keyword.arg}:{getattr(node, 'lineno', 0)}")
+                    elif keyword.arg is None and (func.attr, owner) not in safe_expansion_calls:
+                        violations.append(f"{func.attr}:kwargs:{getattr(node, 'lineno', 0)}:{owner}")
+            self.generic_visit(node)
+
+    ContextViewportVisitor().visit(tree)
+    if violations:
+        fail(f"browser context viewport contract has direct context emulation keywords in {path}: {', '.join(violations[:8])}")
 
 
 def replace_in_function(text: str, function_name: str, old: str, new: str, label: str) -> str:
@@ -611,13 +675,25 @@ def patch_main(path: pathlib.Path) -> None:
     if not path.exists():
         return
     text = read_text(path)
-    if "AIDA_INITIATOR_CONTRACT_V2" in text and "--aida-contract-check" in text:
+    required_contract_markers = (
+        "AIDA_INITIATOR_CONTRACT_V2",
+        "--aida-contract-check",
+        "AIDA_CONTEXT_VIEWPORT_SANITIZER",
+        "context_viewport_sanitizer_ok",
+        "direct_context_viewport_emulation_absent",
+        "direct_context_viewport_emulation_violations",
+        "safe_expansion_context_creation_present",
+    )
+    if all(marker in text for marker in required_contract_markers):
         return
     probe = f'''import sys as _aida_contract_sys
 if "--aida-contract-check" in _aida_contract_sys.argv:
+    import ast as _aida_contract_ast
     import inspect as _aida_contract_inspect
+    import importlib.util as _aida_contract_importlib_util
     import json as _aida_contract_json
     AIDA_INITIATOR_CONTRACT_V2 = "{AIDA_INITIATOR_CONTRACT_V2}"
+    AIDA_CONTEXT_VIEWPORT_SANITIZER_V1 = "{AIDA_CONTEXT_VIEWPORT_SANITIZER_V1}"
     try:
         from .tools import network as _aida_contract_network
         _aida_contract_fn = _aida_contract_network.get_request_initiator
@@ -625,8 +701,61 @@ if "--aida-contract-check" in _aida_contract_sys.argv:
         _aida_contract_params = list(_aida_contract_sig.parameters)
         _aida_contract_consts = repr(getattr(getattr(_aida_contract_fn, "__code__", None), "co_consts", ()))
         _aida_contract_ok = all(name in _aida_contract_params for name in ("request_id", "page_id", "marker")) and AIDA_INITIATOR_CONTRACT_V2 in _aida_contract_consts
-        print(_aida_contract_json.dumps({{"contract": AIDA_INITIATOR_CONTRACT_V2, "ok": _aida_contract_ok, "params": _aida_contract_params, "has_marker_constant": AIDA_INITIATOR_CONTRACT_V2 in _aida_contract_consts}}, sort_keys=True))
-        raise SystemExit(0 if _aida_contract_ok else 2)
+        _aida_browser_spec = _aida_contract_importlib_util.find_spec("camoufox_reverse_mcp.browser")
+        _aida_browser_text = ""
+        if _aida_browser_spec and _aida_browser_spec.origin:
+            with open(_aida_browser_spec.origin, "r", encoding="utf-8") as _aida_browser_handle:
+                _aida_browser_text = _aida_browser_handle.read()
+        _aida_context_markers_ok = all(marker in _aida_browser_text for marker in (
+            AIDA_CONTEXT_VIEWPORT_SANITIZER_V1,
+            "def _sanitize_camoufox_context_options",
+            "page.set_viewport_size(target)",
+            "page_viewport_set_ok",
+            "protocol_schema_viewport",
+            'sanitized["no_viewport"] = True',
+        ))
+        _aida_context_violations = []
+        _aida_safe_expansion_calls = {{
+            ("new_context", "_create_camoufox_safe_context"),
+            ("new_context", "_create_private_context"),
+            ("new_page", "_create_private_browser_page_context"),
+        }}
+        _aida_safe_expansion_seen = set()
+        if _aida_browser_text:
+            _aida_tree = _aida_contract_ast.parse(_aida_browser_text)
+            _aida_forbidden = {{"viewport", "screen", "device_scale_factor", "deviceScaleFactor", "is_mobile", "isMobile"}}
+            _aida_function_stack = []
+            class _AidaContextViewportVisitor(_aida_contract_ast.NodeVisitor):
+                def visit_FunctionDef(self, _aida_node):
+                    _aida_function_stack.append(_aida_node.name)
+                    self.generic_visit(_aida_node)
+                    _aida_function_stack.pop()
+                def visit_AsyncFunctionDef(self, _aida_node):
+                    _aida_function_stack.append(_aida_node.name)
+                    self.generic_visit(_aida_node)
+                    _aida_function_stack.pop()
+                def visit_Call(self, _aida_node):
+                    _aida_func = _aida_node.func
+                    if isinstance(_aida_func, _aida_contract_ast.Attribute) and _aida_func.attr in {{"new_context", "new_page"}}:
+                        _aida_owner = _aida_function_stack[-1] if _aida_function_stack else ""
+                        if _aida_func.attr == "new_context" and not _aida_node.keywords and (_aida_func.attr, _aida_owner) not in _aida_safe_expansion_calls:
+                            _aida_context_violations.append({{"call": _aida_func.attr, "keyword": "direct", "line": getattr(_aida_node, "lineno", 0), "owner": _aida_owner}})
+                        for _aida_keyword in _aida_node.keywords:
+                            if _aida_keyword.arg in _aida_forbidden:
+                                _aida_context_violations.append({{"call": _aida_func.attr, "keyword": _aida_keyword.arg, "line": getattr(_aida_node, "lineno", 0), "owner": _aida_owner}})
+                            elif _aida_keyword.arg is None:
+                                _aida_pair = (_aida_func.attr, _aida_owner)
+                                if _aida_pair in _aida_safe_expansion_calls:
+                                    _aida_safe_expansion_seen.add(_aida_pair)
+                                else:
+                                    _aida_context_violations.append({{"call": _aida_func.attr, "keyword": "kwargs", "line": getattr(_aida_node, "lineno", 0), "owner": _aida_owner}})
+                    self.generic_visit(_aida_node)
+            _AidaContextViewportVisitor().visit(_aida_tree)
+        _aida_safe_expansion_ok = all(_aida_pair in _aida_safe_expansion_seen for _aida_pair in _aida_safe_expansion_calls)
+        _aida_context_ok = _aida_context_markers_ok and _aida_safe_expansion_ok and not _aida_context_violations
+        _aida_ok = _aida_contract_ok and _aida_context_ok
+        print(_aida_contract_json.dumps({{"contract": AIDA_INITIATOR_CONTRACT_V2, "ok": _aida_ok, "params": _aida_contract_params, "has_marker_constant": AIDA_INITIATOR_CONTRACT_V2 in _aida_contract_consts, "context_viewport_sanitizer_marker": AIDA_CONTEXT_VIEWPORT_SANITIZER_V1, "context_viewport_sanitizer_ok": _aida_context_ok, "context_viewport_markers_ok": _aida_context_markers_ok, "direct_context_viewport_emulation_absent": not _aida_context_violations, "direct_context_viewport_emulation_violations": _aida_context_violations, "safe_expansion_context_creation_present": _aida_safe_expansion_ok, "safe_expansion_context_creation_seen": sorted(":".join(_aida_pair) for _aida_pair in _aida_safe_expansion_seen)}}, sort_keys=True))
+        raise SystemExit(0 if _aida_ok else 2)
     except Exception as _aida_contract_exc:
         print(_aida_contract_json.dumps({{"contract": AIDA_INITIATOR_CONTRACT_V2, "ok": False, "error_type": type(_aida_contract_exc).__name__, "error": str(_aida_contract_exc)[:500]}}, sort_keys=True))
         raise SystemExit(3)
@@ -1157,11 +1286,11 @@ def patch_browser_launch_deadline_diagnostics(text: str) -> str:
     )
     text = text.replace(
         "ctx = await asyncio.wait_for(self.browser.new_context(), timeout=max(5.0, launch_timeout_ms / 3000))",
-        "ctx = await _launch_wait_phase(\"new_context\", self.browser.new_context(), max(5.0, launch_timeout_ms / 3000))",
+        "ctx, _, _ = await _create_camoufox_safe_context(self.browser, {}, max(5.0, launch_timeout_ms / 3000), \"launch_new_context\", None, launch_started)",
     )
     text = text.replace(
         "ctx = await asyncio.wait_for(self.browser.new_context(), timeout=min(max(8.0, max(5.0, launch_timeout_ms / 1000.0) * 0.50), max(5.0, launch_timeout_ms / 1000.0)))",
-        "ctx = await _launch_wait_phase(\"new_context\", self.browser.new_context(), min(max(8.0, max(5.0, launch_timeout_ms / 1000.0) * 0.50), max(5.0, launch_timeout_ms / 1000.0)))",
+        "ctx, _, _ = await _create_camoufox_safe_context(self.browser, {}, min(max(8.0, max(5.0, launch_timeout_ms / 1000.0) * 0.50), max(5.0, launch_timeout_ms / 1000.0)), \"launch_new_context\", None, launch_started)",
     )
     text = text.replace(
         "await ctx.add_init_script(get_font_fallback_script())",
@@ -1478,7 +1607,7 @@ def _target_closed_error(exc: Exception) -> bool:
     )
     text = text.replace(
         '                ctx = await self.browser.new_context(service_workers="block")\n',
-        '                ctx = await self.browser.new_context()\n',
+        '                ctx, _, _ = await _create_camoufox_safe_context(self.browser, {"service_workers": "block"}, 30.0, "storage_import_context")\n',
     )
     if '"browser_ready_ms": elapsed_ms' not in text:
         text = replace_once(
@@ -1836,6 +1965,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_debug_helper(updated)
         validate_browser_addon_policy_contract(path, updated)
         validate_browser_launch_budget_contract(path, updated)
+        validate_browser_context_viewport_contract(path, updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -1891,6 +2021,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_debug_helper(updated)
         validate_browser_addon_policy_contract(path, updated)
         validate_browser_launch_budget_contract(path, updated)
+        validate_browser_context_viewport_contract(path, updated)
         if updated != text:
             write_text(path, updated)
         return
@@ -1966,6 +2097,7 @@ def patch_browser(path: pathlib.Path) -> None:
         updated = patch_browser_debug_helper(updated)
         validate_browser_addon_policy_contract(path, updated)
         validate_browser_launch_budget_contract(path, updated)
+        validate_browser_context_viewport_contract(path, updated)
         write_text(path, updated)
         return
     text = replace_once(
@@ -2491,6 +2623,7 @@ def patch_browser(path: pathlib.Path) -> None:
             fail(f"browser validation missing {marker}")
     validate_browser_addon_policy_contract(path, text)
     validate_browser_launch_budget_contract(path, text)
+    validate_browser_context_viewport_contract(path, text)
     write_text(path, text)
 
 

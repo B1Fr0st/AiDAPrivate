@@ -221,10 +221,24 @@ struct pcap_decrypt_result_t {
     bool dependency_unavailable = false;
     bool killed_on_deadline = false;
     bool launched = false;
+    bool local_resource_failure = false;
+    bool prelaunch_resource_failure = false;
+    bool retry_exhausted = false;
+    bool create_process_attempted = false;
+    bool create_process_ok = false;
+    bool pipe_stdout_created = false;
+    bool pipe_stderr_created = false;
+    bool stdout_reader_started = false;
+    bool stderr_reader_started = false;
+    bool killed_after_reader_failure = false;
     std::string error_message;
     std::string keylog_file_used;
     std::string pcap_file_used;
     std::string tshark_path;
+    std::string command_shape;
+    std::string local_exception_stage;
+    std::string local_exception_message;
+    std::string stderr_tail;
     std::uint32_t total_packets = 0;
     std::uint32_t decrypted_packets = 0;
     std::uint32_t timeout_ms = 0;
@@ -232,6 +246,12 @@ struct pcap_decrypt_result_t {
     std::uint32_t wait_status = 0;
     std::uint32_t exit_code = 0;
     std::uint32_t win32_error = 0;
+    std::uint32_t launch_attempts = 0;
+    std::uint32_t pipe_stdout_error = 0;
+    std::uint32_t pipe_stderr_error = 0;
+    std::uint32_t stdout_reader_error = 0;
+    std::uint32_t stderr_reader_error = 0;
+    std::uint32_t local_exception_code = 0;
     std::uint64_t elapsed_ms = 0;
     std::uint64_t launch_elapsed_ms = 0;
     std::uint64_t first_stdout_elapsed_ms = 0;
@@ -239,6 +259,7 @@ struct pcap_decrypt_result_t {
     std::uint64_t stdout_bytes = 0;
     std::uint64_t stderr_bytes = 0;
     std::uint64_t json_parse_elapsed_ms = 0;
+    std::uint64_t prelaunch_retry_sleep_ms = 0;
     struct http2_frame_t {
         std::string stream_id;
         std::string method;

@@ -19,6 +19,7 @@
 #include "intercept/cert_profile_manager.hpp"
 #include "intercept/diagnostics.hpp"
 #include "intercept/instrumentation_provider.hpp"
+#include "../infra/work_queue.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "helpers/diag_log.hpp"
@@ -916,6 +917,29 @@ static DWORD ns_tls_timeout_ms(DWORD fallback)
     if (deadline <= now)
         return 1;
     return std::max<DWORD>(1, static_cast<DWORD>(std::min<std::uint64_t>(bounded, deadline - now)));
+}
+
+static json ns_udp_live_stimulus_status_json(const char* protocol)
+{
+    const auto wq = work_queue::stats();
+    const auto sq = work_queue::service_stats();
+    const std::uint64_t now = GetTickCount64();
+    const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+    json j;
+    j["protocol"] = protocol ? protocol : "";
+    j["implementation_owns_udp_stimulus_executor"] = false;
+    j["implementation_udp_stimulus_executor_available"] = false;
+    j["implementation_udp_stimulus_executor_reason"] = "live UDP stimulus is owned by the Test Lab harness in this wave";
+    j["parser_only_is_live_detection"] = false;
+    j["live_detection_requires_external_stimulus"] = true;
+    j["mcp_cancelled"] = mcp_standalone::current_call_cancelled();
+    j["mcp_deadline_ms"] = deadline;
+    j["deadline_remaining_ms"] = deadline > now ? deadline - now : 0;
+    j["work_queue_pending"] = static_cast<std::uint64_t>(wq.pending);
+    j["work_queue_active"] = static_cast<std::uint64_t>(wq.active);
+    j["critical_queue_pending"] = static_cast<std::uint64_t>(sq.pending);
+    j["critical_queue_active"] = static_cast<std::uint64_t>(sq.active);
+    return j;
 }
 
 static std::once_flag& ns_tls_wsa_once()
@@ -2929,6 +2953,9 @@ tool_result_t quic_detect_connections(const json& params) {
         result["capture_evidence"] = false;
         result["key_evidence"] = false;
         result["live_capture_required_for_functional"] = true;
+        result["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("quic");
+        result["live_stimulus_owned_by"] = "testlab_harness";
+        result["implementation_udp_stimulus_executor_available"] = false;
         result["live_capture_correlated"] = false;
         result["target_pid_correlated"] = false;
         result["tuple_correlated"] = false;
@@ -2976,7 +3003,16 @@ tool_result_t quic_detect_connections(const json& params) {
     }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "quic_detect_connections driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected"));
+        json r;
+        r["backend"] = "driver_capture";
+        r["capture_performed"] = false;
+        r["driver_connected"] = false;
+        r["functional_evidence"] = false;
+        r["live_capture_required_for_functional"] = true;
+        r["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("quic");
+        r["live_stimulus_owned_by"] = "testlab_harness";
+        r["implementation_udp_stimulus_executor_available"] = false;
+        return tool_result_t::error(OBFSTR("Driver not connected"), r);
     }
 
     bool cap_active_before = false;
@@ -3045,6 +3081,9 @@ tool_result_t quic_detect_connections(const json& params) {
     result["capture_evidence"] = functional;
     result["key_evidence"] = false;
     result["live_capture_required_for_functional"] = true;
+    result["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("quic");
+    result["live_stimulus_owned_by"] = "testlab_harness";
+    result["implementation_udp_stimulus_executor_available"] = false;
     result["live_capture_correlated"] = functional;
     result["target_pid_correlated"] = all_pid_correlated;
     result["tuple_correlated"] = all_tuple_correlated;
@@ -3378,6 +3417,9 @@ tool_result_t dtls_detect_sessions(const json& params) {
         result["capture_evidence"] = false;
         result["key_evidence"] = false;
         result["live_capture_required_for_functional"] = true;
+        result["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("dtls");
+        result["live_stimulus_owned_by"] = "testlab_harness";
+        result["implementation_udp_stimulus_executor_available"] = false;
         result["live_capture_correlated"] = false;
         result["target_pid_correlated"] = false;
         result["tuple_correlated"] = false;
@@ -3421,7 +3463,16 @@ tool_result_t dtls_detect_sessions(const json& params) {
     }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "dtls_detect_sessions driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected"));
+        json r;
+        r["backend"] = "driver_capture";
+        r["capture_performed"] = false;
+        r["driver_connected"] = false;
+        r["functional_evidence"] = false;
+        r["live_capture_required_for_functional"] = true;
+        r["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("dtls");
+        r["live_stimulus_owned_by"] = "testlab_harness";
+        r["implementation_udp_stimulus_executor_available"] = false;
+        return tool_result_t::error(OBFSTR("Driver not connected"), r);
     }
 
     bool cap_active_before = false;
@@ -3490,6 +3541,9 @@ tool_result_t dtls_detect_sessions(const json& params) {
     result["capture_evidence"] = functional;
     result["key_evidence"] = false;
     result["live_capture_required_for_functional"] = true;
+    result["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("dtls");
+    result["live_stimulus_owned_by"] = "testlab_harness";
+    result["implementation_udp_stimulus_executor_available"] = false;
     result["live_capture_correlated"] = functional;
     result["target_pid_correlated"] = all_pid_correlated;
     result["tuple_correlated"] = all_tuple_correlated;
@@ -3712,9 +3766,50 @@ tool_result_t network_decrypt_capture(const json& params) {
         timeout_ms,
         pcap_probe.packet_count,
         keylog_probe.entry_count);
-    auto decrypt_result = net_security::TlsKeyExtractor::instance().decrypt_pcap_with_tshark(
-        pcap_path, keylog_path, display_filter, timeout_ms);
-    diag::log_tagged_fmt("net_sec", "network_decrypt_capture result success=%d dependency_slow=%d killed=%d total_packets=%u decrypted=%u http2_frames=%zu elapsed_ms=%llu exit_code=%u stdout_bytes=%llu stderr_bytes=%llu",
+    net_security::pcap_decrypt_result_t decrypt_result;
+    const ULONGLONG decrypt_call_start = GetTickCount64();
+    const std::string tshark_command_shape = "\"" + tshark_path + "\" -n -r <pcap> -o tls.keylog_file:<keylog> -Y \"" + display_filter + "\" -T json -l";
+    try {
+        decrypt_result = net_security::TlsKeyExtractor::instance().decrypt_pcap_with_tshark(
+            pcap_path, keylog_path, display_filter, timeout_ms);
+    } catch (const std::bad_alloc& ex) {
+        decrypt_result.pcap_file_used = pcap_path;
+        decrypt_result.keylog_file_used = keylog_path;
+        decrypt_result.tshark_path = tshark_path;
+        decrypt_result.command_shape = tshark_command_shape;
+        decrypt_result.timeout_ms = timeout_ms;
+        decrypt_result.elapsed_ms = GetTickCount64() - decrypt_call_start;
+        decrypt_result.local_resource_failure = true;
+        decrypt_result.local_exception_stage = "network_decrypt_capture_handler";
+        decrypt_result.local_exception_message = ex.what();
+        decrypt_result.local_exception_code = ERROR_NOT_ENOUGH_MEMORY;
+        decrypt_result.win32_error = ERROR_NOT_ENOUGH_MEMORY;
+        decrypt_result.error_message = std::string("Local resource failure during network_decrypt_capture handler: ") + ex.what();
+    } catch (const std::system_error& ex) {
+        decrypt_result.pcap_file_used = pcap_path;
+        decrypt_result.keylog_file_used = keylog_path;
+        decrypt_result.tshark_path = tshark_path;
+        decrypt_result.command_shape = tshark_command_shape;
+        decrypt_result.timeout_ms = timeout_ms;
+        decrypt_result.elapsed_ms = GetTickCount64() - decrypt_call_start;
+        decrypt_result.local_resource_failure = true;
+        decrypt_result.local_exception_stage = "network_decrypt_capture_handler";
+        decrypt_result.local_exception_message = ex.what();
+        decrypt_result.local_exception_code = static_cast<std::uint32_t>(ex.code().value());
+        decrypt_result.win32_error = decrypt_result.local_exception_code;
+        decrypt_result.error_message = std::string("Local resource failure during network_decrypt_capture handler: ") + ex.what();
+    } catch (const std::exception& ex) {
+        decrypt_result.pcap_file_used = pcap_path;
+        decrypt_result.keylog_file_used = keylog_path;
+        decrypt_result.tshark_path = tshark_path;
+        decrypt_result.command_shape = tshark_command_shape;
+        decrypt_result.timeout_ms = timeout_ms;
+        decrypt_result.elapsed_ms = GetTickCount64() - decrypt_call_start;
+        decrypt_result.local_exception_stage = "network_decrypt_capture_handler";
+        decrypt_result.local_exception_message = ex.what();
+        decrypt_result.error_message = std::string("network_decrypt_capture handler exception: ") + ex.what();
+    }
+    diag::log_tagged_fmt("net_sec", "network_decrypt_capture result success=%d dependency_slow=%d killed=%d total_packets=%u decrypted=%u http2_frames=%zu elapsed_ms=%llu exit_code=%u stdout_bytes=%llu stderr_bytes=%llu local_resource=%d prelaunch_resource=%d attempts=%u create_process=%d pipes=%d/%d readers=%d/%d stage=%s",
         (int)decrypt_result.success,
         decrypt_result.dependency_slow ? 1 : 0,
         decrypt_result.killed_on_deadline ? 1 : 0,
@@ -3724,7 +3819,16 @@ tool_result_t network_decrypt_capture(const json& params) {
         static_cast<unsigned long long>(decrypt_result.elapsed_ms),
         decrypt_result.exit_code,
         static_cast<unsigned long long>(decrypt_result.stdout_bytes),
-        static_cast<unsigned long long>(decrypt_result.stderr_bytes));
+        static_cast<unsigned long long>(decrypt_result.stderr_bytes),
+        decrypt_result.local_resource_failure ? 1 : 0,
+        decrypt_result.prelaunch_resource_failure ? 1 : 0,
+        decrypt_result.launch_attempts,
+        decrypt_result.create_process_ok ? 1 : 0,
+        decrypt_result.pipe_stdout_created ? 1 : 0,
+        decrypt_result.pipe_stderr_created ? 1 : 0,
+        decrypt_result.stdout_reader_started ? 1 : 0,
+        decrypt_result.stderr_reader_started ? 1 : 0,
+        decrypt_result.local_exception_stage.c_str());
 
     json r;
     r["success"] = decrypt_result.success;
@@ -3743,6 +3847,7 @@ tool_result_t network_decrypt_capture(const json& params) {
     r["selected"] = tshark_path;
     r["searched_paths"] = ns_paths_to_json(searched_paths);
     r["tshark_path"] = tshark_path;
+    r["tshark_command_shape"] = decrypt_result.command_shape;
     r["pcap_file"] = decrypt_result.pcap_file_used;
     r["keylog_file"] = decrypt_result.keylog_file_used;
     r["display_filter"] = display_filter;
@@ -3762,11 +3867,31 @@ tool_result_t network_decrypt_capture(const json& params) {
     r["tshark_wait_status"] = decrypt_result.wait_status;
     r["tshark_win32_error"] = decrypt_result.win32_error;
     r["tshark_launched"] = decrypt_result.launched;
+    r["tshark_launch_attempts"] = decrypt_result.launch_attempts;
+    r["tshark_create_process_attempted"] = decrypt_result.create_process_attempted;
+    r["tshark_create_process_ok"] = decrypt_result.create_process_ok;
+    r["tshark_pipe_stdout_created"] = decrypt_result.pipe_stdout_created;
+    r["tshark_pipe_stdout_error"] = decrypt_result.pipe_stdout_error;
+    r["tshark_pipe_stderr_created"] = decrypt_result.pipe_stderr_created;
+    r["tshark_pipe_stderr_error"] = decrypt_result.pipe_stderr_error;
+    r["tshark_stdout_reader_started"] = decrypt_result.stdout_reader_started;
+    r["tshark_stdout_reader_error"] = decrypt_result.stdout_reader_error;
+    r["tshark_stderr_reader_started"] = decrypt_result.stderr_reader_started;
+    r["tshark_stderr_reader_error"] = decrypt_result.stderr_reader_error;
+    r["tshark_local_resource_failure"] = decrypt_result.local_resource_failure;
+    r["tshark_prelaunch_resource_failure"] = decrypt_result.prelaunch_resource_failure;
+    r["tshark_retry_exhausted"] = decrypt_result.retry_exhausted;
+    r["tshark_prelaunch_retry_sleep_ms"] = decrypt_result.prelaunch_retry_sleep_ms;
+    r["tshark_killed_after_reader_failure"] = decrypt_result.killed_after_reader_failure;
+    r["tshark_local_exception_stage"] = decrypt_result.local_exception_stage;
+    r["tshark_local_exception_message"] = decrypt_result.local_exception_message;
+    r["tshark_local_exception_code"] = decrypt_result.local_exception_code;
     r["tshark_launch_elapsed_ms"] = decrypt_result.launch_elapsed_ms;
     r["tshark_first_stdout_elapsed_ms"] = decrypt_result.first_stdout_elapsed_ms;
     r["tshark_first_stderr_elapsed_ms"] = decrypt_result.first_stderr_elapsed_ms;
     r["tshark_stdout_bytes"] = decrypt_result.stdout_bytes;
     r["tshark_stderr_bytes"] = decrypt_result.stderr_bytes;
+    r["tshark_stderr_tail"] = decrypt_result.stderr_tail;
     r["tshark_json_parse_elapsed_ms"] = decrypt_result.json_parse_elapsed_ms;
     r["reason"] = decrypt_result.success
         ? "tshark decrypted capture"

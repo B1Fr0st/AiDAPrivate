@@ -1,5 +1,10 @@
 #include "chain_verification_engine.hpp"
 
+#include "chain_boundary.hpp"
+#include "chain_cross_domain.hpp"
+#include "chain_regression_specs.hpp"
+#include "chain_transfer.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -8,6 +13,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 
 #include <ida.hpp>
 #include <kernwin.hpp>
@@ -60,6 +66,76 @@ bool read_bool(const nlohmann::json& value, const char* key, bool fallback = fal
     if (item.is_number_integer())
         return item.get<int64_t>() != 0;
     return fallback;
+}
+
+bool has_source_backing(const nlohmann::json& value)
+{
+    if (!value.is_object())
+        return false;
+    if (value.contains("evidence") && (value.at("evidence").is_object() || value.at("evidence").is_array()) && !value.at("evidence").empty())
+        return true;
+    if (value.contains("location") && value.at("location").is_object())
+    {
+        const nlohmann::json& loc = value.at("location");
+        if (!read_string(loc, "ea").empty() || !read_string(loc, "rva").empty() || !read_string(loc, "function_id").empty())
+            return true;
+    }
+    for (const char* key : {"source_layer", "layer", "lineage", "evidence_id", "snapshot_id", "trace_id", "function_id", "ea", "rva"})
+    {
+        const std::string text = lower_copy(read_string(value, key));
+        if (!text.empty() && text != "user_declared" && text != "declared" && text != "assumption")
+            return true;
+    }
+    return false;
+}
+
+nlohmann::json collect_assumption_blockers_from_array(const nlohmann::json& array, const std::string& scope)
+{
+    nlohmann::json blockers = nlohmann::json::array();
+    if (!array.is_array())
+        return blockers;
+    for (const auto& item : array)
+    {
+        if (!item.is_object())
+            continue;
+        const contract_criticality_t criticality = parse_criticality(read_string(item, "criticality", "chain_critical"));
+        const contract_proof_state_t proof = parse_proof_state(read_string(item, "proof_state", read_string(item, "state", "conditional")));
+        if (!criticality_blocks_acceptance(criticality) || proof_state_accepts(proof))
+            continue;
+        blockers.push_back({
+            {"scope", scope},
+            {"assumption_id", read_string(item, "assumption_id", read_string(item, "id"))},
+            {"proof_state", proof_state_str(proof)},
+            {"criticality", criticality_str(criticality)}
+        });
+    }
+    return blockers;
+}
+
+nlohmann::json collect_assumption_blockers(const nlohmann::json& document)
+{
+    nlohmann::json blockers = nlohmann::json::array();
+    if (!document.is_object())
+        return blockers;
+    if (document.contains("assumptions"))
+    {
+        for (const auto& item : collect_assumption_blockers_from_array(document.at("assumptions"), "document"))
+            blockers.push_back(item);
+    }
+    if (document.contains("links") && document.at("links").is_array())
+    {
+        for (const auto& link : document.at("links"))
+        {
+            if (!link.is_object() || !link.contains("assumptions"))
+                continue;
+            std::string scope = read_string(link, "link_id", read_string(link, "id"));
+            if (scope.empty())
+                scope = "link";
+            for (auto item : collect_assumption_blockers_from_array(link.at("assumptions"), scope))
+                blockers.push_back(std::move(item));
+        }
+    }
+    return blockers;
 }
 
 uint64_t now_ms()
@@ -161,10 +237,36 @@ std::string fact_value_identity(const chain_fact_t& fact)
     return value_as_identity(fact.value);
 }
 
+bool evidence_source_backed(const evidence_t& evidence)
+{
+    for (const std::string& value : {evidence.layer, evidence.lineage, evidence.evidence_id, evidence.snapshot_id})
+    {
+        const std::string text = lower_copy(value);
+        if (!text.empty() && text != "user_declared" && text != "declared" && text != "assumption")
+            return true;
+    }
+    if (evidence.location.ea != BADADDR || evidence.location.has_rva || !evidence.location.function_id.empty())
+        return true;
+    return has_source_backing(evidence.payload);
+}
+
+bool fact_source_backed(const chain_fact_t& fact)
+{
+    for (const evidence_t& evidence : fact.evidence)
+    {
+        if (evidence_source_backed(evidence))
+            return true;
+    }
+    return false;
+}
+
 std::string find_state_value(const contract_trace_state_t& state,
                              const std::string& subject,
-                             const std::vector<std::string>& predicates)
+                             const std::vector<std::string>& predicates,
+                             bool* source_backed = nullptr)
 {
+    if (source_backed != nullptr)
+        *source_backed = false;
     for (const chain_fact_t& fact : state.facts)
     {
         if (!subject.empty() && fact.subject != subject)
@@ -176,7 +278,11 @@ std::string find_state_value(const contract_trace_state_t& state,
             continue;
         const std::string out = fact_value_identity(fact);
         if (!out.empty())
+        {
+            if (source_backed != nullptr)
+                *source_backed = fact_source_backed(fact);
             return out;
+        }
     }
     return {};
 }
@@ -253,6 +359,93 @@ std::vector<failure_code_t> failures_from_contract_eval(const contract_evaluatio
     for (failure_code_t code : eval.failures)
         add_failure(out, code);
     return out;
+}
+
+void add_transfer_issues(std::vector<failure_code_t>& failures, const std::vector<transfer_issue_t>& issues)
+{
+    for (const transfer_issue_t& issue : issues)
+        add_failure(failures, issue.code);
+}
+
+void append_cross_domain_facts(contract_trace_state_t& state, const cross_domain_proof_t& proof)
+{
+    for (const chain_fact_t& fact : proof.facts)
+        state = append_fact(state, fact);
+}
+
+nlohmann::json p0_p6_status(const verification_report_t& report, const verification_document_t& document)
+{
+    nlohmann::json out = nlohmann::json::object();
+    out["p0_schema"] = !document.chain_id.empty() && document.schema == "aida_chain_document_v2";
+    out["p1_corpus"] = true;
+    for (const verification_corpus_record_t& corpus : document.corpus)
+    {
+        if (corpus.chain_critical && !accepted_corpus_availability(corpus.availability))
+            out["p1_corpus"] = false;
+    }
+    out["p2_link_obligations"] = !report.links.empty();
+    out["p3_boundaries"] = true;
+    out["p4_objectives"] = !report.objectives.empty();
+    out["p5_transfer_semantics"] = true;
+    out["p6_goal"] = true;
+    nlohmann::json blockers = nlohmann::json::array();
+    for (const verification_link_report_t& link : report.links)
+    {
+        const bool transfer_present = link.transfer_proof.value("trace_present", false);
+        const bool transfer_confirmed = link.transfer_proof.value("verdict", std::string("inconclusive")) == "confirmed";
+        if (!transfer_present || !transfer_confirmed)
+        {
+            out["p5_transfer_semantics"] = false;
+            blockers.push_back({{"link_id", link.link_id}, {"phase", "p5_transfer_semantics"}, {"transfer", link.transfer_proof}});
+        }
+        if (link.verdict != chain_verdict_t::confirmed || !link.failures.empty())
+        {
+            out["p2_link_obligations"] = false;
+            blockers.push_back({{"link_id", link.link_id}, {"phase", "p2_link_obligations"}, {"failures", link.failures.size()}});
+        }
+    }
+    for (const verification_boundary_report_t& boundary : report.boundaries)
+    {
+        if (boundary.verdict != chain_verdict_t::confirmed)
+        {
+            out["p3_boundaries"] = false;
+            blockers.push_back({{"producer_link", boundary.producer_link}, {"consumer_link", boundary.consumer_link}, {"phase", "p3_boundaries"}, {"matrix", boundary.typed_matrix}});
+        }
+    }
+    for (const verification_objective_report_t& objective : report.objectives)
+    {
+        if (objective.verdict != chain_verdict_t::confirmed || objective.failure != failure_code_t::none)
+        {
+            out["p4_objectives"] = false;
+            out["p6_goal"] = false;
+            blockers.push_back({{"objective_id", objective.objective_id}, {"phase", "p6_goal"}, {"failure", failure_code_str(objective.failure)}});
+        }
+    }
+    if (!report.failures.empty())
+    {
+        out["p6_goal"] = false;
+        for (failure_code_t code : report.failures)
+            blockers.push_back({{"phase", "p0_p6_failure"}, {"failure", failure_code_str(code)}});
+    }
+    out["blockers"] = blockers;
+    return out;
+}
+
+void enforce_p0_p6_completeness(verification_report_t& report, const verification_document_t& document)
+{
+    const nlohmann::json status = p0_p6_status(report, document);
+    report.diagnostics["p0_p6"] = status;
+    const bool complete = status.value("p0_schema", false) &&
+                          status.value("p1_corpus", false) &&
+                          status.value("p2_link_obligations", false) &&
+                          status.value("p3_boundaries", false) &&
+                          status.value("p4_objectives", false) &&
+                          status.value("p5_transfer_semantics", false) &&
+                          status.value("p6_goal", false);
+    if (!complete && report.verdict == chain_verdict_t::confirmed)
+        report.verdict = chain_verdict_t::inconclusive;
+    if (complete && report.verdict == chain_verdict_t::confirmed)
+        report.proof_level = proof_level_t::p5_complete;
 }
 
 }
@@ -480,8 +673,9 @@ verification_objective_report_t evaluate_objective(const contract_trace_state_t&
         {
             const std::string pointer_slot = read_string(op, "pointer_slot", read_string(op, "slot"));
             std::string actual = read_string(op, "actual_destination", read_string(op, "actual_source"));
+            bool actual_source_backed = has_source_backing(op);
             if (actual.empty())
-                actual = find_state_value(state, pointer_slot, {"points_to", "value", "target", "address"});
+                actual = find_state_value(state, pointer_slot, {"points_to", "value", "target", "address"}, &actual_source_backed);
             const std::string required = read_string(op, "required_updated_location",
                                                      read_string(op, "required_read_location",
                                                                  read_string(op, "updated_location",
@@ -504,15 +698,37 @@ verification_objective_report_t evaluate_objective(const contract_trace_state_t&
             }
             else
             {
-                op_report["verdict"] = "confirmed";
-                op_report["failure"] = failure_code_str(failure_code_t::none);
+                if (!actual_source_backed)
+                {
+                    op_report["verdict"] = "inconclusive";
+                    op_report["failure"] = failure_code_str(failure_code_t::objective_not_achieved);
+                    sequence_verdict = combine_verdict(sequence_verdict, chain_verdict_t::inconclusive);
+                    out.failure = failure_code_t::objective_not_achieved;
+                }
+                else
+                {
+                    op_report["verdict"] = "confirmed";
+                    op_report["failure"] = failure_code_str(failure_code_t::none);
+                }
             }
         }
         else
         {
             const contract_proof_state_t proof = parse_proof_state(read_string(op, "proof_state", read_string(op, "state", "unknown")));
             if (proof == contract_proof_state_t::proven)
-                op_report["verdict"] = "confirmed";
+            {
+                if (!has_source_backing(op))
+                {
+                    op_report["verdict"] = "inconclusive";
+                    op_report["failure"] = failure_code_str(failure_code_t::objective_not_achieved);
+                    sequence_verdict = combine_verdict(sequence_verdict, chain_verdict_t::inconclusive);
+                    out.failure = failure_code_t::objective_not_achieved;
+                }
+                else
+                {
+                    op_report["verdict"] = "confirmed";
+                }
+            }
             else if (proof == contract_proof_state_t::refuted)
             {
                 op_report["verdict"] = "refuted";
@@ -618,6 +834,13 @@ verification_report_t ChainVerificationEngine::verify(const verification_request
             report.verdict = combine_verdict(report.verdict, chain_verdict_t::unsupported);
         }
     }
+    const nlohmann::json assumption_blockers = collect_assumption_blockers(document.raw);
+    if (!assumption_blockers.empty())
+    {
+        report.diagnostics["assumption_blockers"] = assumption_blockers;
+        add_failure(report.failures, failure_code_t::solver_unknown);
+        report.verdict = combine_verdict(report.verdict, chain_verdict_t::inconclusive);
+    }
 
     contract_trace_state_t state = make_trace_state(document.initial_facts);
     if (budget.cancelled(token))
@@ -644,8 +867,9 @@ verification_report_t ChainVerificationEngine::verify(const verification_request
         link_report.link_id = link.link_id;
         link_report.proof_level = proof_level_t::p2_link_obligations;
         link_report.verdict = chain_verdict_t::confirmed;
+        const contract_trace_state_t entry_state = state;
 
-        link_report.preconditions = match_contracts(state, link.preconditions, proof_level_t::p3_boundary_contracts);
+        link_report.preconditions = match_contracts(entry_state, link.preconditions, proof_level_t::p3_boundary_contracts);
         link_report.verdict = combine_verdict(link_report.verdict, link_report.preconditions.verdict);
         for (failure_code_t code : failures_from_contract_eval(link_report.preconditions))
             add_failure(link_report.failures, code);
@@ -655,40 +879,84 @@ verification_report_t ChainVerificationEngine::verify(const verification_request
         for (failure_code_t code : link_report.solver.failures)
             add_failure(link_report.failures, code);
 
-        link_report.calls = match_contracts(state, link.path_job.call_obligations, proof_level_t::p2_link_obligations);
+        link_report.calls = match_contracts(entry_state, link.path_job.call_obligations, proof_level_t::p2_link_obligations);
         link_report.verdict = combine_verdict(link_report.verdict, link_report.calls.verdict);
         for (failure_code_t code : failures_from_contract_eval(link_report.calls))
             add_failure(link_report.failures, code);
 
-        link_report.returns = match_contracts(state, link.path_job.return_obligations, proof_level_t::p2_link_obligations);
+        link_report.returns = match_contracts(entry_state, link.path_job.return_obligations, proof_level_t::p2_link_obligations);
         link_report.verdict = combine_verdict(link_report.verdict, link_report.returns.verdict);
         for (failure_code_t code : failures_from_contract_eval(link_report.returns))
             add_failure(link_report.failures, code);
 
-        link_report.side_effects = evaluate_side_effects(state, link, link_report);
+        link_report.side_effects = evaluate_side_effects(entry_state, link, link_report);
         link_report.verdict = combine_verdict(link_report.verdict, link_report.side_effects.verdict);
+
+        transfer_request_t transfer_request;
+        transfer_request.link_id = link.link_id;
+        transfer_request.role = link.role;
+        transfer_request.link = link.raw;
+        transfer_request.target = document.target;
+        transfer_request.link_index = i;
+        transfer_proof_t transfer = derive_transfer_proof(transfer_request, entry_state, link.produced_facts);
+        link_report.transfer_proof = to_json(transfer);
+        link_report.verdict = combine_verdict(link_report.verdict, transfer.verdict);
+        add_transfer_issues(link_report.failures, transfer.issues);
+
+        state = transfer.state;
+        for (const chain_fact_t& fact : transfer.derived_facts)
+            link_report.produced_facts.push_back(fact);
+
+        cross_domain_request_t cross_request;
+        cross_request.link_id = link.link_id;
+        cross_request.link = link.raw;
+        cross_request.target = document.target;
+        cross_request.corpus = document.raw.contains("corpus") ? document.raw.at("corpus") : nlohmann::json::array();
+        cross_domain_proof_t cross = evaluate_cross_domain_transition(cross_request, state);
+        link_report.cross_domain_proof = to_json(cross);
+        link_report.verdict = combine_verdict(link_report.verdict, cross.verdict);
+        add_transfer_issues(link_report.failures, cross.issues);
+        append_cross_domain_facts(state, cross);
+        for (const chain_fact_t& fact : cross.facts)
+            link_report.produced_facts.push_back(fact);
+        link_report.proof_completeness = nlohmann::json{
+            {"preconditions", verdict_str(link_report.preconditions.verdict)},
+            {"solver", verdict_str(link_report.solver.verdict)},
+            {"calls", verdict_str(link_report.calls.verdict)},
+            {"returns", verdict_str(link_report.returns.verdict)},
+            {"side_effects", verdict_str(link_report.side_effects.verdict)},
+            {"transfer", verdict_str(transfer.verdict)},
+            {"cross_domain", verdict_str(cross.verdict)}
+        };
 
         if (i > 0)
         {
+            boundary_proof_t typed_boundary = evaluate_typed_boundary(document.links[i - 1].link_id, link.link_id, entry_state, link.preconditions);
             verification_boundary_report_t boundary;
-            boundary.producer_link = document.links[i - 1].link_id;
-            boundary.consumer_link = link.link_id;
-            boundary.requirements = link_report.preconditions;
-            boundary.verdict = boundary.requirements.verdict;
+            boundary.producer_link = typed_boundary.producer_link;
+            boundary.consumer_link = typed_boundary.consumer_link;
+            boundary.requirements = typed_boundary.requirements;
+            boundary.verdict = typed_boundary.verdict;
+            boundary.typed_matrix = typed_boundary.matrix;
+            link_report.verdict = combine_verdict(link_report.verdict, typed_boundary.verdict);
+            add_transfer_issues(link_report.failures, typed_boundary.issues);
             report.boundaries.push_back(std::move(boundary));
         }
+        link_report.proof_completeness["boundary"] = i > 0 && !report.boundaries.empty()
+            ? verdict_str(report.boundaries.back().verdict)
+            : "not_applicable";
 
-        for (const chain_fact_t& fact : link.produced_facts)
+        for (const chain_fact_t& fact : link_report.produced_facts)
         {
+            (void)fact;
             if (!budget.consume_fact())
             {
                 add_failure(link_report.failures, failure_code_t::resource_exhausted);
                 link_report.verdict = combine_verdict(link_report.verdict, chain_verdict_t::timeout);
                 break;
             }
-            state = append_fact(state, fact);
-            link_report.produced_facts.push_back(fact);
         }
+        link_report.proof_completeness["failure_count"] = link_report.failures.size();
 
         for (failure_code_t code : link_report.failures)
             add_failure(report.failures, code);
@@ -722,9 +990,7 @@ verification_report_t ChainVerificationEngine::verify(const verification_request
     }
 
     report.final_state = state;
-    report.proof_level = report.verdict == chain_verdict_t::confirmed && report.failures.empty()
-        ? proof_level_t::p5_complete
-        : report.proof_level;
+    enforce_p0_p6_completeness(report, document);
     if (!report.failures.empty() && report.verdict == chain_verdict_t::confirmed)
         report.verdict = chain_verdict_t::inconclusive;
     report.diagnostics["solver_cache_size"] = m_impl->solver.cache_size();
@@ -757,61 +1023,7 @@ ChainVerificationEngine& engine()
 
 std::vector<nlohmann::json> universal_synthetic_regression_specs()
 {
-    std::vector<nlohmann::json> specs;
-    specs.push_back({
-        {"schema", "aida_chain_document_v2"},
-        {"chain_id", "synthetic_controlled_copy_confirm"},
-        {"target", {{"architecture", "x86_64"}, {"platform", "user_mode"}}},
-        {"corpus", {{{"corpus_id", "mod"}, {"kind", "binary"}, {"availability", "recorded_only"}, {"identity", {{"sha256", "synthetic"}}}, {"trust", "recorded_dynamic"}}}},
-        {"facts", {{{"id", "input_control"}, {"kind", "content_fact"}, {"subject", "buf"}, {"predicate", "content"}, {"value", {{"content_class", "controlled"}, {"controlled", true}}}, {"proof_state", "proven"}, {"criticality", "chain_critical"}}}},
-        {"links", {
-            {{"id", "copy"}, {"preconditions", {{{"id", "need_controlled"}, {"dimension", "content"}, {"subject", "buf"}, {"predicate", "content"}, {"required", {{"controlled", true}}}}}}, {"postconditions", {{{"id", "field_control"}, {"kind", "content_fact"}, {"subject", "obj.field"}, {"predicate", "content"}, {"value", {{"content_class", "controlled"}, {"controlled", true}}}, {"proof_state", "proven"}, {"criticality", "chain_critical"}}}}},
-            {{"id", "consume"}, {"preconditions", {{{"id", "consume_controlled"}, {"dimension", "content"}, {"subject", "obj.field"}, {"predicate", "content"}, {"required", {{"controlled", true}}}}}}, {"postconditions", {{{"id", "objective_done"}, {"kind", "objective_fact"}, {"subject", "goal"}, {"predicate", "achieved"}, {"value", {{"achieved", true}}}, {"proof_state", "proven"}, {"criticality", "objective_critical"}}}}}
-        }},
-        {"objectives", {{{"id", "goal"}, {"dimension", "final_objective"}, {"subject", "goal"}, {"predicate", "achieved"}, {"required", {{"achieved", true}}}}}}
-    });
-    specs.push_back({
-        {"schema", "aida_chain_document_v2"},
-        {"chain_id", "synthetic_zero_fill_refutes_control"},
-        {"target", {{"architecture", "x86_64"}, {"platform", "user_mode"}}},
-        {"corpus", {{{"corpus_id", "mod"}, {"kind", "binary"}, {"availability", "recorded_only"}, {"identity", {{"sha256", "synthetic"}}}, {"trust", "recorded_dynamic"}}}},
-        {"links", {
-            {{"id", "zero_fill"}, {"postconditions", {{{"id", "zero_field"}, {"kind", "content_fact"}, {"subject", "obj.ptr"}, {"predicate", "content"}, {"value", {{"content_class", "zero_bytes"}, {"zero", true}}}, {"proof_state", "proven"}, {"criticality", "chain_critical"}}}}},
-            {{"id", "consume_pointer"}, {"preconditions", {{{"id", "needs_controlled_pointer"}, {"dimension", "content"}, {"subject", "obj.ptr"}, {"predicate", "content"}, {"required", {{"controlled", true}}}}}}, {"postconditions", {{{"id", "goal_unknown"}, {"kind", "objective_fact"}, {"subject", "goal"}, {"predicate", "achieved"}, {"value", {{"achieved", false}}}, {"proof_state", "refuted"}, {"criticality", "objective_critical"}}}}}
-        }},
-        {"objectives", {{{"id", "goal"}, {"dimension", "final_objective"}, {"subject", "goal"}, {"predicate", "achieved"}, {"required", {{"achieved", true}}}}}}
-    });
-    specs.push_back({
-        {"schema", "aida_chain_document_v2"},
-        {"chain_id", "synthetic_self_reference_required"},
-        {"target", {{"architecture", "x86_64"}, {"platform", "user_mode"}}},
-        {"corpus", {{{"corpus_id", "mod"}, {"kind", "binary"}, {"availability", "recorded_only"}, {"identity", {{"sha256", "synthetic"}}}, {"trust", "recorded_dynamic"}}}},
-        {"links", {
-            {{"id", "hidden_check"}, {"preconditions", {{{"id", "needs_self_ref"}, {"dimension", "alias_set"}, {"subject", "node.flink"}, {"predicate", "self_reference"}, {"required", {{"self_reference", true}}}, {"failure_when_unmet", "self_reference_unproven"}}}}, {"postconditions", {{{"id", "goal_unproven"}, {"kind", "objective_fact"}, {"subject", "goal"}, {"predicate", "achieved"}, {"value", {{"achieved", false}}}, {"proof_state", "unknown"}, {"criticality", "objective_critical"}}}}}
-        }},
-        {"objectives", {{{"id", "goal"}, {"dimension", "final_objective"}, {"subject", "goal"}, {"predicate", "achieved"}, {"required", {{"achieved", true}}}}}}
-    });
-    specs.push_back({
-        {"schema", "aida_chain_document_v2"},
-        {"chain_id", "synthetic_self_reference_positive"},
-        {"target", {{"architecture", "x86_64"}, {"platform", "user_mode"}}},
-        {"corpus", {{{"corpus_id", "mod"}, {"kind", "binary"}, {"availability", "recorded_only"}, {"identity", {{"sha256", "synthetic"}}}, {"trust", "recorded_dynamic"}}}},
-        {"facts", {{{"id", "self_ref_fact"}, {"kind", "alias_fact"}, {"subject", "node.flink"}, {"predicate", "self_reference"}, {"value", {{"self_reference", true}}}, {"proof_state", "proven"}, {"criticality", "chain_critical"}}}},
-        {"links", {
-            {{"id", "hidden_check"}, {"preconditions", {{{"id", "needs_self_ref"}, {"dimension", "alias_set"}, {"subject", "node.flink"}, {"predicate", "self_reference"}, {"required", {{"self_reference", true}}}}}}, {"postconditions", {{{"id", "goal_done"}, {"kind", "objective_fact"}, {"subject", "goal"}, {"predicate", "achieved"}, {"value", {{"achieved", true}}}, {"proof_state", "proven"}, {"criticality", "objective_critical"}}}}}
-        }},
-        {"objectives", {{{"id", "goal"}, {"dimension", "final_objective"}, {"subject", "goal"}, {"predicate", "achieved"}, {"required", {{"achieved", true}}}}}}
-    });
-    specs.push_back({
-        {"schema", "aida_chain_document_v2"},
-        {"chain_id", "synthetic_write_through_mismatch"},
-        {"target", {{"architecture", "x86_64"}, {"platform", "user_mode"}}},
-        {"corpus", {{{"corpus_id", "mod"}, {"kind", "binary"}, {"availability", "recorded_only"}, {"identity", {{"sha256", "synthetic"}}}, {"trust", "recorded_dynamic"}}}},
-        {"facts", {{{"id", "slot_points_elsewhere"}, {"kind", "alias_fact"}, {"subject", "surface.slot"}, {"predicate", "points_to"}, {"value", {{"target", "global.manager"}}}, {"proof_state", "proven"}, {"criticality", "chain_critical"}}}},
-        {"links", {{{"id", "write_through"}, {"postconditions", {{{"id", "write_done"}, {"kind", "memory_fact"}, {"subject", "global.manager"}, {"predicate", "written"}, {"value", {{"value", "target"}}}, {"proof_state", "proven"}, {"criticality", "chain_critical"}}}}}}},
-        {"objectives", {{{"id", "redirect_slot"}, {"dimension", "final_objective"}, {"subject", "surface.slot"}, {"predicate", "written"}, {"required", {{"operation", {{"kind", "write_through"}, {"pointer_slot", "surface.slot"}, {"required_updated_location", "surface.slot"}}}}}}}}
-    });
-    return specs;
+    return universal_chain_regression_documents();
 }
 
 nlohmann::json to_json(const verification_corpus_record_t& corpus)
@@ -949,7 +1161,10 @@ nlohmann::json to_json(const verification_link_report_t& report)
         {"returns", to_json(report.returns)},
         {"side_effects", to_json(report.side_effects)},
         {"produced_facts", facts},
-        {"failures", failures}
+        {"failures", failures},
+        {"transfer_proof", report.transfer_proof},
+        {"cross_domain_proof", report.cross_domain_proof},
+        {"proof_completeness", report.proof_completeness}
     };
 }
 
@@ -959,7 +1174,8 @@ nlohmann::json to_json(const verification_boundary_report_t& report)
         {"producer_link", report.producer_link},
         {"consumer_link", report.consumer_link},
         {"verdict", verdict_str(report.verdict)},
-        {"requirements", to_json(report.requirements)}
+        {"requirements", to_json(report.requirements)},
+        {"typed_matrix", report.typed_matrix}
     };
 }
 
