@@ -17,6 +17,7 @@
 #include "helpers/diag_log.hpp"
 #include "../../infra/event_bus.hpp"
 #include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -664,7 +665,36 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
     }
 
     ctx->in_flight.fetch_sub(1);
-    work_queue::post([ctx] { run_crawl(ctx); });
+    {
+        mcp_standalone::downstream::producer_identity_t cont_id;
+        cont_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        cont_id.tool_name = "crawler.run_crawl";
+        cont_id.domain = c.config.start_urls.empty() ? std::string() : c.config.start_urls.front();
+        auto cont_admission = mcp_standalone::downstream::scoped_admission_t::acquire(cont_id);
+        if (!cont_admission.active()) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=continuation",
+                static_cast<unsigned long long>(c.id),
+                cont_admission.result().reason.c_str(),
+                cont_admission.result().quota_name.c_str(),
+                cont_admission.result().observed, cont_admission.result().limit);
+            return;
+        }
+        const uint64_t cont_token = cont_admission.token();
+        diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=continuation",
+            static_cast<unsigned long long>(c.id),
+            static_cast<unsigned long long>(cont_token));
+        if (!work_queue::post([ctx, admission = std::move(cont_admission), cont_token]() mutable {
+            run_crawl(ctx);
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=continuation",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(cont_token));
+            admission.release("completed");
+        })) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable phase=continuation",
+                static_cast<unsigned long long>(c.id),
+                static_cast<unsigned long long>(cont_token));
+        }
+    }
 }
 
 void run_crawl(std::shared_ptr<crawl_t> ctx)
@@ -716,10 +746,37 @@ void run_crawl(std::shared_ptr<crawl_t> ctx)
         return;
     }
 
-    work_queue::post([ctx] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        run_crawl(ctx);
-    });
+    {
+        mcp_standalone::downstream::producer_identity_t wait_id;
+        wait_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        wait_id.tool_name = "crawler.run_crawl_wait";
+        wait_id.domain = c.config.start_urls.empty() ? std::string() : c.config.start_urls.front();
+        auto wait_admission = mcp_standalone::downstream::scoped_admission_t::acquire(wait_id);
+        if (!wait_admission.active()) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=wait",
+                static_cast<unsigned long long>(c.id),
+                wait_admission.result().reason.c_str(),
+                wait_admission.result().quota_name.c_str(),
+                wait_admission.result().observed, wait_admission.result().limit);
+            return;
+        }
+        const uint64_t wait_token = wait_admission.token();
+        diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=wait",
+            static_cast<unsigned long long>(c.id),
+            static_cast<unsigned long long>(wait_token));
+        if (!work_queue::post([ctx, admission = std::move(wait_admission), wait_token]() mutable {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            run_crawl(ctx);
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=wait",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(wait_token));
+            admission.release("completed");
+        })) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable phase=wait",
+                static_cast<unsigned long long>(c.id),
+                static_cast<unsigned long long>(wait_token));
+        }
+    }
 }
 
 }
@@ -797,8 +854,36 @@ uint64_t start(const crawl_config_t& config)
         static_cast<unsigned long long>(ctx->id), config.start_urls.size(), config.max_depth, config.max_pages);
 
     int kick = std::max(1, std::min(config.concurrency, 32));
-    for (int i = 0; i < kick; ++i)
-        work_queue::post([ctx] { run_crawl(ctx); });
+    for (int i = 0; i < kick; ++i) {
+        mcp_standalone::downstream::producer_identity_t kick_id;
+        kick_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        kick_id.tool_name = "crawler.run_crawl_kick";
+        kick_id.domain = config.start_urls.empty() ? std::string() : config.start_urls.front();
+        auto kick_admission = mcp_standalone::downstream::scoped_admission_t::acquire(kick_id);
+        if (!kick_admission.active()) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=kick",
+                static_cast<unsigned long long>(ctx->id),
+                kick_admission.result().reason.c_str(),
+                kick_admission.result().quota_name.c_str(),
+                kick_admission.result().observed, kick_admission.result().limit);
+            continue;
+        }
+        const uint64_t kick_token = kick_admission.token();
+        diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=kick",
+            static_cast<unsigned long long>(ctx->id),
+            static_cast<unsigned long long>(kick_token));
+        if (!work_queue::post([ctx, admission = std::move(kick_admission), kick_token]() mutable {
+            run_crawl(ctx);
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(kick_token));
+            admission.release("completed");
+        })) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable phase=kick",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(kick_token));
+        }
+    }
     return ctx->id;
 }
 

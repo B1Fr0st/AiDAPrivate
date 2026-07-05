@@ -1,10 +1,13 @@
 #include "flow_store.hpp"
 
+#include "../mcp/downstream_producer_governor.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace flow_store {
 namespace {
@@ -115,11 +118,35 @@ client_replay_result client_replay(const client_replay_options& options)
     std::atomic_size_t failed{0};
     std::mutex result_mutex;
     const uint32_t worker_count = std::max<uint32_t>(1, std::min<uint32_t>(options.concurrency == 0 ? 1 : options.concurrency, static_cast<uint32_t>(flows.size())));
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
+    const uint32_t capped_worker_count = std::min<uint32_t>(worker_count,
+        static_cast<uint32_t>(mcp_standalone::downstream::default_quotas().burp_network_worker_group_size));
 
-    for (uint32_t i = 0; i < worker_count; ++i) {
-        workers.emplace_back([&, i]() {
+    mcp_standalone::downstream::producer_identity_t fs_id;
+    fs_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+    fs_id.tool_name = "flow_store.client_replay";
+    auto fs_admission = mcp_standalone::downstream::scoped_admission_t::acquire(fs_id);
+    if (!fs_admission.active()) {
+        diag::log_tagged_fmt("flow_store", "BURP-NETWORK-WORKER-REJECT reason=%s quota=%s observed=%zu limit=%zu",
+            fs_admission.result().reason.c_str(),
+            fs_admission.result().quota_name.c_str(),
+            fs_admission.result().observed, fs_admission.result().limit);
+        result.completed = false;
+        result.error = "Downstream capacity exhausted";
+        return result;
+    }
+    const uint64_t fs_token = fs_admission.token();
+    diag::log_tagged_fmt("flow_store", "BURP-NETWORK-WORKER-ADMIT token=%llu workers=%u",
+        static_cast<unsigned long long>(fs_token), capped_worker_count);
+    auto fs_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(fs_admission));
+
+    std::vector<aida::infra::win_thread::joinable_thread_t> workers;
+    workers.reserve(capped_worker_count);
+
+    for (uint32_t i = 0; i < capped_worker_count; ++i) {
+        aida::infra::win_thread::joinable_thread_t wt;
+        std::string err;
+        const std::string label = "flow_store.replay." + std::to_string(i);
+        const bool started = wt.start([&, i, fs_admission_ptr, fs_token]() {
             for (;;) {
                 if (stop.load(std::memory_order_acquire) || cancelled(options.cancel))
                     break;
@@ -160,12 +187,19 @@ client_replay_result client_replay(const client_replay_options& options)
                         stop.store(true, std::memory_order_release);
                 }
             }
-        });
+        }, &err, aida::infra::win_thread::default_stack_reserve, label.c_str());
+        if (started)
+            workers.push_back(std::move(wt));
     }
 
-    for (auto& worker : workers)
-        if (worker.joinable())
-            worker.join();
+    for (auto& worker : workers) {
+        std::string err;
+        worker.join(&err);
+    }
+
+    diag::log_tagged_fmt("flow_store", "BURP-NETWORK-WORKER-RELEASE token=%llu reason=completed",
+        static_cast<unsigned long long>(fs_token));
+    fs_admission_ptr->release("completed");
 
     result.attempted = attempted.load(std::memory_order_relaxed);
     result.succeeded = succeeded.load(std::memory_order_relaxed);

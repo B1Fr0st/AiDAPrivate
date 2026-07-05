@@ -11,6 +11,7 @@
 #include "../../infra/event_bus.hpp"
 #include "../../infra/work_queue.hpp"
 #include "../../mcp/mcp_client.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <windows.h>
@@ -94,6 +95,7 @@ struct singleton_t
     bool                                    active_profile_generated = false;
     bool                                    cleanup_profile_generated = false;
     uint64_t                                generation         = 0;
+    uint64_t                                launch_admission_token = 0;
     uint64_t                                cleanup_generation = 0;
     uint64_t                                cleanup_started_ms = 0;
     uint32_t                                cleanup_child_pid  = 0;
@@ -163,6 +165,12 @@ struct managed_session_t
     bool                                  active_profile_generated = false;
     std::vector<page_status_t>            pages;
     uint64_t                              generation = 0;
+    uint64_t                              launch_admission_token = 0;
+    uint64_t                              cleanup_generation = 0;
+    uint64_t                              cleanup_started_ms = 0;
+    uint32_t                              cleanup_child_pid = 0;
+    std::string                           cleanup_reason;
+    nlohmann::json                        cleanup_diagnostics = nlohmann::json::object();
     uint64_t                              last_launch_ms = 0;
     uint64_t                              last_nav_ms = 0;
     uint64_t                              last_cleanup_ms = 0;
@@ -246,11 +254,183 @@ constexpr DWORD kProcessInitializationFailureExitCode = 0xC0000142;
 constexpr uint64_t kLaunchInitFailureBlockBaseMs = 120000;
 constexpr uint64_t kLaunchInitFailureBlockMaxMs = 600000;
 thread_local uint32_t g_bridge_activity_depth = 0;
+thread_local uint32_t g_camoufox_op_admission_depth = 0;
 
 const char* safe_reason(const char* reason)
 {
     return (reason && reason[0]) ? reason : "unspecified";
 }
+
+mcp_standalone::downstream::producer_identity_t build_camoufox_op_identity(
+    const char* tool_name,
+    const std::string& session_id,
+    uint64_t generation,
+    uint32_t child_pid)
+{
+    mcp_standalone::downstream::producer_identity_t id;
+    id.kind = mcp_standalone::downstream::producer_kind_t::camoufox_longop;
+    id.principal_id = "camoufox";
+    id.session_id = session_id.empty() ? std::string("default") : session_id;
+    id.generation = generation;
+    id.child_pid = child_pid;
+    id.tool_name = tool_name ? std::string(tool_name) : std::string();
+    id.command_label = tool_name ? std::string(tool_name) : std::string();
+    const char* diag_id = mcp_standalone::current_call_diag_id();
+    const char* req_id = mcp_standalone::current_call_request_id();
+    if (diag_id && diag_id[0]) id.diagnostic_id = diag_id;
+    if (req_id && req_id[0]) id.request_id = req_id;
+    id.deadline_ms = mcp_standalone::current_call_deadline_ms();
+    return id;
+}
+
+struct camoufox_op_admission_t
+{
+    mcp_standalone::downstream::admission_result_t result;
+    mcp_standalone::downstream::producer_identity_t identity;
+    bool held = false;
+    bool depth_incremented = false;
+    bool skipped = false;
+    uint64_t generation_at_admit = 0;
+
+    explicit camoufox_op_admission_t(const mcp_standalone::downstream::producer_identity_t& id)
+        : identity(id), generation_at_admit(id.generation)
+    {
+        if (g_camoufox_op_admission_depth > 0)
+        {
+            skipped = true;
+            return;
+        }
+        result = mcp_standalone::downstream::governor_t::instance().try_admit(id);
+        held = result.admitted;
+        if (held)
+        {
+            ++g_camoufox_op_admission_depth;
+            depth_incremented = true;
+            diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-ADMIT tool=%s session=%s generation=%llu child_pid=%lu token=%llu depth=%u",
+                identity.tool_name.c_str(), identity.session_id.c_str(),
+                static_cast<unsigned long long>(identity.generation),
+                static_cast<unsigned long>(identity.child_pid),
+                static_cast<unsigned long long>(result.admission_token),
+                static_cast<unsigned>(g_camoufox_op_admission_depth));
+        }
+        else
+        {
+            diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-REJECT tool=%s session=%s generation=%llu child_pid=%lu reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+                identity.tool_name.c_str(), identity.session_id.c_str(),
+                static_cast<unsigned long long>(identity.generation),
+                static_cast<unsigned long>(identity.child_pid),
+                result.reason.c_str(), result.quota_name.c_str(), result.quota_scope.c_str(),
+                result.observed, result.limit);
+        }
+    }
+
+    ~camoufox_op_admission_t()
+    {
+        release("scope_exit");
+    }
+
+    camoufox_op_admission_t(const camoufox_op_admission_t&) = delete;
+    camoufox_op_admission_t& operator=(const camoufox_op_admission_t&) = delete;
+
+    void release(const char* reason)
+    {
+        if (!held) return;
+        diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-RELEASE reason=%s tool=%s session=%s token=%llu",
+            reason ? reason : "completed",
+            identity.tool_name.c_str(), identity.session_id.c_str(),
+            static_cast<unsigned long long>(result.admission_token));
+        mcp_standalone::downstream::governor_t::instance().release(result.admission_token, reason ? reason : "completed");
+        held = false;
+        if (depth_incremented)
+        {
+            if (g_camoufox_op_admission_depth > 0)
+                --g_camoufox_op_admission_depth;
+            depth_incremented = false;
+        }
+    }
+
+    bool admitted() const noexcept
+    {
+        return held || (skipped && g_camoufox_op_admission_depth > 0);
+    }
+
+    bool is_stale(uint64_t current_generation) const noexcept
+    {
+        return held && generation_at_admit != 0 && current_generation != 0 && current_generation != generation_at_admit;
+    }
+
+    const mcp_standalone::downstream::admission_result_t& rejection() const noexcept { return result; }
+    const mcp_standalone::downstream::producer_identity_t& id() const noexcept { return identity; }
+};
+
+bool acquire_launch_admission(const char* phase, const std::string& session_id, uint64_t generation, uint32_t child_pid, uint64_t& out_token)
+{
+    out_token = 0;
+    mcp_standalone::downstream::producer_identity_t id;
+    id.kind = mcp_standalone::downstream::producer_kind_t::camoufox_longop;
+    id.principal_id = "camoufox_launch";
+    id.session_id = session_id.empty() ? std::string("default") : session_id;
+    id.generation = generation;
+    id.child_pid = child_pid;
+    id.tool_name = phase ? std::string(phase) : std::string("start_bridge");
+    id.command_label = phase ? std::string(phase) : std::string("start_bridge");
+    const char* diag_id = mcp_standalone::current_call_diag_id();
+    const char* req_id = mcp_standalone::current_call_request_id();
+    if (diag_id && diag_id[0]) id.diagnostic_id = diag_id;
+    if (req_id && req_id[0]) id.request_id = req_id;
+
+    auto r = mcp_standalone::downstream::governor_t::instance().try_admit(id);
+    if (r.admitted)
+    {
+        out_token = r.admission_token;
+        diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-ADMIT phase=%s session=%s generation=%llu child_pid=%lu token=%llu kind=launch",
+            phase ? phase : "start_bridge", id.session_id.c_str(),
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(child_pid),
+            static_cast<unsigned long long>(out_token));
+        return true;
+    }
+    diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-REJECT phase=%s session=%s generation=%llu child_pid=%lu reason=%s quota=%s scope=%s observed=%zu limit=%zu kind=launch",
+        phase ? phase : "start_bridge", id.session_id.c_str(),
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(child_pid),
+        r.reason.c_str(), r.quota_name.c_str(), r.quota_scope.c_str(),
+        r.observed, r.limit);
+    return false;
+}
+
+void release_launch_admission(uint64_t token, const char* reason, const std::string& session_id)
+{
+    if (token == 0) return;
+    diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-RELEASE reason=%s session=%s token=%llu kind=launch",
+        reason ? reason : "completed",
+        session_id.empty() ? "default" : session_id.c_str(),
+        static_cast<unsigned long long>(token));
+    mcp_standalone::downstream::governor_t::instance().release(token, reason ? reason : "completed");
+}
+
+struct launch_admission_guard_t
+{
+    uint64_t* token_ptr;
+    std::string session_id;
+    bool committed = false;
+
+    launch_admission_guard_t(uint64_t* ptr, std::string sid)
+        : token_ptr(ptr), session_id(std::move(sid)) {}
+
+    ~launch_admission_guard_t()
+    {
+        if (!committed && token_ptr && *token_ptr != 0)
+        {
+            const uint64_t t = *token_ptr;
+            *token_ptr = 0;
+            release_launch_admission(t, "start_bridge_failed", session_id);
+        }
+    }
+
+    launch_admission_guard_t(const launch_admission_guard_t&) = delete;
+    launch_admission_guard_t& operator=(const launch_admission_guard_t&) = delete;
+};
 
 class scoped_child_error_mode_t
 {
@@ -2771,6 +2951,114 @@ struct process_exit_snapshot_t
     DWORD gle = 0;
     DWORD exit_code = 0;
 };
+
+struct process_identity_snapshot_t
+{
+    bool opened = false;
+    bool exit_queried = false;
+    bool image_queried = false;
+    bool times_queried = false;
+    bool alive = false;
+    DWORD gle = 0;
+    DWORD exit_code = 0;
+    DWORD image_gle = 0;
+    DWORD times_gle = 0;
+    uint64_t creation_time_100ns = 0;
+    std::string image_path;
+};
+
+std::string sidecar_executable_path_from_command(std::string command)
+{
+    while (!command.empty() && std::isspace(static_cast<unsigned char>(command.front())))
+        command.erase(command.begin());
+    while (!command.empty() && std::isspace(static_cast<unsigned char>(command.back())))
+        command.pop_back();
+    if (command.empty())
+        return {};
+    if (command.front() == '"' || command.front() == '\'')
+    {
+        const char quote = command.front();
+        const std::size_t end = command.find(quote, 1);
+        if (end != std::string::npos && end > 1)
+            return command.substr(1, end - 1);
+    }
+    const std::string lower = ascii_lower_copy(command);
+    const std::size_t exe = lower.find(".exe");
+    if (exe != std::string::npos)
+        return command.substr(0, exe + 4);
+    const std::size_t first_space = command.find_first_of(" \t\r\n");
+    return first_space == std::string::npos ? command : command.substr(0, first_space);
+}
+
+bool normalized_process_path_equal(const std::string& a, const std::string& b)
+{
+    const std::string na = normalize_launch_path(a);
+    const std::string nb = normalize_launch_path(b);
+    return !na.empty() && !nb.empty() && na == nb;
+}
+
+process_identity_snapshot_t query_process_identity_snapshot(uint32_t pid)
+{
+    process_identity_snapshot_t out;
+    if (pid == 0)
+        return out;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (!h)
+    {
+        out.gle = GetLastError();
+        return out;
+    }
+    out.opened = true;
+    out.exit_queried = GetExitCodeProcess(h, &out.exit_code) != FALSE;
+    out.gle = out.exit_queried ? 0 : GetLastError();
+    out.alive = out.exit_queried && out.exit_code == STILL_ACTIVE;
+    DWORD path_chars = 32768;
+    std::wstring image;
+    image.resize(path_chars);
+    if (QueryFullProcessImageNameW(h, 0, image.data(), &path_chars))
+    {
+        image.resize(path_chars);
+        out.image_path = wide_to_utf8(image);
+        out.image_queried = true;
+    }
+    else
+    {
+        out.image_gle = GetLastError();
+        image.clear();
+        path_chars = MAX_PATH;
+        image.resize(path_chars);
+        if (QueryFullProcessImageNameW(h, 0, image.data(), &path_chars))
+        {
+            image.resize(path_chars);
+            out.image_path = wide_to_utf8(image);
+            out.image_queried = true;
+            out.image_gle = 0;
+        }
+    }
+    FILETIME creation{}, exit_time{}, kernel{}, user{};
+    if (GetProcessTimes(h, &creation, &exit_time, &kernel, &user))
+    {
+        out.creation_time_100ns = filetime_to_u64(creation);
+        out.times_queried = true;
+    }
+    else
+    {
+        out.times_gle = GetLastError();
+    }
+    CloseHandle(h);
+    return out;
+}
+
+void populate_child_process_identity(bridge_status_t& status)
+{
+    if (status.child_pid == 0)
+        return;
+    const process_identity_snapshot_t identity = query_process_identity_snapshot(status.child_pid);
+    status.child_process_identity_available = identity.opened && identity.image_queried && identity.times_queried;
+    status.child_process_identity_gle = identity.opened ? (identity.image_queried && identity.times_queried ? 0u : (identity.image_gle != 0 ? identity.image_gle : identity.times_gle)) : identity.gle;
+    status.child_process_image_path = identity.image_path;
+    status.child_process_creation_time_100ns = identity.creation_time_100ns;
+}
 
 process_exit_snapshot_t query_process_exit_snapshot(uint32_t pid)
 {
@@ -8132,6 +8420,21 @@ bool start_bridge(const launch_config_t& cfg)
     sg().last_launch_diagnostics = nlohmann::json::object();
     publish_state(bridge_state_t::starting, std::string());
 
+    {
+        uint64_t launch_token = 0;
+        if (!acquire_launch_admission("start_bridge", effective_cfg.session_id, start_generation, 0, launch_token))
+        {
+            sg().state = bridge_state_t::error;
+            sg().last_error = "CAMOUFOX-LONGOP-REJECT: downstream producer capacity exhausted for camoufox_longop launch";
+            sg().last_launch_ms = now_ms() - bridge_start_ms;
+            publish_state(bridge_state_t::error, sg().last_error);
+            emit_stage_timing(false, "launch_admission_rejected", 0);
+            return false;
+        }
+        sg().launch_admission_token = launch_token;
+    }
+    launch_admission_guard_t launch_guard(&sg().launch_admission_token, effective_cfg.session_id);
+
     std::string python_path = effective_cfg.python_executable;
     const bool testlab_launch = test_lab_launch_fail_fast_enabled(effective_cfg);
     const bool explicit_python_cfg = !effective_cfg.python_executable.empty();
@@ -9698,6 +10001,7 @@ bool start_bridge(const launch_config_t& cfg)
     publish_state(bridge_state_t::ready, std::string());
     emit_stage_timing(true, "ready", sg().child_pid);
     clear_sticky_setup_failure("start_bridge_ready");
+    launch_guard.committed = true;
     return true;
 }
 
@@ -9829,6 +10133,9 @@ bool stop_bridge(const char* reason)
         if (sg().state == bridge_state_t::stopped)
         {
             diag::log_tagged_fmt("camoufox", "stop_bridge already_stopped reason=%s", stop_reason);
+            const uint64_t stale_launch_token = sg().launch_admission_token;
+            sg().launch_admission_token = 0;
+            const std::string stale_session = sg().session_id.empty() ? std::string("default") : sg().session_id;
             sg().client.reset();
             clear_page_state_locked();
             clear_auto_restart_block_locked("stop_bridge_already_stopped");
@@ -9836,6 +10143,8 @@ bool stop_bridge(const char* reason)
             sg().child_pid = 0;
             sg().cleanup_pending = false;
             sg().last_cleanup_ms = now_ms() - stop_start_ms;
+            lk.unlock();
+            release_launch_admission(stale_launch_token, "stop_bridge_already_stopped", stale_session);
             return true;
         }
         cli = sg().client;
@@ -9850,6 +10159,17 @@ bool stop_bridge(const char* reason)
         clear_auto_restart_block_locked("stop_bridge");
         clear_sticky_setup_failure("stop_bridge");
         mark_cleanup_started_locked(stop_generation, child_pid, std::string("stop_bridge:") + stop_reason);
+    }
+    {
+        uint64_t launch_token = 0;
+        std::string launch_session;
+        {
+            std::lock_guard<std::recursive_mutex> slk(sg().mtx);
+            launch_token = sg().launch_admission_token;
+            sg().launch_admission_token = 0;
+            launch_session = sg().session_id.empty() ? std::string("default") : sg().session_id;
+        }
+        release_launch_admission(launch_token, stop_reason, launch_session);
     }
     diag::log_tagged_fmt("camoufox", "stop_bridge cleanup_sync reason=%s generation=%llu child_pid=%lu client=%d browser_open=%d",
         stop_reason, static_cast<unsigned long long>(stop_generation), static_cast<unsigned long>(child_pid),
@@ -9923,7 +10243,11 @@ bool force_cleanup(const char* reason)
         }
         sg().active_profile_dir.clear();
         sg().active_profile_generated = false;
+        const uint64_t force_launch_token = sg().launch_admission_token;
+        sg().launch_admission_token = 0;
+        const std::string force_launch_session = sg().session_id.empty() ? std::string("default") : sg().session_id;
         lk.unlock();
+        release_launch_admission(force_launch_token, cleanup_reason, force_launch_session);
     }
     else
     {
@@ -9966,6 +10290,377 @@ bool force_cleanup(const char* reason)
         success ? 1 : 0, static_cast<unsigned long>(child_pid), reap.descendants_before, reap.alive_after,
         profile_dir.empty() ? "<empty>" : profile_dir.c_str(), static_cast<unsigned long long>(now_ms() - t0));
     return success;
+}
+
+static nlohmann::json stale_cleanup_proof_json(const stale_sidecar_cleanup_proof_t& proof)
+{
+    return {
+        {"diagnostic_id", proof.diagnostic_id},
+        {"request_id", proof.request_id},
+        {"tool", proof.tool},
+        {"action", proof.action},
+        {"bridge_session_id", proof.bridge_session_id},
+        {"mcp_session_id", proof.mcp_session_id},
+        {"mcp_session_hash", proof.mcp_session_hash},
+        {"principal_bucket", proof.principal_bucket},
+        {"expected_executable_path", proof.expected_executable_path},
+        {"expected_sidecar_pid", proof.expected_sidecar_pid},
+        {"expected_bridge_generation", proof.expected_bridge_generation},
+        {"expected_process_creation_time_100ns", proof.expected_process_creation_time_100ns},
+        {"lease_token", proof.lease_token},
+        {"registry_generation", proof.registry_generation},
+        {"operation_generation", proof.operation_generation},
+        {"sidecar_ownership_marker", proof.sidecar_ownership_marker}
+    };
+}
+
+static std::string compact_string_list(const std::vector<std::string>& values)
+{
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < values.size(); ++i)
+    {
+        if (i)
+            oss << ",";
+        oss << values[i];
+    }
+    return oss.str();
+}
+
+static void stale_cleanup_add_missing_proof_fields(const stale_sidecar_cleanup_proof_t& proof, std::vector<std::string>& missing)
+{
+    if (proof.expected_executable_path.empty())
+        missing.push_back("expected_executable_path");
+    if (proof.expected_sidecar_pid == 0)
+        missing.push_back("expected_sidecar_pid");
+    if (proof.bridge_session_id.empty())
+        missing.push_back("bridge_session_id");
+    if (proof.mcp_session_id.empty())
+        missing.push_back("mcp_session_id");
+    if (proof.mcp_session_hash.empty())
+        missing.push_back("mcp_session_hash");
+    if (proof.registry_generation == 0)
+        missing.push_back("registry_generation");
+    if (proof.lease_token == 0)
+        missing.push_back("lease_token");
+    if (proof.operation_generation == 0)
+        missing.push_back("operation_generation");
+    if (proof.principal_bucket.empty())
+        missing.push_back("principal_bucket");
+    if (proof.expected_bridge_generation == 0)
+        missing.push_back("expected_bridge_generation");
+    if (proof.expected_process_creation_time_100ns == 0)
+        missing.push_back("expected_process_creation_time_100ns");
+    if (proof.sidecar_ownership_marker.empty())
+        missing.push_back("sidecar_ownership_marker");
+}
+
+static stale_sidecar_cleanup_result_t stale_cleanup_rejected(const stale_sidecar_cleanup_proof_t& proof,
+                                                            const char* reason,
+                                                            const std::vector<std::string>& missing,
+                                                            nlohmann::json extra = nlohmann::json::object())
+{
+    stale_sidecar_cleanup_result_t result;
+    result.rejected = true;
+    result.reason = reason ? reason : "rejected";
+    result.diagnostics = {
+        {"result", "rejected"},
+        {"reason", result.reason},
+        {"missing", missing},
+        {"proof", stale_cleanup_proof_json(proof)}
+    };
+    if (extra.is_object())
+    {
+        for (auto it = extra.begin(); it != extra.end(); ++it)
+            result.diagnostics[it.key()] = it.value();
+    }
+    const std::string missing_text = compact_string_list(missing);
+    diag::log_tagged_fmt("camoufox",
+        "MCP-CAMOUFOX-STALE-CLEANUP-REJECTED reason=%s missing=%s diag_id=%s request_id=%s tool=%s action=%s bridge_session=%s mcp_session=%s session_hash=%s principal_bucket=%s lease_token=%llu operation_generation=%llu registry_generation=%llu expected_generation=%llu expected_pid=%lu expected_path=%s marker=%s",
+        result.reason.c_str(),
+        missing_text.empty() ? "<none>" : missing_text.c_str(),
+        proof.diagnostic_id.c_str(),
+        proof.request_id.c_str(),
+        proof.tool.c_str(),
+        proof.action.c_str(),
+        proof.bridge_session_id.c_str(),
+        proof.mcp_session_id.c_str(),
+        proof.mcp_session_hash.c_str(),
+        proof.principal_bucket.c_str(),
+        static_cast<unsigned long long>(proof.lease_token),
+        static_cast<unsigned long long>(proof.operation_generation),
+        static_cast<unsigned long long>(proof.registry_generation),
+        static_cast<unsigned long long>(proof.expected_bridge_generation),
+        static_cast<unsigned long>(proof.expected_sidecar_pid),
+        proof.expected_executable_path.c_str(),
+        proof.sidecar_ownership_marker.c_str());
+    return result;
+}
+
+static nlohmann::json stale_cleanup_identity_json(const process_identity_snapshot_t& identity)
+{
+    return {
+        {"opened", identity.opened},
+        {"exit_queried", identity.exit_queried},
+        {"image_queried", identity.image_queried},
+        {"times_queried", identity.times_queried},
+        {"alive", identity.alive},
+        {"gle", static_cast<uint32_t>(identity.gle)},
+        {"exit_code", static_cast<uint32_t>(identity.exit_queried ? identity.exit_code : 0)},
+        {"image_gle", static_cast<uint32_t>(identity.image_gle)},
+        {"times_gle", static_cast<uint32_t>(identity.times_gle)},
+        {"creation_time_100ns", identity.creation_time_100ns},
+        {"image_path", identity.image_path}
+    };
+}
+
+static bool stale_cleanup_process_identity_matches(const stale_sidecar_cleanup_proof_t& proof,
+                                                   const process_identity_snapshot_t& identity,
+                                                   std::vector<std::string>& mismatches)
+{
+    if (!identity.opened)
+        mismatches.push_back("process_open");
+    if (!identity.exit_queried)
+        mismatches.push_back("process_exit_query");
+    if (!identity.alive)
+        mismatches.push_back("process_alive");
+    if (!identity.image_queried || identity.image_path.empty())
+        mismatches.push_back("process_image_path");
+    else if (!normalized_process_path_equal(identity.image_path, proof.expected_executable_path))
+        mismatches.push_back("process_image_path_mismatch");
+    if (!identity.times_queried || identity.creation_time_100ns == 0)
+        mismatches.push_back("process_creation_time");
+    else if (identity.creation_time_100ns != proof.expected_process_creation_time_100ns)
+        mismatches.push_back("process_creation_time_mismatch");
+    return mismatches.empty();
+}
+
+static void clear_managed_page_state_locked(managed_session_t& session)
+{
+    session.browser_open = false;
+    session.page_verified = false;
+    session.pages.clear();
+    clear_privacy_locked(session);
+    session.active_page_id.clear();
+    session.active_page_url.clear();
+    session.active_page_title.clear();
+    session.active_profile_dir.clear();
+    session.active_profile_generated = false;
+}
+
+stale_sidecar_cleanup_result_t cleanup_stale_sidecar_if_owned(const stale_sidecar_cleanup_proof_t& proof)
+{
+    std::vector<std::string> missing;
+    stale_cleanup_add_missing_proof_fields(proof, missing);
+    if (!missing.empty())
+        return stale_cleanup_rejected(proof, "missing_proof", missing);
+
+    const std::string sid = normalize_session_id(proof.bridge_session_id);
+    const bool default_session = is_default_session_id(sid);
+    const uint64_t t0 = now_ms();
+    std::shared_ptr<mcp_client::client_t> cli;
+    uint32_t child_pid = 0;
+    uint64_t cleanup_generation = 0;
+    std::string state_command;
+    std::string state_expected_path;
+    nlohmann::json proof_state = nlohmann::json::object();
+
+    if (default_session)
+    {
+        std::unique_lock<std::recursive_mutex> lk(sg().mtx, std::try_to_lock);
+        if (!lk.owns_lock())
+            return stale_cleanup_rejected(proof, "bridge_state_lock_busy", {});
+
+        state_command = sg().server_command;
+        state_expected_path = sidecar_executable_path_from_command(state_command);
+        proof_state = {
+            {"state_session_id", sg().session_id.empty() ? std::string("default") : sg().session_id},
+            {"state_generation", sg().generation},
+            {"state_child_pid", sg().child_pid},
+            {"state_server_command", state_command},
+            {"state_expected_executable_path", state_expected_path},
+            {"state_cleanup_pending", sg().cleanup_pending},
+            {"state_cleanup_child_pid", sg().cleanup_child_pid}
+        };
+        std::vector<std::string> mismatches;
+        if (normalize_session_id(sg().session_id.empty() ? std::string("default") : sg().session_id) != sid)
+            mismatches.push_back("bridge_session_id_mismatch");
+        if (sg().generation != proof.expected_bridge_generation)
+            mismatches.push_back("bridge_generation_mismatch");
+        if (sg().child_pid != proof.expected_sidecar_pid)
+            mismatches.push_back("sidecar_pid_mismatch");
+        if (state_expected_path.empty())
+            mismatches.push_back("state_expected_executable_path");
+        else if (!normalized_process_path_equal(state_expected_path, proof.expected_executable_path))
+            mismatches.push_back("state_executable_path_mismatch");
+        if (sg().cleanup_pending)
+            mismatches.push_back("cleanup_already_pending");
+        if (!mismatches.empty())
+            return stale_cleanup_rejected(proof, "state_proof_mismatch", mismatches, proof_state);
+
+        const process_identity_snapshot_t identity = query_process_identity_snapshot(proof.expected_sidecar_pid);
+        std::vector<std::string> identity_mismatches;
+        if (!stale_cleanup_process_identity_matches(proof, identity, identity_mismatches))
+        {
+            proof_state["process_identity"] = stale_cleanup_identity_json(identity);
+            return stale_cleanup_rejected(proof, "process_identity_mismatch", identity_mismatches, proof_state);
+        }
+
+        cli = sg().client;
+        child_pid = sg().child_pid;
+        cleanup_generation = ++sg().generation;
+        sg().stop_epoch.fetch_add(1, std::memory_order_acq_rel);
+        sg().stop_requested.store(true, std::memory_order_release);
+        sg().client.reset();
+        sg().server_command.clear();
+        clear_page_state_locked();
+        sg().child_pid = 0;
+        sg().state = bridge_state_t::stopped;
+        sg().last_error = std::string("mcp stale sidecar cleanup: ") + proof.diagnostic_id;
+        clear_auto_restart_block_locked("mcp_stale_sidecar_cleanup");
+        clear_sticky_setup_failure("mcp_stale_sidecar_cleanup");
+        mark_cleanup_started_locked(cleanup_generation, child_pid, std::string("mcp_stale_sidecar_cleanup:") + proof.diagnostic_id);
+        const uint64_t stale_launch_token = sg().launch_admission_token;
+        sg().launch_admission_token = 0;
+        const std::string stale_launch_session = sg().session_id.empty() ? std::string("default") : sg().session_id;
+        proof_state["process_identity"] = stale_cleanup_identity_json(identity);
+        proof_state["cleanup_generation"] = cleanup_generation;
+        lk.unlock();
+        release_launch_admission(stale_launch_token, "stale_cleanup", stale_launch_session);
+    }
+    else
+    {
+        auto session = get_managed_session(sid, false);
+        if (!session)
+            return stale_cleanup_rejected(proof, "managed_session_missing", {});
+        std::unique_lock<std::recursive_mutex> lk(session->mtx, std::try_to_lock);
+        if (!lk.owns_lock())
+            return stale_cleanup_rejected(proof, "managed_state_lock_busy", {});
+
+        state_command = session->server_command;
+        state_expected_path = sidecar_executable_path_from_command(state_command);
+        proof_state = {
+            {"state_session_id", session->session_id},
+            {"state_generation", session->generation},
+            {"state_child_pid", session->child_pid},
+            {"state_server_command", state_command},
+            {"state_expected_executable_path", state_expected_path},
+            {"state_cleanup_pending", session->cleanup_pending}
+        };
+        std::vector<std::string> mismatches;
+        if (normalize_session_id(session->session_id) != sid)
+            mismatches.push_back("bridge_session_id_mismatch");
+        if (session->generation != proof.expected_bridge_generation)
+            mismatches.push_back("bridge_generation_mismatch");
+        if (session->child_pid != proof.expected_sidecar_pid)
+            mismatches.push_back("sidecar_pid_mismatch");
+        if (state_expected_path.empty())
+            mismatches.push_back("state_expected_executable_path");
+        else if (!normalized_process_path_equal(state_expected_path, proof.expected_executable_path))
+            mismatches.push_back("state_executable_path_mismatch");
+        if (session->cleanup_pending)
+            mismatches.push_back("cleanup_already_pending");
+        if (!mismatches.empty())
+            return stale_cleanup_rejected(proof, "state_proof_mismatch", mismatches, proof_state);
+
+        const process_identity_snapshot_t identity = query_process_identity_snapshot(proof.expected_sidecar_pid);
+        std::vector<std::string> identity_mismatches;
+        if (!stale_cleanup_process_identity_matches(proof, identity, identity_mismatches))
+        {
+            proof_state["process_identity"] = stale_cleanup_identity_json(identity);
+            return stale_cleanup_rejected(proof, "process_identity_mismatch", identity_mismatches, proof_state);
+        }
+
+        cli = session->client;
+        child_pid = session->child_pid;
+        cleanup_generation = ++session->generation;
+        session->stop_requested.store(true, std::memory_order_release);
+        session->client.reset();
+        session->server_command.clear();
+        session->child_pid = 0;
+        session->state = bridge_state_t::stopped;
+        session->last_error = std::string("mcp stale sidecar cleanup: ") + proof.diagnostic_id;
+        clear_managed_page_state_locked(*session);
+        session->cleanup_pending = true;
+        session->cleanup_generation = cleanup_generation;
+        session->cleanup_started_ms = now_ms();
+        session->cleanup_child_pid = child_pid;
+        session->cleanup_reason = std::string("mcp_stale_sidecar_cleanup:") + proof.diagnostic_id;
+        session->cleanup_diagnostics = {
+            {"status", "pending"},
+            {"reason", session->cleanup_reason},
+            {"proof", stale_cleanup_proof_json(proof)},
+            {"process_identity", stale_cleanup_identity_json(identity)}
+        };
+        proof_state["process_identity"] = stale_cleanup_identity_json(identity);
+        proof_state["cleanup_generation"] = cleanup_generation;
+        const uint64_t stale_managed_launch_token = session->launch_admission_token;
+        session->launch_admission_token = 0;
+        const std::string stale_managed_session_id = session->session_id;
+        lk.unlock();
+        release_launch_admission(stale_managed_launch_token, "stale_cleanup", stale_managed_session_id);
+    }
+
+    stale_sidecar_cleanup_result_t result;
+    result.attempted = true;
+    const process_tree_reap_result_t reap = terminate_process_tree_sync(child_pid, std::string("mcp_stale_sidecar_cleanup:") + proof.diagnostic_id);
+    if (cli)
+        cli->disconnect();
+
+    if (default_session)
+    {
+        mark_cleanup_finished(cleanup_generation, now_ms() - t0, std::string("mcp_stale_sidecar_cleanup:") + proof.diagnostic_id);
+    }
+    else
+    {
+        auto session = get_managed_session(sid, false);
+        if (session)
+        {
+            std::lock_guard<std::recursive_mutex> lk(session->mtx);
+            session->cleanup_pending = false;
+            session->last_cleanup_ms = now_ms() - t0;
+            session->cleanup_diagnostics["status"] = reap.alive_after == 0 ? "finished" : "finished_with_live_processes";
+            session->cleanup_diagnostics["process_reap"] = cleanup_reap_json(reap);
+            session->cleanup_diagnostics["elapsed_ms"] = now_ms() - t0;
+            session->cleanup_child_pid = 0;
+        }
+    }
+
+    result.cleaned = reap.alive_after == 0;
+    result.reason = result.cleaned ? "cleaned" : "cleanup_incomplete";
+    result.diagnostics = {
+        {"result", result.reason},
+        {"attempted", true},
+        {"cleaned", result.cleaned},
+        {"proof", stale_cleanup_proof_json(proof)},
+        {"state", proof_state},
+        {"process_reap", cleanup_reap_json(reap)},
+        {"elapsed_ms", now_ms() - t0}
+    };
+    publish_state(bridge_state_t::stopped, std::string());
+    diag::log_tagged_fmt("camoufox",
+        "MCP-CAMOUFOX-STALE-CLEANUP result=%s cleaned=%d diag_id=%s request_id=%s tool=%s action=%s bridge_session=%s mcp_session=%s session_hash=%s principal_bucket=%s lease_token=%llu operation_generation=%llu registry_generation=%llu expected_generation=%llu expected_pid=%lu expected_path=%s creation_time_100ns=%llu cleanup_generation=%llu reap_before=%zu reap_alive_after=%zu elapsed_ms=%llu",
+        result.reason.c_str(),
+        result.cleaned ? 1 : 0,
+        proof.diagnostic_id.c_str(),
+        proof.request_id.c_str(),
+        proof.tool.c_str(),
+        proof.action.c_str(),
+        proof.bridge_session_id.c_str(),
+        proof.mcp_session_id.c_str(),
+        proof.mcp_session_hash.c_str(),
+        proof.principal_bucket.c_str(),
+        static_cast<unsigned long long>(proof.lease_token),
+        static_cast<unsigned long long>(proof.operation_generation),
+        static_cast<unsigned long long>(proof.registry_generation),
+        static_cast<unsigned long long>(proof.expected_bridge_generation),
+        static_cast<unsigned long>(proof.expected_sidecar_pid),
+        proof.expected_executable_path.c_str(),
+        static_cast<unsigned long long>(proof.expected_process_creation_time_100ns),
+        static_cast<unsigned long long>(cleanup_generation),
+        reap.before,
+        reap.alive_after,
+        static_cast<unsigned long long>(now_ms() - t0));
+    return result;
 }
 
 bool wait_until_idle(uint32_t timeout_ms, const char* reason)
@@ -10749,6 +11444,11 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
     s.last_launch_diagnostics = session->last_launch_diagnostics;
     s.page_verified = session->page_verified;
     s.cleanup_pending = session->cleanup_pending;
+    s.cleanup_generation = session->cleanup_generation;
+    s.cleanup_started_ms = session->cleanup_started_ms;
+    s.cleanup_child_pid = session->cleanup_child_pid;
+    s.cleanup_reason = session->cleanup_reason;
+    s.cleanup_diagnostics = session->cleanup_diagnostics;
     s.generation = session->generation;
     s.last_launch_ms = session->last_launch_ms;
     s.last_nav_ms = session->last_nav_ms;
@@ -10758,6 +11458,7 @@ bridge_status_t managed_status(const std::shared_ptr<managed_session_t>& session
     s.page_count = static_cast<uint32_t>(session->pages.size());
     s.session_count = managed_session_count();
     s.child_alive = process_alive(s.child_pid);
+    populate_child_process_identity(s);
     populate_process_counts(s);
     const bool client_connected = session->client != nullptr;
     if (s.state == bridge_state_t::ready && (!s.child_alive || !s.browser_open || !s.page_verified || !s.privacy_verified || !usable_browser_process_count(s.browser_process_count)))
@@ -11307,6 +12008,20 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         session->generation++;
         managed_generation = session->generation;
     }
+    {
+        uint64_t managed_launch_token = 0;
+        if (!acquire_launch_admission("start_managed_bridge", sid, managed_generation, 0, managed_launch_token))
+        {
+            std::lock_guard<std::recursive_mutex> lk(session->mtx);
+            session->state = bridge_state_t::error;
+            session->last_error = "CAMOUFOX-LONGOP-REJECT: downstream producer capacity exhausted for camoufox_longop managed launch";
+            return false;
+        }
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        session->launch_admission_token = managed_launch_token;
+    }
+    launch_admission_guard_t managed_launch_guard(&session->launch_admission_token, sid);
+
     const std::string cwd_log = wide_to_utf8(current_dir_w());
     const auto workdir_it = scfg.env.find("AIDA_CAMOUFOX_WORKING_DIR");
     const auto profile_it = scfg.env.find("AIDA_CAMOUFOX_PROFILE_ROOT");
@@ -11979,6 +12694,7 @@ bool start_managed_bridge(const launch_config_t& cfg, const std::string& session
         static_cast<unsigned long long>(now_ms() - t0),
         static_cast<unsigned long>(cli->child_process_id()));
     clear_sticky_setup_failure("managed_start_ready");
+    managed_launch_guard.committed = true;
     return true;
 }
 
@@ -12016,6 +12732,10 @@ bool stop_managed_bridge(const std::string& session_id, const char* reason)
         session->active_page_title.clear();
         session->last_error.clear();
         session->last_cleanup_ms = 0;
+        const uint64_t managed_launch_token = session->launch_admission_token;
+        session->launch_admission_token = 0;
+        lk.unlock();
+        release_launch_admission(managed_launch_token, stop_reason, sid);
     }
     clear_sticky_setup_failure("managed_stop_bridge");
     if (child_pid != 0)
@@ -12047,6 +12767,7 @@ bridge_status_t get_status()
         s.phase = "state_busy";
         s.readiness_phase = "starting";
         s.last_debug_event = "get_status_busy";
+        populate_child_process_identity(s);
         populate_process_counts(s);
         diag::log_tagged_fmt("camoufox", "get_status busy child_pid=%lu child_alive=%d calls=%llu errors=%llu readiness_phase=%s",
             static_cast<unsigned long>(s.child_pid), s.child_alive ? 1 : 0,
@@ -12097,6 +12818,7 @@ bridge_status_t get_status()
     s.last_cleanup_ms = sg().last_cleanup_ms;
     s.last_verified_ms = sg().last_verified_ms;
     s.child_alive     = process_alive(s.child_pid);
+    populate_child_process_identity(s);
     populate_process_counts(s);
     bool client_connected = sg().client != nullptr;
     std::shared_ptr<mcp_client::client_t> cleanup_client;
@@ -12321,6 +13043,25 @@ bool force_cleanup(const std::string& session_id, const char* reason)
 
 call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args, int timeout_ms)
 {
+    const uint64_t pre_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t pre_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto op_identity = build_camoufox_op_identity(tool_name.c_str(), "default", pre_admission_generation, pre_admission_child_pid);
+    camoufox_op_admission_t op_admission(op_identity);
+    if (!op_admission.admitted())
+    {
+        call_result_t rejected;
+        rejected.ok = false;
+        rejected.error = "CAMOUFOX-LONGOP-REJECT: " + op_admission.rejection().reason;
+        rejected.data = mcp_standalone::downstream::rejection_json(op_admission.rejection(), op_admission.id());
+        diag::log_tagged_fmt("camoufox", "call_tool longop_rejected tool=%s session=default reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            tool_name.c_str(),
+            op_admission.rejection().reason.c_str(),
+            op_admission.rejection().quota_name.c_str(),
+            op_admission.rejection().quota_scope.c_str(),
+            op_admission.rejection().observed,
+            op_admission.rejection().limit);
+        return rejected;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     const uint64_t call_start_ms = now_ms();
     const uint64_t request_id = next_request_id();
@@ -12511,6 +13252,19 @@ call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args
         static_cast<unsigned long long>(exit.generation), static_cast<unsigned long>(exit.child_pid),
         bridge_state_name(exit.state), static_cast<int>(exit.browser_open), static_cast<int>(exit.page_verified),
         static_cast<int>(exit.child_alive), static_cast<int>(exit.cleanup_pending));
+    if (op_admission.is_stale(exit.generation))
+    {
+        diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-TOMBSTONE tool=%s session=default request_id=%llu admit_generation=%llu exit_generation=%llu ok=%d reason=generation_changed_discard",
+            tool_name.c_str(), static_cast<unsigned long long>(request_id),
+            static_cast<unsigned long long>(op_admission.generation_at_admit),
+            static_cast<unsigned long long>(exit.generation),
+            static_cast<int>(r.ok));
+        call_result_t tombstoned;
+        tombstoned.ok = false;
+        tombstoned.error = "CAMOUFOX-LONGOP-TOMBSTONE: result arrived after bridge generation changed; discarded";
+        tombstoned.data = nlohmann::json{{"tombstoned", true}, {"admit_generation", op_admission.generation_at_admit}, {"exit_generation", exit.generation}, {"tool", tool_name}};
+        return tombstoned;
+    }
     return r;
 }
 
@@ -12526,6 +13280,31 @@ call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args
         out.error = std::string("camoufox session is not running: ") + normalize_session_id(session_id);
         out.data = nlohmann::json{{"error", out.error}, {"session_id", normalize_session_id(session_id)}};
         return out;
+    }
+    const std::string managed_sid = session->session_id;
+    uint64_t managed_admission_generation = 0;
+    uint32_t managed_admission_child_pid = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        managed_admission_generation = session->generation;
+        managed_admission_child_pid = session->child_pid;
+    }
+    auto op_identity = build_camoufox_op_identity(tool_name.c_str(), managed_sid, managed_admission_generation, managed_admission_child_pid);
+    camoufox_op_admission_t op_admission(op_identity);
+    if (!op_admission.admitted())
+    {
+        call_result_t rejected;
+        rejected.ok = false;
+        rejected.error = "CAMOUFOX-LONGOP-REJECT: " + op_admission.rejection().reason;
+        rejected.data = mcp_standalone::downstream::rejection_json(op_admission.rejection(), op_admission.id());
+        diag::log_tagged_fmt("camoufox", "call_tool longop_rejected tool=%s session=%s reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            tool_name.c_str(), managed_sid.c_str(),
+            op_admission.rejection().reason.c_str(),
+            op_admission.rejection().quota_name.c_str(),
+            op_admission.rejection().quota_scope.c_str(),
+            op_admission.rejection().observed,
+            op_admission.rejection().limit);
+        return rejected;
     }
     std::lock_guard<std::recursive_mutex> op_lk(session->operation_mtx);
     nlohmann::json safe_args = args.is_null() ? nlohmann::json::object() : args;
@@ -12567,6 +13346,24 @@ call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args
                 session->session_id.c_str(), tool_name.c_str(), requested_page_id.c_str(), restore_page_id.c_str(),
                 restore_result.error.c_str(), json_shape(restore_result.data).c_str());
         }
+    }
+    uint64_t managed_exit_generation = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        managed_exit_generation = session->generation;
+    }
+    if (op_admission.is_stale(managed_exit_generation))
+    {
+        diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-TOMBSTONE tool=%s session=%s admit_generation=%llu exit_generation=%llu ok=%d reason=generation_changed_discard",
+            tool_name.c_str(), managed_sid.c_str(),
+            static_cast<unsigned long long>(op_admission.generation_at_admit),
+            static_cast<unsigned long long>(managed_exit_generation),
+            static_cast<int>(r.ok));
+        call_result_t tombstoned;
+        tombstoned.ok = false;
+        tombstoned.error = "CAMOUFOX-LONGOP-TOMBSTONE: result arrived after session generation changed; discarded";
+        tombstoned.data = nlohmann::json{{"tombstoned", true}, {"admit_generation", op_admission.generation_at_admit}, {"exit_generation", managed_exit_generation}, {"tool", tool_name}, {"session_id", managed_sid}};
+        return tombstoned;
     }
     return r;
 }
@@ -13029,6 +13826,22 @@ call_result_t list_network_requests(size_t max_records, const std::string& sessi
 
 bool navigate(const std::string& url, const std::string& wait_until, int timeout_ms)
 {
+    const uint64_t nav_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t nav_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto nav_identity = build_camoufox_op_identity("navigate", "default", nav_admission_generation, nav_admission_child_pid);
+    camoufox_op_admission_t nav_admission(nav_identity);
+    if (!nav_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + nav_admission.rejection().reason);
+        diag::log_tagged_fmt("camoufox", "navigate longop_rejected session=default reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            nav_admission.rejection().reason.c_str(),
+            nav_admission.rejection().quota_name.c_str(),
+            nav_admission.rejection().quota_scope.c_str(),
+            nav_admission.rejection().observed,
+            nav_admission.rejection().limit);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     const uint64_t nav_start_ms = now_ms();
     const url_log_t u = summarize_url_for_log(url);
@@ -13306,6 +14119,16 @@ bool navigate(const std::string& url, const std::string& wait_until, int timeout
 
 bool reload(const std::string& wait_until)
 {
+    const uint64_t reload_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t reload_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto reload_identity = build_camoufox_op_identity("reload", "default", reload_admission_generation, reload_admission_child_pid);
+    camoufox_op_admission_t reload_admission(reload_identity);
+    if (!reload_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + reload_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "reload entry wait_until=%s", wait_until.c_str());
     nlohmann::json a;
@@ -13346,6 +14169,24 @@ bool reload(const std::string& wait_until)
 
 call_result_t evaluate_js(const std::string& expression, bool await_promise)
 {
+    const uint64_t eval_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t eval_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto eval_identity = build_camoufox_op_identity("evaluate_js", "default", eval_admission_generation, eval_admission_child_pid);
+    camoufox_op_admission_t eval_admission(eval_identity);
+    if (!eval_admission.admitted())
+    {
+        call_result_t rejected;
+        rejected.ok = false;
+        rejected.error = "CAMOUFOX-LONGOP-REJECT: " + eval_admission.rejection().reason;
+        rejected.data = mcp_standalone::downstream::rejection_json(eval_admission.rejection(), eval_admission.id());
+        diag::log_tagged_fmt("camoufox", "evaluate_js longop_rejected session=default reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            eval_admission.rejection().reason.c_str(),
+            eval_admission.rejection().quota_name.c_str(),
+            eval_admission.rejection().quota_scope.c_str(),
+            eval_admission.rejection().observed,
+            eval_admission.rejection().limit);
+        return rejected;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "evaluate_js entry expr_len=%zu await=%d",
         expression.size(), static_cast<int>(await_promise));
@@ -13359,6 +14200,16 @@ call_result_t evaluate_js(const std::string& expression, bool await_promise)
 
 bool add_init_script(const std::string& js)
 {
+    const uint64_t ais_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t ais_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto ais_identity = build_camoufox_op_identity("add_init_script", "default", ais_admission_generation, ais_admission_child_pid);
+    camoufox_op_admission_t ais_admission(ais_identity);
+    if (!ais_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + ais_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "add_init_script entry js_len=%zu", js.size());
     if (js.empty())
@@ -13584,6 +14435,16 @@ call_result_t get_page_info()
 
 bool take_screenshot(const std::string& output_path, bool full_page)
 {
+    const uint64_t ss_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t ss_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto ss_identity = build_camoufox_op_identity("take_screenshot", "default", ss_admission_generation, ss_admission_child_pid);
+    camoufox_op_admission_t ss_admission(ss_identity);
+    if (!ss_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + ss_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "take_screenshot entry path=%s full_page=%d",
         output_path.c_str(), static_cast<int>(full_page));
@@ -13672,6 +14533,16 @@ bool take_screenshot(const std::string& output_path, bool full_page)
 
 bool take_snapshot(std::string& out_text)
 {
+    const uint64_t snap_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t snap_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto snap_identity = build_camoufox_op_identity("take_snapshot", "default", snap_admission_generation, snap_admission_child_pid);
+    camoufox_op_admission_t snap_admission(snap_identity);
+    if (!snap_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + snap_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "take_snapshot entry");
     out_text.clear();
@@ -13697,6 +14568,16 @@ bool take_snapshot(std::string& out_text)
 
 bool click(const std::string& selector)
 {
+    const uint64_t click_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t click_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto click_identity = build_camoufox_op_identity("click", "default", click_admission_generation, click_admission_child_pid);
+    camoufox_op_admission_t click_admission(click_identity);
+    if (!click_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + click_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     const uint64_t request_id = next_request_id();
     diag::log_tagged_fmt("camoufox", "click entry request_id=%llu selector=%s", static_cast<unsigned long long>(request_id), selector_for_log(selector).c_str());
@@ -13713,6 +14594,16 @@ bool click(const std::string& selector)
 
 bool type_text(const std::string& selector, const std::string& text)
 {
+    const uint64_t tt_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t tt_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto tt_identity = build_camoufox_op_identity("type_text", "default", tt_admission_generation, tt_admission_child_pid);
+    camoufox_op_admission_t tt_admission(tt_identity);
+    if (!tt_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + tt_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     const uint64_t request_id = next_request_id();
     diag::log_tagged_fmt("camoufox", "type_text entry request_id=%llu selector=%s text_len=%zu",
@@ -13731,6 +14622,16 @@ bool type_text(const std::string& selector, const std::string& text)
 
 bool wait_for(const std::string& selector, int timeout_ms)
 {
+    const uint64_t wf_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t wf_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto wf_identity = build_camoufox_op_identity("wait_for", "default", wf_admission_generation, wf_admission_child_pid);
+    camoufox_op_admission_t wf_admission(wf_identity);
+    if (!wf_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + wf_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     const uint64_t request_id = next_request_id();
     diag::log_tagged_fmt("camoufox", "wait_for entry request_id=%llu selector=%s timeout_ms=%d",
@@ -13846,6 +14747,16 @@ bool wait_for(const std::string& selector, int timeout_ms, const std::string& se
 
 bool reset_browser_state()
 {
+    const uint64_t rbs_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t rbs_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto rbs_identity = build_camoufox_op_identity("reset_browser_state", "default", rbs_admission_generation, rbs_admission_child_pid);
+    camoufox_op_admission_t rbs_admission(rbs_identity);
+    if (!rbs_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + rbs_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "reset_browser_state entry");
     std::string restore_page_id;
@@ -13884,6 +14795,16 @@ bool reset_browser_state()
 
 bool inject_hook_preset(const std::string& preset_name)
 {
+    const uint64_t ihp_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t ihp_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto ihp_identity = build_camoufox_op_identity("inject_hook_preset", "default", ihp_admission_generation, ihp_admission_child_pid);
+    camoufox_op_admission_t ihp_admission(ihp_identity);
+    if (!ihp_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + ihp_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "inject_hook_preset entry preset=%s", preset_name.c_str());
     if (preset_name.empty())
@@ -13910,6 +14831,16 @@ bool inject_hook_preset(const std::string& preset_name)
 
 bool hook_function(const std::string& target, const std::string& mode)
 {
+    const uint64_t hf_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t hf_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto hf_identity = build_camoufox_op_identity("hook_function", "default", hf_admission_generation, hf_admission_child_pid);
+    camoufox_op_admission_t hf_admission(hf_identity);
+    if (!hf_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + hf_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "hook_function entry target=%s mode=%s", target.c_str(), mode.c_str());
     if (target.empty())
@@ -13936,6 +14867,16 @@ bool hook_function(const std::string& target, const std::string& mode)
 
 bool remove_hooks()
 {
+    const uint64_t rh_admission_generation = [&] { std::lock_guard<std::recursive_mutex> lk(sg().mtx); return sg().generation; }();
+    const uint32_t rh_admission_child_pid = sg().tracked_child_pid.load(std::memory_order_acquire);
+    auto rh_identity = build_camoufox_op_identity("remove_hooks", "default", rh_admission_generation, rh_admission_child_pid);
+    camoufox_op_admission_t rh_admission(rh_identity);
+    if (!rh_admission.admitted())
+    {
+        std::lock_guard<std::recursive_mutex> lk(sg().mtx);
+        set_error_locked(std::string("CAMOUFOX-LONGOP-REJECT: ") + rh_admission.rejection().reason);
+        return false;
+    }
     std::lock_guard<std::recursive_mutex> op_lk(sg().operation_mtx);
     diag::log_tagged_fmt("camoufox", "remove_hooks entry");
     nlohmann::json a;
@@ -13965,6 +14906,41 @@ std::string last_error()
     return e;
 }
 
+nlohmann::json get_downstream_snapshot()
+{
+    nlohmann::json snapshot = mcp_standalone::downstream::governor_t::instance().snapshot_json();
+    nlohmann::json camoufox_kind = nlohmann::json::object();
+    if (snapshot.contains("by_kind") && snapshot["by_kind"].is_array())
+    {
+        for (const auto& entry : snapshot["by_kind"])
+        {
+            if (entry.is_object() && entry.value("kind", std::string()) == "camoufox_longop")
+            {
+                camoufox_kind = entry;
+                break;
+            }
+        }
+    }
+    nlohmann::json out;
+    out["producer_kind"] = "camoufox_longop";
+    out["kind_snapshot"] = camoufox_kind;
+    out["global_active"] = camoufox_kind.value("active", 0);
+    out["total_admitted"] = camoufox_kind.value("total_admitted", static_cast<uint64_t>(0));
+    out["total_rejected"] = camoufox_kind.value("total_rejected", static_cast<uint64_t>(0));
+    out["total_released"] = camoufox_kind.value("total_released", static_cast<uint64_t>(0));
+    out["oldest_active_ms"] = camoufox_kind.value("oldest_active_ms", static_cast<uint64_t>(0));
+    out["quotas"] = mcp_standalone::downstream::governor_t::instance().quota_json()["camoufox_longop"];
+    out["governor_total_active"] = snapshot.value("total_active", 0);
+    out["governor_shutdown_pending"] = snapshot.value("shutdown_pending", 0);
+    diag::log_tagged_fmt("camoufox", "get_downstream_snapshot active=%zu admitted=%llu rejected=%llu released=%llu",
+        static_cast<size_t>(out["global_active"].get<uint64_t>()),
+        static_cast<unsigned long long>(out["total_admitted"].get<uint64_t>()),
+        static_cast<unsigned long long>(out["total_rejected"].get<uint64_t>()),
+        static_cast<unsigned long long>(out["total_released"].get<uint64_t>()));
+    return out;
+}
+
+}
 }
 }
 }

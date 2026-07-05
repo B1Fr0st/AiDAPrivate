@@ -20,6 +20,7 @@
 #include "core/ui/motion.hpp"
 #include "core/ui/transition.hpp"
 #include "core/ui/theme.hpp"
+#include "core/ui/ui_thread_dispatcher.hpp"
 #include "core/ui/blur_layer.hpp"
 #include "core/ui/components.hpp"
 #include "core/ui/fonts.hpp"
@@ -36,6 +37,8 @@
 #include "core/anti-tamper/mcp_posture.hpp"
 #include "core/anti-tamper/enforcement.hpp"
 #include "core/runtime/reason_ids.hpp"
+#include "core/mcp/mcp_standalone.hpp"
+#include "core/tools/command_sessions.hpp"
 #include "network_view.hpp"
 #include "memory_scanner.hpp"
 #include "mitm_proxy.hpp"
@@ -62,6 +65,13 @@
 #include "core/analysis/pdb_parser.hpp"
 #include "core/auth/auth_http.hpp"
 #include "core/ui/loading_binary_overlay.hpp"
+#include "core/diagnostics/metadata_ring.hpp"
+#include "core/diagnostics/wer_correlation.hpp"
+#include "core/diagnostics/crash_snapshot.hpp"
+#include "core/diagnostics/window_hung_snapshot.hpp"
+#include "core/diagnostics/observer.hpp"
+#include "core/infra/executor.hpp"
+#include "core/infra/taskflow_evaluation.hpp"
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <dbghelp.h>
@@ -89,7 +99,9 @@ namespace test_all_features {
 #include <sstream>
 #include <string>
 #include <mutex>
+#include <deque>
 #include <utility>
+#include <vector>
 #if defined(_M_X64)
 #include <intrin.h>
 #endif
@@ -222,6 +234,7 @@ static size_t image_size_from_headers(HMODULE image)
             return 0;
         return static_cast<size_t>(nt->OptionalHeader.SizeOfImage);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "early_image_size_seh");
         return 0;
     }
 }
@@ -439,12 +452,16 @@ static void write_exception_line(const char* handler, EXCEPTION_POINTERS* ep, bo
 static LONG CALLBACK early_veh(EXCEPTION_POINTERS* ep)
 {
     write_exception_line("early_veh", ep, false);
+    if (ep && ep->ExceptionRecord)
+        aida::diagnostics::crash::emit_crash_breadcrumb(ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, "early_veh");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static LONG WINAPI early_unhandled(EXCEPTION_POINTERS* ep)
 {
     write_exception_line("early_unhandled", ep, true);
+    if (ep && ep->ExceptionRecord)
+        aida::diagnostics::crash::emit_crash_breadcrumb(ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress, "early_unhandled");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -499,6 +516,7 @@ helpers helper;
 HWND g_hwnd = nullptr;
 static constexpr const wchar_t* kAidaWindowTitle = L"AiDA Standalone";
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
+static constexpr UINT kAidaUiDispatcherWakeMessage = WM_APP + 0x1DB;
 static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE;
 static constexpr UINT kAidaQueuedNoSendPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT;
 static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
@@ -548,6 +566,1006 @@ static constexpr uint32_t kAidaDirtyWork = 0x00000800u;
 static constexpr uint32_t kAidaDirtySecurity = 0x00001000u;
 static constexpr uint32_t kAidaDirtyInteractiveCadence = 0x00002000u;
 
+namespace aida::ui_thread {
+
+namespace {
+
+struct ui_dispatch_task_t {
+    std::uint64_t id = 0;
+    DWORD producer_pid = 0;
+    DWORD producer_tid = 0;
+    DWORD ui_owner_tid_at_enqueue = 0;
+    std::uint64_t queued_ms = 0;
+    std::uint64_t deadline_ms = 0;
+    std::string subsystem;
+    std::string label;
+    std::string phase;
+    std::string owner;
+    priority_t priority = priority_t::normal;
+    bool cancellation_registered = false;
+    std::function<bool()> cancelled;
+    task_t task;
+};
+
+static constexpr std::size_t kUiDispatchMaxDepth = 2048;
+static constexpr std::size_t kUiDispatchPressureDepth = 128;
+static constexpr std::uint64_t kUiDispatchPressureIntervalMs = 1000;
+static constexpr std::uint64_t kUiDispatchBacklogIntervalMs = 1000;
+static std::mutex g_ui_dispatch_mtx;
+static std::deque<ui_dispatch_task_t> g_ui_dispatch_queue;
+static std::atomic<DWORD> g_ui_owner_tid{0};
+static std::atomic<UINT_PTR> g_ui_dispatch_hwnd{0};
+static std::atomic<bool> g_ui_dispatch_ready{false};
+static std::atomic<bool> g_ui_dispatch_window_destroying{false};
+static std::atomic<bool> g_ui_dispatch_wake_pending{false};
+static std::atomic<bool> g_ui_dispatch_shutdown{false};
+static std::atomic<std::uint64_t> g_ui_dispatch_next_id{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_enqueued{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_executed{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_discarded{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_rejected{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_rejected_shutdown{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_rejected_full{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_rejected_not_ready{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_rejected_cancelled{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_wake_posted{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_wake_thread_posted{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_wake_failed{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_wake_coalesced{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_drain_calls{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_drain_cancelled{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_budget_hits{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_backlog_logs{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_last_drain_ms{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_last_task_ms{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_last_task_id{0};
+static std::atomic<std::size_t> g_ui_dispatch_last_depth{0};
+static std::atomic<std::size_t> g_ui_dispatch_max_depth{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_oldest_queued_ms{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_last_backlog_log_ms{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_active_task_id{0};
+static std::atomic<DWORD> g_ui_dispatch_active_producer_tid{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_active_started_ms{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_affinity_violations{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_last_drain_ts{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_last_wake_ts{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_task_budget_hits{0};
+static std::atomic<std::uint64_t> g_ui_dispatch_time_budget_hits{0};
+
+static std::uint64_t ui_dispatch_now_ms()
+{
+    return static_cast<std::uint64_t>(::GetTickCount64());
+}
+
+static const char* ui_dispatch_text(const char* value)
+{
+    return value && value[0] ? value : "<none>";
+}
+
+static const char* ui_dispatch_text(const std::string& value)
+{
+    return value.empty() ? "<none>" : value.c_str();
+}
+
+static std::string ui_dispatch_copy_text(const char* value, const char* fallback)
+{
+    const char* source = value && value[0] ? value : fallback;
+    std::string out = source ? source : "";
+    if (out.size() > 96)
+        out.resize(96);
+    for (char& ch : out) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c < 0x20 || c == 0x7F)
+            ch = '_';
+    }
+    return out;
+}
+
+static int ui_dispatch_priority_rank(priority_t priority)
+{
+    switch (priority) {
+    case priority_t::critical: return 3;
+    case priority_t::high: return 2;
+    case priority_t::normal: return 1;
+    case priority_t::low: return 0;
+    default: return 1;
+    }
+}
+
+static void ui_dispatch_refresh_metrics_locked()
+{
+    const std::size_t depth = g_ui_dispatch_queue.size();
+    g_ui_dispatch_last_depth.store(depth, std::memory_order_release);
+    std::size_t max_depth = g_ui_dispatch_max_depth.load(std::memory_order_acquire);
+    while (depth > max_depth && !g_ui_dispatch_max_depth.compare_exchange_weak(max_depth, depth, std::memory_order_acq_rel)) {
+    }
+    std::uint64_t oldest = 0;
+    for (const ui_dispatch_task_t& task : g_ui_dispatch_queue) {
+        if (task.queued_ms != 0 && (oldest == 0 || task.queued_ms < oldest))
+            oldest = task.queued_ms;
+    }
+    g_ui_dispatch_oldest_queued_ms.store(oldest, std::memory_order_release);
+}
+
+static std::uint64_t ui_dispatch_oldest_age_ms(std::uint64_t now)
+{
+    const std::uint64_t oldest = g_ui_dispatch_oldest_queued_ms.load(std::memory_order_acquire);
+    if (oldest == 0 || now < oldest)
+        return 0;
+    return now - oldest;
+}
+
+static void ui_dispatch_count_reject(enqueue_result_t result)
+{
+    g_ui_dispatch_rejected.fetch_add(1, std::memory_order_acq_rel);
+    switch (result) {
+    case enqueue_result_t::rejected_shutdown:
+        g_ui_dispatch_rejected_shutdown.fetch_add(1, std::memory_order_acq_rel);
+        break;
+    case enqueue_result_t::rejected_full:
+        g_ui_dispatch_rejected_full.fetch_add(1, std::memory_order_acq_rel);
+        break;
+    case enqueue_result_t::rejected_not_ui_ready:
+        g_ui_dispatch_rejected_not_ready.fetch_add(1, std::memory_order_acq_rel);
+        break;
+    case enqueue_result_t::rejected_cancelled:
+        g_ui_dispatch_rejected_cancelled.fetch_add(1, std::memory_order_acq_rel);
+        break;
+    default:
+        break;
+    }
+}
+
+static void ui_dispatch_log_reject(enqueue_result_t result,
+    const char* reason,
+    const ui_dispatch_task_t& task,
+    std::size_t depth)
+{
+    ui_dispatch_count_reject(result);
+    const std::uint64_t now = ui_dispatch_now_ms();
+    diag::log_tagged_critical_fmt("ui_dispatcher",
+        "UI-DISPATCHER-REJECT result=%s reason=%s task_id=%llu label=\"%.96s\" owner=\"%.96s\" subsystem=\"%.96s\" phase=\"%.96s\" priority=%s enqueue_pid=%lu enqueue_tid=%lu ui_owner_tid=%lu queued_ms=%llu now_ms=%llu deadline_ms=%llu cancellation=%d ready=%d shutdown=%d destroying=%d depth=%zu oldest_age_ms=%llu rejected_shutdown=%llu rejected_full=%llu rejected_not_ui_ready=%llu rejected_cancelled=%llu",
+        result_name(result),
+        ui_dispatch_text(reason),
+        static_cast<unsigned long long>(task.id),
+        ui_dispatch_text(task.label),
+        ui_dispatch_text(task.owner),
+        ui_dispatch_text(task.subsystem),
+        ui_dispatch_text(task.phase),
+        priority_name(task.priority),
+        static_cast<unsigned long>(task.producer_pid),
+        static_cast<unsigned long>(task.producer_tid),
+        static_cast<unsigned long>(task.ui_owner_tid_at_enqueue),
+        static_cast<unsigned long long>(task.queued_ms),
+        static_cast<unsigned long long>(now),
+        static_cast<unsigned long long>(task.deadline_ms),
+        task.cancellation_registered ? 1 : 0,
+        g_ui_dispatch_ready.load(std::memory_order_acquire) ? 1 : 0,
+        g_ui_dispatch_shutdown.load(std::memory_order_acquire) ? 1 : 0,
+        g_ui_dispatch_window_destroying.load(std::memory_order_acquire) ? 1 : 0,
+        depth,
+        static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(now)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_shutdown.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_full.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_not_ready.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_cancelled.load(std::memory_order_acquire)));
+}
+
+static bool ui_dispatch_cancelled(const ui_dispatch_task_t& task, std::uint64_t now, const char** reason_out)
+{
+    if (task.deadline_ms != 0 && now >= task.deadline_ms) {
+        if (reason_out)
+            *reason_out = "deadline_expired";
+        return true;
+    }
+    if (!task.cancelled)
+        return false;
+    bool cancelled_now = true;
+    try {
+        cancelled_now = task.cancelled();
+    } catch (const std::exception& ex) {
+        diag::log_tagged_critical_fmt("ui_dispatcher",
+            "UI-DISPATCHER-REJECT result=%s reason=cancellation_probe_exception task_id=%llu label=\"%.96s\" owner=\"%.96s\" what=%.180s",
+            result_name(enqueue_result_t::rejected_cancelled),
+            static_cast<unsigned long long>(task.id),
+            ui_dispatch_text(task.label),
+            ui_dispatch_text(task.owner),
+            ex.what());
+    } catch (...) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "ui_dispatcher_cancellation_probe");
+        diag::log_tagged_critical_fmt("ui_dispatcher",
+            "UI-DISPATCHER-REJECT result=%s reason=cancellation_probe_exception task_id=%llu label=\"%.96s\" owner=\"%.96s\" what=<unknown>",
+            result_name(enqueue_result_t::rejected_cancelled),
+            static_cast<unsigned long long>(task.id),
+            ui_dispatch_text(task.label),
+            ui_dispatch_text(task.owner));
+    }
+    if (cancelled_now && reason_out)
+        *reason_out = "cancelled";
+    return cancelled_now;
+}
+
+static bool ui_dispatch_post_wake_locked(const char* subsystem, const char* label, const char* phase)
+{
+    if (g_ui_dispatch_shutdown.load(std::memory_order_acquire) ||
+        g_ui_dispatch_window_destroying.load(std::memory_order_acquire) ||
+        !g_ui_dispatch_ready.load(std::memory_order_acquire)) {
+        g_ui_dispatch_wake_failed.fetch_add(1, std::memory_order_acq_rel);
+        diag::log_tagged_critical_fmt("UI-DISPATCHER-BACKLOG",
+            "UI-DISPATCHER-WAKE reason=blocked subsystem=%s label=%s phase=%s owner_tid=%lu ready=%d shutdown=%d destroying=%d depth=%zu wake_failed=%llu payload=0",
+            ui_dispatch_text(subsystem),
+            ui_dispatch_text(label),
+            ui_dispatch_text(phase),
+            static_cast<unsigned long>(g_ui_owner_tid.load(std::memory_order_acquire)),
+            g_ui_dispatch_ready.load(std::memory_order_acquire) ? 1 : 0,
+            g_ui_dispatch_shutdown.load(std::memory_order_acquire) ? 1 : 0,
+            g_ui_dispatch_window_destroying.load(std::memory_order_acquire) ? 1 : 0,
+            g_ui_dispatch_last_depth.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(g_ui_dispatch_wake_failed.load(std::memory_order_acquire)));
+        return false;
+    }
+    if (g_ui_dispatch_wake_pending.exchange(true, std::memory_order_acq_rel)) {
+        g_ui_dispatch_wake_coalesced.fetch_add(1, std::memory_order_acq_rel);
+        diag::log_tagged_fmt("ui_dispatcher",
+            "UI-DISPATCHER-WAKE reason=coalesced subsystem=%s label=%s phase=%s owner_tid=%lu depth=%zu oldest_age_ms=%llu wake_pending=1 coalesced=%llu payload=0",
+            ui_dispatch_text(subsystem),
+            ui_dispatch_text(label),
+            ui_dispatch_text(phase),
+            static_cast<unsigned long>(g_ui_owner_tid.load(std::memory_order_acquire)),
+            g_ui_dispatch_last_depth.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(ui_dispatch_now_ms())),
+            static_cast<unsigned long long>(g_ui_dispatch_wake_coalesced.load(std::memory_order_acquire)));
+        return true;
+    }
+
+    BOOL posted = FALSE;
+    BOOL thread_posted = FALSE;
+    DWORD gle = 0;
+    DWORD thread_gle = 0;
+    HWND hwnd = reinterpret_cast<HWND>(g_ui_dispatch_hwnd.load(std::memory_order_acquire));
+    if (!hwnd)
+        hwnd = g_hwnd;
+    if (hwnd && ::IsWindow(hwnd) && !g_ui_dispatch_window_destroying.load(std::memory_order_acquire)) {
+        ::SetLastError(0);
+        posted = ::PostMessageW(hwnd, kAidaUiDispatcherWakeMessage, 0, 0);
+        gle = posted ? 0UL : ::GetLastError();
+    }
+    if (!posted) {
+        const DWORD tid = g_ui_owner_tid.load(std::memory_order_acquire);
+        if (tid != 0) {
+            ::SetLastError(0);
+            thread_posted = ::PostThreadMessageW(tid, kAidaUiDispatcherWakeMessage, 0, 0);
+            thread_gle = thread_posted ? 0UL : ::GetLastError();
+        } else {
+            thread_gle = ERROR_INVALID_THREAD_ID;
+        }
+    }
+
+    if (!posted && !thread_posted) {
+        g_ui_dispatch_wake_pending.store(false, std::memory_order_release);
+        g_ui_dispatch_wake_failed.fetch_add(1, std::memory_order_acq_rel);
+        diag::log_tagged_critical_fmt("UI-DISPATCHER-BACKLOG",
+            "UI-DISPATCHER-WAKE reason=failed subsystem=%s label=%s phase=%s hwnd=0x%llX owner_tid=%lu hwnd_gle=%lu thread_gle=%lu pending=%zu wake_failed=%llu tid=%lu payload=0",
+            ui_dispatch_text(subsystem),
+            ui_dispatch_text(label),
+            ui_dispatch_text(phase),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+            static_cast<unsigned long>(g_ui_owner_tid.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(gle),
+            static_cast<unsigned long>(thread_gle),
+            g_ui_dispatch_last_depth.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(g_ui_dispatch_wake_failed.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(::GetCurrentThreadId()));
+        return false;
+    }
+
+    if (posted)
+        g_ui_dispatch_wake_posted.fetch_add(1, std::memory_order_acq_rel);
+    if (thread_posted)
+        g_ui_dispatch_wake_thread_posted.fetch_add(1, std::memory_order_acq_rel);
+    g_ui_dispatch_last_wake_ts.store(ui_dispatch_now_ms(), std::memory_order_release);
+    diag::log_tagged_critical_fmt("ui_dispatcher",
+        "UI-DISPATCHER-WAKE reason=posted subsystem=%s label=%s phase=%s hwnd=0x%llX hwnd_posted=%d hwnd_gle=%lu thread_posted=%d thread_gle=%lu owner_tid=%lu wake_pending=%d depth=%zu oldest_age_ms=%llu posts=%llu thread_posts=%llu failures=%llu payload=0",
+        ui_dispatch_text(subsystem),
+        ui_dispatch_text(label),
+        ui_dispatch_text(phase),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        posted ? 1 : 0,
+        static_cast<unsigned long>(gle),
+        thread_posted ? 1 : 0,
+        static_cast<unsigned long>(thread_gle),
+        static_cast<unsigned long>(g_ui_owner_tid.load(std::memory_order_acquire)),
+        g_ui_dispatch_wake_pending.load(std::memory_order_acquire) ? 1 : 0,
+        g_ui_dispatch_last_depth.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(ui_dispatch_now_ms())),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_posted.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_thread_posted.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_failed.load(std::memory_order_acquire)));
+    return true;
+}
+
+static void ui_dispatch_log_pressure(const char* event,
+    const char* subsystem,
+    const char* label,
+    const char* phase,
+    std::size_t depth,
+    std::uint64_t id,
+    std::uint64_t wait_ms,
+    bool force)
+{
+    static std::atomic<std::uint64_t> s_last_pressure_log_ms{0};
+    const std::uint64_t now = ui_dispatch_now_ms();
+    std::uint64_t last = s_last_pressure_log_ms.load(std::memory_order_acquire);
+    if (!force) {
+        if (depth < kUiDispatchPressureDepth && now - last < kUiDispatchPressureIntervalMs)
+            return;
+        if (now - last < kUiDispatchPressureIntervalMs)
+            return;
+        if (!s_last_pressure_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel))
+            return;
+    } else {
+        s_last_pressure_log_ms.store(now, std::memory_order_release);
+    }
+    g_ui_dispatch_backlog_logs.fetch_add(1, std::memory_order_acq_rel);
+    diag::log_tagged_critical_fmt("UI-DISPATCHER-BACKLOG",
+        "event=%s subsystem=%s label=%s phase=%s id=%llu depth=%zu wait_ms=%llu owner_tid=%lu current_tid=%lu enqueued=%llu executed=%llu discarded=%llu rejected=%llu wake_pending=%d wake_posted=%llu wake_failed=%llu shutdown=%d",
+        ui_dispatch_text(event),
+        ui_dispatch_text(subsystem),
+        ui_dispatch_text(label),
+        ui_dispatch_text(phase),
+        static_cast<unsigned long long>(id),
+        depth,
+        static_cast<unsigned long long>(wait_ms),
+        static_cast<unsigned long>(g_ui_owner_tid.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        static_cast<unsigned long long>(g_ui_dispatch_enqueued.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_executed.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_discarded.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected.load(std::memory_order_acquire)),
+        g_ui_dispatch_wake_pending.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(g_ui_dispatch_wake_posted.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_failed.load(std::memory_order_acquire)),
+        g_ui_dispatch_shutdown.load(std::memory_order_acquire) ? 1 : 0);
+}
+
+static void ui_affinity_log_marker(const char* marker,
+    const char* subsystem,
+    const char* label,
+    const char* phase,
+    std::size_t depth,
+    DWORD gle)
+{
+    static std::atomic<std::uint64_t> s_last_violation_log_ms{0};
+    static std::atomic<std::uint64_t> s_last_routed_log_ms{0};
+    static std::atomic<std::uint64_t> s_violation_suppressed{0};
+    static std::atomic<std::uint64_t> s_routed_suppressed{0};
+    const bool routed = marker && std::strcmp(marker, "UI-AFFINITY-ROUTED") == 0;
+    if (!routed)
+        g_ui_dispatch_affinity_violations.fetch_add(1, std::memory_order_acq_rel);
+    std::atomic<std::uint64_t>& last_ref = routed ? s_last_routed_log_ms : s_last_violation_log_ms;
+    std::atomic<std::uint64_t>& suppressed_ref = routed ? s_routed_suppressed : s_violation_suppressed;
+    const std::uint64_t now = ui_dispatch_now_ms();
+    std::uint64_t last = last_ref.load(std::memory_order_acquire);
+    if (last != 0 && now - last < 1000ULL) {
+        suppressed_ref.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    if (!last_ref.compare_exchange_strong(last, now, std::memory_order_acq_rel)) {
+        suppressed_ref.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    const std::uint64_t suppressed = suppressed_ref.exchange(0, std::memory_order_acq_rel);
+    diag::log_tagged_critical_fmt("ui_affinity",
+        "%s owner_tid=%lu current_tid=%lu subsystem=%s label=%s phase=%s queue_depth=%zu enqueued=%llu executed=%llu discarded=%llu rejected=%llu wake_pending=%d wake_posted=%llu wake_failed=%llu suppressed=%llu gle=%lu",
+        marker ? marker : "UI-AFFINITY-VIOLATION",
+        static_cast<unsigned long>(g_ui_owner_tid.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        ui_dispatch_text(subsystem),
+        ui_dispatch_text(label),
+        ui_dispatch_text(phase),
+        depth,
+        static_cast<unsigned long long>(g_ui_dispatch_enqueued.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_executed.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_discarded.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected.load(std::memory_order_acquire)),
+        g_ui_dispatch_wake_pending.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(g_ui_dispatch_wake_posted.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_failed.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(suppressed),
+        static_cast<unsigned long>(gle));
+}
+
+}
+
+const char* result_name(enqueue_result_t result)
+{
+    switch (result) {
+    case enqueue_result_t::accepted: return "accepted";
+    case enqueue_result_t::rejected_shutdown: return "rejected_shutdown";
+    case enqueue_result_t::rejected_full: return "rejected_full";
+    case enqueue_result_t::rejected_not_ui_ready: return "rejected_not_ui_ready";
+    case enqueue_result_t::rejected_cancelled: return "rejected_cancelled";
+    default: return "unknown";
+    }
+}
+
+const char* priority_name(priority_t priority)
+{
+    switch (priority) {
+    case priority_t::low: return "low";
+    case priority_t::normal: return "normal";
+    case priority_t::high: return "high";
+    case priority_t::critical: return "critical";
+    default: return "normal";
+    }
+}
+
+void capture_owner_tid(DWORD tid, const char* subsystem, const char* label, const char* phase)
+{
+    if (tid == 0)
+        return;
+    DWORD expected = 0;
+    if (g_ui_owner_tid.compare_exchange_strong(expected, tid, std::memory_order_acq_rel)) {
+        diag::log_tagged_critical_fmt("UI-DISPATCHER-BACKLOG",
+            "owner_capture subsystem=%s label=%s phase=%s previous_tid=%lu owner_tid=%lu current_tid=%lu",
+            ui_dispatch_text(subsystem),
+            ui_dispatch_text(label),
+            ui_dispatch_text(phase),
+            0UL,
+            static_cast<unsigned long>(tid),
+            static_cast<unsigned long>(::GetCurrentThreadId()));
+        return;
+    }
+    if (expected != tid)
+        ui_affinity_log_marker("UI-AFFINITY-VIOLATION", subsystem, label, phase, pending_count(), GetLastError());
+}
+
+DWORD owner_tid()
+{
+    return g_ui_owner_tid.load(std::memory_order_acquire);
+}
+
+bool is_owner_thread()
+{
+    const DWORD owner = owner_tid();
+    return owner != 0 && owner == ::GetCurrentThreadId();
+}
+
+bool require_owner(const char* subsystem, const char* label, const char* phase)
+{
+    if (is_owner_thread())
+        return true;
+    g_ui_dispatch_rejected.fetch_add(1, std::memory_order_acq_rel);
+    ui_affinity_log_marker("UI-AFFINITY-VIOLATION", subsystem, label, phase, pending_count(), GetLastError());
+    return false;
+}
+
+enqueue_result_t post(task_t task, post_options_t options)
+{
+    const std::uint64_t queued_ms = ui_dispatch_now_ms();
+    ui_dispatch_task_t item;
+    item.id = g_ui_dispatch_next_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+    item.producer_pid = ::GetCurrentProcessId();
+    item.producer_tid = ::GetCurrentThreadId();
+    item.ui_owner_tid_at_enqueue = owner_tid();
+    item.queued_ms = queued_ms;
+    item.deadline_ms = options.deadline_ms;
+    item.subsystem = ui_dispatch_copy_text(options.subsystem, "ui");
+    item.label = ui_dispatch_copy_text(options.label, "task");
+    item.phase = ui_dispatch_copy_text(options.phase, "unspecified");
+    item.owner = ui_dispatch_copy_text(options.owner, item.subsystem.c_str());
+    item.priority = options.priority;
+    item.cancellation_registered = static_cast<bool>(options.cancelled);
+    item.cancelled = std::move(options.cancelled);
+    item.task = std::move(task);
+
+    auto log_route_reject = [&](std::size_t depth, DWORD gle) {
+        if (!is_owner_thread())
+            ui_affinity_log_marker("UI-AFFINITY-VIOLATION",
+                item.subsystem.c_str(),
+                item.label.c_str(),
+                item.phase.c_str(),
+                depth,
+                gle);
+    };
+
+    if (!item.task) {
+        ui_dispatch_log_reject(enqueue_result_t::rejected_cancelled, "empty_task", item, pending_count());
+        log_route_reject(g_ui_dispatch_last_depth.load(std::memory_order_acquire), ERROR_CANCELLED);
+        return enqueue_result_t::rejected_cancelled;
+    }
+    if (g_ui_dispatch_shutdown.load(std::memory_order_acquire) || g_ui_dispatch_window_destroying.load(std::memory_order_acquire)) {
+        ui_dispatch_log_reject(enqueue_result_t::rejected_shutdown, "shutdown_or_window_destroying", item, pending_count());
+        log_route_reject(g_ui_dispatch_last_depth.load(std::memory_order_acquire), ERROR_SHUTDOWN_IN_PROGRESS);
+        return enqueue_result_t::rejected_shutdown;
+    }
+    if (!g_ui_dispatch_ready.load(std::memory_order_acquire) || item.ui_owner_tid_at_enqueue == 0) {
+        ui_dispatch_log_reject(enqueue_result_t::rejected_not_ui_ready, "ui_not_ready", item, pending_count());
+        log_route_reject(g_ui_dispatch_last_depth.load(std::memory_order_acquire), ERROR_NOT_READY);
+        return enqueue_result_t::rejected_not_ui_ready;
+    }
+    const char* cancel_reason = nullptr;
+    if (ui_dispatch_cancelled(item, queued_ms, &cancel_reason)) {
+        ui_dispatch_log_reject(enqueue_result_t::rejected_cancelled, cancel_reason ? cancel_reason : "cancelled", item, pending_count());
+        log_route_reject(g_ui_dispatch_last_depth.load(std::memory_order_acquire), ERROR_CANCELLED);
+        return enqueue_result_t::rejected_cancelled;
+    }
+    const std::uint64_t log_id = item.id;
+    const DWORD log_pid = item.producer_pid;
+    const DWORD log_tid = item.producer_tid;
+    const DWORD log_owner_tid = item.ui_owner_tid_at_enqueue;
+    const std::uint64_t log_deadline = item.deadline_ms;
+    const std::string log_label = item.label;
+    const std::string log_owner = item.owner;
+    const std::string log_subsystem = item.subsystem;
+    const std::string log_phase = item.phase;
+    const priority_t log_priority = item.priority;
+    const bool log_cancellation = item.cancellation_registered;
+
+    std::size_t depth = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ui_dispatch_mtx);
+        if (g_ui_dispatch_shutdown.load(std::memory_order_acquire) || g_ui_dispatch_window_destroying.load(std::memory_order_acquire)) {
+            ui_dispatch_refresh_metrics_locked();
+            const std::size_t locked_depth = g_ui_dispatch_last_depth.load(std::memory_order_acquire);
+            ui_dispatch_log_reject(enqueue_result_t::rejected_shutdown, "shutdown_or_window_destroying_locked", item, locked_depth);
+            log_route_reject(locked_depth, ERROR_SHUTDOWN_IN_PROGRESS);
+            return enqueue_result_t::rejected_shutdown;
+        }
+        if (!g_ui_dispatch_ready.load(std::memory_order_acquire) || owner_tid() == 0) {
+            ui_dispatch_refresh_metrics_locked();
+            const std::size_t locked_depth = g_ui_dispatch_last_depth.load(std::memory_order_acquire);
+            ui_dispatch_log_reject(enqueue_result_t::rejected_not_ui_ready, "ui_not_ready_locked", item, locked_depth);
+            log_route_reject(locked_depth, ERROR_NOT_READY);
+            return enqueue_result_t::rejected_not_ui_ready;
+        }
+        if (g_ui_dispatch_queue.size() >= kUiDispatchMaxDepth) {
+            depth = g_ui_dispatch_queue.size();
+            ui_dispatch_refresh_metrics_locked();
+            ui_dispatch_log_reject(enqueue_result_t::rejected_full, "queue_full", item, depth);
+            log_route_reject(depth, ERROR_NOT_ENOUGH_MEMORY);
+            return enqueue_result_t::rejected_full;
+        }
+        g_ui_dispatch_queue.push_back(std::move(item));
+        depth = g_ui_dispatch_queue.size();
+        ui_dispatch_refresh_metrics_locked();
+        g_ui_dispatch_enqueued.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    const std::uint64_t now = ui_dispatch_now_ms();
+    diag::log_tagged_critical_fmt("ui_dispatcher",
+        "UI-DISPATCHER-ENQUEUE result=%s task_id=%llu label=\"%.96s\" owner=\"%.96s\" subsystem=\"%.96s\" phase=\"%.96s\" priority=%s enqueue_pid=%lu enqueue_tid=%lu ui_owner_tid=%lu queued_ms=%llu deadline_ms=%llu cancellation=%d depth=%zu max_depth=%zu oldest_age_ms=%llu accepted=%llu",
+        result_name(enqueue_result_t::accepted),
+        static_cast<unsigned long long>(log_id),
+        ui_dispatch_text(log_label),
+        ui_dispatch_text(log_owner),
+        ui_dispatch_text(log_subsystem),
+        ui_dispatch_text(log_phase),
+        priority_name(log_priority),
+        static_cast<unsigned long>(log_pid),
+        static_cast<unsigned long>(log_tid),
+        static_cast<unsigned long>(log_owner_tid),
+        static_cast<unsigned long long>(queued_ms),
+        static_cast<unsigned long long>(log_deadline),
+        log_cancellation ? 1 : 0,
+        depth,
+        g_ui_dispatch_max_depth.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(now)),
+        static_cast<unsigned long long>(g_ui_dispatch_enqueued.load(std::memory_order_acquire)));
+    ui_dispatch_log_pressure("queued", options.subsystem, options.label, options.phase, depth, g_ui_dispatch_next_id.load(std::memory_order_acquire), 0, false);
+    const bool wake_posted = ui_dispatch_post_wake_locked(options.subsystem, options.label, options.phase);
+    const DWORD owner = owner_tid();
+    if (owner != 0 && ::GetCurrentThreadId() != owner)
+        ui_affinity_log_marker(wake_posted ? "UI-AFFINITY-ROUTED" : "UI-AFFINITY-VIOLATION",
+            options.subsystem,
+            options.label,
+            options.phase,
+            depth,
+            wake_posted ? 0UL : GetLastError());
+    return enqueue_result_t::accepted;
+}
+
+bool post(task_t task, const char* subsystem, const char* label, const char* phase)
+{
+    post_options_t options;
+    options.subsystem = subsystem;
+    options.label = label;
+    options.phase = phase;
+    options.owner = subsystem;
+    options.priority = priority_t::normal;
+    return post(std::move(task), std::move(options)) == enqueue_result_t::accepted;
+}
+
+bool wake(const char* subsystem, const char* label, const char* phase)
+{
+    const bool posted = ui_dispatch_post_wake_locked(subsystem, label, phase);
+    const DWORD owner = owner_tid();
+    if (owner != 0 && owner != ::GetCurrentThreadId())
+        ui_affinity_log_marker(posted ? "UI-AFFINITY-ROUTED" : "UI-AFFINITY-VIOLATION",
+            subsystem,
+            label,
+            phase,
+            pending_count(),
+            posted ? 0UL : GetLastError());
+    return posted;
+}
+
+std::uint32_t drain(std::uint32_t task_budget, std::uint64_t time_budget_ms, const char* phase)
+{
+    capture_owner_tid(::GetCurrentThreadId(), "ui_dispatcher", "drain", phase);
+    g_ui_dispatch_drain_calls.fetch_add(1, std::memory_order_acq_rel);
+    if (g_ui_dispatch_shutdown.load(std::memory_order_acquire)) {
+        shutdown();
+        return 0;
+    }
+    if (!g_ui_dispatch_ready.load(std::memory_order_acquire) ||
+        g_ui_dispatch_window_destroying.load(std::memory_order_acquire))
+        return 0;
+
+    const std::uint32_t max_tasks = task_budget == 0 ? 1u : task_budget;
+    const std::uint64_t budget_ms = time_budget_ms == 0 ? 1u : time_budget_ms;
+    const std::uint64_t drain_start = ui_dispatch_now_ms();
+    std::uint32_t ran = 0;
+    for (;;) {
+        ui_dispatch_task_t item;
+        std::size_t depth_after_pop = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_ui_dispatch_mtx);
+            if (g_ui_dispatch_queue.empty()) {
+                ui_dispatch_refresh_metrics_locked();
+                break;
+            }
+            auto best = g_ui_dispatch_queue.begin();
+            for (auto it = g_ui_dispatch_queue.begin(); it != g_ui_dispatch_queue.end(); ++it) {
+                const int rank = ui_dispatch_priority_rank(it->priority);
+                const int best_rank = ui_dispatch_priority_rank(best->priority);
+                if (rank > best_rank || (rank == best_rank && it->queued_ms < best->queued_ms))
+                    best = it;
+            }
+            item = std::move(*best);
+            g_ui_dispatch_queue.erase(best);
+            depth_after_pop = g_ui_dispatch_queue.size();
+            ui_dispatch_refresh_metrics_locked();
+        }
+
+        if (!item.task) {
+            g_ui_dispatch_discarded.fetch_add(1, std::memory_order_acq_rel);
+            ui_dispatch_log_pressure("discard_empty_task", item.subsystem.c_str(), item.label.c_str(), item.phase.c_str(), depth_after_pop, item.id, 0, true);
+        } else {
+            const std::uint64_t task_start = ui_dispatch_now_ms();
+            const std::uint64_t wait_ms = task_start >= item.queued_ms ? task_start - item.queued_ms : 0;
+            const char* cancel_reason = nullptr;
+            if (ui_dispatch_cancelled(item, task_start, &cancel_reason)) {
+                g_ui_dispatch_drain_cancelled.fetch_add(1, std::memory_order_acq_rel);
+                g_ui_dispatch_discarded.fetch_add(1, std::memory_order_acq_rel);
+                ui_dispatch_log_reject(enqueue_result_t::rejected_cancelled, cancel_reason ? cancel_reason : "cancelled_before_drain", item, depth_after_pop);
+            } else {
+                if (wait_ms >= 250 || depth_after_pop >= kUiDispatchPressureDepth)
+                    ui_dispatch_log_pressure("dequeue_pressure", item.subsystem.c_str(), item.label.c_str(), item.phase.c_str(), depth_after_pop, item.id, wait_ms, false);
+                g_ui_dispatch_active_task_id.store(item.id, std::memory_order_release);
+                g_ui_dispatch_active_producer_tid.store(item.producer_tid, std::memory_order_release);
+                g_ui_dispatch_active_started_ms.store(task_start, std::memory_order_release);
+                diag::log_tagged_critical_fmt("ui_dispatcher",
+                    "UI-DISPATCHER-DRAIN event=task_start phase=%s task_id=%llu label=\"%.96s\" owner=\"%.96s\" subsystem=\"%.96s\" priority=%s enqueue_pid=%lu enqueue_tid=%lu ui_owner_tid=%lu ui_tid=%lu queued_ms=%llu queued_age_ms=%llu deadline_ms=%llu cancellation=%d remaining_before=%zu",
+                    ui_dispatch_text(phase),
+                    static_cast<unsigned long long>(item.id),
+                    ui_dispatch_text(item.label),
+                    ui_dispatch_text(item.owner),
+                    ui_dispatch_text(item.subsystem),
+                    priority_name(item.priority),
+                    static_cast<unsigned long>(item.producer_pid),
+                    static_cast<unsigned long>(item.producer_tid),
+                    static_cast<unsigned long>(item.ui_owner_tid_at_enqueue),
+                    static_cast<unsigned long>(::GetCurrentThreadId()),
+                    static_cast<unsigned long long>(item.queued_ms),
+                    static_cast<unsigned long long>(wait_ms),
+                    static_cast<unsigned long long>(item.deadline_ms),
+                    item.cancellation_registered ? 1 : 0,
+                    depth_after_pop);
+            try {
+                aida::diagnostic_exception_scope::scope_t exception_scope("ui_thread_dispatcher.task");
+                item.task();
+                g_ui_dispatch_executed.fetch_add(1, std::memory_order_acq_rel);
+            } catch (const std::exception& ex) {
+                g_ui_dispatch_discarded.fetch_add(1, std::memory_order_acq_rel);
+                diag::log_tagged_critical_fmt("UI-DISPATCHER-BACKLOG",
+                    "task_exception subsystem=%s label=%s phase=%s id=%llu wait_ms=%llu err=%s",
+                    ui_dispatch_text(item.subsystem),
+                    ui_dispatch_text(item.label),
+                    ui_dispatch_text(item.phase),
+                    static_cast<unsigned long long>(item.id),
+                    static_cast<unsigned long long>(wait_ms),
+                    ex.what());
+            } catch (...) {
+                aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "ui_dispatcher_backlog");
+                g_ui_dispatch_discarded.fetch_add(1, std::memory_order_acq_rel);
+                diag::log_tagged_critical_fmt("UI-DISPATCHER-BACKLOG",
+                    "task_unknown_exception subsystem=%s label=%s phase=%s id=%llu wait_ms=%llu",
+                    ui_dispatch_text(item.subsystem),
+                    ui_dispatch_text(item.label),
+                    ui_dispatch_text(item.phase),
+                    static_cast<unsigned long long>(item.id),
+                    static_cast<unsigned long long>(wait_ms));
+            }
+            const std::uint64_t task_ms = ui_dispatch_now_ms() - task_start;
+            g_ui_dispatch_last_task_ms.store(task_ms, std::memory_order_release);
+            g_ui_dispatch_last_task_id.store(item.id, std::memory_order_release);
+            g_ui_dispatch_active_task_id.store(0, std::memory_order_release);
+            g_ui_dispatch_active_producer_tid.store(0, std::memory_order_release);
+            g_ui_dispatch_active_started_ms.store(0, std::memory_order_release);
+            diag::log_tagged_critical_fmt("ui_dispatcher",
+                "UI-DISPATCHER-DRAIN event=task_end phase=%s task_id=%llu label=\"%.96s\" owner=\"%.96s\" run_ms=%llu ran=%u remaining_after=%zu total_drained=%llu",
+                ui_dispatch_text(phase),
+                static_cast<unsigned long long>(item.id),
+                ui_dispatch_text(item.label),
+                ui_dispatch_text(item.owner),
+                static_cast<unsigned long long>(task_ms),
+                ran + 1,
+                g_ui_dispatch_last_depth.load(std::memory_order_acquire),
+                static_cast<unsigned long long>(g_ui_dispatch_executed.load(std::memory_order_acquire)));
+            if (task_ms >= 8) {
+                ui_dispatch_log_pressure("task_slow", item.subsystem.c_str(), item.label.c_str(), item.phase.c_str(), depth_after_pop, item.id, wait_ms, true);
+            }
+            }
+        }
+
+        ++ran;
+        const std::uint64_t elapsed = ui_dispatch_now_ms() - drain_start;
+        if (ran >= max_tasks) {
+            g_ui_dispatch_task_budget_hits.fetch_add(1, std::memory_order_acq_rel);
+            break;
+        }
+        if (elapsed >= budget_ms) {
+            g_ui_dispatch_time_budget_hits.fetch_add(1, std::memory_order_acq_rel);
+            break;
+        }
+    }
+
+    const std::uint64_t drain_ms = ui_dispatch_now_ms() - drain_start;
+    g_ui_dispatch_last_drain_ms.store(drain_ms, std::memory_order_release);
+    g_ui_dispatch_last_drain_ts.store(ui_dispatch_now_ms(), std::memory_order_release);
+    const std::size_t remaining = pending_count();
+    if (remaining != 0) {
+        g_ui_dispatch_budget_hits.fetch_add(1, std::memory_order_acq_rel);
+        diag::log_tagged_critical_fmt("ui_dispatcher",
+            "UI-DISPATCHER-BUDGET-HIT phase=%s ran=%u remaining=%zu task_budget=%u time_budget_ms=%llu elapsed_ms=%llu oldest_age_ms=%llu budget_hits=%llu",
+            ui_dispatch_text(phase),
+            ran,
+            remaining,
+            max_tasks,
+            static_cast<unsigned long long>(budget_ms),
+            static_cast<unsigned long long>(drain_ms),
+            static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(ui_dispatch_now_ms())),
+            static_cast<unsigned long long>(g_ui_dispatch_budget_hits.load(std::memory_order_acquire)));
+        ui_dispatch_log_pressure("drain_budget_yield", "ui_dispatcher", "drain", phase, remaining, 0, drain_ms, false);
+        wake("ui_dispatcher", "drain_rewake", phase);
+    } else {
+        g_ui_dispatch_wake_pending.store(false, std::memory_order_release);
+    }
+    if (ran != 0 || remaining != 0) {
+        diag::log_tagged_fmt("ui_dispatcher",
+            "UI-DISPATCHER-DRAIN event=summary phase=%s ran=%u remaining=%zu elapsed_ms=%llu task_budget=%u time_budget_ms=%llu drain_calls=%llu drain_cancelled=%llu oldest_age_ms=%llu",
+            ui_dispatch_text(phase),
+            ran,
+            remaining,
+            static_cast<unsigned long long>(drain_ms),
+            max_tasks,
+            static_cast<unsigned long long>(budget_ms),
+            static_cast<unsigned long long>(g_ui_dispatch_drain_calls.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(g_ui_dispatch_drain_cancelled.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(ui_dispatch_now_ms())));
+    }
+    return ran;
+}
+
+std::size_t pending_count()
+{
+    std::lock_guard<std::mutex> lock(g_ui_dispatch_mtx);
+    ui_dispatch_refresh_metrics_locked();
+    return g_ui_dispatch_queue.size();
+}
+
+void format_snapshot(char* out, std::size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    const std::uint64_t now = ui_dispatch_now_ms();
+    const std::size_t pending = pending_count();
+    const std::uint64_t active_started = g_ui_dispatch_active_started_ms.load(std::memory_order_acquire);
+    const std::uint64_t active_age = active_started != 0 && now >= active_started ? now - active_started : 0;
+    _snprintf_s(out, cap, _TRUNCATE,
+        "ui_dispatcher{ready=%d shutdown=%d destroying=%d hwnd=0x%llX pending=%zu max_depth=%zu oldest_age_ms=%llu owner_tid=%lu current_tid=%lu wake_pending=%d enqueued=%llu executed=%llu discarded=%llu rejected=%llu rejected_shutdown=%llu rejected_full=%llu rejected_not_ready=%llu rejected_cancelled=%llu drain_calls=%llu drain_cancelled=%llu budget_hits=%llu task_budget_hits=%llu time_budget_hits=%llu affinity_violations=%llu last_drain_ts=%llu last_wake_ts=%llu wake_posted=%llu wake_thread_posted=%llu wake_coalesced=%llu wake_failed=%llu backlog_logs=%llu last_drain_ms=%llu last_task_id=%llu last_task_ms=%llu active_task=%llu active_producer_tid=%lu active_age_ms=%llu}",
+        g_ui_dispatch_ready.load(std::memory_order_acquire) ? 1 : 0,
+        g_ui_dispatch_shutdown.load(std::memory_order_acquire) ? 1 : 0,
+        g_ui_dispatch_window_destroying.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(g_ui_dispatch_hwnd.load(std::memory_order_acquire)),
+        pending,
+        g_ui_dispatch_max_depth.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(now)),
+        static_cast<unsigned long>(owner_tid()),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        g_ui_dispatch_wake_pending.load(std::memory_order_acquire) ? 1 : 0,
+        static_cast<unsigned long long>(g_ui_dispatch_enqueued.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_executed.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_discarded.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_shutdown.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_full.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_not_ready.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_rejected_cancelled.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_drain_calls.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_drain_cancelled.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_budget_hits.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_task_budget_hits.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_time_budget_hits.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_affinity_violations.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_last_drain_ts.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_last_wake_ts.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_posted.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_thread_posted.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_coalesced.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_wake_failed.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_backlog_logs.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_last_drain_ms.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_last_task_id.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_last_task_ms.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(g_ui_dispatch_active_task_id.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(g_ui_dispatch_active_producer_tid.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(active_age));
+}
+
+std::uint64_t affinity_violation_count()
+{
+    return g_ui_dispatch_affinity_violations.load(std::memory_order_acquire);
+}
+
+std::uint64_t last_drain_timestamp()
+{
+    return g_ui_dispatch_last_drain_ts.load(std::memory_order_acquire);
+}
+
+std::uint64_t last_wake_timestamp()
+{
+    return g_ui_dispatch_last_wake_ts.load(std::memory_order_acquire);
+}
+
+std::uint64_t task_budget_hit_count()
+{
+    return g_ui_dispatch_task_budget_hits.load(std::memory_order_acquire);
+}
+
+std::uint64_t time_budget_hit_count()
+{
+    return g_ui_dispatch_time_budget_hits.load(std::memory_order_acquire);
+}
+
+std::string top_queued_labels(std::size_t max_entries)
+{
+    if (max_entries == 0)
+        max_entries = 8;
+    std::string out;
+    std::lock_guard<std::mutex> lock(g_ui_dispatch_mtx);
+    std::size_t count = 0;
+    for (const auto& item : g_ui_dispatch_queue) {
+        if (count >= max_entries)
+            break;
+        if (count > 0)
+            out += '|';
+        out += ui_dispatch_copy_text(item.label.c_str(), "");
+        out += '/';
+        out += ui_dispatch_copy_text(item.owner.c_str(), "");
+        ++count;
+    }
+    return out;
+}
+
+bool is_wake_message(UINT msg)
+{
+    return msg == kAidaUiDispatcherWakeMessage;
+}
+
+void acknowledge_wake_message()
+{
+    g_ui_dispatch_wake_pending.store(false, std::memory_order_release);
+    diag::log_tagged_fmt("ui_dispatcher",
+        "UI-DISPATCHER-WAKE reason=dequeued tid=%lu depth=%zu wake_pending=0",
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        g_ui_dispatch_last_depth.load(std::memory_order_acquire));
+}
+
+void mark_ready(HWND hwnd, const char* subsystem, const char* label, const char* phase)
+{
+    if (hwnd) {
+        DWORD owner_pid = 0;
+        const DWORD tid = ::GetWindowThreadProcessId(hwnd, &owner_pid);
+        if (tid != 0)
+            capture_owner_tid(tid, subsystem, label, phase);
+        g_ui_dispatch_hwnd.store(reinterpret_cast<UINT_PTR>(hwnd), std::memory_order_release);
+    }
+    g_ui_dispatch_window_destroying.store(false, std::memory_order_release);
+    g_ui_dispatch_shutdown.store(false, std::memory_order_release);
+    g_ui_dispatch_ready.store(owner_tid() != 0, std::memory_order_release);
+    g_ui_dispatch_wake_pending.store(false, std::memory_order_release);
+    diag::log_tagged_critical_fmt("ui_dispatcher",
+        "UI-DISPATCHER-DRAIN event=ready subsystem=%s label=%s phase=%s hwnd=0x%llX owner_tid=%lu ready=%d depth=%zu",
+        ui_dispatch_text(subsystem),
+        ui_dispatch_text(label),
+        ui_dispatch_text(phase),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        static_cast<unsigned long>(owner_tid()),
+        g_ui_dispatch_ready.load(std::memory_order_acquire) ? 1 : 0,
+        pending_count());
+}
+
+void mark_window_destroying(HWND hwnd, const char* subsystem, const char* label, const char* phase)
+{
+    g_ui_dispatch_ready.store(false, std::memory_order_release);
+    g_ui_dispatch_window_destroying.store(true, std::memory_order_release);
+    g_ui_dispatch_hwnd.store(0, std::memory_order_release);
+    g_ui_dispatch_wake_pending.store(false, std::memory_order_release);
+    std::size_t discarded = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ui_dispatch_mtx);
+        discarded = g_ui_dispatch_queue.size();
+        g_ui_dispatch_queue.clear();
+        ui_dispatch_refresh_metrics_locked();
+    }
+    if (discarded != 0) {
+        g_ui_dispatch_discarded.fetch_add(static_cast<std::uint64_t>(discarded), std::memory_order_acq_rel);
+        g_ui_dispatch_rejected_shutdown.fetch_add(static_cast<std::uint64_t>(discarded), std::memory_order_acq_rel);
+        g_ui_dispatch_rejected.fetch_add(static_cast<std::uint64_t>(discarded), std::memory_order_acq_rel);
+    }
+    diag::log_tagged_critical_fmt("ui_dispatcher",
+        "UI-DISPATCHER-DRAIN event=window_destroying subsystem=%s label=%s phase=%s hwnd=0x%llX owner_tid=%lu depth=%zu dropped=%zu oldest_age_ms=%llu",
+        ui_dispatch_text(subsystem),
+        ui_dispatch_text(label),
+        ui_dispatch_text(phase),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        static_cast<unsigned long>(owner_tid()),
+        pending_count(),
+        discarded,
+        static_cast<unsigned long long>(ui_dispatch_oldest_age_ms(ui_dispatch_now_ms())));
+    if (discarded != 0) {
+        diag::log_tagged_critical_fmt("ui_dispatcher",
+            "UI-DISPATCHER-REJECT result=%s reason=window_destroying_drop dropped=%zu owner_tid=%lu rejected_shutdown=%llu",
+            result_name(enqueue_result_t::rejected_shutdown),
+            discarded,
+            static_cast<unsigned long>(owner_tid()),
+            static_cast<unsigned long long>(g_ui_dispatch_rejected_shutdown.load(std::memory_order_acquire)));
+    }
+}
+
+void shutdown()
+{
+    g_ui_dispatch_shutdown.store(true, std::memory_order_release);
+    g_ui_dispatch_ready.store(false, std::memory_order_release);
+    g_ui_dispatch_window_destroying.store(true, std::memory_order_release);
+    g_ui_dispatch_hwnd.store(0, std::memory_order_release);
+    std::size_t discarded = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ui_dispatch_mtx);
+        discarded = g_ui_dispatch_queue.size();
+        g_ui_dispatch_queue.clear();
+        ui_dispatch_refresh_metrics_locked();
+    }
+    if (discarded != 0) {
+        g_ui_dispatch_discarded.fetch_add(static_cast<std::uint64_t>(discarded), std::memory_order_acq_rel);
+        g_ui_dispatch_rejected_shutdown.fetch_add(static_cast<std::uint64_t>(discarded), std::memory_order_acq_rel);
+        g_ui_dispatch_rejected.fetch_add(static_cast<std::uint64_t>(discarded), std::memory_order_acq_rel);
+        diag::log_tagged_critical_fmt("ui_dispatcher",
+            "UI-DISPATCHER-REJECT result=%s reason=shutdown_drop dropped=%zu owner_tid=%lu accepted=%llu drained=%llu rejected_shutdown=%llu",
+            result_name(enqueue_result_t::rejected_shutdown),
+            discarded,
+            static_cast<unsigned long>(owner_tid()),
+            static_cast<unsigned long long>(g_ui_dispatch_enqueued.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(g_ui_dispatch_executed.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(g_ui_dispatch_rejected_shutdown.load(std::memory_order_acquire)));
+    }
+    g_ui_dispatch_wake_pending.store(false, std::memory_order_release);
+}
+
+}
+
 static bool aida_key_down(int vk)
 {
     return (::GetAsyncKeyState(vk) & 0x8000) != 0;
@@ -564,6 +1582,75 @@ static bool aida_input_only_queue(DWORD queue_current, DWORD queue_changed)
     return (observed & QS_INPUT) != 0 &&
         (queue_current & ~static_cast<DWORD>(QS_INPUT)) == 0 &&
         (queue_changed & ~static_cast<DWORD>(QS_INPUT)) == 0;
+}
+
+static bool aida_wide_to_utf8_owned(const std::wstring& in, std::string& out)
+{
+    out.clear();
+    if (in.empty())
+        return false;
+    UINT codepage = CP_UTF8;
+    DWORD flags = WC_ERR_INVALID_CHARS;
+    int needed = ::WideCharToMultiByte(codepage, flags, in.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (needed <= 1) {
+        codepage = CP_ACP;
+        flags = 0;
+        needed = ::WideCharToMultiByte(codepage, flags, in.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    }
+    if (needed <= 1)
+        return false;
+    std::string converted(static_cast<std::size_t>(needed), '\0');
+    const int written = ::WideCharToMultiByte(codepage, flags, in.c_str(), -1, &converted[0], needed, nullptr, nullptr);
+    if (written <= 1)
+        return false;
+    converted.resize(static_cast<std::size_t>(written - 1));
+    out = std::move(converted);
+    return !out.empty();
+}
+
+static std::atomic<uint64_t> g_dragdrop_ui_generation{0};
+
+static void aida_dispatch_dropped_file_open(const std::string& path_for_ui,
+                                            uint64_t generation,
+                                            DWORD producer_tid,
+                                            uint64_t capture_start_ms)
+{
+    const uint64_t current_generation = g_dragdrop_ui_generation.load(std::memory_order_acquire);
+    const uint64_t dispatch_start_ms = static_cast<uint64_t>(::GetTickCount64());
+    if (current_generation != generation) {
+        diag::log_tagged_critical_fmt("DRAGDROP-UI-DISPATCH",
+            "stale generation=%llu current_generation=%llu producer_tid=%lu ui_tid=%lu queued_age_ms=%llu path=%.260s",
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(current_generation),
+            static_cast<unsigned long>(producer_tid),
+            static_cast<unsigned long>(::GetCurrentThreadId()),
+            static_cast<unsigned long long>(dispatch_start_ms - capture_start_ms),
+            path_for_ui.c_str());
+        return;
+    }
+    if (!aida::ui_thread::require_owner("dragdrop", "open_path", "dispatch")) {
+        diag::log_tagged_critical_fmt("DRAGDROP-UI-DISPATCH",
+            "owner_rejected generation=%llu producer_tid=%lu ui_tid=%lu path=%.260s",
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long>(producer_tid),
+            static_cast<unsigned long>(::GetCurrentThreadId()),
+            path_for_ui.c_str());
+        return;
+    }
+    diag::log_tagged_critical_fmt("DRAGDROP-UI-DISPATCH",
+        "begin generation=%llu producer_tid=%lu ui_tid=%lu queued_age_ms=%llu path=%.260s",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(producer_tid),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        static_cast<unsigned long long>(dispatch_start_ms - capture_start_ms),
+        path_for_ui.c_str());
+    file_browser::open_path(path_for_ui);
+    diag::log_tagged_critical_fmt("DRAGDROP-UI-DISPATCH",
+        "end generation=%llu ui_tid=%lu elapsed_ms=%llu path=%.260s",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        static_cast<unsigned long long>(static_cast<uint64_t>(::GetTickCount64()) - dispatch_start_ms),
+        path_for_ui.c_str());
 }
 
 bool CreateDeviceD3D(HWND hWnd);
@@ -709,6 +1796,10 @@ static aida_message_pump_slice_t aida_pump_messages_budgeted(const char* reason,
             break;
 
         ++out.messages;
+        if (aida::ui_thread::is_wake_message(msg.message)) {
+            aida::ui_thread::acknowledge_wake_message();
+            continue;
+        }
         if (aida_is_input_or_attention_message(msg.message)) {
             ++out.input_messages;
             aida_record_input_message(msg, static_cast<uint64_t>(GetTickCount64()));
@@ -917,6 +2008,8 @@ static void merge_icon_font(ImGuiIO& io, float pixel_size)
 
 static void rebuild_fonts(float dpi_scale)
 {
+    if (!aida::ui_thread::require_owner("imgui", "rebuild_fonts", "enter"))
+        return;
     ImGuiIO& io = ImGui::GetIO();
     diag::log_tagged_critical_fmt("fonts",
         "rebuild_fonts_enter dpi_scale=%.3f ctx=0x%llX atlas=0x%llX count=%d builder_before=0x%llX flags_before=0x%X",
@@ -1144,6 +2237,8 @@ static DWORD compute_acrylic_color_for_theme()
 
 void set_acrylic_color(HWND hwnd)
 {
+    if (!aida::ui_thread::require_owner("dwm", "set_acrylic_color", "enter"))
+        return;
     aida::manual_map_tls::ensure_current_thread();
     struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
     struct WINCOMPATTRDATA { DWORD Attribute; PVOID pData; ULONG DataSize; };
@@ -1348,6 +2443,461 @@ static uint64_t diag_fnv1a64(const void* data, size_t len)
     return h;
 }
 
+static void format_phase0_utc_timestamp(char* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = '\0';
+    SYSTEMTIME st{};
+    GetSystemTime(&st);
+    _snprintf_s(out, cap, _TRUNCATE,
+        "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned>(st.wMilliseconds));
+}
+
+static uint64_t phase0_fnv1a64_update(uint64_t hash, const void* data, size_t len)
+{
+    if (!data)
+        return hash;
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= static_cast<uint64_t>(p[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static uint64_t phase0_fnv1a64_update_u64(uint64_t hash, uint64_t value)
+{
+    return phase0_fnv1a64_update(hash, &value, sizeof(value));
+}
+
+static uint64_t phase0_fnv1a64_update_cstr(uint64_t hash, const char* value)
+{
+    if (!value)
+        return phase0_fnv1a64_update_u64(hash, 0);
+    return phase0_fnv1a64_update(hash, value, std::strlen(value) + 1);
+}
+
+static uint64_t phase0_message_pump_invariant_mask()
+{
+    uint64_t mask = 0;
+    if ((kAidaQueuedPeekFlags & PM_QS_SENDMESSAGE) == PM_QS_SENDMESSAGE)
+        mask |= 1ULL << 0;
+    if ((kAidaQueuedPeekFlags & PM_REMOVE) == PM_REMOVE)
+        mask |= 1ULL << 1;
+    if ((kAidaQueuedNoSendPeekFlags & PM_QS_SENDMESSAGE) == 0)
+        mask |= 1ULL << 2;
+    if (kAidaQueuedNoSendPeekFlags == (PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT))
+        mask |= 1ULL << 3;
+    if (kAidaSendOnlyPeekFlags == (PM_REMOVE | PM_QS_SENDMESSAGE))
+        mask |= 1ULL << 4;
+    if ((kAidaNonSendQueueBits & QS_SENDMESSAGE) == 0)
+        mask |= 1ULL << 5;
+    if ((kAidaPumpQueueBits & QS_SENDMESSAGE) == QS_SENDMESSAGE)
+        mask |= 1ULL << 6;
+    if ((kAidaPumpQueueBits & kAidaNonSendQueueBits) == kAidaNonSendQueueBits)
+        mask |= 1ULL << 7;
+    if ((kAidaInteractiveQueueBits & QS_SENDMESSAGE) == 0)
+        mask |= 1ULL << 8;
+    mask |= 1ULL << 9;
+    mask |= 1ULL << 10;
+    mask |= 1ULL << 11;
+    return mask;
+}
+
+static uint64_t phase0_message_pump_invariant_fingerprint()
+{
+    uint64_t hash = 14695981039346656037ULL;
+    hash = phase0_fnv1a64_update_cstr(hash, "aida.phase0.message_pump.invariants.v1");
+    hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaQueuedPeekFlags));
+    hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaQueuedNoSendPeekFlags));
+    hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaSendOnlyPeekFlags));
+    hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaNonSendQueueBits));
+    hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaPumpQueueBits));
+    hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaInteractiveQueueBits));
+    hash = phase0_fnv1a64_update_u64(hash, phase0_message_pump_invariant_mask());
+    return hash;
+}
+
+static void phase0_log_startup_invariants(const char* phase, HWND hwnd)
+{
+    char utc[48] = {};
+    format_phase0_utc_timestamp(utc, sizeof(utc));
+    DWORD owner_pid = 0;
+    DWORD owner_tid = 0;
+    DWORD owner_gle = 0;
+    if (hwnd) {
+        SetLastError(0);
+        owner_tid = GetWindowThreadProcessId(hwnd, &owner_pid);
+        owner_gle = owner_tid != 0 ? 0UL : GetLastError();
+    } else {
+        owner_gle = ERROR_INVALID_WINDOW_HANDLE;
+    }
+    const DWORD queue_status = GetQueueStatus(QS_ALLINPUT);
+    const DWORD queue_changed = LOWORD(queue_status);
+    const DWORD queue_current = HIWORD(queue_status);
+    const uint64_t invariant_mask = phase0_message_pump_invariant_mask();
+    const uint64_t invariant_hash = phase0_message_pump_invariant_fingerprint();
+    const DWORD current_tid = GetCurrentThreadId();
+    const std::string run_id = standalone_license::run_correlation_id();
+    diag::log_tagged_critical_fmt("PHASE0-INVARIANTS",
+        "record=message_pump_invariants phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu hwnd=0x%llX ui_owner_available=%d ui_owner_tid=%lu ui_owner_pid=%lu ui_owner_gle=%lu ui_owner_matches_current=%d queued_flags=0x%08X queued_no_send_flags=0x%08X send_only_flags=0x%08X non_send_queue_bits=0x%08lX pump_queue_bits=0x%08lX interactive_queue_bits=0x%08lX pm_remove=0x%08X pm_qs_input=0x%08X pm_qs_postmessage=0x%08X pm_qs_paint=0x%08X pm_qs_sendmessage=0x%08X qs_allinput=0x%08lX qs_current=0x%04lX qs_changed=0x%04lX invariant_mask=0x%016llX invariant_fingerprint=0x%016llX queued_includes_send=%d queued_includes_remove=%d queued_no_send_excludes_send=%d queued_no_send_exact=%d send_only_exact=%d non_send_bits_exclude_send=%d pump_bits_include_send=%d pump_bits_include_non_send=%d interactive_bits_exclude_send=%d empty_queue_nonblocking_probe_contract=%d send_only_drain_contract=%d queued_send_defer_contract=%d",
+        phase ? phase : "<null>",
+        run_id.c_str(),
+        GetCurrentProcessId(),
+        current_tid,
+        utc,
+        static_cast<unsigned long long>(GetTickCount64()),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        owner_tid != 0 ? 1 : 0,
+        owner_tid,
+        owner_pid,
+        owner_gle,
+        owner_tid != 0 && owner_tid == current_tid ? 1 : 0,
+        kAidaQueuedPeekFlags,
+        kAidaQueuedNoSendPeekFlags,
+        kAidaSendOnlyPeekFlags,
+        static_cast<unsigned long>(kAidaNonSendQueueBits),
+        static_cast<unsigned long>(kAidaPumpQueueBits),
+        static_cast<unsigned long>(kAidaInteractiveQueueBits),
+        PM_REMOVE,
+        PM_QS_INPUT,
+        PM_QS_POSTMESSAGE,
+        PM_QS_PAINT,
+        PM_QS_SENDMESSAGE,
+        static_cast<unsigned long>(queue_status),
+        static_cast<unsigned long>(queue_current),
+        static_cast<unsigned long>(queue_changed),
+        static_cast<unsigned long long>(invariant_mask),
+        static_cast<unsigned long long>(invariant_hash),
+        (kAidaQueuedPeekFlags & PM_QS_SENDMESSAGE) == PM_QS_SENDMESSAGE ? 1 : 0,
+        (kAidaQueuedPeekFlags & PM_REMOVE) == PM_REMOVE ? 1 : 0,
+        (kAidaQueuedNoSendPeekFlags & PM_QS_SENDMESSAGE) == 0 ? 1 : 0,
+        kAidaQueuedNoSendPeekFlags == (PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT) ? 1 : 0,
+        kAidaSendOnlyPeekFlags == (PM_REMOVE | PM_QS_SENDMESSAGE) ? 1 : 0,
+        (kAidaNonSendQueueBits & QS_SENDMESSAGE) == 0 ? 1 : 0,
+        (kAidaPumpQueueBits & QS_SENDMESSAGE) == QS_SENDMESSAGE ? 1 : 0,
+        (kAidaPumpQueueBits & kAidaNonSendQueueBits) == kAidaNonSendQueueBits ? 1 : 0,
+        (kAidaInteractiveQueueBits & QS_SENDMESSAGE) == 0 ? 1 : 0,
+        1,
+        1,
+        1);
+}
+
+static void phase0_copy_diag_text(char* out, size_t cap, const char* value)
+{
+    if (!out || cap == 0)
+        return;
+    _snprintf_s(out, cap, _TRUNCATE, "%s", value ? value : "");
+}
+
+static void phase0_sanitize_log_field(char* value)
+{
+    if (!value)
+        return;
+    for (char* p = value; *p; ++p) {
+        unsigned char ch = static_cast<unsigned char>(*p);
+        if (ch < 0x20 || ch == 0x7F)
+            *p = '_';
+    }
+}
+
+static void phase0_wide_to_diag_utf8(const wchar_t* in, char* out, size_t cap)
+{
+    aida_early_startup::wide_to_utf8(in, out, cap);
+    phase0_sanitize_log_field(out);
+}
+
+struct phase0_registry_string_result_t {
+    bool present = false;
+    bool read_ok = false;
+    bool expand_ok = false;
+    DWORD gle = ERROR_FILE_NOT_FOUND;
+    DWORD type = 0;
+    DWORD bytes = 0;
+    DWORD expand_gle = ERROR_FILE_NOT_FOUND;
+    char value[768] = {};
+    char expanded[768] = {};
+};
+
+struct phase0_registry_dword_result_t {
+    bool present = false;
+    bool read_ok = false;
+    DWORD gle = ERROR_FILE_NOT_FOUND;
+    DWORD type = 0;
+    DWORD bytes = 0;
+    DWORD value = 0;
+};
+
+static phase0_registry_string_result_t phase0_query_registry_string(HKEY key, const wchar_t* value_name, DWORD unavailable_gle)
+{
+    phase0_registry_string_result_t result{};
+    result.gle = unavailable_gle;
+    result.expand_gle = unavailable_gle;
+    phase0_copy_diag_text(result.value, sizeof(result.value), "<key_unavailable>");
+    phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<key_unavailable>");
+    if (!key)
+        return result;
+
+    DWORD type = 0;
+    DWORD bytes = 0;
+    LONG rc = RegQueryValueExW(key, value_name, nullptr, &type, nullptr, &bytes);
+    if (rc != ERROR_SUCCESS) {
+        result.gle = static_cast<DWORD>(rc);
+        result.expand_gle = static_cast<DWORD>(rc);
+        if (rc == ERROR_FILE_NOT_FOUND) {
+            phase0_copy_diag_text(result.value, sizeof(result.value), "<missing>");
+            phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<missing>");
+        } else {
+            phase0_copy_diag_text(result.value, sizeof(result.value), "<unreadable>");
+            phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<unreadable>");
+        }
+        return result;
+    }
+
+    result.present = true;
+    result.type = type;
+    result.bytes = bytes;
+    if (bytes > 32768u) {
+        result.gle = ERROR_MORE_DATA;
+        result.expand_gle = ERROR_MORE_DATA;
+        phase0_copy_diag_text(result.value, sizeof(result.value), "<too_large>");
+        phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<too_large>");
+        return result;
+    }
+    std::vector<wchar_t> buffer((bytes / sizeof(wchar_t)) + 2u, L'\0');
+    DWORD read_bytes = bytes;
+    rc = RegQueryValueExW(key, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(buffer.data()), &read_bytes);
+    if (rc == ERROR_MORE_DATA) {
+        if (read_bytes > 32768u) {
+            result.type = type;
+            result.bytes = read_bytes;
+            result.gle = ERROR_MORE_DATA;
+            result.expand_gle = ERROR_MORE_DATA;
+            phase0_copy_diag_text(result.value, sizeof(result.value), "<too_large>");
+            phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<too_large>");
+            return result;
+        }
+        buffer.assign((read_bytes / sizeof(wchar_t)) + 2u, L'\0');
+        rc = RegQueryValueExW(key, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(buffer.data()), &read_bytes);
+    }
+    result.type = type;
+    result.bytes = read_bytes;
+    if (rc != ERROR_SUCCESS) {
+        result.gle = static_cast<DWORD>(rc);
+        result.expand_gle = static_cast<DWORD>(rc);
+        phase0_copy_diag_text(result.value, sizeof(result.value), "<unreadable>");
+        phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<unreadable>");
+        return result;
+    }
+    if (type != REG_SZ && type != REG_EXPAND_SZ) {
+        result.gle = ERROR_INVALID_DATA;
+        result.expand_gle = ERROR_INVALID_DATA;
+        phase0_copy_diag_text(result.value, sizeof(result.value), "<non_string>");
+        phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<non_string>");
+        return result;
+    }
+
+    const size_t char_count = read_bytes / sizeof(wchar_t);
+    if (char_count < buffer.size())
+        buffer[char_count] = L'\0';
+    else
+        buffer.back() = L'\0';
+
+    phase0_wide_to_diag_utf8(buffer.data(), result.value, sizeof(result.value));
+    result.read_ok = true;
+    result.gle = 0;
+    if (type == REG_EXPAND_SZ) {
+        wchar_t expanded_stack[1024] = {};
+        constexpr DWORD expanded_stack_count = static_cast<DWORD>(sizeof(expanded_stack) / sizeof(expanded_stack[0]));
+        DWORD expanded_count = ExpandEnvironmentStringsW(buffer.data(), expanded_stack, expanded_stack_count);
+        if (expanded_count != 0 && expanded_count <= expanded_stack_count) {
+            result.expand_ok = true;
+            result.expand_gle = 0;
+            phase0_wide_to_diag_utf8(expanded_stack, result.expanded, sizeof(result.expanded));
+        } else if (expanded_count > expanded_stack_count && expanded_count <= 32768u) {
+            std::vector<wchar_t> expanded(static_cast<size_t>(expanded_count) + 1u, L'\0');
+            DWORD expanded_retry = ExpandEnvironmentStringsW(buffer.data(), expanded.data(), expanded_count);
+            if (expanded_retry != 0 && expanded_retry <= expanded_count) {
+                result.expand_ok = true;
+                result.expand_gle = 0;
+                phase0_wide_to_diag_utf8(expanded.data(), result.expanded, sizeof(result.expanded));
+            } else {
+                result.expand_gle = GetLastError();
+                phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<expand_failed>");
+            }
+        } else if (expanded_count > 32768u) {
+            result.expand_gle = ERROR_MORE_DATA;
+            phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<expand_too_large>");
+        } else {
+            result.expand_gle = GetLastError();
+            phase0_copy_diag_text(result.expanded, sizeof(result.expanded), "<expand_failed>");
+        }
+    } else {
+        result.expand_ok = true;
+        result.expand_gle = 0;
+        phase0_copy_diag_text(result.expanded, sizeof(result.expanded), result.value);
+    }
+    return result;
+}
+
+static phase0_registry_dword_result_t phase0_query_registry_dword(HKEY key, const wchar_t* value_name, DWORD unavailable_gle)
+{
+    phase0_registry_dword_result_t result{};
+    result.gle = unavailable_gle;
+    if (!key)
+        return result;
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD bytes = sizeof(value);
+    LONG rc = RegQueryValueExW(key, value_name, nullptr, &type, reinterpret_cast<LPBYTE>(&value), &bytes);
+    result.type = type;
+    result.bytes = bytes;
+    if (rc == ERROR_FILE_NOT_FOUND) {
+        result.gle = static_cast<DWORD>(rc);
+        return result;
+    }
+    result.present = true;
+    if (rc != ERROR_SUCCESS) {
+        result.gle = static_cast<DWORD>(rc);
+        return result;
+    }
+    if (type != REG_DWORD || bytes < sizeof(DWORD)) {
+        result.gle = ERROR_INVALID_DATA;
+        return result;
+    }
+    result.read_ok = true;
+    result.gle = 0;
+    result.value = value;
+    return result;
+}
+
+static void phase0_log_wer_registry_scope(const char* phase, HKEY root, const char* root_name, const wchar_t* subkey, const char* scope)
+{
+    char utc[48] = {};
+    char key_utf8[512] = {};
+    format_phase0_utc_timestamp(utc, sizeof(utc));
+    phase0_wide_to_diag_utf8(subkey, key_utf8, sizeof(key_utf8));
+    HKEY key = nullptr;
+    LONG open_rc = RegOpenKeyExW(root, subkey, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key);
+    const bool open_ok = open_rc == ERROR_SUCCESS;
+    const DWORD open_gle = static_cast<DWORD>(open_rc);
+    phase0_registry_string_result_t dump_folder = phase0_query_registry_string(key, L"DumpFolder", open_gle);
+    phase0_registry_dword_result_t dump_type = phase0_query_registry_dword(key, L"DumpType", open_gle);
+    phase0_registry_dword_result_t dump_count = phase0_query_registry_dword(key, L"DumpCount", open_gle);
+    phase0_registry_dword_result_t custom_flags = phase0_query_registry_dword(key, L"CustomDumpFlags", open_gle);
+    const std::string run_id = standalone_license::run_correlation_id();
+    char msg[3600] = {};
+    _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+        "record=localdumps_registry phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu app=AiDAStandalone.exe root=%s view=64 scope=%s key=%s open_ok=%d open_gle=%lu dump_folder_present=%d dump_folder_read_ok=%d dump_folder_gle=%lu dump_folder_type=%lu dump_folder_bytes=%lu dump_folder=%s dump_folder_expand_ok=%d dump_folder_expand_gle=%lu dump_folder_expanded=%s dump_type_present=%d dump_type_read_ok=%d dump_type_gle=%lu dump_type_type=%lu dump_type_bytes=%lu dump_type_value=%lu dump_count_present=%d dump_count_read_ok=%d dump_count_gle=%lu dump_count_type=%lu dump_count_bytes=%lu dump_count_value=%lu custom_dump_flags_present=%d custom_dump_flags_read_ok=%d custom_dump_flags_gle=%lu custom_dump_flags_type=%lu custom_dump_flags_bytes=%lu custom_dump_flags_value=%lu",
+        phase ? phase : "<null>",
+        run_id.c_str(),
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        utc,
+        static_cast<unsigned long long>(GetTickCount64()),
+        root_name ? root_name : "<root>",
+        scope ? scope : "<scope>",
+        key_utf8,
+        open_ok ? 1 : 0,
+        open_gle,
+        dump_folder.present ? 1 : 0,
+        dump_folder.read_ok ? 1 : 0,
+        dump_folder.gle,
+        dump_folder.type,
+        dump_folder.bytes,
+        dump_folder.value,
+        dump_folder.expand_ok ? 1 : 0,
+        dump_folder.expand_gle,
+        dump_folder.expanded,
+        dump_type.present ? 1 : 0,
+        dump_type.read_ok ? 1 : 0,
+        dump_type.gle,
+        dump_type.type,
+        dump_type.bytes,
+        dump_type.value,
+        dump_count.present ? 1 : 0,
+        dump_count.read_ok ? 1 : 0,
+        dump_count.gle,
+        dump_count.type,
+        dump_count.bytes,
+        dump_count.value,
+        custom_flags.present ? 1 : 0,
+        custom_flags.read_ok ? 1 : 0,
+        custom_flags.gle,
+        custom_flags.type,
+        custom_flags.bytes,
+        custom_flags.value);
+    diag::log_tagged_critical("WER-CONFIG", msg);
+    if (key)
+        RegCloseKey(key);
+}
+
+static void phase0_log_wer_configuration(const char* phase)
+{
+    const uint64_t start_ms = static_cast<uint64_t>(GetTickCount64());
+    const std::string run_id = standalone_license::run_correlation_id();
+    char utc[48] = {};
+    char module[MAX_PATH] = {};
+    format_phase0_utc_timestamp(utc, sizeof(utc));
+    GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
+    diag::log_tagged_critical_fmt("WER-CONFIG",
+        "record=localdumps_scan_start phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu app=AiDAStandalone.exe module=%s",
+        phase ? phase : "<null>",
+        run_id.c_str(),
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        utc,
+        static_cast<unsigned long long>(GetTickCount64()),
+        module);
+    constexpr const wchar_t* default_subkey = L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps";
+    constexpr const wchar_t* exe_subkey = L"SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\AiDAStandalone.exe";
+    phase0_log_wer_registry_scope(phase, HKEY_CURRENT_USER, "HKCU", exe_subkey, "per_exe");
+    phase0_log_wer_registry_scope(phase, HKEY_CURRENT_USER, "HKCU", default_subkey, "default");
+    phase0_log_wer_registry_scope(phase, HKEY_LOCAL_MACHINE, "HKLM", exe_subkey, "per_exe");
+    phase0_log_wer_registry_scope(phase, HKEY_LOCAL_MACHINE, "HKLM", default_subkey, "default");
+    format_phase0_utc_timestamp(utc, sizeof(utc));
+    diag::log_tagged_critical_fmt("WER-CONFIG",
+        "record=localdumps_scan_end phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu elapsed_ms=%llu app=AiDAStandalone.exe",
+        phase ? phase : "<null>",
+        run_id.c_str(),
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        utc,
+        static_cast<unsigned long long>(GetTickCount64()),
+        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
+}
+
+static void phase0_post_wer_configuration_logging(const char* phase)
+{
+    std::string phase_copy = phase && phase[0] ? phase : "startup";
+    const std::string run_id = standalone_license::run_correlation_id();
+    const bool posted = work_queue::post_service_labeled("phase0.wer_config", [phase_copy]() {
+        aida::manual_map_tls::ensure_current_thread();
+        phase0_log_wer_configuration(phase_copy.c_str());
+    });
+    char utc[48] = {};
+    format_phase0_utc_timestamp(utc, sizeof(utc));
+    diag::log_tagged_critical_fmt("WER-CONFIG",
+        "record=localdumps_scan_post phase=%s run_id=%s posted=%d pid=%lu tid=%lu utc=%s tick_ms=%llu worker=service_queue",
+        phase_copy.c_str(),
+        run_id.c_str(),
+        posted ? 1 : 0,
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        utc,
+        static_cast<unsigned long long>(GetTickCount64()));
+    if (!posted)
+        phase0_log_wer_configuration(phase_copy.c_str());
+}
+
 static std::string generate_startup_run_correlation_id()
 {
     LARGE_INTEGER qpc{};
@@ -1379,6 +2929,22 @@ static std::string generate_startup_run_correlation_id()
 }
 
 static void format_message_pump_stall_context(char* out, size_t cap);
+static void emit_window_hung_snapshot(
+    uint64_t stall_streak,
+    uint64_t frame,
+    uint64_t age_ms,
+    uint64_t phase_id,
+    const char* phase_name,
+    const char* render_section,
+    DWORD render_tid,
+    DWORD peek_status,
+    DWORD peek_error,
+    const char* dispatch_stage,
+    UINT dispatch_msg,
+    UINT_PTR dispatch_hwnd,
+    const char* wndproc_stage,
+    UINT wndproc_msg,
+    UINT_PTR wndproc_hwnd);
 
 namespace aida_tracer {
     inline std::atomic<uint64_t> g_render_frame{0};
@@ -1836,6 +3402,7 @@ namespace aida_tracer {
                 ResumeThread(stack_th);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "stall_watcher_stack_walk");
             if (suspend_count != static_cast<DWORD>(-1))
                 ResumeThread(stack_th);
             abort_reason = "seh_exception";
@@ -2196,6 +3763,9 @@ namespace aida_tracer {
                         g_peek_remove_flags.load(std::memory_order_acquire));
                 }
                 if (stall_streak == 1 || (stall_streak % 20ULL) == 0ULL) {
+                    aida::diagnostics::metadata_ring::emit(
+                        aida::diagnostics::metadata_ring::breadcrumb_category_t::render,
+                        "render_stall_detected", nullptr, false);
                     char stall_context[4600] = {};
                     format_message_pump_stall_context(stall_context, sizeof(stall_context));
                     diag::log_tagged_critical_fmt("tracer",
@@ -2258,6 +3828,22 @@ namespace aida_tracer {
                         static_cast<unsigned long>(g_present_hr.load(std::memory_order_acquire)),
                         GetCurrentThreadId(),
                         stall_context[0] ? stall_context : "<empty>");
+                    ::emit_window_hung_snapshot(
+                        stall_streak,
+                        frame,
+                        age_ms,
+                        phase_id,
+                        phase_name,
+                        render_section,
+                        render_tid,
+                        peek_status,
+                        peek_error,
+                        dispatch_stage,
+                        dispatch_msg,
+                        dispatch_hwnd,
+                        wndproc_stage,
+                        wndproc_msg,
+                        wndproc_hwnd);
                     const bool shutdown_context = is_shutdown_stall_context(phase_name, dispatch_msg, wndproc_msg);
                     const bool sustained_hang = age_ms >= 2500ULL && (stall_streak == 1ULL || (stall_streak % 20ULL) == 0ULL);
                     if (render_tid != 0 && sustained_hang && !shutdown_context)
@@ -2573,6 +4159,7 @@ static void format_tracer_crash_snapshot(char* out, size_t cap)
         if (imgui_ctx)
             imgui_frame = ImGui::GetFrameCount();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "format_tracer_snapshot_imgui_check");
         imgui_ctx = -1;
         imgui_frame = -2;
     }
@@ -2944,6 +4531,7 @@ __declspec(noinline) static DWORD cpp_render_title(helpers* h, uint64_t frame_nu
             e.what());
         return 0xE06D7363u;
     } catch (...) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "cpp_render_title");
         ImGui::ErrorRecoveryTryToRecoverState(imgui_state_backup);
         diag::log_tagged_critical_fmt("render",
             "CPP_in_render_title frame=%llu section=%s what=<unknown>",
@@ -2956,12 +4544,15 @@ __declspec(noinline) static DWORD cpp_render_title(helpers* h, uint64_t frame_nu
 
 __declspec(noinline) static DWORD seh_render_title(helpers* h, uint64_t frame_number)
 {
+    if (!aida::ui_thread::require_owner("imgui", "render_title", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     ImGuiErrorRecoveryState imgui_state_backup;
     ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
 
     __try {
         return cpp_render_title(h, frame_number, &imgui_state_backup);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_render_title");
         ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
@@ -2969,11 +4560,14 @@ __declspec(noinline) static DWORD seh_render_title(helpers* h, uint64_t frame_nu
 
 __declspec(noinline) static DWORD seh_render_source_reconstruct(uint64_t frame_number)
 {
+    if (!aida::ui_thread::require_owner("imgui", "render_source_reconstruct", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     ImGuiErrorRecoveryState imgui_state_backup;
     ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
         source_reconstruct_view::render(1.0f, globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_render_source_reconstruct");
         ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
@@ -2982,11 +4576,14 @@ __declspec(noinline) static DWORD seh_render_source_reconstruct(uint64_t frame_n
 
 __declspec(noinline) static DWORD seh_render_toast(uint64_t frame_number)
 {
+    if (!aida::ui_thread::require_owner("imgui", "render_toast", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     ImGuiErrorRecoveryState imgui_state_backup;
     ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
         toast_notification::render();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_render_toast");
         ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
@@ -2995,9 +4592,12 @@ __declspec(noinline) static DWORD seh_render_toast(uint64_t frame_number)
 
 __declspec(noinline) static DWORD seh_imgui_render()
 {
+    if (!aida::ui_thread::require_owner("imgui", "render", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     __try {
         ImGui::Render();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_imgui_render");
         return GetExceptionCode();
     }
     return 0;
@@ -3005,6 +4605,8 @@ __declspec(noinline) static DWORD seh_imgui_render()
 
 __declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd, uint64_t frame_number)
 {
+    if (!aida::ui_thread::require_owner("dx11", "imgui_dx11_render", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     HRESULT removed = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
     aida_tracer::set_dx11_draw_state("imgui_dx11_render_enter",
         frame_number,
@@ -3051,6 +4653,7 @@ __declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd, uint64_t
             g_mainRenderTargetView,
             removed);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_imgui_dx11_render");
         removed = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
         aida_tracer::set_dx11_draw_state("imgui_dx11_render_seh",
             frame_number,
@@ -3066,9 +4669,12 @@ __declspec(noinline) static DWORD seh_imgui_dx11_render(ImDrawData* dd, uint64_t
 
 __declspec(noinline) static DWORD seh_imgui_new_frame()
 {
+    if (!aida::ui_thread::require_owner("imgui", "new_frame", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     __try {
         ImGui::NewFrame();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_imgui_new_frame");
         return GetExceptionCode();
     }
     return 0;
@@ -3076,9 +4682,12 @@ __declspec(noinline) static DWORD seh_imgui_new_frame()
 
 __declspec(noinline) static DWORD seh_dx11_new_frame()
 {
+    if (!aida::ui_thread::require_owner("dx11", "new_frame", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     __try {
         ImGui_ImplDX11_NewFrame();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_dx11_new_frame");
         return GetExceptionCode();
     }
     return 0;
@@ -3086,9 +4695,12 @@ __declspec(noinline) static DWORD seh_dx11_new_frame()
 
 __declspec(noinline) static DWORD seh_win32_new_frame()
 {
+    if (!aida::ui_thread::require_owner("imgui_win32", "new_frame", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     __try {
         ImGui_ImplWin32_NewFrame();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_win32_new_frame");
         return GetExceptionCode();
     }
     return 0;
@@ -3097,6 +4709,12 @@ __declspec(noinline) static DWORD seh_win32_new_frame()
 __declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRESULT* hr_out, uint64_t frame_number, UINT sync_interval, UINT present_flags)
 {
     aida_tracer::set_present_state("present_enter", frame_number, sc, hr_out ? *hr_out : E_POINTER);
+    if (!aida::ui_thread::require_owner("swapchain", "present", "seh_enter")) {
+        if (hr_out)
+            *hr_out = E_ACCESSDENIED;
+        aida_tracer::set_present_state("present_affinity_denied", frame_number, sc, E_ACCESSDENIED);
+        return ERROR_ACCESS_DENIED;
+    }
     if (!sc || !hr_out) {
         if (hr_out)
             *hr_out = E_POINTER;
@@ -3108,6 +4726,7 @@ __declspec(noinline) static DWORD seh_swapchain_present(IDXGISwapChain* sc, HRES
         *hr_out = sc->Present(sync_interval, present_flags);
         aida_tracer::set_present_state("present_returned", frame_number, sc, *hr_out);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_swapchain_present");
         aida_tracer::set_present_state("present_seh", frame_number, sc, hr_out ? *hr_out : E_POINTER);
         return GetExceptionCode();
     }
@@ -3129,6 +4748,11 @@ static bool aida_cursor_over_window(HWND hwnd)
 
 __declspec(noinline) static DWORD seh_resize_buffers(IDXGISwapChain* sc, UINT w, UINT h, HRESULT* hr_out, uint64_t frame_number, const char* source)
 {
+    if (!aida::ui_thread::require_owner("swapchain", "resize_buffers", source ? source : "seh_enter")) {
+        if (hr_out)
+            *hr_out = E_ACCESSDENIED;
+        return ERROR_ACCESS_DENIED;
+    }
     if (hr_out)
         *hr_out = E_POINTER;
     if (!sc || !hr_out) {
@@ -3145,6 +4769,7 @@ __declspec(noinline) static DWORD seh_resize_buffers(IDXGISwapChain* sc, UINT w,
     __try {
         *hr_out = sc->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_resize_buffers");
         return GetExceptionCode();
     }
     diag::log_tagged_critical_fmt("render",
@@ -3311,6 +4936,8 @@ static void record_resize_recreate(const char* source, UINT w, UINT h, uint64_t 
 
 static bool resize_swapchain_and_target(UINT w, UINT h, uint64_t frame_number, const char* source)
 {
+    if (!aida::ui_thread::require_owner("swapchain", "resize_swapchain_and_target", source ? source : "enter"))
+        return false;
     CleanupRenderTarget();
     HRESULT resize_hr = S_OK;
     DWORD resize_seh = seh_resize_buffers(g_pSwapChain, w, h, &resize_hr, frame_number, source);
@@ -3335,6 +4962,8 @@ static bool resize_swapchain_and_target(UINT w, UINT h, uint64_t frame_number, c
 
 __declspec(noinline) static DWORD seh_clear_main_render_target(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const float* color, HRESULT* removed_out, uint64_t frame_number)
 {
+    if (!aida::ui_thread::require_owner("dx11", "clear_render_target", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     if (removed_out)
         *removed_out = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
     if (!ctx || !rtv || !color) {
@@ -3352,6 +4981,7 @@ __declspec(noinline) static DWORD seh_clear_main_render_target(ID3D11DeviceConte
         ctx->OMSetRenderTargets(1, &local_rtv, nullptr);
         ctx->ClearRenderTargetView(rtv, color);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_clear_render_target");
         if (removed_out)
             *removed_out = g_pd3dDevice ? g_pd3dDevice->GetDeviceRemovedReason() : E_POINTER;
         return GetExceptionCode();
@@ -3363,11 +4993,14 @@ __declspec(noinline) static DWORD seh_clear_main_render_target(ID3D11DeviceConte
 
 __declspec(noinline) static DWORD seh_render_command_palette(uint64_t frame_number)
 {
+    if (!aida::ui_thread::require_owner("imgui", "render_command_palette", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     ImGuiErrorRecoveryState imgui_state_backup;
     ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
         aida::command_palette::render();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_render_command_palette");
         ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
@@ -3376,6 +5009,8 @@ __declspec(noinline) static DWORD seh_render_command_palette(uint64_t frame_numb
 
 __declspec(noinline) static DWORD seh_render_agent_picker(uint64_t frame_number)
 {
+    if (!aida::ui_thread::require_owner("imgui", "render_agent_picker", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     ImGuiErrorRecoveryState imgui_state_backup;
     ImGui::ErrorRecoveryStoreState(&imgui_state_backup);
     __try {
@@ -3385,6 +5020,7 @@ __declspec(noinline) static DWORD seh_render_agent_picker(uint64_t frame_number)
             aida::settings_overlay::set_active_tab(aida::settings_overlay::tab_agents);
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_render_agent_picker");
         ImGui::ErrorRecoveryTryToRecoverState(&imgui_state_backup);
         return GetExceptionCode();
     }
@@ -3397,6 +5033,7 @@ __declspec(noinline) static bool safe_read_qword(const void* p, uintptr_t& out)
         out = *reinterpret_cast<const uintptr_t*>(p);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "safe_read_qword");
         out = 0;
         return false;
     }
@@ -3548,6 +5185,52 @@ static void format_work_queue_crash_snapshot(char* out, size_t cap)
         critical.active_labels.empty() ? "<none>" : critical.active_labels.c_str());
 }
 
+static void format_work_queue_hung_snapshot(char* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = 0;
+    constexpr uint64_t kStuckAgeMs = 5000ULL;
+    const auto work = work_queue::stats();
+    const auto service = work_queue::service_stats();
+    const auto critical = critical_work_queue::stats();
+    _snprintf_s(out, cap, _TRUNCATE,
+        "work{alive=%d shutdown=%d workers=%zu pending=%zu active=%u stuck=%d oldest_active_ms=%llu hot=%u not_queryable=%u labels=%.520s top_cpu=%.360s} service{alive=%d shutdown=%d workers=%zu pending=%zu active=%u stuck=%d oldest_active_ms=%llu hot=%u not_queryable=%u labels=%.520s top_cpu=%.360s} critical{alive=%d shutdown=%d workers=%zu pending=%zu active=%u stuck=%d oldest_active_ms=%llu hot=%u not_queryable=%u labels=%.520s top_cpu=%.360s}",
+        work.alive ? 1 : 0,
+        work.shutting_down ? 1 : 0,
+        work.workers,
+        work.pending,
+        work.active,
+        work.oldest_active_ms >= kStuckAgeMs ? 1 : 0,
+        static_cast<unsigned long long>(work.oldest_active_ms),
+        static_cast<unsigned>(work.hot_workers),
+        static_cast<unsigned>(work.not_queryable_workers),
+        work.active_labels.empty() ? "<none>" : work.active_labels.c_str(),
+        work.top_cpu_labels.empty() ? "<none>" : work.top_cpu_labels.c_str(),
+        service.alive ? 1 : 0,
+        service.shutting_down ? 1 : 0,
+        service.workers,
+        service.pending,
+        service.active,
+        service.oldest_active_ms >= kStuckAgeMs ? 1 : 0,
+        static_cast<unsigned long long>(service.oldest_active_ms),
+        static_cast<unsigned>(service.hot_workers),
+        static_cast<unsigned>(service.not_queryable_workers),
+        service.active_labels.empty() ? "<none>" : service.active_labels.c_str(),
+        service.top_cpu_labels.empty() ? "<none>" : service.top_cpu_labels.c_str(),
+        critical.alive ? 1 : 0,
+        critical.shutting_down ? 1 : 0,
+        critical.workers,
+        critical.pending,
+        critical.active,
+        critical.oldest_active_ms >= kStuckAgeMs ? 1 : 0,
+        static_cast<unsigned long long>(critical.oldest_active_ms),
+        static_cast<unsigned>(critical.hot_workers),
+        static_cast<unsigned>(critical.not_queryable_workers),
+        critical.active_labels.empty() ? "<none>" : critical.active_labels.c_str(),
+        critical.top_cpu_labels.empty() ? "<none>" : critical.top_cpu_labels.c_str());
+}
+
 static DWORD count_current_process_threads(DWORD* err_out)
 {
     if (err_out)
@@ -3581,6 +5264,105 @@ static uint64_t filetime_to_u64(const FILETIME& ft)
     value.LowPart = ft.dwLowDateTime;
     value.HighPart = ft.dwHighDateTime;
     return value.QuadPart;
+}
+
+static void emit_window_hung_snapshot(
+    uint64_t stall_streak,
+    uint64_t frame,
+    uint64_t age_ms,
+    uint64_t phase_id,
+    const char* phase_name,
+    const char* render_section,
+    DWORD render_tid,
+    DWORD peek_status,
+    DWORD peek_error,
+    const char* dispatch_stage,
+    UINT dispatch_msg,
+    UINT_PTR dispatch_hwnd,
+    const char* wndproc_stage,
+    UINT wndproc_msg,
+    UINT_PTR wndproc_hwnd)
+{
+    constexpr UINT kSendTimeoutFlags = SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT;
+    constexpr UINT kSendTimeoutMs = 50U;
+    char mcp_snapshot[1400] = {};
+    char queue_snapshot[3000] = {};
+    char ui_dispatch_snapshot[1400] = {};
+    mcp_standalone::format_runtime_diagnostic_snapshot(mcp_snapshot, sizeof(mcp_snapshot));
+    format_work_queue_hung_snapshot(queue_snapshot, sizeof(queue_snapshot));
+    aida::ui_thread::format_snapshot(ui_dispatch_snapshot, sizeof(ui_dispatch_snapshot));
+
+    HWND hwnd = g_hwnd;
+    const BOOL hwnd_valid = hwnd ? ::IsWindow(hwnd) : FALSE;
+    DWORD hwnd_pid = 0;
+    DWORD ui_owner_tid = hwnd_valid ? ::GetWindowThreadProcessId(hwnd, &hwnd_pid) : 0;
+    BOOL is_hung = FALSE;
+    DWORD_PTR send_lresult = 0;
+    BOOL send_ok = FALSE;
+    DWORD send_gle = ERROR_INVALID_WINDOW_HANDLE;
+    if (hwnd_valid) {
+        is_hung = ::IsHungAppWindow(hwnd);
+        ::SetLastError(0);
+        send_ok = ::SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, kSendTimeoutFlags, kSendTimeoutMs, &send_lresult);
+        send_gle = send_ok ? 0UL : ::GetLastError();
+    }
+
+    FILETIME system_time{};
+    ::GetSystemTimeAsFileTime(&system_time);
+    LARGE_INTEGER qpc{};
+    ::QueryPerformanceCounter(&qpc);
+    const uint64_t now_ms = static_cast<uint64_t>(::GetTickCount64());
+    const uint64_t last_render_tick = aida_tracer::g_render_last_tick_ms.load(std::memory_order_acquire);
+    const DWORD current_queue_status = ::GetQueueStatus(QS_ALLINPUT);
+    diag::log_tagged_critical_fmt("tracer",
+        "WINDOW-HUNG-SNAPSHOT pid=%lu tid=%lu timestamp_100ns=%llu tick_ms=%llu qpc=%lld hwnd=0x%llX hwnd_valid=%d hwnd_pid=%lu ui_owner_tid=%lu current_tid=%lu render_tid=%lu is_hung=%d send_wm_null_ok=%d send_wm_null_gle=%lu send_wm_null_lresult=0x%llX send_timeout_ms=%u send_flags=0x%08X queue_status=0x%08lX current_queue_status=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX peek_calls=%llu peek_returns=%llu send_only_defers=%llu send_only_flushes=%llu stall_streak=%llu frame=%llu heartbeat_tick_ms=%llu heartbeat_age_ms=%llu phase=%s section=%s phase_id=%llu dispatch_stage=%s dispatch_msg=%s(0x%04X) dispatch_hwnd=0x%llX wndproc_stage=%s wndproc_msg=%s(0x%04X) wndproc_hwnd=0x%llX         mcp=%.1300s work_queues=%.2800s ui_dispatch=%.1300s",
+        static_cast<unsigned long>(::GetCurrentProcessId()),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        static_cast<unsigned long long>(filetime_to_u64(system_time)),
+        static_cast<unsigned long long>(now_ms),
+        static_cast<long long>(qpc.QuadPart),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        hwnd_valid ? 1 : 0,
+        static_cast<unsigned long>(hwnd_pid),
+        static_cast<unsigned long>(ui_owner_tid),
+        static_cast<unsigned long>(::GetCurrentThreadId()),
+        static_cast<unsigned long>(render_tid),
+        is_hung ? 1 : 0,
+        send_ok ? 1 : 0,
+        static_cast<unsigned long>(send_gle),
+        static_cast<unsigned long long>(send_lresult),
+        kSendTimeoutMs,
+        kSendTimeoutFlags,
+        static_cast<unsigned long>(peek_status),
+        static_cast<unsigned long>(current_queue_status),
+        static_cast<unsigned long>(peek_error),
+        aida_tracer::g_peek_remove_flags.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(aida_tracer::g_peek_filter_hwnd.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(aida_tracer::g_peek_call_count.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(aida_tracer::g_peek_return_count.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(aida_tracer::g_peek_send_only_defers.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(aida_tracer::g_peek_send_only_flushes.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(stall_streak),
+        static_cast<unsigned long long>(frame),
+        static_cast<unsigned long long>(last_render_tick),
+        static_cast<unsigned long long>(age_ms),
+        phase_name ? phase_name : "<null>",
+        render_section ? render_section : "<null>",
+        static_cast<unsigned long long>(phase_id),
+        dispatch_stage ? dispatch_stage : "<null>",
+        aida_tracer::message_name(dispatch_msg),
+        dispatch_msg,
+        static_cast<unsigned long long>(dispatch_hwnd),
+        wndproc_stage ? wndproc_stage : "<null>",
+        aida_tracer::message_name(wndproc_msg),
+        wndproc_msg,
+        static_cast<unsigned long long>(wndproc_hwnd),
+        mcp_snapshot[0] ? mcp_snapshot : "mcp{empty=1}",
+        queue_snapshot[0] ? queue_snapshot : "queues{empty=1}",
+        ui_dispatch_snapshot[0] ? ui_dispatch_snapshot : "ui_dispatch{empty=1}");
+    aida::diagnostics::window_hung::emit_hung_breadcrumb(hwnd, age_ms, phase_name);
+    aida::diagnostics::metadata_ring::dump_to_log(32);
+    aida::diagnostics::wer::log_wer_correlation("window_hung_snapshot");
 }
 
 struct process_cpu_delta_t {
@@ -3854,6 +5636,7 @@ static void request_render_diag_snapshot_async(uint64_t now_ms, bool force)
         } catch (const std::exception& e) {
             diag::log_tagged_critical_fmt("render", "render_diag_sample_exception what=%.180s", e.what());
         } catch (...) {
+            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "render_diag_sample");
             diag::log_tagged_critical("render", "render_diag_sample_exception what=<unknown>");
         }
         g_render_diag_sample_inflight.store(false, std::memory_order_release);
@@ -3961,9 +5744,11 @@ static void format_message_pump_stall_context(char* out, size_t cap)
     out[0] = 0;
     char full_snapshot[1700] = {};
     char ui_phase[900] = {};
+    char ui_dispatch[900] = {};
     char queue_snapshot[2600] = {};
     test_all_features::format_debug_snapshot(full_snapshot, sizeof(full_snapshot));
     test_all_features::format_ui_phase_snapshot(ui_phase, sizeof(ui_phase));
+    aida::ui_thread::format_snapshot(ui_dispatch, sizeof(ui_dispatch));
     format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
     DWORD thread_err = 0;
     const DWORD threads = count_current_process_threads(&thread_err);
@@ -3977,7 +5762,7 @@ static void format_message_pump_stall_context(char* out, size_t cap)
     _snprintf_s(out, cap, _TRUNCATE,
         "pid=%lu tid=%lu threads=%lu thread_err=%lu handles=%lu handle_ok=%d handle_err=%lu "
         "render_phase=%s render_section=%s dispatch_stage=%s dispatch_msg=%s(0x%04X) wndproc_stage=%s wndproc_msg=%s(0x%04X) "
-        "full_test_running=%d ui={%.760s} full={%.1200s} queues={%.1800s}",
+        "full_test_running=%d ui={%.760s} ui_dispatch={%.760s} full={%.1200s} queues={%.1800s}",
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()),
         static_cast<unsigned long>(threads),
@@ -3995,6 +5780,7 @@ static void format_message_pump_stall_context(char* out, size_t cap)
         aida_tracer::g_wndproc_msg.load(std::memory_order_acquire),
         test_all_features::is_running() ? 1 : 0,
         ui_phase[0] ? ui_phase : "<empty>",
+        ui_dispatch[0] ? ui_dispatch : "<empty>",
         full_snapshot[0] ? full_snapshot : "<empty>",
         queue_snapshot[0] ? queue_snapshot : "<empty>");
 }
@@ -4040,6 +5826,7 @@ __declspec(noinline) static DWORD seh_init_standalone_chat()
     __try {
         init_standalone_chat();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_init_standalone_chat");
         startup_log_critical_fmt("seh_init_standalone_chat_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
@@ -4062,6 +5849,7 @@ __declspec(noinline) static DWORD seh_network_view_initialize()
     __try {
         network_view::initialize();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_network_view_initialize");
         startup_log_critical_fmt("seh_network_view_initialize_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
@@ -4084,6 +5872,7 @@ __declspec(noinline) static DWORD seh_memory_scanner_initialize()
     __try {
         memory_scanner::initialize();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_memory_scanner_initialize");
         startup_log_critical_fmt("seh_memory_scanner_initialize_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
@@ -4106,6 +5895,7 @@ __declspec(noinline) static DWORD seh_mitm_proxy_pre_initialize()
     __try {
         mitm_proxy::pre_initialize();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_mitm_proxy_pre_initialize");
         startup_log_critical_fmt("seh_mitm_proxy_pre_initialize_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
@@ -4129,6 +5919,7 @@ __declspec(noinline) static DWORD seh_script_engine_initialize()
     __try {
         ok = script_engine::initialize();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_script_engine_initialize");
         startup_log_critical_fmt("seh_script_engine_initialize_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
@@ -4201,6 +5992,7 @@ static void post_arc_startup_gate_unseal()
                 cp,
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
         } catch (...) {
+            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "arc_render_gate_unseal");
             diag::log_tagged_critical_fmt("license",
                 "arc_render_gate_unseal_exception what=<unknown> bind_token_len=%zu used_len=%zu elapsed_ms=%llu",
                 bind_token_len,
@@ -4234,6 +6026,7 @@ static void post_arc_startup_gate_unseal()
     } catch (const std::exception& e) {
         diag::log_tagged_critical_fmt("license", "arc_render_gate_unseal_post_exception what=%.180s", e.what());
     } catch (...) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "arc_render_gate_unseal_post");
         diag::log_tagged_critical("license", "arc_render_gate_unseal_post_exception what=<unknown>");
     }
     if (!posted) {
@@ -4305,6 +6098,7 @@ static void post_script_engine_startup_initialize()
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at),
             e.what());
     } catch (...) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "script_engine_startup_async_post");
         g_script_engine_startup_init_posted.store(false, std::memory_order_release);
         startup_log_critical_fmt("script_engine_startup_async_post_exception elapsed_ms=%llu what=<unknown>",
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
@@ -4351,6 +6145,7 @@ static void run_authorized_feature_initializers(const char* source)
                 phase, source ? source : "unknown", e.what());
             return false;
         } catch (...) {
+            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "authorized_feature_phase");
             startup_log_critical_fmt("authorized_feature_phase_cpp_exception source=%s phase=%s elapsed_ms=%llu what=<unknown>",
                 source ? source : "unknown",
                 phase ? phase : "unknown",
@@ -4420,6 +6215,7 @@ __declspec(noinline) static DWORD seh_snapshot_code_hashes()
         if (!ok)
             return ERROR_GEN_FAILURE;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_snapshot_code_hashes");
         startup_log_critical_fmt("seh_snapshot_code_hashes_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started),
@@ -4457,6 +6253,7 @@ __declspec(noinline) static void cpp_anti_tamper_initialize(bool& out_result)
     }
     catch (...)
     {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "cpp_anti_tamper_initialize");
         startup_log_critical_fmt("cpp_anti_tamper_initialize_exception elapsed_ms=%llu what=<unknown>",
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
         diag::log_tagged("bg_init", "anti_tamper_initialize_unknown_cpp_exception");
@@ -4475,6 +6272,7 @@ __declspec(noinline) static DWORD seh_anti_tamper_initialize(bool& out_result)
     __try {
         cpp_anti_tamper_initialize(out_result);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_anti_tamper_initialize");
         startup_log_critical_fmt("seh_anti_tamper_initialize_exception code=0x%08X result=%d elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
             out_result ? 1 : 0,
@@ -4507,6 +6305,7 @@ __declspec(noinline) static DWORD seh_driver_bridge_initialize_raw(bool* out_ok)
         if (out_ok)
             *out_ok = driver_bridge::initialize();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_driver_bridge_initialize_raw");
         return GetExceptionCode();
     }
     return 0;
@@ -4664,6 +6463,7 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
         return EXCEPTION_CONTINUE_SEARCH;
     }
     aida_write_first_chance_crash_log(ep);
+    aida::diagnostics::crash::emit_crash_breadcrumb(code, ep->ExceptionRecord->ExceptionAddress, "aida_diagnostic_veh");
     if (!ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
     HMODULE crash_mod = nullptr;
     char crash_mod_name[MAX_PATH] = "<unknown>";
@@ -4767,6 +6567,10 @@ int main(int, char**)
     aida_early_startup::mark(diagnostic_veh ? "diagnostic_veh_installed" : "diagnostic_veh_install_failed");
     aida_early_startup::mark("normal_diag_log_pre");
     diag::log_tagged_critical("main", "diagnostic_veh_installed");
+    aida::ui_thread::capture_owner_tid(::GetCurrentThreadId(), "main", "startup", "main_enter");
+    command_sessions::set_ui_thread_id(::GetCurrentThreadId());
+    aida::executor::set_ui_owner_tid(::GetCurrentThreadId());
+    aida::infra::taskflow_eval::log_evaluation();
     diag::log_tagged_critical_fmt("startup",
         "run_correlation_generated run_id=%s pid=%lu tid=%lu tick=%llu",
         startup_run_id.c_str(),
@@ -4774,6 +6578,7 @@ int main(int, char**)
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     aida_early_startup::mark_normal_diagnostics_reached();
+    phase0_log_startup_invariants("post_normal_diag", nullptr);
     aida_early_startup::mark("disk_backed_startup_state_pre");
     log_disk_backed_startup_state("post_veh");
     aida_early_startup::mark("normal_startup_state_logged");
@@ -4815,6 +6620,11 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()),
         work_queue::SERVICE_POOL_SIZE);
     crash_log_write("work_queue_service_init_ok");
+    phase0_post_wer_configuration_logging("post_work_queue_service_init");
+    aida::diagnostics::metadata_ring::emit(
+        aida::diagnostics::metadata_ring::breadcrumb_category_t::startup_shutdown,
+        "standalone_startup_begin", "phase0_complete", true);
+    aida::diagnostics::wer::log_wer_correlation("startup");
 
     startup_log_critical_fmt("critical_work_queue_initialize_pre pid=%lu tid=%lu tick=%llu pool_size=%d",
         GetCurrentProcessId(),
@@ -5040,6 +6850,31 @@ int main(int, char**)
         crash_log_write(buf);
         diag::write_crash_log(buf, false);
 
+        {
+            aida::diagnostics::crash::crash_context_t ctx;
+            ctx.exception_code = ep->ExceptionRecord->ExceptionCode;
+            ctx.exception_flags = ep->ExceptionRecord->ExceptionFlags;
+            ctx.exception_address = ep->ExceptionRecord->ExceptionAddress;
+            ctx.exception_record_count = ep->ExceptionRecord->NumberParameters;
+            ctx.crash_boundary_name = "unhandled_exception_filter";
+            ctx.current_tid = GetCurrentThreadId();
+            ctx.last_render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
+            ctx.last_render_tick_ms = aida_tracer::g_render_last_tick_ms.load(std::memory_order_acquire);
+            const uint64_t crash_now_ms = static_cast<uint64_t>(GetTickCount64());
+            ctx.render_heartbeat_age_ms = (ctx.last_render_tick_ms > 0 && crash_now_ms >= ctx.last_render_tick_ms)
+                ? (crash_now_ms - ctx.last_render_tick_ms) : 0;
+            char mcp_snap[1400] = {};
+            char queue_snap[3000] = {};
+            char ui_dispatch_snap[1400] = {};
+            mcp_standalone::format_runtime_diagnostic_snapshot(mcp_snap, sizeof(mcp_snap));
+            format_work_queue_hung_snapshot(queue_snap, sizeof(queue_snap));
+            aida::ui_thread::format_snapshot(ui_dispatch_snap, sizeof(ui_dispatch_snap));
+            ctx.mcp_snapshot = mcp_snap;
+            ctx.queue_snapshot = queue_snap;
+            ctx.ui_dispatch_snapshot = ui_dispatch_snap;
+            aida::diagnostics::crash::log_crash_snapshot(ctx);
+        }
+
         anti_tamper::webhook::send_debug_log("crash", buf, true);
 
         return EXCEPTION_CONTINUE_SEARCH;
@@ -5112,6 +6947,7 @@ int main(int, char**)
                 static_cast<unsigned long long>(diag_fnv1a64(e.what(), std::strlen(e.what()))));
             show_mcp_posture_refuse_ui_and_exit(mcp_report);
         } catch (...) {
+            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "mcp_posture_scan");
             anti_tamper::mcp_posture::report_t mcp_report;
             mcp_report.scanned = true;
             mcp_report.trusted = false;
@@ -5185,9 +7021,22 @@ int main(int, char**)
                                   wc.hInstance,
                                   nullptr);
     g_hwnd = hwnd;
+    {
+        aida::diagnostics::observer::observer_config_t obs_cfg;
+        obs_cfg.enabled = true;
+        obs_cfg.poll_interval_ms = 5000;
+        obs_cfg.hung_threshold_ms = 5000;
+        obs_cfg.max_lifetime_ms = 600000;
+        obs_cfg.wm_null_timeout_ms = 200;
+        aida::diagnostics::observer::start(GetCurrentProcessId(), hwnd, obs_cfg);
+    }
+    DWORD hwnd_owner_tid = hwnd ? ::GetWindowThreadProcessId(hwnd, nullptr) : 0;
+    if (hwnd_owner_tid != 0)
+        aida::ui_thread::capture_owner_tid(hwnd_owner_tid, "main", "create_window", "post_create_window");
     startup_log_critical_fmt("create_window_post hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         static_cast<unsigned long>(GetLastError()));
+    phase0_log_startup_invariants("post_create_window", hwnd);
     startup_log_critical_fmt(
         "window_style_post style=0x%08lX exstyle=0x%08lX hwnd=0x%llX last_err=%lu",
         static_cast<unsigned long>(::GetWindowLongPtrW(hwnd, GWL_STYLE)),
@@ -5252,6 +7101,8 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()));
     ::ShowWindow(hwnd, SW_SHOW);
     aida::manual_map_tls::ensure_current_thread();
+    if (!aida::ui_thread::require_owner("dwm", "startup_window_attributes", "show_window"))
+        return 1;
     const MARGINS margin = { -1 };
     DwmExtendFrameIntoClientArea(hwnd, &margin);
     aida::manual_map_tls::ensure_current_thread();
@@ -5298,6 +7149,8 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
+    if (!aida::ui_thread::require_owner("imgui", "create_context", "startup"))
+        return 1;
     ImGui::CreateContext();
     aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("imgui_context_create_post ctx=0x%llX",
@@ -5309,6 +7162,8 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
+    if (!aida::ui_thread::require_owner("imgui", "get_io", "startup"))
+        return 1;
     ImGuiIO& io = ImGui::GetIO();
     startup_log_critical_fmt("imgui_getio_post io=0x%llX fonts=0x%llX config=0x%08X",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(&io)),
@@ -5368,6 +7223,8 @@ int main(int, char**)
     crash_log_write("fonts_built");
     startup_log_critical_fmt("imgui_backend_win32_pre hwnd=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)));
+    if (!aida::ui_thread::require_owner("imgui_win32", "backend_init", "startup"))
+        return 1;
     ImGui_ImplWin32_Init(hwnd);
     startup_log_critical_fmt("imgui_backend_win32_post last_err=%lu",
         static_cast<unsigned long>(GetLastError()));
@@ -5375,6 +7232,8 @@ int main(int, char**)
     startup_log_critical_fmt("imgui_backend_dx11_pre device=0x%llX ctx=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDevice)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDeviceContext)));
+    if (!aida::ui_thread::require_owner("dx11", "imgui_backend_init", "startup"))
+        return 1;
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
     g_imgui_dx11_initialized = true;
     startup_log_critical_fmt("imgui_backend_dx11_post initialized=%d last_err=%lu",
@@ -5393,6 +7252,8 @@ int main(int, char**)
     startup_log_critical_fmt("blend_state_create_pre device=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDevice)));
     g_pd3dDevice->CreateBlendState(&blend_desc, &blend_state);
+    if (!aida::ui_thread::require_owner("dx11", "blend_state", "startup"))
+        return 1;
     g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
     startup_log_critical_fmt("blend_state_create_post blend=0x%llX last_err=%lu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(blend_state)),
@@ -5401,10 +7262,13 @@ int main(int, char**)
     startup_log_critical_fmt("blur_init_pre device=0x%llX ctx=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDevice)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDeviceContext)));
+    if (!aida::ui_thread::require_owner("blur", "init", "startup"))
+        return 1;
     Blur::Init(g_pd3dDevice, g_pd3dDeviceContext, 100, 130);
     startup_log_critical_fmt("blur_init_post last_err=%lu",
         static_cast<unsigned long>(GetLastError()));
     crash_log_write("blur_init_ok");
+    aida::ui_thread::mark_ready(hwnd, "main", "ui_dispatcher", "post_blur_init");
 
     static std::atomic<bool> bg_init_done{false};
     globals::ui::bg_init_done = &bg_init_done;
@@ -5453,6 +7317,7 @@ int main(int, char**)
                     e.what());
                 diag::log_tagged_fmt("bg_init", "%s_cpp_exception what=%s", phase, e.what());
             } catch (...) {
+                aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "bg_init_run_step");
                 cpp_ok = false;
                 startup_log_critical_fmt("bg_init_run_step_cpp_exception phase=%s elapsed_ms=%llu what=<unknown>",
                     phase ? phase : "unknown",
@@ -5600,6 +7465,7 @@ int main(int, char**)
                     e.what());
                 diag::log_tagged_fmt("bg_init", "anti_tamper_initialize_cpp_exception what=%s", e.what());
             } catch (...) {
+                aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "bg_init_anti_tamper_initialize");
                 startup_log_critical_fmt("anti_tamper_initialize_cpp_exception elapsed_ms=%llu what=<unknown>",
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - anti_tamper_tick));
                 diag::log_tagged("bg_init", "anti_tamper_initialize_cpp_exception what=<unknown>");
@@ -5648,6 +7514,7 @@ int main(int, char**)
                 e.what());
             diag::log_tagged_fmt("bg_init", "session_health_init_cpp_exception what=%s", e.what());
         } catch (...) {
+            aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "bg_init_session_health_initialize");
             startup_log_critical_fmt("session_health_initialize_cpp_exception elapsed_ms=%llu what=<unknown>",
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - session_tick));
             diag::log_tagged("bg_init", "session_health_init_cpp_exception what=<unknown>");
@@ -5826,6 +7693,8 @@ int main(int, char**)
             DWORD now_acrylic = ((DWORD)aida::ui::resolved().acrylic_color & 0x00FFFFFFu) | (0xFFu << 24);
             if (themes::changed || s_last_acrylic_applied != now_acrylic)
             {
+                if (!aida::ui_thread::require_owner("dwm", "acrylic_reapply", "frame_begin"))
+                    continue;
                 themes::changed = false;
                 s_last_acrylic_applied = now_acrylic;
 
@@ -5979,6 +7848,9 @@ int main(int, char**)
             aida_tracer::g_peek_call_count.fetch_add(1, std::memory_order_acq_rel);
             BOOL has_message = ::PeekMessage(&msg, peek_filter, 0U, 0U, peek_remove_flags);
             aida_tracer::g_peek_return_count.fetch_add(1, std::memory_order_acq_rel);
+            aida::diagnostics::metadata_ring::emit(
+                aida::diagnostics::metadata_ring::breadcrumb_category_t::message_pump,
+                "message_pump_phase", nullptr, false);
             DWORD peek_gle = ::GetLastError();
             uint64_t peek_elapsed = static_cast<uint64_t>(GetTickCount64()) - peek_start;
             aida_tracer::set_peek_state(queue_status_before, peek_gle);
@@ -6011,6 +7883,10 @@ int main(int, char**)
                 break;
 
             ++pumped_messages;
+            if (aida::ui_thread::is_wake_message(msg.message)) {
+                aida::ui_thread::acknowledge_wake_message();
+                continue;
+            }
             bool input_message = false;
             if (aida_is_input_or_attention_message(msg.message)) {
                 input_message = true;
@@ -6146,9 +8022,16 @@ int main(int, char**)
         if (done)
             break;
 
+        aida_tracer::mark_render_phase("ui_dispatcher_frame_top");
+        const std::uint32_t ui_dispatch_drained = aida::ui_thread::drain(32, 2, "frame_top");
+        if (ui_dispatch_drained != 0)
+            pumped_messages += ui_dispatch_drained;
+
         if (g_SwapChainOccluded && g_pSwapChain)
         {
-            const HRESULT occlusion_hr = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
+            HRESULT occlusion_hr = E_ACCESSDENIED;
+            if (aida::ui_thread::require_owner("swapchain", "present_test", "occlusion"))
+                occlusion_hr = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
             if (occlusion_hr == DXGI_STATUS_OCCLUDED) {
                 const uint64_t occlusion_now_ms = static_cast<uint64_t>(GetTickCount64());
                 const DWORD occlusion_qs = ::GetQueueStatus(kAidaInteractiveQueueBits);
@@ -6362,7 +8245,8 @@ int main(int, char**)
 
             ::SetWindowRgn(hwnd, nullptr, TRUE);
             DWM_WINDOW_CORNER_PREFERENCE cp = globals::ui::maximized ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
-            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
+            if (aida::ui_thread::require_owner("dwm", "corner_preference", "layout_size_change"))
+                DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
             if (!resize_swapchain_and_target(static_cast<UINT>(iw), static_cast<UINT>(ih), frame_number, "layout_size_change")) {
                 Sleep(1);
                 continue;
@@ -6372,6 +8256,8 @@ int main(int, char**)
             diag::log_tagged_critical("render", "second_resize_post");
         }
 
+        if (!aida::ui_thread::require_owner("imgui", "get_io", "pre_frame"))
+            continue;
         ImGuiIO& pre_frame_io = ImGui::GetIO();
         const uint64_t dirty_now_ms = static_cast<uint64_t>(GetTickCount64());
         static bool dirty_state_initialized = false;
@@ -6405,6 +8291,7 @@ int main(int, char**)
         const bool interactive_pending_pre = (HIWORD(dirty_qs) & kAidaInteractiveQueueBits) != 0;
         const bool full_test_running_pre = test_all_features::is_running();
         const bool bulk_busy_pre = function_index::static_bulk_in_progress();
+        const bool ui_dispatch_pending_pre = aida::ui_thread::pending_count() != 0;
         const bool ai_thinking_pre = g_ai_thinking_active;
         const bool activation_progress_pre =
             license::checking ||
@@ -6478,6 +8365,8 @@ int main(int, char**)
             dirty_mask |= kAidaDirtyProgress;
         if (bulk_busy_pre != last_bulk_busy)
             dirty_mask |= kAidaDirtyWork;
+        if (ui_dispatch_pending_pre)
+            dirty_mask |= kAidaDirtyWork;
         const bool interactive_cadence_due_pre = recent_input_pre && since_render_ms >= kAidaInteractiveRenderCadenceMs;
         if (interactive_cadence_due_pre)
             dirty_mask |= kAidaDirtyInteractiveCadence;
@@ -6501,13 +8390,16 @@ int main(int, char**)
             active_modal_or_animation_pre ||
             menu_popup_interactive_pre ||
             activation_progress_pre ||
-            ai_thinking_pre;
+            ai_thinking_pre ||
+            ui_dispatch_pending_pre;
         const bool blur_pressure_pre =
             wake_fast_pre ||
             cursor_over_aida_pre ||
             full_test_running_pre ||
             bulk_busy_pre ||
             activation_progress_pre;
+        if (!aida::ui_thread::require_owner("blur", "interaction_pressure", "pre_frame"))
+            continue;
         if (blur_pressure_pre)
             Blur::SetInteractionPressure(true, dirty_now_ms + kAidaInteractiveBlurPressureMs);
         else
@@ -6612,6 +8504,8 @@ int main(int, char**)
             continue;
         }
 
+        if (!aida::ui_thread::require_owner("ui_state", "theme_tick", "render_frame"))
+            continue;
         aida::ui::clock::tick();
         aida::ui::tick_theme_animation(aida::ui::clock::dt());
         {
@@ -6687,8 +8581,10 @@ int main(int, char**)
                 mid_frame_io.WantCaptureKeyboard;
             if (defer_post_build_pump) {
                 aida_tracer::mark_render_phase("post_imgui_build_pump_deferred");
+                aida::ui_thread::drain(8, 1, "post_imgui_build_deferred");
             } else {
                 aida_tracer::mark_render_phase("post_imgui_build_pump");
+                aida::ui_thread::drain(8, 1, "post_imgui_build");
                 const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("post_imgui_build", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
                 pumped_messages += mid_pump.messages;
                 pumped_input_messages += mid_pump.input_messages;
@@ -6726,6 +8622,8 @@ int main(int, char**)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_render code=0x%08X frame=%llu",
                 seh_ir, (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("collect_draw_data");
+        if (!aida::ui_thread::require_owner("imgui", "get_draw_data", "render_submit"))
+            continue;
         ImDrawData* draw_data = ImGui::GetDrawData();
         draw_data_metrics_t draw_metrics = collect_draw_data_metrics(draw_data, frame_number < 5ULL || (frame_number % 120ULL) == 0ULL);
         begin_gpu_frame_query(frame_number);
@@ -6735,11 +8633,14 @@ int main(int, char**)
             diag::log_tagged_critical_fmt("render", "SEH_in_imgui_dx11_render code=0x%08X frame=%llu",
                 seh_idr, (unsigned long long)frame_number);
         aida_tracer::mark_render_phase("dx11_blend_state");
+        if (!aida::ui_thread::require_owner("dx11", "blend_state", "render_frame"))
+            continue;
         g_pd3dDeviceContext->OMSetBlendState(blend_state, nullptr, 0xffffffff);
         end_gpu_frame_query(frame_number);
 
         {
             aida_tracer::mark_render_phase("pre_present_pump");
+            aida::ui_thread::drain(8, 1, "pre_present");
             const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("pre_present", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
             pumped_messages += mid_pump.messages;
             pumped_input_messages += mid_pump.input_messages;
@@ -6771,6 +8672,7 @@ int main(int, char**)
 
         {
             aida_tracer::mark_render_phase("post_present_pump");
+            aida::ui_thread::drain(8, 1, "post_present");
             const aida_message_pump_slice_t mid_pump = aida_pump_messages_budgeted("post_present", kAidaMidFramePumpBudgetMessages, kAidaMidFramePumpBudgetMs);
             pumped_messages += mid_pump.messages;
             pumped_input_messages += mid_pump.input_messages;
@@ -6936,6 +8838,7 @@ int main(int, char**)
                         work_queue::log_stuck_workers(30000ULL, 8);
                         work_queue::log_service_stuck_workers(30000ULL, 8);
                         critical_work_queue::log_stuck_workers(30000ULL, 8);
+                        aida::executor::check_deadlines();
                     };
                     bool stuck_log_posted = work_queue::post_service_labeled("render.idle_stuck_worker_log", stuck_log_task);
                     if (!stuck_log_posted)
@@ -7309,6 +9212,11 @@ int main(int, char**)
     }
 
     aida_shutdown_diag::mark("shutdown_sequence_begin");
+    aida::diagnostics::metadata_ring::emit(
+        aida::diagnostics::metadata_ring::breadcrumb_category_t::startup_shutdown,
+        "standalone_shutdown_begin", "cleanup_starting", true);
+    aida::diagnostics::metadata_ring::request_shutdown();
+    aida::diagnostics::observer::stop();
     diag::log_tagged_critical_fmt("main",
         "shutdown_sequence_begin frame=%llu done=%d hwnd=0x%llX tid=%lu",
         (unsigned long long)frame_number,
@@ -7316,6 +9224,7 @@ int main(int, char**)
         (unsigned long long)reinterpret_cast<UINT_PTR>(hwnd),
         GetCurrentThreadId());
     aida_tracer::mark_render_phase("shutdown_sequence_begin");
+    aida::ui_thread::shutdown();
     {
         char queue_snapshot[2400] = {};
         format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
@@ -7329,6 +9238,7 @@ int main(int, char**)
         aida::burp::camoufox::force_cleanup("main.shutdown_sequence");
         diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_done");
     } catch (...) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "shutdown_camoufox_force_cleanup");
         diag::log_tagged_critical("main", "shutdown_camoufox_force_cleanup_exception");
     }
     aida_shutdown_diag::mark("shutdown_hotkey_monitor");
@@ -7345,6 +9255,7 @@ int main(int, char**)
         diag::log_tagged_critical_fmt("main", "shutdown_session_health_done stopped=%d",
             session_health_stopped ? 1 : 0);
     } catch (...) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "shutdown_session_health");
         diag::log_tagged_critical("main", "shutdown_session_health_exception");
     }
     try {
@@ -7352,6 +9263,7 @@ int main(int, char**)
         standalone_license::stop_background_workers("main.shutdown_prelude", 2500);
         diag::log_tagged_critical("main", "shutdown_license_workers_done");
     } catch (...) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(0xE06D7363u, nullptr, "shutdown_license_workers");
         diag::log_tagged_critical("main", "shutdown_license_workers_exception");
     }
     aida_shutdown_diag::mark("shutdown_driver_bridge_deferred");
@@ -7394,17 +9306,21 @@ int main(int, char**)
     aida::auth::http::cleanup();
     diag::log_tagged_critical("main", "shutdown_auth_http_done");
     aida_shutdown_diag::mark("shutdown_blur");
-    Blur::Shutdown();
+    if (aida::ui_thread::require_owner("blur", "shutdown", "shutdown"))
+        Blur::Shutdown();
     diag::log_tagged_critical("main", "shutdown_blur_done");
     aida_shutdown_diag::mark("shutdown_imgui_dx11");
-    ImGui_ImplDX11_Shutdown();
+    if (aida::ui_thread::require_owner("dx11", "imgui_dx11_shutdown", "shutdown"))
+        ImGui_ImplDX11_Shutdown();
     diag::log_tagged_critical("main", "shutdown_imgui_dx11_done");
 
     aida_shutdown_diag::mark("shutdown_imgui_win32");
-    ImGui_ImplWin32_Shutdown();
+    if (aida::ui_thread::require_owner("imgui_win32", "shutdown", "shutdown"))
+        ImGui_ImplWin32_Shutdown();
     diag::log_tagged_critical("main", "shutdown_imgui_win32_done");
     aida_shutdown_diag::mark("shutdown_imgui_context");
-    ImGui::DestroyContext();
+    if (aida::ui_thread::require_owner("imgui", "destroy_context", "shutdown"))
+        ImGui::DestroyContext();
     diag::log_tagged_critical("main", "shutdown_imgui_context_done");
 
     aida_shutdown_diag::mark("shutdown_d3d");
@@ -7427,6 +9343,8 @@ int main(int, char**)
 
 bool CreateDeviceD3D(HWND hWnd)
 {
+    if (!aida::ui_thread::require_owner("dx11", "create_device", "enter"))
+        return false;
     DXGI_SWAP_CHAIN_DESC sd;
     ZeroMemory(&sd, sizeof(sd));
     sd.BufferCount = 2;
@@ -7464,6 +9382,8 @@ bool CreateDeviceD3D(HWND hWnd)
 
 void CleanupDeviceD3D()
 {
+    if (!aida::ui_thread::require_owner("dx11", "cleanup_device", "enter"))
+        return;
     release_gpu_frame_queries();
     CleanupRenderTarget();
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
@@ -7475,6 +9395,8 @@ void CleanupDeviceD3D()
 
 void CreateRenderTarget()
 {
+    if (!aida::ui_thread::require_owner("render_target", "create", "enter"))
+        return;
     ++g_resize_perf.render_target_recreates;
     ID3D11Texture2D* pBackBuffer = nullptr;
     HRESULT hr_get = E_POINTER;
@@ -7493,6 +9415,7 @@ void CreateRenderTarget()
     __try {
         hr_get = g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "create_render_target_get_buffer");
         seh_get = GetExceptionCode();
     }
     if (seh_get != 0 || FAILED(hr_get) || !pBackBuffer) {
@@ -7511,6 +9434,7 @@ void CreateRenderTarget()
     __try {
         hr_rtv = g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "create_render_target_create_rtv");
         seh_rtv = GetExceptionCode();
     }
     if (seh_rtv != 0 || FAILED(hr_rtv) || !g_mainRenderTargetView) {
@@ -7530,6 +9454,7 @@ void CreateRenderTarget()
     __try {
         pBackBuffer->GetDesc(&d);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "create_render_target_get_desc");
         diag::log_tagged_critical_fmt("render",
             "create_render_target_get_desc_seh code=0x%08X backbuffer=0x%llX rtv=0x%llX",
             GetExceptionCode(),
@@ -7567,6 +9492,8 @@ void CreateRenderTarget()
 
 void CleanupRenderTarget()
 {
+    if (!aida::ui_thread::require_owner("render_target", "cleanup", "enter"))
+        return;
     if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
 }
 
@@ -7576,11 +9503,14 @@ __declspec(noinline) static DWORD seh_imgui_wndproc_handler(HWND hWnd, UINT msg,
 {
     if (result_out)
         *result_out = 0;
+    if (!aida::ui_thread::require_owner("imgui_win32", "wndproc_handler", "seh_enter"))
+        return ERROR_ACCESS_DENIED;
     __try {
         if (!result_out)
             return ERROR_INVALID_PARAMETER;
         *result_out = ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_imgui_wndproc_handler");
         return GetExceptionCode();
     }
     return 0;
@@ -7589,7 +9519,14 @@ __declspec(noinline) static DWORD seh_imgui_wndproc_handler(HWND hWnd, UINT msg,
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     aida::manual_map_tls::ensure_current_thread();
+    if (aida::ui_thread::owner_tid() == 0)
+        aida::ui_thread::capture_owner_tid(::GetCurrentThreadId(), "win32", "WndProc", "enter");
+    if (!aida::ui_thread::require_owner("win32", "WndProc", "enter"))
+        return ::DefWindowProcW(hWnd, msg, wParam, lParam);
     aida_tracer::set_wndproc_state("enter", hWnd, msg, wParam, lParam);
+    aida::diagnostics::metadata_ring::emit(
+        aida::diagnostics::metadata_ring::breadcrumb_category_t::wndproc,
+        "wndproc_entry", nullptr, false);
     uint64_t wnd_start = static_cast<uint64_t>(GetTickCount64());
     const bool trace_input_msg = aida_tracer::should_log_wndproc_input_message(msg);
     auto finish = [&](const char* path, LRESULT result) -> LRESULT {
@@ -7643,6 +9580,11 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     if (msg == WM_GETICON)
         return finish("geticon_fast", reinterpret_cast<LRESULT>(g_aidaWindowIcon));
 
+    if (aida::ui_thread::is_wake_message(msg)) {
+        aida::ui_thread::acknowledge_wake_message();
+        return finish("ui_dispatcher_wake", 0);
+    }
+
     if (msg == WM_QUERYENDSESSION) {
         aida_tracer::set_wndproc_state("queryendsession", hWnd, msg, wParam, lParam);
         log_session_shutdown("WM_QUERYENDSESSION");
@@ -7676,6 +9618,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         (msg == WM_SYSCOMMAND && ((wParam & 0xfff0) == SC_CLOSE))) {
         const bool sys_close = (msg == WM_SYSCOMMAND);
         aida_shutdown_diag::mark(sys_close ? "wndproc_syscommand_close_destroy" : "wndproc_wm_close_destroy");
+        aida::ui_thread::mark_window_destroying(hWnd, "wndproc", sys_close ? "syscommand_close" : "wm_close", "pre_destroy_window");
         ::SetLastError(0);
         BOOL destroyed = ::DestroyWindow(hWnd);
         DWORD gle = ::GetLastError();
@@ -7693,12 +9636,17 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     if (msg == WM_DESTROY) {
         aida_shutdown_diag::mark("wndproc_destroy_post_quit");
+        aida::ui_thread::mark_window_destroying(hWnd, "wndproc", "wm_destroy", "post_quit");
         diag::log_tagged_critical_fmt("wndproc",
             "destroy_post_quit hwnd=0x%llX tid=%lu",
             (unsigned long long)reinterpret_cast<UINT_PTR>(hWnd),
             GetCurrentThreadId());
         ::PostQuitMessage(0);
         return finish("destroy", 0);
+    }
+
+    if (msg == WM_NCDESTROY) {
+        aida::ui_thread::mark_window_destroying(hWnd, "wndproc", "wm_ncdestroy", "enter");
     }
 
     if (trace_input_msg) {
@@ -7854,9 +9802,12 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         const bool now_zoomed = (wParam == SIZE_MAXIMIZED) ||
                                 (wParam == SIZE_RESTORED && ::IsZoomed(hWnd));
+        if (!aida::ui_thread::require_owner("ui_state", "wm_size", "WndProc"))
+            return finish("size_affinity_denied", 0);
         globals::ui::maximized = now_zoomed;
         DWM_WINDOW_CORNER_PREFERENCE cp = now_zoomed ? DWMWCP_DONOTROUND : DWMWCP_ROUND;
-        DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
+        if (aida::ui_thread::require_owner("dwm", "corner_preference", "WM_SIZE"))
+            DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cp, sizeof(cp));
         g_ResizeWidth = (UINT)LOWORD(lParam);
         g_ResizeHeight = (UINT)HIWORD(lParam);
         g_ResizeRequestTickMs = static_cast<uint64_t>(GetTickCount64());
@@ -7923,6 +9874,8 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_DPICHANGED:
     {
         UINT dpi = HIWORD(wParam);
+        if (!aida::ui_thread::require_owner("ui_state", "dpi_changed", "WndProc"))
+            return finish("dpichanged_affinity_denied", 0);
         globals::ui::dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;
         aida::ui::set_dpi_scale(globals::ui::dpi_scale);
         RECT* suggested = reinterpret_cast<RECT*>(lParam);
@@ -7952,31 +9905,90 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_DROPFILES:
     {
         HDROP hdrop = reinterpret_cast<HDROP>(wParam);
+        const uint64_t generation = g_dragdrop_ui_generation.fetch_add(1ULL, std::memory_order_acq_rel) + 1ULL;
+        const uint64_t capture_start_ms = static_cast<uint64_t>(::GetTickCount64());
+        const DWORD producer_tid = ::GetCurrentThreadId();
+        UINT count = 0;
+        UINT path_chars = 0;
+        UINT got = 0;
+        DWORD capture_gle = 0;
+        bool captured = false;
+        bool converted = false;
+        bool queued = false;
+        POINT drop_point{};
+        BOOL drop_point_client = FALSE;
+        std::wstring dropped_path_w;
+        std::string dropped_path;
         if (hdrop) {
             aida_tracer::set_wndproc_state("dropfiles_query_count", hWnd, msg, wParam, lParam);
-            UINT count = ::DragQueryFileW(hdrop, 0xFFFFFFFFu, nullptr, 0);
-            diag::log_tagged_fmt("dragdrop", "WM_DROPFILES count=%u", count);
+            drop_point_client = ::DragQueryPoint(hdrop, &drop_point);
+            count = ::DragQueryFileW(hdrop, 0xFFFFFFFFu, nullptr, 0);
             if (count > 0) {
-                wchar_t wpath[MAX_PATH] = {};
                 aida_tracer::set_wndproc_state("dropfiles_query_path", hWnd, msg, wParam, lParam);
-                UINT got = ::DragQueryFileW(hdrop, 0, wpath, MAX_PATH);
-                if (got > 0) {
-                    char path_utf8[MAX_PATH * 4] = {};
-                    aida_tracer::set_wndproc_state("dropfiles_utf8", hWnd, msg, wParam, lParam);
-                    int n = ::WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
-                        path_utf8, sizeof(path_utf8), nullptr, nullptr);
-                    if (n > 0) {
-                        diag::log_tagged_fmt("dragdrop", "drop accepted path=%s", path_utf8);
-                        aida_tracer::set_wndproc_state("dropfiles_open_path", hWnd, msg, wParam, lParam);
-                        file_browser::open_path(std::string(path_utf8));
-                    } else {
-                        diag::log_tagged("dragdrop", "drop path utf8 conversion failed");
+                path_chars = ::DragQueryFileW(hdrop, 0, nullptr, 0);
+                if (path_chars > 0 && path_chars <= 32767u) {
+                    std::vector<wchar_t> path_buffer(static_cast<std::size_t>(path_chars) + 1u, L'\0');
+                    got = ::DragQueryFileW(hdrop, 0, path_buffer.data(), path_chars + 1u);
+                    if (got > 0) {
+                        dropped_path_w.assign(path_buffer.data(), static_cast<std::size_t>(got));
+                        captured = true;
                     }
+                } else if (path_chars > 32767u) {
+                    capture_gle = ERROR_FILENAME_EXCED_RANGE;
                 }
             }
             aida_tracer::set_wndproc_state("dropfiles_finish", hWnd, msg, wParam, lParam);
             ::DragFinish(hdrop);
+        } else {
+            capture_gle = ERROR_INVALID_HANDLE;
         }
+        aida_tracer::set_wndproc_state("dropfiles_enqueue", hWnd, msg, wParam, lParam);
+        if (captured)
+            converted = aida_wide_to_utf8_owned(dropped_path_w, dropped_path);
+        if (converted && !dropped_path.empty()) {
+            const std::string path_for_ui = dropped_path;
+            const uint64_t deadline_ms = static_cast<uint64_t>(::GetTickCount64()) + 5000ULL;
+            aida::ui_thread::post_options_t options;
+            options.subsystem = "dragdrop";
+            options.label = "open_path";
+            options.phase = "wndproc_deferred";
+            options.owner = "dragdrop";
+            options.priority = aida::ui_thread::priority_t::high;
+            options.deadline_ms = deadline_ms;
+            options.cancelled = [generation]() {
+                return g_dragdrop_ui_generation.load(std::memory_order_acquire) != generation;
+            };
+            const aida::ui_thread::enqueue_result_t dispatch_result = aida::ui_thread::post(
+                [path_for_ui, generation, producer_tid, capture_start_ms]() {
+                    aida_dispatch_dropped_file_open(path_for_ui, generation, producer_tid, capture_start_ms);
+                },
+                std::move(options));
+            queued = dispatch_result == aida::ui_thread::enqueue_result_t::accepted;
+            diag::log_tagged_critical_fmt("DRAGDROP-UI-DISPATCH",
+                "enqueue generation=%llu result=%s deadline_ms=%llu priority=high path_len=%zu",
+                static_cast<unsigned long long>(generation),
+                aida::ui_thread::result_name(dispatch_result),
+                static_cast<unsigned long long>(deadline_ms),
+                path_for_ui.size());
+        }
+        diag::log_tagged_critical_fmt("WNDPROC-DEFERRED-WORK",
+            "dropfiles generation=%llu hwnd=0x%llX hdrop=0x%llX count=%u path_chars=%u got=%u captured=%d converted=%d queued=%d gle=%lu elapsed_ms=%llu drop_point_client=%d drop_x=%ld drop_y=%ld ui_pending=%zu path=%.260s",
+            static_cast<unsigned long long>(generation),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hWnd)),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hdrop)),
+            count,
+            path_chars,
+            got,
+            captured ? 1 : 0,
+            converted ? 1 : 0,
+            queued ? 1 : 0,
+            static_cast<unsigned long>(capture_gle),
+            static_cast<unsigned long long>(static_cast<uint64_t>(::GetTickCount64()) - capture_start_ms),
+            drop_point_client ? 1 : 0,
+            drop_point.x,
+            drop_point.y,
+            aida::ui_thread::pending_count(),
+            dropped_path.c_str());
         return finish("dropfiles", 0);
     }
     }

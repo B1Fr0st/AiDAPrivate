@@ -15,10 +15,12 @@
 #include <iostream>
 #include <string>
 #include <cstring>
+#include <cstdint>
 #include <atomic>
 #include <thread>
 #include <chrono>
 #include <exception>
+#include <utility>
 #include <nlohmann/json.hpp>
 #include "blur.h"
 #include "../assets/icons.h"
@@ -54,6 +56,7 @@
 #include "source_reconstruct_view.hpp"
 #include "work_queue.hpp"
 #include "critical_work_queue.hpp"
+#include "../core/ui/ui_thread_dispatcher.hpp"
 #include "functions_panel.hpp"
 #include "function_index.hpp"
 #include "xref_index.hpp"
@@ -653,70 +656,137 @@ namespace file_menu_deferred
 		return value;
 	}
 
-	static std::atomic<bool>& result_ready()
+	static std::atomic<std::uint64_t>& generation()
 	{
-		static std::atomic<bool> value{ false };
+		static std::atomic<std::uint64_t> value{ 0 };
 		return value;
 	}
 
-	static std::mutex& result_mutex()
+	static std::atomic<std::uint64_t>& active_generation()
 	{
-		static std::mutex value;
+		static std::atomic<std::uint64_t> value{ 0 };
 		return value;
 	}
 
-	static result_t& result_state()
+	static const char* action_name(action_t action)
 	{
-		static result_t value;
-		return value;
-	}
-
-	static void store_result(action_t action, bool ok, std::string path)
-	{
-		{
-			std::lock_guard<std::mutex> lock(result_mutex());
-			result_state() = result_t{ action, ok, std::move(path) };
+		switch (action) {
+		case action_t::none: return "none";
+		case action_t::open_file: return "open_file";
+		case action_t::open_folder: return "open_folder";
 		}
-		result_ready().store(true, std::memory_order_release);
+		return "unknown";
+	}
+
+	static void clear_active_generation_if_current(std::uint64_t token)
+	{
+		std::uint64_t expected = token;
+		(void)active_generation().compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+	}
+
+	static void store_result(std::uint64_t token, result_t result, const char* source)
+	{
+		std::string source_copy = source && source[0] ? source : "worker";
+		const action_t action = result.action;
+		const bool ok = result.ok;
+		const std::string path_copy = result.path;
+		const bool posted = aida::ui_thread::post([token, action, ok, path_copy, source_copy]() {
+			if (!aida::ui_thread::require_owner("file_dialog", "publish_result", source_copy.c_str())) {
+				clear_active_generation_if_current(token);
+				return;
+			}
+			const std::uint64_t current = generation().load(std::memory_order_acquire);
+			const std::uint64_t active_token = active_generation().load(std::memory_order_acquire);
+			const bool stale = token == 0 || token != current;
+			if (stale) {
+				diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+					"discard_stale source=%s token=%llu current=%llu active_generation=%llu action=%s ok=%d path=%.260s",
+					source_copy.c_str(),
+					static_cast<unsigned long long>(token),
+					static_cast<unsigned long long>(current),
+					static_cast<unsigned long long>(active_token),
+					action_name(action),
+					ok ? 1 : 0,
+					path_copy.c_str());
+				clear_active_generation_if_current(token);
+				return;
+			}
+
+			if (action == action_t::open_file) {
+				if (ok && !path_copy.empty()) {
+					diag::log_tagged_fmt("file_dialog", "deferred_open_file picked path=%.260s", path_copy.c_str());
+					diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+						"publish_open_file token=%llu source=%s path=%.260s",
+						static_cast<unsigned long long>(token),
+						source_copy.c_str(),
+						path_copy.c_str());
+					file_browser::open_path(path_copy);
+				} else {
+					diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+						"publish_open_file_cancelled token=%llu source=%s ok=%d",
+						static_cast<unsigned long long>(token),
+						source_copy.c_str(),
+						ok ? 1 : 0);
+					diag::log_tagged_critical("file_dialog", "deferred_open_file cancelled_or_failed");
+				}
+				diag::log_tagged_critical("file_dialog", "deferred_open_file end");
+			} else if (action == action_t::open_folder) {
+				if (ok && !path_copy.empty()) {
+					diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+						"publish_open_folder token=%llu source=%s path=%.260s",
+						static_cast<unsigned long long>(token),
+						source_copy.c_str(),
+						path_copy.c_str());
+					file_browser::refresh(path_copy);
+					g_sa_settings.workspace.root_path = path_copy;
+					g_sa_settings_request_save();
+					diag::log_tagged_fmt("file_dialog", "deferred_open_folder picked path=%.260s", path_copy.c_str());
+				} else {
+					diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+						"publish_open_folder_cancelled token=%llu source=%s ok=%d",
+						static_cast<unsigned long long>(token),
+						source_copy.c_str(),
+						ok ? 1 : 0);
+					diag::log_tagged_critical("file_dialog", "deferred_open_folder cancelled_or_failed");
+				}
+				diag::log_tagged_critical("file_dialog", "deferred_open_folder end");
+			} else {
+				diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+					"discard_none token=%llu source=%s",
+					static_cast<unsigned long long>(token),
+					source_copy.c_str());
+			}
+			clear_active_generation_if_current(token);
+		}, "file_dialog", "publish_result", source_copy.c_str());
+
+		diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+			"post_publish source=%s token=%llu action=%s ok=%d posted=%d dispatcher_pending=%zu path=%.260s",
+			source_copy.c_str(),
+			static_cast<unsigned long long>(token),
+			action_name(action),
+			ok ? 1 : 0,
+			posted ? 1 : 0,
+			aida::ui_thread::pending_count(),
+			path_copy.c_str());
+		if (!posted)
+			clear_active_generation_if_current(token);
 	}
 
 	static void request(action_t action)
 	{
+		const std::uint64_t token = generation().fetch_add(1, std::memory_order_acq_rel) + 1;
 		pending_action().store(static_cast<int>(action), std::memory_order_release);
 		diag::log_tagged_fmt("file_dialog", "deferred_request action=%d active=%d", static_cast<int>(action), active().load(std::memory_order_acquire) ? 1 : 0);
+		diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+			"request token=%llu action=%s active=%d pending_raw=%d active_generation=%llu",
+			static_cast<unsigned long long>(token),
+			action_name(action),
+			active().load(std::memory_order_acquire) ? 1 : 0,
+			pending_action().load(std::memory_order_acquire),
+			static_cast<unsigned long long>(active_generation().load(std::memory_order_acquire)));
 	}
-
 	static void run_pending()
 	{
-		if (result_ready().exchange(false, std::memory_order_acq_rel)) {
-			result_t result;
-			{
-				std::lock_guard<std::mutex> lock(result_mutex());
-				result = std::move(result_state());
-				result_state() = {};
-			}
-
-			if (result.action == action_t::open_file) {
-				if (result.ok && !result.path.empty()) {
-					diag::log_tagged_fmt("file_dialog", "deferred_open_file picked path=%.260s", result.path.c_str());
-					file_browser::open_path(result.path);
-				} else {
-					diag::log_tagged_critical("file_dialog", "deferred_open_file cancelled_or_failed");
-				}
-				diag::log_tagged_critical("file_dialog", "deferred_open_file end");
-			} else if (result.action == action_t::open_folder) {
-				if (result.ok && !result.path.empty()) {
-					file_browser::refresh(result.path);
-					g_sa_settings.workspace.root_path = result.path;
-					g_sa_settings_request_save();
-					diag::log_tagged_fmt("file_dialog", "deferred_open_folder picked path=%.260s", result.path.c_str());
-				} else {
-					diag::log_tagged_critical("file_dialog", "deferred_open_folder cancelled_or_failed");
-				}
-				diag::log_tagged_critical("file_dialog", "deferred_open_folder end");
-			}
-		}
-
 		if (active().load(std::memory_order_acquire))
 			return;
 
@@ -725,8 +795,16 @@ namespace file_menu_deferred
 		if (action == action_t::none)
 			return;
 
+		const std::uint64_t token = generation().load(std::memory_order_acquire);
+		active_generation().store(token, std::memory_order_release);
 		active().store(true, std::memory_order_release);
-		auto task = [action]() {
+		diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
+			"worker_start_post token=%llu action=%s active_generation=%llu dispatcher_pending=%zu",
+			static_cast<unsigned long long>(token),
+			action_name(action),
+			static_cast<unsigned long long>(active_generation().load(std::memory_order_acquire)),
+			aida::ui_thread::pending_count());
+		auto task = [action, token]() {
 			try {
 				if (action == action_t::open_file) {
 					diag::log_tagged_critical("file_dialog", "deferred_open_file worker_begin");
@@ -739,7 +817,8 @@ namespace file_menu_deferred
 						k_open_file_filter,
 						buf, sizeof(buf),
 						"file_menu_open");
-					store_result(action, ok, ok ? std::string(buf) : std::string());
+					active().store(false, std::memory_order_release);
+					store_result(token, result_t{ action, ok, ok ? std::string(buf) : std::string() }, "worker_open_file");
 					diag::log_tagged_fmt("file_dialog", "deferred_open_file worker_end ok=%d", ok ? 1 : 0);
 				} else if (action == action_t::open_folder) {
 					diag::log_tagged_critical("file_dialog", "deferred_open_folder worker_begin");
@@ -748,19 +827,22 @@ namespace file_menu_deferred
 						L"Open Workspace Folder",
 						folder,
 						"workspace_open_folder");
-					store_result(action, ok, ok ? folder : std::string());
+					active().store(false, std::memory_order_release);
+					store_result(token, result_t{ action, ok, ok ? folder : std::string() }, "worker_open_folder");
 					diag::log_tagged_fmt("file_dialog", "deferred_open_folder worker_end ok=%d", ok ? 1 : 0);
 				} else {
-					store_result(action_t::none, false, {});
+					active().store(false, std::memory_order_release);
+					store_result(token, result_t{ action_t::none, false, {} }, "worker_none");
 				}
 			} catch (const std::exception& ex) {
 				diag::log_tagged_fmt("file_dialog", "deferred_worker exception=%s", ex.what());
-				store_result(action, false, {});
+				active().store(false, std::memory_order_release);
+				store_result(token, result_t{ action, false, {} }, "worker_exception");
 			} catch (...) {
 				diag::log_tagged_critical("file_dialog", "deferred_worker unknown_exception");
-				store_result(action, false, {});
+				active().store(false, std::memory_order_release);
+				store_result(token, result_t{ action, false, {} }, "worker_unknown_exception");
 			}
-			active().store(false, std::memory_order_release);
 		};
 		bool queued = false;
 		try {
@@ -768,18 +850,18 @@ namespace file_menu_deferred
 		} catch (const std::exception& ex) {
 			active().store(false, std::memory_order_release);
 			diag::log_tagged_fmt("file_dialog", "deferred_post exception=%s", ex.what());
-			store_result(action, false, {});
+			store_result(token, result_t{ action, false, {} }, "post_exception");
 			return;
 		} catch (...) {
 			active().store(false, std::memory_order_release);
 			diag::log_tagged_critical("file_dialog", "deferred_post unknown_exception");
-			store_result(action, false, {});
+			store_result(token, result_t{ action, false, {} }, "post_unknown_exception");
 			return;
 		}
 		if (!queued) {
 			active().store(false, std::memory_order_release);
 			diag::log_tagged_critical("file_dialog", "deferred_post failed");
-			store_result(action, false, {});
+			store_result(token, result_t{ action, false, {} }, "post_failed");
 		}
 	}
 }
@@ -4332,7 +4414,9 @@ void helpers::render_title()
 								anti_tamper::webhook::write_log("chrome", "load_pe cancelled");
 							} else {
 								std::string fpath_copy = fpath;
-								work_queue::post([fpath_copy]() {
+								const bool posted = aida::ui_thread::post([fpath_copy]() {
+									if (!aida::ui_thread::require_owner("analysis_session", "open_session", "load_pe_menu"))
+										return;
 									bool ok = analysis_session::open_session(fpath_copy);
 									if (ok) {
 										char buf[600];
@@ -4347,7 +4431,14 @@ void helpers::render_title()
 											fpath_copy.c_str(), err ? err : "(none)");
 										anti_tamper::webhook::write_log("chrome", buf);
 									}
-								});
+								}, "analysis_session", "open_session", "load_pe_menu");
+								if (!posted) {
+									diag::log_tagged_critical_fmt("analysis_session",
+										"load_pe_dispatch_failed tid=%lu ui_tid=%lu path=%.260s",
+										static_cast<unsigned long>(GetCurrentThreadId()),
+										static_cast<unsigned long>(aida::ui_thread::owner_tid()),
+										fpath_copy.c_str());
+								}
 							}
 						}
 						if (menu_item("Attach to Process...", "")) {
@@ -6503,7 +6594,9 @@ void helpers::render_title()
 				anti_tamper::webhook::write_log("file_dialog",
 					(std::string("chrome.choose_file path=") + fpath).c_str());
 				std::string fpath_copy = fpath;
-				work_queue::post([fpath_copy]() {
+				const bool posted = aida::ui_thread::post([fpath_copy]() {
+					if (!aida::ui_thread::require_owner("analysis_session", "open_session", "choose_file"))
+						return;
 					bool ok = analysis_session::open_session(fpath_copy);
 					if (ok) {
 						char buf[600];
@@ -6518,7 +6611,14 @@ void helpers::render_title()
 							fpath_copy.c_str(), err ? err : "(none)");
 						anti_tamper::webhook::write_log("chrome", buf);
 					}
-				});
+				}, "analysis_session", "open_session", "choose_file");
+				if (!posted) {
+					diag::log_tagged_critical_fmt("analysis_session",
+						"choose_file_dispatch_failed tid=%lu ui_tid=%lu path=%.260s",
+						static_cast<unsigned long>(GetCurrentThreadId()),
+						static_cast<unsigned long>(aida::ui_thread::owner_tid()),
+						fpath_copy.c_str());
+				}
 			}
 		}
 
@@ -6907,7 +7007,7 @@ void helpers::render_title()
 	{
 
 
-	mark_center_render_section("center_pump_ui_thread_jobs", globals::ui::active_center_view, false, center_content_w, center_content_h);
+	mark_center_render_section("center_ui_dispatcher_drain", globals::ui::active_center_view, false, center_content_w, center_content_h);
 	static std::atomic<unsigned long long> s_last_pump_jobs_log_ms{0};
 	const unsigned long long ui_jobs_start_ms = GetTickCount64();
 	unsigned long long last_pump_jobs_log_ms = s_last_pump_jobs_log_ms.load(std::memory_order_acquire);
@@ -6920,23 +7020,24 @@ void helpers::render_title()
 		test_all_features::format_ui_phase_snapshot(ui_phase_before, sizeof(ui_phase_before));
 	if (log_pump_jobs) {
 		diag::log_tagged_critical_fmt("render_center",
-			"pump_ui_thread_jobs_enter view=%s view_id=%d frame=%d tid=%lu stats={%.760s}",
+			"ui_dispatcher_drain_enter view=%s view_id=%d frame=%d tid=%lu stats={%.760s}",
 			center_view_name(globals::ui::active_center_view),
 			static_cast<int>(globals::ui::active_center_view),
 			ImGui::GetFrameCount(),
 			static_cast<unsigned long>(GetCurrentThreadId()),
 			ui_phase_before[0] ? ui_phase_before : "<not-sampled>");
 	}
-	test_all_features::pump_ui_thread_jobs();
+	const std::uint32_t ui_dispatch_drained = aida::ui_thread::drain(8, 1, "center_content");
 	const unsigned long long ui_jobs_wall_ms = GetTickCount64() - ui_jobs_start_ms;
 	const bool slow_pump_jobs = ui_jobs_wall_ms >= (full_test_active_for_pump_log ? 8ULL : 32ULL);
 	if (log_pump_jobs || slow_pump_jobs) {
 		char ui_phase_after[900] = {};
 		test_all_features::format_ui_phase_snapshot(ui_phase_after, sizeof(ui_phase_after));
 		diag::log_tagged_critical_fmt("render_center",
-			"pump_ui_thread_jobs_exit view=%s view_id=%d wall_ms=%llu slow=%d frame=%d tid=%lu before={%.760s} after={%.760s}",
+			"ui_dispatcher_drain_exit view=%s view_id=%d drained=%u wall_ms=%llu slow=%d frame=%d tid=%lu before={%.760s} after={%.760s}",
 			center_view_name(globals::ui::active_center_view),
 			static_cast<int>(globals::ui::active_center_view),
+			static_cast<unsigned>(ui_dispatch_drained),
 			static_cast<unsigned long long>(ui_jobs_wall_ms),
 			slow_pump_jobs ? 1 : 0,
 			ImGui::GetFrameCount(),

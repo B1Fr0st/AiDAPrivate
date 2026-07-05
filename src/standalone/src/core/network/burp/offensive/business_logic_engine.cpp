@@ -14,6 +14,7 @@
 #include "../intruder_engine.hpp"
 #include "../issue.hpp"
 #include "../../../mcp/mcp_standalone.hpp"
+#include "../../../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -521,6 +522,15 @@ std::string start_job(const std::string& action, size_t total)
     return id;
 }
 
+mcp_standalone::downstream::scoped_admission_t acquire_biz_admission(const std::string& action, const std::string& domain)
+{
+    mcp_standalone::downstream::producer_identity_t id;
+    id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+    id.tool_name = "business_logic." + action;
+    id.domain = domain;
+    return mcp_standalone::downstream::scoped_admission_t::acquire(id);
+}
+
 void update_job_progress(const std::string& id, size_t completed)
 {
     std::lock_guard<std::mutex> lk(jobs_mutex());
@@ -596,16 +606,24 @@ std::vector<send_result_t> concurrent_send(const target_t& target,
                                            int timeout_ms)
 {
     count = std::min(count, kMaxConcurrentRequests);
+    const size_t capped_count = std::min(count,
+        mcp_standalone::downstream::default_quotas().burp_network_worker_group_size);
     std::vector<send_result_t> results(count);
-    std::vector<std::thread> threads;
-    threads.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-        threads.emplace_back([&, i]() {
+    std::vector<aida::infra::win_thread::joinable_thread_t> threads;
+    threads.reserve(capped_count);
+    for (size_t i = 0; i < capped_count; ++i) {
+        aida::infra::win_thread::joinable_thread_t wt;
+        std::string err;
+        const std::string label = "biz_logic.concurrent_send." + std::to_string(i);
+        const bool started = wt.start([&, i]() {
             results[i] = send_raw_request(target, raw, timeout_ms);
-        });
+        }, &err, aida::infra::win_thread::default_stack_reserve, label.c_str());
+        if (started)
+            threads.push_back(std::move(wt));
     }
     for (auto& t : threads) {
-        if (t.joinable()) t.join();
+        std::string err;
+        t.join(&err);
     }
     return results;
 }
@@ -639,6 +657,17 @@ result_t race_test(const json& payload)
     target_t target;
     std::string err;
     if (!parse_target(url, target, err)) return error_result(err, "invalid_url");
+    auto admission = acquire_biz_admission("race_test", target.host);
+    if (!admission.active()) {
+        diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-REJECT action=race_test host=%s reason=%s quota=%s observed=%zu limit=%zu",
+            target.host.c_str(),
+            admission.result().reason.c_str(),
+            admission.result().quota_name.c_str(),
+            admission.result().observed, admission.result().limit);
+        return error_result("Downstream capacity exhausted", "downstream_capacity_reject");
+    }
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-ADMIT action=race_test host=%s token=%llu",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     const size_t concurrent = get_size(payload, "concurrent_requests", 20, 2, kMaxConcurrentRequests);
     const size_t repeat_count = get_size(payload, "repeat_count", 5, 1, kMaxRepeatCount);
     const size_t total_expected = concurrent * repeat_count;
@@ -766,6 +795,8 @@ result_t race_test(const json& payload)
     data["cancelled"] = cancelled;
     data["issues_created"] = issue_ids;
     finish_job(task_id, data, completed, cancelled, {});
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-RELEASE action=race_test host=%s token=%llu reason=completed",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     return ok_result("race_test completed divergent_batches=" + std::to_string(divergent_batches), std::move(data));
 }
 
@@ -776,6 +807,17 @@ result_t price_tamper(const json& payload)
     target_t target;
     std::string err;
     if (!parse_target(url, target, err)) return error_result(err, "invalid_url");
+    auto admission = acquire_biz_admission("price_tamper", target.host);
+    if (!admission.active()) {
+        diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-REJECT action=price_tamper host=%s reason=%s quota=%s observed=%zu limit=%zu",
+            target.host.c_str(),
+            admission.result().reason.c_str(),
+            admission.result().quota_name.c_str(),
+            admission.result().observed, admission.result().limit);
+        return error_result("Downstream capacity exhausted", "downstream_capacity_reject");
+    }
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-ADMIT action=price_tamper host=%s token=%llu",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     std::map<std::string, std::string> params = params_from_payload(payload);
     const std::string field = get_string(payload, "price_field", detect_field(params, {"price", "amount", "total", "subtotal", "cost"}, "price"));
     std::vector<std::string> values = string_array(payload, "test_values");
@@ -827,6 +869,8 @@ result_t price_tamper(const json& payload)
     data["cancelled"] = cancelled;
     data["issues_created"] = issue_ids;
     finish_job(task_id, data, completed, cancelled, {});
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-RELEASE action=price_tamper host=%s token=%llu reason=completed",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     return ok_result("price_tamper completed accepted=" + std::to_string(accepted.size()), std::move(data));
 }
 
@@ -841,6 +885,17 @@ result_t coupon_abuse(const json& payload)
     target_t target;
     std::string err;
     if (!parse_target(url, target, err)) return error_result(err, "invalid_url");
+    auto admission = acquire_biz_admission("coupon_abuse", target.host);
+    if (!admission.active()) {
+        diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-REJECT action=coupon_abuse host=%s reason=%s quota=%s observed=%zu limit=%zu",
+            target.host.c_str(),
+            admission.result().reason.c_str(),
+            admission.result().quota_name.c_str(),
+            admission.result().observed, admission.result().limit);
+        return error_result("Downstream capacity exhausted", "downstream_capacity_reject");
+    }
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-ADMIT action=coupon_abuse host=%s token=%llu",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     const bool test_reuse = get_bool(payload, "test_reuse", true);
     const bool test_stacking = get_bool(payload, "test_stacking", true);
     const bool test_expired = get_bool(payload, "test_expired", true);
@@ -931,6 +986,8 @@ result_t coupon_abuse(const json& payload)
     data["cancelled"] = cancelled;
     data["issues_created"] = issue_ids;
     finish_job(task_id, data, completed, cancelled, {});
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-RELEASE action=coupon_abuse host=%s token=%llu reason=completed",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     return ok_result("coupon_abuse completed", std::move(data));
 }
 
@@ -941,6 +998,17 @@ result_t workflow_bypass(const json& payload)
     target_t target;
     std::string err;
     if (!parse_target(url, target, err)) return error_result(err, "invalid_url");
+    auto admission = acquire_biz_admission("workflow_bypass", target.host);
+    if (!admission.active()) {
+        diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-REJECT action=workflow_bypass host=%s reason=%s quota=%s observed=%zu limit=%zu",
+            target.host.c_str(),
+            admission.result().reason.c_str(),
+            admission.result().quota_name.c_str(),
+            admission.result().observed, admission.result().limit);
+        return error_result("Downstream capacity exhausted", "downstream_capacity_reject");
+    }
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-ADMIT action=workflow_bypass host=%s token=%llu",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     const std::string task_id = start_job("workflow_bypass", 1);
     const std::string method = get_string(payload, "method", "POST");
     const int timeout_ms = get_int(payload, "timeout_ms", 15000, 1000, 300000);
@@ -985,6 +1053,8 @@ result_t workflow_bypass(const json& payload)
     else data["transport_error"] = sent.error;
     data["issues_created"] = issue_ids;
     finish_job(task_id, data, 1, false, {});
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-RELEASE action=workflow_bypass host=%s token=%llu reason=completed",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     return ok_result("workflow_bypass completed", std::move(data));
 }
 
@@ -995,6 +1065,17 @@ result_t quantity_tamper(const json& payload)
     target_t target;
     std::string err;
     if (!parse_target(url, target, err)) return error_result(err, "invalid_url");
+    auto admission = acquire_biz_admission("quantity_tamper", target.host);
+    if (!admission.active()) {
+        diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-REJECT action=quantity_tamper host=%s reason=%s quota=%s observed=%zu limit=%zu",
+            target.host.c_str(),
+            admission.result().reason.c_str(),
+            admission.result().quota_name.c_str(),
+            admission.result().observed, admission.result().limit);
+        return error_result("Downstream capacity exhausted", "downstream_capacity_reject");
+    }
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-ADMIT action=quantity_tamper host=%s token=%llu",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     std::map<std::string, std::string> params = params_from_payload(payload);
     const std::string field = get_string(payload, "quantity_field", get_string(payload, "param_target", detect_field(params, {"quantity", "qty", "count", "units", "amount"}, "quantity")));
     std::vector<std::string> values = string_array(payload, "test_values");
@@ -1038,6 +1119,8 @@ result_t quantity_tamper(const json& payload)
     data["cancelled"] = cancelled;
     data["issues_created"] = issue_ids;
     finish_job(task_id, data, completed, cancelled, {});
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-RELEASE action=quantity_tamper host=%s token=%llu reason=completed",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     return ok_result("quantity_tamper completed accepted=" + std::to_string(accepted.size()), std::move(data));
 }
 
@@ -1048,6 +1131,17 @@ result_t role_escalation(const json& payload)
     target_t target;
     std::string err;
     if (!parse_target(url, target, err)) return error_result(err, "invalid_url");
+    auto admission = acquire_biz_admission("role_escalation", target.host);
+    if (!admission.active()) {
+        diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-REJECT action=role_escalation host=%s reason=%s quota=%s observed=%zu limit=%zu",
+            target.host.c_str(),
+            admission.result().reason.c_str(),
+            admission.result().quota_name.c_str(),
+            admission.result().observed, admission.result().limit);
+        return error_result("Downstream capacity exhausted", "downstream_capacity_reject");
+    }
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-ADMIT action=role_escalation host=%s token=%llu",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     std::map<std::string, std::string> params = params_from_payload(payload);
     const std::string field = get_string(payload, "role_field", get_string(payload, "param_target", detect_field(params, {"role", "is_admin", "admin", "permission", "scope", "tier"}, "role")));
     std::vector<std::string> values = string_array(payload, "test_values");
@@ -1092,6 +1186,8 @@ result_t role_escalation(const json& payload)
     data["auth_token_summary"] = secret_summary(get_string(payload, "auth_token"));
     data["issues_created"] = issue_ids;
     finish_job(task_id, data, completed, cancelled, {});
+    diag::log_tagged_fmt("biz_logic", "BURP-NETWORK-WORKER-RELEASE action=role_escalation host=%s token=%llu reason=completed",
+        target.host.c_str(), static_cast<unsigned long long>(admission.token()));
     return ok_result("role_escalation completed accepted=" + std::to_string(accepted.size()), std::move(data));
 }
 

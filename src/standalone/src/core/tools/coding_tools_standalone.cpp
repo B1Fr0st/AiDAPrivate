@@ -13,6 +13,7 @@
 #include "event_bus.hpp"
 #include "standalone_chat.hpp"
 #include "command_sessions.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 #include "../helpers/globals.h"
 #include "../infra/work_queue.hpp"
 
@@ -810,6 +811,24 @@ static tool_result_t tool_run_command(const json& params)
 
     PROCESS_INFORMATION pi{};
 
+    auto bg_admission = command_sessions::acquire_background_command_admission(
+        "standalone", "session_unknown", command);
+    if (!bg_admission.admitted) {
+        diag::log_tagged_fmt("coding",
+            "run_command downstream_rejected reason=%s quota=%s observed=%zu limit=%zu cmd='%.120s'",
+            bg_admission.reason.c_str(),
+            bg_admission.quota_name.c_str(),
+            bg_admission.observed,
+            bg_admission.limit,
+            command.c_str());
+        CloseHandle(h_stdout_rd);
+        CloseHandle(h_stderr_rd);
+        json rej = command_sessions::background_command_rejection_json(bg_admission);
+        return tool_result_t::error("Downstream capacity exhausted; command was not started.",
+            "MCP_DOWNSTREAM_CAPACITY_REJECT", rej);
+    }
+    const std::uint64_t bg_downstream_token = bg_admission.admission_token;
+
     SetLastError(ERROR_SUCCESS);
     BOOL created = CreateProcessA(
         nullptr,
@@ -830,6 +849,7 @@ static tool_result_t tool_run_command(const json& params)
             create_gle,
             cwd.c_str(),
             command.c_str());
+        mcp_standalone::downstream::governor_t::instance().release(bg_downstream_token, "create_process_failed");
         CloseHandle(h_stdout_rd);
         CloseHandle(h_stderr_rd);
         return tool_result_t::error("Failed to launch command: " + command +
@@ -854,6 +874,8 @@ static tool_result_t tool_run_command(const json& params)
         sess->stderr_read = h_stderr_rd;
         sess->timeout_ms = timeout_ms;
         sess->alive.store(true);
+        sess->downstream_token = bg_downstream_token;
+        sess->principal_id = "standalone";
 
         std::string session_id_copy = sess->id;
         command_sessions::command_session_t* raw = command_sessions::register_session(std::move(sess));
@@ -1094,6 +1116,8 @@ static tool_result_t tool_run_command(const json& params)
     CloseHandle(h_stderr_rd);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    mcp_standalone::downstream::governor_t::instance().release(bg_downstream_token, "sync_complete");
 
 
     output_log::push(bottom_tab_t::sandbox_log,

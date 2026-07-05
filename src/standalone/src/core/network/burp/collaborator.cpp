@@ -7,6 +7,7 @@
 #include "collaborator.hpp"
 #include "../../infra/critical_work_queue.hpp"
 #include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include "httplib.h"
@@ -100,6 +101,36 @@ struct state_t
 };
 
 static state_t g_state;
+
+struct http_session_worker_group_t
+{
+    std::unique_ptr<mcp_standalone::downstream::feature_worker_group_t> group;
+    std::once_flag init_flag;
+
+    void ensure()
+    {
+        std::call_once(init_flag, [this]() {
+            mcp_standalone::downstream::feature_worker_group_config_t cfg;
+            cfg.owner_subsystem = "collaborator.http_session";
+            cfg.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+            cfg.worker_count = mcp_standalone::downstream::default_quotas().burp_network_worker_group_size;
+            cfg.queue_depth = mcp_standalone::downstream::default_quotas().burp_network_queue_depth;
+            cfg.label_prefix = "collab.http_session";
+            cfg.default_timeout_ms = 30000;
+            group = std::make_unique<mcp_standalone::downstream::feature_worker_group_t>(cfg);
+        });
+    }
+
+    void shutdown()
+    {
+        if (group) {
+            group->shutdown();
+            group.reset();
+        }
+    }
+};
+
+static http_session_worker_group_t s_http_session_wg;
 
 static uint64_t now_ms();
 
@@ -1221,14 +1252,46 @@ static void http_thread_main(std::string bind_ip, uint16_t port, uint64_t genera
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()));
         bool spawned = false;
-        try {
-            std::thread(task).detach();
-            spawned = true;
-        } catch (...) {
-            spawned = false;
+        mcp_standalone::downstream::producer_identity_t sess_id;
+        sess_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        sess_id.tool_name = "collaborator.http_session";
+        sess_id.domain = client_ip;
+        auto sess_admission = mcp_standalone::downstream::scoped_admission_t::acquire(sess_id);
+        if (!sess_admission.active()) {
+            ::diag::log_tagged_fmt("collaborator", "BURP-NETWORK-WORKER-REJECT client=%s:%u reason=%s quota=%s observed=%zu limit=%zu",
+                client_ip.c_str(),
+                static_cast<unsigned>(client_port),
+                sess_admission.result().reason.c_str(),
+                sess_admission.result().quota_name.c_str(),
+                sess_admission.result().observed, sess_admission.result().limit);
+        } else {
+            const uint64_t sess_token = sess_admission.token();
+            ::diag::log_tagged_fmt("collaborator", "BURP-NETWORK-WORKER-ADMIT client=%s:%u token=%llu",
+                client_ip.c_str(),
+                static_cast<unsigned>(client_port),
+                static_cast<unsigned long long>(sess_token));
+            s_http_session_wg.ensure();
+            if (s_http_session_wg.group) {
+                auto posted = s_http_session_wg.group->post([task, admission = std::move(sess_admission), sess_token, client_sock]() mutable {
+                    task();
+                    ::diag::log_tagged_fmt("collaborator", "BURP-NETWORK-WORKER-RELEASE client=%s:%u token=%llu reason=completed",
+                        client_ip.c_str(),
+                        static_cast<unsigned>(client_port),
+                        static_cast<unsigned long long>(sess_token));
+                    admission.release("completed");
+                });
+                if (posted) {
+                    spawned = true;
+                } else {
+                    ::diag::log_tagged_fmt("collaborator", "BURP-NETWORK-WORKER-RELEASE client=%s:%u token=%llu reason=worker_group_full",
+                        client_ip.c_str(),
+                        static_cast<unsigned>(client_port),
+                        static_cast<unsigned long long>(sess_token));
+                }
+            }
         }
         if (!spawned) {
-            ::diag::log_tagged_fmt("collaborator", "http_session_thread_failed client=%s:%u fallback=inline active=%u",
+            ::diag::log_tagged_fmt("collaborator", "http_session_dispatch_fallback_inline client=%s:%u active=%u",
                 client_ip.c_str(),
                 static_cast<unsigned>(client_port),
                 g_state.http_sessions_active.load(std::memory_order_acquire));
@@ -2227,6 +2290,8 @@ void stop()
     g_state.http_alive.store(false);
     g_state.dns_alive.store(false);
     g_state.smtp_alive.store(false);
+
+    s_http_session_wg.shutdown();
 
     ::diag::log_tagged_fmt("collaborator", "stopped elapsed_ms=%llu",
         static_cast<unsigned long long>(now_ms() - t0));

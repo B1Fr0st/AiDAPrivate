@@ -16,6 +16,7 @@
 #include "../analysis/stealth_engine.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <Zydis/Zydis.h>
 #include "zydis_disasm.hpp"
@@ -50,6 +51,85 @@ using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
 namespace driver_tools
 {
+
+struct driver_debugger_quota_guard_t
+{
+    std::uint64_t token = 0;
+    std::string tool_name;
+    std::uint32_t target_pid = 0;
+
+    driver_debugger_quota_guard_t() = default;
+    driver_debugger_quota_guard_t(const driver_debugger_quota_guard_t&) = delete;
+    driver_debugger_quota_guard_t& operator=(const driver_debugger_quota_guard_t&) = delete;
+    driver_debugger_quota_guard_t(driver_debugger_quota_guard_t&& o) noexcept
+        : token(o.token), tool_name(std::move(o.tool_name)), target_pid(o.target_pid)
+    { o.token = 0; }
+    driver_debugger_quota_guard_t& operator=(driver_debugger_quota_guard_t&& o) noexcept
+    {
+        if (this != &o) { release(); token = o.token; tool_name = std::move(o.tool_name); target_pid = o.target_pid; o.token = 0; }
+        return *this;
+    }
+    ~driver_debugger_quota_guard_t() { release(); }
+    void release()
+    {
+        if (token == 0) return;
+        if (mcp_standalone::downstream::governor_t::instance().is_admitted(token))
+        {
+            diag::log_tagged_fmt("drv_tools",
+                "DRIVER-DEBUGGER-QUOTA-RELEASE tool=%s target_pid=%u token=%llu",
+                tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+            mcp_standalone::downstream::governor_t::instance().release(token, "driver_debugger_scope_exit");
+        }
+        else
+        {
+            diag::log_tagged_fmt("drv_tools",
+                "DRIVER-DEBUGGER-QUOTA-STALE-RESULT tool=%s target_pid=%u token=%llu",
+                tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+        }
+        token = 0;
+    }
+};
+
+static std::optional<tool_result_t> acquire_driver_debugger_quota(
+    const char* tool_name, std::uint32_t target_pid,
+    driver_debugger_quota_guard_t& guard)
+{
+    mcp_standalone::downstream::producer_identity_t id;
+    id.kind = mcp_standalone::downstream::producer_kind_t::driver_debugger;
+    id.tool_name = tool_name ? tool_name : "";
+    id.target_pid = target_pid;
+    id.target_id = target_pid != 0 ? ("pid:" + std::to_string(target_pid)) : "";
+    id.principal_id = "standalone";
+    const char* diag_id = mcp_standalone::current_call_diag_id();
+    if (diag_id) id.diagnostic_id = diag_id;
+    const char* req_id = mcp_standalone::current_call_request_id();
+    if (req_id) id.request_id = req_id;
+    id.deadline_ms = mcp_standalone::current_call_deadline_ms();
+
+    auto result = mcp_standalone::downstream::governor_t::instance().try_admit(id);
+    if (!result.admitted)
+    {
+        diag::log_tagged_fmt("drv_tools",
+            "DRIVER-DEBUGGER-QUOTA-REJECT tool=%s target_pid=%u reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            id.tool_name.c_str(), id.target_pid,
+            result.reason.c_str(), result.quota_name.c_str(),
+            result.quota_scope.c_str(), result.observed, result.limit);
+        return tool_result_t::error(
+            "Downstream driver/debugger capacity exhausted; work was not started.",
+            "MCP_DOWNSTREAM_CAPACITY_REJECT",
+            mcp_standalone::downstream::rejection_json(result, id));
+    }
+
+    diag::log_tagged_fmt("drv_tools",
+        "DRIVER-DEBUGGER-QUOTA-ADMIT tool=%s target_pid=%u token=%llu",
+        id.tool_name.c_str(), id.target_pid,
+        static_cast<unsigned long long>(result.admission_token));
+
+    guard.token = result.admission_token;
+    guard.tool_name = id.tool_name;
+    guard.target_pid = id.target_pid;
+    return std::nullopt;
+}
 
 static std::string to_lower_ascii_copy(std::string value)
 {
@@ -832,6 +912,10 @@ tool_result_t driver_read_pointer_chain(const json& params)
         return tool_result_t::error("Tool cancelled before operation.");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_read_pointer_chain", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     std::string base_address;
     if (params.contains("address") && params["address"].is_string())
@@ -1675,6 +1759,11 @@ static bool query_kernel_modules(
 tool_result_t driver_enumerate_kernel_modules(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_kernel_modules entry");
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_enumerate_kernel_modules", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     std::vector<std::uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
@@ -1774,6 +1863,10 @@ tool_result_t driver_allocate_memory(const json& params)
         return *ctx_err;
     }
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_allocate_memory", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     std::size_t size = 0;
     if (params.contains("size"))
     {
@@ -1871,6 +1964,10 @@ tool_result_t driver_free_memory(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_free_memory", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     auto addr_opt = sa_parse_address(params["address"].get<std::string>());
     if (!addr_opt || *addr_opt == 0)
         return tool_result_t::error(OBFSTR("Invalid address."));
@@ -1939,6 +2036,10 @@ tool_result_t driver_call_function(const json& params)
                    "or dry_run=true to preview only."));
     }
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_call_function", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     std::uint64_t args[4] = {0, 0, 0, 0};
     const char* arg_names[] = {"arg1", "arg2", "arg3", "arg4"};
     for (int i = 0; i < 4; ++i)
@@ -1991,6 +2092,10 @@ tool_result_t driver_protect_memory(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_protect_memory", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     std::uint64_t address = 0;
     if (params.contains("address"))
         address = sa_parse_address(params["address"].get<std::string>()).value_or(0);
@@ -2039,6 +2144,10 @@ tool_result_t driver_read_peb(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_read_peb", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     voyager::device_t::peb_info info{};
     if (!device->read_peb(info))
         return tool_result_t::error(OBFSTR("Failed to read PEB"));
@@ -2062,6 +2171,10 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
     diag::log_tagged_fmt("drv_tools", "driver_set_hw_breakpoint entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_set_hw_breakpoint", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     const auto tid_opt = parse_tid_param(params);
     if (!tid_opt)
@@ -2111,6 +2224,10 @@ tool_result_t driver_clear_hw_breakpoint(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_clear_hw_breakpoint", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     const auto tid_opt = parse_tid_param(params);
     if (!tid_opt)
         return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
@@ -2133,6 +2250,10 @@ tool_result_t driver_resolve_export(const json& params)
     diag::log_tagged_fmt("drv_tools", "driver_resolve_export entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_resolve_export", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     std::string export_name;
     if (params.contains("name") && params["name"].is_string())
@@ -2209,6 +2330,10 @@ tool_result_t driver_virtual_to_physical(const json& params)
     diag::log_tagged_fmt("drv_tools", "driver_virtual_to_physical entry");
     if (!device->is_connected() || device->get_dtb() == 0)
         return tool_result_t::error(OBFSTR("Driver not connected or DTB not solved"));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_virtual_to_physical", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     std::uint64_t vaddr = 0;
     if (params.contains("address"))
@@ -2988,6 +3113,11 @@ static std::string deferred_status_to_string(deferred_status s)
 tool_result_t driver_defer_action(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_defer_action entry");
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_defer_action", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     json normalized = params;
 
     if (!normalized.contains("actions") && normalized.contains("action"))
@@ -3307,6 +3437,10 @@ tool_result_t driver_sniff_network_buffers(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_sniff_network_buffers", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
 
     if (params.contains("operation")) {
         std::string op = params["operation"].get<std::string>();
@@ -3485,6 +3619,10 @@ tool_result_t driver_reassemble_stream(const json& params)
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver not connected"));
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_reassemble_stream", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     std::string operation = params.value("operation", "list");
     std::transform(operation.begin(), operation.end(), operation.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -3549,6 +3687,10 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
         return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_enum_kernel_callbacks", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
@@ -3711,6 +3853,10 @@ tool_result_t driver_detect_integrity_checks(const json& params)
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
         return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_detect_integrity_checks", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     std::vector<std::uint8_t> mod_buf;
     sys_module_info_t* info = nullptr;
@@ -3922,6 +4068,10 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
         return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_detect_ssdt_hooks", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -4135,6 +4285,10 @@ tool_result_t driver_enum_minifilters(const json& params)
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
         return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_enum_minifilters", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
@@ -4351,6 +4505,10 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     if (device->get_kernel_dtb() == 0)
         return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_detect_etw_monitors", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     std::vector<uint8_t> buf;
     sys_module_info_t* info = nullptr;
     std::string err;
@@ -4554,6 +4712,10 @@ tool_result_t driver_detect_hidden_modules(const json& params)
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_process_id() == 0)
         return tool_result_t::error(OBFSTR("No target process attached. Use sessions_manage action=attach_pid first."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_detect_hidden_modules", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     bool scan_kernel = params.value("kernel", false);
 
@@ -4814,6 +4976,10 @@ tool_result_t driver_walk_heap(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_walk_heap", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     const std::uint32_t pid = device->get_process_id();
     const int max_entries = std::min(params.value("limit", 500), 5000);
     const std::uint64_t filter_min = params.contains("min_size") ? params["min_size"].get<std::uint64_t>() : 0;
@@ -5018,6 +5184,10 @@ tool_result_t driver_enumerate_handles(const json& params)
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_enumerate_handles", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     const std::uint32_t filter_pid = params.value("pid", 0u);
     const std::string filter_type = params.value("type_filter", "");
     const int limit = std::min(params.value("limit", 500), 10000);
@@ -5137,6 +5307,10 @@ tool_result_t driver_enumerate_windows(const json& params)
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_windows entry");
     if (!device->is_connected())
         return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_enumerate_windows", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     const std::uint32_t filter_pid = params.value("pid", device->get_process_id());
     const bool include_children = params.value("include_children", true);
@@ -5525,6 +5699,10 @@ tool_result_t driver_assemble(const json& params)
 
     if (params.contains("write_to"))
     {
+        driver_debugger_quota_guard_t quota_guard;
+        if (auto quota_err = acquire_driver_debugger_quota("driver_assemble", driver_bridge::attached_pid(), quota_guard))
+            return *quota_err;
+
         auto write_addr = sa_parse_address(params["write_to"].get<std::string>());
         if (write_addr && device->is_connected() && device->get_process_id() != 0)
         {
@@ -5550,6 +5728,10 @@ tool_result_t driver_find_references(const json& params)
         return tool_result_t::error("Tool cancelled before operation.");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_find_references", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     const std::string target_str = params.value("target_address", "");
     if (target_str.empty())
@@ -5660,6 +5842,10 @@ tool_result_t driver_read_teb(const json& params)
     diag::log_tagged_fmt("drv_tools", "driver_read_teb entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_read_teb", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     auto tid_opt = parse_tid_param(params);
     if (!tid_opt)
@@ -5807,6 +5993,10 @@ tool_result_t driver_map_peb_modules(const json& params)
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_map_peb_modules", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     const std::string order = params.value("order", "all");
     const std::string filter = to_lower_ascii_copy(params.value("filter", ""));
 
@@ -5937,6 +6127,10 @@ tool_result_t driver_set_page_guard(const json& params)
     diag::log_tagged_fmt("drv_tools", "driver_set_page_guard entry");
     if (auto ctx_err = ensure_attached_process_context(params))
         return *ctx_err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("driver_set_page_guard", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     const std::string operation = params.value("operation", "set");
 

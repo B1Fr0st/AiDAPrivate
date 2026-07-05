@@ -20,6 +20,7 @@
 #include "../editor/expression_eval.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,86 @@ using tool_result_t = mcp_standalone::tool_result_t;
 
 namespace debugger_tools
 {
+
+
+struct driver_debugger_quota_guard_t
+{
+    std::uint64_t token = 0;
+    std::string tool_name;
+    std::uint32_t target_pid = 0;
+
+    driver_debugger_quota_guard_t() = default;
+    driver_debugger_quota_guard_t(const driver_debugger_quota_guard_t&) = delete;
+    driver_debugger_quota_guard_t& operator=(const driver_debugger_quota_guard_t&) = delete;
+    driver_debugger_quota_guard_t(driver_debugger_quota_guard_t&& o) noexcept
+        : token(o.token), tool_name(std::move(o.tool_name)), target_pid(o.target_pid)
+    { o.token = 0; }
+    driver_debugger_quota_guard_t& operator=(driver_debugger_quota_guard_t&& o) noexcept
+    {
+        if (this != &o) { release(); token = o.token; tool_name = std::move(o.tool_name); target_pid = o.target_pid; o.token = 0; }
+        return *this;
+    }
+    ~driver_debugger_quota_guard_t() { release(); }
+    void release()
+    {
+        if (token == 0) return;
+        if (mcp_standalone::downstream::governor_t::instance().is_admitted(token))
+        {
+            diag::log_tagged_fmt("dbg_tools",
+                "DRIVER-DEBUGGER-QUOTA-RELEASE tool=%s target_pid=%u token=%llu",
+                tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+            mcp_standalone::downstream::governor_t::instance().release(token, "driver_debugger_scope_exit");
+        }
+        else
+        {
+            diag::log_tagged_fmt("dbg_tools",
+                "DRIVER-DEBUGGER-QUOTA-STALE-RESULT tool=%s target_pid=%u token=%llu",
+                tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+        }
+        token = 0;
+    }
+};
+
+static std::optional<tool_result_t> acquire_driver_debugger_quota(
+    const char* tool_name, std::uint32_t target_pid,
+    driver_debugger_quota_guard_t& guard)
+{
+    mcp_standalone::downstream::producer_identity_t id;
+    id.kind = mcp_standalone::downstream::producer_kind_t::driver_debugger;
+    id.tool_name = tool_name ? tool_name : "";
+    id.target_pid = target_pid;
+    id.target_id = target_pid != 0 ? ("pid:" + std::to_string(target_pid)) : "";
+    id.principal_id = "standalone";
+    const char* diag_id = mcp_standalone::current_call_diag_id();
+    if (diag_id) id.diagnostic_id = diag_id;
+    const char* req_id = mcp_standalone::current_call_request_id();
+    if (req_id) id.request_id = req_id;
+    id.deadline_ms = mcp_standalone::current_call_deadline_ms();
+
+    auto result = mcp_standalone::downstream::governor_t::instance().try_admit(id);
+    if (!result.admitted)
+    {
+        diag::log_tagged_fmt("dbg_tools",
+            "DRIVER-DEBUGGER-QUOTA-REJECT tool=%s target_pid=%u reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            id.tool_name.c_str(), id.target_pid,
+            result.reason.c_str(), result.quota_name.c_str(),
+            result.quota_scope.c_str(), result.observed, result.limit);
+        return tool_result_t::error(
+            "Downstream driver/debugger capacity exhausted; work was not started.",
+            "MCP_DOWNSTREAM_CAPACITY_REJECT",
+            mcp_standalone::downstream::rejection_json(result, id));
+    }
+
+    diag::log_tagged_fmt("dbg_tools",
+        "DRIVER-DEBUGGER-QUOTA-ADMIT tool=%s target_pid=%u token=%llu",
+        id.tool_name.c_str(), id.target_pid,
+        static_cast<unsigned long long>(result.admission_token));
+
+    guard.token = result.admission_token;
+    guard.tool_name = id.tool_name;
+    guard.target_pid = id.target_pid;
+    return std::nullopt;
+}
 
 
 static bool is_process_alive(std::uint32_t pid)
@@ -1494,6 +1575,10 @@ static tool_result_t handle_debugger_set_register(const json& params, bool allow
     if (auto err = ensure_attached(params))
         return *err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("debugger_set_register", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     auto tid = parse_tid(params);
     if (!tid)
         return tool_result_t::error(OBFSTR("'tid' is required."));
@@ -1555,6 +1640,10 @@ static tool_result_t handle_debugger_start_trace(const json& params)
     diag::log_tagged_fmt("dbg_tools", "debugger_start_trace: entry");
     if (auto err = ensure_attached(params))
         return *err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("debugger_start_trace", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     auto tid = parse_tid(params);
     if (!tid)
@@ -1761,6 +1850,10 @@ static tool_result_t handle_debugger_get_trace(const json& params)
     trace_session_t session;
     if (!load_trace_session(trace_id, session))
         return tool_result_t::error(OBFSTR("Trace ID not found."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("debugger_get_trace", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     const int offset = int_param_clamped(params, "offset", 0, 0, static_cast<int>(std::min<std::size_t>(session.entries.size(), 1000000)));
     const int limit = int_param_clamped(params, "limit", 200, 1, 1000);
@@ -2200,6 +2293,10 @@ static tool_result_t dbg_snapshot_state(const json& params)
     if (auto err = ensure_attached(params))
         return *err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("dbg_snapshot_state", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     auto tid_opt = parse_tid(params);
     if (!tid_opt) {
         diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: missing tid param");
@@ -2436,6 +2533,10 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
     if (auto err = ensure_attached(params))
         return *err;
 
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("dbg_detect_vm_handler", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
+
     if (!params.contains("address") || !params["address"].is_string()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: missing address param");
         return tool_result_t::error(OBFSTR("'address' (hex string) is required."));
@@ -2612,6 +2713,10 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
     diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: entry");
     if (auto err = ensure_attached(params))
         return *err;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("dbg_map_vm_handlers", driver_bridge::attached_pid(), quota_guard))
+        return *quota_err;
 
     if (!params.contains("table_address") || !params["table_address"].is_string()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: missing table_address param");
@@ -2857,6 +2962,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (mcp_standalone::current_call_cancelled())
                 return tool_result_t::error("Tool cancelled before operation.");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_run_to_address", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
@@ -3012,6 +3122,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_get_memory_map", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             const int limit = int_param_clamped(params, "limit", 2048, 1, 4096);
             const bool executable_only = params.value("executable_only", false);
             auto regions = debugger_engine::get_memory_map();
@@ -3108,6 +3223,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (action == "status")
                 return tool_result_t::ok(make_status());
             if (auto err = ensure_attached(p)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_execution_manage", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (action == "continue") {
                 const bool ok = debugger_engine::run_target();
                 json result = make_status();
@@ -3195,6 +3315,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (auto err = ensure_attached(params))
                 return *err;
 
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_get_callstack", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             json call_params = params.is_object() ? params : json::object();
             if (!parse_tid(call_params)) {
                 std::uint32_t tid = debugger_engine::g_state.active_tid;
@@ -3229,6 +3353,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_get_handles: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_get_handles", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             debugger_engine::enumerate_handles();
             std::lock_guard<std::mutex> lk(debugger_engine::g_state.handle_mutex);
             json arr = json::array();
@@ -3262,6 +3391,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 static_cast<unsigned long>(entry_tid),
                 static_cast<unsigned long long>(entry_tick));
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_get_seh_chain", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             auto refresh_and_wait = [&](const char* phase) {
                 const std::uint64_t phase_start = GetTickCount64();
                 seh_view::refresh();
@@ -3437,6 +3571,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_set_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_set_breakpoint", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             uint64_t addr = 0;
             if (params.contains("address") && params["address"].is_string()) {
                 auto p = sa_parse_address(params["address"].get<std::string>());
@@ -3506,6 +3645,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_remove_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_remove_breakpoint", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             int idx = -1;
             if (params.contains("index") && params["index"].is_number_integer()) {
                 idx = params["index"].get<int>();
@@ -3559,6 +3703,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_step_over: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_step_over", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             auto tid = parse_tid(params);
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
             debugger_engine::g_state.active_tid = *tid;
@@ -3580,6 +3729,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_step_into: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_step_into", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             auto tid = parse_tid(params);
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
             debugger_engine::g_state.active_tid = *tid;
@@ -3601,6 +3755,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_step_out: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("debugger_step_out", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             auto tid = parse_tid(params);
             if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
             debugger_engine::g_state.active_tid = *tid;
@@ -3745,6 +3904,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (mcp_standalone::current_call_cancelled())
                 return tool_result_t::error("Tool cancelled before operation.");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_find_strings", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             int min_len = params.value("min_length", 4);
             diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: min_length=%d", min_len);
             debugger_engine::find_strings(min_len);
@@ -3782,6 +3946,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_add_hw_breakpoint", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
@@ -3873,6 +4042,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_build_cfg", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
@@ -3961,6 +4135,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             };
             diag::log_tagged_fmt("dbg_tools", "dbg_get_modules_detail: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_get_modules_detail", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             std::string filter;
             if (params.contains("module_name") && params["module_name"].is_string())
                 filter = params["module_name"].get<std::string>();
@@ -4669,6 +4848,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_add_patch", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             if (!params.contains("bytes") || !params["bytes"].is_string())
@@ -4763,6 +4947,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 removed_entry["patched_bytes"] = code_patcher::format_bytes(p.patched_bytes);
                 removed_entry["size"] = p.patched_bytes.size();
             }
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_remove_patch", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!code_patcher::revert_patch(idx)) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: revert_patch failed for idx=%d", idx);
                 return tool_result_t::error(OBFSTR("Failed to revert patch."));
@@ -4825,6 +5013,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_nop_fill", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             if (!params.contains("size") || !params["size"].is_number())
@@ -4889,6 +5082,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_find_code_caves", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
@@ -4935,6 +5133,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
+
+            driver_debugger_quota_guard_t quota_guard;
+            if (auto quota_err = acquire_driver_debugger_quota("dbg_conditional_breakpoint", driver_bridge::attached_pid(), quota_guard))
+                return *quota_err;
+
             if (!params.contains("address") || !params["address"].is_string())
                 return tool_result_t::error(OBFSTR("'address' is required."));
             if (!params.contains("condition") || !params["condition"].is_string())

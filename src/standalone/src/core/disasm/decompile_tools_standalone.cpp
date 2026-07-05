@@ -8,7 +8,9 @@
 #include "rename_store.hpp"
 #include "work_queue.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -55,9 +57,34 @@ static bool parse_address_param(const json& params, const char* key, uint64_t& o
 
 static tool_result_t handle_decompile_function(const json& params)
 {
+    mcp_standalone::downstream::producer_identity_t dec_id;
+    dec_id.kind = mcp_standalone::downstream::producer_kind_t::decompiler;
+    dec_id.tool_name = "decompile_function";
+    mcp_standalone::downstream::scoped_admission_t dec_admission =
+        mcp_standalone::downstream::scoped_admission_t::acquire(dec_id);
+    if (!dec_admission.active()) {
+        auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(dec_id);
+        diag::log_tagged_fmt("decomp_tools",
+            "FEATURE-WORKER-GROUP-REJECT decompile_function reason=%s quota=%s observed=%zu limit=%zu",
+            rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+        return tool_result_t::error(
+            "Decompiler capacity exhausted; work was not started.",
+            "MCP_DOWNSTREAM_CAPACITY_REJECT",
+            mcp_standalone::downstream::rejection_json(rej, dec_id));
+    }
+    diag::log_tagged_fmt("decomp_tools",
+        "FEATURE-WORKER-GROUP-ADMIT decompile_function token=%llu",
+        static_cast<unsigned long long>(dec_admission.token()));
+
     uint64_t addr = 0;
     if (!parse_address_param(params, "address", addr)) {
         diag::log_tagged_fmt("decomp_tools", "decompile_function_bad_params");
+        if (dec_admission.active()) {
+            diag::log_tagged_fmt("decomp_tools",
+                "FEATURE-WORKER-GROUP-RELEASE decompile_function token=%llu reason=completed",
+                static_cast<unsigned long long>(dec_admission.token()));
+            dec_admission.release("completed");
+        }
         return tool_result_t::error("'address' is required (hex string or integer).");
     }
 
@@ -94,7 +121,23 @@ static tool_result_t handle_decompile_function(const json& params)
         slot->result = std::move(r);
         slot->done = true;
     };
-    bool posted = critical_work_queue::post(run_decompile) || work_queue::post(run_decompile);
+    bool posted = false;
+    {
+        aida::executor::submission_t _exec_sub;
+        _exec_sub.owner_subsystem = "standalone.decompiler.tools";
+        _exec_sub.label = "decompile_tools.post";
+        _exec_sub.thread_class = "queued_task";
+        _exec_sub.domain = aida::executor::domain_t::general;
+        _exec_sub.priority = 3;
+        _exec_sub.body = run_decompile;
+        _exec_sub.failure_policy = "reject_not_started";
+        _exec_sub.ui_access_policy = "none";
+        _exec_sub.shutdown_policy = "drain";
+        _exec_sub.no_capacity_reason = "no_capacity_needed_general_queue";
+        auto _exec_result = aida::executor::submit(std::move(_exec_sub));
+        posted = _exec_result.submitted;
+        (void)_exec_result;
+    }
     if (!posted) {
         diag::log_tagged_fmt("decomp_tools", "decompile_function_post_failed_running_inline addr=0x%llX",
             static_cast<unsigned long long>(addr));
@@ -131,6 +174,12 @@ static tool_result_t handle_decompile_function(const json& params)
             slot->cancel.store(true);
             diag::log_tagged_fmt("decomp_tools", "decompile_function_timeout addr=0x%llX timeout_sec=%d",
                 static_cast<unsigned long long>(addr), timeout_sec);
+            if (dec_admission.active()) {
+                diag::log_tagged_fmt("decomp_tools",
+                    "FEATURE-WORKER-GROUP-RELEASE decompile_function token=%llu reason=completed",
+                    static_cast<unsigned long long>(dec_admission.token()));
+                dec_admission.release("completed");
+            }
             return tool_result_t::error("Decompilation timed out after " +
                                        std::to_string(timeout_sec) + " seconds.");
         }
@@ -138,6 +187,12 @@ static tool_result_t handle_decompile_function(const json& params)
         if (r.is_error) {
             diag::log_tagged_fmt("decomp_tools", "decompile_function_error addr=0x%llX error=%s",
                 static_cast<unsigned long long>(addr), r.error_text.c_str());
+            if (dec_admission.active()) {
+                diag::log_tagged_fmt("decomp_tools",
+                    "FEATURE-WORKER-GROUP-RELEASE decompile_function token=%llu reason=completed",
+                    static_cast<unsigned long long>(dec_admission.token()));
+                dec_admission.release("completed");
+            }
             return tool_result_t::error(r.error_text.empty()
                                         ? std::string("Decompilation failed.")
                                         : r.error_text);
@@ -147,6 +202,12 @@ static tool_result_t handle_decompile_function(const json& params)
                 static_cast<unsigned long long>(r.function_addr),
                 r.function_name.c_str(),
                 static_cast<long long>(r.elapsed_ms));
+            if (dec_admission.active()) {
+                diag::log_tagged_fmt("decomp_tools",
+                    "FEATURE-WORKER-GROUP-RELEASE decompile_function token=%llu reason=completed",
+                    static_cast<unsigned long long>(dec_admission.token()));
+                dec_admission.release("completed");
+            }
             return tool_result_t::error("Decompilation produced no pseudocode.");
         }
         const size_t mapped_line_count = r.line_to_address.size();
@@ -185,6 +246,12 @@ static tool_result_t handle_decompile_function(const json& params)
         result["line_count"] = reported_line_count;
         result["mapped_line_count"] = mapped_line_count;
         result["pseudocode_line_count"] = pseudocode_line_count;
+        if (dec_admission.active()) {
+            diag::log_tagged_fmt("decomp_tools",
+                "FEATURE-WORKER-GROUP-RELEASE decompile_function token=%llu reason=completed",
+                static_cast<unsigned long long>(dec_admission.token()));
+            dec_admission.release("completed");
+        }
         return tool_result_t::ok(result);
     }
 }

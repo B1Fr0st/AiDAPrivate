@@ -9,6 +9,7 @@
 #include "../debugger/page_guard_engine.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -897,6 +898,25 @@ static std::string results_to_json(size_t limit = 100) {
 
 
 static tool_result_t handle_first_scan(const json& params) {
+	mcp_standalone::downstream::producer_identity_t fs_id;
+	fs_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	fs_id.tool_name = "scanner_first_scan";
+	mcp_standalone::downstream::scoped_admission_t fs_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(fs_id);
+	if (!fs_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(fs_id);
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-REJECT scanner_first_scan reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			OBFSTR("Scanner capacity exhausted; work was not started."),
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, fs_id));
+	}
+	diag::log_tagged_fmt("scanner",
+		"FEATURE-WORKER-GROUP-ADMIT scanner_first_scan token=%llu",
+		static_cast<unsigned long long>(fs_admission.token()));
+
 	memory_scanner::scan_config_t cfg;
 
 	if (params.contains("value_type"))
@@ -930,6 +950,12 @@ static tool_result_t handle_first_scan(const json& params) {
 
 	if (!memory_scanner::first_scan(cfg)) {
 		diag::log_tagged("scanner", "mcp first_scan refused");
+		if (fs_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE scanner_first_scan token=%llu reason=completed",
+				static_cast<unsigned long long>(fs_admission.token()));
+			fs_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("Scanner busy or not attached to a process."));
 	}
 
@@ -946,6 +972,12 @@ static tool_result_t handle_first_scan(const json& params) {
 				memory_scanner::g_state.scan_count,
 				i);
 			memory_scanner::reset_scan();
+			if (fs_admission.active()) {
+				diag::log_tagged_fmt("scanner",
+					"FEATURE-WORKER-GROUP-RELEASE scanner_first_scan token=%llu reason=completed",
+					static_cast<unsigned long long>(fs_admission.token()));
+				fs_admission.release("completed");
+			}
 			return tool_result_t::error(OBFSTR("Memory scan cancelled."), "cancelled", result);
 		}
 		Sleep(100);
@@ -963,13 +995,44 @@ static tool_result_t handle_first_scan(const json& params) {
 			memory_scanner::g_state.total_found,
 			memory_scanner::g_state.scan_count);
 		memory_scanner::reset_scan();
+		if (fs_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE scanner_first_scan token=%llu reason=completed",
+				static_cast<unsigned long long>(fs_admission.token()));
+			fs_admission.release("completed");
+		}
 		return tool_result_t{false, OBFSTR("Memory scan did not complete within the wait budget."), result};
 	}
 
+	if (fs_admission.active()) {
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-RELEASE scanner_first_scan token=%llu reason=completed",
+			static_cast<unsigned long long>(fs_admission.token()));
+		fs_admission.release("completed");
+	}
 	return tool_result_t::ok(results_to_json());
 }
 
 static tool_result_t handle_next_scan(const json& params) {
+	mcp_standalone::downstream::producer_identity_t ns_id;
+	ns_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	ns_id.tool_name = "scanner_next_scan";
+	mcp_standalone::downstream::scoped_admission_t ns_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(ns_id);
+	if (!ns_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(ns_id);
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-REJECT scanner_next_scan reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			OBFSTR("Scanner capacity exhausted; work was not started."),
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, ns_id));
+	}
+	diag::log_tagged_fmt("scanner",
+		"FEATURE-WORKER-GROUP-ADMIT scanner_next_scan token=%llu",
+		static_cast<unsigned long long>(ns_admission.token()));
+
 	auto mode = memory_scanner::scan_mode_t::exact;
 	std::string val, val2;
 
@@ -985,6 +1048,12 @@ static tool_result_t handle_next_scan(const json& params) {
 
 	if (!memory_scanner::next_scan(mode, val, val2)) {
 		diag::log_tagged("scanner", "mcp next_scan refused");
+		if (ns_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE scanner_next_scan token=%llu reason=completed",
+				static_cast<unsigned long long>(ns_admission.token()));
+			ns_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("Scanner busy or no initial scan performed."));
 	}
 
@@ -1000,6 +1069,12 @@ static tool_result_t handle_next_scan(const json& params) {
 				memory_scanner::g_state.scan_count,
 				i);
 			memory_scanner::reset_scan();
+			if (ns_admission.active()) {
+				diag::log_tagged_fmt("scanner",
+					"FEATURE-WORKER-GROUP-RELEASE scanner_next_scan token=%llu reason=completed",
+					static_cast<unsigned long long>(ns_admission.token()));
+				ns_admission.release("completed");
+			}
 			return tool_result_t::error(OBFSTR("Next memory scan cancelled."), "cancelled", result);
 		}
 		Sleep(100);
@@ -1015,9 +1090,21 @@ static tool_result_t handle_next_scan(const json& params) {
 			memory_scanner::g_state.total_found,
 			memory_scanner::g_state.scan_count);
 		memory_scanner::reset_scan();
+		if (ns_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE scanner_next_scan token=%llu reason=completed",
+				static_cast<unsigned long long>(ns_admission.token()));
+			ns_admission.release("completed");
+		}
 		return tool_result_t{false, OBFSTR("Next memory scan did not complete within the wait budget."), result};
 	}
 
+	if (ns_admission.active()) {
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-RELEASE scanner_next_scan token=%llu reason=completed",
+			static_cast<unsigned long long>(ns_admission.token()));
+		ns_admission.release("completed");
+	}
 	return tool_result_t::ok(results_to_json());
 }
 
@@ -1204,14 +1291,48 @@ static tool_result_t handle_get_address_list(const json&) {
 }
 
 static tool_result_t handle_pointer_scan(const json& params) {
-	if (!params.contains("address"))
+	mcp_standalone::downstream::producer_identity_t ps_id;
+	ps_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	ps_id.tool_name = "scanner_pointer_scan";
+	mcp_standalone::downstream::scoped_admission_t ps_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(ps_id);
+	if (!ps_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(ps_id);
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-REJECT scanner_pointer_scan reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			OBFSTR("Scanner capacity exhausted; work was not started."),
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, ps_id));
+	}
+	diag::log_tagged_fmt("scanner",
+		"FEATURE-WORKER-GROUP-ADMIT scanner_pointer_scan token=%llu",
+		static_cast<unsigned long long>(ps_admission.token()));
+
+	if (!params.contains("address")) {
+		if (ps_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE scanner_pointer_scan token=%llu reason=completed",
+				static_cast<unsigned long long>(ps_admission.token()));
+			ps_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("Missing 'address' parameter."));
+	}
 
 	uint64_t addr = 0;
 	auto& v = params["address"];
 	if (v.is_string()) {
 		auto parsed = sa_parse_address(v.get<std::string>());
-		if (!parsed) return tool_result_t::error(OBFSTR("Invalid address format."));
+		if (!parsed) {
+			if (ps_admission.active()) {
+				diag::log_tagged_fmt("scanner",
+					"FEATURE-WORKER-GROUP-RELEASE scanner_pointer_scan token=%llu reason=completed",
+					static_cast<unsigned long long>(ps_admission.token()));
+				ps_admission.release("completed");
+			}
+			return tool_result_t::error(OBFSTR("Invalid address format."));
+		}
 		addr = *parsed;
 	} else if (v.is_number()) {
 		addr = v.get<uint64_t>();
@@ -1240,8 +1361,15 @@ static tool_result_t handle_pointer_scan(const json& params) {
 		static_cast<unsigned long long>(scan_size));
 
 	const bool started = memory_scanner::start_pointer_scan(addr, max_depth, max_offset, scan_base, scan_size);
-	if (!started)
+	if (!started) {
+		if (ps_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE scanner_pointer_scan token=%llu reason=completed",
+				static_cast<unsigned long long>(ps_admission.token()));
+			ps_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("Pointer scan did not start. Ensure the driver is loaded and a process is attached."));
+	}
 	{
 		std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
 		diag::log_tagged_fmt("scanner", "mcp pointer_scan started scanning=%d current_results=%zu",
@@ -1260,6 +1388,12 @@ static tool_result_t handle_pointer_scan(const json& params) {
 			result["target_address"] = sa_format_address(addr);
 			result["poll_iteration"] = i;
 			diag::log_tagged_fmt("scanner", "mcp pointer_scan cancelled tick=%d/%d", i + 1, loops);
+			if (ps_admission.active()) {
+				diag::log_tagged_fmt("scanner",
+					"FEATURE-WORKER-GROUP-RELEASE scanner_pointer_scan token=%llu reason=completed",
+					static_cast<unsigned long long>(ps_admission.token()));
+				ps_admission.release("completed");
+			}
 			return tool_result_t::error(OBFSTR("Pointer scan cancelled."), "cancelled", result);
 		}
 		if (i == 0 || ((i + 1) % 20) == 0) {
@@ -1329,19 +1463,65 @@ static tool_result_t handle_pointer_scan(const json& params) {
 	result["pointer_scanning"] = pointer_scanning_now;
 	result["active_pointer_session"] = g_active_pointer_session.load(std::memory_order_relaxed);
 	result["results"] = std::move(arr);
-	if (timed_out && !allow_partial)
+	if (timed_out && !allow_partial) {
+		if (ps_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE scanner_pointer_scan token=%llu reason=completed",
+				static_cast<unsigned long long>(ps_admission.token()));
+			ps_admission.release("completed");
+		}
 		return tool_result_t{false, OBFSTR("Pointer scan did not complete within the timeout."), result};
+	}
+	if (ps_admission.active()) {
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-RELEASE scanner_pointer_scan token=%llu reason=completed",
+			static_cast<unsigned long long>(ps_admission.token()));
+		ps_admission.release("completed");
+	}
 	return tool_result_t::ok(result);
 }
 
 
 
 static tool_result_t handle_find_what_accesses(const json& params) {
-	if (!params.contains("address") || !params["address"].is_string())
+	mcp_standalone::downstream::producer_identity_t fwa_id;
+	fwa_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	fwa_id.tool_name = "find_what_accesses";
+	mcp_standalone::downstream::scoped_admission_t fwa_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(fwa_id);
+	if (!fwa_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(fwa_id);
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-REJECT find_what_accesses reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			OBFSTR("Scanner capacity exhausted; work was not started."),
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, fwa_id));
+	}
+	diag::log_tagged_fmt("scanner",
+		"FEATURE-WORKER-GROUP-ADMIT find_what_accesses token=%llu",
+		static_cast<unsigned long long>(fwa_admission.token()));
+
+	if (!params.contains("address") || !params["address"].is_string()) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("'address' is required."));
+	}
 	auto address = sa_parse_address(params["address"].get<std::string>());
-	if (!address)
+	if (!address) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("Invalid address."));
+	}
 	uint64_t size = 4;
 	if (params.contains("size") && params["size"].is_number_integer()) {
 		int requested = params["size"].get<int>();
@@ -1350,28 +1530,70 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 	}
 	std::string type = "write";
 	if (params.contains("type")) {
-		if (!params["type"].is_string())
+		if (!params["type"].is_string()) {
+			if (fwa_admission.active()) {
+				diag::log_tagged_fmt("scanner",
+					"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+					static_cast<unsigned long long>(fwa_admission.token()));
+				fwa_admission.release("completed");
+			}
 			return tool_result_t::error(OBFSTR("'type' must be read, write, or execute."));
+		}
 		type = params["type"].get<std::string>();
 	}
 	const uint32_t wanted_access = access_type_code(type);
-	if (wanted_access == std::numeric_limits<uint32_t>::max())
+	if (wanted_access == std::numeric_limits<uint32_t>::max()) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("'type' must be read, write, or execute."));
+	}
 	const int wait_ms = clamp_wait_ms(params, 5000);
 	const size_t limit = limit_param(params, 32, 256);
-	if (!driver_bridge::using_kernel_driver())
+	if (!driver_bridge::using_kernel_driver()) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("find_what_accesses requires the kernel driver page-guard backend."));
+	}
 	const uint32_t pid = driver_bridge::attached_pid();
-	if (pid == 0)
+	if (pid == 0) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("No attached process."));
+	}
 	SYSTEM_INFO si{};
 	GetSystemInfo(&si);
 	const uint64_t page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
-	if (*address > std::numeric_limits<uint64_t>::max() - size)
+	if (*address > std::numeric_limits<uint64_t>::max() - size) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("Watched address range overflows."));
+	}
 	const uint64_t end = *address + size;
-	if (end > std::numeric_limits<uint64_t>::max() - (page_size - 1))
+	if (end > std::numeric_limits<uint64_t>::max() - (page_size - 1)) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("Guard address range overflows."));
+	}
 	const uint64_t page_base = *address & ~(page_size - 1);
 	const uint64_t guard_end = (end + page_size - 1) & ~(page_size - 1);
 	const uint64_t guard_size = std::max<uint64_t>(page_size, guard_end - page_base);
@@ -1436,6 +1658,12 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		mcp_standalone::current_call_diag_id());
 	if (const char* reason = cancel_reason()) {
 		log_cancel("entry", reason);
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return cancelled_result("entry", reason, 0, false, false, 0);
 	}
 	const bool polling_enabled = false;
@@ -1456,6 +1684,12 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
 	if (const char* reason = cancel_reason()) {
 		log_cancel("before_install", reason);
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return cancelled_result("before_install", reason, 0, false, false, 0);
 	}
 	uint32_t sid = page_guard_engine::g_pg_engine.install(pid, page_base, guard_size, true, max_records_per_drain);
@@ -1515,6 +1749,12 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 			static_cast<unsigned long long>(page_base),
 			static_cast<unsigned long long>(guard_size),
 			static_cast<unsigned long long>(GetTickCount64() - started_tick));
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return tool_result_t::error(OBFSTR("find_what_accesses page-guard install failed."), "page_guard_install_failed", result);
 	}
 	diag::log_tagged_fmt("scanner",
@@ -1531,6 +1771,12 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 			sid,
 			cleanup_ok ? 1 : 0,
 			static_cast<unsigned long long>(GetTickCount64() - started_tick));
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return cancelled_result("after_install", reason, sid, true, cleanup_ok, 0);
 	}
 	const size_t payload_budget = std::min<size_t>(256, std::max<size_t>(limit * 4, 16));
@@ -1676,8 +1922,15 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		sid,
 		uninstalled ? 1 : 0,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
-	if (cancelled)
+	if (cancelled) {
+		if (fwa_admission.active()) {
+			diag::log_tagged_fmt("scanner",
+				"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+				static_cast<unsigned long long>(fwa_admission.token()));
+			fwa_admission.release("completed");
+		}
 		return cancelled_result(cancelled_phase, cancelled_reason, sid, true, uninstalled, captures.size());
+	}
 	json arr = json::array();
 	for (const auto& c : captures) {
 		if (arr.size() >= limit)
@@ -1727,6 +1980,12 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		0,
 		pg_failed ? 1 : 0,
 		static_cast<unsigned long long>(GetTickCount64() - started_tick));
+	if (fwa_admission.active()) {
+		diag::log_tagged_fmt("scanner",
+			"FEATURE-WORKER-GROUP-RELEASE find_what_accesses token=%llu reason=completed",
+			static_cast<unsigned long long>(fwa_admission.token()));
+		fwa_admission.release("completed");
+	}
 	return tool_result_t::ok(result);
 }
 

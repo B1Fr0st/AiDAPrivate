@@ -16,6 +16,7 @@
 
 #include "standalone_driver.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 namespace pointer_scanner {
 
@@ -252,9 +253,24 @@ inline void build_reverse_map()
 		g_state.last_map_diagnostics.source = "build_reverse_map";
 	}
 
+	mcp_standalone::downstream::producer_identity_t brm_id;
+	brm_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	brm_id.tool_name = "build_reverse_map";
+	mcp_standalone::downstream::scoped_admission_t brm_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(brm_id);
+	if (!brm_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(brm_id);
+		diag::log_tagged_fmt("pointer_scan",
+			"FEATURE-WORKER-GROUP-REJECT build_reverse_map reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		g_state.map_building.store(false);
+		return;
+	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-ADMIT build_reverse_map token=%llu",
+		static_cast<unsigned long long>(brm_admission.token()));
+
 	work_queue::post([]() {
-		auto t_start = std::chrono::steady_clock::now();
-		auto modules = driver_bridge::enumerate_modules();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 
 		std::vector<driver_bridge::memory_region_t> readable;
@@ -366,6 +382,11 @@ inline void build_reverse_map()
 
 		g_state.map_building.store(false);
 	});
+
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-RELEASE build_reverse_map token=%llu reason=dispatched",
+		static_cast<unsigned long long>(brm_admission.token()));
+	brm_admission.release("dispatched");
 }
 
 inline void start_scan()
@@ -420,6 +441,24 @@ inline void start_scan()
 	g_state.scanning.store(true);
 	g_state.scan_cancel.store(false);
 	g_state.scan_progress.store(0.f);
+
+	mcp_standalone::downstream::producer_identity_t ss_id;
+	ss_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	ss_id.tool_name = "pointer_start_scan";
+	mcp_standalone::downstream::scoped_admission_t ss_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(ss_id);
+	if (!ss_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(ss_id);
+		diag::log_tagged_fmt("pointer_scan",
+			"FEATURE-WORKER-GROUP-REJECT pointer_start_scan reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		g_state.scan_progress.store(1.f);
+		g_state.scanning.store(false);
+		return;
+	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-ADMIT pointer_start_scan token=%llu",
+		static_cast<unsigned long long>(ss_admission.token()));
 
 	if (!work_queue::post([]() {
 		try {
@@ -495,6 +534,11 @@ inline void start_scan()
 		g_state.scan_progress.store(1.f);
 		g_state.scanning.store(false);
 	}
+
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-RELEASE pointer_start_scan token=%llu reason=dispatched",
+		static_cast<unsigned long long>(ss_admission.token()));
+	ss_admission.release("dispatched");
 }
 
 inline bool validate_chain(const pointer_chain_t& chain)
@@ -559,6 +603,23 @@ inline void validate_all_results()
 	g_state.validating.store(true);
 	g_state.validate_progress.store(0.f);
 
+	mcp_standalone::downstream::producer_identity_t va_id;
+	va_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	va_id.tool_name = "validate_all_results";
+	mcp_standalone::downstream::scoped_admission_t va_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(va_id);
+	if (!va_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(va_id);
+		diag::log_tagged_fmt("pointer_scan",
+			"FEATURE-WORKER-GROUP-REJECT validate_all_results reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		g_state.validating.store(false);
+		return;
+	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-ADMIT validate_all_results token=%llu",
+		static_cast<unsigned long long>(va_admission.token()));
+
 	work_queue::post([]() {
 		auto t_start = std::chrono::steady_clock::now();
 		std::vector<pointer_chain_t> work;
@@ -594,6 +655,11 @@ inline void validate_all_results()
 		g_state.validate_progress.store(1.f);
 		g_state.validating.store(false);
 	});
+
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-RELEASE validate_all_results token=%llu reason=dispatched",
+		static_cast<unsigned long long>(va_admission.token()));
+	va_admission.release("dispatched");
 }
 
 inline std::string chain_to_string(const pointer_chain_t& chain)

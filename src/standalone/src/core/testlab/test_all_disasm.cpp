@@ -14,11 +14,14 @@
 #include "../debugger/debugger_engine.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -2333,8 +2336,15 @@ namespace {
         const uint32_t wd_module_size = module.size;
         const uint64_t wd_range_lo = range_lo;
         const uint64_t wd_range_hi = range_hi;
-        const bool watchdog_posted = work_queue::post_labeled("xref_live_after_warm.watchdog",
-            [wd_state, watchdog_event_holder, t0, tag, wd_log_file, wd_pid, wd_module_name, wd_module_base, wd_module_size, wd_range_lo, wd_range_hi]() {
+        bool watchdog_posted = false;
+        {
+            aida::executor::submission_t _exec_sub;
+            _exec_sub.owner_subsystem = "standalone.testlab.disasm";
+            _exec_sub.label = "xref_live_after_warm.watchdog";
+            _exec_sub.thread_class = "queued_task";
+            _exec_sub.domain = aida::executor::domain_t::diagnostics;
+            _exec_sub.priority = 4;
+            _exec_sub.body = [wd_state, watchdog_event_holder, t0, tag, wd_log_file, wd_pid, wd_module_name, wd_module_base, wd_module_size, wd_range_lo, wd_range_hi]() {
                 HANDLE watchdog_event = watchdog_event_holder.get();
                 const auto deadline = t0 + std::chrono::milliseconds(watchdog_timeout_ms);
                 while (!wd_state->finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
@@ -2370,7 +2380,15 @@ namespace {
                         elapsed_us_since(t0));
                 }
                 wd_state->done.store(true, std::memory_order_release);
-            });
+            };
+            _exec_sub.failure_policy = "reject_not_started";
+            _exec_sub.ui_access_policy = "none";
+            _exec_sub.shutdown_policy = "drain";
+            _exec_sub.no_capacity_reason = "no_capacity_needed_diagnostics_queue";
+            auto _exec_result = aida::executor::submit(std::move(_exec_sub));
+            watchdog_posted = _exec_result.submitted;
+            (void)_exec_result;
+        }
         if (!watchdog_posted) {
             const work_queue::stats_t work_stats = work_queue::stats();
             const work_queue::stats_t service_stats = work_queue::service_stats();
@@ -3925,8 +3943,86 @@ namespace {
             center_view_name(value),
             static_cast<int>(value),
             (unsigned long)GetCurrentThreadId());
-        globals::ui::active_center_view = value;
-        const center_view_t got = globals::ui::active_center_view;
+
+        struct center_view_dispatch_state_t {
+            std::mutex mtx;
+            std::condition_variable cv;
+            bool done = false;
+            center_view_t got = center_view_t::welcome;
+        };
+
+        if (aida::ui_thread::is_owner_thread()) {
+            if (!aida::ui_thread::require_owner("testlab", "select_center_view", "disasm_inline")) {
+                log_msg(hf, tag, "FAIL -- select_center_view require_owner rejected tid=%lu",
+                    (unsigned long)GetCurrentThreadId());
+                failed.fetch_add(1);
+                return;
+            }
+            globals::ui::active_center_view = value;
+            const center_view_t got = globals::ui::active_center_view;
+            log_msg(hf, tag, "STATE -- after active_center_view=%s(%d) changed=%d elapsed_us=%lld",
+                center_view_name(got),
+                static_cast<int>(got),
+                (before != got) ? 1 : 0,
+                elapsed_us_since(t0));
+            if (got == value) {
+                log_msg(hf, tag, "PASS -- active_center_view selected %s(%d)", center_view_name(value), static_cast<int>(value));
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- active_center_view target=%s(%d) got=%s(%d)",
+                    center_view_name(value),
+                    static_cast<int>(value),
+                    center_view_name(got),
+                    static_cast<int>(got));
+                failed.fetch_add(1);
+            }
+            return;
+        }
+
+        auto state = std::make_shared<center_view_dispatch_state_t>();
+        const DWORD producer_tid = ::GetCurrentThreadId();
+        const bool posted = aida::ui_thread::post([state, value, producer_tid]() {
+            bool ok = false;
+            if (aida::ui_thread::require_owner("testlab", "select_center_view", "disasm_dispatch")) {
+                globals::ui::active_center_view = value;
+                ok = true;
+            }
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                state->got = globals::ui::active_center_view;
+                state->done = true;
+            }
+            state->cv.notify_all();
+            diag::log_tagged_critical_fmt("TESTLAB-UI-DISPATCH",
+                "select_center_view producer_tid=%lu ui_tid=%lu value=%d ok=%d got=%d",
+                static_cast<unsigned long>(producer_tid),
+                static_cast<unsigned long>(::GetCurrentThreadId()),
+                static_cast<int>(value),
+                ok ? 1 : 0,
+                static_cast<int>(state->got));
+        }, "testlab", "select_center_view", "disasm_dispatch");
+
+        if (!posted) {
+            log_msg(hf, tag, "FAIL -- select_center_view dispatcher post failed tid=%lu ui_tid=%lu",
+                (unsigned long)producer_tid,
+                (unsigned long)aida::ui_thread::owner_tid());
+            failed.fetch_add(1);
+            return;
+        }
+
+        std::unique_lock<std::mutex> lk(state->mtx);
+        const bool completed = state->cv.wait_for(lk, std::chrono::milliseconds(5000), [&] { return state->done; });
+        lk.unlock();
+
+        if (!completed) {
+            log_msg(hf, tag, "FAIL -- select_center_view dispatcher timeout tid=%lu pending=%zu",
+                (unsigned long)producer_tid,
+                aida::ui_thread::pending_count());
+            failed.fetch_add(1);
+            return;
+        }
+
+        const center_view_t got = state->got;
         log_msg(hf, tag, "STATE -- after active_center_view=%s(%d) changed=%d elapsed_us=%lld",
             center_view_name(got),
             static_cast<int>(got),

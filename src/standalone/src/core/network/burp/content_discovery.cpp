@@ -17,6 +17,7 @@
 #include "helpers/diag_log.hpp"
 #include "../../infra/event_bus.hpp"
 #include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -517,7 +518,36 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
         std::this_thread::sleep_for(std::chrono::milliseconds(d.config.delay_ms));
 
     d.in_flight.fetch_sub(1);
-    work_queue::post([ctx] { run_disc(ctx); });
+    {
+        mcp_standalone::downstream::producer_identity_t cont_id;
+        cont_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        cont_id.tool_name = "content_discovery.run_disc";
+        cont_id.domain = d.config.target_url;
+        auto cont_admission = mcp_standalone::downstream::scoped_admission_t::acquire(cont_id);
+        if (!cont_admission.active()) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu",
+                static_cast<unsigned long long>(d.id),
+                cont_admission.result().reason.c_str(),
+                cont_admission.result().quota_name.c_str(),
+                cont_admission.result().observed, cont_admission.result().limit);
+            return;
+        }
+        const uint64_t cont_token = cont_admission.token();
+        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=continuation",
+            static_cast<unsigned long long>(d.id),
+            static_cast<unsigned long long>(cont_token));
+        if (!work_queue::post([ctx, admission = std::move(cont_admission), cont_token]() mutable {
+            run_disc(ctx);
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(cont_token));
+            admission.release("completed");
+        })) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable",
+                static_cast<unsigned long long>(d.id),
+                static_cast<unsigned long long>(cont_token));
+        }
+    }
 }
 
 void run_disc(std::shared_ptr<disc_t> ctx)
@@ -555,7 +585,37 @@ void run_disc(std::shared_ptr<disc_t> ctx)
             static_cast<unsigned long long>(d.id), d.attempts.load(), d.hits_count.load(), d.errors.load(), d.filtered.load());
         return;
     }
-    work_queue::post([ctx] { std::this_thread::sleep_for(std::chrono::milliseconds(50)); run_disc(ctx); });
+    {
+        mcp_standalone::downstream::producer_identity_t wait_id;
+        wait_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        wait_id.tool_name = "content_discovery.run_disc_wait";
+        wait_id.domain = d.config.target_url;
+        auto wait_admission = mcp_standalone::downstream::scoped_admission_t::acquire(wait_id);
+        if (!wait_admission.active()) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=wait",
+                static_cast<unsigned long long>(d.id),
+                wait_admission.result().reason.c_str(),
+                wait_admission.result().quota_name.c_str(),
+                wait_admission.result().observed, wait_admission.result().limit);
+            return;
+        }
+        const uint64_t wait_token = wait_admission.token();
+        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=wait",
+            static_cast<unsigned long long>(d.id),
+            static_cast<unsigned long long>(wait_token));
+        if (!work_queue::post([ctx, admission = std::move(wait_admission), wait_token]() mutable {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            run_disc(ctx);
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
+                static_cast<unsigned long long>(ctx->id),
+                static_cast<unsigned long long>(wait_token));
+            admission.release("completed");
+        })) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable",
+                static_cast<unsigned long long>(d.id),
+                static_cast<unsigned long long>(wait_token));
+        }
+    }
 }
 
 bool auto_calibrate(disc_t& d)
@@ -725,7 +785,38 @@ uint64_t start(const config_t& cfg)
     diag::log_tagged_fmt("burp.content_discovery", "disc_start id=%llu target=%s total=%d conc=%d delay=%d",
         static_cast<unsigned long long>(ctx->id), cfg.target_url.c_str(), ctx->total.load(std::memory_order_acquire), cfg.concurrency, cfg.delay_ms);
 
-    bool posted = work_queue::post([ctx] {
+    mcp_standalone::downstream::producer_identity_t start_id;
+    start_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+    start_id.tool_name = "content_discovery.start";
+    start_id.domain = cfg.target_url;
+    auto start_admission = mcp_standalone::downstream::scoped_admission_t::acquire(start_id);
+    if (!start_admission.active()) {
+        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=start",
+            static_cast<unsigned long long>(ctx->id),
+            start_admission.result().reason.c_str(),
+            start_admission.result().quota_name.c_str(),
+            start_admission.result().observed, start_admission.result().limit);
+        {
+            std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
+            if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
+                ctx->phase.store(disc_phase_t::error, std::memory_order_release);
+                ctx->last_error = "downstream capacity exhausted";
+                ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
+            }
+        }
+        ctx->finished.store(true, std::memory_order_release);
+        set_err("downstream capacity exhausted");
+        std::unique_lock<std::timed_mutex> reg_lk(reg().mtx, std::defer_lock);
+        if (reg_lk.try_lock_for(std::chrono::milliseconds(kRegistryLockTimeoutMs)))
+            reg().by_id.erase(ctx->id);
+        return 0;
+    }
+    const uint64_t start_token = start_admission.token();
+    diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-ADMIT id=%llu token=%llu phase=start",
+        static_cast<unsigned long long>(ctx->id),
+        static_cast<unsigned long long>(start_token));
+
+    bool posted = work_queue::post([ctx, admission = std::move(start_admission), start_token]() mutable {
         if (ctx->config.auto_calibrate) auto_calibrate(*ctx);
         {
             std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
@@ -738,9 +829,30 @@ uint64_t start(const config_t& cfg)
         }
         int kick = std::max(1, std::min(ctx->config.concurrency, 64));
         int posted_kicks = 0;
-        for (int i = 0; i < kick; ++i)
-            if (work_queue::post([ctx] { run_disc(ctx); }))
+        for (int i = 0; i < kick; ++i) {
+            mcp_standalone::downstream::producer_identity_t kick_id;
+            kick_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+            kick_id.tool_name = "content_discovery.run_disc_kick";
+            kick_id.domain = ctx->config.target_url;
+            auto kick_admission = mcp_standalone::downstream::scoped_admission_t::acquire(kick_id);
+            if (!kick_admission.active()) {
+                diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-REJECT id=%llu reason=%s quota=%s observed=%zu limit=%zu phase=kick",
+                    static_cast<unsigned long long>(ctx->id),
+                    kick_admission.result().reason.c_str(),
+                    kick_admission.result().quota_name.c_str(),
+                    kick_admission.result().observed, kick_admission.result().limit);
+                continue;
+            }
+            const uint64_t kick_token = kick_admission.token();
+            if (work_queue::post([ctx, k_admission = std::move(kick_admission), kick_token]() mutable {
+                run_disc(ctx);
+                diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
+                    static_cast<unsigned long long>(ctx->id),
+                    static_cast<unsigned long long>(kick_token));
+                k_admission.release("completed");
+            }))
                 ++posted_kicks;
+        }
         if (posted_kicks == 0) {
             std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
             if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
@@ -753,6 +865,10 @@ uint64_t start(const config_t& cfg)
                 static_cast<unsigned long long>(ctx->id),
                 kick);
         }
+        diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=start_outer",
+            static_cast<unsigned long long>(ctx->id),
+            static_cast<unsigned long long>(start_token));
+        admission.release("completed");
     });
     if (!posted) {
         {

@@ -21,6 +21,7 @@
 #include "components.hpp"
 #include "theme.hpp"
 #include "../core/infra/work_queue.hpp"
+#include "../core/ui/ui_thread_dispatcher.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -43,6 +44,17 @@ extern DisasmState g_disasm;
 
 void file_browser::refresh(const std::string& dir)
 {
+    if (!aida::ui_thread::is_owner_thread()) {
+        const bool routed = aida::ui_thread::post([dir]() {
+            file_browser::refresh(dir);
+        }, "file_browser", "refresh", "entry");
+        if (!routed)
+            diag::log_tagged_fmt("file_browser", "refresh denied dir=%s reason=ui_affinity_route_failed", dir.c_str());
+        return;
+    }
+    if (!aida::ui_thread::require_owner("file_browser", "refresh", "entry"))
+        return;
+
     std::string root = dir;
 
 
@@ -228,6 +240,16 @@ inline bool is_archive(const std::string& ext)
 void open_path(const std::string& path)
 {
     if (path.empty()) return;
+    if (!aida::ui_thread::is_owner_thread()) {
+        const bool routed = aida::ui_thread::post([path]() {
+            file_browser::open_path(path);
+        }, "file_browser", "open_path", "entry");
+        if (!routed)
+            diag::log_tagged_fmt("file_browser", "open_path denied path=%s reason=ui_affinity_route_failed", path.c_str());
+        return;
+    }
+    if (!aida::ui_thread::require_owner("file_browser", "open_path", "entry"))
+        return;
 
     std::error_code ec;
     if (fs::is_directory(path, ec) && !ec) {
@@ -393,6 +415,16 @@ inline std::string truncate_middle(const std::string& s, size_t max_len) {
 void request_open_confirmation(const std::string& path)
 {
     if (path.empty()) return;
+    if (!aida::ui_thread::is_owner_thread()) {
+        const bool routed = aida::ui_thread::post([path]() {
+            file_browser::request_open_confirmation(path);
+        }, "file_browser", "request_open_confirmation", "entry");
+        if (!routed)
+            diag::log_tagged_fmt("file_open", "explorer_confirm_denied path=%s reason=ui_affinity_route_failed", path.c_str());
+        return;
+    }
+    if (!aida::ui_thread::require_owner("file_browser", "request_open_confirmation", "entry"))
+        return;
 
     std::error_code ec;
     if (fs::is_directory(path, ec) && !ec) {

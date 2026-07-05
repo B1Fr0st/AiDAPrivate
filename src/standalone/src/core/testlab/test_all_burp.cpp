@@ -52,6 +52,7 @@
 #include "../network/burp/headless_view.hpp"
 #include "../network/network_view.hpp"
 #include "../runtime/manual_map_tls.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "test_lab_bounded_runner.hpp"
 
@@ -100,6 +101,66 @@ namespace {
         std::string s(line);
         write_log_file(hf, s);
         test_all_features::mirror_full_test_log_line(tag, detail, s.c_str());
+    }
+
+    struct ui_exchange_publish_state_t {
+        std::mutex mtx;
+        std::condition_variable cv;
+        bool done = false;
+        bool ok = false;
+    };
+
+    bool publish_exchange_observed_on_ui(HANDLE hf, const char* tag, const aida::burp::exchange_observed_t& ex, const char* source) {
+        const char* phase = "source_proven_ui_thread";
+        if (aida::ui_thread::is_owner_thread()) {
+            if (!aida::ui_thread::require_owner("testlab", "burp_exchange_publish", phase))
+                return false;
+            aida::events::publish(aida::burp::kExchangeObservedEvent, ex);
+            return true;
+        }
+        auto state = std::make_shared<ui_exchange_publish_state_t>();
+        const DWORD producer_tid = ::GetCurrentThreadId();
+        const std::string source_copy = source && source[0] ? source : "testlab_exchange";
+        const bool posted = aida::ui_thread::post([state, ex, source_copy, producer_tid]() mutable {
+            const char* phase_inner = "source_proven_ui_thread";
+            bool ok = false;
+            if (aida::ui_thread::require_owner("testlab", "burp_exchange_publish", phase_inner)) {
+                aida::events::publish(aida::burp::kExchangeObservedEvent, ex);
+                ok = true;
+            }
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                state->ok = ok;
+                state->done = true;
+            }
+            state->cv.notify_all();
+            diag::log_tagged_critical_fmt("TESTLAB-UI-DISPATCH",
+                "burp_exchange_publish source=%s producer_tid=%lu ui_tid=%lu ok=%d id=%llu",
+                source_copy.c_str(),
+                static_cast<unsigned long>(producer_tid),
+                static_cast<unsigned long>(::GetCurrentThreadId()),
+                ok ? 1 : 0,
+                static_cast<unsigned long long>(ex.id));
+        }, "testlab", "burp_exchange_publish", source_copy.c_str());
+        if (!posted) {
+            log_msg(hf, tag, "FAIL -- exchange event UI dispatch post failed source=%s id=%llu ui_tid=%lu",
+                source_copy.c_str(),
+                static_cast<unsigned long long>(ex.id),
+                static_cast<unsigned long>(aida::ui_thread::owner_tid()));
+            return false;
+        }
+        std::unique_lock<std::mutex> lk(state->mtx);
+        const bool completed = state->cv.wait_for(lk, std::chrono::milliseconds(5000), [&] { return state->done; });
+        const bool ok = completed && state->ok;
+        if (!ok) {
+            log_msg(hf, tag, "FAIL -- exchange event UI dispatch did not complete source=%s id=%llu completed=%d ok=%d pending=%zu",
+                source_copy.c_str(),
+                static_cast<unsigned long long>(ex.id),
+                completed ? 1 : 0,
+                state->ok ? 1 : 0,
+                aida::ui_thread::pending_count());
+        }
+        return ok;
     }
 
     void fail_empty_evidence(HANDLE hf, const char* tag, std::atomic<int>& failed, const char* fmt, ...) {
@@ -1633,7 +1694,8 @@ namespace {
             static_cast<unsigned long long>(ex.id), ex.host.c_str(), static_cast<unsigned>(ex.port), ex.path.c_str(),
             static_cast<unsigned long long>(before_stats.exchanges_scanned), before_hosts, before_rows, before_inv);
         aida::burp::sitemap::ingest_exchange(ex);
-        aida::events::publish(aida::burp::kExchangeObservedEvent, ex);
+        if (!publish_exchange_observed_on_ui(hf, tag, ex, "publish_fixture_exchange"))
+            return;
         Sleep(250);
         auto after_stats = aida::burp::passive_scanner::get_stats();
         size_t after_hosts = aida::burp::sitemap::list_hosts(false).size();

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <mutex>
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <vector>
 #include <map>
@@ -63,6 +64,7 @@ namespace mcp_standalone
     std::atomic<bool>* current_cancel_token() noexcept;
     bool current_call_cancelled() noexcept;
     const char* current_call_diag_id() noexcept;
+    const char* current_call_request_id() noexcept;
     const char* current_call_tool_name() noexcept;
     std::uint64_t current_call_deadline_ms() noexcept;
 
@@ -90,12 +92,14 @@ namespace mcp_standalone
     {
     public:
         scoped_call_metadata_t(const std::string& diag_id, const std::string& tool_name, std::uint64_t deadline_ms);
+        scoped_call_metadata_t(const std::string& diag_id, const std::string& request_id, const std::string& tool_name, std::uint64_t deadline_ms);
         ~scoped_call_metadata_t();
         scoped_call_metadata_t(const scoped_call_metadata_t&) = delete;
         scoped_call_metadata_t& operator=(const scoped_call_metadata_t&) = delete;
 
     private:
         std::string _prev_diag;
+        std::string _prev_request;
         std::string _prev_tool;
         std::uint64_t _prev_deadline = 0;
         bool _active = false;
@@ -103,6 +107,8 @@ namespace mcp_standalone
 
     void set_ide_lifecycle_ready(bool ready) noexcept;
     bool lifecycle_authorized(std::string* reason = nullptr);
+    void format_runtime_diagnostic_snapshot(char* out, std::size_t cap) noexcept;
+    json active_session_policy_debug_snapshot();
 
     struct tool_def_t
     {
@@ -131,7 +137,7 @@ namespace mcp_standalone
         const std::vector<tool_def_t>& get_tools() const { return _tools; }
 
     private:
-        friend std::string handle_body(server_t*, const std::string&);
+        friend std::string handle_body(server_t*, const std::string&, const std::function<bool()>&);
         void server_thread_func(int port);
         json handle_initialize(const json& id, const json& params);
         json handle_tools_list(const json& id, const json& params);
@@ -157,7 +163,7 @@ namespace mcp_standalone
     };
 
     void register_standalone_tools(server_t& server);
-    std::string handle_body(server_t* self, const std::string& body);
+    std::string handle_body(server_t* self, const std::string& body, const std::function<bool()>& connection_closed = {});
 
     struct target_scope_t
     {

@@ -48,6 +48,7 @@
 #include "../runtime/standalone_license.hpp"
 #include "../scanner/crypto_scanner.hpp"
 #include "../scanner/memory_scanner.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 #include "test_lab_bounded_runner.hpp"
@@ -1603,6 +1604,66 @@ namespace {
         std::string s(line);
         write_log_file(hf, s);
         test_all_features::mirror_full_test_log_line(tag, detail_s.c_str(), s.c_str());
+    }
+
+    struct ui_exchange_publish_state_t {
+        std::mutex mtx;
+        std::condition_variable cv;
+        bool done = false;
+        bool ok = false;
+    };
+
+    bool publish_exchange_observed_on_ui(HANDLE hf, const char* tag, const aida::burp::exchange_observed_t& ex, const char* source) {
+        const char* phase = "source_proven_ui_thread";
+        if (aida::ui_thread::is_owner_thread()) {
+            if (!aida::ui_thread::require_owner("testlab", "burp_exchange_publish", phase))
+                return false;
+            aida::events::publish(aida::burp::kExchangeObservedEvent, ex);
+            return true;
+        }
+        auto state = std::make_shared<ui_exchange_publish_state_t>();
+        const DWORD producer_tid = ::GetCurrentThreadId();
+        const std::string source_copy = source && source[0] ? source : "testlab_exchange";
+        const bool posted = aida::ui_thread::post([state, ex, source_copy, producer_tid]() mutable {
+            const char* phase_inner = "source_proven_ui_thread";
+            bool ok = false;
+            if (aida::ui_thread::require_owner("testlab", "burp_exchange_publish", phase_inner)) {
+                aida::events::publish(aida::burp::kExchangeObservedEvent, ex);
+                ok = true;
+            }
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                state->ok = ok;
+                state->done = true;
+            }
+            state->cv.notify_all();
+            diag::log_tagged_critical_fmt("TESTLAB-UI-DISPATCH",
+                "mcp_exchange_publish source=%s producer_tid=%lu ui_tid=%lu ok=%d id=%llu",
+                source_copy.c_str(),
+                static_cast<unsigned long>(producer_tid),
+                static_cast<unsigned long>(::GetCurrentThreadId()),
+                ok ? 1 : 0,
+                static_cast<unsigned long long>(ex.id));
+        }, "testlab", "burp_exchange_publish", source_copy.c_str());
+        if (!posted) {
+            log_msg(hf, tag, "FAIL -- exchange event UI dispatch post failed source=%s id=%llu ui_tid=%lu",
+                source_copy.c_str(),
+                static_cast<unsigned long long>(ex.id),
+                static_cast<unsigned long>(aida::ui_thread::owner_tid()));
+            return false;
+        }
+        std::unique_lock<std::mutex> lk(state->mtx);
+        const bool completed = state->cv.wait_for(lk, std::chrono::milliseconds(5000), [&] { return state->done; });
+        const bool ok = completed && state->ok;
+        if (!ok) {
+            log_msg(hf, tag, "FAIL -- exchange event UI dispatch did not complete source=%s id=%llu completed=%d ok=%d pending=%zu",
+                source_copy.c_str(),
+                static_cast<unsigned long long>(ex.id),
+                completed ? 1 : 0,
+                state->ok ? 1 : 0,
+                aida::ui_thread::pending_count());
+        }
+        return ok;
     }
 
     bool sensitive_json_key(const std::string& key) {
@@ -5942,10 +6003,14 @@ namespace {
         std::string owner_tid;
         std::string owner_age_ms;
         std::string wait_ms;
+        uint64_t owner_token = 0;
+        uint64_t owner_generation = 0;
         payload_recursive_string_any(ir.data, { "owner_phase", "active_phase", "lock_owner_phase" }, phase);
         payload_recursive_string_any(ir.data, { "owner_tid", "active_tid", "lock_owner_tid" }, owner_tid);
         payload_recursive_string_any(ir.data, { "owner_age_ms", "active_age_ms", "lock_owner_age_ms" }, owner_age_ms);
         payload_recursive_string_any(ir.data, { "wait_ms", "lock_wait_ms", "active_lock_wait_ms" }, wait_ms);
+        payload_recursive_u64_any(ir.data, { "owner_token", "lock_owner_token", "active_token" }, owner_token);
+        payload_recursive_u64_any(ir.data, { "owner_operation_generation", "owner_generation", "lock_owner_generation", "active_generation" }, owner_generation);
         reason = "mcp_active_session_lock_busy";
         if (!blocked_by_tool.empty())
             reason += " blocked_by_tool=" + compact_text(blocked_by_tool, 180);
@@ -5961,6 +6026,10 @@ namespace {
             reason += " owner_age_ms=" + compact_text(owner_age_ms, 80);
         if (!wait_ms.empty())
             reason += " wait_ms=" + compact_text(wait_ms, 80);
+        if (owner_token != 0)
+            reason += " owner_token=" + std::to_string(static_cast<unsigned long long>(owner_token));
+        if (owner_generation != 0)
+            reason += " owner_generation=" + std::to_string(static_cast<unsigned long long>(owner_generation));
         if (blocked_by_tool.empty())
             blocked_by_tool = "mcp_active_session";
         return true;
@@ -10003,7 +10072,8 @@ namespace {
     }
 
     invoke_result_t invoke_tool(mcp_standalone::server_t* srv, const char* tool_name,
-                                const mcp_standalone::json& args)
+                                const mcp_standalone::json& args,
+                                bool external_visible_only = false)
     {
         invoke_result_t ir;
         if (!srv) {
@@ -10015,7 +10085,10 @@ namespace {
         mcp_standalone::json call_args = args.is_null() ? mcp_standalone::json::object() : args;
         ir.found = tool_registered(srv, tool_name);
         try {
-            auto result = srv->call_registered_tool(tool_name ? std::string(tool_name) : std::string(), call_args, false);
+            const std::string call_name = tool_name ? std::string(tool_name) : std::string();
+            auto result = external_visible_only
+                ? srv->call_registered_tool(call_name, call_args, true)
+                : srv->call_registered_tool(call_name, call_args, false);
             ir.success = result.success;
             ir.text = result.text;
             ir.data = result.data;
@@ -10045,7 +10118,8 @@ namespace {
                                              long long timeout_ms,
                                              HANDLE hf = INVALID_HANDLE_VALUE,
                                              const char* tag = nullptr,
-                                             int seq = 0)
+                                             int seq = 0,
+                                             bool external_visible_only = false)
     {
         timed_invoke_result_t out;
         const auto state = std::make_shared<async_invoke_state_t>();
@@ -10073,7 +10147,7 @@ namespace {
                 static_cast<unsigned long>(GetCurrentProcessId()),
                 static_cast<unsigned long>(GetCurrentThreadId()),
                 static_cast<unsigned long long>(queued_tick));
-            if (!critical_work_queue::post([state, srv, tool_name, args, queued_at, queued_tick, seq, timeout_ms]() {
+            if (!critical_work_queue::post([state, srv, tool_name, args, queued_at, queued_tick, seq, timeout_ms, external_visible_only]() {
                 mcp_standalone::scoped_call_cancel_t cancel_scope(state->cancel_token);
                 auto t0 = std::chrono::steady_clock::now();
                 const DWORD worker_pid = GetCurrentProcessId();
@@ -10135,7 +10209,7 @@ namespace {
                     });
                 } else {
                     try {
-                        ir = invoke_tool(srv, tool_name.c_str(), args);
+                        ir = invoke_tool(srv, tool_name.c_str(), args, external_visible_only);
                     } catch (const std::exception& ex) {
                         ir.found = tool_registered(srv, tool_name.c_str());
                         ir.threw = true;
@@ -20191,7 +20265,8 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
         ex.resp_headers.push_back({"X-Powered-By", "AiDA-Fixture"});
         std::string body = "<!doctype html><html><body>aida-passive</body></html>";
         ex.resp_body.assign(body.begin(), body.end());
-        aida::events::publish(aida::burp::kExchangeObservedEvent, ex);
+        if (!publish_exchange_observed_on_ui(hf, tag, ex, "seed_burp_passive_scanner_exchange"))
+            return;
         for (int i = 0; i < 40; ++i) {
             auto now = aida::burp::passive_scanner::get_stats();
             if (now.exchanges_scanned > before.exchanges_scanned)
@@ -23223,6 +23298,190 @@ void test_tool_driver_find_references(HANDLE hf, std::atomic<int>& passed, std::
 
     void test_tool_dbg_find_strings(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         test_tool_call(hf, "mcp.dbg_find_strings", get_server(), "dbg_find_strings", {}, passed, failed, skipped);
+    }
+
+    void test_tool_dbg_find_strings_stale_owner_regression(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tag = "mcp.dbg_find_strings.stale_owner";
+        auto* srv = get_server();
+        if (!srv || !tool_registered(srv, "thread_classify") || !tool_registered(srv, "dbg_find_strings")) {
+            log_msg(hf, tag, "FAIL -- required tools unavailable thread_classify=%d dbg_find_strings=%d",
+                srv && tool_registered(srv, "thread_classify") ? 1 : 0,
+                srv && tool_registered(srv, "dbg_find_strings") ? 1 : 0);
+            record_tool_status("dbg_find_strings", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+
+        struct holder_state_t {
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool started = false;
+            bool done = false;
+            invoke_result_t result;
+            long long elapsed_ms = 0;
+        };
+
+        const int holder_seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const std::string holder_diag = "testlab-" + std::to_string(holder_seq) + "-thread_classify-stale-owner";
+        const auto holder_state = std::make_shared<holder_state_t>();
+        auto holder_cancel = mcp_standalone::make_call_cancel_token(false);
+        mcp_standalone::json holder_args = mcp_standalone::json::object();
+        holder_args["process_id"] = 4294967294u;
+        holder_args["sample_sec"] = 0.1;
+        holder_args["interval_ms"] = 100;
+        holder_args["max_threads"] = 1;
+        holder_args["__aida_test_policy_hold_target_resolve_ms"] = 6500;
+        const std::uint64_t holder_deadline = GetTickCount64() + 750;
+
+        const bool posted = critical_work_queue::post_labeled("testlab.mcp.stale_owner.thread_classify", [srv, holder_args, holder_state, holder_cancel, holder_diag, holder_deadline]() mutable {
+            mcp_standalone::scoped_call_cancel_t cancel_scope(holder_cancel);
+            mcp_standalone::scoped_call_metadata_t metadata_scope(holder_diag, "external-stale-owner-holder", "thread_classify", holder_deadline);
+            const auto started = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lk(holder_state->mutex);
+                holder_state->started = true;
+            }
+            holder_state->cv.notify_all();
+            invoke_result_t ir;
+            try {
+                auto result = srv->call_registered_tool("thread_classify", holder_args, true);
+                ir.found = true;
+                ir.success = result.success;
+                ir.text = result.text;
+                ir.data = result.data;
+                if (!result.success && json_payload_empty(ir.data) && !result.error_details.is_null())
+                    ir.data = result.error_details;
+                if (!result.error_code.empty()) {
+                    if (!ir.data.is_object())
+                        ir.data = mcp_standalone::json::object({{"payload", ir.data}});
+                    ir.data["error_code"] = result.error_code;
+                }
+                normalize_invoke_result_payload(ir);
+            } catch (const std::exception& ex) {
+                ir.found = tool_registered(srv, "thread_classify");
+                ir.threw = true;
+                ir.exception_msg = ex.what();
+                normalize_invoke_result_payload(ir);
+            } catch (...) {
+                ir.found = tool_registered(srv, "thread_classify");
+                ir.threw = true;
+                ir.exception_msg = "unknown exception";
+                normalize_invoke_result_payload(ir);
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+            {
+                std::lock_guard<std::mutex> lk(holder_state->mutex);
+                holder_state->result = std::move(ir);
+                holder_state->elapsed_ms = static_cast<long long>(elapsed);
+                holder_state->done = true;
+            }
+            holder_state->cv.notify_all();
+        });
+        if (!posted) {
+            log_msg(hf, tag, "FAIL -- unable to post thread_classify stale-owner holder");
+            record_tool_status("dbg_find_strings", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+
+        {
+            std::unique_lock<std::mutex> lk(holder_state->mutex);
+            holder_state->cv.wait_for(lk, std::chrono::milliseconds(1500), [&]() { return holder_state->started; });
+        }
+
+        bool owner_ready = false;
+        mcp_standalone::json owner_snapshot;
+        const std::uint64_t ready_start = GetTickCount64();
+        while (GetTickCount64() - ready_start < 3000) {
+            owner_snapshot = mcp_standalone::active_session_policy_debug_snapshot();
+            const bool present = owner_snapshot.value("owner_present", false);
+            const std::string owner_tool = owner_snapshot.value("owner_tool", std::string());
+            const std::string owner_lane = owner_snapshot.value("owner_lane", std::string());
+            const std::string owner_phase = owner_snapshot.value("owner_phase", std::string());
+            if (present && owner_tool == "thread_classify" && owner_lane == "exclusive_mutating" && owner_phase == "target_resolve") {
+                owner_ready = true;
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lk(holder_state->mutex);
+                if (holder_state->done)
+                    break;
+            }
+            Sleep(25);
+        }
+        if (!owner_ready) {
+            mcp_standalone::signal_call_cancel_token(holder_cancel);
+            {
+                std::unique_lock<std::mutex> lk(holder_state->mutex);
+                holder_state->cv.wait_for(lk, std::chrono::milliseconds(8000), [&]() { return holder_state->done; });
+            }
+            log_msg(hf, tag, "FAIL -- thread_classify holder did not reach exclusive_mutating target_resolve snapshot=%s",
+                compact_json(owner_snapshot, 900).c_str());
+            record_tool_status("dbg_find_strings", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+
+        const int probe_seq = g_mcp_tool_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+        auto probe = invoke_tool_bounded(srv, "dbg_find_strings", mcp_standalone::json::object(), 4500, hf, tag, probe_seq, true);
+        mcp_standalone::signal_call_cancel_token(holder_cancel);
+        std::string busy_reason;
+        std::string blocked_by_tool;
+        std::string blocked_by_seq;
+        std::string blocked_by_diag_id;
+        const bool active_busy = !probe.timed_out && mcp_active_session_busy_result(probe.result, busy_reason, blocked_by_tool, blocked_by_seq, blocked_by_diag_id);
+        const mcp_standalone::json probe_data = probe.result.data.is_object() ? probe.result.data : mcp_standalone::json::object();
+        const std::string owner_tool = probe_data.value("owner_tool", std::string());
+        const std::string owner_lane = probe_data.value("owner_lane", std::string());
+        const std::string owner_phase = probe_data.value("owner_phase", std::string());
+        const std::string disposition = probe_data.value("late_result_disposition", std::string());
+        const bool work_started = probe_data.value("work_started", true);
+        const bool owner_expired = probe_data.value("owner_deadline_expired", false);
+        const bool eviction_requested = probe_data.value("owner_eviction_requested", false);
+        const bool stale = probe_data.value("owner_stale", false);
+        const bool policy_ok = active_busy &&
+            owner_tool == "thread_classify" &&
+            owner_lane == "exclusive_mutating" &&
+            owner_phase == "target_resolve" &&
+            disposition == "not_started" &&
+            !work_started &&
+            (owner_expired || eviction_requested || stale);
+
+        {
+            std::unique_lock<std::mutex> lk(holder_state->mutex);
+            holder_state->cv.wait_for(lk, std::chrono::milliseconds(8000), [&]() { return holder_state->done; });
+        }
+
+        if (!policy_ok) {
+            log_msg(hf, tag, "FAIL -- dbg_find_strings did not return bounded stale-owner policy evidence timed_out=%d elapsed_ms=%lld active_busy=%d reason=%s owner_tool=%s owner_lane=%s owner_phase=%s disposition=%s work_started=%d owner_expired=%d eviction_requested=%d stale=%d data=%s text=%s err=%s",
+                probe.timed_out ? 1 : 0,
+                probe.elapsed_ms,
+                active_busy ? 1 : 0,
+                busy_reason.empty() ? "<none>" : busy_reason.c_str(),
+                owner_tool.empty() ? "<empty>" : owner_tool.c_str(),
+                owner_lane.empty() ? "<empty>" : owner_lane.c_str(),
+                owner_phase.empty() ? "<empty>" : owner_phase.c_str(),
+                disposition.empty() ? "<empty>" : disposition.c_str(),
+                work_started ? 1 : 0,
+                owner_expired ? 1 : 0,
+                eviction_requested ? 1 : 0,
+                stale ? 1 : 0,
+                compact_json(probe.result.data, 900).c_str(),
+                compact_text(probe.result.text, 500).c_str(),
+                compact_text(probe.result.exception_msg, 300).c_str());
+            record_tool_status("dbg_find_strings", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
+
+        log_msg(hf, tag, "PASS -- dbg_find_strings returned bounded active-session policy evidence while thread_classify held exclusive_mutating target_resolve elapsed_ms=%lld reason=%s owner_snapshot=%s",
+            probe.elapsed_ms,
+            busy_reason.c_str(),
+            compact_json(probe.result.data, 900).c_str());
+        g_invoked_tools.insert("dbg_find_strings");
+        record_tool_status("dbg_find_strings", mcp_tool_call_status_t::functional_pass);
+        passed.fetch_add(1);
     }
 
     void test_tool_dbg_add_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -34679,6 +34938,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_dbg_remove_watch(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_toggle_bookmark(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_find_strings(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_dbg_find_strings_stale_owner_regression(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_add_hw_breakpoint(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_clear_all_breakpoints(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_dbg_get_bookmarks(hf, passed, failed, skipped);

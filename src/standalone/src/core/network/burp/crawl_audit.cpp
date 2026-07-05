@@ -9,6 +9,8 @@
 #include "crawler.hpp"
 #include "active_scanner.hpp"
 #include "audit_http.hpp"
+#include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <atomic>
@@ -31,7 +33,7 @@ struct pipeline_entry_t
 {
     pipeline_status_t                  status;
     std::shared_ptr<std::atomic<bool>> cancel_flag;
-    std::thread                        worker;
+    aida::infra::win_thread::joinable_thread_t worker;
     bool                               imported_snapshot = false;
 };
 
@@ -412,8 +414,10 @@ void stop_entries(std::vector<std::unique_ptr<pipeline_entry_t>>& entries)
 
     for (auto& e : entries)
     {
-        if (e && e->worker.joinable())
-            e->worker.join();
+        if (e) {
+            std::string err;
+            e->worker.join(&err);
+        }
     }
 }
 
@@ -495,9 +499,41 @@ uint64_t start(const pipeline_config_t& config)
     auto cf = entry->cancel_flag;
     auto cfg_copy = config;
 
-    entry->worker = std::thread([pipeline_id, crawl_id, cf, cfg_copy]() {
-        pipeline_worker(pipeline_id, crawl_id, cf, cfg_copy);
-    });
+    mcp_standalone::downstream::producer_identity_t ca_id;
+    ca_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+    ca_id.tool_name = "crawl_audit.pipeline_worker";
+    if (!config.start_urls.empty()) ca_id.domain = config.start_urls.front();
+    auto ca_admission = mcp_standalone::downstream::scoped_admission_t::acquire(ca_id);
+    if (!ca_admission.active()) {
+        diag::log_tagged_fmt("crawl_audit", "BURP-NETWORK-WORKER-REJECT pipeline_id=%llu reason=%s quota=%s observed=%zu limit=%zu",
+            static_cast<unsigned long long>(pipeline_id),
+            ca_admission.result().reason.c_str(),
+            ca_admission.result().quota_name.c_str(),
+            ca_admission.result().observed, ca_admission.result().limit);
+        return 0;
+    }
+    const uint64_t ca_token = ca_admission.token();
+    diag::log_tagged_fmt("crawl_audit", "BURP-NETWORK-WORKER-ADMIT pipeline_id=%llu token=%llu",
+        static_cast<unsigned long long>(pipeline_id),
+        static_cast<unsigned long long>(ca_token));
+    auto admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(ca_admission));
+    std::string thread_err;
+    const std::string thread_label = "crawl_audit.pipeline." + std::to_string(pipeline_id);
+    const bool started = entry->worker.start(
+        [pipeline_id, crawl_id, cf, cfg_copy, admission_ptr, ca_token]() {
+            pipeline_worker(pipeline_id, crawl_id, cf, cfg_copy);
+            diag::log_tagged_fmt("crawl_audit", "BURP-NETWORK-WORKER-RELEASE pipeline_id=%llu token=%llu reason=completed",
+                static_cast<unsigned long long>(pipeline_id),
+                static_cast<unsigned long long>(ca_token));
+            admission_ptr->release("completed");
+        },
+        &thread_err, aida::infra::win_thread::default_stack_reserve, thread_label.c_str());
+    if (!started) {
+        diag::log_tagged_fmt("crawl_audit", "pipeline_worker_start_failed pipeline_id=%llu err=%s",
+            static_cast<unsigned long long>(pipeline_id), thread_err.c_str());
+        admission_ptr->release("thread_start_failed");
+        return 0;
+    }
 
     g_pipelines.push_back(std::move(entry));
 

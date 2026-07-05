@@ -5,8 +5,10 @@
 #include "thread_intel.hpp"
 #include "obfuscation.hpp"
 #include "helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 using json = nlohmann::json;
@@ -14,6 +16,85 @@ using tool_result_t = mcp_standalone::tool_result_t;
 
 namespace thread_intel_tools {
 namespace {
+
+struct driver_debugger_quota_guard_t
+{
+    std::uint64_t token = 0;
+    std::string tool_name;
+    std::uint32_t target_pid = 0;
+
+    driver_debugger_quota_guard_t() = default;
+    driver_debugger_quota_guard_t(const driver_debugger_quota_guard_t&) = delete;
+    driver_debugger_quota_guard_t& operator=(const driver_debugger_quota_guard_t&) = delete;
+    driver_debugger_quota_guard_t(driver_debugger_quota_guard_t&& o) noexcept
+        : token(o.token), tool_name(std::move(o.tool_name)), target_pid(o.target_pid)
+    { o.token = 0; }
+    driver_debugger_quota_guard_t& operator=(driver_debugger_quota_guard_t&& o) noexcept
+    {
+        if (this != &o) { release(); token = o.token; tool_name = std::move(o.tool_name); target_pid = o.target_pid; o.token = 0; }
+        return *this;
+    }
+    ~driver_debugger_quota_guard_t() { release(); }
+    void release()
+    {
+        if (token == 0) return;
+        if (mcp_standalone::downstream::governor_t::instance().is_admitted(token))
+        {
+            diag::log_tagged_fmt("thread_intel",
+                "DRIVER-DEBUGGER-QUOTA-RELEASE tool=%s target_pid=%u token=%llu",
+                tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+            mcp_standalone::downstream::governor_t::instance().release(token, "driver_debugger_scope_exit");
+        }
+        else
+        {
+            diag::log_tagged_fmt("thread_intel",
+                "DRIVER-DEBUGGER-QUOTA-STALE-RESULT tool=%s target_pid=%u token=%llu",
+                tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+        }
+        token = 0;
+    }
+};
+
+static std::optional<tool_result_t> acquire_driver_debugger_quota(
+    const char* tool_name, std::uint32_t target_pid,
+    driver_debugger_quota_guard_t& guard)
+{
+    mcp_standalone::downstream::producer_identity_t id;
+    id.kind = mcp_standalone::downstream::producer_kind_t::driver_debugger;
+    id.tool_name = tool_name ? tool_name : "";
+    id.target_pid = target_pid;
+    id.target_id = target_pid != 0 ? ("pid:" + std::to_string(target_pid)) : "";
+    id.principal_id = "standalone";
+    const char* diag_id = mcp_standalone::current_call_diag_id();
+    if (diag_id) id.diagnostic_id = diag_id;
+    const char* req_id = mcp_standalone::current_call_request_id();
+    if (req_id) id.request_id = req_id;
+    id.deadline_ms = mcp_standalone::current_call_deadline_ms();
+
+    auto result = mcp_standalone::downstream::governor_t::instance().try_admit(id);
+    if (!result.admitted)
+    {
+        diag::log_tagged_fmt("thread_intel",
+            "DRIVER-DEBUGGER-QUOTA-REJECT tool=%s target_pid=%u reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            id.tool_name.c_str(), id.target_pid,
+            result.reason.c_str(), result.quota_name.c_str(),
+            result.quota_scope.c_str(), result.observed, result.limit);
+        return tool_result_t::error(
+            "Downstream driver/debugger capacity exhausted; work was not started.",
+            "MCP_DOWNSTREAM_CAPACITY_REJECT",
+            mcp_standalone::downstream::rejection_json(result, id));
+    }
+
+    diag::log_tagged_fmt("thread_intel",
+        "DRIVER-DEBUGGER-QUOTA-ADMIT tool=%s target_pid=%u token=%llu",
+        id.tool_name.c_str(), id.target_pid,
+        static_cast<unsigned long long>(result.admission_token));
+
+    guard.token = result.admission_token;
+    guard.tool_name = id.tool_name;
+    guard.target_pid = id.target_pid;
+    return std::nullopt;
+}
 
 std::uint32_t process_id_from_params(const json& params)
 {
@@ -55,6 +136,10 @@ tool_result_t handle_thread_classify(const json& raw_params)
         options.sample_ms,
         options.interval_ms,
         options.max_threads);
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("thread_classify", options.process_id, quota_guard))
+        return *quota_err;
 
     json result;
     std::string error;
@@ -104,6 +189,10 @@ tool_result_t handle_thread_watch_rip(const json& raw_params)
         options.interval_ms,
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_err = acquire_driver_debugger_quota("thread_watch_rip", options.process_id, quota_guard))
+        return *quota_err;
 
     json result;
     std::string error;

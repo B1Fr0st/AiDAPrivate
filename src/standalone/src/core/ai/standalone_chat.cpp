@@ -2205,8 +2205,13 @@ void restore_workspace_state()
     else
         file_browser::refresh();
 
-    globals::ui::panel_left_w = g_sa_settings.workspace.left_width;
-    globals::ui::panel_right_w = g_sa_settings.workspace.right_width;
+    const float restored_left_w = g_sa_settings.workspace.left_width;
+    const float restored_right_w = g_sa_settings.workspace.right_width;
+    aida::ui_thread::post([restored_left_w, restored_right_w]() {
+            globals::ui::panel_left_w = restored_left_w;
+            globals::ui::panel_right_w = restored_right_w;
+        },
+        "chat", "restore_workspace_widths", "bg_init");
 
     if (!g_sa_settings.workspace.open_tabs_json.empty()) {
         try {

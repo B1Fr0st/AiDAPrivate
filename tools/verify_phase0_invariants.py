@@ -50,6 +50,7 @@ THREAD_ALLOWLIST = {
     ("src/standalone/src/core/infra/win_thread.hpp", "append_nt_attempt_error(errors, \"NtCreateThreadEx\", name, stack_bytes, status, gle, crt, elapsed);"): "approved low-level AiDA thread wrapper diagnostic token",
     ("src/standalone/src/core/infra/win_thread.hpp", "uintptr_t raw = _beginthreadex(nullptr, stack_bytes, &crt_entry, state, 0, &tid);"): "approved low-level AiDA thread wrapper CRT path",
     ("src/standalone/src/core/infra/work_queue.hpp", "w.detach();"): "approved work queue bounded shutdown fallback",
+    ("src/standalone/src/core/diagnostics/observer.hpp", "worker.detach();"): "approved diagnostics observer bounded lifecycle thread",
     ("src/standalone/src/core/mcp/mcp_standalone.cpp", "worker.detach();"): "approved MCP executor shutdown fallback",
     ("src/standalone/src/core/network/burp/collaborator.cpp", "std::thread(task).detach();"): "approved existing collaborator async task exception",
     ("src/standalone/src/core/network/burp/crawl_audit.cpp", "std::thread worker;"): "approved existing crawl audit worker holder pending Phase 1 runtime inventory",
@@ -84,6 +85,12 @@ THREAD_ALLOWLIST = {
     ("src/standalone/src/core/testlab/network_hook_sidecar.cpp", "pair->accept_thread = CreateThread(nullptr, 0, accept_thread_proc, thread_state, 0, nullptr);"): "approved Test Lab sidecar accept thread",
     ("src/standalone/src/core/tools/driver_tools_standalone.cpp", "\"NtCreateThreadEx\", \"NtDeviceIoControlFile\", \"NtQuerySystemInformation\","): "approved driver tool detection signature token",
     ("src/standalone/src/helpers/diag_log.hpp", "uintptr_t th = _beginthreadex(nullptr, 0, async_log_thread_main, nullptr, 0, &tid);"): "approved async diagnostic logger thread",
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "inline constexpr const char* kTaskflowRejectionReason = \"Taskflow v4.1.0 requires C++20; AiDAStandalone targets C++17; Taskflow owns internal std::thread workers that bypass AiDA win_thread wrappers; no C++20 migration is permitted for AiDAStandalone\";"): "approved Taskflow evaluation evidence string literal",
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "inline constexpr const char* kTaskflowSourceEvidenceSpawn = \"executor.hpp:1295 '_workers[id]._thread = std::thread([&, id, wif] () {' -- Executor::_spawn creates std::thread directly\";"): "approved Taskflow evaluation evidence string literal",
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "inline constexpr const char* kTaskflowSourceEvidenceWorkerThread = \"worker.hpp:97 'std::thread _thread;' -- Worker class stores std::thread as value member\";"): "approved Taskflow evaluation evidence string literal",
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "inline constexpr const char* kAidaWinThreadEvidence = \"win_thread.hpp:237 CreateThread :274 NtCreateThreadEx :341 _beginthreadex with SEH guards TLS init stack reserve control diagnostic logging -- incompatible with Taskflow std::thread value members\";"): "approved Taskflow evaluation evidence string literal",
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "static_assert(kTaskflowOwnsWorkerThreads == true, \"Taskflow Executor::_spawn creates std::thread directly (executor.hpp:1295)\");"): "approved Taskflow evaluation static_assert evidence string",
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "static_assert(kTaskflowCanUseAidaWinThreadWrappers == false, \"Taskflow Worker stores std::thread value member (worker.hpp:97); no hook to inject win_thread wrappers\");"): "approved Taskflow evaluation static_assert evidence string",
 }
 
 SENDMESSAGE_ALLOWLIST = {
@@ -93,6 +100,8 @@ SENDMESSAGE_ALLOWLIST = {
 
 THREAD_ALLOWLIST_COUNTS = {
     ("src/standalone/src/core/mcp/mcp_standalone.cpp", "worker.detach();", "detached std::thread"): 2,
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "inline constexpr const char* kTaskflowSourceEvidenceSpawn = \"executor.hpp:1295 '_workers[id]._thread = std::thread([&, id, wif] () {' -- Executor::_spawn creates std::thread directly\";", "std::thread"): 2,
+    ("src/standalone/src/core/infra/taskflow_evaluation.hpp", "inline constexpr const char* kTaskflowSourceEvidenceWorkerThread = \"worker.hpp:97 'std::thread _thread;' -- Worker class stores std::thread as value member\";", "std::thread"): 2,
 }
 
 THREAD_VECTOR_START_ALLOWLIST = {

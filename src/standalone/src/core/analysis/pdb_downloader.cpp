@@ -7,6 +7,7 @@
 
 #include "pdb_downloader.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <windows.h>
 #include <winhttp.h>
@@ -509,6 +510,25 @@ bool download_pdb_sync(const download_request_t& req,
 		return true;
 	}
 
+	mcp_standalone::downstream::producer_identity_t pdb_dl_id;
+	pdb_dl_id.kind = mcp_standalone::downstream::producer_kind_t::pdb_parser;
+	pdb_dl_id.tool_name = "download_pdb_sync";
+	mcp_standalone::downstream::scoped_admission_t pdb_dl_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(pdb_dl_id);
+	if (!pdb_dl_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(pdb_dl_id);
+		diag::log_tagged_fmt("pdb_dl",
+			"FEATURE-WORKER-GROUP-REJECT download_pdb_sync pdb=%s reason=%s quota=%s observed=%zu limit=%zu",
+			req.pdb_name.c_str(),
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		out.error = "PDB parser capacity exhausted; download was not started.";
+		return false;
+	}
+	diag::log_tagged_fmt("pdb_dl",
+		"FEATURE-WORKER-GROUP-ADMIT download_pdb_sync pdb=%s token=%llu",
+		req.pdb_name.c_str(),
+		static_cast<unsigned long long>(pdb_dl_admission.token()));
+
 	auto target = build_local_target(req);
 	std::error_code ec;
 	std::filesystem::create_directories(target.parent_path(), ec);
@@ -539,9 +559,16 @@ bool download_pdb_sync(const download_request_t& req,
 			cab_error, cab_bytes, cab_status);
 		if (!cab_ok) {
 			out.error = "primary http " + error + "; compressed " + cab_error;
-			diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_download_failed pdb=%s err=%s",
-				req.pdb_name.c_str(), out.error.c_str());
-			return false;
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_download_failed pdb=%s err=%s",
+			req.pdb_name.c_str(), out.error.c_str());
+		if (pdb_dl_admission.active()) {
+			diag::log_tagged_fmt("pdb_dl",
+				"FEATURE-WORKER-GROUP-RELEASE download_pdb_sync pdb=%s token=%llu reason=completed",
+				req.pdb_name.c_str(),
+				static_cast<unsigned long long>(pdb_dl_admission.token()));
+			pdb_dl_admission.release("completed");
+		}
+		return false;
 		}
 		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_downloaded bytes=%llu decompressing",
 			static_cast<unsigned long long>(cab_bytes));
@@ -551,8 +578,15 @@ bool download_pdb_sync(const download_request_t& req,
 		if (!fdi_decompress(cab_target, cab_target.parent_path(), extracted, fdi_err)) {
 			std::filesystem::remove(cab_target, ec);
 			out.error = "cab decompress failed: " + fdi_err;
-			diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_decompress_failed err=%s", fdi_err.c_str());
-			return false;
+		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_decompress_failed err=%s", fdi_err.c_str());
+		if (pdb_dl_admission.active()) {
+			diag::log_tagged_fmt("pdb_dl",
+				"FEATURE-WORKER-GROUP-RELEASE download_pdb_sync pdb=%s token=%llu reason=completed",
+				req.pdb_name.c_str(),
+				static_cast<unsigned long long>(pdb_dl_admission.token()));
+			pdb_dl_admission.release("completed");
+		}
+		return false;
 		}
 		std::filesystem::remove(cab_target, ec);
 		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync cab_decompressed extracted=%s", extracted.c_str());
@@ -572,6 +606,13 @@ bool download_pdb_sync(const download_request_t& req,
 		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync complete via_cab pdb=%s path=%s bytes=%llu",
 			req.pdb_name.c_str(), out.local_path.c_str(),
 			static_cast<unsigned long long>(out.bytes_downloaded));
+		if (pdb_dl_admission.active()) {
+			diag::log_tagged_fmt("pdb_dl",
+				"FEATURE-WORKER-GROUP-RELEASE download_pdb_sync pdb=%s token=%llu reason=completed",
+				req.pdb_name.c_str(),
+				static_cast<unsigned long long>(pdb_dl_admission.token()));
+			pdb_dl_admission.release("completed");
+		}
 		return true;
 	}
 
@@ -579,6 +620,13 @@ bool download_pdb_sync(const download_request_t& req,
 		out.error = error;
 		diag::log_tagged_fmt("pdb_dl", "download_pdb_sync failed pdb=%s err=%s",
 			req.pdb_name.c_str(), error.c_str());
+		if (pdb_dl_admission.active()) {
+			diag::log_tagged_fmt("pdb_dl",
+				"FEATURE-WORKER-GROUP-RELEASE download_pdb_sync pdb=%s token=%llu reason=completed",
+				req.pdb_name.c_str(),
+				static_cast<unsigned long long>(pdb_dl_admission.token()));
+			pdb_dl_admission.release("completed");
+		}
 		return false;
 	}
 
@@ -589,6 +637,13 @@ bool download_pdb_sync(const download_request_t& req,
 	diag::log_tagged_fmt("pdb_dl", "download_pdb_sync complete direct pdb=%s path=%s bytes=%llu",
 		req.pdb_name.c_str(), out.local_path.c_str(),
 		static_cast<unsigned long long>(out.bytes_downloaded));
+	if (pdb_dl_admission.active()) {
+		diag::log_tagged_fmt("pdb_dl",
+			"FEATURE-WORKER-GROUP-RELEASE download_pdb_sync pdb=%s token=%llu reason=completed",
+			req.pdb_name.c_str(),
+			static_cast<unsigned long long>(pdb_dl_admission.token()));
+		pdb_dl_admission.release("completed");
+	}
 	return true;
 }
 

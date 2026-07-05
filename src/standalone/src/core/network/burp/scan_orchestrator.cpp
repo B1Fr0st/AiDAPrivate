@@ -24,6 +24,7 @@
 
 #include "../../infra/event_bus.hpp"
 #include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -1968,7 +1969,36 @@ tool_result_t tool_orchestrate(const json& params)
         }
     }
     for (const auto& check : profile.defensive_checks) {
-        const bool posted = work_queue::post([job, check]() { run_defensive_check(job, check); });
+        mcp_standalone::downstream::producer_identity_t def_id;
+        def_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        def_id.tool_name = "scan_orchestrator.run_defensive_check";
+        def_id.command_label = check;
+        def_id.domain = job->target_url_redacted;
+        auto def_admission = mcp_standalone::downstream::scoped_admission_t::acquire(def_id);
+        if (!def_admission.active()) {
+            diag::log_tagged_fmt("scan_orchestrator", "BURP-NETWORK-WORKER-REJECT check=%s scan_id=%llu reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+                check.c_str(),
+                static_cast<unsigned long long>(job->scan_id),
+                def_admission.result().reason.c_str(),
+                def_admission.result().quota_name.c_str(),
+                def_admission.result().quota_scope.c_str(),
+                def_admission.result().observed, def_admission.result().limit);
+            update_defensive_status(job, check, "error", 0, "downstream capacity exhausted");
+            continue;
+        }
+        const uint64_t def_token = def_admission.token();
+        diag::log_tagged_fmt("scan_orchestrator", "BURP-NETWORK-WORKER-ADMIT check=%s scan_id=%llu token=%llu",
+            check.c_str(),
+            static_cast<unsigned long long>(job->scan_id),
+            static_cast<unsigned long long>(def_token));
+        const bool posted = work_queue::post([job, check, admission = std::move(def_admission), def_token]() mutable {
+            run_defensive_check(job, check);
+            diag::log_tagged_fmt("scan_orchestrator", "BURP-NETWORK-WORKER-RELEASE check=%s scan_id=%llu token=%llu reason=completed",
+                check.c_str(),
+                static_cast<unsigned long long>(job->scan_id),
+                static_cast<unsigned long long>(def_token));
+            admission.release("completed");
+        });
         if (!posted)
             update_defensive_status(job, check, "error", 0, "work_queue unavailable");
     }

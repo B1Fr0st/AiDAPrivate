@@ -31,6 +31,8 @@
 #include "../analysis/pdb_default_skip.hpp"
 #include "../analysis/symbol_store.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../diagnostics/testlab_hung_packet.hpp"
+#include "../diagnostics/metadata_ring.hpp"
 #include "../../helpers/globals.h"
 
 #include <winsock2.h>
@@ -951,6 +953,8 @@ namespace test_all_features {
 			store_label_snapshot(g_step_label, label);
 			g_step_start_tick.store(now_ms_tick(), std::memory_order_release);
 			g_hung_marker_emitted.store(false, std::memory_order_release);
+			const std::string phase_label = load_label_snapshot(g_phase_label);
+			aida::diagnostics::testlab::emit_testlab_breadcrumb(phase_label.c_str(), label, true);
 		}
 
 		void set_stepf(const char* fmt, ...) {
@@ -1034,6 +1038,7 @@ namespace test_all_features {
 
 		void set_phase(const char* label) {
 			store_label_snapshot(g_phase_label, label);
+			aida::diagnostics::testlab::emit_testlab_breadcrumb(label, "phase_begin", true);
 			g_phase_start_tick.store(now_ms_tick(), std::memory_order_release);
 		}
 
@@ -1305,6 +1310,42 @@ namespace test_all_features {
 				kMcpFeatureTests,
 				mcp_entered,
 				mcp_done);
+			{
+				aida::diagnostics::testlab::hung_packet_context_t pkt_ctx;
+				pkt_ctx.test_run_id = g_run_id.load(std::memory_order_acquire);
+				pkt_ctx.suite = "full_test";
+				pkt_ctx.domain = phase.c_str();
+				pkt_ctx.test_name = step.c_str();
+				pkt_ctx.phase = phase.c_str();
+				pkt_ctx.step_label = step.c_str();
+				pkt_ctx.step_start_ms = step_start;
+				pkt_ctx.step_elapsed_ms = now - step_start;
+				pkt_ctx.target_pid = current_target_pid();
+				pkt_ctx.driver_attached = g_driver_attached.load(std::memory_order_acquire);
+				pkt_ctx.cancellation_requested = g_cancel_requested.load(std::memory_order_acquire);
+				pkt_ctx.shutdown_requested = false;
+				auto wq_stats = work_queue::stats();
+				char wq_buf[512] = {};
+				_snprintf_s(wq_buf, sizeof(wq_buf), _TRUNCATE,
+					"alive=%d active=%u pending=%zu started=%llu finished=%llu rejected=%llu oldest_ms=%llu",
+					wq_stats.alive ? 1 : 0, wq_stats.active, wq_stats.pending,
+					static_cast<unsigned long long>(wq_stats.started),
+					static_cast<unsigned long long>(wq_stats.finished),
+					static_cast<unsigned long long>(wq_stats.rejected),
+					static_cast<unsigned long long>(wq_stats.oldest_active_ms));
+				pkt_ctx.work_queue_snapshot = wq_buf;
+				auto cq_stats = critical_work_queue::stats();
+				char cq_buf[512] = {};
+				_snprintf_s(cq_buf, sizeof(cq_buf), _TRUNCATE,
+					"alive=%d active=%u pending=%zu started=%llu finished=%llu rejected=%llu oldest_ms=%llu",
+					cq_stats.alive ? 1 : 0, cq_stats.active, cq_stats.pending,
+					static_cast<unsigned long long>(cq_stats.started),
+					static_cast<unsigned long long>(cq_stats.finished),
+					static_cast<unsigned long long>(cq_stats.rejected),
+					static_cast<unsigned long long>(cq_stats.oldest_active_ms));
+				pkt_ctx.critical_queue_snapshot = cq_buf;
+				aida::diagnostics::testlab::log_hung_diagnostic_packet(pkt_ctx);
+			}
 			g_cancel_requested.store(true, std::memory_order_release);
 			log_msg(hf, "heartbeat", "CANCEL -- full test cancellation requested after HUNG step detected step_age_ms=%llu threshold_ms=%llu",
 				static_cast<unsigned long long>(now - step_start),
@@ -3743,6 +3784,8 @@ namespace test_all_features {
 			run_heartbeat_t heartbeat;
 			heartbeat.start(hf);
 			const std::uint64_t this_run = g_run_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+			aida::diagnostics::testlab::reset_emitted_packets();
+			aida::diagnostics::testlab::emit_testlab_breadcrumb("run_all", "full_test_start", true);
 			g_run_start_tick.store(now_ms_tick(), std::memory_order_release);
 			set_step("run_all entry");
 
@@ -4017,6 +4060,8 @@ namespace test_all_features {
 
 			diag::log_tagged_fmt("test_all", "========== Full Feature Test DONE: total=%d executed=%d passed=%d failed=%d skipped=%d suspect=%d ==========", planned, executed, p, f, s, suspect);
 
+			aida::diagnostics::testlab::emit_testlab_breadcrumb("run_all", "full_test_end", false);
+
 			full_test_env_guard.clear("run_all normal completion");
 
 			if (hf != INVALID_HANDLE_VALUE) {
@@ -4278,7 +4323,8 @@ namespace test_all_features {
 				return false;
 			}
 
-			globals::ui::test_all_visible = true;
+			aida::ui_thread::post([]() { globals::ui::test_all_visible = true; },
+				"testlab", "queue_set_visible", "queue_start_tests");
 			set_phase("Initializing...");
 			set_step("start_tests queued");
 			const std::uint64_t queued_at = now_ms_tick();
@@ -4471,7 +4517,8 @@ namespace test_all_features {
 
 	bool trigger_from_hotkey(const char* source) {
 		const char* tag = source && source[0] ? source : "ctrl_shift_t";
-		globals::ui::test_all_visible = true;
+		aida::ui_thread::post([]() { globals::ui::test_all_visible = true; },
+			"testlab", "hotkey_set_visible", "trigger_from_hotkey");
 		char snap_before[1200] = {};
 		format_debug_snapshot(snap_before, sizeof(snap_before));
 		diag::log_tagged_fmt("ui", "test_all_start hotkey=%s before={%s}", tag, snap_before);

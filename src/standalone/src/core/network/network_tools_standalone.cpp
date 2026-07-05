@@ -33,6 +33,7 @@
 #include "../debugger/page_guard_engine.hpp"
 #include "../infra/work_queue.hpp"
 #include "../infra/critical_work_queue.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 #include "burp/burp_module.hpp"
 
@@ -63,6 +64,64 @@ namespace network_tools
 
 void register_http_tools(mcp_standalone::server_t& srv);
 void register_network_tool_aliases(mcp_standalone::server_t& srv);
+
+struct network_admission_t
+{
+    mcp_standalone::downstream::scoped_admission_t admission;
+    bool admitted = false;
+    std::string action;
+    std::string domain;
+
+    static network_admission_t acquire(const char* action, const std::string& domain_str = std::string())
+    {
+        network_admission_t r;
+        r.action = action ? action : "network_tool";
+        r.domain = domain_str;
+        mcp_standalone::downstream::producer_identity_t id;
+        id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+        id.tool_name = r.action;
+        id.domain = domain_str;
+        r.admission = mcp_standalone::downstream::scoped_admission_t::acquire(id);
+        r.admitted = r.admission.active();
+        if (!r.admitted) {
+            diag::log_tagged_fmt("network_tools", "BURP-NETWORK-WORKER-REJECT action=%s domain=%s reason=%s quota=%s observed=%zu limit=%zu",
+                r.action.c_str(), r.domain.c_str(),
+                r.admission.result().reason.c_str(),
+                r.admission.result().quota_name.c_str(),
+                r.admission.result().observed, r.admission.result().limit);
+        } else {
+            diag::log_tagged_fmt("network_tools", "BURP-NETWORK-WORKER-ADMIT action=%s domain=%s token=%llu",
+                r.action.c_str(), r.domain.c_str(),
+                static_cast<unsigned long long>(r.admission.token()));
+        }
+        return r;
+    }
+
+    void release(const char* reason = "completed")
+    {
+        if (admitted) {
+            diag::log_tagged_fmt("network_tools", "BURP-NETWORK-WORKER-RELEASE action=%s domain=%s token=%llu reason=%s",
+                action.c_str(), domain.c_str(),
+                static_cast<unsigned long long>(admission.token()),
+                reason ? reason : "completed");
+            admission.release(reason);
+            admitted = false;
+        }
+    }
+
+    ~network_admission_t() { release("scope_exit"); }
+    network_admission_t() = default;
+    network_admission_t(network_admission_t&&) = default;
+    network_admission_t& operator=(network_admission_t&&) = default;
+    network_admission_t(const network_admission_t&) = delete;
+    network_admission_t& operator=(const network_admission_t&) = delete;
+};
+
+static tool_result_t admission_reject_result(const network_admission_t& adm)
+{
+    json data = mcp_standalone::downstream::rejection_json(adm.admission.result(), mcp_standalone::downstream::producer_identity_t{});
+    return tool_result_t::error("Downstream network capacity exhausted", data);
+}
 
 
 static std::string format_ip(const std::uint8_t* addr, std::uint32_t af) {
@@ -1080,6 +1139,8 @@ static std::uint64_t s_capture_start_ms = 0;
 tool_result_t network_start_capture(const json& params)
 {
     diag::log_tagged_fmt("net_tools", "network_start_capture entry");
+    auto adm = network_admission_t::acquire("network_start_capture");
+    if (!adm.admitted) return admission_reject_result(adm);
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
@@ -2932,6 +2993,8 @@ tool_result_t network_capture_status(const json&)
 
 tool_result_t network_block_ip(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_block_ip");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_block_ip entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
@@ -2973,6 +3036,8 @@ tool_result_t network_block_ip(const json& params)
 
 tool_result_t network_block_port(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_block_port");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_block_port entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
@@ -3009,6 +3074,8 @@ tool_result_t network_block_port(const json& params)
 
 tool_result_t network_block_process(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_block_process");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_block_process entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
@@ -3855,6 +3922,8 @@ tool_result_t network_enumerate_interfaces(const json&)
 
 tool_result_t network_inject_packet(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_inject_packet");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_inject_packet entry");
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
@@ -3912,6 +3981,8 @@ tool_result_t network_inject_packet(const json& params)
 
 tool_result_t network_modify_packet_rule(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_modify_packet_rule");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_modify_packet_rule entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
@@ -4142,6 +4213,8 @@ static void attach_redirect_delivery_breadcrumbs(json& r,
 
 tool_result_t network_redirect_traffic(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_redirect_traffic");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_redirect_traffic entry");
     const std::uint64_t start_ms = GetTickCount64();
     if (!driver_bridge::using_kernel_driver()) {
@@ -4339,6 +4412,8 @@ tool_result_t network_list_redirect_rules(const json&)
 
 tool_result_t network_intercept(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_intercept");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_intercept entry");
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
@@ -4620,6 +4695,8 @@ tool_result_t network_release_packet(const json& params)
 
 tool_result_t network_kill_connection(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_kill_connection");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_kill_connection entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));
@@ -4674,6 +4751,8 @@ tool_result_t network_kill_connection(const json& params)
 
 tool_result_t network_spoof_dns(const json& params)
 {
+    auto adm = network_admission_t::acquire("network_spoof_dns");
+    if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_spoof_dns entry");
     if (!driver_bridge::using_kernel_driver())
         return tool_result_t::error(OBFSTR("Driver not connected."));

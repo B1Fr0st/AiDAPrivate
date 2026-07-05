@@ -8,6 +8,7 @@
 
 #include "standalone_driver.hpp"
 #include "../infra/work_queue.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -381,10 +382,50 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
 
     bool posted_service = false;
     bool posted_work = false;
+    mcp_standalone::downstream::producer_identity_t api_mon_id;
+    api_mon_id.kind = mcp_standalone::downstream::producer_kind_t::api_monitor;
+    api_mon_id.tool_name = phase ? phase : "api_monitor.phase";
+    api_mon_id.target_pid = pid;
+    auto api_mon_admission = mcp_standalone::downstream::scoped_admission_t::acquire(api_mon_id);
+    if (!api_mon_admission.active()) {
+        diag::log_tagged_fmt("api_monitor",
+            "BURP-NETWORK-WORKER-REJECT phase=%s pid=%u reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            phase ? phase : "unknown", pid,
+            api_mon_admission.result().reason.c_str(),
+            api_mon_admission.result().quota_name.c_str(),
+            api_mon_admission.result().quota_scope.c_str(),
+            api_mon_admission.result().observed, api_mon_admission.result().limit);
+        phase_result_t<T> reject_result;
+        reject_result.threw = true;
+        reject_result.exception = "downstream api_monitor capacity exhausted";
+        reject_result.elapsed_ms = GetTickCount64() - started_ms;
+        log_phase_state("reject_downstream", phase, pid, caller_tid, reject_result.elapsed_ms, timeout_ms);
+        return reject_result;
+    }
+    const uint64_t api_mon_token = api_mon_admission.token();
+    diag::log_tagged_fmt("api_monitor",
+        "BURP-NETWORK-WORKER-ADMIT phase=%s pid=%u token=%llu",
+        phase ? phase : "unknown", pid,
+        static_cast<unsigned long long>(api_mon_token));
+    auto admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(api_mon_admission));
     try {
-        posted_service = work_queue::post_service([worker_body]() mutable { worker_body("service_queue"); });
+        posted_service = work_queue::post_service([worker_body, admission_ptr, phase, pid, api_mon_token]() mutable {
+            worker_body("service_queue");
+            diag::log_tagged_fmt("api_monitor",
+                "BURP-NETWORK-WORKER-RELEASE phase=%s pid=%u token=%llu reason=completed",
+                phase ? phase : "unknown", pid,
+                static_cast<unsigned long long>(api_mon_token));
+            admission_ptr->release("completed");
+        });
         if (!posted_service)
-            posted_work = work_queue::post([worker_body]() mutable { worker_body("work_queue"); });
+            posted_work = work_queue::post([worker_body, admission_ptr, phase, pid, api_mon_token]() mutable {
+                worker_body("work_queue");
+                diag::log_tagged_fmt("api_monitor",
+                    "BURP-NETWORK-WORKER-RELEASE phase=%s pid=%u token=%llu reason=completed",
+                    phase ? phase : "unknown", pid,
+                    static_cast<unsigned long long>(api_mon_token));
+                admission_ptr->release("completed");
+            });
     } catch (const std::exception& ex) {
         diag::log_tagged_fmt("api_monitor",
             "phase_queue_post_exception phase=%s pid=%u caller_tid=%lu message=%s",
@@ -2619,8 +2660,37 @@ inline bool start_polling(std::string& error) {
         "start_polling_post_begin pid=%u caller_tid=%lu",
         pid_snapshot(),
         GetCurrentThreadId());
+    mcp_standalone::downstream::producer_identity_t poll_id;
+    poll_id.kind = mcp_standalone::downstream::producer_kind_t::api_monitor;
+    poll_id.tool_name = "api_monitor.kernel_context_loop";
+    poll_id.target_pid = pid_snapshot();
+    auto poll_admission = mcp_standalone::downstream::scoped_admission_t::acquire(poll_id);
+    if (!poll_admission.active()) {
+        diag::log_tagged_fmt("api_monitor",
+            "BURP-NETWORK-WORKER-REJECT phase=kernel_context_loop pid=%u reason=%s quota=%s observed=%zu limit=%zu",
+            pid_snapshot(),
+            poll_admission.result().reason.c_str(),
+            poll_admission.result().quota_name.c_str(),
+            poll_admission.result().observed, poll_admission.result().limit);
+        g_state.polling.store(false);
+        g_state.debug_loop_running.store(false);
+        error = "Downstream api_monitor capacity exhausted.";
+        return false;
+    }
+    const uint64_t poll_token = poll_admission.token();
+    diag::log_tagged_fmt("api_monitor",
+        "BURP-NETWORK-WORKER-ADMIT phase=kernel_context_loop pid=%u token=%llu",
+        pid_snapshot(),
+        static_cast<unsigned long long>(poll_token));
+    auto poll_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(poll_admission));
     try {
-        posted = work_queue::post([]() { kernel_context_loop(); });
+        posted = work_queue::post([poll_admission_ptr, poll_token]() {
+            kernel_context_loop();
+            diag::log_tagged_fmt("api_monitor",
+                "BURP-NETWORK-WORKER-RELEASE phase=kernel_context_loop token=%llu reason=completed",
+                static_cast<unsigned long long>(poll_token));
+            poll_admission_ptr->release("completed");
+        });
     } catch (...) {
         posted = false;
     }

@@ -26,6 +26,7 @@
 #include "helpers/diag_log.hpp"
 #include "zydis_disasm.hpp"
 #include "../analysis/pe_parser.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include "ghidra_adapters/aida_ghidra_preamble.hpp"
 #include "ghidra_adapters/aida_architecture.hpp"
@@ -1454,9 +1455,30 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 		}
 	}
 
-	unsigned int num_threads = std::thread::hardware_concurrency();
+	mcp_standalone::downstream::producer_identity_t bd_id;
+	bd_id.kind = mcp_standalone::downstream::producer_kind_t::decompiler;
+	bd_id.tool_name = "batch_decompile";
+	mcp_standalone::downstream::scoped_admission_t bd_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(bd_id);
+	if (!bd_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(bd_id);
+		diag::log_tagged_fmt("ghidra",
+			"FEATURE-WORKER-GROUP-REJECT batch_decompile reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		for (auto& r : results) {
+			r.is_error = true;
+			r.error_text = "decompiler capacity exhausted; batch decompile was not started.";
+		}
+		return;
+	}
+	diag::log_tagged_fmt("ghidra",
+		"FEATURE-WORKER-GROUP-ADMIT batch_decompile token=%llu",
+		static_cast<unsigned long long>(bd_admission.token()));
+
+	const std::size_t dec_wg_size = mcp_standalone::downstream::governor_t::instance().quotas().decompiler_worker_group_size;
+	unsigned int num_threads = static_cast<unsigned int>(dec_wg_size);
 	if (num_threads == 0)
-		num_threads = 4;
+		num_threads = 2;
 	if (num_threads > static_cast<unsigned int>(entries.size()))
 		num_threads = static_cast<unsigned int>(entries.size());
 
@@ -1618,6 +1640,12 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 		progress ? progress->load(std::memory_order_relaxed) : -1,
 		(cancel && cancel->load(std::memory_order_acquire)) ? 1 : 0,
 		static_cast<unsigned long long>(GetTickCount64() - batch_start_ms));
+	if (bd_admission.active()) {
+		diag::log_tagged_fmt("ghidra",
+			"FEATURE-WORKER-GROUP-RELEASE batch_decompile token=%llu reason=completed",
+			static_cast<unsigned long long>(bd_admission.token()));
+		bd_admission.release("completed");
+	}
 }
 
 inline std::string last_error() {

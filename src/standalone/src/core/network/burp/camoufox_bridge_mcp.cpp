@@ -2,6 +2,7 @@
 #include "camoufox_bridge.hpp"
 #include "burp_events.hpp"
 #include "../../settings/standalone_compat.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 
 #ifdef small
 #undef small
@@ -35,6 +36,77 @@ namespace {
 
 using mcp_standalone::tool_result_t;
 using nlohmann::json;
+
+struct camoufox_mcp_op_admission_t
+{
+    mcp_standalone::downstream::admission_result_t result;
+    mcp_standalone::downstream::producer_identity_t identity;
+    bool held = false;
+
+    explicit camoufox_mcp_op_admission_t(
+        const char* tool_name,
+        const std::string& session_id,
+        uint64_t generation,
+        uint32_t child_pid)
+        : identity({})
+    {
+        identity.kind = mcp_standalone::downstream::producer_kind_t::camoufox_longop;
+        identity.principal_id = "camoufox_mcp";
+        identity.session_id = session_id.empty() ? std::string("default") : session_id;
+        identity.generation = generation;
+        identity.child_pid = child_pid;
+        identity.tool_name = tool_name ? std::string(tool_name) : std::string();
+        identity.command_label = tool_name ? std::string(tool_name) : std::string();
+        const char* diag_id = mcp_standalone::current_call_diag_id();
+        const char* req_id = mcp_standalone::current_call_request_id();
+        if (diag_id && diag_id[0]) identity.diagnostic_id = diag_id;
+        if (req_id && req_id[0]) identity.request_id = req_id;
+        identity.deadline_ms = mcp_standalone::current_call_deadline_ms();
+
+        result = mcp_standalone::downstream::governor_t::instance().try_admit(identity);
+        held = result.admitted;
+        if (held)
+        {
+            diag::log_tagged_fmt("mcp_burp", "CAMOUFOX-LONGOP-ADMIT tool=%s session=%s generation=%llu child_pid=%lu token=%llu source=mcp_passthrough",
+                identity.tool_name.c_str(), identity.session_id.c_str(),
+                static_cast<unsigned long long>(identity.generation),
+                static_cast<unsigned long>(identity.child_pid),
+                static_cast<unsigned long long>(result.admission_token));
+        }
+        else
+        {
+            diag::log_tagged_fmt("mcp_burp", "CAMOUFOX-LONGOP-REJECT tool=%s session=%s generation=%llu child_pid=%lu reason=%s quota=%s scope=%s observed=%zu limit=%zu source=mcp_passthrough",
+                identity.tool_name.c_str(), identity.session_id.c_str(),
+                static_cast<unsigned long long>(identity.generation),
+                static_cast<unsigned long>(identity.child_pid),
+                result.reason.c_str(), result.quota_name.c_str(), result.quota_scope.c_str(),
+                result.observed, result.limit);
+        }
+    }
+
+    ~camoufox_mcp_op_admission_t()
+    {
+        release("scope_exit");
+    }
+
+    camoufox_mcp_op_admission_t(const camoufox_mcp_op_admission_t&) = delete;
+    camoufox_mcp_op_admission_t& operator=(const camoufox_mcp_op_admission_t&) = delete;
+
+    void release(const char* reason)
+    {
+        if (!held) return;
+        diag::log_tagged_fmt("mcp_burp", "CAMOUFOX-LONGOP-RELEASE reason=%s tool=%s session=%s token=%llu source=mcp_passthrough",
+            reason ? reason : "completed",
+            identity.tool_name.c_str(), identity.session_id.c_str(),
+            static_cast<unsigned long long>(result.admission_token));
+        mcp_standalone::downstream::governor_t::instance().release(result.admission_token, reason ? reason : "completed");
+        held = false;
+    }
+
+    bool admitted() const noexcept { return held; }
+    const mcp_standalone::downstream::admission_result_t& rejection() const noexcept { return result; }
+    const mcp_standalone::downstream::producer_identity_t& id() const noexcept { return identity; }
+};
 
 constexpr uint32_t kMinReadyBrowserProcessCount = 2;
 
@@ -111,6 +183,10 @@ json status_to_json(const camoufox::bridge_status_t& s)
     j["last_error"]       = s.last_error;
     j["server_command"]   = s.server_command;
     j["child_pid"]        = s.child_pid;
+    j["child_process_image_path"] = s.child_process_image_path;
+    j["child_process_creation_time_100ns"] = s.child_process_creation_time_100ns;
+    j["child_process_identity_gle"] = s.child_process_identity_gle;
+    j["child_process_identity_available"] = s.child_process_identity_available;
     j["launched_ms"]      = s.launched_ms;
     j["attempt_started_ms"] = s.attempt_started_ms;
     j["attempt_elapsed_ms"] = s.attempt_elapsed_ms;
@@ -2542,6 +2618,27 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
             state_label(before.state),
             static_cast<unsigned long>(before.child_pid),
             before.child_alive ? 1 : 0);
+    }
+    camoufox_mcp_op_admission_t mcp_admission(
+        tool_name.c_str(),
+        session_id,
+        before.generation,
+        before.child_pid);
+    if (!mcp_admission.admitted())
+    {
+        json rejection = mcp_standalone::downstream::rejection_json(mcp_admission.rejection(), mcp_admission.id());
+        tool_result_t out = tool_result_t::error(
+            "CAMOUFOX-LONGOP-REJECT: " + mcp_admission.rejection().reason,
+            "MCP_DOWNSTREAM_CAPACITY_REJECT",
+            rejection);
+        diag::log_tagged_fmt("mcp_burp", "camoufox_passthrough longop_rejected tool=%s session=%s reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            tool_name.c_str(), session_id.c_str(),
+            mcp_admission.rejection().reason.c_str(),
+            mcp_admission.rejection().quota_name.c_str(),
+            mcp_admission.rejection().quota_scope.c_str(),
+            mcp_admission.rejection().observed,
+            mcp_admission.rejection().limit);
+        return out;
     }
     camoufox::call_result_t bridge_result = camoufox::call_tool(tool_name, args, effective_rpc_timeout_ms, session_id);
     const auto rpc_end = std::chrono::steady_clock::now();

@@ -12,7 +12,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <thread>
+
+#include "../infra/win_thread.hpp"
 
 namespace mitm_proxy {
 namespace quic_proxy {
@@ -24,7 +25,7 @@ struct listener_runtime {
     quic_proxy_config config;
     SOCKET socket = INVALID_SOCKET;
     std::atomic<bool> running{false};
-    std::thread worker;
+    aida::infra::win_thread::joinable_thread_t worker;
 };
 
 std::mutex g_mutex;
@@ -261,7 +262,20 @@ bool start(const quic_proxy_config& config, uint64_t* listener_id)
         if (listener_id)
             *listener_id = rt->id;
     }
-    rt->worker = std::thread(listener_loop, rt);
+    auto rt_for_thread = rt;
+    std::string start_err;
+    if (!rt->worker.start([rt_for_thread]() { listener_loop(rt_for_thread.get()); }, &start_err,
+            aida::infra::win_thread::default_stack_reserve, "quic_proxy.listener")) {
+        diag::log_tagged_fmt("quic_proxy", "listener_thread_start_failed err=%s", start_err.c_str());
+        rt->running.store(false);
+        if (rt->socket != INVALID_SOCKET) { closesocket(rt->socket); rt->socket = INVALID_SOCKET; }
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_listeners.erase(std::remove_if(g_listeners.begin(), g_listeners.end(),
+            [&rt](const std::shared_ptr<listener_runtime>& item) { return item == rt; }), g_listeners.end());
+        g_stats.running = !g_listeners.empty();
+        g_stats.listener_count = g_listeners.size();
+        return false;
+    }
     return true;
 }
 
@@ -285,8 +299,7 @@ bool stop(uint64_t listener_id)
         closesocket(rt->socket);
         rt->socket = INVALID_SOCKET;
     }
-    if (rt->worker.joinable())
-        rt->worker.join();
+    rt->worker.join_for(10000);
     return true;
 }
 

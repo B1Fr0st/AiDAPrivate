@@ -24,6 +24,7 @@
 
 #include "../../helpers/diag_log.hpp"
 #include "../infra/win_thread.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 namespace pdb_parser {
 
@@ -2673,6 +2674,9 @@ inline void quarantine_dbghelp_and_recycle()
 			"dbghelp_recycle_thread_stuck attempt=%llu hard_cap_ms=%lu still_quarantined=1",
 			static_cast<unsigned long long>(attempt),
 			static_cast<unsigned long>(hard_cap_ms));
+		diag::log_tagged_critical_fmt("pdb",
+			"FEATURE-WORKER-GROUP-RELEASE dbghelp_recycle attempt=%llu reason=stuck_detach",
+			static_cast<unsigned long long>(attempt));
 		recycle_thread->detach();
 	}
 }
@@ -2707,6 +2711,25 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 		pdb_path.c_str(),
 		cap,
 		symbol_search_path.size());
+
+	mcp_standalone::downstream::producer_identity_t pdb_id;
+	pdb_id.kind = mcp_standalone::downstream::producer_kind_t::pdb_parser;
+	pdb_id.tool_name = "parse_pdb_bounded";
+	mcp_standalone::downstream::scoped_admission_t pdb_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(pdb_id);
+	if (!pdb_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(pdb_id);
+		diag::log_tagged_critical_fmt("pdb",
+			"FEATURE-WORKER-GROUP-REJECT parse_pdb_bounded path='%s' reason=%s quota=%s observed=%zu limit=%zu",
+			pdb_path.c_str(),
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		set_last_error_text("PDB parser capacity exhausted; work was not started.");
+		return false;
+	}
+	diag::log_tagged_critical_fmt("pdb",
+		"FEATURE-WORKER-GROUP-ADMIT parse_pdb_bounded path='%s' token=%llu",
+		pdb_path.c_str(),
+		static_cast<unsigned long long>(pdb_admission.token()));
 
 	struct bounded_state_t {
 		pdb_info_t info;
@@ -2765,6 +2788,10 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 			pdb_path.c_str(),
 			start_err.c_str());
 		set_last_error_text(std::string("parse_pdb_bounded thread start failed: ") + start_err);
+		diag::log_tagged_critical_fmt("pdb",
+			"FEATURE-WORKER-GROUP-RELEASE parse_pdb_bounded token=%llu reason=thread_start_failed",
+			static_cast<unsigned long long>(pdb_admission.token()));
+		pdb_admission.release("thread_start_failed");
 		return false;
 	}
 
@@ -2871,6 +2898,10 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 			ok ? 1 : 0,
 			static_cast<unsigned long long>(elapsed_ms),
 			pdb_path.c_str());
+		diag::log_tagged_critical_fmt("pdb",
+			"FEATURE-WORKER-GROUP-RELEASE parse_pdb_bounded token=%llu reason=completed",
+			static_cast<unsigned long long>(pdb_admission.token()));
+		pdb_admission.release("completed");
 		return ok;
 	}
 
@@ -2901,6 +2932,10 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 			static_cast<unsigned long long>(stalled_elapsed),
 			stalled_deadline);
 		dbghelp_call_gate_mark_abandoned(stalled_gen, stalled_owner, dbghelp_inner_phase_name(stalled_phase));
+		diag::log_tagged_critical_fmt("pdb",
+			"FEATURE-WORKER-GROUP-RELEASE parse_pdb_bounded token=%llu reason=inner_phase_stall_detach",
+			static_cast<unsigned long long>(pdb_admission.token()));
+		pdb_admission.release("inner_phase_stall_detach");
 		worker_thread->detach();
 		quarantine_dbghelp_and_recycle();
 		dbghelp_call_gate_reset(g_parse_generation.fetch_add(1, std::memory_order_acq_rel),
@@ -2926,6 +2961,10 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 
 	const inner_phase_snapshot_t stuck_snap = read_inner_phase_snapshot();
 	dbghelp_call_gate_mark_abandoned(stuck_snap.generation, stuck_snap.owner_tid, "bounded_hard_cap");
+	diag::log_tagged_critical_fmt("pdb",
+		"FEATURE-WORKER-GROUP-RELEASE parse_pdb_bounded token=%llu reason=hard_cap_detach",
+		static_cast<unsigned long long>(pdb_admission.token()));
+	pdb_admission.release("hard_cap_detach");
 	worker_thread->detach();
 	quarantine_dbghelp_and_recycle();
 	dbghelp_call_gate_reset(g_parse_generation.fetch_add(1, std::memory_order_acq_rel),

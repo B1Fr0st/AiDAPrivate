@@ -8,6 +8,7 @@
 
 #include "../../../helpers/diag_log.hpp"
 #include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -444,10 +445,23 @@ static void miner_main(std::shared_ptr<job_t> job)
     if (concurrency <= 1) {
         worker();
     } else {
-        std::vector<std::thread> threads;
+        const size_t capped_concurrency = std::min(concurrency,
+            mcp_standalone::downstream::default_quotas().burp_network_worker_group_size);
+        std::vector<aida::infra::win_thread::joinable_thread_t> threads;
         try {
-            threads.reserve(concurrency);
-            for (size_t i = 0; i < concurrency; ++i) threads.emplace_back(worker);
+            threads.reserve(capped_concurrency);
+            for (size_t i = 0; i < capped_concurrency; ++i) {
+                aida::infra::win_thread::joinable_thread_t wt;
+                std::string err;
+                const std::string label = "param_miner." + std::to_string(job->id) + "." + std::to_string(i);
+                const bool started = wt.start(worker, &err,
+                    aida::infra::win_thread::default_stack_reserve, label.c_str());
+                if (started)
+                    threads.push_back(std::move(wt));
+                else
+                    diag::log_tagged_fmt("param_miner", "worker_thread_start_failed_single job_id=%llu idx=%zu err=%s",
+                        static_cast<unsigned long long>(job->id), i, err.c_str());
+            }
         } catch (const std::exception& ex) {
             set_err(std::string("param_miner: worker thread start failed: ") + ex.what());
             diag::log_tagged_fmt("param_miner", "worker_thread_start_failed job_id=%llu started=%zu err=%s",
@@ -459,7 +473,10 @@ static void miner_main(std::shared_ptr<job_t> job)
                 static_cast<unsigned long long>(job->id), threads.size());
             job->cancel.store(true);
         }
-        for (auto& t : threads) if (t.joinable()) t.join();
+        for (auto& t : threads) {
+            std::string err;
+            t.join(&err);
+        }
     }
 
     job->running.store(false);
@@ -493,7 +510,28 @@ uint64_t start(config_t cfg)
     }
     diag::log_tagged_fmt("param_miner", "start job_id=%llu concurrency=%zu timeout_ms=%d sigma=%.1f",
         static_cast<unsigned long long>(job->id), job->cfg.concurrency, job->cfg.timeout_ms, job->cfg.diff_sigma_threshold);
-    const bool posted = work_queue::post([job]() {
+    mcp_standalone::downstream::producer_identity_t pm_id;
+    pm_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+    pm_id.tool_name = "param_miner.mine";
+    pm_id.domain = job->cfg.target_url;
+    auto pm_admission = mcp_standalone::downstream::scoped_admission_t::acquire(pm_id);
+    if (!pm_admission.active()) {
+        diag::log_tagged_fmt("param_miner", "BURP-NETWORK-WORKER-REJECT job_id=%llu url=%s reason=%s quota=%s observed=%zu limit=%zu",
+            static_cast<unsigned long long>(job->id), job->cfg.target_url.c_str(),
+            pm_admission.result().reason.c_str(),
+            pm_admission.result().quota_name.c_str(),
+            pm_admission.result().observed, pm_admission.result().limit);
+        set_err("param_miner: downstream capacity exhausted");
+        job->running.store(false);
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().jobs.erase(job->id);
+        return 0;
+    }
+    const uint64_t pm_token = pm_admission.token();
+    diag::log_tagged_fmt("param_miner", "BURP-NETWORK-WORKER-ADMIT job_id=%llu url=%s token=%llu",
+        static_cast<unsigned long long>(job->id), job->cfg.target_url.c_str(),
+        static_cast<unsigned long long>(pm_token));
+    const bool posted = work_queue::post([job, admission = std::move(pm_admission), pm_token]() mutable {
         try {
             miner_main(job);
         } catch (const std::exception& ex) {
@@ -507,6 +545,10 @@ uint64_t start(config_t cfg)
                 static_cast<unsigned long long>(job->id));
             job->running.store(false);
         }
+        diag::log_tagged_fmt("param_miner", "BURP-NETWORK-WORKER-RELEASE job_id=%llu token=%llu reason=completed",
+            static_cast<unsigned long long>(job->id),
+            static_cast<unsigned long long>(pm_token));
+        admission.release("completed");
     });
     if (!posted) {
         diag::log_tagged_fmt("param_miner", "start_work_queue_rejected job_id=%llu",

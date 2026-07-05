@@ -6,6 +6,7 @@
 #include "standalone_driver.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -476,25 +477,42 @@ static void first_scan_thread(scan_config_t config) {
 
 
 	const bool full_test_running = anti_tamper::state::get().full_test_running.load(std::memory_order_acquire);
-	const int worker_count = full_test_running ? 0 : []() {
-		unsigned int hc = std::thread::hardware_concurrency();
-		if (hc < 2u) return 1;
-		if (hc > 8u) return 4;
-		return static_cast<int>(hc / 2u);
-	}();
+	const std::size_t scanner_wg_size = mcp_standalone::downstream::governor_t::instance().quotas().scanner_worker_group_size;
+	const int worker_count = full_test_running ? 0 : static_cast<int>(scanner_wg_size);
 	if (full_test_running) {
 		diag::log_tagged_fmt("mem_scanner",
 			"first_scan_thread full_test_inline_workers regions=%zu bytes=%zu",
 			scan_regions.size(),
 			total_bytes);
 	}
+	mcp_standalone::downstream::producer_identity_t scan_id;
+	scan_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	scan_id.tool_name = "first_scan";
+	mcp_standalone::downstream::scoped_admission_t scan_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(scan_id);
+	if (!scan_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(scan_id);
+		diag::log_tagged_fmt("mem_scanner",
+			"FEATURE-WORKER-GROUP-REJECT first_scan reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		st.scan_progress.store(1.f);
+		st.scanning.store(false);
+		return;
+	}
+	diag::log_tagged_fmt("mem_scanner",
+		"FEATURE-WORKER-GROUP-ADMIT first_scan token=%llu worker_group_size=%zu",
+		static_cast<unsigned long long>(scan_admission.token()), scanner_wg_size);
 	std::atomic<size_t> next_region{0};
-	std::vector<std::thread> workers;
+	std::vector<aida::infra::win_thread::joinable_thread_t> workers;
 	const int actual_workers = static_cast<int>((std::min<size_t>)(static_cast<size_t>(worker_count), scan_regions.size()));
 	try {
 		workers.reserve(static_cast<size_t>(actual_workers));
 		for (int w = 0; w < actual_workers; ++w) {
-			workers.emplace_back([&]() {
+			aida::infra::win_thread::joinable_thread_t t;
+			std::string err;
+			char tname[32];
+			_snprintf_s(tname, sizeof(tname), _TRUNCATE, "mem_scan.fs.%d", w);
+			if (t.start([&]() {
 				for (;;) {
 					size_t idx = next_region.fetch_add(1);
 					if (idx >= scan_regions.size()) break;
@@ -505,7 +523,10 @@ static void first_scan_thread(scan_config_t config) {
 						read_failures.fetch_add(1, std::memory_order_acq_rel);
 					}
 				}
-			});
+			}, &err, aida::infra::win_thread::default_stack_reserve, tname))
+				workers.push_back(std::move(t));
+			else
+				diag::log_tagged_fmt("mem_scanner", "first_scan_thread worker_start_failed w=%d err='%s'", w, err.c_str());
 		}
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("mem_scanner", "first_scan_thread local_worker_create_failed err='%s'", ex.what());
@@ -523,6 +544,10 @@ static void first_scan_thread(scan_config_t config) {
 				worker.join();
 		}
 	}
+	diag::log_tagged_fmt("mem_scanner",
+		"FEATURE-WORKER-GROUP-RELEASE first_scan token=%llu reason=completed",
+		static_cast<unsigned long long>(scan_admission.token()));
+	scan_admission.release("completed");
 
 
 	std::sort(all_results.begin(), all_results.end(),
@@ -1004,12 +1029,8 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 		skipped_size,
 		skipped_range);
 
-	const int ptr_worker_count = []() {
-		unsigned int hc = std::thread::hardware_concurrency();
-		if (hc < 2u) return 1;
-		if (hc > 8u) return 4;
-		return static_cast<int>(hc / 2u);
-	}();
+	const std::size_t ptr_wg_size = mcp_standalone::downstream::governor_t::instance().quotas().scanner_worker_group_size;
+	const int ptr_worker_count = static_cast<int>(ptr_wg_size);
 	std::vector<std::multimap<uint64_t, pointer_entry_t>> partial_maps(static_cast<size_t>(ptr_worker_count));
 	std::atomic<size_t> region_idx{0};
 	std::atomic<uint64_t> bytes_scanned{0};
@@ -1073,11 +1094,36 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 			}
 		}
 	};
-	std::vector<std::thread> ptr_workers;
+	mcp_standalone::downstream::producer_identity_t ptr_id;
+	ptr_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	ptr_id.tool_name = "pointer_scan_map";
+	mcp_standalone::downstream::scoped_admission_t ptr_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(ptr_id);
+	if (!ptr_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(ptr_id);
+		diag::log_tagged_fmt("pointer_scan",
+			"FEATURE-WORKER-GROUP-REJECT pointer_scan_map reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		st.pointer_progress.store(1.f);
+		st.pointer_scanning.store(false);
+		return;
+	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-ADMIT pointer_scan_map token=%llu worker_group_size=%zu",
+		static_cast<unsigned long long>(ptr_admission.token()), ptr_wg_size);
+	std::vector<aida::infra::win_thread::joinable_thread_t> ptr_workers;
 	try {
 		ptr_workers.reserve(static_cast<size_t>(ptr_worker_count));
-		for (int w = 0; w < ptr_worker_count; ++w)
-			ptr_workers.emplace_back(scan_pointer_worker, w);
+		for (int w = 0; w < ptr_worker_count; ++w) {
+			aida::infra::win_thread::joinable_thread_t t;
+			std::string err;
+			char tname[32];
+			_snprintf_s(tname, sizeof(tname), _TRUNCATE, "ptr_scan.map.%d", w);
+			if (t.start(scan_pointer_worker, w, &err, aida::infra::win_thread::default_stack_reserve, tname))
+				ptr_workers.push_back(std::move(t));
+			else
+				diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_worker_start_failed w=%d err='%s'", w, err.c_str());
+		}
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_worker_create_failed err='%s'", ex.what());
 	} catch (...) {
@@ -1092,6 +1138,10 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 				worker.join();
 		}
 	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-RELEASE pointer_scan_map token=%llu reason=completed",
+		static_cast<unsigned long long>(ptr_admission.token()));
+	ptr_admission.release("completed");
 
 	if (!st.pointer_scanning.load()) {
 		st.pointer_progress.store(1.f);
@@ -1203,11 +1253,36 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 				0.5f + (static_cast<float>(idx + 1) / static_cast<float>(seed_values.size())) * 0.5f);
 		}
 	};
-	std::vector<std::thread> dfs_workers;
+	mcp_standalone::downstream::producer_identity_t dfs_id;
+	dfs_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	dfs_id.tool_name = "pointer_scan_dfs";
+	mcp_standalone::downstream::scoped_admission_t dfs_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(dfs_id);
+	if (!dfs_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(dfs_id);
+		diag::log_tagged_fmt("pointer_scan",
+			"FEATURE-WORKER-GROUP-REJECT pointer_scan_dfs reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		st.pointer_progress.store(1.f);
+		st.pointer_scanning.store(false);
+		return;
+	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-ADMIT pointer_scan_dfs token=%llu worker_group_size=%zu",
+		static_cast<unsigned long long>(dfs_admission.token()), ptr_wg_size);
+	std::vector<aida::infra::win_thread::joinable_thread_t> dfs_workers;
 	try {
 		dfs_workers.reserve(static_cast<size_t>(ptr_worker_count));
-		for (int w = 0; w < ptr_worker_count; ++w)
-			dfs_workers.emplace_back(dfs_worker);
+		for (int w = 0; w < ptr_worker_count; ++w) {
+			aida::infra::win_thread::joinable_thread_t t;
+			std::string err;
+			char tname[32];
+			_snprintf_s(tname, sizeof(tname), _TRUNCATE, "ptr_scan.dfs.%d", w);
+			if (t.start(dfs_worker, &err, aida::infra::win_thread::default_stack_reserve, tname))
+				dfs_workers.push_back(std::move(t));
+			else
+				diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread dfs_worker_start_failed w=%d err='%s'", w, err.c_str());
+		}
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread dfs_worker_create_failed err='%s'", ex.what());
 	} catch (...) {
@@ -1221,6 +1296,10 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 				worker.join();
 		}
 	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-RELEASE pointer_scan_dfs token=%llu reason=completed",
+		static_cast<unsigned long long>(dfs_admission.token()));
+	dfs_admission.release("completed");
 
 	std::sort(results.begin(), results.end(),
 		[](const pointer_result_t& a, const pointer_result_t& b) {
@@ -1281,6 +1360,22 @@ void initialize() {
 	st.freeze_active.store(true);
 	st.freeze_thread_done.store(false, std::memory_order_release);
 	diag::log_tagged("mem_scanner", "initialize posting_freeze_loop");
+	mcp_standalone::downstream::producer_identity_t freeze_id;
+	freeze_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	freeze_id.tool_name = "freeze_loop";
+	mcp_standalone::downstream::scoped_admission_t freeze_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(freeze_id);
+	if (!freeze_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(freeze_id);
+		diag::log_tagged_fmt("mem_scanner",
+			"FEATURE-WORKER-GROUP-REJECT freeze_loop reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		st.freeze_thread_done.store(true, std::memory_order_release);
+		return;
+	}
+	diag::log_tagged_fmt("mem_scanner",
+		"FEATURE-WORKER-GROUP-ADMIT freeze_loop token=%llu",
+		static_cast<unsigned long long>(freeze_admission.token()));
 	if (!work_queue::post([]() {
 			freeze_loop();
 			g_state.freeze_thread_done.store(true, std::memory_order_release);
@@ -1289,6 +1384,10 @@ void initialize() {
 		diag::log_tagged("mem_scanner", "initialize freeze_loop_post_failed");
 		st.freeze_thread_done.store(true, std::memory_order_release);
 	}
+	diag::log_tagged_fmt("mem_scanner",
+		"FEATURE-WORKER-GROUP-RELEASE freeze_loop token=%llu reason=dispatched",
+		static_cast<unsigned long long>(freeze_admission.token()));
+	freeze_admission.release("dispatched");
 }
 
 void shutdown() {
@@ -1360,6 +1459,23 @@ bool first_scan(const scan_config_t& config) {
 		return true;
 	}
 	try {
+		mcp_standalone::downstream::producer_identity_t fs_id;
+		fs_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+		fs_id.tool_name = "first_scan_dispatch";
+		mcp_standalone::downstream::scoped_admission_t fs_admission =
+			mcp_standalone::downstream::scoped_admission_t::acquire(fs_id);
+		if (!fs_admission.active()) {
+			auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(fs_id);
+			diag::log_tagged_fmt("mem_scanner",
+				"FEATURE-WORKER-GROUP-REJECT first_scan_dispatch reason=%s quota=%s observed=%zu limit=%zu",
+				rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+			st.scan_thread_done.store(true, std::memory_order_release);
+			st.scanning.store(false);
+			return false;
+		}
+		diag::log_tagged_fmt("mem_scanner",
+			"FEATURE-WORKER-GROUP-ADMIT first_scan_dispatch token=%llu",
+			static_cast<unsigned long long>(fs_admission.token()));
 		if (!work_queue::post([config]() {
 			try {
 				first_scan_thread(config);
@@ -1379,6 +1495,10 @@ bool first_scan(const scan_config_t& config) {
 			st.scanning.store(false);
 			return false;
 		}
+		diag::log_tagged_fmt("mem_scanner",
+			"FEATURE-WORKER-GROUP-RELEASE first_scan_dispatch token=%llu reason=dispatched",
+			static_cast<unsigned long long>(fs_admission.token()));
+		fs_admission.release("dispatched");
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("mem_scanner", "first_scan worker_create_failed err='%s'", ex.what());
 		st.scan_thread_done.store(true, std::memory_order_release);
@@ -1435,6 +1555,23 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 		return true;
 	}
 	try {
+		mcp_standalone::downstream::producer_identity_t ns_id;
+		ns_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+		ns_id.tool_name = "next_scan_dispatch";
+		mcp_standalone::downstream::scoped_admission_t ns_admission =
+			mcp_standalone::downstream::scoped_admission_t::acquire(ns_id);
+		if (!ns_admission.active()) {
+			auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(ns_id);
+			diag::log_tagged_fmt("mem_scanner",
+				"FEATURE-WORKER-GROUP-REJECT next_scan_dispatch reason=%s quota=%s observed=%zu limit=%zu",
+				rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+			st.scan_thread_done.store(true, std::memory_order_release);
+			st.scanning.store(false);
+			return false;
+		}
+		diag::log_tagged_fmt("mem_scanner",
+			"FEATURE-WORKER-GROUP-ADMIT next_scan_dispatch token=%llu",
+			static_cast<unsigned long long>(ns_admission.token()));
 		if (!work_queue::post([mode, value_text, value_text2]() {
 			try {
 				next_scan_thread(mode, value_text, value_text2);
@@ -1454,6 +1591,10 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 			st.scanning.store(false);
 			return false;
 		}
+		diag::log_tagged_fmt("mem_scanner",
+			"FEATURE-WORKER-GROUP-RELEASE next_scan_dispatch token=%llu reason=dispatched",
+			static_cast<unsigned long long>(ns_admission.token()));
+		ns_admission.release("dispatched");
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("mem_scanner", "next_scan worker_create_failed err='%s'", ex.what());
 		st.scan_thread_done.store(true, std::memory_order_release);
@@ -1652,6 +1793,23 @@ bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, 
 		st.pointer_thread_done.store(true, std::memory_order_release);
 		return true;
 	}
+	mcp_standalone::downstream::producer_identity_t ps_id;
+	ps_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
+	ps_id.tool_name = "pointer_scan_dispatch";
+	mcp_standalone::downstream::scoped_admission_t ps_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(ps_id);
+	if (!ps_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(ps_id);
+		diag::log_tagged_fmt("pointer_scan",
+			"FEATURE-WORKER-GROUP-REJECT pointer_scan_dispatch reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		st.pointer_thread_done.store(true, std::memory_order_release);
+		st.pointer_scanning.store(false);
+		return false;
+	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-ADMIT pointer_scan_dispatch token=%llu",
+		static_cast<unsigned long long>(ps_admission.token()));
 	if (!work_queue::post([target_address, max_depth, max_offset, scan_base, scan_size]() {
 			pointer_scan_thread(target_address, max_depth, max_offset, scan_base, scan_size);
 			g_state.pointer_thread_done.store(true, std::memory_order_release);
@@ -1661,6 +1819,10 @@ bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, 
 		st.pointer_scanning.store(false);
 		return false;
 	}
+	diag::log_tagged_fmt("pointer_scan",
+		"FEATURE-WORKER-GROUP-RELEASE pointer_scan_dispatch token=%llu reason=dispatched",
+		static_cast<unsigned long long>(ps_admission.token()));
+	ps_admission.release("dispatched");
 	return true;
 }
 

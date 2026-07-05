@@ -72,6 +72,10 @@ struct bridge_status_t
     std::string    last_error;
     std::string    server_command;
     uint32_t       child_pid        = 0;
+    std::string    child_process_image_path;
+    uint64_t       child_process_creation_time_100ns = 0;
+    uint32_t       child_process_identity_gle = 0;
+    bool           child_process_identity_available = false;
     uint64_t       launched_ms      = 0;
     uint64_t       attempt_started_ms = 0;
     uint64_t       attempt_elapsed_ms = 0;
@@ -142,6 +146,35 @@ struct bridge_call_completed_t
     uint64_t    duration_ms = 0;
 };
 
+struct stale_sidecar_cleanup_proof_t
+{
+    std::string diagnostic_id;
+    std::string request_id;
+    std::string tool;
+    std::string action;
+    std::string bridge_session_id;
+    std::string mcp_session_id;
+    std::string mcp_session_hash;
+    std::string principal_bucket;
+    std::string expected_executable_path;
+    uint32_t    expected_sidecar_pid = 0;
+    uint64_t    expected_bridge_generation = 0;
+    uint64_t    expected_process_creation_time_100ns = 0;
+    uint64_t    lease_token = 0;
+    uint64_t    registry_generation = 0;
+    uint64_t    operation_generation = 0;
+    std::string sidecar_ownership_marker;
+};
+
+struct stale_sidecar_cleanup_result_t
+{
+    bool attempted = false;
+    bool cleaned = false;
+    bool rejected = false;
+    std::string reason;
+    nlohmann::json diagnostics = nlohmann::json::object();
+};
+
 inline constexpr aida::events::event_def_t<bridge_state_changed_t>  kBridgeStateChanged{"burp.camoufox.state_changed"};
 inline constexpr aida::events::event_def_t<bridge_call_completed_t> kBridgeCallCompleted{"burp.camoufox.call_completed"};
 
@@ -154,6 +187,7 @@ bool             stop_bridge(const char* reason = nullptr);
 bool             stop_bridge(const std::string& session_id, const char* reason = nullptr);
 bool             force_cleanup(const char* reason = nullptr);
 bool             force_cleanup(const std::string& session_id, const char* reason = nullptr);
+stale_sidecar_cleanup_result_t cleanup_stale_sidecar_if_owned(const stale_sidecar_cleanup_proof_t& proof);
 bool             wait_until_idle(uint32_t timeout_ms, const char* reason = nullptr);
 bool             is_ready();
 bool             ensure_ready();
@@ -202,6 +236,8 @@ bool             remove_hooks();
 std::string      last_error();
 
 bool             ensure_python_available(std::string& out_python_path);
+
+nlohmann::json   get_downstream_snapshot();
 
 }
 }

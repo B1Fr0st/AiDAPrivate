@@ -27,6 +27,7 @@
 #include "../infra/event_bus.hpp"
 #include "../infra/critical_work_queue.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -826,6 +827,30 @@ inline void decompile_function_native(uint64_t func_addr, const DisasmFile* file
 		}
 	};
 
+	mcp_standalone::downstream::producer_identity_t dec_id;
+	dec_id.kind = mcp_standalone::downstream::producer_kind_t::decompiler;
+	dec_id.tool_name = "decompile_function_native";
+	mcp_standalone::downstream::scoped_admission_t dec_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(dec_id);
+	if (!dec_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(dec_id);
+		diag::log_tagged_critical_fmt("dec",
+			"FEATURE-WORKER-GROUP-REJECT decompile_function_native addr=0x%llX reason=%s quota=%s observed=%zu limit=%zu",
+			static_cast<unsigned long long>(func_addr),
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.current.function_addr = func_addr;
+		g_state.current.is_error = true;
+		g_state.current.error_text = "decompiler capacity exhausted";
+		g_state.current.complete = true;
+		g_state.decompiling.store(false);
+		return;
+	}
+	diag::log_tagged_critical_fmt("dec",
+		"FEATURE-WORKER-GROUP-ADMIT decompile_function_native addr=0x%llX token=%llu",
+		static_cast<unsigned long long>(func_addr),
+		static_cast<unsigned long long>(dec_admission.token()));
+
 	if (!critical_work_queue::post(worker_with_drain) && !work_queue::post(std::move(worker_with_drain))) {
 		diag::log_tagged_critical_fmt("dec",
 			"decompile_function_native_dispatch_failed addr=0x%llX reason=work_queue_unavailable",
@@ -840,6 +865,11 @@ inline void decompile_function_native(uint64_t func_addr, const DisasmFile* file
 	}
 	diag::log_tagged_critical_fmt("dec", "decompile_function_native_post_thread_spawn addr=0x%llX",
 		static_cast<unsigned long long>(func_addr));
+	diag::log_tagged_critical_fmt("dec",
+		"FEATURE-WORKER-GROUP-RELEASE decompile_function_native addr=0x%llX token=%llu reason=dispatched",
+		static_cast<unsigned long long>(func_addr),
+		static_cast<unsigned long long>(dec_admission.token()));
+	dec_admission.release("dispatched");
 }
 
 inline void navigate_back()

@@ -6,6 +6,7 @@
 #include "intruder_engine.hpp"
 
 #include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 #include "../protocol_parser.hpp"
 #include "../../../helpers/diag_log.hpp"
 
@@ -867,7 +868,6 @@ struct job_t
     std::mutex                    results_mtx;
     std::deque<result_t>          results;
 
-    std::vector<std::thread>      workers;
     std::mutex                    worker_mtx;
 
     std::mutex                    feed_mtx;
@@ -1907,15 +1907,26 @@ static void job_main(std::shared_ptr<job_t> job)
         case engine_mode_t::http1_pooled: {
             size_t pool = job->cfg.concurrency > 0 ? job->cfg.concurrency : 16;
             if (pool > 128) pool = 128;
-            diag::log_tagged_fmt("intruder", "job_main dispatching http1_pooled pool=%zu job_id=%llu", pool, static_cast<unsigned long long>(job->id));
-            if (pool <= 1) {
+            const size_t capped_pool = std::min(pool, mcp_standalone::downstream::default_quotas().burp_network_worker_group_size);
+            diag::log_tagged_fmt("intruder", "job_main dispatching http1_pooled pool=%zu capped=%zu job_id=%llu",
+                pool, capped_pool, static_cast<unsigned long long>(job->id));
+            if (capped_pool <= 1) {
                 worker_pooled_h1(job);
             } else {
-                std::vector<std::thread> ws;
+                std::vector<aida::infra::win_thread::joinable_thread_t> ws;
                 try {
-                    ws.reserve(pool);
-                    for (size_t i = 0; i < pool; ++i) {
-                        ws.emplace_back([job]() { worker_pooled_h1(job); });
+                    ws.reserve(capped_pool);
+                    for (size_t i = 0; i < capped_pool; ++i) {
+                        aida::infra::win_thread::joinable_thread_t wt;
+                        std::string err;
+                        const std::string label = "intruder.pooled_h1." + std::to_string(job->id) + "." + std::to_string(i);
+                        const bool started = wt.start([job]() { worker_pooled_h1(job); }, &err,
+                            aida::infra::win_thread::default_stack_reserve, label.c_str());
+                        if (started)
+                            ws.push_back(std::move(wt));
+                        else
+                            diag::log_tagged_fmt("intruder", "pooled_worker_start_failed_single job_id=%llu idx=%zu err=%s",
+                                static_cast<unsigned long long>(job->id), i, err.c_str());
                     }
                 } catch (const std::exception& ex) {
                     set_err(std::string("intruder: pooled worker start failed: ") + ex.what());
@@ -1928,7 +1939,10 @@ static void job_main(std::shared_ptr<job_t> job)
                         static_cast<unsigned long long>(job->id), ws.size());
                     job->running.store(false);
                 }
-                for (auto& t : ws) if (t.joinable()) t.join();
+                for (auto& t : ws) {
+                    std::string err;
+                    t.join(&err);
+                }
             }
             break;
         }
@@ -1999,7 +2013,29 @@ uint64_t start(config_t cfg)
     diag::log_tagged_fmt("intruder", "start job_id=%llu concurrency=%zu timeout_ms=%d max_resp_bytes=%zu",
         static_cast<unsigned long long>(job->id), job->cfg.concurrency,
         job->cfg.timeout_ms, job->cfg.max_response_body_bytes);
-    const bool posted = work_queue::post([job]() {
+    mcp_standalone::downstream::producer_identity_t intruder_id;
+    intruder_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+    intruder_id.tool_name = "intruder.attack";
+    intruder_id.domain = job->cfg.host;
+    auto intruder_admission = mcp_standalone::downstream::scoped_admission_t::acquire(intruder_id);
+    if (!intruder_admission.active()) {
+        diag::log_tagged_fmt("intruder", "BURP-NETWORK-WORKER-REJECT job_id=%llu host=%s reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            static_cast<unsigned long long>(job->id), job->cfg.host.c_str(),
+            intruder_admission.result().reason.c_str(),
+            intruder_admission.result().quota_name.c_str(),
+            intruder_admission.result().quota_scope.c_str(),
+            intruder_admission.result().observed, intruder_admission.result().limit);
+        set_err("intruder: downstream capacity exhausted");
+        job->running.store(false);
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().jobs.erase(job->id);
+        return 0;
+    }
+    const uint64_t intruder_token = intruder_admission.token();
+    diag::log_tagged_fmt("intruder", "BURP-NETWORK-WORKER-ADMIT job_id=%llu host=%s token=%llu",
+        static_cast<unsigned long long>(job->id), job->cfg.host.c_str(),
+        static_cast<unsigned long long>(intruder_token));
+    const bool posted = work_queue::post([job, admission = std::move(intruder_admission), intruder_token]() mutable {
         try {
             job_main(job);
         } catch (const std::exception& ex) {
@@ -2013,6 +2049,10 @@ uint64_t start(config_t cfg)
                 static_cast<unsigned long long>(job->id));
             job->running.store(false);
         }
+        diag::log_tagged_fmt("intruder", "BURP-NETWORK-WORKER-RELEASE job_id=%llu token=%llu reason=completed",
+            static_cast<unsigned long long>(job->id),
+            static_cast<unsigned long long>(intruder_token));
+        admission.release("completed");
     });
     if (!posted) {
         diag::log_tagged_fmt("intruder", "start_work_queue_rejected job_id=%llu",

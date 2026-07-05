@@ -4,6 +4,8 @@
 #include "terminal_view.hpp"
 #include "workspace_search.hpp"
 #include "work_queue.hpp"
+#include "diag_log.hpp"
+#include "../core/ui/ui_thread_dispatcher.hpp"
 #include <iostream>
 #include <d3d11.h>
 #include <string>
@@ -1038,15 +1040,34 @@ namespace file_tabs {
 			code_editor::load(std::string("Loading..."), fname, fpath);
 			work_queue::post([fname, fpath]() {
 				std::string c = read_file_contents(fpath);
-				for (auto& tab : tabs) {
-					if (tab.filepath == fpath) {
-						tab.buffer = c;
-						tab.buffer_loaded = true;
-						tab.dirty = false;
-						break;
-					}
+				const bool posted = aida::ui_thread::post(
+					[fname, fpath, content = std::move(c)]() mutable {
+						for (auto& tab : tabs) {
+							if (tab.filepath == fpath) {
+								tab.buffer = content;
+								tab.buffer_loaded = true;
+								tab.dirty = false;
+								break;
+							}
+						}
+						const bool active_matches_tab = active_tab >= 0 &&
+							active_tab < static_cast<int>(tabs.size()) &&
+							tabs[active_tab].filepath == fpath;
+						const bool active_matches_editor = code_editor::active &&
+							code_editor::filepath == fpath;
+						if (active_matches_tab || active_matches_editor)
+							code_editor::load(content, fname, fpath);
+					},
+					"file_tabs",
+					"large_file_load_result",
+					"worker_result");
+				if (!posted) {
+					diag::log_tagged_critical_fmt("file_tabs",
+						"large_file_load_dispatch_failed worker_tid=%lu ui_tid=%lu path=%.260s",
+						static_cast<unsigned long>(GetCurrentThreadId()),
+						static_cast<unsigned long>(aida::ui_thread::owner_tid()),
+						fpath.c_str());
 				}
-				code_editor::load(c, fname, fpath);
 			});
 		}
 	}

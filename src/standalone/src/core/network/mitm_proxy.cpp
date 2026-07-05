@@ -12,6 +12,7 @@
 #include "script_engine.hpp"
 #include "../infra/work_queue.hpp"
 #include "../infra/event_bus.hpp"
+#include "../infra/win_thread.hpp"
 #include "helpers/diag_log.hpp"
 #include "burp/burp_events.hpp"
 #include "burp/cookie_jar.hpp"
@@ -2973,7 +2974,7 @@ struct extra_listener_runtime_t {
     SOCKET listen_socket = INVALID_SOCKET;
     std::atomic<bool> running{false};
     std::atomic<uint64_t> accepted{0};
-    std::thread thread;
+    aida::infra::win_thread::joinable_thread_t thread;
 };
 
 static std::mutex g_extra_listener_mutex;
@@ -3120,8 +3121,7 @@ static void stop_extra_listeners() {
             closesocket(rt->listen_socket);
             rt->listen_socket = INVALID_SOCKET;
         }
-        if (rt->thread.joinable())
-            rt->thread.join();
+        rt->thread.join_for(10000);
         remove_wfp_redirect(rt->config);
     }
 }
@@ -3195,7 +3195,16 @@ bool start_listener(const proxy_config& config, uint64_t* listener_id) {
     rt->listen_socket = listen_sock;
     install_wfp_redirect(rt->config);
     rt->running.store(true);
-    rt->thread = std::thread(extra_listener_loop, rt);
+    auto rt_for_thread = rt;
+    std::string thread_start_err;
+    if (!rt->thread.start([rt_for_thread]() { extra_listener_loop(rt_for_thread); }, &thread_start_err,
+            aida::infra::win_thread::default_stack_reserve, "mitm_proxy.extra_listener")) {
+        diag::log_tagged_fmt("mitm_proxy", "extra_listener_thread_start_failed err=%s", thread_start_err.c_str());
+        rt->running.store(false);
+        remove_wfp_redirect(rt->config);
+        if (rt->listen_socket != INVALID_SOCKET) { closesocket(rt->listen_socket); rt->listen_socket = INVALID_SOCKET; }
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(g_extra_listener_mutex);
         g_extra_listeners.push_back(rt);
@@ -3228,8 +3237,7 @@ bool stop_listener(uint64_t listener_id) {
         closesocket(rt->listen_socket);
         rt->listen_socket = INVALID_SOCKET;
     }
-    if (rt->thread.joinable())
-        rt->thread.join();
+    rt->thread.join_for(10000);
     remove_wfp_redirect(rt->config);
     return true;
 }

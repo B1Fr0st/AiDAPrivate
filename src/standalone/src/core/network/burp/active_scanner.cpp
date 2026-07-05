@@ -13,6 +13,7 @@
 #include "scope.hpp"
 
 #include "../../infra/work_queue.hpp"
+#include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -946,7 +947,45 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
         static_cast<unsigned long long>(now_ms() - enqueue_started), static_cast<unsigned long>(GetCurrentThreadId()));
 
     std::shared_ptr<audit_runtime_t> captured = rt;
-    const bool posted = work_queue::post([captured]() { run_audit(captured); });
+    mcp_standalone::downstream::producer_identity_t admission_id;
+    admission_id.kind = mcp_standalone::downstream::producer_kind_t::burp_network;
+    admission_id.tool_name = "active_scanner.run_audit";
+    admission_id.domain = host;
+    auto admission = mcp_standalone::downstream::scoped_admission_t::acquire(admission_id);
+    if (!admission.active()) {
+        diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-REJECT audit_id=%llu host=%s reason=%s quota=%s scope=%s observed=%zu limit=%zu",
+            static_cast<unsigned long long>(rt->status.id), host.c_str(),
+            admission.result().reason.c_str(),
+            admission.result().quota_name.c_str(),
+            admission.result().quota_scope.c_str(),
+            admission.result().observed, admission.result().limit);
+        {
+            std::lock_guard<std::mutex> lk(rt->status_mtx);
+            rt->status.running = false;
+            rt->status.cancelled = true;
+            rt->status.cancel_requested = true;
+            rt->status.drained = true;
+            rt->status.ended_ms = now_ms();
+        }
+        rt->cancel_flag.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(s.audits_mtx);
+            s.audits.erase(rt->status.id);
+        }
+        set_err("active_scanner.enqueue: downstream capacity exhausted");
+        return 0;
+    }
+    const uint64_t admission_token = admission.token();
+    diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-ADMIT audit_id=%llu host=%s token=%llu",
+        static_cast<unsigned long long>(rt->status.id), host.c_str(),
+        static_cast<unsigned long long>(admission_token));
+    const bool posted = work_queue::post([captured, admission = std::move(admission), admission_token]() mutable {
+        run_audit(captured);
+        diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-RELEASE audit_id=%llu token=%llu reason=completed",
+            static_cast<unsigned long long>(captured->status.id),
+            static_cast<unsigned long long>(admission_token));
+        admission.release("completed");
+    });
     if (!posted) {
         {
             std::lock_guard<std::mutex> lk(rt->status_mtx);

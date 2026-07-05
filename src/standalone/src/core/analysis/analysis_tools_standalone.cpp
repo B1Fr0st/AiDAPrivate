@@ -25,6 +25,7 @@
 #include "../disasm/function_index.hpp"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -296,6 +297,25 @@ static json fast_export_names_json(const std::vector<pe_parser::export_entry_t>&
 
 static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 {
+	mcp_standalone::downstream::producer_identity_t be_id;
+	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
+	be_id.tool_name = "binary_map_fast_summary";
+	mcp_standalone::downstream::scoped_admission_t be_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
+	if (!be_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-REJECT binary_map_fast_summary reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			"Broad enumeration capacity exhausted; work was not started.",
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, be_id));
+	}
+	diag::log_tagged_fmt("analysis",
+		"FEATURE-WORKER-GROUP-ADMIT binary_map_fast_summary token=%llu",
+		static_cast<unsigned long long>(be_admission.token()));
+
 	const uint64_t start_ms = GetTickCount64();
 	json phases = json::object();
 	json phase_details = json::object();
@@ -356,8 +376,15 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 			sections.push_back(std::move(o));
 		}
 		mark_phase("static_sections", phase_start);
-		if (mcp_standalone::current_call_cancelled())
+		if (mcp_standalone::current_call_cancelled()) {
+			if (be_admission.active()) {
+				diag::log_tagged_fmt("analysis",
+					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+					static_cast<unsigned long long>(be_admission.token()));
+				be_admission.release("completed");
+			}
 			return cancelled_result("static_sections");
+		}
 
 		phase_start = GetTickCount64();
 		json functions = json::array();
@@ -378,8 +405,15 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 			functions.push_back(std::move(o));
 		}
 		mark_phase("static_functions", phase_start);
-		if (mcp_standalone::current_call_cancelled())
+		if (mcp_standalone::current_call_cancelled()) {
+			if (be_admission.active()) {
+				diag::log_tagged_fmt("analysis",
+					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+					static_cast<unsigned long long>(be_admission.token()));
+				be_admission.release("completed");
+			}
 			return cancelled_result("static_functions");
+		}
 
 		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g_disasm.file.image_base));
 		json result;
@@ -406,16 +440,36 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 			result["sections"].size(),
 			result["functions"].size(),
 			static_cast<unsigned long long>(GetTickCount64() - start_ms));
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::ok(result);
 	}
 
 	uint64_t phase_start = GetTickCount64();
 	const uint32_t attached_pid = driver_bridge::attached_pid();
-	if (attached_pid == 0)
+	if (attached_pid == 0) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("No process is attached and no static binary is loaded.");
+	}
 	mark_phase("attached_pid", phase_start);
-	if (mcp_standalone::current_call_cancelled())
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("attached_pid");
+	}
 
 	phase_start = GetTickCount64();
 	auto modules = driver_bridge::enumerate_modules();
@@ -428,27 +482,69 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		attached_pid,
 		driver_module_count,
 		modules.size());
-	if (modules.empty())
+	if (modules.empty()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("Module enumeration returned no entries.");
-	if (mcp_standalone::current_call_cancelled())
+	}
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("module_enumeration");
+	}
 
 	phase_start = GetTickCount64();
 	const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
 	mark_phase("module_select", phase_start);
-	if (!selected)
+	if (!selected) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("Requested module was not found in the attached process.");
-	if (mcp_standalone::current_call_cancelled())
+	}
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("module_select");
+	}
 
 	phase_start = GetTickCount64();
 	pe_parser::pe_info_t pe;
 	const bool pe_ok = pe_parser::parse(selected->base, pe, false);
 	mark_phase("pe_parse_headers", phase_start);
-	if (!pe_ok)
+	if (!pe_ok) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("pe_parser::parse failed on the selected module.");
-	if (mcp_standalone::current_call_cancelled())
+	}
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("pe_parse_headers");
+	}
 
 	phase_start = GetTickCount64();
 	json sections = json::array();
@@ -464,8 +560,15 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		sections.push_back(std::move(o));
 	}
 	mark_phase("sections", phase_start);
-	if (mcp_standalone::current_call_cancelled())
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("sections");
+	}
 
 	phase_start = GetTickCount64();
 	json functions = json::array();
@@ -541,8 +644,15 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		emit_function(selected->base + s.virtual_address, name, "executable_section");
 	}
 	mark_phase("functions", phase_start);
-	if (mcp_standalone::current_call_cancelled())
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("functions");
+	}
 
 	json imports = json::array();
 	json exports = json::array();
@@ -582,8 +692,15 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		phase_details["export_function_promotion_timed_out"] = export_function_promotion_timed_out;
 		phase_details["functions_after_export_promotion"] = functions.size();
 		mark_phase("exports", phase_start);
-		if (mcp_standalone::current_call_cancelled())
+		if (mcp_standalone::current_call_cancelled()) {
+			if (be_admission.active()) {
+				diag::log_tagged_fmt("analysis",
+					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+					static_cast<unsigned long long>(be_admission.token()));
+				be_admission.release("completed");
+			}
 			return cancelled_result("exports");
+		}
 	}
 	if (include_imports) {
 		phase_start = GetTickCount64();
@@ -595,8 +712,15 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		phase_details["imports_truncated"] = imports_truncated;
 		phase_details["imports_returned"] = imports.size();
 		mark_phase("imports", phase_start);
-		if (mcp_standalone::current_call_cancelled())
+		if (mcp_standalone::current_call_cancelled()) {
+			if (be_admission.active()) {
+				diag::log_tagged_fmt("analysis",
+					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+					static_cast<unsigned long long>(be_admission.token()));
+				be_admission.release("completed");
+			}
 			return cancelled_result("imports");
+		}
 	}
 
 	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
@@ -633,6 +757,12 @@ static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
 		result["imports"].size(),
 		result["exports"].size(),
 		static_cast<unsigned long long>(GetTickCount64() - start_ms));
+	if (be_admission.active()) {
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
+			static_cast<unsigned long long>(be_admission.token()));
+		be_admission.release("completed");
+	}
 	return tool_result_t::ok(result);
 }
 
@@ -1081,14 +1211,54 @@ static tool_result_t symbolic_manage_solve_path(const json& params)
 
 static tool_result_t analysis_query_imports(const json& params)
 {
-	if (driver_bridge::attached_pid() == 0)
+	mcp_standalone::downstream::producer_identity_t be_id;
+	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
+	be_id.tool_name = "analysis_query_imports";
+	mcp_standalone::downstream::scoped_admission_t be_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
+	if (!be_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-REJECT analysis_query_imports reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			"Broad enumeration capacity exhausted; work was not started.",
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, be_id));
+	}
+	diag::log_tagged_fmt("analysis",
+		"FEATURE-WORKER-GROUP-ADMIT analysis_query_imports token=%llu",
+		static_cast<unsigned long long>(be_admission.token()));
+
+	if (driver_bridge::attached_pid() == 0) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("No process is attached; use sessions_manage action=attach_pid first.");
+	}
 	auto modules = driver_bridge::enumerate_modules();
-	if (modules.empty())
+	if (modules.empty()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("Module enumeration returned no entries.");
+	}
 	pe_parser::pe_info_t pe;
-	if (!pe_parser::parse(modules.front().base, pe, false))
+	if (!pe_parser::parse(modules.front().base, pe, false)) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("pe_parser::parse failed on the main module.");
+	}
 	size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
 	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -1118,23 +1288,76 @@ static tool_result_t analysis_query_imports(const json& params)
 	result["max_entries"] = max_entries;
 	result["timeout_ms"] = timeout_ms;
 	result["imports"] = std::move(arr);
+	if (be_admission.active()) {
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
+			static_cast<unsigned long long>(be_admission.token()));
+		be_admission.release("completed");
+	}
 	return tool_result_t::ok(result);
 }
 
 static tool_result_t analysis_query_exports(const json& params)
 {
-	if (driver_bridge::attached_pid() == 0)
+	mcp_standalone::downstream::producer_identity_t be_id;
+	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
+	be_id.tool_name = "analysis_query_exports";
+	mcp_standalone::downstream::scoped_admission_t be_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
+	if (!be_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-REJECT analysis_query_exports reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			"Broad enumeration capacity exhausted; work was not started.",
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, be_id));
+	}
+	diag::log_tagged_fmt("analysis",
+		"FEATURE-WORKER-GROUP-ADMIT analysis_query_exports token=%llu",
+		static_cast<unsigned long long>(be_admission.token()));
+
+	if (driver_bridge::attached_pid() == 0) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("No process is attached; use sessions_manage action=attach_pid first.");
+	}
 	auto modules = driver_bridge::enumerate_modules();
-	if (modules.empty())
+	if (modules.empty()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("Module enumeration returned no entries.");
+	}
 	const std::string requested_module = params.value("module_name", std::string());
 	const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
-	if (!selected)
+	if (!selected) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("Requested module was not found in the attached process.");
+	}
 	pe_parser::pe_info_t pe;
-	if (!pe_parser::parse(selected->base, pe, false))
+	if (!pe_parser::parse(selected->base, pe, false)) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error("pe_parser::parse failed on the selected module.");
+	}
 	size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
 	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
 	const std::string selected_name_lc = lower_ascii(selected->name);
@@ -1236,11 +1459,36 @@ static tool_result_t analysis_query_exports(const json& params)
 		static_cast<unsigned long long>(GetTickCount64() - analysis_exports_t0),
 		effective_timeout_ms);
 	result["exports"] = std::move(arr);
+	if (be_admission.active()) {
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
+			static_cast<unsigned long long>(be_admission.token()));
+		be_admission.release("completed");
+	}
 	return tool_result_t::ok(result);
 }
 
 static tool_result_t analysis_query_types(const json& params)
 {
+	mcp_standalone::downstream::producer_identity_t be_id;
+	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
+	be_id.tool_name = "analysis_query_types";
+	mcp_standalone::downstream::scoped_admission_t be_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
+	if (!be_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-REJECT analysis_query_types reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			"Broad enumeration capacity exhausted; work was not started.",
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, be_id));
+	}
+	diag::log_tagged_fmt("analysis",
+		"FEATURE-WORKER-GROUP-ADMIT analysis_query_types token=%llu",
+		static_cast<unsigned long long>(be_admission.token()));
+
 	std::string filter;
 	if (params.contains("filter") && params["filter"].is_string()) {
 		filter = params["filter"].get<std::string>();
@@ -1272,6 +1520,12 @@ static tool_result_t analysis_query_types(const json& params)
 				arr.push_back({{"module", mod.module_name}, {"name", e.name}, {"kind", "enum"}, {"member_count", e.members.size()}});
 			}
 		}
+	}
+	if (be_admission.active()) {
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-RELEASE analysis_query_types token=%llu reason=completed",
+			static_cast<unsigned long long>(be_admission.token()));
+		be_admission.release("completed");
 	}
 	return tool_result_t::ok(json{{"total", total}, {"returned", arr.size()}, {"types", arr}});
 }
@@ -1324,6 +1578,25 @@ static tool_result_t analysis_query_type_definition(const json& params)
 
 static tool_result_t analysis_query_pdb_symbols(const json& params)
 {
+	mcp_standalone::downstream::producer_identity_t be_id;
+	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
+	be_id.tool_name = "analysis_query_pdb_symbols";
+	mcp_standalone::downstream::scoped_admission_t be_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
+	if (!be_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-REJECT analysis_query_pdb_symbols reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			"Broad enumeration capacity exhausted; work was not started.",
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, be_id));
+	}
+	diag::log_tagged_fmt("analysis",
+		"FEATURE-WORKER-GROUP-ADMIT analysis_query_pdb_symbols token=%llu",
+		static_cast<unsigned long long>(be_admission.token()));
+
 	std::string filter;
 	if (params.contains("filter") && params["filter"].is_string())
 		filter = lower_ascii(params["filter"].get<std::string>());
@@ -1356,11 +1629,36 @@ static tool_result_t analysis_query_pdb_symbols(const json& params)
 			}
 		}
 	}
+	if (be_admission.active()) {
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-RELEASE analysis_query_pdb_symbols token=%llu reason=completed",
+			static_cast<unsigned long long>(be_admission.token()));
+		be_admission.release("completed");
+	}
 	return tool_result_t::ok(json{{"total", total}, {"returned", arr.size()}, {"symbols", arr}});
 }
 
 static tool_result_t analysis_query_binary_map_overview(const json& params)
 {
+	mcp_standalone::downstream::producer_identity_t be_id;
+	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
+	be_id.tool_name = "binary_map_overview";
+	mcp_standalone::downstream::scoped_admission_t be_admission =
+		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
+	if (!be_admission.active()) {
+		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-REJECT binary_map_overview reason=%s quota=%s observed=%zu limit=%zu",
+			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
+		return tool_result_t::error(
+			"Broad enumeration capacity exhausted; work was not started.",
+			"MCP_DOWNSTREAM_CAPACITY_REJECT",
+			mcp_standalone::downstream::rejection_json(rej, be_id));
+	}
+	diag::log_tagged_fmt("analysis",
+		"FEATURE-WORKER-GROUP-ADMIT binary_map_overview token=%llu",
+		static_cast<unsigned long long>(be_admission.token()));
+
 	const uint64_t start_ms = GetTickCount64();
 	json phases = json::object();
 	json phase_details = json::object();
@@ -1389,6 +1687,12 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 	if (params.value("fast_summary", false) &&
 		!params.value("include_xrefs", false)) {
 		diag::log_tagged("analysis", "binary_map_overview_delegate_fast_summary");
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return analysis_query_binary_map_fast_summary(params);
 	}
 	uint64_t phase_start = GetTickCount64();
@@ -1409,8 +1713,15 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 		{"include_entropy", opts.include_entropy}};
 	mark_phase("request_options", phase_start);
 	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled())
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("pre_generate");
+	}
 	mark_phase("cancellation_check_pre_generate", phase_start);
 
 	for (const char* delegated : { "module_resolution", "pe_parse", "sections", "entropy", "exports_imports", "function_discovery", "xref_callee_work" }) {
@@ -1429,12 +1740,25 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 		out["phase_details"] = phase_details;
 		out["elapsed_ms"] = GetTickCount64() - start_ms;
 		out["binary_map_error"] = aida::binary_map::last_error();
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return tool_result_t::error(aida::binary_map::last_error(), out);
 	}
 	mark_phase("binary_map_generate_total", phase_start);
 	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled())
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("post_generate");
+	}
 	mark_phase("cancellation_check_post_generate", phase_start);
 	char buf[32];
 	phase_start = GetTickCount64();
@@ -1457,8 +1781,15 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 	phase_details["sections_serialized"] = sections.size();
 	mark_phase("serialization_sections", phase_start);
 	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled())
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("post_sections_serialization");
+	}
 	mark_phase("cancellation_check_post_sections", phase_start);
 	phase_start = GetTickCount64();
 	json functions = json::array();
@@ -1477,8 +1808,15 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 	phase_details["functions_serialized"] = functions.size();
 	mark_phase("serialization_functions", phase_start);
 	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled())
+	if (mcp_standalone::current_call_cancelled()) {
+		if (be_admission.active()) {
+			diag::log_tagged_fmt("analysis",
+				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
+				static_cast<unsigned long long>(be_admission.token()));
+			be_admission.release("completed");
+		}
 		return cancelled_result("post_functions_serialization");
+	}
 	mark_phase("cancellation_check_post_functions", phase_start);
 	phase_start = GetTickCount64();
 	json globals = json::array();
@@ -1529,6 +1867,12 @@ static tool_result_t analysis_query_binary_map_overview(const json& params)
 		m.imports.size(),
 		m.exports.size(),
 		static_cast<unsigned long long>(GetTickCount64() - start_ms));
+	if (be_admission.active()) {
+		diag::log_tagged_fmt("analysis",
+			"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
+			static_cast<unsigned long long>(be_admission.token()));
+		be_admission.release("completed");
+	}
 	return tool_result_t::ok(result);
 }
 
