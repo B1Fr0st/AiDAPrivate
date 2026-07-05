@@ -123,18 +123,18 @@ static tool_result_t handle_decompile_function(const json& params)
     };
     bool posted = false;
     {
-        aida::executor::submission_t _exec_sub;
+        aida::infra::executor::submission_t _exec_sub;
         _exec_sub.owner_subsystem = "standalone.decompiler.tools";
         _exec_sub.label = "decompile_tools.post";
         _exec_sub.thread_class = "queued_task";
-        _exec_sub.domain = aida::executor::domain_t::general;
+        _exec_sub.domain = aida::infra::executor::domain_t::general;
         _exec_sub.priority = 3;
         _exec_sub.body = run_decompile;
         _exec_sub.failure_policy = "reject_not_started";
         _exec_sub.ui_access_policy = "none";
         _exec_sub.shutdown_policy = "drain";
         _exec_sub.no_capacity_reason = "no_capacity_needed_general_queue";
-        auto _exec_result = aida::executor::submit(std::move(_exec_sub));
+        auto _exec_result = aida::infra::executor::submit(std::move(_exec_sub));
         posted = _exec_result.submitted;
         (void)_exec_result;
     }

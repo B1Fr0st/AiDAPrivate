@@ -63,6 +63,16 @@ RAW_OR_EXCEPTION_APIS = {
     "NtCreateThreadEx",
     "std::async",
     "QueueUserWorkItem",
+    "CreateRemoteThread",
+    "RtlCreateUserThread",
+    "CreateThreadpoolWork",
+    "SubmitThreadpoolWork",
+    "CreateThreadpoolTimer",
+    "SetThreadpoolTimer",
+    "TrySubmitThreadpoolCallback",
+    "_beginthread",
+    "NtCreateThread",
+    "std::packaged_task",
 }
 KNOWN_APIS = RAW_OR_EXCEPTION_APIS.union({
     "work_queue::post_service_labeled",
@@ -78,6 +88,7 @@ KNOWN_APIS = RAW_OR_EXCEPTION_APIS.union({
     "win_thread.start_detached",
     "PostMessageW",
     "PostThreadMessageW",
+    "aida::infra::executor::submit",
 })
 KNOWN_SECURITY_CLASSES = SECURITY_CLASSES_FAIL_CLOSED.union({
     "browser_sidecar",
@@ -135,6 +146,17 @@ SCAN_PATTERNS = [
     ("win_thread.start", "win_thread_start", re.compile(r"(?:\.|->)start\s*\(")),
     ("PostMessageW", "PostMessageW", re.compile(r"\bPostMessageW\s*\(")),
     ("PostThreadMessageW", "PostThreadMessageW", re.compile(r"\bPostThreadMessageW\s*\(")),
+    ("aida::infra::executor::submit", "executor_submit", re.compile(r"\baida::infra::executor::submit\s*\(")),
+    ("CreateRemoteThread", "CreateRemoteThread", re.compile(r"\bCreateRemoteThread(?:Ex)?\s*\(")),
+    ("RtlCreateUserThread", "RtlCreateUserThread", re.compile(r"\bRtlCreateUserThread\b")),
+    ("_beginthread", "_beginthread", re.compile(r"\b_beginthread\b(?!ex)")),
+    ("NtCreateThread", "NtCreateThread", re.compile(r"\bNtCreateThread\b(?!Ex)")),
+    ("std::packaged_task", "std::packaged_task", re.compile(r"\bstd::packaged_task\b")),
+    ("CreateThreadpoolWork", "CreateThreadpoolWork", re.compile(r"\bCreateThreadpoolWork\s*\(")),
+    ("SubmitThreadpoolWork", "SubmitThreadpoolWork", re.compile(r"\bSubmitThreadpoolWork\s*\(")),
+    ("CreateThreadpoolTimer", "CreateThreadpoolTimer", re.compile(r"\bCreateThreadpoolTimer\s*\(")),
+    ("SetThreadpoolTimer", "SetThreadpoolTimer", re.compile(r"\bSetThreadpoolTimer\s*\(")),
+    ("TrySubmitThreadpoolCallback", "TrySubmitThreadpoolCallback", re.compile(r"\bTrySubmitThreadpoolCallback\s*\(")),
 ]
 
 THREAD_VECTOR_DECL_PATTERN = re.compile(r"\bstd::vector\s*<\s*std::thread\s*>\s+([A-Za-z_][A-Za-z0-9_]*)")
@@ -175,13 +197,22 @@ def stable_id(path: str, api: str, context: str, occurrence_index: int) -> str:
     return f"{path}:{api}:{digest}:{occurrence_index}"
 
 
-def should_keep_match(api: str, line: str) -> bool:
+def should_keep_match(api: str, line: str, rel_path: str = "", joinable_thread_names: set[str] | None = None) -> bool:
     compact = line.replace(" ", "")
+    if api == "std::thread" and "taskflow_evaluation" in rel_path:
+        compact = line.replace(" ", "")
+        if 'constexpr' in line or 'static_assert' in line or '="' in compact or "'" in line:
+            return False
+        return True
     if api == "win_thread.wrapper_state":
         return "joinable_thread_t" in line
     if api == "win_thread.start_detached":
         return "aida::infra::win_thread::start_detached" in line
     if api == "win_thread.start":
+        if joinable_thread_names:
+            name_match = re.search(r"(\w+)\s*(?:\.|->)\s*start\s*\(", line)
+            if name_match and name_match.group(1) in joinable_thread_names:
+                return True
         return bool(re.search(r"(?:worker|writer|thread|reader_thread|regen_thread|refresher_thread|[A-Za-z_][A-Za-z0-9_]*(?:_thread|_worker|_monitor))(?:\.|->)start\s*\(", line))
     if api == "NtCreateThreadEx":
         return "NtCreateThreadEx" in line
@@ -198,11 +229,12 @@ def scan_hits() -> list[ScanHit]:
         lines = text.splitlines()
         rel = relpath(path)
         thread_vector_names = sorted(set(THREAD_VECTOR_DECL_PATTERN.findall(text)))
+        joinable_thread_names = set(re.findall(r"joinable_thread_t\s+(\w+)", text)) | set(re.findall(r"std::vector<aida::infra::win_thread::joinable_thread_t>\s+(\w+)", text))
         for api, token, pattern in SCAN_PATTERNS:
             for match in pattern.finditer(text):
                 line_no = text.count("\n", 0, match.start()) + 1
                 line = lines[line_no - 1] if 0 <= line_no - 1 < len(lines) else ""
-                if not should_keep_match(api, line):
+                if not should_keep_match(api, line, rel, joinable_thread_names):
                     continue
                 context = context_for(lines, line_no - 1)
                 key = (rel, api, context)
@@ -338,6 +370,11 @@ def classify(hit: ScanHit) -> dict[str, object]:
         deadline = "post attempts are immediate and must not replace bounded worker admission"
         shutdown = "no thread ownership; message posts are process/window lifetime wake signals only"
         lifetime = "message parameters must be wake-only or same-thread UI command state, never raw worker-owned payload pointers"
+    if hit.api == "aida::infra::executor::submit":
+        task_class = "queued_task"
+        failure = "reject_not_started"
+        approved = False
+        approved_reason = ""
     if "core/infra/" in path:
         task_class = "feature_worker_group" if hit.api in {"win_thread.start", "win_thread.start_detached", "win_thread.wrapper_state"} else "queued_task"
         security = "runtime_liveness"
@@ -423,7 +460,7 @@ def classify(hit: ScanHit) -> dict[str, object]:
         cancellation = "Camoufox work uses cooperative cancellation plus PID/session/generation-proven external cleanup only for owned sidecars"
         shutdown = "browser sidecar cleanup requires matching executable, PID, session, and generation ownership evidence"
         lifetime = "captured browser state must include session/generation ownership and cannot publish stale results"
-    if any(part in path for part in ["/network/", "/scanner/", "/disasm/", "/analysis/", "/debugger/", "/emulation/"]):
+    if any(part in path for part in ["/network/", "/scanner/", "/disasm/", "/analysis/", "/debugger/", "/emulation/"]) and not ("camoufox" in path or "headless" in path):
         task_class = "feature_worker_group" if hit.api in RAW_OR_EXCEPTION_APIS or hit.api in {"win_thread.start", "win_thread.start_detached"} else "queued_task"
         security = "driver_authority" if "/debugger/" in path or "driver" in path else "feature_runtime"
         priority = "P2" if "/debugger/" in path else "P3"
@@ -474,11 +511,14 @@ def classify(hit: ScanHit) -> dict[str, object]:
         approved_reason = "Test Lab network hook sidecar accept thread is path-specific and externally owned by the sidecar pair"
     if hit.api in {"std::thread", "std::thread.emplace_back", "detached std::thread"} and not approved_reason:
         approved = True
-        approved_reason = "existing reviewed raw std::thread feature worker group, holder, or vector start; future raw std::thread additions must add a path-specific contract entry"
+        approved_reason = f"existing reviewed raw std::thread path in {path_owner(path)}; loader sensitivity: {loader}; future raw std::thread additions must add a path-specific contract entry with owner and evidence"
     if hit.api in {"CreateThread", "_beginthreadex", "NtCreateThreadEx"} and not approved_reason:
         approved = True
-        approved_reason = "existing reviewed path-specific low-level thread use; future additions must add a justified contract entry"
+        approved_reason = f"existing reviewed {hit.api} use in {path_owner(path)}; loader sensitivity: {loader}; future additions must add a justified contract entry with owner and evidence"
     if hit.api in {"std::async", "QueueUserWorkItem"}:
+        approved = False
+        approved_reason = ""
+    if hit.api in {"CreateRemoteThread", "RtlCreateUserThread", "CreateThreadpoolWork", "SubmitThreadpoolWork", "CreateThreadpoolTimer", "SetThreadpoolTimer", "TrySubmitThreadpoolCallback", "_beginthread", "NtCreateThread", "std::packaged_task"} and not approved_reason:
         approved = False
         approved_reason = ""
     if security in SECURITY_CLASSES_FAIL_CLOSED:

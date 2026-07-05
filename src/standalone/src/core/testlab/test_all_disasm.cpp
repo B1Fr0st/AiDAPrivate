@@ -2338,11 +2338,11 @@ namespace {
         const uint64_t wd_range_hi = range_hi;
         bool watchdog_posted = false;
         {
-            aida::executor::submission_t _exec_sub;
+            aida::infra::executor::submission_t _exec_sub;
             _exec_sub.owner_subsystem = "standalone.testlab.disasm";
             _exec_sub.label = "xref_live_after_warm.watchdog";
             _exec_sub.thread_class = "queued_task";
-            _exec_sub.domain = aida::executor::domain_t::diagnostics;
+            _exec_sub.domain = aida::infra::executor::domain_t::diagnostics;
             _exec_sub.priority = 4;
             _exec_sub.body = [wd_state, watchdog_event_holder, t0, tag, wd_log_file, wd_pid, wd_module_name, wd_module_base, wd_module_size, wd_range_lo, wd_range_hi]() {
                 HANDLE watchdog_event = watchdog_event_holder.get();
@@ -2385,7 +2385,7 @@ namespace {
             _exec_sub.ui_access_policy = "none";
             _exec_sub.shutdown_policy = "drain";
             _exec_sub.no_capacity_reason = "no_capacity_needed_diagnostics_queue";
-            auto _exec_result = aida::executor::submit(std::move(_exec_sub));
+            auto _exec_result = aida::infra::executor::submit(std::move(_exec_sub));
             watchdog_posted = _exec_result.submitted;
             (void)_exec_result;
         }

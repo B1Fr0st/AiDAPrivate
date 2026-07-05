@@ -122,6 +122,17 @@ THREAD_PATTERNS = [
     (re.compile(r"\bNtCreateThreadEx\b"), "NtCreateThreadEx"),
     (re.compile(r"\bstd::async\s*\("), "std::async"),
     (re.compile(r"\bQueueUserWorkItem\s*\("), "QueueUserWorkItem"),
+    (re.compile(r"\bstd::jthread\b"), "std::jthread"),
+    (re.compile(r"\bCreateRemoteThread(?:Ex)?\s*\("), "CreateRemoteThread"),
+    (re.compile(r"\bRtlCreateUserThread\b"), "RtlCreateUserThread"),
+    (re.compile(r"\b_beginthread\b(?!ex)"), "_beginthread"),
+    (re.compile(r"\bNtCreateThread\b(?!Ex)"), "NtCreateThread"),
+    (re.compile(r"\bstd::packaged_task\b"), "std::packaged_task"),
+    (re.compile(r"\bCreateThreadpoolWork\s*\("), "CreateThreadpoolWork"),
+    (re.compile(r"\bSubmitThreadpoolWork\s*\("), "SubmitThreadpoolWork"),
+    (re.compile(r"\bCreateThreadpoolTimer\s*\("), "CreateThreadpoolTimer"),
+    (re.compile(r"\bSetThreadpoolTimer\s*\("), "SetThreadpoolTimer"),
+    (re.compile(r"\bTrySubmitThreadpoolCallback\s*\("), "TrySubmitThreadpoolCallback"),
 ]
 
 THREAD_VECTOR_DECL_PATTERN = re.compile(r"\bstd::vector\s*<\s*std::thread\s*>\s+([A-Za-z_][A-Za-z0-9_]*)")

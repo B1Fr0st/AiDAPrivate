@@ -15471,7 +15471,7 @@ void server_t::server_thread_func(int port)
                 diag_state.metadata_ring_summary = ring_summary.c_str();
                 const std::string wer_summary = aida::diagnostics::wer::correlation_summary_string();
                 diag_state.wer_correlation = wer_summary.c_str();
-                const std::string executor_snap = aida::executor::snapshot_json_string();
+                const std::string executor_snap = aida::infra::executor::snapshot_json_string();
                 diag_state.executor_snapshot = executor_snap.c_str();
                 diag_state.taskflow_evaluation = aida::infra::taskflow_eval::kTaskflowEvaluationStatus;
                 const std::string diag_json = aida::diagnostics::health::build_diagnostics_json(diag_state);

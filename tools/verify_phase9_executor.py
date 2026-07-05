@@ -21,7 +21,7 @@ Phase 9 requirements:
   8. No Taskflow headers in any AiDAStandalone source file
   9. No C++20 features in executor.hpp
   10. Phase 0-8 guard scripts still exist
-  11. Ported call sites use aida::executor::submit
+  11. Ported call sites use aida::infra::executor::submit
   12. EXECUTOR-UI-WAIT-REJECTED rejects UI-thread blocking waits
 """
 
@@ -167,7 +167,7 @@ check_file_exists(executor_path, "executor.hpp")
 
 # --- 2. Namespace aida::executor ---
 print("[2] Namespace aida::executor")
-check_pattern_in_file(executor_path, r"namespace\s+aida::executor", "namespace aida::executor")
+check_pattern_in_file(executor_path, r"namespace\s+aida::infra::executor", "namespace aida::infra::executor")
 
 # --- 3. All 9 domains present ---
 print("[3] All 9 domains present")
@@ -339,8 +339,8 @@ for phase in range(9):
     guard_path = os.path.join(REPO_ROOT, "tools", phase_guards[phase])
     check_file_exists(guard_path, f"Phase {phase} guard script")
 
-# --- 17. Ported call sites use aida::executor::submit ---
-print("[17] Ported call sites use aida::executor::submit")
+# --- 17. Ported call sites use aida::infra::executor::submit ---
+print("[17] Ported call sites use aida::infra::executor::submit")
 ported_files = [
     os.path.join(STANDALONE_ROOT, "core", "disasm", "decompile_tools_standalone.cpp"),
     os.path.join(STANDALONE_ROOT, "core", "testlab", "test_all_disasm.cpp"),
@@ -358,10 +358,10 @@ for candidate in ported_files:
     try:
         with open(candidate, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-        if re.search(r"aida::executor::submit", content):
-            passed.append(f"PORTED: {os.path.relpath(candidate, REPO_ROOT)} uses aida::executor::submit")
+        if re.search(r"aida::infra::executor::submit", content):
+            passed.append(f"PORTED: {os.path.relpath(candidate, REPO_ROOT)} uses aida::infra::executor::submit")
         else:
-            errors.append(f"NOT_PORTED: {os.path.relpath(candidate, REPO_ROOT)} does not use aida::executor::submit")
+            errors.append(f"NOT_PORTED: {os.path.relpath(candidate, REPO_ROOT)} does not use aida::infra::executor::submit")
     except Exception as e:
         errors.append(f"READ_ERROR: {os.path.relpath(candidate, REPO_ROOT)}: {e}")
 for candidate, reason in non_portable_files:
@@ -403,16 +403,16 @@ print("[20] Executor lifecycle wired into main.cpp")
 main_cpp_path = os.path.join(STANDALONE_ROOT, "main.cpp")
 check_pattern_in_file(main_cpp_path, r'#include.*core/infra/executor\.hpp', "main.cpp includes executor.hpp")
 check_pattern_in_file(main_cpp_path, r'#include.*core/infra/taskflow_evaluation\.hpp', "main.cpp includes taskflow_evaluation.hpp")
-check_pattern_in_file(main_cpp_path, r'aida::executor::set_ui_owner_tid', "main.cpp calls executor::set_ui_owner_tid")
+check_pattern_in_file(main_cpp_path, r'aida::infra::executor::set_ui_owner_tid', "main.cpp calls executor::set_ui_owner_tid")
 check_pattern_in_file(main_cpp_path, r'aida::infra::taskflow_eval::log_evaluation', "main.cpp calls taskflow_eval::log_evaluation")
-check_pattern_in_file(main_cpp_path, r'aida::executor::check_deadlines', "main.cpp calls executor::check_deadlines from periodic tick")
+check_pattern_in_file(main_cpp_path, r'aida::infra::executor::check_deadlines', "main.cpp calls executor::check_deadlines from periodic tick")
 
 # --- 21. Executor snapshot wired into mcp_standalone.cpp health endpoint ---
 print("[21] Executor snapshot wired into mcp_standalone.cpp health endpoint")
 mcp_cpp_path = os.path.join(STANDALONE_ROOT, "core", "mcp", "mcp_standalone.cpp")
 check_pattern_in_file(mcp_cpp_path, r'#include.*infra/executor\.hpp', "mcp_standalone.cpp includes executor.hpp")
 check_pattern_in_file(mcp_cpp_path, r'#include.*infra/taskflow_evaluation\.hpp', "mcp_standalone.cpp includes taskflow_evaluation.hpp")
-check_pattern_in_file(mcp_cpp_path, r'aida::executor::snapshot_json_string', "mcp_standalone.cpp calls executor::snapshot_json_string")
+check_pattern_in_file(mcp_cpp_path, r'aida::infra::executor::snapshot_json_string', "mcp_standalone.cpp calls executor::snapshot_json_string")
 check_pattern_in_file(mcp_cpp_path, r'diag_state\.executor_snapshot\s*=', "mcp_standalone.cpp populates diag_state.executor_snapshot")
 check_pattern_in_file(mcp_cpp_path, r'diag_state\.taskflow_evaluation\s*=', "mcp_standalone.cpp populates diag_state.taskflow_evaluation")
 check_pattern_in_file(mcp_cpp_path, r'aida::infra::taskflow_eval::kTaskflowEvaluationStatus', "mcp_standalone.cpp references taskflow evaluation status constant")
@@ -446,9 +446,25 @@ forbidden_domain_files = [
     os.path.join(STANDALONE_ROOT, "main.cpp"),
     os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_license.hpp"),
     os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_license.cpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_license_transport.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_license_transport.cpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "arc_loader.hpp"),
     os.path.join(STANDALONE_ROOT, "core", "runtime", "arc_loader.cpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_driver.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_driver.cpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_anti_tamper.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "standalone_anti_dump.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "gate_tokens.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "gate_tokens.cpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "license_state.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "runtime", "license_state.cpp"),
     os.path.join(STANDALONE_ROOT, "core", "anti-tamper", "orchestrator.hpp"),
     os.path.join(STANDALONE_ROOT, "core", "anti-tamper", "enforcement.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "anti-tamper", "integrity.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "anti-tamper", "anti_debug.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "anti-tamper", "anti_dump.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "anti-tamper", "anti_hook.hpp"),
+    os.path.join(STANDALONE_ROOT, "core", "anti-tamper", "state.hpp"),
     os.path.join(STANDALONE_ROOT, "core", "mcp", "mcp_standalone.cpp"),
     os.path.join(STANDALONE_ROOT, "core", "mcp", "mcp_standalone.hpp"),
     os.path.join(STANDALONE_ROOT, "core", "network", "burp", "camoufox_bridge.cpp"),
@@ -499,6 +515,38 @@ check_pattern_in_file(executor_path, r'taskflow_evaluation_status', "taskflow_ev
 print("[30] Executor shutdown_guard exists")
 check_pattern_in_file(executor_path, r'shutdown_guard_t', "shutdown_guard_t struct exists")
 check_pattern_in_file(executor_path, r'g_shutdown_guard', "static g_shutdown_guard instance exists")
+
+# --- 31. RAII guard in body_fn for exception-safe active-submission cleanup ---
+print("[31] RAII guard in body_fn for exception-safe cleanup")
+check_pattern_in_file(executor_path, r'scoped_finish_t', "scoped_finish_t RAII guard struct in body_fn")
+check_pattern_in_file(executor_path, r'EXECUTOR-FINISH-EXCEPTION', "EXECUTOR-FINISH-EXCEPTION log event for exception path")
+check_pattern_in_file(executor_path, r'EXECUTOR-BODY-EXCEPTION', "EXECUTOR-BODY-EXCEPTION log event for body exception")
+check_pattern_in_file(executor_path, r'exception_path', "exception_path flag in body_fn")
+
+# --- 32. Reject-reason tracking ---
+print("[32] Reject-reason tracking")
+check_pattern_in_file(executor_path, r'record_reject_reason', "record_reject_reason function exists")
+check_pattern_in_file(executor_path, r'g_reject_reasons', "g_reject_reasons map exists")
+check_pattern_in_file(executor_path, r'kMaxRejectReasonEntries', "bounded reject reason entries limit")
+check_pattern_in_file(executor_path, r'reject_reasons', "reject_reasons array in snapshot_json_string")
+
+# --- 33. Downstream governor association in health snapshot ---
+print("[33] Downstream governor association in health snapshot")
+check_pattern_in_file(executor_path, r'downstream_governor', "downstream_governor object in snapshot_json_string")
+check_pattern_in_file(executor_path, r'gov_snap\.total_active', "downstream governor total_active in snapshot")
+check_pattern_in_file(executor_path, r'gov_snap\.total_rejected', "downstream governor total_rejected in snapshot")
+check_pattern_in_file(executor_path, r'gov_snap\.shutdown_pending', "downstream governor shutdown_pending in snapshot")
+
+# --- 34. Capacity lease association in active_submission_t ---
+print("[34] Capacity lease association in active_submission_t")
+check_pattern_in_file(executor_path, r'capacity_lease', "capacity_lease field in active_submission_t")
+check_pattern_in_file(executor_path, r'capacity_lease_active', "capacity_lease_active count in snapshot_json_string")
+
+# --- 35. Shutdown stale-entry cleanup after queue drain ---
+print("[35] Shutdown stale-entry cleanup after queue drain")
+check_pattern_in_file(executor_path, r'EXECUTOR-SHUTDOWN-STALE', "EXECUTOR-SHUTDOWN-STALE log event")
+check_pattern_in_file(executor_path, r'EXECUTOR-SHUTDOWN-STALE-CLEARED', "EXECUTOR-SHUTDOWN-STALE-CLEARED log event")
+check_pattern_in_file(executor_path, r'g_active_submissions\.clear\(\)', "g_active_submissions.clear() in shutdown")
 
 # --- Summary ---
 print()

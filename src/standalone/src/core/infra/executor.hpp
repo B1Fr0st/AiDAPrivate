@@ -26,7 +26,7 @@
 #endif
 #include <Windows.h>
 
-namespace aida::executor {
+namespace aida::infra::executor {
 
 inline constexpr std::size_t kMaxActiveSubmissions = 4096;
 inline constexpr std::uint32_t kWaitPollIntervalMs = 5;
@@ -139,6 +139,7 @@ struct active_submission_t {
     std::string owner_subsystem;
     std::uint64_t deadline_ms = 0;
     std::uint64_t submitted_ms = 0;
+    std::uint64_t capacity_lease = 0;
     std::function<void()> cancel_hook;
 };
 
@@ -165,18 +166,36 @@ inline std::atomic<std::uint64_t> submits_per_domain[domain_count] = {};
 inline std::atomic<std::uint64_t> rejects_per_domain[domain_count] = {};
 
 inline std::atomic<std::uint64_t> g_next_task_id{0};
-inline std::atomic<DWORD> g_ui_owner_tid{0};
+inline std::atomic<DWORD> g_executor_ui_owner_tid{0};
 inline std::atomic<bool> g_shutdown_requested{false};
 
 inline std::mutex g_active_mutex;
 inline std::map<std::uint64_t, active_submission_t> g_active_submissions;
+
+inline std::mutex g_reject_reason_mutex;
+inline std::map<std::string, std::uint64_t> g_reject_reasons;
+inline constexpr std::size_t kMaxRejectReasonEntries = 32;
+
+inline void record_reject_reason(const char* reason) {
+    if (!reason)
+        return;
+    std::lock_guard<std::mutex> lk(g_reject_reason_mutex);
+    auto it = g_reject_reasons.find(reason);
+    if (it != g_reject_reasons.end()) {
+        ++it->second;
+    } else if (g_reject_reasons.size() < kMaxRejectReasonEntries) {
+        g_reject_reasons[reason] = 1;
+    } else {
+        ++g_reject_reasons["other"];
+    }
+}
 
 inline static const char* taskflow_evaluation_status() {
     return "not_integrated_rejected_by_cxx_standard";
 }
 
 inline void set_ui_owner_tid(DWORD tid) {
-    g_ui_owner_tid.store(tid, std::memory_order_release);
+    g_executor_ui_owner_tid.store(tid, std::memory_order_release);
     diag::log_tagged_fmt("executor",
         "EXECUTOR-UI-OWNER-TID-SET tid=%lu caller_tid=%lu",
         static_cast<unsigned long>(tid),
@@ -184,7 +203,7 @@ inline void set_ui_owner_tid(DWORD tid) {
 }
 
 inline bool is_ui_thread() {
-    const DWORD owner = g_ui_owner_tid.load(std::memory_order_acquire);
+    const DWORD owner = g_executor_ui_owner_tid.load(std::memory_order_acquire);
     if (owner == 0)
         return false;
     return GetCurrentThreadId() == owner;
@@ -232,6 +251,7 @@ inline bool store_active_submission(std::uint64_t task_id, const submission_t& s
     entry.owner_subsystem = sub.owner_subsystem ? sub.owner_subsystem : "<unknown>";
     entry.deadline_ms = sub.deadline_ms;
     entry.submitted_ms = now_ms();
+    entry.capacity_lease = sub.capacity_lease;
     entry.cancel_hook = sub.cancel_hook;
     g_active_submissions[task_id] = std::move(entry);
     return true;
@@ -250,6 +270,7 @@ inline submit_result_t submit(submission_t&& sub) {
         result.reject_reason = "missing_owner_subsystem";
         total_rejected.fetch_add(1, std::memory_order_acq_rel);
         rejects_per_domain[domain_index(sub.domain)].fetch_add(1, std::memory_order_acq_rel);
+        record_reject_reason("missing_owner_subsystem");
         diag::log_tagged_fmt("executor",
             "EXECUTOR-REJECT reason=missing_owner_subsystem label=%s domain=%s priority=%d tid=%lu",
             sub.label ? sub.label : "<null>",
@@ -263,6 +284,7 @@ inline submit_result_t submit(submission_t&& sub) {
         result.reject_reason = "missing_label";
         total_rejected.fetch_add(1, std::memory_order_acq_rel);
         rejects_per_domain[domain_index(sub.domain)].fetch_add(1, std::memory_order_acq_rel);
+        record_reject_reason("missing_label");
         diag::log_tagged_fmt("executor",
             "EXECUTOR-REJECT reason=missing_label owner=%s domain=%s priority=%d tid=%lu",
             sub.owner_subsystem,
@@ -276,6 +298,7 @@ inline submit_result_t submit(submission_t&& sub) {
         result.reject_reason = "missing_body";
         total_rejected.fetch_add(1, std::memory_order_acq_rel);
         rejects_per_domain[domain_index(sub.domain)].fetch_add(1, std::memory_order_acq_rel);
+        record_reject_reason("missing_body");
         diag::log_tagged_fmt("executor",
             "EXECUTOR-REJECT reason=missing_body owner=%s label=%s domain=%s priority=%d tid=%lu",
             sub.owner_subsystem,
@@ -302,6 +325,7 @@ inline submit_result_t submit(submission_t&& sub) {
             sub.diagnostic_id ? sub.diagnostic_id : "<none>",
             sub.request_id ? sub.request_id : "<none>",
             static_cast<unsigned long>(GetCurrentThreadId()));
+        record_reject_reason("EXECUTOR-UI-WAIT-REJECTED");
         emit_breadcrumb(sub.domain, "EXECUTOR-UI-WAIT-REJECTED", sub, 0, 1);
         return result;
     }
@@ -310,6 +334,7 @@ inline submit_result_t submit(submission_t&& sub) {
         result.reject_reason = "executor_shutdown_requested";
         total_rejected.fetch_add(1, std::memory_order_acq_rel);
         rejects_per_domain[domain_index(sub.domain)].fetch_add(1, std::memory_order_acq_rel);
+        record_reject_reason("executor_shutdown_requested");
         diag::log_tagged_fmt("executor",
             "EXECUTOR-REJECT reason=executor_shutdown_requested owner=%s label=%s domain=%s priority=%d tid=%lu",
             sub.owner_subsystem,
@@ -358,16 +383,60 @@ inline submit_result_t submit(submission_t&& sub) {
             domain_name(domain),
             domain_to_queue_name(domain),
             static_cast<unsigned long>(GetCurrentThreadId()));
-        body();
-        diag::log_tagged_fmt("executor",
-            "EXECUTOR-FINISH task_id=%llu owner=%s label=%s domain=%s queue=%s tid=%lu note=finish_observed_via_queue_diagnostics",
-            static_cast<unsigned long long>(task_id),
-            owner.c_str(),
-            label.c_str(),
-            domain_name(domain),
-            domain_to_queue_name(domain),
-            static_cast<unsigned long>(GetCurrentThreadId()));
-        remove_active_submission(task_id);
+        bool exception_path = false;
+        struct scoped_finish_t {
+            std::uint64_t ftask_id;
+            const std::string& fowner;
+            const std::string& flabel;
+            domain_t fdomain;
+            bool& fexception_path;
+            ~scoped_finish_t() {
+                if (fexception_path) {
+                    diag::log_tagged_fmt("executor",
+                        "EXECUTOR-FINISH-EXCEPTION task_id=%llu owner=%s label=%s domain=%s queue=%s tid=%lu note=body_threw_active_entry_removed",
+                        static_cast<unsigned long long>(ftask_id),
+                        fowner.c_str(),
+                        flabel.c_str(),
+                        domain_name(fdomain),
+                        domain_to_queue_name(fdomain),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                } else {
+                    diag::log_tagged_fmt("executor",
+                        "EXECUTOR-FINISH task_id=%llu owner=%s label=%s domain=%s queue=%s tid=%lu note=finish_observed_via_queue_diagnostics",
+                        static_cast<unsigned long long>(ftask_id),
+                        fowner.c_str(),
+                        flabel.c_str(),
+                        domain_name(fdomain),
+                        domain_to_queue_name(fdomain),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
+                remove_active_submission(ftask_id);
+            }
+        } finish_guard{task_id, owner, label, domain, exception_path};
+        try {
+            body();
+        } catch (const std::exception& ex) {
+            exception_path = true;
+            diag::log_tagged_fmt("executor",
+                "EXECUTOR-BODY-EXCEPTION task_id=%llu owner=%s label=%s domain=%s err=%s tid=%lu note=exception_propagating_to_queue_seh_guard",
+                static_cast<unsigned long long>(task_id),
+                owner.c_str(),
+                label.c_str(),
+                domain_name(domain),
+                ex.what(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            throw;
+        } catch (...) {
+            exception_path = true;
+            diag::log_tagged_fmt("executor",
+                "EXECUTOR-BODY-EXCEPTION task_id=%llu owner=%s label=%s domain=%s err=unknown tid=%lu note=exception_propagating_to_queue_seh_guard",
+                static_cast<unsigned long long>(task_id),
+                owner.c_str(),
+                label.c_str(),
+                domain_name(domain),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            throw;
+        }
     };
 
     switch (sub.domain) {
@@ -447,6 +516,7 @@ inline submit_result_t submit(submission_t&& sub) {
         total_rejected.fetch_add(1, std::memory_order_acq_rel);
         rejects_per_domain[domain_index(sub.domain)].fetch_add(1, std::memory_order_acq_rel);
         result.reject_reason = post_reject_reason;
+        record_reject_reason(post_reject_reason.c_str());
         diag::log_tagged_fmt("executor",
             "EXECUTOR-REJECT reason=%s task_id=%llu owner=%s label=%s domain=%s queue=%s priority=%d tid=%lu",
             post_reject_reason.c_str(),
@@ -738,6 +808,28 @@ inline void shutdown() {
     work_queue::shutdown();
     critical_work_queue::shutdown();
 
+    {
+        std::lock_guard<std::mutex> lk(g_active_mutex);
+        if (!g_active_submissions.empty()) {
+            for (const auto& kv : g_active_submissions) {
+                const auto& entry = kv.second;
+                diag::log_tagged_fmt("executor",
+                    "EXECUTOR-SHUTDOWN-STALE task_id=%llu label=%s owner=%s domain=%s deadline_ms=%llu note=cleared_after_queue_drain",
+                    static_cast<unsigned long long>(kv.first),
+                    entry.label.c_str(),
+                    entry.owner_subsystem.c_str(),
+                    domain_name(entry.domain),
+                    static_cast<unsigned long long>(entry.deadline_ms));
+            }
+            std::size_t cleared = g_active_submissions.size();
+            g_active_submissions.clear();
+            diag::log_tagged_fmt("executor",
+                "EXECUTOR-SHUTDOWN-STALE-CLEARED count=%zu note=stale_active_entries_removed_post_drain tid=%lu",
+                cleared,
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+    }
+
     diag::log_tagged_fmt("executor",
         "EXECUTOR-SHUTDOWN-COMPLETE tid=%lu",
         static_cast<unsigned long>(GetCurrentThreadId()));
@@ -794,7 +886,51 @@ inline std::string snapshot_json_string() {
         if (c == '"' || c == '\\') out += '\\';
         out += c;
     }
-    out += "\"}";
+
+    out += "\",\"reject_reasons\":[";
+    {
+        std::lock_guard<std::mutex> lk(g_reject_reason_mutex);
+        bool first_reason = true;
+        for (const auto& kr : g_reject_reasons) {
+            if (!first_reason) out += ",";
+            first_reason = false;
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "{\"reason\":\"%s\",\"count\":%llu}",
+                kr.first.c_str(),
+                static_cast<unsigned long long>(kr.second));
+            out += buf;
+        }
+    }
+    out += "]";
+
+    {
+        auto gov_snap = mcp_standalone::downstream::governor_t::instance().snapshot();
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            ",\"downstream_governor\":{\"total_active\":%zu,\"total_rejected\":%zu,\"p0_reserve_available\":%zu,\"p1_reserve_available\":%zu,\"shutdown_pending\":%zu}",
+            gov_snap.total_active,
+            gov_snap.total_rejected,
+            gov_snap.p0_reserve_available,
+            gov_snap.p1_reserve_available,
+            gov_snap.shutdown_pending);
+        out += buf;
+    }
+
+    {
+        std::uint32_t capacity_lease_active = 0;
+        std::unique_lock<std::mutex> lk(g_active_mutex, std::try_to_lock);
+        if (lk.owns_lock()) {
+            for (const auto& kv : g_active_submissions) {
+                if (kv.second.capacity_lease != 0)
+                    ++capacity_lease_active;
+            }
+        }
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            ",\"capacity_lease_active\":%u",
+            static_cast<unsigned>(capacity_lease_active));
+        out += buf;
+    }
+
+    out += "}";
     return out;
 }
 

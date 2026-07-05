@@ -6569,7 +6569,7 @@ int main(int, char**)
     diag::log_tagged_critical("main", "diagnostic_veh_installed");
     aida::ui_thread::capture_owner_tid(::GetCurrentThreadId(), "main", "startup", "main_enter");
     command_sessions::set_ui_thread_id(::GetCurrentThreadId());
-    aida::executor::set_ui_owner_tid(::GetCurrentThreadId());
+    aida::infra::executor::set_ui_owner_tid(::GetCurrentThreadId());
     aida::infra::taskflow_eval::log_evaluation();
     diag::log_tagged_critical_fmt("startup",
         "run_correlation_generated run_id=%s pid=%lu tid=%lu tick=%llu",
@@ -8838,7 +8838,7 @@ int main(int, char**)
                         work_queue::log_stuck_workers(30000ULL, 8);
                         work_queue::log_service_stuck_workers(30000ULL, 8);
                         critical_work_queue::log_stuck_workers(30000ULL, 8);
-                        aida::executor::check_deadlines();
+                        aida::infra::executor::check_deadlines();
                     };
                     bool stuck_log_posted = work_queue::post_service_labeled("render.idle_stuck_worker_log", stuck_log_task);
                     if (!stuck_log_posted)
