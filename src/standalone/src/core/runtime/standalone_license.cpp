@@ -19,6 +19,7 @@
 #include "../infra/work_queue.hpp"
 #include "../crypto/keys.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../diagnostics/metadata_ring.hpp"
 #include "standalone_license_transport.hpp"
 #include "license_state.hpp"
 #include "gate_tokens.hpp"
@@ -6174,6 +6175,16 @@ namespace
                     lic_log(dbg_arc);
                 }
 
+                {
+                    aida::diagnostics::breadcrumb_options_t hb_opts{};
+                    hb_opts.category = aida::diagnostics::breadcrumb_category_t::license_arc_watchdog;
+                    hb_opts.label = "license_heartbeat_arc";
+                    hb_opts.reason = arc_hb_invoked ? (arc_hb_valid ? "arc_ok" : "arc_invalid") : "arc_skipped";
+                    hb_opts.owner_subsystem = "standalone_license";
+                    hb_opts.status_code = arc_hb_valid ? 0 : 1;
+                    aida::diagnostics::emit(std::move(hb_opts));
+                }
+
                 bool drv_loaded = driver_bridge::is_loaded();
                 bool drv_kernel = drv_loaded ? driver_bridge::using_kernel_driver() : false;
                 bool drv_proof_added = false;
@@ -10908,6 +10919,11 @@ namespace standalone_license
         return s_activation_completed_at_ms.load(std::memory_order_acquire);
     }
 
+    uint64_t last_heartbeat_time()
+    {
+        return static_cast<uint64_t>(s_last_heartbeat_time.load(std::memory_order_acquire));
+    }
+
     bool with_arc_comm_bridge(arc_comm_bridge_callback_t callback, void* ctx)
     {
         if (!callback)
@@ -11014,6 +11030,13 @@ namespace standalone_license
             lic_log_fmt("arc_heartbeat_seh code=0x%08lX", static_cast<unsigned long>(seh));
             SecureZeroMemory(&result, sizeof(result));
         }
+        aida::diagnostics::breadcrumb_options_t arc_opts{};
+        arc_opts.category = aida::diagnostics::breadcrumb_category_t::license_arc_watchdog;
+        arc_opts.label = "arc_heartbeat";
+        arc_opts.reason = (seh == ERROR_SUCCESS && result.valid) ? "ok" : "failed";
+        arc_opts.owner_subsystem = "standalone_license";
+        arc_opts.status_code = static_cast<std::uint16_t>(seh);
+        aida::diagnostics::emit(std::move(arc_opts));
         return result;
     }
 

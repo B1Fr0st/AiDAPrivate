@@ -113,6 +113,7 @@ namespace standalone_license
     bool is_arc_transfer_in_progress();
     bool validate_arc_required_exports(std::string& missing_out);
     uint64_t activation_completed_at();
+    uint64_t last_heartbeat_time();
     using arc_comm_bridge_callback_t = bool (*)(const arc_comm_vtable_t*, void*);
     bool with_arc_comm_bridge(arc_comm_bridge_callback_t callback, void* ctx);
     uint64_t arc_validate_tool(uint64_t tool_name_hash, uint64_t gate_token);

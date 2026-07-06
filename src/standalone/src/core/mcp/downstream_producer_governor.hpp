@@ -851,6 +851,36 @@ private:
         return count;
     }
 
+    struct bounded_snapshot_t {
+        bool lock_busy = false;
+        std::size_t total_active = 0;
+        std::uint64_t total_rejected = 0;
+        std::size_t camoufox_longop_active = 0;
+        std::size_t background_command_active = 0;
+        bool shutdown_pending = false;
+    };
+
+    bounded_snapshot_t try_snapshot_bounded() const
+    {
+        bounded_snapshot_t out;
+        std::unique_lock<std::mutex> lk(mutex_, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            out.lock_busy = true;
+            return out;
+        }
+        out.total_active = active_.size();
+        out.shutdown_pending = shutdown_requested_.load(std::memory_order_acquire);
+        for (const auto& kv : active_) {
+            if (kv.second.kind == producer_kind_t::camoufox_longop)
+                ++out.camoufox_longop_active;
+            else if (kv.second.kind == producer_kind_t::background_command)
+                ++out.background_command_active;
+        }
+        for (const auto& kv : kind_stats_)
+            out.total_rejected += kv.second.total_rejected.load(std::memory_order_relaxed);
+        return out;
+    }
+
     producer_quota_set_t quotas_;
     std::map<std::uint64_t, active_record_t> active_;
     std::map<std::string, kind_stats_t> kind_stats_;

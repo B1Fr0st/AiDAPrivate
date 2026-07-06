@@ -1439,6 +1439,34 @@ std::uint64_t time_budget_hit_count()
     return g_ui_dispatch_time_budget_hits.load(std::memory_order_acquire);
 }
 
+std::uint64_t budget_hit_count()
+{
+    return g_ui_dispatch_budget_hits.load(std::memory_order_acquire);
+}
+
+std::uint64_t rejected_count()
+{
+    return g_ui_dispatch_rejected.load(std::memory_order_acquire);
+}
+
+std::uint64_t drained_count()
+{
+    return g_ui_dispatch_drain_calls.load(std::memory_order_acquire);
+}
+
+bool wake_pending()
+{
+    return g_ui_dispatch_wake_pending.load(std::memory_order_acquire);
+}
+
+std::uint64_t oldest_queued_age_ms()
+{
+    const std::uint64_t now = ui_dispatch_now_ms();
+    std::lock_guard<std::mutex> lock(g_ui_dispatch_mtx);
+    ui_dispatch_refresh_metrics_locked();
+    return ui_dispatch_oldest_age_ms(now);
+}
+
 std::string top_queued_labels(std::size_t max_entries)
 {
     if (max_entries == 0)
@@ -5307,62 +5335,84 @@ static void emit_window_hung_snapshot(
         send_gle = send_ok ? 0UL : ::GetLastError();
     }
 
-    FILETIME system_time{};
-    ::GetSystemTimeAsFileTime(&system_time);
-    LARGE_INTEGER qpc{};
-    ::QueryPerformanceCounter(&qpc);
     const uint64_t now_ms = static_cast<uint64_t>(::GetTickCount64());
     const uint64_t last_render_tick = aida_tracer::g_render_last_tick_ms.load(std::memory_order_acquire);
     const DWORD current_queue_status = ::GetQueueStatus(QS_ALLINPUT);
-    diag::log_tagged_critical_fmt("tracer",
-        "WINDOW-HUNG-SNAPSHOT pid=%lu tid=%lu timestamp_100ns=%llu tick_ms=%llu qpc=%lld hwnd=0x%llX hwnd_valid=%d hwnd_pid=%lu ui_owner_tid=%lu current_tid=%lu render_tid=%lu is_hung=%d send_wm_null_ok=%d send_wm_null_gle=%lu send_wm_null_lresult=0x%llX send_timeout_ms=%u send_flags=0x%08X queue_status=0x%08lX current_queue_status=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX peek_calls=%llu peek_returns=%llu send_only_defers=%llu send_only_flushes=%llu stall_streak=%llu frame=%llu heartbeat_tick_ms=%llu heartbeat_age_ms=%llu phase=%s section=%s phase_id=%llu dispatch_stage=%s dispatch_msg=%s(0x%04X) dispatch_hwnd=0x%llX wndproc_stage=%s wndproc_msg=%s(0x%04X) wndproc_hwnd=0x%llX         mcp=%.1300s work_queues=%.2800s ui_dispatch=%.1300s",
-        static_cast<unsigned long>(::GetCurrentProcessId()),
-        static_cast<unsigned long>(::GetCurrentThreadId()),
-        static_cast<unsigned long long>(filetime_to_u64(system_time)),
-        static_cast<unsigned long long>(now_ms),
-        static_cast<long long>(qpc.QuadPart),
-        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-        hwnd_valid ? 1 : 0,
-        static_cast<unsigned long>(hwnd_pid),
-        static_cast<unsigned long>(ui_owner_tid),
-        static_cast<unsigned long>(::GetCurrentThreadId()),
-        static_cast<unsigned long>(render_tid),
-        is_hung ? 1 : 0,
-        send_ok ? 1 : 0,
-        static_cast<unsigned long>(send_gle),
-        static_cast<unsigned long long>(send_lresult),
-        kSendTimeoutMs,
-        kSendTimeoutFlags,
-        static_cast<unsigned long>(peek_status),
-        static_cast<unsigned long>(current_queue_status),
-        static_cast<unsigned long>(peek_error),
-        aida_tracer::g_peek_remove_flags.load(std::memory_order_acquire),
-        static_cast<unsigned long long>(aida_tracer::g_peek_filter_hwnd.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(aida_tracer::g_peek_call_count.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(aida_tracer::g_peek_return_count.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(aida_tracer::g_peek_send_only_defers.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(aida_tracer::g_peek_send_only_flushes.load(std::memory_order_acquire)),
-        static_cast<unsigned long long>(stall_streak),
-        static_cast<unsigned long long>(frame),
-        static_cast<unsigned long long>(last_render_tick),
-        static_cast<unsigned long long>(age_ms),
-        phase_name ? phase_name : "<null>",
-        render_section ? render_section : "<null>",
-        static_cast<unsigned long long>(phase_id),
-        dispatch_stage ? dispatch_stage : "<null>",
-        aida_tracer::message_name(dispatch_msg),
-        dispatch_msg,
-        static_cast<unsigned long long>(dispatch_hwnd),
-        wndproc_stage ? wndproc_stage : "<null>",
-        aida_tracer::message_name(wndproc_msg),
-        wndproc_msg,
-        static_cast<unsigned long long>(wndproc_hwnd),
-        mcp_snapshot[0] ? mcp_snapshot : "mcp{empty=1}",
-        queue_snapshot[0] ? queue_snapshot : "queues{empty=1}",
-        ui_dispatch_snapshot[0] ? ui_dispatch_snapshot : "ui_dispatch{empty=1}");
+
+    char testlab_step_buf[260] = {};
+    uint64_t testlab_step_start = 0;
+    test_all_features::current_phase_and_step(nullptr, 0, testlab_step_buf, sizeof(testlab_step_buf), &testlab_step_start);
+    const uint64_t testlab_step_elapsed = (testlab_step_start != 0 && now_ms >= testlab_step_start)
+        ? (now_ms - testlab_step_start) : 0;
+    const uint64_t arc_completed_at = standalone_license::activation_completed_at();
+    const uint64_t arc_liveness = (arc_completed_at != 0 && now_ms >= arc_completed_at)
+        ? (now_ms - arc_completed_at) : 0;
+    const uint64_t input_event_age = (g_last_input_event_tick_ms != 0 && now_ms >= g_last_input_event_tick_ms)
+        ? (now_ms - g_last_input_event_tick_ms) : 0;
+
+    mcp_standalone::bounded_diag_snapshot_t bdiag = mcp_standalone::bounded_diagnostic_snapshot();
+    std::string top_labels = aida::ui_thread::top_queued_labels(8);
+
+    aida::diagnostics::window_hung::hung_context_t hctx;
+    hctx.hwnd = hwnd;
+    hctx.ui_owner_tid = ui_owner_tid;
+    hctx.current_tid = ::GetCurrentThreadId();
+    hctx.is_hung = is_hung;
+    hctx.send_wm_null_ok = send_ok;
+    hctx.send_wm_null_gle = send_gle;
+    hctx.send_wm_null_lresult = static_cast<DWORD_PTR>(send_lresult);
+    hctx.send_timeout_ms = kSendTimeoutMs;
+    hctx.send_flags = kSendTimeoutFlags;
+    hctx.peek_queue_status = peek_status;
+    hctx.current_queue_status = current_queue_status;
+    hctx.peek_gle = peek_error;
+    hctx.peek_remove_flags = aida_tracer::g_peek_remove_flags.load(std::memory_order_acquire);
+    hctx.peek_filter_hwnd = static_cast<std::uint64_t>(aida_tracer::g_peek_filter_hwnd.load(std::memory_order_acquire));
+    hctx.peek_call_count = aida_tracer::g_peek_call_count.load(std::memory_order_acquire);
+    hctx.peek_return_count = aida_tracer::g_peek_return_count.load(std::memory_order_acquire);
+    hctx.send_only_defers = aida_tracer::g_peek_send_only_defers.load(std::memory_order_acquire);
+    hctx.send_only_flushes = aida_tracer::g_peek_send_only_flushes.load(std::memory_order_acquire);
+    hctx.stall_streak = stall_streak;
+    hctx.frame = frame;
+    hctx.heartbeat_tick_ms = last_render_tick;
+    hctx.heartbeat_age_ms = age_ms;
+    hctx.phase_name = phase_name;
+    hctx.render_section = render_section;
+    hctx.phase_id = phase_id;
+    hctx.dispatch_stage = dispatch_stage;
+    hctx.dispatch_msg = dispatch_msg;
+    hctx.dispatch_hwnd = static_cast<UINT_PTR>(dispatch_hwnd);
+    hctx.wndproc_stage = wndproc_stage;
+    hctx.wndproc_msg = wndproc_msg;
+    hctx.wndproc_hwnd = static_cast<UINT_PTR>(wndproc_hwnd);
+    hctx.render_tid = render_tid;
+    hctx.last_input_event_ms = input_event_age;
+    hctx.last_successful_pump_return_ms = 0;
+    hctx.ui_dispatcher_queue_depth = aida::ui_thread::pending_count();
+    hctx.ui_dispatcher_oldest_queued_age_ms = aida::ui_thread::oldest_queued_age_ms();
+    hctx.ui_dispatcher_wake_pending = aida::ui_thread::wake_pending();
+    hctx.ui_dispatcher_rejected_count = aida::ui_thread::rejected_count();
+    hctx.ui_dispatcher_drained_count = aida::ui_thread::drained_count();
+    hctx.ui_dispatcher_budget_hit_count = aida::ui_thread::budget_hit_count();
+    hctx.ui_dispatcher_time_budget_hit_count = aida::ui_thread::time_budget_hit_count();
+    hctx.ui_dispatcher_affinity_violations = aida::ui_thread::affinity_violation_count();
+    hctx.ui_dispatcher_top_labels = top_labels.c_str();
+    hctx.mcp_active_requests = bdiag.active_requests;
+    hctx.mcp_active_leases = bdiag.active_leases;
+    hctx.mcp_oldest_owner = bdiag.oldest_owner;
+    hctx.mcp_pending_cancellation_count = bdiag.pending_cancellations;
+    hctx.capacity_pressure = bdiag.capacity_snapshot;
+    hctx.downstream_pressure = bdiag.downstream_snapshot;
+    hctx.testlab_step = testlab_step_buf;
+    hctx.testlab_step_elapsed_ms = testlab_step_elapsed;
+    hctx.license_liveness_ms = 0;
+    hctx.arc_liveness_ms = arc_liveness;
+    hctx.driver_watchdog_ms = driver_bridge::driver_watchdog_age_ms();
+    hctx.mcp_snapshot = mcp_snapshot;
+    hctx.queue_snapshot = queue_snapshot;
+    hctx.ui_dispatch_snapshot = ui_dispatch_snapshot;
+    aida::diagnostics::window_hung::log_window_hung_snapshot(hctx);
     aida::diagnostics::window_hung::emit_hung_breadcrumb(hwnd, age_ms, phase_name);
-    aida::diagnostics::metadata_ring::dump_to_log(32);
-    aida::diagnostics::wer::log_wer_correlation("window_hung_snapshot");
 }
 
 struct process_cpu_delta_t {
@@ -6858,11 +6908,53 @@ int main(int, char**)
             ctx.exception_record_count = ep->ExceptionRecord->NumberParameters;
             ctx.crash_boundary_name = "unhandled_exception_filter";
             ctx.current_tid = GetCurrentThreadId();
+            ctx.ui_owner_tid = aida::ui_thread::owner_tid();
             ctx.last_render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
             ctx.last_render_tick_ms = aida_tracer::g_render_last_tick_ms.load(std::memory_order_acquire);
             const uint64_t crash_now_ms = static_cast<uint64_t>(GetTickCount64());
             ctx.render_heartbeat_age_ms = (ctx.last_render_tick_ms > 0 && crash_now_ms >= ctx.last_render_tick_ms)
                 ? (crash_now_ms - ctx.last_render_tick_ms) : 0;
+            ctx.last_wndproc_stage = aida_tracer::g_wndproc_stage.load(std::memory_order_acquire);
+            ctx.last_dispatch_stage = aida_tracer::g_dispatch_stage.load(std::memory_order_acquire);
+            ctx.last_message_pump_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
+            ctx.last_input_event_ms = (g_last_input_event_tick_ms != 0 && crash_now_ms >= g_last_input_event_tick_ms)
+                ? (crash_now_ms - g_last_input_event_tick_ms) : 0;
+            char testlab_phase_buf[200] = {};
+            char testlab_step_buf[260] = {};
+            uint64_t testlab_step_start = 0;
+            test_all_features::current_phase_and_step(testlab_phase_buf, sizeof(testlab_phase_buf),
+                testlab_step_buf, sizeof(testlab_step_buf), &testlab_step_start);
+            ctx.testlab_phase = testlab_phase_buf;
+            ctx.testlab_step = testlab_step_buf;
+            ctx.testlab_step_start_ms = testlab_step_start;
+            const uint64_t arc_completed_at = standalone_license::activation_completed_at();
+            ctx.arc_liveness_ms = (arc_completed_at != 0 && crash_now_ms >= arc_completed_at)
+                ? (crash_now_ms - arc_completed_at) : 0;
+            ctx.driver_watchdog_ms = driver_bridge::driver_watchdog_age_ms();
+            ctx.license_liveness_ms = 0;
+            char thread_classes_buf[320] = {};
+            {
+                const auto exec_snap = aida::infra::executor::active_snapshot();
+                _snprintf_s(thread_classes_buf, sizeof(thread_classes_buf), _TRUNCATE,
+                    "general=%u service=%u critical=%u ui_dispatch=%u external=%u long_running=%u security=%u feature=%u diagnostics=%u total=%u oldest_ms=%llu",
+                    static_cast<unsigned>(exec_snap.active_per_domain[0]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[1]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[2]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[3]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[4]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[5]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[6]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[7]),
+                    static_cast<unsigned>(exec_snap.active_per_domain[8]),
+                    static_cast<unsigned>(exec_snap.total_active),
+                    static_cast<unsigned long long>(exec_snap.oldest_active_ms));
+            }
+            ctx.thread_runtime_active_classes = thread_classes_buf;
+            char camoufox_longop_buf[64] = {};
+            mcp_standalone::bounded_diag_snapshot_t bdiag = mcp_standalone::bounded_diagnostic_snapshot();
+            _snprintf_s(camoufox_longop_buf, sizeof(camoufox_longop_buf), _TRUNCATE,
+                "active=%zu", bdiag.camoufox_longop_active);
+            ctx.camoufox_longop = camoufox_longop_buf;
             char mcp_snap[1400] = {};
             char queue_snap[3000] = {};
             char ui_dispatch_snap[1400] = {};
@@ -6872,6 +6964,9 @@ int main(int, char**)
             ctx.mcp_snapshot = mcp_snap;
             ctx.queue_snapshot = queue_snap;
             ctx.ui_dispatch_snapshot = ui_dispatch_snap;
+            ctx.capacity_snapshot = bdiag.capacity_snapshot;
+            ctx.lease_registry_snapshot = bdiag.lease_registry_snapshot;
+            ctx.downstream_snapshot = bdiag.downstream_snapshot;
             aida::diagnostics::crash::log_crash_snapshot(ctx);
         }
 

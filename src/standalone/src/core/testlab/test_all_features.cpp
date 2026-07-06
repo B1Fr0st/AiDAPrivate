@@ -19,6 +19,9 @@
 #include "../network/burp/camoufox_bridge.hpp"
 #include "../runtime/run_target.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../runtime/standalone_license.hpp"
+#include "../mcp/mcp_standalone.hpp"
+#include "../mcp/downstream_producer_governor.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../scanner/memory_scanner.hpp"
 #include "../scanner/aob_generator.hpp"
@@ -163,6 +166,16 @@ namespace test_all_features {
 		std::atomic<std::uint64_t> g_target_image_base{ 0 };
 		std::atomic<bool>          g_driver_attached{ false };
 		std::atomic<std::uint64_t> g_saved_dtb{ 0 };
+
+		std::mutex g_launch_state_mtx;
+		std::string g_target_executable_path;
+		std::string g_requested_cwd;
+		std::string g_effective_cwd;
+
+		std::mutex g_test_marker_mtx;
+		std::string g_first_failure_marker;
+		std::string g_last_successful_marker;
+		std::atomic<bool> g_first_failure_recorded{ false };
 
 		std::mutex        g_log_mtx;
 		enum class overlay_log_severity_t : std::uint8_t {
@@ -327,6 +340,8 @@ namespace test_all_features {
 			g_log_version.fetch_add(1, std::memory_order_acq_rel);
 		}
 
+		std::string load_label_snapshot(const std::shared_ptr<const std::string>& slot);
+
 		void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
 			char ts[40];
 			format_timestamp(ts, sizeof(ts));
@@ -349,6 +364,31 @@ namespace test_all_features {
 
 
 			push_log(s);
+
+			if (detail[0] == 'P' && detail[1] == 'A' && detail[2] == 'S' && detail[3] == 'S') {
+				std::string phase_label = load_label_snapshot(g_phase_label);
+				std::string step_label = load_label_snapshot(g_step_label);
+				char marker[256];
+				_snprintf_s(marker, sizeof(marker), _TRUNCATE, "phase=%s step=%s tag=%s",
+					phase_label.empty() ? "<none>" : phase_label.c_str(),
+					step_label.empty() ? "<none>" : step_label.c_str(),
+					tag ? tag : "<null>");
+				std::lock_guard<std::mutex> lk(g_test_marker_mtx);
+				g_last_successful_marker = marker;
+			} else if (detail[0] == 'F' && detail[1] == 'A' && detail[2] == 'I' && detail[3] == 'L') {
+				bool expected = false;
+				if (g_first_failure_recorded.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+					std::string phase_label = load_label_snapshot(g_phase_label);
+					std::string step_label = load_label_snapshot(g_step_label);
+					char marker[256];
+					_snprintf_s(marker, sizeof(marker), _TRUNCATE, "phase=%s step=%s tag=%s",
+						phase_label.empty() ? "<none>" : phase_label.c_str(),
+						step_label.empty() ? "<none>" : step_label.c_str(),
+						tag ? tag : "<null>");
+					std::lock_guard<std::mutex> lk(g_test_marker_mtx);
+					g_first_failure_marker = marker;
+				}
+			}
 		}
 
 		bool prepare_target_log_file(HANDLE hf) {
@@ -1324,6 +1364,34 @@ namespace test_all_features {
 				pkt_ctx.driver_attached = g_driver_attached.load(std::memory_order_acquire);
 				pkt_ctx.cancellation_requested = g_cancel_requested.load(std::memory_order_acquire);
 				pkt_ctx.shutdown_requested = false;
+				std::string target_path_snap;
+				std::string requested_cwd_snap;
+				std::string effective_cwd_snap;
+				{
+					std::lock_guard<std::mutex> lk(g_launch_state_mtx);
+					target_path_snap = g_target_executable_path;
+					requested_cwd_snap = g_requested_cwd;
+					effective_cwd_snap = g_effective_cwd;
+				}
+				pkt_ctx.target_executable_path = target_path_snap.c_str();
+				pkt_ctx.requested_cwd = requested_cwd_snap.c_str();
+				pkt_ctx.effective_cwd = effective_cwd_snap.c_str();
+				pkt_ctx.mcp_active_requests = mcp_standalone::active_http_request_count();
+				pkt_ctx.mcp_active_leases = mcp_standalone::active_tool_lease_count();
+				char downstream_buf[512] = {};
+				try {
+					auto ds_snap = mcp_standalone::downstream::governor_t::instance().snapshot();
+					_snprintf_s(downstream_buf, sizeof(downstream_buf), _TRUNCATE,
+						"total_active=%zu total_rejected=%zu shutdown_pending=%zu",
+						ds_snap.total_active,
+						ds_snap.total_rejected,
+						ds_snap.shutdown_pending);
+				} catch (...) {
+					_snprintf_s(downstream_buf, sizeof(downstream_buf), _TRUNCATE,
+						"snapshot_exception=1");
+				}
+				pkt_ctx.downstream_summary = downstream_buf;
+				pkt_ctx.ui_dispatcher_backlog = aida::ui_thread::pending_count();
 				auto wq_stats = work_queue::stats();
 				char wq_buf[512] = {};
 				_snprintf_s(wq_buf, sizeof(wq_buf), _TRUNCATE,
@@ -1344,6 +1412,18 @@ namespace test_all_features {
 					static_cast<unsigned long long>(cq_stats.rejected),
 					static_cast<unsigned long long>(cq_stats.oldest_active_ms));
 				pkt_ctx.critical_queue_snapshot = cq_buf;
+				pkt_ctx.license_liveness_ms = standalone_license::last_heartbeat_time();
+				pkt_ctx.arc_liveness_ms = standalone_license::activation_completed_at();
+				pkt_ctx.driver_watchdog_ms = driver_bridge::watchdog_last_ok_tick();
+				std::string first_failure_snap;
+				std::string last_success_snap;
+				{
+					std::lock_guard<std::mutex> lk(g_test_marker_mtx);
+					first_failure_snap = g_first_failure_marker;
+					last_success_snap = g_last_successful_marker;
+				}
+				pkt_ctx.first_failure_marker = first_failure_snap.c_str();
+				pkt_ctx.last_successful_marker = last_success_snap.c_str();
 				aida::diagnostics::testlab::log_hung_diagnostic_packet(pkt_ctx);
 			}
 			g_cancel_requested.store(true, std::memory_order_release);
@@ -2630,6 +2710,11 @@ namespace test_all_features {
 		log_msg(hf, "launch", "found: %s", exe_log.empty() ? "<unavailable>" : exe_log.c_str());
 
 		{
+			std::lock_guard<std::mutex> lk(g_launch_state_mtx);
+			g_target_executable_path = exe_log;
+		}
+
+		{
 			auto parent_dir = std::filesystem::path(exe).parent_path();
 			if (!parent_dir.empty()) {
 				symbol_store::add_target_module_search_path(parent_dir.string());
@@ -2644,6 +2729,11 @@ namespace test_all_features {
 				work_dir = current_directory_for_launch();
 			std::string work_dir_log = wide_to_log_string(work_dir);
 			log_msg(hf, "launch", "resolved working_dir=%s", work_dir.empty() ? "<inherit>" : work_dir_log.c_str());
+			{
+				std::lock_guard<std::mutex> lk(g_launch_state_mtx);
+				g_requested_cwd = work_dir_log;
+				g_effective_cwd = work_dir_log;
+			}
 			set_step("launch: log_target_launch_context");
 			log_msg(hf, "launch", "BEFORE target launch context probe");
 			DWORD context_seh = log_target_launch_context_seh(hf, exe, work_dir);
@@ -4201,6 +4291,18 @@ namespace test_all_features {
 			g_target_image_base.store(0);
 			g_driver_attached.store(false);
 			g_saved_dtb.store(0, std::memory_order_release);
+			{
+				std::lock_guard<std::mutex> lk(g_launch_state_mtx);
+				g_target_executable_path.clear();
+				g_requested_cwd.clear();
+				g_effective_cwd.clear();
+			}
+			g_first_failure_recorded.store(false, std::memory_order_release);
+			{
+				std::lock_guard<std::mutex> lk(g_test_marker_mtx);
+				g_first_failure_marker.clear();
+				g_last_successful_marker.clear();
+			}
 			reset_destructive_skip_accounting();
 			{
 				std::lock_guard<std::mutex> lk(g_phase_ledger_mtx);
@@ -4618,6 +4720,16 @@ namespace test_all_features {
 
 	void format_debug_snapshot(char* out, std::size_t cap) {
 		format_debug_snapshot_impl(out, cap);
+	}
+
+	void current_phase_and_step(char* phase, std::size_t phase_cap, char* step, std::size_t step_cap, std::uint64_t* step_start_ms_out) {
+		if (phase && phase_cap > 0) phase[0] = '\0';
+		if (step && step_cap > 0) step[0] = '\0';
+		if (step_start_ms_out) *step_start_ms_out = 0;
+		copy_label_snapshot(g_phase_label, phase, phase_cap);
+		copy_label_snapshot(g_step_label, step, step_cap);
+		if (step_start_ms_out)
+			*step_start_ms_out = g_step_start_tick.load(std::memory_order_acquire);
 	}
 
 	void log_external_session_event(const char* source, unsigned msg, std::uintptr_t wparam, std::intptr_t lparam) {

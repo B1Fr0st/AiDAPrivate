@@ -13,6 +13,7 @@
 #include "work_queue.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../diagnostics/metadata_ring.hpp"
 
 #include <windows.h>
 #include <psapi.h>
@@ -4031,6 +4032,13 @@ namespace
                 device ? (unsigned int)device->get_last_heartbeat_global_server_seed_present() : 0u,
                 device ? (unsigned int)device->get_last_heartbeat_global_ioctl_seed_present() : 0u,
                 static_cast<unsigned long long>(g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire)));
+            aida::diagnostics::breadcrumb_options_t wd_opts{};
+            wd_opts.category = aida::diagnostics::breadcrumb_category_t::license_arc_watchdog;
+            wd_opts.label = "driver_watchdog_heartbeat";
+            wd_opts.reason = ok ? "ok" : (connected ? "heartbeat_failed" : "not_connected");
+            wd_opts.owner_subsystem = "driver_bridge";
+            wd_opts.status_code = ok ? 0 : static_cast<std::uint16_t>(device ? device->get_last_heartbeat_error() : 0);
+            aida::diagnostics::emit(std::move(wd_opts));
             if (ok) {
                 g_driver_watchdog_last_ok_tick.store(GetTickCount64(), std::memory_order_release);
                 g_driver_consecutive_fail.store(0, std::memory_order_release);
@@ -10307,6 +10315,15 @@ namespace driver_bridge
         return device->sentinel_ready_since_tsc();
     }
 
+    uint64_t driver_watchdog_age_ms()
+    {
+        const uint64_t last_ok = g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
+        if (last_ok == 0)
+            return 0;
+        const uint64_t now = static_cast<uint64_t>(GetTickCount64());
+        return now >= last_ok ? now - last_ok : 0;
+    }
+
     dynamic_ioctl_state_t dynamic_ioctl_state()
     {
         dynamic_ioctl_state_t out{};
@@ -12108,5 +12125,10 @@ namespace driver_bridge
             out.push_back(std::move(dst));
         }
         return true;
+    }
+
+    uint64_t watchdog_last_ok_tick()
+    {
+        return g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
     }
 }

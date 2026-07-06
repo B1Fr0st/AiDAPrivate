@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../runtime/manual_map_tls.hpp"
+#include "../diagnostics/metadata_ring.hpp"
 #include "win_thread.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -622,7 +623,16 @@ inline bool post(std::function<void()> f) {
 }
 
 inline bool post_service(std::function<void()> f) {
-    return post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f), "work_queue.service_task");
+    const bool ok = post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f), "work_queue.service_task");
+    aida::diagnostics::breadcrumb_options_t opts{};
+    opts.category = aida::diagnostics::breadcrumb_category_t::service_queue;
+    opts.label = "service_queue_post";
+    opts.reason = ok ? "posted" : "rejected";
+    opts.owner_subsystem = "work_queue";
+    opts.tool_or_request_id = "work_queue.service_task";
+    opts.status_code = ok ? 0 : 1;
+    aida::diagnostics::emit(std::move(opts));
+    return ok;
 }
 
 inline bool post_labeled(const char* label, std::function<void()> f) {
@@ -630,7 +640,16 @@ inline bool post_labeled(const char* label, std::function<void()> f) {
 }
 
 inline bool post_service_labeled(const char* label, std::function<void()> f) {
-    return post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f), label);
+    const bool ok = post_to(detail::g_service_pool, SERVICE_POOL_SIZE, std::move(f), label);
+    aida::diagnostics::breadcrumb_options_t opts{};
+    opts.category = aida::diagnostics::breadcrumb_category_t::service_queue;
+    opts.label = "service_queue_post";
+    opts.reason = ok ? "posted" : "rejected";
+    opts.owner_subsystem = "work_queue";
+    opts.tool_or_request_id = label;
+    opts.status_code = ok ? 0 : 1;
+    aida::diagnostics::emit(std::move(opts));
+    return ok;
 }
 
 inline void shutdown_pool(detail::pool_t& p, const char* name, std::uint32_t timeout_ms) {

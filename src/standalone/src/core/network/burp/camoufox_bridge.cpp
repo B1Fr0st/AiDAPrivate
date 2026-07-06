@@ -13,6 +13,7 @@
 #include "../../mcp/mcp_client.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
+#include "../../diagnostics/metadata_ring.hpp"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -312,6 +313,17 @@ struct camoufox_op_admission_t
                 static_cast<unsigned long>(identity.child_pid),
                 static_cast<unsigned long long>(result.admission_token),
                 static_cast<unsigned>(g_camoufox_op_admission_depth));
+            aida::diagnostics::breadcrumb_options_t cf_opts{};
+            cf_opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+            cf_opts.label = "camoufox_longop_admit";
+            cf_opts.reason = "tool_call_start";
+            cf_opts.owner_subsystem = "camoufox_bridge";
+            cf_opts.tool_or_request_id = identity.tool_name.c_str();
+            cf_opts.session_or_target = identity.session_id.c_str();
+            cf_opts.lease_token = result.admission_token;
+            cf_opts.generation = identity.generation;
+            cf_opts.status_code = 0;
+            aida::diagnostics::emit(std::move(cf_opts));
         }
         else
         {
@@ -321,6 +333,16 @@ struct camoufox_op_admission_t
                 static_cast<unsigned long>(identity.child_pid),
                 result.reason.c_str(), result.quota_name.c_str(), result.quota_scope.c_str(),
                 result.observed, result.limit);
+            aida::diagnostics::breadcrumb_options_t cf_opts{};
+            cf_opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+            cf_opts.label = "camoufox_longop_reject";
+            cf_opts.reason = "capacity_rejected";
+            cf_opts.owner_subsystem = "camoufox_bridge";
+            cf_opts.tool_or_request_id = identity.tool_name.c_str();
+            cf_opts.session_or_target = identity.session_id.c_str();
+            cf_opts.generation = identity.generation;
+            cf_opts.status_code = 1;
+            aida::diagnostics::emit(std::move(cf_opts));
         }
     }
 
@@ -339,6 +361,17 @@ struct camoufox_op_admission_t
             reason ? reason : "completed",
             identity.tool_name.c_str(), identity.session_id.c_str(),
             static_cast<unsigned long long>(result.admission_token));
+        aida::diagnostics::breadcrumb_options_t opts{};
+        opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+        opts.label = "camoufox_longop_release";
+        opts.reason = reason ? reason : "completed";
+        opts.owner_subsystem = "camoufox_bridge";
+        opts.tool_or_request_id = identity.tool_name.c_str();
+        opts.session_or_target = identity.session_id.c_str();
+        opts.lease_token = result.admission_token;
+        opts.generation = identity.generation;
+        opts.status_code = 0;
+        aida::diagnostics::emit(std::move(opts));
         mcp_standalone::downstream::governor_t::instance().release(result.admission_token, reason ? reason : "completed");
         held = false;
         if (depth_incremented)
@@ -388,6 +421,17 @@ bool acquire_launch_admission(const char* phase, const std::string& session_id, 
             static_cast<unsigned long long>(generation),
             static_cast<unsigned long>(child_pid),
             static_cast<unsigned long long>(out_token));
+        aida::diagnostics::breadcrumb_options_t opts{};
+        opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+        opts.label = "camoufox_launch_admit";
+        opts.reason = "launch_start";
+        opts.owner_subsystem = "camoufox_bridge";
+        opts.tool_or_request_id = phase ? phase : "start_bridge";
+        opts.session_or_target = id.session_id.c_str();
+        opts.lease_token = out_token;
+        opts.generation = generation;
+        opts.status_code = 0;
+        aida::diagnostics::emit(std::move(opts));
         return true;
     }
     diag::log_tagged_fmt("camoufox", "CAMOUFOX-LONGOP-REJECT phase=%s session=%s generation=%llu child_pid=%lu reason=%s quota=%s scope=%s observed=%zu limit=%zu kind=launch",
@@ -396,6 +440,16 @@ bool acquire_launch_admission(const char* phase, const std::string& session_id, 
         static_cast<unsigned long>(child_pid),
         r.reason.c_str(), r.quota_name.c_str(), r.quota_scope.c_str(),
         r.observed, r.limit);
+    aida::diagnostics::breadcrumb_options_t opts{};
+    opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+    opts.label = "camoufox_launch_reject";
+    opts.reason = "launch_capacity_rejected";
+    opts.owner_subsystem = "camoufox_bridge";
+    opts.tool_or_request_id = phase ? phase : "start_bridge";
+    opts.session_or_target = id.session_id.c_str();
+    opts.generation = generation;
+    opts.status_code = 1;
+    aida::diagnostics::emit(std::move(opts));
     return false;
 }
 
@@ -406,6 +460,15 @@ void release_launch_admission(uint64_t token, const char* reason, const std::str
         reason ? reason : "completed",
         session_id.empty() ? "default" : session_id.c_str(),
         static_cast<unsigned long long>(token));
+    aida::diagnostics::breadcrumb_options_t opts{};
+    opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+    opts.label = "camoufox_launch_release";
+    opts.reason = reason ? reason : "completed";
+    opts.owner_subsystem = "camoufox_bridge";
+    opts.session_or_target = session_id.empty() ? "default" : session_id.c_str();
+    opts.lease_token = token;
+    opts.status_code = 0;
+    aida::diagnostics::emit(std::move(opts));
     mcp_standalone::downstream::governor_t::instance().release(token, reason ? reason : "completed");
 }
 
@@ -13259,6 +13322,16 @@ call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args
             static_cast<unsigned long long>(op_admission.generation_at_admit),
             static_cast<unsigned long long>(exit.generation),
             static_cast<int>(r.ok));
+        aida::diagnostics::breadcrumb_options_t opts{};
+        opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+        opts.label = "camoufox_longop_tombstone";
+        opts.reason = "generation_changed_discard";
+        opts.owner_subsystem = "camoufox_bridge";
+        opts.tool_or_request_id = tool_name.c_str();
+        opts.session_or_target = "default";
+        opts.generation = exit.generation;
+        opts.status_code = 1;
+        aida::diagnostics::emit(std::move(opts));
         call_result_t tombstoned;
         tombstoned.ok = false;
         tombstoned.error = "CAMOUFOX-LONGOP-TOMBSTONE: result arrived after bridge generation changed; discarded";
@@ -13359,6 +13432,16 @@ call_result_t call_tool(const std::string& tool_name, const nlohmann::json& args
             static_cast<unsigned long long>(op_admission.generation_at_admit),
             static_cast<unsigned long long>(managed_exit_generation),
             static_cast<int>(r.ok));
+        aida::diagnostics::breadcrumb_options_t opts{};
+        opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+        opts.label = "camoufox_longop_tombstone";
+        opts.reason = "generation_changed_discard";
+        opts.owner_subsystem = "camoufox_bridge";
+        opts.tool_or_request_id = tool_name.c_str();
+        opts.session_or_target = managed_sid.c_str();
+        opts.generation = managed_exit_generation;
+        opts.status_code = 1;
+        aida::diagnostics::emit(std::move(opts));
         call_result_t tombstoned;
         tombstoned.ok = false;
         tombstoned.error = "CAMOUFOX-LONGOP-TOMBSTONE: result arrived after session generation changed; discarded";

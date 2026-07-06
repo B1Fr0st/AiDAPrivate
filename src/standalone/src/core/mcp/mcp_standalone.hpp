@@ -108,6 +108,25 @@ namespace mcp_standalone
     void set_ide_lifecycle_ready(bool ready) noexcept;
     bool lifecycle_authorized(std::string* reason = nullptr);
     void format_runtime_diagnostic_snapshot(char* out, std::size_t cap) noexcept;
+    std::size_t active_http_request_count() noexcept;
+    std::size_t active_tool_lease_count() noexcept;
+
+    struct bounded_diag_snapshot_t {
+        std::size_t active_requests = 0;
+        std::size_t active_leases = 0;
+        std::size_t pending_cancellations = 0;
+        std::size_t stale_leases = 0;
+        std::size_t fenced_leases = 0;
+        std::size_t tombstoned_active = 0;
+        bool lease_lock_busy = false;
+        char oldest_owner[160] = {};
+        char capacity_snapshot[1024] = {};
+        char lease_registry_snapshot[1400] = {};
+        char downstream_snapshot[512] = {};
+        std::size_t camoufox_longop_active = 0;
+    };
+    bounded_diag_snapshot_t bounded_diagnostic_snapshot() noexcept;
+
     json active_session_policy_debug_snapshot();
 
     struct tool_def_t

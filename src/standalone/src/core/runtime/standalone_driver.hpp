@@ -512,6 +512,7 @@ namespace driver_bridge
     bool refresh_heartbeat();
     bool sentinel_bridge_ready();
     uint64_t sentinel_ready_since_tsc();
+    uint64_t driver_watchdog_age_ms();
 
     struct dynamic_ioctl_state_t {
         bool loaded = false;
@@ -753,4 +754,6 @@ namespace driver_bridge
     bool drain_debug_events(std::vector<debug_event_t>& out,
                             size_t max_events = 64,
                             debug_event_stats_t* out_stats = nullptr);
+
+    uint64_t watchdog_last_ok_tick();
 }

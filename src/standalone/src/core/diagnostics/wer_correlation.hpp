@@ -4,14 +4,19 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
+#include <winevt.h>
 
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "../../helpers/diag_log.hpp"
+
+#pragma comment(lib, "wevtapi.lib")
 
 namespace aida::diagnostics::wer {
 
@@ -53,6 +58,10 @@ struct wer_event_record_t {
     bool dump_file_found = false;
     std::uint64_t dump_file_size = 0;
     std::uint64_t dump_file_mtime_100ns = 0;
+    std::int64_t event_dump_delta_ms = 0;
+    bool dump_correlated = false;
+    std::string app_path;
+    std::string exception_code_raw;
 };
 
 struct wer_correlation_t {
@@ -63,6 +72,8 @@ struct wer_correlation_t {
     bool event_log_query_ok = false;
     DWORD event_log_last_error = 0;
     std::size_t event_log_record_count = 0;
+    std::uint64_t current_process_start_100ns = 0;
+    std::uint64_t event_log_elapsed_ms = 0;
 };
 
 inline std::string read_registry_string(HKEY root, const wchar_t* subkey, const wchar_t* value_name, DWORD& gle) {
@@ -176,53 +187,6 @@ inline wer_config_t scan_wer_config() {
     return cfg;
 }
 
-inline void log_wer_config(const char* phase) {
-    const auto cfg = scan_wer_config();
-    const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
-
-    diag::log_tagged_critical_fmt("WER-CONFIG",
-        "record=wer_config_summary phase=%s pid=%lu configured=%d expected_dump_folder=%s hkcu_per_exe_present=%d hkcu_default_present=%d hklm_per_exe_present=%d hklm_default_present=%d",
-        phase ? phase : "<null>",
-        static_cast<unsigned long>(GetCurrentProcessId()),
-        cfg.any_configured ? 1 : 0,
-        cfg.expected_dump_folder.c_str(),
-        cfg.hkcu_per_exe.present ? 1 : 0,
-        cfg.hkcu_default.present ? 1 : 0,
-        cfg.hklm_per_exe.present ? 1 : 0,
-        cfg.hklm_default.present ? 1 : 0);
-
-    const char* scopes[][4] = {
-        {"HKCU", "per_exe", nullptr, nullptr},
-        {"HKCU", "default", nullptr, nullptr},
-        {"HKLM", "per_exe", nullptr, nullptr},
-        {"HKLM", "default", nullptr, nullptr},
-    };
-    const wer_registry_scope_t* scope_ptrs[] = {
-        &cfg.hkcu_per_exe, &cfg.hkcu_default, &cfg.hklm_per_exe, &cfg.hklm_default
-    };
-
-    for (int i = 0; i < 4; ++i) {
-        const auto& s = *scope_ptrs[i];
-        char msg[2048];
-        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-            "record=wer_scope root=%s scope=%s present=%d dump_folder=%s dump_type=%s dump_count_present=%d dump_count_value=%lu dump_count_gle=%lu gle=%lu",
-            scopes[i][0], scopes[i][1],
-            s.present ? 1 : 0,
-            s.dump_folder.c_str(),
-            s.dump_type_str.c_str(),
-            s.dump_count_present ? 1 : 0,
-            static_cast<unsigned long>(s.dump_count_value),
-            static_cast<unsigned long>(s.dump_count_gle),
-            static_cast<unsigned long>(s.gle));
-        diag::log_tagged_critical("WER-CONFIG", msg);
-    }
-
-    diag::log_tagged_critical_fmt("WER-CONFIG",
-        "record=wer_config_scan_end phase=%s elapsed_ms=%llu",
-        phase ? phase : "<null>",
-        static_cast<unsigned long long>(static_cast<std::uint64_t>(GetTickCount64()) - start_ms));
-}
-
 inline bool file_exists_with_size(const char* path, std::uint64_t& size, std::uint64_t& mtime_100ns) {
     size = 0;
     mtime_100ns = 0;
@@ -266,23 +230,310 @@ inline std::vector<std::string> find_recent_dump_files(const std::string& folder
     return results;
 }
 
+inline std::string wide_to_utf8(PCWSTR wstr) {
+    if (!wstr) return std::string();
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return std::string();
+    std::string out(static_cast<std::size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &out[0], len, nullptr, nullptr);
+    return out;
+}
+
+inline std::uint32_t parse_exception_code(const std::string& s) {
+    if (s.empty()) return 0;
+    const char* p = s.c_str();
+    if (s.size() > 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+        return static_cast<std::uint32_t>(std::strtoul(p + 2, nullptr, 16));
+    if (std::strspn(p, "0123456789") == s.size())
+        return static_cast<std::uint32_t>(std::strtoul(p, nullptr, 10));
+    return static_cast<std::uint32_t>(std::strtoul(p, nullptr, 16));
+}
+
+inline bool contains_ci(const std::string& haystack, const char* needle) {
+    if (!needle || !needle[0]) return false;
+    std::string h = haystack;
+    std::string n = needle;
+    for (auto& c : h) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    for (auto& c : n) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+    return h.find(n) != std::string::npos;
+}
+
+struct evt_log_query_result_t {
+    std::vector<wer_event_record_t> events;
+    bool query_ok = false;
+    DWORD last_error = 0;
+    std::uint64_t elapsed_ms = 0;
+};
+
+struct evt_extracted_t {
+    bool valid = false;
+    std::string provider_name;
+    std::uint16_t event_id = 0;
+    std::uint64_t timestamp_100ns = 0;
+    DWORD pid = 0;
+    std::string app_name;
+    std::string module_name;
+    std::string exception_code_str;
+    std::string report_id;
+    std::string app_path;
+    std::string faulting_app_name;
+    std::string faulting_module_name;
+    std::string original_app_name;
+};
+
+inline evt_extracted_t extract_event_fields(EVT_HANDLE event) {
+    evt_extracted_t out;
+    static PCWSTR kValuePaths[] = {
+        L"Event/System/Provider/@Name",
+        L"Event/System/EventID",
+        L"Event/System/TimeCreated/@SystemTime",
+        L"Event/System/Execution/@ProcessID",
+        L"Event/EventData/Data[@Name='AppName']",
+        L"Event/EventData/Data[@Name='ModuleName']",
+        L"Event/EventData/Data[@Name='ExceptionCode']",
+        L"Event/EventData/Data[@Name='ReportId']",
+        L"Event/EventData/Data[@Name='AppPath']",
+        L"Event/EventData/Data[@Name='FaultingApplicationName']",
+        L"Event/EventData/Data[@Name='FaultingModuleName']",
+        L"Event/EventData/Data[@Name='OriginalAppName']",
+    };
+    static const DWORD kValueCount = sizeof(kValuePaths) / sizeof(kValuePaths[0]);
+
+    EVT_HANDLE ctx = EvtCreateRenderContext(kValueCount, kValuePaths, EvtRenderContextValues);
+    if (!ctx) return out;
+
+    std::vector<unsigned char> buffer;
+    DWORD buf_size = 4096;
+    buffer.resize(buf_size);
+    DWORD used = 0;
+    DWORD prop_count = 0;
+    BOOL ok = EvtRender(ctx, event, EvtRenderEventValues, buf_size, buffer.data(), &used, &prop_count);
+    if (!ok && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+        buffer.resize(used);
+        ok = EvtRender(ctx, event, EvtRenderEventValues, used, buffer.data(), &used, &prop_count);
+    }
+    EvtClose(ctx);
+    if (!ok || prop_count < kValueCount) return out;
+
+    PEVT_VARIANT vars = reinterpret_cast<PEVT_VARIANT>(buffer.data());
+
+    if (vars[0].Type == EvtVarTypeString && vars[0].StringVal)
+        out.provider_name = wide_to_utf8(vars[0].StringVal);
+
+    if (vars[1].Type == EvtVarTypeUInt16)
+        out.event_id = vars[1].UInt16Val;
+    else if (vars[1].Type == EvtVarTypeUInt32)
+        out.event_id = static_cast<std::uint16_t>(vars[1].UInt32Val);
+    else if (vars[1].Type == EvtVarTypeInt32)
+        out.event_id = static_cast<std::uint16_t>(vars[1].Int32Val);
+
+    if (vars[2].Type == EvtVarTypeFileTime) {
+        out.timestamp_100ns = static_cast<std::uint64_t>(vars[2].FileTimeVal);
+    }
+
+    if (vars[3].Type == EvtVarTypeUInt32)
+        out.pid = vars[3].UInt32Val;
+    else if (vars[3].Type == EvtVarTypeUInt64)
+        out.pid = static_cast<DWORD>(vars[3].UInt64Val);
+
+    auto get_str = [&](std::size_t idx) -> std::string {
+        if (vars[idx].Type == EvtVarTypeString && vars[idx].StringVal)
+            return wide_to_utf8(vars[idx].StringVal);
+        return std::string();
+    };
+    out.app_name = get_str(4);
+    out.module_name = get_str(5);
+    out.exception_code_str = get_str(6);
+    out.report_id = get_str(7);
+    out.app_path = get_str(8);
+    out.faulting_app_name = get_str(9);
+    out.faulting_module_name = get_str(10);
+    out.original_app_name = get_str(11);
+
+    out.valid = true;
+    return out;
+}
+
+inline evt_log_query_result_t query_wer_event_log(std::size_t max_events) {
+    evt_log_query_result_t result;
+    const std::uint64_t start_ms = static_cast<std::uint64_t>(GetTickCount64());
+    const std::uint64_t time_budget_ms = 2000;
+    if (max_events == 0) max_events = 32;
+
+    EVT_HANDLE query_handle = EvtQuery(
+        nullptr,
+        L"Application",
+        L"*[System[(EventID=1000 or EventID=1001)]]",
+        EvtQueryChannelPath | EvtQueryReverseDirection);
+
+    if (!query_handle) {
+        result.query_ok = false;
+        result.last_error = GetLastError();
+        result.elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
+        return result;
+    }
+
+    const DWORD kBatchSize = 16;
+    const std::size_t kMaxRawEvents = 256;
+    std::vector<EVT_HANDLE> event_handles;
+    event_handles.resize(kBatchSize);
+
+    std::size_t collected = 0;
+    std::size_t raw_fetched = 0;
+    while (collected < max_events && raw_fetched < kMaxRawEvents) {
+        DWORD returned = 0;
+        BOOL ok = EvtNext(query_handle, kBatchSize, event_handles.data(), 0, 0, &returned);
+        if (!ok || returned == 0)
+            break;
+        raw_fetched += returned;
+
+        for (DWORD i = 0; i < returned && collected < max_events; ++i) {
+            evt_extracted_t ext = extract_event_fields(event_handles[i]);
+            EvtClose(event_handles[i]);
+            event_handles[i] = nullptr;
+
+            if (!ext.valid) continue;
+
+            const std::string& app_ref = !ext.app_name.empty() ? ext.app_name :
+                                         !ext.faulting_app_name.empty() ? ext.faulting_app_name :
+                                         !ext.original_app_name.empty() ? ext.original_app_name :
+                                         !ext.app_path.empty() ? ext.app_path : ext.app_name;
+
+            if (!contains_ci(app_ref, "AiDAStandalone"))
+                continue;
+
+            wer_event_record_t rec;
+            rec.timestamp_100ns = ext.timestamp_100ns;
+            rec.tick_ms = static_cast<std::uint64_t>(GetTickCount64());
+            rec.pid = ext.pid;
+            rec.provider_name = ext.provider_name;
+            rec.source_name = ext.provider_name;
+            rec.event_id = ext.event_id;
+            rec.exception_code_raw = ext.exception_code_str;
+            rec.exception_code = parse_exception_code(ext.exception_code_str);
+
+            if (!ext.module_name.empty())
+                rec.faulting_module = ext.module_name;
+            else if (!ext.faulting_module_name.empty())
+                rec.faulting_module = ext.faulting_module_name;
+
+            rec.report_id = ext.report_id;
+            rec.app_path = ext.app_path;
+
+            result.events.push_back(std::move(rec));
+            ++collected;
+        }
+
+        for (DWORD i = 0; i < returned; ++i) {
+            if (event_handles[i]) {
+                EvtClose(event_handles[i]);
+                event_handles[i] = nullptr;
+            }
+        }
+
+        if (returned < kBatchSize)
+            break;
+        if (static_cast<std::uint64_t>(GetTickCount64()) - start_ms > time_budget_ms)
+            break;
+    }
+
+    for (std::size_t i = 0; i < event_handles.size(); ++i) {
+        if (event_handles[i]) {
+            EvtClose(event_handles[i]);
+            event_handles[i] = nullptr;
+        }
+    }
+
+    EvtClose(query_handle);
+
+    result.query_ok = true;
+    result.elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_ms;
+    return result;
+}
+
+inline std::uint64_t current_process_start_100ns() {
+    FILETIME creation{}, exit_time{}, kernel{}, user{};
+    if (GetProcessTimes(GetCurrentProcess(), &creation, &exit_time, &kernel, &user)) {
+        ULARGE_INTEGER ul;
+        ul.LowPart = creation.dwLowDateTime;
+        ul.HighPart = creation.dwHighDateTime;
+        return ul.QuadPart;
+    }
+    return 0;
+}
+
+struct dump_info_t {
+    std::string path;
+    bool found = false;
+    std::uint64_t size = 0;
+    std::uint64_t mtime_100ns = 0;
+    bool matched = false;
+};
+
 inline wer_correlation_t build_correlation() {
     wer_correlation_t corr;
     corr.config = scan_wer_config();
     corr.normalized_dump_folder = corr.config.expected_dump_folder;
+    corr.current_process_start_100ns = current_process_start_100ns();
 
     corr.recent_dump_paths = find_recent_dump_files(corr.normalized_dump_folder);
 
+    std::vector<dump_info_t> dumps;
+    dumps.reserve(corr.recent_dump_paths.size());
     for (const auto& path : corr.recent_dump_paths) {
+        dump_info_t d;
+        d.path = path;
+        d.found = file_exists_with_size(path.c_str(), d.size, d.mtime_100ns);
+        dumps.push_back(std::move(d));
+    }
+
+    evt_log_query_result_t evt_result = query_wer_event_log(32);
+    corr.event_log_query_ok = evt_result.query_ok;
+    corr.event_log_last_error = evt_result.last_error;
+    corr.event_log_elapsed_ms = evt_result.elapsed_ms;
+    corr.event_log_record_count = evt_result.events.size();
+
+    for (auto& evt : evt_result.events) {
+        bool found_match = false;
+        std::size_t best_idx = 0;
+        std::uint64_t best_abs_delta = 0;
+        for (std::size_t i = 0; i < dumps.size(); ++i) {
+            if (!dumps[i].found || dumps[i].matched) continue;
+            if (dumps[i].mtime_100ns == 0) continue;
+            std::int64_t delta = static_cast<std::int64_t>(dumps[i].mtime_100ns) -
+                                 static_cast<std::int64_t>(evt.timestamp_100ns);
+            std::uint64_t abs_delta = delta < 0 ? static_cast<std::uint64_t>(-delta)
+                                                 : static_cast<std::uint64_t>(delta);
+            if (!found_match || abs_delta < best_abs_delta) {
+                found_match = true;
+                best_abs_delta = abs_delta;
+                best_idx = i;
+            }
+        }
+        if (found_match && best_abs_delta <= 1200000000ULL) {
+            dumps[best_idx].matched = true;
+            evt.dump_path = dumps[best_idx].path;
+            evt.dump_file_found = dumps[best_idx].found;
+            evt.dump_file_size = dumps[best_idx].size;
+            evt.dump_file_mtime_100ns = dumps[best_idx].mtime_100ns;
+            evt.event_dump_delta_ms = static_cast<std::int64_t>(
+                (dumps[best_idx].mtime_100ns - evt.timestamp_100ns) / 10000ULL);
+            evt.dump_correlated = true;
+        }
+        corr.recent_events.push_back(std::move(evt));
+    }
+
+    for (const auto& d : dumps) {
+        if (d.matched) continue;
         wer_event_record_t rec;
-        rec.dump_path = path;
-        rec.dump_file_found = file_exists_with_size(path.c_str(), rec.dump_file_size, rec.dump_file_mtime_100ns);
+        rec.dump_path = d.path;
+        rec.dump_file_found = d.found;
+        rec.dump_file_size = d.size;
+        rec.dump_file_mtime_100ns = d.mtime_100ns;
+        rec.timestamp_100ns = d.mtime_100ns;
         rec.tick_ms = static_cast<std::uint64_t>(GetTickCount64());
         corr.recent_events.push_back(std::move(rec));
     }
-
-    corr.event_log_record_count = corr.recent_events.size();
-    corr.event_log_query_ok = true;
 
     return corr;
 }
@@ -291,25 +542,40 @@ inline void log_wer_correlation(const char* context) {
     auto corr = build_correlation();
 
     diag::log_tagged_critical_fmt("WER-EVENT-CORRELATION",
-        "context=%s pid=%lu configured=%d dump_folder=%s dump_count=%zu event_log_ok=%d event_log_gle=%lu",
+        "context=%s pid=%lu configured=%d dump_folder=%s dump_count=%zu event_log_ok=%d event_log_gle=%lu event_log_records=%zu event_log_elapsed_ms=%llu proc_start_100ns=%llu",
         context ? context : "<null>",
         static_cast<unsigned long>(GetCurrentProcessId()),
         corr.config.any_configured ? 1 : 0,
         corr.normalized_dump_folder.c_str(),
         corr.recent_dump_paths.size(),
         corr.event_log_query_ok ? 1 : 0,
-        static_cast<unsigned long>(corr.event_log_last_error));
+        static_cast<unsigned long>(corr.event_log_last_error),
+        corr.event_log_record_count,
+        static_cast<unsigned long long>(corr.event_log_elapsed_ms),
+        static_cast<unsigned long long>(corr.current_process_start_100ns));
 
     for (std::size_t i = 0; i < corr.recent_events.size(); ++i) {
         const auto& e = corr.recent_events[i];
         diag::log_tagged_fmt("WER-EVENT-CORRELATION",
-            "idx=%zu dump_path=%s found=%d size=%llu mtime_100ns=%llu tick_ms=%llu",
+            "idx=%zu event_id=%u provider=%s source=%s exception_code=0x%08X exception_code_raw=%s faulting_module=%s report_id=%s pid=%lu timestamp_100ns=%llu tick_ms=%llu dump_path=%s found=%d size=%llu mtime_100ns=%llu dump_correlated=%d event_dump_delta_ms=%lld app_path=%s",
             i,
+            static_cast<unsigned>(e.event_id),
+            e.provider_name.c_str(),
+            e.source_name.c_str(),
+            static_cast<unsigned long>(e.exception_code),
+            e.exception_code_raw.c_str(),
+            e.faulting_module.c_str(),
+            e.report_id.c_str(),
+            static_cast<unsigned long>(e.pid),
+            static_cast<unsigned long long>(e.timestamp_100ns),
+            static_cast<unsigned long long>(e.tick_ms),
             e.dump_path.c_str(),
             e.dump_file_found ? 1 : 0,
             static_cast<unsigned long long>(e.dump_file_size),
             static_cast<unsigned long long>(e.dump_file_mtime_100ns),
-            static_cast<unsigned long long>(e.tick_ms));
+            e.dump_correlated ? 1 : 0,
+            static_cast<long long>(e.event_dump_delta_ms),
+            e.app_path.c_str());
     }
 }
 
@@ -317,11 +583,15 @@ inline std::string correlation_summary_string() {
     auto corr = build_correlation();
     char buf[1024];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-        "configured=%d folder=%s dumps_found=%zu event_log_ok=%d",
+        "configured=%d folder=%s dumps_found=%zu event_log_ok=%d event_log_gle=%lu event_log_records=%zu event_log_elapsed_ms=%llu proc_start_100ns=%llu",
         corr.config.any_configured ? 1 : 0,
         corr.normalized_dump_folder.c_str(),
         corr.recent_dump_paths.size(),
-        corr.event_log_query_ok ? 1 : 0);
+        corr.event_log_query_ok ? 1 : 0,
+        static_cast<unsigned long>(corr.event_log_last_error),
+        corr.event_log_record_count,
+        static_cast<unsigned long long>(corr.event_log_elapsed_ms),
+        static_cast<unsigned long long>(corr.current_process_start_100ns));
     return std::string(buf);
 }
 

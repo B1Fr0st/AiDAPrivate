@@ -97,6 +97,71 @@ inline void log_observer_heartbeat(std::uint64_t poll_index, DWORD pid, HWND hwn
         static_cast<unsigned long long>(now_ms() - state().heartbeat_tick_ms.load(std::memory_order_acquire)));
 }
 
+inline void write_evidence_file(const char* event_type, DWORD pid, HWND hwnd, BOOL is_hung,
+    BOOL send_wm_null_ok, DWORD send_wm_null_gle, BOOL process_alive, DWORD exit_code,
+    std::uint64_t heartbeat_age_ms, std::uint64_t timestamp_ms) {
+    char path[MAX_PATH];
+    if (!GetEnvironmentVariableA("TEMP", path, sizeof(path)) || !path[0])
+        GetEnvironmentVariableA("USERPROFILE", path, sizeof(path));
+    if (!path[0])
+        return;
+    char full_path[MAX_PATH];
+    _snprintf_s(full_path, sizeof(full_path), _TRUNCATE, "%s\\aida_observer_evidence.log", path);
+
+    HANDLE hFile = CreateFileA(full_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return;
+
+    char line[1024];
+    int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "OBSERVER-EVIDENCE event=%s pid=%lu hwnd=0x%llX is_hung=%d send_wm_null_ok=%d "
+        "send_wm_null_gle=%lu process_alive=%d exit_code=0x%08lX heartbeat_age_ms=%llu "
+        "timestamp_ms=%llu\r\n",
+        event_type,
+        static_cast<unsigned long>(pid),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        is_hung ? 1 : 0,
+        send_wm_null_ok ? 1 : 0,
+        static_cast<unsigned long>(send_wm_null_gle),
+        process_alive ? 1 : 0,
+        static_cast<unsigned long>(exit_code),
+        static_cast<unsigned long long>(heartbeat_age_ms),
+        static_cast<unsigned long long>(timestamp_ms));
+
+    if (len > 0) {
+        DWORD written = 0;
+        WriteFile(hFile, line, static_cast<DWORD>(len), &written, nullptr);
+    }
+    FlushFileBuffers(hFile);
+    CloseHandle(hFile);
+}
+
+inline void log_observer_wer_correlation(DWORD pid, HWND hwnd, const char* context) {
+    wer::wer_correlation_t corr = wer::build_correlation();
+    diag::log_tagged_critical_fmt("diag",
+        "OBSERVER-WER-CORRELATION context=%s pid=%lu hwnd=0x%llX event_log_query_ok=%d "
+        "event_log_last_error=%lu event_count=%lu dump_count=%lu provider_name=%s "
+        "event_id=%u exception_code=0x%08lX faulting_module=%s report_id=%s "
+        "dump_folder=%s timestamp_ms=%llu",
+        context,
+        static_cast<unsigned long>(pid),
+        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
+        corr.event_log_query_ok ? 1 : 0,
+        static_cast<unsigned long>(corr.event_log_last_error),
+        static_cast<unsigned long long>(corr.recent_events.size()),
+        static_cast<unsigned long long>(corr.recent_dump_paths.size()),
+        corr.recent_events.empty() ? "<none>" : corr.recent_events[0].provider_name.c_str(),
+        corr.recent_events.empty() ? 0U : static_cast<unsigned>(corr.recent_events[0].event_id),
+        corr.recent_events.empty() ? 0UL : static_cast<unsigned long>(corr.recent_events[0].exception_code),
+        corr.recent_events.empty() ? "<none>" : corr.recent_events[0].faulting_module.c_str(),
+        corr.recent_events.empty() ? "<none>" : corr.recent_events[0].report_id.c_str(),
+        corr.normalized_dump_folder.c_str(),
+        static_cast<unsigned long long>(now_ms()));
+
+    state().wer_correlation_count.fetch_add(1, std::memory_order_relaxed);
+}
+
 inline void log_observer_hang(const observer_hang_record_t& rec) {
     diag::log_tagged_critical_fmt("diag",
         "OBSERVER-HANG poll=%llu pid=%lu hwnd=0x%llX is_hung=%d send_wm_null_ok=%d send_wm_null_gle=%lu send_wm_null_lresult=0x%llX process_alive=%d exit_code=0x%08lX heartbeat_age_ms=%llu timestamp_ms=%llu",
@@ -113,6 +178,11 @@ inline void log_observer_hang(const observer_hang_record_t& rec) {
         static_cast<unsigned long long>(rec.timestamp_ms));
 
     wer::log_wer_correlation("observer_hang");
+    log_observer_wer_correlation(rec.pid, rec.hwnd, "observer_hang");
+
+    write_evidence_file("hang", rec.pid, rec.hwnd, rec.is_hung,
+        rec.send_wm_null_ok, rec.send_wm_null_gle, rec.process_alive, rec.exit_code,
+        rec.heartbeat_age_ms, rec.timestamp_ms);
 
     const std::string log_paths = wer::known_log_paths_summary();
     diag::log_tagged_critical_fmt("diag",
@@ -187,7 +257,12 @@ inline void observer_loop(DWORD pid, HWND hwnd) {
                 static_cast<unsigned long>(exit_code));
 
             wer::log_wer_correlation("observer_process_exit");
-            s.wer_correlation_count.fetch_add(1, std::memory_order_relaxed);
+            log_observer_wer_correlation(pid, hwnd, "observer_process_exit");
+
+            write_evidence_file("process_exit", pid, hwnd, FALSE,
+                FALSE, 0, FALSE, exit_code,
+                now_ms() - s.heartbeat_tick_ms.load(std::memory_order_acquire),
+                now_ms());
             break;
         }
 

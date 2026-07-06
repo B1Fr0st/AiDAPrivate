@@ -2904,9 +2904,14 @@ namespace
     }
 }
 
-static void format_active_session_owner_diagnostic_snapshot(char* out, std::size_t cap) noexcept;
+    std::size_t active_http_request_count() noexcept
+    {
+        return static_cast<std::size_t>(std::max(0, g_active_http_requests.load(std::memory_order_acquire)));
+    }
 
-void format_runtime_diagnostic_snapshot(char* out, std::size_t cap) noexcept
+    static void format_active_session_owner_diagnostic_snapshot(char* out, std::size_t cap) noexcept;
+
+    void format_runtime_diagnostic_snapshot(char* out, std::size_t cap) noexcept
 {
     if (!out || cap == 0)
         return;
@@ -5032,6 +5037,111 @@ static std::atomic<std::uint64_t>& mcp_lease_operation_generation_source()
 {
     static std::atomic<std::uint64_t> source{0};
     return source;
+}
+
+bounded_diag_snapshot_t bounded_diagnostic_snapshot() noexcept
+{
+    bounded_diag_snapshot_t snap;
+    snap.active_requests = active_http_request_count();
+
+    try {
+        const std::uint64_t now = mcp_now_ms();
+        std::unique_lock<std::mutex> lk(mcp_lease_registry_mutex(), std::try_to_lock);
+        if (lk.owns_lock()) {
+            const auto& active = mcp_lease_registry_active();
+            snap.active_leases = active.size();
+            std::size_t stale_count = 0;
+            std::size_t fenced_count = 0;
+            std::size_t tombstoned_active = 0;
+            std::size_t cancellation_count = 0;
+            const mcp_lease_registry_record_t* oldest = nullptr;
+            for (const auto& kv : active) {
+                const auto& rec = kv.second;
+                if (rec.stale) ++stale_count;
+                if (rec.fenced) ++fenced_count;
+                if (rec.tombstoned) ++tombstoned_active;
+                if (rec.cancellation_signalled) ++cancellation_count;
+                if (oldest == nullptr ||
+                    (rec.started_ms != 0 && oldest->started_ms != 0 && rec.started_ms < oldest->started_ms))
+                    oldest = &rec;
+            }
+            snap.stale_leases = stale_count;
+            snap.fenced_leases = fenced_count;
+            snap.tombstoned_active = tombstoned_active;
+            snap.pending_cancellations = cancellation_count;
+            if (oldest != nullptr) {
+                const std::uint64_t age_ms = oldest->started_ms != 0 && now >= oldest->started_ms
+                    ? now - oldest->started_ms : 0;
+                _snprintf_s(snap.oldest_owner, sizeof(snap.oldest_owner), _TRUNCATE,
+                    "tool=%.96s lane=%.48s age_ms=%llu",
+                    oldest->tool.empty() ? "<none>" : oldest->tool.c_str(),
+                    oldest->lane.empty() ? "<none>" : oldest->lane.c_str(),
+                    static_cast<unsigned long long>(age_ms));
+            }
+            _snprintf_s(snap.lease_registry_snapshot, sizeof(snap.lease_registry_snapshot), _TRUNCATE,
+                "lease{active=%zu stale=%zu fenced=%zu tombstoned_active=%zu cancellations=%zu gen=%llu}",
+                snap.active_leases,
+                stale_count,
+                fenced_count,
+                tombstoned_active,
+                cancellation_count,
+                static_cast<unsigned long long>(mcp_lease_registry_generation_source().load(std::memory_order_acquire)));
+        } else {
+            snap.lease_lock_busy = true;
+            _snprintf_s(snap.lease_registry_snapshot, sizeof(snap.lease_registry_snapshot), _TRUNCATE,
+                "lease{lock_busy=1}");
+        }
+    } catch (...) {
+        _snprintf_s(snap.lease_registry_snapshot, sizeof(snap.lease_registry_snapshot), _TRUNCATE,
+            "lease{snapshot_exception=1}");
+    }
+
+    try {
+        const auto exec_snap = aida::infra::executor::active_snapshot();
+        const auto wq = work_queue::stats();
+        const auto sq = work_queue::service_stats();
+        const auto cq = critical_work_queue::stats();
+        _snprintf_s(snap.capacity_snapshot, sizeof(snap.capacity_snapshot), _TRUNCATE,
+            "exec{total_active=%u wq=%u svc=%u crit=%u wq_pending=%llu svc_pending=%llu crit_pending=%llu oldest_ms=%llu labels=%.360s} "
+            "queues{wq_alive=%d wq_active=%u wq_pending=%zu svc_alive=%d svc_active=%u svc_pending=%zu crit_alive=%d crit_active=%u crit_pending=%zu}",
+            static_cast<unsigned>(exec_snap.total_active),
+            static_cast<unsigned>(exec_snap.work_queue_active),
+            static_cast<unsigned>(exec_snap.service_queue_active),
+            static_cast<unsigned>(exec_snap.critical_queue_active),
+            static_cast<unsigned long long>(exec_snap.work_queue_pending),
+            static_cast<unsigned long long>(exec_snap.service_queue_pending),
+            static_cast<unsigned long long>(exec_snap.critical_queue_pending),
+            static_cast<unsigned long long>(exec_snap.oldest_active_ms),
+            exec_snap.labels_under_pressure.empty() ? "<none>" : exec_snap.labels_under_pressure.c_str(),
+            wq.alive ? 1 : 0, static_cast<unsigned>(wq.active), wq.pending,
+            sq.alive ? 1 : 0, static_cast<unsigned>(sq.active), sq.pending,
+            cq.alive ? 1 : 0, static_cast<unsigned>(cq.active), cq.pending);
+    } catch (...) {
+        _snprintf_s(snap.capacity_snapshot, sizeof(snap.capacity_snapshot), _TRUNCATE,
+            "exec{snapshot_exception=1}");
+    }
+
+    try {
+        const auto ds = mcp_standalone::downstream::governor_t::instance().try_snapshot_bounded();
+        snap.camoufox_longop_active = ds.camoufox_longop_active;
+        if (ds.lock_busy) {
+            _snprintf_s(snap.downstream_snapshot, sizeof(snap.downstream_snapshot), _TRUNCATE,
+                "downstream{lock_busy=1}");
+        } else {
+            _snprintf_s(snap.downstream_snapshot, sizeof(snap.downstream_snapshot), _TRUNCATE,
+                "downstream{total_active=%zu total_rejected=%llu camoufox_longop=%zu background_cmd=%zu shutdown=%d}",
+                ds.total_active,
+                static_cast<unsigned long long>(ds.total_rejected),
+                ds.camoufox_longop_active,
+                ds.background_command_active,
+                ds.shutdown_pending ? 1 : 0);
+        }
+    } catch (...) {
+        _snprintf_s(snap.downstream_snapshot, sizeof(snap.downstream_snapshot), _TRUNCATE,
+            "downstream{snapshot_exception=1}");
+    }
+
+    return snap;
 }
 
 static std::atomic<std::uint64_t>& mcp_lease_late_result_discard_count()
@@ -9879,6 +9989,14 @@ struct mcp_tool_capacity_snapshot_t
 std::mutex g_mcp_tool_capacity_mtx;
 std::map<std::uint64_t, mcp_tool_capacity_record_t> g_mcp_tool_active_leases;
 std::set<std::uint64_t> g_mcp_tool_cleanup_released_leases;
+
+    std::size_t active_tool_lease_count() noexcept
+    {
+        std::unique_lock<std::mutex> lk(g_mcp_tool_capacity_mtx, std::try_to_lock);
+        if (!lk.owns_lock())
+            return 0;
+        return g_mcp_tool_active_leases.size();
+    }
 std::map<std::string, mcp_tool_capacity_counts_t> g_mcp_tool_by_principal;
 std::map<std::string, mcp_tool_capacity_counts_t> g_mcp_tool_by_session;
 std::map<std::string, mcp_tool_capacity_counts_t> g_mcp_tool_by_target;
@@ -15467,6 +15585,17 @@ void server_t::server_thread_func(int port)
                 diag_state.work_queue_snapshot = general_buf;
                 diag_state.service_queue_snapshot = service_buf;
                 diag_state.critical_queue_snapshot = critical_buf;
+                char thread_classes_buf[1600] = {};
+                _snprintf_s(thread_classes_buf, sizeof(thread_classes_buf), _TRUNCATE,
+                    "general_active=%zu healthy=%u hot=%u not_queryable=%u labels=%.800s; critical_active=%zu labels=%.700s",
+                    static_cast<std::size_t>(wq_stats.active_label_count),
+                    wq_stats.healthy_long_lived,
+                    wq_stats.hot_workers,
+                    wq_stats.not_queryable_workers,
+                    wq_stats.active_labels.c_str(),
+                    static_cast<std::size_t>(crit_stats.active_label_count),
+                    crit_stats.active_labels.c_str());
+                diag_state.thread_runtime_classes = thread_classes_buf;
                 const std::string ring_summary = aida::diagnostics::metadata_ring::category_summary_string();
                 diag_state.metadata_ring_summary = ring_summary.c_str();
                 const std::string wer_summary = aida::diagnostics::wer::correlation_summary_string();
@@ -15489,6 +15618,7 @@ void server_t::server_thread_func(int port)
                     ring_summary.c_str());
                 aida::diagnostics::health::log_mcp_diagnostic_snapshot(mcp_snap_buf);
                 aida::diagnostics::health::log_queue_diagnostic_snapshot(general_buf, service_buf, critical_buf);
+                aida::diagnostics::health::log_thread_runtime_diagnostic_snapshot(thread_classes_buf);
             } catch (...) {
                 aida::diagnostics::health::log_diagnostic_snapshot_failed("health_diagnostics_build_exception");
             }

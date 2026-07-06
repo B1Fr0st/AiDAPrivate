@@ -188,7 +188,7 @@ check_pattern_in_file(
 print("[5] WER/Event Log correlation")
 
 check_pattern_in_file(
-    os.path.join(DIAG_ROOT, "wer_correlation.hpp"),
+    os.path.join(STANDALONE_ROOT, "main.cpp"),
     r"WER-CONFIG",
     "WER-CONFIG log tag"
 )

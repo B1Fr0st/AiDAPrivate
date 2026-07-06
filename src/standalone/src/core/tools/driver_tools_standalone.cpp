@@ -16,6 +16,7 @@
 #include "../analysis/stealth_engine.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../diagnostics/metadata_ring.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 #include <Zydis/Zydis.h>
@@ -78,6 +79,15 @@ struct driver_debugger_quota_guard_t
             diag::log_tagged_fmt("drv_tools",
                 "DRIVER-DEBUGGER-QUOTA-RELEASE tool=%s target_pid=%u token=%llu",
                 tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+            aida::diagnostics::breadcrumb_options_t opts{};
+            opts.category = aida::diagnostics::breadcrumb_category_t::driver_debugger;
+            opts.label = "driver_debugger_release";
+            opts.reason = "scope_exit";
+            opts.owner_subsystem = "driver_tools";
+            opts.tool_or_request_id = tool_name.c_str();
+            opts.lease_token = token;
+            opts.status_code = 0;
+            aida::diagnostics::emit(std::move(opts));
             mcp_standalone::downstream::governor_t::instance().release(token, "driver_debugger_scope_exit");
         }
         else
@@ -85,6 +95,15 @@ struct driver_debugger_quota_guard_t
             diag::log_tagged_fmt("drv_tools",
                 "DRIVER-DEBUGGER-QUOTA-STALE-RESULT tool=%s target_pid=%u token=%llu",
                 tool_name.c_str(), target_pid, static_cast<unsigned long long>(token));
+            aida::diagnostics::breadcrumb_options_t opts{};
+            opts.category = aida::diagnostics::breadcrumb_category_t::driver_debugger;
+            opts.label = "driver_debugger_stale_result";
+            opts.reason = "stale_result";
+            opts.owner_subsystem = "driver_tools";
+            opts.tool_or_request_id = tool_name.c_str();
+            opts.lease_token = token;
+            opts.status_code = 1;
+            aida::diagnostics::emit(std::move(opts));
         }
         token = 0;
     }
@@ -114,6 +133,14 @@ static std::optional<tool_result_t> acquire_driver_debugger_quota(
             id.tool_name.c_str(), id.target_pid,
             result.reason.c_str(), result.quota_name.c_str(),
             result.quota_scope.c_str(), result.observed, result.limit);
+        aida::diagnostics::breadcrumb_options_t opts{};
+        opts.category = aida::diagnostics::breadcrumb_category_t::driver_debugger;
+        opts.label = "driver_debugger_reject";
+        opts.reason = "capacity_rejected";
+        opts.owner_subsystem = "driver_tools";
+        opts.tool_or_request_id = id.tool_name.c_str();
+        opts.status_code = 1;
+        aida::diagnostics::emit(std::move(opts));
         return tool_result_t::error(
             "Downstream driver/debugger capacity exhausted; work was not started.",
             "MCP_DOWNSTREAM_CAPACITY_REJECT",
@@ -124,6 +151,17 @@ static std::optional<tool_result_t> acquire_driver_debugger_quota(
         "DRIVER-DEBUGGER-QUOTA-ADMIT tool=%s target_pid=%u token=%llu",
         id.tool_name.c_str(), id.target_pid,
         static_cast<unsigned long long>(result.admission_token));
+
+    aida::diagnostics::breadcrumb_options_t admit_opts{};
+    admit_opts.category = aida::diagnostics::breadcrumb_category_t::driver_debugger;
+    admit_opts.label = "driver_debugger_admit";
+    admit_opts.reason = "operation_start";
+    admit_opts.owner_subsystem = "driver_tools";
+    admit_opts.tool_or_request_id = id.tool_name.c_str();
+    admit_opts.session_or_target = id.target_id.c_str();
+    admit_opts.lease_token = result.admission_token;
+    admit_opts.status_code = 0;
+    aida::diagnostics::emit(std::move(admit_opts));
 
     guard.token = result.admission_token;
     guard.tool_name = id.tool_name;

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../mcp/downstream_producer_governor.hpp"
+#include "../diagnostics/metadata_ring.hpp"
 
 namespace command_sessions
 {
@@ -74,6 +75,15 @@ struct command_session_t
 					"BACKGROUND-COMMAND-RELEASE token=%llu principal=%s reason=session_destructor",
 					static_cast<unsigned long long>(downstream_token),
 					principal_id.c_str());
+				aida::diagnostics::breadcrumb_options_t opts{};
+				opts.category = aida::diagnostics::breadcrumb_category_t::background_command;
+				opts.label = "background_command_release";
+				opts.reason = "session_destructor";
+				opts.owner_subsystem = "command_sessions";
+				opts.tool_or_request_id = id.c_str();
+				opts.lease_token = downstream_token;
+				opts.status_code = 0;
+				aida::diagnostics::emit(std::move(opts));
 			}
 		}
 	}
@@ -155,6 +165,15 @@ acquire_background_command_admission(const std::string& principal_id,
 			principal_id.c_str(), session_id.c_str(), command_label.c_str(),
 			static_cast<unsigned long>(caller_tid),
 			static_cast<unsigned long>(ui_tid));
+		aida::diagnostics::breadcrumb_options_t opts{};
+		opts.category = aida::diagnostics::breadcrumb_category_t::background_command;
+		opts.label = "background_command_reject";
+		opts.reason = "ui_thread_blocked";
+		opts.owner_subsystem = "command_sessions";
+		opts.tool_or_request_id = command_label.c_str();
+		opts.session_or_target = session_id.c_str();
+		opts.status_code = 1;
+		aida::diagnostics::emit(std::move(opts));
 		return admission_result_t::rejected_result(
 			"ui_thread_blocked", "ui_thread_policy", "thread", 0, 0);
 	}
@@ -171,6 +190,16 @@ acquire_background_command_admission(const std::string& principal_id,
 			static_cast<unsigned long long>(result.admission_token),
 			principal_id.c_str(), session_id.c_str(), command_label.c_str(),
 			static_cast<unsigned long>(caller_tid));
+		aida::diagnostics::breadcrumb_options_t opts{};
+		opts.category = aida::diagnostics::breadcrumb_category_t::background_command;
+		opts.label = "background_command_admit";
+		opts.reason = "command_launch";
+		opts.owner_subsystem = "command_sessions";
+		opts.tool_or_request_id = command_label.c_str();
+		opts.session_or_target = session_id.c_str();
+		opts.lease_token = result.admission_token;
+		opts.status_code = 0;
+		aida::diagnostics::emit(std::move(opts));
 	} else {
 		diag::log_tagged_fmt("mcp_srv",
 			"BACKGROUND-COMMAND-REJECT principal=%s session=%s command_label=%s "
@@ -179,6 +208,15 @@ acquire_background_command_admission(const std::string& principal_id,
 			result.reason.c_str(), result.quota_name.c_str(),
 			result.quota_scope.c_str(), result.observed, result.limit,
 			static_cast<unsigned long>(caller_tid));
+		aida::diagnostics::breadcrumb_options_t opts{};
+		opts.category = aida::diagnostics::breadcrumb_category_t::background_command;
+		opts.label = "background_command_reject";
+		opts.reason = "capacity_rejected";
+		opts.owner_subsystem = "command_sessions";
+		opts.tool_or_request_id = command_label.c_str();
+		opts.session_or_target = session_id.c_str();
+		opts.status_code = 1;
+		aida::diagnostics::emit(std::move(opts));
 	}
 	return result;
 }
@@ -210,6 +248,15 @@ inline void release_downstream_token(command_session_t& sess, const char* reason
 		"BACKGROUND-COMMAND-RELEASE token=%llu principal=%s reason=%s",
 		static_cast<unsigned long long>(sess.downstream_token),
 		sess.principal_id.c_str(), reason ? reason : "unknown");
+	aida::diagnostics::breadcrumb_options_t opts{};
+	opts.category = aida::diagnostics::breadcrumb_category_t::background_command;
+	opts.label = "background_command_release";
+	opts.reason = reason ? reason : "unknown";
+	opts.owner_subsystem = "command_sessions";
+	opts.tool_or_request_id = sess.id.c_str();
+	opts.lease_token = sess.downstream_token;
+	opts.status_code = 0;
+	aida::diagnostics::emit(std::move(opts));
 	sess.downstream_token = 0;
 }
 

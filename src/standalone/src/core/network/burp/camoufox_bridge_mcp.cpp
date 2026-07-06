@@ -9,6 +9,7 @@
 #endif
 
 #include "../../../helpers/diag_log.hpp"
+#include "../../diagnostics/metadata_ring.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -72,6 +73,17 @@ struct camoufox_mcp_op_admission_t
                 static_cast<unsigned long long>(identity.generation),
                 static_cast<unsigned long>(identity.child_pid),
                 static_cast<unsigned long long>(result.admission_token));
+            aida::diagnostics::breadcrumb_options_t opts{};
+            opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+            opts.label = "camoufox_mcp_admit";
+            opts.reason = "mcp_passthrough_start";
+            opts.owner_subsystem = "camoufox_bridge_mcp";
+            opts.tool_or_request_id = identity.tool_name.c_str();
+            opts.session_or_target = identity.session_id.c_str();
+            opts.lease_token = result.admission_token;
+            opts.generation = identity.generation;
+            opts.status_code = 0;
+            aida::diagnostics::emit(std::move(opts));
         }
         else
         {
@@ -81,6 +93,16 @@ struct camoufox_mcp_op_admission_t
                 static_cast<unsigned long>(identity.child_pid),
                 result.reason.c_str(), result.quota_name.c_str(), result.quota_scope.c_str(),
                 result.observed, result.limit);
+            aida::diagnostics::breadcrumb_options_t opts{};
+            opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+            opts.label = "camoufox_mcp_reject";
+            opts.reason = "mcp_passthrough_rejected";
+            opts.owner_subsystem = "camoufox_bridge_mcp";
+            opts.tool_or_request_id = identity.tool_name.c_str();
+            opts.session_or_target = identity.session_id.c_str();
+            opts.generation = identity.generation;
+            opts.status_code = 1;
+            aida::diagnostics::emit(std::move(opts));
         }
     }
 
@@ -99,6 +121,17 @@ struct camoufox_mcp_op_admission_t
             reason ? reason : "completed",
             identity.tool_name.c_str(), identity.session_id.c_str(),
             static_cast<unsigned long long>(result.admission_token));
+        aida::diagnostics::breadcrumb_options_t opts{};
+        opts.category = aida::diagnostics::breadcrumb_category_t::camoufox;
+        opts.label = "camoufox_mcp_release";
+        opts.reason = reason ? reason : "completed";
+        opts.owner_subsystem = "camoufox_bridge_mcp";
+        opts.tool_or_request_id = identity.tool_name.c_str();
+        opts.session_or_target = identity.session_id.c_str();
+        opts.lease_token = result.admission_token;
+        opts.generation = identity.generation;
+        opts.status_code = 0;
+        aida::diagnostics::emit(std::move(opts));
         mcp_standalone::downstream::governor_t::instance().release(result.admission_token, reason ? reason : "completed");
         held = false;
     }
