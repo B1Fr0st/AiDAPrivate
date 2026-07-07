@@ -474,8 +474,7 @@ static void miner_main(std::shared_ptr<job_t> job)
             job->cancel.store(true);
         }
         for (auto& t : threads) {
-            std::string err;
-            t.join(&err);
+            t.join();
         }
     }
 
@@ -531,7 +530,8 @@ uint64_t start(config_t cfg)
     diag::log_tagged_fmt("param_miner", "BURP-NETWORK-WORKER-ADMIT job_id=%llu url=%s token=%llu",
         static_cast<unsigned long long>(job->id), job->cfg.target_url.c_str(),
         static_cast<unsigned long long>(pm_token));
-    const bool posted = work_queue::post([job, admission = std::move(pm_admission), pm_token]() mutable {
+    auto pm_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(pm_admission));
+    const bool posted = work_queue::post([job, pm_admission_ptr, pm_token]() {
         try {
             miner_main(job);
         } catch (const std::exception& ex) {
@@ -548,7 +548,7 @@ uint64_t start(config_t cfg)
         diag::log_tagged_fmt("param_miner", "BURP-NETWORK-WORKER-RELEASE job_id=%llu token=%llu reason=completed",
             static_cast<unsigned long long>(job->id),
             static_cast<unsigned long long>(pm_token));
-        admission.release("completed");
+        pm_admission_ptr->release("completed");
     });
     if (!posted) {
         diag::log_tagged_fmt("param_miner", "start_work_queue_rejected job_id=%llu",

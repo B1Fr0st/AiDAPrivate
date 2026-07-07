@@ -271,6 +271,8 @@ inline void build_reverse_map()
 		static_cast<unsigned long long>(brm_admission.token()));
 
 	work_queue::post([]() {
+		auto t_start = std::chrono::steady_clock::now();
+		auto modules = driver_bridge::enumerate_modules();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 
 		std::vector<driver_bridge::memory_region_t> readable;

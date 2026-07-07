@@ -11,6 +11,7 @@
 #include "../../infra/event_bus.hpp"
 #include "../../infra/work_queue.hpp"
 #include "../../mcp/mcp_client.hpp"
+#include "../../mcp/mcp_standalone.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
 #include "../../diagnostics/metadata_ring.hpp"
@@ -12782,7 +12783,7 @@ bool stop_managed_bridge(const std::string& session_id, const char* reason)
         cli->disconnect();
     }
     {
-        std::lock_guard<std::recursive_mutex> lk(session->mtx);
+        std::unique_lock<std::recursive_mutex> lk(session->mtx);
         session->client.reset();
         session->child_pid = 0;
         session->state = bridge_state_t::stopped;
@@ -15023,7 +15024,6 @@ nlohmann::json get_downstream_snapshot()
     return out;
 }
 
-}
 }
 }
 }

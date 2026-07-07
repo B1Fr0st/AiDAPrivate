@@ -15,7 +15,7 @@
 #include <thread>
 
 #include "../../helpers/diag_log.hpp"
-#include "../../infra/win_thread.hpp"
+#include "../infra/win_thread.hpp"
 #include "../runtime/manual_map_tls.hpp"
 #include "metadata_ring.hpp"
 #include "wer_correlation.hpp"
@@ -278,10 +278,10 @@ inline void observer_loop(DWORD pid, HWND hwnd) {
         if (hwnd && ::IsWindow(hwnd)) {
             rec.is_hung = ::IsHungAppWindow(hwnd);
             ::SetLastError(0);
-            rec.send_wm_null_ok = ::SendMessageTimeoutW(hwnd, WM_NULL, 0, 0,
+            rec.send_wm_null_ok = static_cast<BOOL>(::SendMessageTimeoutW(hwnd, WM_NULL, 0, 0,
                 SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
                 s.config.wm_null_timeout_ms,
-                &rec.send_wm_null_lresult);
+                &rec.send_wm_null_lresult) != 0);
             rec.send_wm_null_gle = rec.send_wm_null_ok ? 0 : ::GetLastError();
         }
 

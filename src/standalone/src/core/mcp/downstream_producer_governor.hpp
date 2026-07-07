@@ -16,7 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include "../../helpers/diag_log.hpp"
-#include "../../infra/win_thread.hpp"
+#include "../infra/win_thread.hpp"
 #include "../runtime/manual_map_tls.hpp"
 
 namespace mcp_standalone {
@@ -851,6 +851,7 @@ private:
         return count;
     }
 
+public:
     struct bounded_snapshot_t {
         bool lock_busy = false;
         std::size_t total_active = 0;
@@ -881,6 +882,7 @@ private:
         return out;
     }
 
+private:
     producer_quota_set_t quotas_;
     std::map<std::uint64_t, active_record_t> active_;
     std::map<std::string, kind_stats_t> kind_stats_;
@@ -1044,8 +1046,7 @@ public:
             return;
         cv_.notify_all();
         for (auto& w : workers_) {
-            std::string err;
-            w.join(&err);
+            w.join();
         }
         workers_.clear();
     }
@@ -1074,9 +1075,22 @@ private:
         std::uint64_t timeout_ms = 0;
     };
 
+    static void invoke_task_seh(const queued_task_t* task, const char* owner, const char* label)
+    {
+        __try {
+            if (task && task->fn)
+                task->fn();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            diag::log_tagged_fmt("mcp_srv",
+                "FEATURE-WORKER-GROUP-EXCEPTION owner=%s label=%s code=0x%08lX",
+                owner ? owner : "", label ? label : "",
+                static_cast<unsigned long>(GetExceptionCode()));
+        }
+    }
+
     void worker_loop(const std::string& label)
     {
-        manual_map_tls::ensure_current_thread();
+        aida::manual_map_tls::ensure_current_thread();
         active_workers_.fetch_add(1, std::memory_order_acq_rel);
         while (true) {
             queued_task_t task;
@@ -1093,15 +1107,7 @@ private:
                 queue_.pop();
                 queued_tasks_.fetch_sub(1, std::memory_order_acq_rel);
             }
-            __try {
-                if (task.fn)
-                    task.fn();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                diag::log_tagged_fmt("mcp_srv",
-                    "FEATURE-WORKER-GROUP-EXCEPTION owner=%s label=%s code=0x%08lX",
-                    cfg_.owner_subsystem.c_str(), label.c_str(),
-                    static_cast<unsigned long>(GetExceptionCode()));
-            }
+            invoke_task_seh(&task, cfg_.owner_subsystem.c_str(), label.c_str());
         }
         active_workers_.fetch_sub(1, std::memory_order_acq_rel);
     }

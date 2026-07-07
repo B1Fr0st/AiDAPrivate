@@ -1991,13 +1991,14 @@ tool_result_t tool_orchestrate(const json& params)
             check.c_str(),
             static_cast<unsigned long long>(job->scan_id),
             static_cast<unsigned long long>(def_token));
-        const bool posted = work_queue::post([job, check, admission = std::move(def_admission), def_token]() mutable {
+        auto def_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(def_admission));
+        const bool posted = work_queue::post([job, check, def_admission_ptr, def_token]() {
             run_defensive_check(job, check);
             diag::log_tagged_fmt("scan_orchestrator", "BURP-NETWORK-WORKER-RELEASE check=%s scan_id=%llu token=%llu reason=completed",
                 check.c_str(),
                 static_cast<unsigned long long>(job->scan_id),
                 static_cast<unsigned long long>(def_token));
-            admission.release("completed");
+            def_admission_ptr->release("completed");
         });
         if (!posted)
             update_defensive_status(job, check, "error", 0, "work_queue unavailable");

@@ -510,30 +510,45 @@ bool load_pin_state_from_aux(pin_state_t& out)
 }
 
 struct watchdog_t {
-    HINTERNET handle = nullptr;
-    winhttp_api_t::fn_close_handle_t p_close = nullptr;
+    const char* phase = nullptr;
     DWORD deadline_ms = 0;
     volatile LONG finished = 0;
+    volatile LONG timed_out = 0;
     HANDLE cancel_ev = nullptr;
 };
 
-HANDLE start_watchdog(watchdog_t& wd, HINTERNET h, winhttp_api_t::fn_close_handle_t p_close, DWORD deadline_ms)
+HANDLE start_watchdog(watchdog_t& wd, DWORD deadline_ms, const char* phase)
 {
-    wd.handle = h;
-    wd.p_close = p_close;
+    wd.phase = phase;
     wd.deadline_ms = deadline_ms;
     wd.finished = 0;
+    wd.timed_out = 0;
     wd.cancel_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    return CreateThread(nullptr, 0, [](LPVOID arg) -> DWORD {
+    if (!wd.cancel_ev) {
+        trans_log_fmt("watchdog_event_failed phase=%s gle=%lu deadline_ms=%lu",
+            phase ? phase : "<none>",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long>(deadline_ms));
+        return nullptr;
+    }
+    HANDLE thread = CreateThread(nullptr, 0, [](LPVOID arg) -> DWORD {
         auto* w = reinterpret_cast<watchdog_t*>(arg);
         DWORD wait = WaitForSingleObject(w->cancel_ev, w->deadline_ms);
-        if (wait == WAIT_TIMEOUT &&
-            InterlockedCompareExchange(&w->finished, 0, 0) == 0 &&
-            w->handle && w->p_close) {
-            w->p_close(w->handle);
+        if (wait == WAIT_TIMEOUT && InterlockedCompareExchange(&w->finished, 0, 0) == 0) {
+            InterlockedExchange(&w->timed_out, 1);
+            trans_log_fmt("watchdog_timeout phase=%s deadline_ms=%lu",
+                w->phase ? w->phase : "<none>",
+                static_cast<unsigned long>(w->deadline_ms));
         }
         return 0;
     }, &wd, 0, nullptr);
+    if (!thread) {
+        trans_log_fmt("watchdog_thread_failed phase=%s gle=%lu deadline_ms=%lu",
+            phase ? phase : "<none>",
+            static_cast<unsigned long>(GetLastError()),
+            static_cast<unsigned long>(deadline_ms));
+    }
+    return thread;
 }
 
 void stop_watchdog(watchdog_t& wd, HANDLE thread)
@@ -541,10 +556,15 @@ void stop_watchdog(watchdog_t& wd, HANDLE thread)
     InterlockedExchange(&wd.finished, 1);
     if (wd.cancel_ev) { SetEvent(wd.cancel_ev); }
     if (thread) {
-        WaitForSingleObject(thread, 1000);
+        WaitForSingleObject(thread, INFINITE);
         CloseHandle(thread);
     }
     if (wd.cancel_ev) { CloseHandle(wd.cancel_ev); wd.cancel_ev = nullptr; }
+}
+
+bool watchdog_timed_out(watchdog_t& wd)
+{
+    return InterlockedCompareExchange(&wd.timed_out, 0, 0) != 0;
 }
 
 bool query_cbt_or_exporter(const winhttp_api_t& api, HINTERNET h_req,
@@ -600,6 +620,15 @@ bool send_once(const winhttp_api_t& api,
                std::string& last_error)
 {
     const ULONGLONG t0 = GetTickCount64();
+    const std::wstring& log_host = host_override.empty() ? req.host : host_override;
+    trans_log_fmt("send_once_begin method=%s host=%ls path=%ls timeout_ms=%lu body=%zu max_body=%zu override=%d",
+        req.method.empty() ? "GET" : req.method.c_str(),
+        log_host.empty() ? L"<empty>" : log_host.c_str(),
+        req.path.empty() ? L"/" : req.path.c_str(),
+        static_cast<unsigned long>(req.timeout_ms > 0u ? req.timeout_ms : kDefaultTimeoutMs),
+        req.body.size(),
+        req.max_response_body_bytes,
+        host_override.empty() ? 0 : 1);
     HINTERNET h_session = api.p_open(L"AiDAStandalone-Auth/1.0",
                                      WINHTTP_ACCESS_TYPE_NO_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
@@ -700,14 +729,21 @@ bool send_once(const winhttp_api_t& api,
     DWORD watchdog_deadline = timeout_ms + kWatchdogGraceMs;
 
     watchdog_t wd_send;
-    HANDLE wd_send_thread = start_watchdog(wd_send, h_req, api.p_close_handle, watchdog_deadline);
+    trans_log_fmt("send_request_begin body=%lu hdr_len=%lu deadline_ms=%lu",
+        static_cast<unsigned long>(body_len),
+        static_cast<unsigned long>(hdr_len),
+        static_cast<unsigned long>(watchdog_deadline));
+    HANDLE wd_send_thread = start_watchdog(wd_send, watchdog_deadline, "send_request");
     BOOL send_ok = api.p_send_request(h_req, hdr_ptr, hdr_len, body_ptr, body_len, body_len, 0);
     DWORD send_gle = GetLastError();
     stop_watchdog(wd_send, wd_send_thread);
 
-    if (!send_ok) {
-        trans_log_fmt("send_failed gle=%lu elapsed_ms=%llu",
+    if (!send_ok || watchdog_timed_out(wd_send)) {
+        if (watchdog_timed_out(wd_send))
+            send_gle = ERROR_OPERATION_ABORTED;
+        trans_log_fmt("send_failed gle=%lu timed_out=%d elapsed_ms=%llu",
             static_cast<unsigned long>(send_gle),
+            watchdog_timed_out(wd_send) ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - t0));
         last_error = format_winhttp_error("winhttp_send_failed", send_gle);
         api.p_close_handle(h_req);
@@ -715,16 +751,22 @@ bool send_once(const winhttp_api_t& api,
         api.p_close_handle(h_session);
         return false;
     }
+    trans_log_fmt("send_request_ok elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     watchdog_t wd_recv;
-    HANDLE wd_recv_thread = start_watchdog(wd_recv, h_req, api.p_close_handle, watchdog_deadline);
+    trans_log_fmt("recv_response_begin deadline_ms=%lu", static_cast<unsigned long>(watchdog_deadline));
+    HANDLE wd_recv_thread = start_watchdog(wd_recv, watchdog_deadline, "recv_response");
     BOOL recv_ok = api.p_recv_response(h_req, nullptr);
     DWORD recv_gle = GetLastError();
     stop_watchdog(wd_recv, wd_recv_thread);
 
-    if (!recv_ok) {
-        trans_log_fmt("recv_failed gle=%lu elapsed_ms=%llu",
+    if (!recv_ok || watchdog_timed_out(wd_recv)) {
+        if (watchdog_timed_out(wd_recv))
+            recv_gle = ERROR_OPERATION_ABORTED;
+        trans_log_fmt("recv_failed gle=%lu timed_out=%d elapsed_ms=%llu",
             static_cast<unsigned long>(recv_gle),
+            watchdog_timed_out(wd_recv) ? 1 : 0,
             static_cast<unsigned long long>(GetTickCount64() - t0));
         last_error = format_winhttp_error("winhttp_recv_failed", recv_gle);
         api.p_close_handle(h_req);
@@ -732,20 +774,37 @@ bool send_once(const winhttp_api_t& api,
         api.p_close_handle(h_session);
         return false;
     }
+    trans_log_fmt("recv_response_ok elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     PCCERT_CONTEXT leaf_cert = nullptr;
     DWORD cert_size = sizeof(leaf_cert);
-    if (!api.p_query_option(h_req, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &leaf_cert, &cert_size) || !leaf_cert) {
-        const DWORD gle = GetLastError();
+    trans_log_fmt("cert_query_begin deadline_ms=%lu", static_cast<unsigned long>(watchdog_deadline));
+    watchdog_t wd_cert;
+    HANDLE wd_cert_thread = start_watchdog(wd_cert, watchdog_deadline, "cert_query");
+    BOOL cert_ok = api.p_query_option(h_req, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &leaf_cert, &cert_size);
+    DWORD cert_gle = GetLastError();
+    stop_watchdog(wd_cert, wd_cert_thread);
+    if (!cert_ok || !leaf_cert || watchdog_timed_out(wd_cert)) {
+        const DWORD gle = watchdog_timed_out(wd_cert) ? ERROR_OPERATION_ABORTED : cert_gle;
         last_error = format_winhttp_error("winhttp_cert_query_failed", gle);
-        trans_log_fmt("send_once_cert_query_failed gle=%lu cert_size=%lu elapsed_ms=%llu",
-            static_cast<unsigned long>(gle), static_cast<unsigned long>(cert_size),
+        trans_log_fmt("send_once_cert_query_failed gle=%lu timed_out=%d cert_ok=%d cert_size=%lu elapsed_ms=%llu",
+            static_cast<unsigned long>(gle),
+            watchdog_timed_out(wd_cert) ? 1 : 0,
+            cert_ok ? 1 : 0,
+            static_cast<unsigned long>(cert_size),
             static_cast<unsigned long long>(GetTickCount64() - t0));
+        if (leaf_cert) {
+            CertFreeCertificateContext(leaf_cert);
+        }
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
         return false;
     }
+    trans_log_fmt("cert_query_ok cert_size=%lu elapsed_ms=%llu",
+        static_cast<unsigned long>(cert_size),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     std::string pin_detail;
     bool pinned_ok = match_pin_against_chain(leaf_cert, pins, resp.server_spki_hash, pin_detail);
@@ -760,28 +819,53 @@ bool send_once(const winhttp_api_t& api,
     }
 
     std::string exporter_detail;
-    if (!query_cbt_or_exporter(api, h_req, resp.tls_exporter, exporter_detail)) {
+    trans_log_fmt("exporter_query_begin deadline_ms=%lu", static_cast<unsigned long>(watchdog_deadline));
+    watchdog_t wd_exporter;
+    HANDLE wd_exporter_thread = start_watchdog(wd_exporter, watchdog_deadline, "exporter_query");
+    bool exporter_ok = query_cbt_or_exporter(api, h_req, resp.tls_exporter, exporter_detail);
+    stop_watchdog(wd_exporter, wd_exporter_thread);
+    if (!exporter_ok || watchdog_timed_out(wd_exporter)) {
         last_error = "exporter_unavailable";
-        trans_log_fmt("exporter_unavailable detail=%s", exporter_detail.c_str());
+        trans_log_fmt("exporter_unavailable detail=%s timed_out=%d elapsed_ms=%llu",
+            exporter_detail.c_str(),
+            watchdog_timed_out(wd_exporter) ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
         return false;
     }
+    trans_log_fmt("exporter_query_ok size=%zu elapsed_ms=%llu",
+        resp.tls_exporter.size(),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     DWORD status_code = 0;
     DWORD scode_size = sizeof(status_code);
-    if (!api.p_query_headers(h_req,
-                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX,
-                             &status_code, &scode_size, WINHTTP_NO_HEADER_INDEX)) {
-        last_error = format_winhttp_error("winhttp_status_query_failed", GetLastError());
+    trans_log_fmt("status_query_begin deadline_ms=%lu", static_cast<unsigned long>(watchdog_deadline));
+    watchdog_t wd_status;
+    HANDLE wd_status_thread = start_watchdog(wd_status, watchdog_deadline, "status_query");
+    BOOL status_ok = api.p_query_headers(h_req,
+                                         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                         WINHTTP_HEADER_NAME_BY_INDEX,
+                                         &status_code, &scode_size, WINHTTP_NO_HEADER_INDEX);
+    DWORD status_gle = GetLastError();
+    stop_watchdog(wd_status, wd_status_thread);
+    if (!status_ok || watchdog_timed_out(wd_status)) {
+        const DWORD gle = watchdog_timed_out(wd_status) ? ERROR_OPERATION_ABORTED : status_gle;
+        last_error = format_winhttp_error("winhttp_status_query_failed", gle);
+        trans_log_fmt("status_query_failed gle=%lu timed_out=%d elapsed_ms=%llu",
+            static_cast<unsigned long>(gle),
+            watchdog_timed_out(wd_status) ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - t0));
         api.p_close_handle(h_req);
         api.p_close_handle(h_connect);
         api.p_close_handle(h_session);
         return false;
     }
     resp.http_status = status_code;
+    trans_log_fmt("status_query_ok status=%lu elapsed_ms=%llu",
+        static_cast<unsigned long>(resp.http_status),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     unsigned long long expected_content_length = 0;
     bool expected_content_length_known = false;
@@ -847,40 +931,107 @@ bool send_once(const winhttp_api_t& api,
         ? req.max_response_body_bytes
         : 16u * 1024u * 1024u;
     resp.body.clear();
-    resp.body.reserve(4096u);
-    uint8_t chunk[8192];
+    if (expected_content_length_known &&
+        expected_content_length > 0u &&
+        expected_content_length <= static_cast<unsigned long long>(max_body)) {
+        resp.body.reserve(static_cast<size_t>(expected_content_length));
+    } else {
+        const size_t initial_reserve = max_body < (1024u * 1024u) ? max_body : (1024u * 1024u);
+        if (initial_reserve > 0u) {
+            resp.body.reserve(initial_reserve);
+        }
+    }
+    uint8_t chunk[64u * 1024u];
     bool body_read_failed = false;
+    bool body_oversized = false;
     DWORD body_read_gle = ERROR_SUCCESS;
     const char* body_read_phase = "";
+    const ULONGLONG body_start_ms = GetTickCount64();
+    const ULONGLONG body_total_deadline_ms = static_cast<ULONGLONG>(timeout_ms) + kWatchdogGraceMs;
+    size_t body_read_iterations = 0u;
+    size_t last_progress_body = 0u;
+    ULONGLONG last_progress_ms = body_start_ms;
+    trans_log_fmt("body_read_begin status=%lu expected_known=%d expected=%llu encoded=%d max_body=%zu deadline_ms=%llu elapsed_ms=%llu",
+        static_cast<unsigned long>(resp.http_status),
+        expected_content_length_known ? 1 : 0,
+        expected_content_length,
+        response_content_encoded ? 1 : 0,
+        max_body,
+        static_cast<unsigned long long>(body_total_deadline_ms),
+        static_cast<unsigned long long>(body_start_ms - t0));
+    watchdog_t wd_body;
+    HANDLE wd_body_thread = start_watchdog(wd_body, watchdog_deadline, "body_read_total");
     for (;;) {
-        DWORD avail = 0u;
-        if (!api.p_query_avail(h_req, &avail)) {
+        const ULONGLONG now_ms = GetTickCount64();
+        if (now_ms - body_start_ms > body_total_deadline_ms || watchdog_timed_out(wd_body)) {
             body_read_failed = true;
-            body_read_gle = GetLastError();
+            body_read_gle = ERROR_OPERATION_ABORTED;
+            body_read_phase = "body_total_timeout";
+            break;
+        }
+        DWORD avail = 0u;
+        BOOL avail_ok = api.p_query_avail(h_req, &avail);
+        DWORD avail_gle = GetLastError();
+        if (watchdog_timed_out(wd_body)) {
+            body_read_failed = true;
+            body_read_gle = ERROR_OPERATION_ABORTED;
+            body_read_phase = "body_total_timeout";
+            break;
+        }
+        if (!avail_ok) {
+            body_read_failed = true;
+            body_read_gle = avail_gle;
             body_read_phase = "query_available_failed";
             break;
         }
         if (avail == 0u) { break; }
         DWORD to_read = avail > sizeof(chunk) ? static_cast<DWORD>(sizeof(chunk)) : avail;
         DWORD got = 0u;
-        if (!api.p_read_data(h_req, chunk, to_read, &got)) {
+        BOOL read_ok = api.p_read_data(h_req, chunk, to_read, &got);
+        DWORD read_gle = GetLastError();
+        if (watchdog_timed_out(wd_body)) {
             body_read_failed = true;
-            body_read_gle = GetLastError();
+            body_read_gle = ERROR_OPERATION_ABORTED;
+            body_read_phase = "body_total_timeout";
+            break;
+        }
+        if (!read_ok) {
+            body_read_failed = true;
+            body_read_gle = read_gle;
             body_read_phase = "read_data_failed";
             break;
         }
         if (got == 0u) { break; }
         resp.body.insert(resp.body.end(), chunk, chunk + got);
-        if (resp.body.size() > max_body) {
-            last_error = "winhttp_body_oversized";
-            trans_log_fmt("send_once_body_oversized body=%zu cap=%zu status=%lu elapsed_ms=%llu",
-                resp.body.size(), max_body, static_cast<unsigned long>(resp.http_status),
-                static_cast<unsigned long long>(GetTickCount64() - t0));
-            api.p_close_handle(h_req);
-            api.p_close_handle(h_connect);
-            api.p_close_handle(h_session);
-            return false;
+        ++body_read_iterations;
+        const ULONGLONG progress_now_ms = GetTickCount64();
+        if (body_read_iterations == 1u ||
+            resp.body.size() - last_progress_body >= 1024u * 1024u ||
+            progress_now_ms - last_progress_ms >= 1000ULL) {
+            last_progress_body = resp.body.size();
+            last_progress_ms = progress_now_ms;
+            trans_log_fmt("body_read_progress iter=%zu avail=%lu got=%lu body=%zu elapsed_ms=%llu",
+                body_read_iterations,
+                static_cast<unsigned long>(avail),
+                static_cast<unsigned long>(got),
+                resp.body.size(),
+                static_cast<unsigned long long>(progress_now_ms - body_start_ms));
         }
+        if (resp.body.size() > max_body) {
+            body_oversized = true;
+            break;
+        }
+    }
+    stop_watchdog(wd_body, wd_body_thread);
+    if (body_oversized) {
+        last_error = "winhttp_body_oversized";
+        trans_log_fmt("send_once_body_oversized body=%zu cap=%zu status=%lu elapsed_ms=%llu",
+            resp.body.size(), max_body, static_cast<unsigned long>(resp.http_status),
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+        api.p_close_handle(h_req);
+        api.p_close_handle(h_connect);
+        api.p_close_handle(h_session);
+        return false;
     }
     if (!body_read_failed && expected_content_length_known &&
         resp.body.size() != static_cast<size_t>(expected_content_length) &&
@@ -904,6 +1055,14 @@ bool send_once(const winhttp_api_t& api,
         api.p_close_handle(h_session);
         return false;
     }
+    trans_log_fmt("body_read_ok status=%lu body=%zu iterations=%zu expected_known=%d expected=%llu elapsed_ms=%llu total_elapsed_ms=%llu",
+        static_cast<unsigned long>(resp.http_status),
+        resp.body.size(),
+        body_read_iterations,
+        expected_content_length_known ? 1 : 0,
+        expected_content_length,
+        static_cast<unsigned long long>(GetTickCount64() - body_start_ms),
+        static_cast<unsigned long long>(GetTickCount64() - t0));
 
     api.p_close_handle(h_req);
     api.p_close_handle(h_connect);
@@ -984,6 +1143,14 @@ bool send(const request_t& req, response_t& resp, std::string& last_error)
     resp.server_spki_hash.fill(0u);
 
     const uint32_t backoff_ms[3] = { 200u, 800u, 3000u };
+
+    trans_log_fmt("send_begin method=%s host=%ls path=%ls timeout_ms=%lu body=%zu max_body=%zu attempts=3",
+        req.method.empty() ? "GET" : req.method.c_str(),
+        req.host.empty() ? L"<empty>" : req.host.c_str(),
+        req.path.empty() ? L"/" : req.path.c_str(),
+        static_cast<unsigned long>(req.timeout_ms > 0u ? req.timeout_ms : kDefaultTimeoutMs),
+        req.body.size(),
+        req.max_response_body_bytes);
 
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (attempt > 0) {

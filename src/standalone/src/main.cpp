@@ -518,7 +518,6 @@ static constexpr const wchar_t* kAidaWindowTitle = L"AiDA Standalone";
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
 static constexpr UINT kAidaUiDispatcherWakeMessage = WM_APP + 0x1DB;
 static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE;
-static constexpr UINT kAidaQueuedNoSendPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT;
 static constexpr UINT kAidaSendOnlyPeekFlags = PM_REMOVE | PM_QS_SENDMESSAGE;
 static constexpr DWORD kAidaNonSendQueueBits = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_HOTKEY | QS_ALLPOSTMESSAGE;
 static constexpr DWORD kAidaPumpQueueBits = kAidaNonSendQueueBits | QS_SENDMESSAGE;
@@ -1604,14 +1603,6 @@ static bool aida_ctrl_shift_t_chord_down()
     return aida_key_down(VK_CONTROL) && aida_key_down(VK_SHIFT) && aida_key_down('T');
 }
 
-static bool aida_input_only_queue(DWORD queue_current, DWORD queue_changed)
-{
-    const DWORD observed = queue_current | queue_changed;
-    return (observed & QS_INPUT) != 0 &&
-        (queue_current & ~static_cast<DWORD>(QS_INPUT)) == 0 &&
-        (queue_changed & ~static_cast<DWORD>(QS_INPUT)) == 0;
-}
-
 static bool aida_wide_to_utf8_owned(const std::wstring& in, std::string& out)
 {
     out.clear();
@@ -1787,25 +1778,6 @@ static aida_message_pump_slice_t aida_pump_messages_budgeted(const char* reason,
         const DWORD queue_current = HIWORD(queue_status_before);
         if ((queue_current & QS_KEY) != 0 && aida_ctrl_shift_t_chord_down())
             break;
-        if (aida_input_only_queue(queue_current, queue_changed)) {
-            static uint64_t s_budget_input_only_last_log_ms = 0;
-            const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
-            if (s_budget_input_only_last_log_ms == 0 || now_ms - s_budget_input_only_last_log_ms >= 1000ULL) {
-                s_budget_input_only_last_log_ms = now_ms;
-                diag::log_tagged_critical_fmt("msgpump",
-                    "budget_input_only_peek_deferred reason=%s qs=0x%08lX current=0x%04lX changed=0x%04lX input=0x%04lX mouse=0x%04lX key=0x%04lX running=%d tid=%lu",
-                    reason && reason[0] ? reason : "<none>",
-                    static_cast<unsigned long>(queue_status_before),
-                    static_cast<unsigned long>(queue_current),
-                    static_cast<unsigned long>(queue_changed),
-                    static_cast<unsigned long>((queue_current | queue_changed) & QS_INPUT),
-                    static_cast<unsigned long>((queue_current | queue_changed) & QS_MOUSE),
-                    static_cast<unsigned long>((queue_current | queue_changed) & QS_KEY),
-                    test_all_features::is_running() ? 1 : 0,
-                    ::GetCurrentThreadId());
-            }
-            break;
-        }
         const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
         const bool non_send_pending = ((queue_current | queue_changed) & kAidaNonSendQueueBits) != 0;
         if (send_message_pending && !non_send_pending) {
@@ -1818,7 +1790,7 @@ static aida_message_pump_slice_t aida_pump_messages_budgeted(const char* reason,
             continue;
         }
 
-        const UINT peek_flags = non_send_pending ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
+        const UINT peek_flags = kAidaQueuedPeekFlags;
         BOOL has_message = ::PeekMessage(&msg, nullptr, 0U, 0U, peek_flags);
         if (!has_message)
             break;
@@ -2520,23 +2492,19 @@ static uint64_t phase0_message_pump_invariant_mask()
         mask |= 1ULL << 0;
     if ((kAidaQueuedPeekFlags & PM_REMOVE) == PM_REMOVE)
         mask |= 1ULL << 1;
-    if ((kAidaQueuedNoSendPeekFlags & PM_QS_SENDMESSAGE) == 0)
-        mask |= 1ULL << 2;
-    if (kAidaQueuedNoSendPeekFlags == (PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT))
-        mask |= 1ULL << 3;
     if (kAidaSendOnlyPeekFlags == (PM_REMOVE | PM_QS_SENDMESSAGE))
-        mask |= 1ULL << 4;
+        mask |= 1ULL << 2;
     if ((kAidaNonSendQueueBits & QS_SENDMESSAGE) == 0)
-        mask |= 1ULL << 5;
+        mask |= 1ULL << 3;
     if ((kAidaPumpQueueBits & QS_SENDMESSAGE) == QS_SENDMESSAGE)
-        mask |= 1ULL << 6;
+        mask |= 1ULL << 4;
     if ((kAidaPumpQueueBits & kAidaNonSendQueueBits) == kAidaNonSendQueueBits)
-        mask |= 1ULL << 7;
+        mask |= 1ULL << 5;
     if ((kAidaInteractiveQueueBits & QS_SENDMESSAGE) == 0)
-        mask |= 1ULL << 8;
+        mask |= 1ULL << 6;
+    mask |= 1ULL << 7;
+    mask |= 1ULL << 8;
     mask |= 1ULL << 9;
-    mask |= 1ULL << 10;
-    mask |= 1ULL << 11;
     return mask;
 }
 
@@ -2545,7 +2513,6 @@ static uint64_t phase0_message_pump_invariant_fingerprint()
     uint64_t hash = 14695981039346656037ULL;
     hash = phase0_fnv1a64_update_cstr(hash, "aida.phase0.message_pump.invariants.v1");
     hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaQueuedPeekFlags));
-    hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaQueuedNoSendPeekFlags));
     hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaSendOnlyPeekFlags));
     hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaNonSendQueueBits));
     hash = phase0_fnv1a64_update_u64(hash, static_cast<uint64_t>(kAidaPumpQueueBits));
@@ -2576,7 +2543,7 @@ static void phase0_log_startup_invariants(const char* phase, HWND hwnd)
     const DWORD current_tid = GetCurrentThreadId();
     const std::string run_id = standalone_license::run_correlation_id();
     diag::log_tagged_critical_fmt("PHASE0-INVARIANTS",
-        "record=message_pump_invariants phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu hwnd=0x%llX ui_owner_available=%d ui_owner_tid=%lu ui_owner_pid=%lu ui_owner_gle=%lu ui_owner_matches_current=%d queued_flags=0x%08X queued_no_send_flags=0x%08X send_only_flags=0x%08X non_send_queue_bits=0x%08lX pump_queue_bits=0x%08lX interactive_queue_bits=0x%08lX pm_remove=0x%08X pm_qs_input=0x%08X pm_qs_postmessage=0x%08X pm_qs_paint=0x%08X pm_qs_sendmessage=0x%08X qs_allinput=0x%08lX qs_current=0x%04lX qs_changed=0x%04lX invariant_mask=0x%016llX invariant_fingerprint=0x%016llX queued_includes_send=%d queued_includes_remove=%d queued_no_send_excludes_send=%d queued_no_send_exact=%d send_only_exact=%d non_send_bits_exclude_send=%d pump_bits_include_send=%d pump_bits_include_non_send=%d interactive_bits_exclude_send=%d empty_queue_nonblocking_probe_contract=%d send_only_drain_contract=%d queued_send_defer_contract=%d",
+        "record=message_pump_invariants phase=%s run_id=%s pid=%lu tid=%lu utc=%s tick_ms=%llu hwnd=0x%llX ui_owner_available=%d ui_owner_tid=%lu ui_owner_pid=%lu ui_owner_gle=%lu ui_owner_matches_current=%d queued_flags=0x%08X send_only_flags=0x%08X non_send_queue_bits=0x%08lX pump_queue_bits=0x%08lX interactive_queue_bits=0x%08lX pm_remove=0x%08X pm_qs_input=0x%08X pm_qs_postmessage=0x%08X pm_qs_paint=0x%08X pm_qs_sendmessage=0x%08X qs_allinput=0x%08lX qs_current=0x%04lX qs_changed=0x%04lX invariant_mask=0x%016llX invariant_fingerprint=0x%016llX queued_includes_send=%d queued_includes_remove=%d send_only_exact=%d non_send_bits_exclude_send=%d pump_bits_include_send=%d pump_bits_include_non_send=%d interactive_bits_exclude_send=%d empty_queue_nonblocking_probe_contract=%d send_only_drain_contract=%d queued_send_codrain_contract=%d",
         phase ? phase : "<null>",
         run_id.c_str(),
         GetCurrentProcessId(),
@@ -2590,7 +2557,6 @@ static void phase0_log_startup_invariants(const char* phase, HWND hwnd)
         owner_gle,
         owner_tid != 0 && owner_tid == current_tid ? 1 : 0,
         kAidaQueuedPeekFlags,
-        kAidaQueuedNoSendPeekFlags,
         kAidaSendOnlyPeekFlags,
         static_cast<unsigned long>(kAidaNonSendQueueBits),
         static_cast<unsigned long>(kAidaPumpQueueBits),
@@ -2607,8 +2573,6 @@ static void phase0_log_startup_invariants(const char* phase, HWND hwnd)
         static_cast<unsigned long long>(invariant_hash),
         (kAidaQueuedPeekFlags & PM_QS_SENDMESSAGE) == PM_QS_SENDMESSAGE ? 1 : 0,
         (kAidaQueuedPeekFlags & PM_REMOVE) == PM_REMOVE ? 1 : 0,
-        (kAidaQueuedNoSendPeekFlags & PM_QS_SENDMESSAGE) == 0 ? 1 : 0,
-        kAidaQueuedNoSendPeekFlags == (PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT) ? 1 : 0,
         kAidaSendOnlyPeekFlags == (PM_REMOVE | PM_QS_SENDMESSAGE) ? 1 : 0,
         (kAidaNonSendQueueBits & QS_SENDMESSAGE) == 0 ? 1 : 0,
         (kAidaPumpQueueBits & QS_SENDMESSAGE) == QS_SENDMESSAGE ? 1 : 0,
@@ -5331,7 +5295,7 @@ static void emit_window_hung_snapshot(
     if (hwnd_valid) {
         is_hung = ::IsHungAppWindow(hwnd);
         ::SetLastError(0);
-        send_ok = ::SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, kSendTimeoutFlags, kSendTimeoutMs, &send_lresult);
+        send_ok = static_cast<BOOL>(::SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, kSendTimeoutFlags, kSendTimeoutMs, &send_lresult) != 0);
         send_gle = send_ok ? 0UL : ::GetLastError();
     }
 
@@ -6411,6 +6375,95 @@ static bool aida_is_fatal_exception_code(DWORD code)
     }
 }
 
+static bool aida_build_local_log_path(const char* file_name, char* out, size_t cap)
+{
+    if (!file_name || !out || cap == 0)
+        return false;
+    out[0] = '\0';
+    char module[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameA(nullptr, module, static_cast<DWORD>(sizeof(module)));
+    if (n == 0 || n >= sizeof(module))
+        return false;
+    char* slash = std::strrchr(module, '\\');
+    if (!slash)
+        return false;
+    *(slash + 1) = '\0';
+    _snprintf_s(out, cap, _TRUNCATE, "%s%s", module, file_name);
+    return out[0] != '\0';
+}
+
+static void aida_append_direct_log_line(const char* file_name, const char* msg)
+{
+    if (!file_name || !msg || msg[0] == '\0')
+        return;
+    char path[MAX_PATH] = {};
+    if (!aida_build_local_log_path(file_name, path, sizeof(path)))
+        return;
+    HANDLE hf = CreateFileA(path,
+        FILE_APPEND_DATA | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+        nullptr);
+    if (hf == INVALID_HANDLE_VALUE)
+        return;
+    DWORD written = 0;
+    const DWORD len = static_cast<DWORD>(strnlen_s(msg, 4095));
+    if (len != 0)
+        WriteFile(hf, msg, len, &written, nullptr);
+    DWORD newline_written = 0;
+    WriteFile(hf, "\r\n", 2, &newline_written, nullptr);
+    FlushFileBuffers(hf);
+    CloseHandle(hf);
+}
+
+static void aida_append_direct_fatal_line(const char* msg)
+{
+    aida_append_direct_log_line("aida_crash.log", msg);
+    aida_append_direct_log_line("aida_debug.log", msg);
+}
+
+static void aida_write_minimal_fatal_exception_line(EXCEPTION_POINTERS* ep, const char* phase)
+{
+    if (!ep || !ep->ExceptionRecord)
+        return;
+    CONTEXT* ctx = ep->ContextRecord;
+    HMODULE exe_base = GetModuleHandleA(nullptr);
+    uintptr_t exe_addr = reinterpret_cast<uintptr_t>(exe_base);
+    uintptr_t rip = ctx ? static_cast<uintptr_t>(ctx->Rip) : 0;
+    uintptr_t rsp = ctx ? static_cast<uintptr_t>(ctx->Rsp) : 0;
+    uintptr_t rbp = ctx ? static_cast<uintptr_t>(ctx->Rbp) : 0;
+    uintptr_t crash_addr = reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
+    uintptr_t rip_offset = exe_addr && rip >= exe_addr ? rip - exe_addr : 0;
+    uintptr_t addr_offset = exe_addr && crash_addr >= exe_addr ? crash_addr - exe_addr : 0;
+    unsigned long long p0 = ep->ExceptionRecord->NumberParameters > 0
+        ? static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[0])
+        : 0ULL;
+    unsigned long long p1 = ep->ExceptionRecord->NumberParameters > 1
+        ? static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1])
+        : 0ULL;
+    char line[1536] = {};
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+        "FIRST_CHANCE_FATAL_EXCEPTION phase=%s code=0x%08X addr=0x%016llX addr_off_exe=0x%llX rip=0x%016llX rip_off_exe=0x%llX rsp=0x%016llX rbp=0x%016llX tid=%lu flags=0x%08X params=%lu p0=0x%016llX p1=0x%016llX last_error=%lu tick=%llu",
+        phase ? phase : "minimal",
+        ep->ExceptionRecord->ExceptionCode,
+        static_cast<unsigned long long>(crash_addr),
+        static_cast<unsigned long long>(addr_offset),
+        static_cast<unsigned long long>(rip),
+        static_cast<unsigned long long>(rip_offset),
+        static_cast<unsigned long long>(rsp),
+        static_cast<unsigned long long>(rbp),
+        GetCurrentThreadId(),
+        ep->ExceptionRecord->ExceptionFlags,
+        static_cast<unsigned long>(ep->ExceptionRecord->NumberParameters),
+        p0,
+        p1,
+        GetLastError(),
+        static_cast<unsigned long long>(GetTickCount64()));
+    aida_append_direct_fatal_line(line);
+}
+
 static void aida_write_first_chance_crash_log(EXCEPTION_POINTERS* ep)
 {
     static std::atomic<bool> written{false};
@@ -6419,6 +6472,12 @@ static void aida_write_first_chance_crash_log(EXCEPTION_POINTERS* ep)
     bool expected = false;
     if (!written.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         return;
+
+    __try {
+        aida_write_minimal_fatal_exception_line(ep, "minimal");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
 
     CONTEXT* ctx = ep->ContextRecord;
     HMODULE exe_base = GetModuleHandleA(nullptr);
@@ -6438,14 +6497,26 @@ static void aida_write_first_chance_crash_log(EXCEPTION_POINTERS* ep)
         : 0ULL;
 
     char tracer_snapshot[2600] = {};
-    format_tracer_crash_snapshot(tracer_snapshot, sizeof(tracer_snapshot));
     char shutdown_snapshot[4200] = {};
     char stack_modules[2200] = {};
-    format_shutdown_crash_snapshot(shutdown_snapshot, sizeof(shutdown_snapshot));
-    format_context_stack_modules(ctx, stack_modules, sizeof(stack_modules));
-    char buf[8192];
-    snprintf(buf, sizeof(buf),
-        "FIRST_CHANCE_FATAL_EXCEPTION: code=0x%08X addr=0x%016llX addr_off_exe=0x%llX rip=0x%016llX rip_off_exe=0x%llX rsp=0x%016llX rbp=0x%016llX tid=%lu flags=0x%08X params=%lu p0=0x%016llX p1=0x%016llX last_error=%lu stack_modules={%s} shutdown={%s} tracer={%s}",
+    __try {
+        format_tracer_crash_snapshot(tracer_snapshot, sizeof(tracer_snapshot));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        _snprintf_s(tracer_snapshot, sizeof(tracer_snapshot), _TRUNCATE, "<tracer_snapshot_exception=0x%08X>", GetExceptionCode());
+    }
+    __try {
+        format_shutdown_crash_snapshot(shutdown_snapshot, sizeof(shutdown_snapshot));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        _snprintf_s(shutdown_snapshot, sizeof(shutdown_snapshot), _TRUNCATE, "<shutdown_snapshot_exception=0x%08X>", GetExceptionCode());
+    }
+    __try {
+        format_context_stack_modules(ctx, stack_modules, sizeof(stack_modules));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        _snprintf_s(stack_modules, sizeof(stack_modules), _TRUNCATE, "<stack_modules_exception=0x%08X>", GetExceptionCode());
+    }
+    char buf[8192] = {};
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "FIRST_CHANCE_FATAL_CONTEXT code=0x%08X addr=0x%016llX addr_off_exe=0x%llX rip=0x%016llX rip_off_exe=0x%llX rsp=0x%016llX rbp=0x%016llX tid=%lu flags=0x%08X params=%lu p0=0x%016llX p1=0x%016llX last_error=%lu stack_modules={%s} shutdown={%s} tracer={%s}",
         ep->ExceptionRecord->ExceptionCode,
         static_cast<unsigned long long>(crash_addr),
         static_cast<unsigned long long>(addr_offset),
@@ -6462,8 +6533,7 @@ static void aida_write_first_chance_crash_log(EXCEPTION_POINTERS* ep)
         stack_modules,
         shutdown_snapshot,
         tracer_snapshot);
-    diag::write_crash_log(buf, false);
-    diag::log_tagged_critical("veh_crash", buf);
+    aida_append_direct_fatal_line(buf);
 }
 
 static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
@@ -6512,7 +6582,11 @@ static LONG CALLBACK aida_diagnostic_veh(EXCEPTION_POINTERS* ep)
             p1);
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    aida_write_first_chance_crash_log(ep);
+    if (aida_is_fatal_exception_code(code))
+    {
+        aida_write_first_chance_crash_log(ep);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     aida::diagnostics::crash::emit_crash_breadcrumb(code, ep->ExceptionRecord->ExceptionAddress, "aida_diagnostic_veh");
     if (!ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
     HMODULE crash_mod = nullptr;
@@ -7809,7 +7883,6 @@ int main(int, char**)
 
         aida_tracer::mark_render_phase("peek_message_begin");
         MSG msg;
-        static uint64_t sent_with_queued_last_log_ms = 0;
         static bool ctrl_shift_t_chord_latched = false;
         for (;;)
         {
@@ -7826,34 +7899,6 @@ int main(int, char**)
                 break;
             }
             ctrl_shift_t_chord_latched = false;
-            if (aida_input_only_queue(queue_current, queue_changed)) {
-                static uint64_t s_input_only_last_log_ms = 0;
-                const uint64_t now_input_defer_ms = static_cast<uint64_t>(GetTickCount64());
-                aida_tracer::set_peek_state(queue_status_before, 0);
-                aida_tracer::set_peek_call_shape(0, nullptr);
-                aida_tracer::mark_render_phase("peek_message_input_only_defer");
-                if (s_input_only_last_log_ms == 0 || now_input_defer_ms - s_input_only_last_log_ms >= 1000ULL) {
-                    s_input_only_last_log_ms = now_input_defer_ms;
-                    char stall_context[4600] = {};
-                    format_message_pump_stall_context(stall_context, sizeof(stall_context));
-                    diag::log_tagged_critical_fmt("msgpump",
-                        "input_only_peek_deferred frame=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX input=0x%04lX mouse=0x%04lX key=0x%04lX flags=0x%08X hwnd=0x%llX running=%d chord=%d tid=%lu ctx={%.3600s}",
-                        static_cast<unsigned long long>(frame_number),
-                        static_cast<unsigned long>(queue_status_before),
-                        static_cast<unsigned long>(queue_current),
-                        static_cast<unsigned long>(queue_changed),
-                        static_cast<unsigned long>((queue_current | queue_changed) & QS_INPUT),
-                        static_cast<unsigned long>((queue_current | queue_changed) & QS_MOUSE),
-                        static_cast<unsigned long>((queue_current | queue_changed) & QS_KEY),
-                        0U,
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-                        test_all_features::is_running() ? 1 : 0,
-                        aida_ctrl_shift_t_chord_down() ? 1 : 0,
-                        ::GetCurrentThreadId(),
-                        stall_context[0] ? stall_context : "<empty>");
-                }
-                break;
-            }
             if (queue_current == 0) {
                 aida_tracer::set_peek_state(queue_status_before, 0);
                 aida_tracer::set_peek_call_shape(kAidaQueuedPeekFlags, nullptr);
@@ -7861,7 +7906,6 @@ int main(int, char**)
             const bool send_message_pending = (queue_current & QS_SENDMESSAGE) != 0;
             const bool non_send_pending = ((queue_current | queue_changed) & kAidaNonSendQueueBits) != 0;
             const bool send_only_pending = send_message_pending && !non_send_pending;
-            const bool sent_deferred_for_queued = send_message_pending && non_send_pending;
             if (send_only_pending) {
                 aida_tracer::set_peek_state(queue_status_before, 0);
                 aida_tracer::set_peek_call_shape(kAidaSendOnlyPeekFlags, nullptr);
@@ -7909,35 +7953,11 @@ int main(int, char**)
                 }
                 continue;
             }
-            const UINT peek_remove_flags = non_send_pending ? kAidaQueuedNoSendPeekFlags : kAidaQueuedPeekFlags;
+            const UINT peek_remove_flags = kAidaQueuedPeekFlags;
             HWND peek_filter = nullptr;
             ::SetLastError(0);
             aida_tracer::set_peek_state(queue_status_before, 0);
             aida_tracer::set_peek_call_shape(peek_remove_flags, peek_filter);
-            if (sent_deferred_for_queued) {
-                const uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
-                if (now_ms - sent_with_queued_last_log_ms >= 1000) {
-                    sent_with_queued_last_log_ms = now_ms;
-                    aida_tracer::mark_render_phase("peek_message_queued_before_send");
-                    diag::log_tagged_critical_fmt("msgpump",
-                        "send_deferred_for_queued frame=%llu qs=0x%08lX current=0x%04lX changed=0x%04lX non_send=0x%04lX send=0x%04lX flags=0x%08X canonical_flags=0x%08X hwnd=0x%llX fg=0x%llX active=0x%llX focus=0x%llX tid=%lu",
-                        (unsigned long long)frame_number,
-                        static_cast<unsigned long>(queue_status_before),
-                        static_cast<unsigned long>(queue_current),
-                        static_cast<unsigned long>(queue_changed),
-                        static_cast<unsigned long>(queue_current & kAidaNonSendQueueBits),
-                        static_cast<unsigned long>(queue_current & QS_SENDMESSAGE),
-                        peek_remove_flags,
-                        kAidaQueuedPeekFlags,
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetForegroundWindow())),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetActiveWindow())),
-                        static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(::GetFocus())),
-                        ::GetCurrentThreadId());
-                } else {
-                    aida_tracer::mark_render_phase("peek_message_queued_before_send");
-                }
-            }
             uint64_t peek_start = static_cast<uint64_t>(GetTickCount64());
             aida_tracer::mark_render_phase("peek_message_call");
             aida_tracer::g_peek_call_count.fetch_add(1, std::memory_order_acq_rel);

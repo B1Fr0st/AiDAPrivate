@@ -415,8 +415,7 @@ void stop_entries(std::vector<std::unique_ptr<pipeline_entry_t>>& entries)
     for (auto& e : entries)
     {
         if (e) {
-            std::string err;
-            e->worker.join(&err);
+            e->worker.join();
         }
     }
 }

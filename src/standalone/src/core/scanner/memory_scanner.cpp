@@ -1119,7 +1119,7 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 			std::string err;
 			char tname[32];
 			_snprintf_s(tname, sizeof(tname), _TRUNCATE, "ptr_scan.map.%d", w);
-			if (t.start(scan_pointer_worker, w, &err, aida::infra::win_thread::default_stack_reserve, tname))
+			if (t.start([&scan_pointer_worker, w]() { scan_pointer_worker(w); }, &err, aida::infra::win_thread::default_stack_reserve, tname))
 				ptr_workers.push_back(std::move(t));
 			else
 				diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_worker_start_failed w=%d err='%s'", w, err.c_str());

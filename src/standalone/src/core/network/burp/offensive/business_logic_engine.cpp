@@ -622,8 +622,7 @@ std::vector<send_result_t> concurrent_send(const target_t& target,
             threads.push_back(std::move(wt));
     }
     for (auto& t : threads) {
-        std::string err;
-        t.join(&err);
+        t.join();
     }
     return results;
 }

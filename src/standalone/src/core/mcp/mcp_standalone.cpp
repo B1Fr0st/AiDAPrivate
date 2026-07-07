@@ -56,6 +56,8 @@
 
 namespace mcp_standalone
 {
+static std::string json_dump_safe(const json& j, int indent = -1);
+
 namespace
 {
     std::atomic<bool> g_ide_lifecycle_ready{false};
@@ -2975,7 +2977,7 @@ namespace
     }
 }
 
-static std::string json_dump_safe(const json& j, int indent = -1)
+static std::string json_dump_safe(const json& j, int indent)
 {
     try { return j.dump(indent); }
     catch (...) { return "{}"; }
@@ -7600,6 +7602,23 @@ struct tool_invocation_metrics_t
     bool resolved_target = false;
 };
 
+static json tool_diagnostics_json(
+    std::uint64_t seq,
+    const std::string& diag_id,
+    const std::string& request_id,
+    const std::string& tool_name,
+    const std::string& domain,
+    bool read_only,
+    std::uint32_t target_pid,
+    std::uint64_t timeout_ms,
+    std::uint64_t deadline_ms,
+    const std::string& payload_shape,
+    const std::string& validation_status,
+    const std::string& dependency_status,
+    const tool_invocation_metrics_t& metrics,
+    const std::shared_ptr<mcp_executor_task_meta_t>& meta,
+    bool cancelled);
+
 static void set_tool_metrics_lane(tool_invocation_metrics_t* metrics, const std::string& lane, std::uint64_t lock_wait_ms)
 {
     if (!metrics)
@@ -9002,8 +9021,8 @@ static void log_capacity_snapshot_events(const char* phase, const capacity_diag:
                     "%s%s=%zu/%zu",
                     ds_offset == 0 ? "" : ";",
                     entry.value("kind", std::string()).c_str(),
-                    entry.value("active", 0),
-                    entry.value("rejected", 0));
+                    entry.value("active", std::size_t{0}),
+                    entry.value("rejected", std::size_t{0}));
                 if (written < 0) break;
                 ds_offset += static_cast<std::size_t>(written);
             }
@@ -9018,7 +9037,7 @@ static void log_capacity_snapshot_events(const char* phase, const capacity_diag:
                     "%s%s=%zu",
                     ds_p_offset == 0 ? "" : ";",
                     entry.value("principal", std::string()).c_str(),
-                    entry.value("active", 0));
+                    entry.value("active", std::size_t{0}));
                 if (written < 0) break;
                 ds_p_offset += static_cast<std::size_t>(written);
             }

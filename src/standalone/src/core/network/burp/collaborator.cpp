@@ -1272,13 +1272,14 @@ static void http_thread_main(std::string bind_ip, uint16_t port, uint64_t genera
                 static_cast<unsigned long long>(sess_token));
             s_http_session_wg.ensure();
             if (s_http_session_wg.group) {
-                auto posted = s_http_session_wg.group->post([task, admission = std::move(sess_admission), sess_token, client_sock]() mutable {
+                auto sess_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(sess_admission));
+                auto posted = s_http_session_wg.group->post([task, sess_admission_ptr, sess_token, client_sock, client_ip, client_port]() {
                     task();
                     ::diag::log_tagged_fmt("collaborator", "BURP-NETWORK-WORKER-RELEASE client=%s:%u token=%llu reason=completed",
                         client_ip.c_str(),
                         static_cast<unsigned>(client_port),
                         static_cast<unsigned long long>(sess_token));
-                    admission.release("completed");
+                    sess_admission_ptr->release("completed");
                 });
                 if (posted) {
                     spawned = true;

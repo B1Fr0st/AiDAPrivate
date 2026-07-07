@@ -1428,255 +1428,6 @@ static SimpleHttpResponse winhttp_https_request(
     return out;
 }
 
-struct winhttp_session_t
-{
-    HMODULE   wh_mod    = nullptr;
-    HINTERNET h_session = nullptr;
-    HINTERNET h_connect = nullptr;
-    std::string host;
-    std::string base_path_prefix;
-    int       port      = 443;
-    bool      is_https  = true;
-    int       timeout_ms = 15000;
-
-    using fn_open_t           = HINTERNET (WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
-    using fn_connect_t        = HINTERNET (WINAPI*)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
-    using fn_open_request_t   = HINTERNET (WINAPI*)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
-    using fn_send_request_t   = BOOL (WINAPI*)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
-    using fn_recv_response_t  = BOOL (WINAPI*)(HINTERNET, LPVOID);
-    using fn_query_headers_t  = BOOL (WINAPI*)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
-    using fn_query_avail_t    = BOOL (WINAPI*)(HINTERNET, LPDWORD);
-    using fn_read_data_t      = BOOL (WINAPI*)(HINTERNET, LPVOID, DWORD, LPDWORD);
-    using fn_close_handle_t   = BOOL (WINAPI*)(HINTERNET);
-    using fn_set_timeouts_t   = BOOL (WINAPI*)(HINTERNET, int, int, int, int);
-    using fn_set_option_t     = BOOL (WINAPI*)(HINTERNET, DWORD, LPVOID, DWORD);
-
-    fn_open_t          p_open          = nullptr;
-    fn_connect_t       p_connect       = nullptr;
-    fn_open_request_t  p_open_request  = nullptr;
-    fn_send_request_t  p_send_request  = nullptr;
-    fn_recv_response_t p_recv_response = nullptr;
-    fn_query_headers_t p_query_headers = nullptr;
-    fn_query_avail_t   p_query_avail   = nullptr;
-    fn_read_data_t     p_read_data     = nullptr;
-    fn_close_handle_t  p_close_handle  = nullptr;
-    fn_set_timeouts_t  p_set_timeouts  = nullptr;
-    fn_set_option_t    p_set_option    = nullptr;
-
-    bool valid() const { return h_session && h_connect && p_open_request; }
-};
-
-static void winhttp_session_close(winhttp_session_t& s)
-{
-    if (s.p_close_handle) {
-        if (s.h_connect) { s.p_close_handle(s.h_connect); s.h_connect = nullptr; }
-        if (s.h_session) { s.p_close_handle(s.h_session); s.h_session = nullptr; }
-    }
-    if (s.wh_mod) {
-        FreeLibrary(s.wh_mod);
-        s.wh_mod = nullptr;
-    }
-}
-
-static bool winhttp_session_open(winhttp_session_t& s, const std::string& base_url, int timeout_sec)
-{
-    s.timeout_ms = (timeout_sec > 0 ? timeout_sec : 15) * 1000;
-
-    s.wh_mod = LoadLibraryW(L"winhttp.dll");
-    if (!s.wh_mod) {
-        lic_log("winhttp_session_load_failed");
-        return false;
-    }
-
-    s.p_open          = reinterpret_cast<winhttp_session_t::fn_open_t>          (GetProcAddress(s.wh_mod, "WinHttpOpen"));
-    s.p_connect       = reinterpret_cast<winhttp_session_t::fn_connect_t>       (GetProcAddress(s.wh_mod, "WinHttpConnect"));
-    s.p_open_request  = reinterpret_cast<winhttp_session_t::fn_open_request_t>  (GetProcAddress(s.wh_mod, "WinHttpOpenRequest"));
-    s.p_send_request  = reinterpret_cast<winhttp_session_t::fn_send_request_t>  (GetProcAddress(s.wh_mod, "WinHttpSendRequest"));
-    s.p_recv_response = reinterpret_cast<winhttp_session_t::fn_recv_response_t> (GetProcAddress(s.wh_mod, "WinHttpReceiveResponse"));
-    s.p_query_headers = reinterpret_cast<winhttp_session_t::fn_query_headers_t> (GetProcAddress(s.wh_mod, "WinHttpQueryHeaders"));
-    s.p_query_avail   = reinterpret_cast<winhttp_session_t::fn_query_avail_t>   (GetProcAddress(s.wh_mod, "WinHttpQueryDataAvailable"));
-    s.p_read_data     = reinterpret_cast<winhttp_session_t::fn_read_data_t>     (GetProcAddress(s.wh_mod, "WinHttpReadData"));
-    s.p_close_handle  = reinterpret_cast<winhttp_session_t::fn_close_handle_t>  (GetProcAddress(s.wh_mod, "WinHttpCloseHandle"));
-    s.p_set_timeouts  = reinterpret_cast<winhttp_session_t::fn_set_timeouts_t>  (GetProcAddress(s.wh_mod, "WinHttpSetTimeouts"));
-    s.p_set_option    = reinterpret_cast<winhttp_session_t::fn_set_option_t>    (GetProcAddress(s.wh_mod, "WinHttpSetOption"));
-
-    if (!s.p_open || !s.p_connect || !s.p_open_request || !s.p_send_request ||
-        !s.p_recv_response || !s.p_query_headers || !s.p_query_avail ||
-        !s.p_read_data || !s.p_close_handle || !s.p_set_timeouts) {
-        lic_log("winhttp_session_resolve_failed");
-        winhttp_session_close(s);
-        return false;
-    }
-
-    std::string work = base_url;
-    s.is_https = true;
-    if (work.rfind("https://", 0) == 0)      work = work.substr(8);
-    else if (work.rfind("http://", 0) == 0) { work = work.substr(7); s.is_https = false; }
-
-    s.port = s.is_https ? 443 : 80;
-    s.base_path_prefix.clear();
-
-    auto slash = work.find('/');
-    if (slash != std::string::npos) {
-        s.host = work.substr(0, slash);
-        s.base_path_prefix = work.substr(slash);
-        if (!s.base_path_prefix.empty() && s.base_path_prefix.back() == '/')
-            s.base_path_prefix.pop_back();
-    } else {
-        s.host = std::move(work);
-    }
-    auto colon = s.host.find(':');
-    if (colon != std::string::npos) {
-        s.port = atoi(s.host.c_str() + colon + 1);
-        s.host = s.host.substr(0, colon);
-    }
-
-    std::wstring agent  = L"AiDAStandalone/1.0";
-    std::wstring whost  = license_utf8_to_utf16(s.host);
-
-    s.h_session = s.p_open(agent.c_str(),
-                           WINHTTP_ACCESS_TYPE_NO_PROXY,
-                           WINHTTP_NO_PROXY_NAME,
-                           WINHTTP_NO_PROXY_BYPASS,
-                           0);
-    if (!s.h_session) {
-        lic_log("winhttp_session_open_failed");
-        winhttp_session_close(s);
-        return false;
-    }
-
-    s.p_set_timeouts(s.h_session, s.timeout_ms, s.timeout_ms, s.timeout_ms, s.timeout_ms);
-
-    if (s.p_set_option) {
-        DWORD proto_flags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 |
-                            WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-        s.p_set_option(s.h_session, WINHTTP_OPTION_SECURE_PROTOCOLS,
-                       &proto_flags, sizeof(proto_flags));
-    }
-
-    s.h_connect = s.p_connect(s.h_session, whost.c_str(),
-                               static_cast<INTERNET_PORT>(s.port), 0);
-    if (!s.h_connect) {
-        lic_log("winhttp_session_connect_failed");
-        winhttp_session_close(s);
-        return false;
-    }
-
-    char dbuf[200];
-    _snprintf_s(dbuf, sizeof(dbuf), _TRUNCATE,
-        "winhttp_session_open_ok host=%.96s port=%d https=%d prefix=%.32s",
-        s.host.c_str(), s.port, s.is_https ? 1 : 0, s.base_path_prefix.c_str());
-    lic_log(dbuf);
-
-    return true;
-}
-
-static SimpleHttpResponse winhttp_session_request(
-    winhttp_session_t& s,
-    const char* verb,
-    const std::string& path,
-    const std::vector<std::pair<std::string,std::string>>& extra_headers,
-    const std::string& req_body,
-    const std::string& content_type)
-{
-    SimpleHttpResponse out;
-    if (!s.valid()) {
-        out.error = "winhttp_session_invalid";
-        return out;
-    }
-
-    std::string full_path = path;
-    if (!s.base_path_prefix.empty() && !path.empty() && path[0] == '/') {
-        full_path = s.base_path_prefix + path;
-    }
-
-    std::wstring wpath = license_utf8_to_utf16(full_path.empty() ? std::string("/") : full_path);
-    std::wstring wverb = license_utf8_to_utf16(verb ? std::string(verb) : std::string("GET"));
-
-    DWORD req_flags = s.is_https ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET h_req = s.p_open_request(s.h_connect, wverb.c_str(), wpath.c_str(),
-                                        nullptr, WINHTTP_NO_REFERER,
-                                        WINHTTP_DEFAULT_ACCEPT_TYPES, req_flags);
-    if (!h_req) {
-        out.error = "winhttp_session_open_request_failed gle=" + std::to_string(GetLastError());
-        return out;
-    }
-
-    s.p_set_timeouts(h_req, s.timeout_ms, s.timeout_ms, s.timeout_ms, s.timeout_ms);
-
-    if (s.p_set_option) {
-        DWORD decompress = WINHTTP_DECOMPRESSION_FLAG_GZIP |
-                           WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
-        s.p_set_option(h_req, WINHTTP_OPTION_DECOMPRESSION,
-                       &decompress, sizeof(decompress));
-    }
-
-    std::string hdr_str;
-    hdr_str.reserve(256 + extra_headers.size() * 64);
-    if (!content_type.empty()) {
-        hdr_str += "Content-Type: ";
-        hdr_str += content_type;
-        hdr_str += "\r\n";
-    }
-    for (const auto& kv : extra_headers) {
-        hdr_str += kv.first;
-        hdr_str += ": ";
-        hdr_str += kv.second;
-        hdr_str += "\r\n";
-    }
-    std::wstring whdr = license_utf8_to_utf16(hdr_str);
-
-    LPCWSTR hdr_ptr = whdr.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : whdr.c_str();
-    DWORD   hdr_len = whdr.empty() ? 0 : static_cast<DWORD>(whdr.size());
-
-    LPVOID body_ptr = req_body.empty()
-                       ? WINHTTP_NO_REQUEST_DATA
-                       : const_cast<char*>(req_body.data());
-    DWORD  body_len = static_cast<DWORD>(req_body.size());
-
-    BOOL send_ok = s.p_send_request(h_req, hdr_ptr, hdr_len,
-                                     body_ptr, body_len, body_len, 0);
-    if (!send_ok) {
-        out.error = "winhttp_session_send_failed gle=" + std::to_string(GetLastError());
-        s.p_close_handle(h_req);
-        return out;
-    }
-
-    if (!s.p_recv_response(h_req, nullptr)) {
-        out.error = "winhttp_session_recv_failed gle=" + std::to_string(GetLastError());
-        s.p_close_handle(h_req);
-        return out;
-    }
-
-    DWORD status_code = 0;
-    DWORD scode_size  = sizeof(status_code);
-    s.p_query_headers(h_req,
-                       WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                       WINHTTP_HEADER_NAME_BY_INDEX,
-                       &status_code, &scode_size, WINHTTP_NO_HEADER_INDEX);
-    out.status = static_cast<int>(status_code);
-
-    std::string body;
-    body.reserve(8192);
-    char chunk[8192];
-    for (;;) {
-        DWORD avail = 0;
-        if (!s.p_query_avail(h_req, &avail)) break;
-        if (avail == 0) break;
-        DWORD to_read = avail > sizeof(chunk) ? static_cast<DWORD>(sizeof(chunk)) : avail;
-        DWORD got = 0;
-        if (!s.p_read_data(h_req, chunk, to_read, &got)) break;
-        if (got == 0) break;
-        body.append(chunk, got);
-        if (body.size() > 32u * 1024u * 1024u) break;
-    }
-    out.body = std::move(body);
-    out.ok = (out.status > 0);
-
-    s.p_close_handle(h_req);
-    return out;
-}
-
 static SimpleHttpResponse curl_subprocess_https_request(
     const char* verb,
     const std::string& url,
@@ -7582,15 +7333,6 @@ namespace
                 proof_token.size(),
                 static_cast<unsigned long long>(fnv1a_str(proof_token)));
 
-            winhttp_session_t arc_session;
-            bool session_active = winhttp_session_open(arc_session, host, 30);
-            struct arc_session_guard
-            {
-                winhttp_session_t* sess;
-                ~arc_session_guard() { if (sess) winhttp_session_close(*sess); }
-            } _arc_session_guard{ session_active ? &arc_session : nullptr };
-            lic_log_fmt("[arc-bulk] session_state active=%d host=%.64s", session_active ? 1 : 0, host.c_str());
-
             json bulk_body;
             bulk_body["license_key"] = settings.license_key;
             bulk_body["session_token"] = settings.license_session_token;
@@ -7600,15 +7342,18 @@ namespace
             lic_log_fmt("[arc-bulk] request_built body_size=%zu", bulk_body_str.size());
 
             const ULONGLONG http_start_ms = GetTickCount64();
+            lic_log_fmt("[arc-bulk] transport_dispatching method=POST path=/api/download/arc/pages/bulk timeout_sec=%d",
+                30);
             SimpleHttpResponse bulk_resp = raw_https_request(
                 "POST",
                 host + "/api/download/arc/pages/bulk",
                 {},
                 bulk_body_str,
-                "application/json");
+                "application/json",
+                30);
             const ULONGLONG http_elapsed_ms = GetTickCount64() - http_start_ms;
-            lic_log_fmt("[arc-bulk] transport_dispatched method=POST path=/api/download/arc/pages/bulk session_active_unused=%d",
-                session_active ? 1 : 0);
+            lic_log_fmt("[arc-bulk] transport_dispatched method=POST path=/api/download/arc/pages/bulk elapsed_ms=%llu",
+                static_cast<unsigned long long>(http_elapsed_ms));
 
             if (!bulk_resp.ok || bulk_resp.status != 200) {
                 SecureZeroMemory(key_seed.data(), key_seed.size());
@@ -7960,10 +7705,9 @@ namespace
 
             {
                 const ULONGLONG page_loop_elapsed_ms = GetTickCount64() - page_loop_start_ms;
-                lic_log_fmt("[arc-bulk] pages_loop_done total=%u elapsed_ms=%llu session_active=%d",
+                lic_log_fmt("[arc-bulk] pages_loop_done total=%u elapsed_ms=%llu",
                     total_pages,
-                    static_cast<unsigned long long>(page_loop_elapsed_ms),
-                    session_active ? 1 : 0);
+                    static_cast<unsigned long long>(page_loop_elapsed_ms));
             }
 
             SecureZeroMemory(key_seed.data(), key_seed.size());

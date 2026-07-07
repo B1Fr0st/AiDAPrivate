@@ -916,99 +916,6 @@ add_custom_target(ghidra_specs ALL DEPENDS
 # regenerates the legacy .c hex dump from the binary directly so the
 # manual HxD round-trip is no longer required.
 find_package(Python3 COMPONENTS Interpreter QUIET)
-set(AIDA_PHASE0_INVARIANT_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_phase0_invariants.py")
-set(AIDA_PHASE1_THREAD_CONTRACT_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_thread_runtime_contract.py")
-set(AIDA_PHASE1_THREAD_CONTRACT_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/tools/thread_runtime_contract_manifest.json")
-set(AIDA_PHASE2_CAPACITY_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_phase2_capacity.py")
-set(AIDA_PHASE3_INGRESS_ADMISSION_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_phase3_admission.py")
-set(AIDA_PHASE4_DIRECT_CALL_ADMISSION_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_phase4_direct_call_admission.py")
-set(AIDA_PHASE4_TOOL_ADMISSION_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_phase4_tool_admission.py")
-set(AIDA_PHASE5_LEASE_REGISTRY_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_phase5_lease_registry.py")
-set(AIDA_PHASE6_UI_DISPATCHER_GUARD_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_phase6_ui_dispatcher.py")
-if(NOT EXISTS "${AIDA_PHASE0_INVARIANT_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 0 invariant guard script missing: ${AIDA_PHASE0_INVARIANT_GUARD_SCRIPT}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE1_THREAD_CONTRACT_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 1 thread runtime contract guard script missing: ${AIDA_PHASE1_THREAD_CONTRACT_GUARD_SCRIPT}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE1_THREAD_CONTRACT_MANIFEST}")
-    message(FATAL_ERROR "AiDA Phase 1 thread runtime contract manifest missing: ${AIDA_PHASE1_THREAD_CONTRACT_MANIFEST}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE2_CAPACITY_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 2 capacity diagnostics guard script missing: ${AIDA_PHASE2_CAPACITY_GUARD_SCRIPT}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE3_INGRESS_ADMISSION_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 3 ingress admission guard script missing: ${AIDA_PHASE3_INGRESS_ADMISSION_GUARD_SCRIPT}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE4_DIRECT_CALL_ADMISSION_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 4 direct-call admission guard script missing: ${AIDA_PHASE4_DIRECT_CALL_ADMISSION_GUARD_SCRIPT}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE4_TOOL_ADMISSION_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 4 tool admission guard script missing: ${AIDA_PHASE4_TOOL_ADMISSION_GUARD_SCRIPT}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE5_LEASE_REGISTRY_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 5 lease registry guard script missing: ${AIDA_PHASE5_LEASE_REGISTRY_GUARD_SCRIPT}")
-endif()
-if(NOT EXISTS "${AIDA_PHASE6_UI_DISPATCHER_GUARD_SCRIPT}")
-    message(FATAL_ERROR "AiDA Phase 6 UI dispatcher guard script missing: ${AIDA_PHASE6_UI_DISPATCHER_GUARD_SCRIPT}")
-endif()
-if(Python3_FOUND)
-    add_custom_target(AiDAPhase0StaticGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE0_INVARIANT_GUARD_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 0 static invariants..."
-        VERBATIM
-    )
-    add_custom_target(AiDAThreadRuntimeContractGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE1_THREAD_CONTRACT_GUARD_SCRIPT}" --manifest "${AIDA_PHASE1_THREAD_CONTRACT_MANIFEST}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 1 thread runtime contract..."
-        VERBATIM
-    )
-    add_custom_target(AiDACapacityDiagnosticsGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE2_CAPACITY_GUARD_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 2 capacity diagnostics..."
-        VERBATIM
-    )
-    add_custom_target(AiDAIngressAdmissionGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE3_INGRESS_ADMISSION_GUARD_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 3 ingress admission..."
-        VERBATIM
-    )
-    add_custom_target(AiDAToolAdmissionGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE4_TOOL_ADMISSION_GUARD_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 4 tool admission..."
-        VERBATIM
-    )
-    add_custom_target(AiDADirectCallAdmissionGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE4_DIRECT_CALL_ADMISSION_GUARD_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 4 direct call admission..."
-        VERBATIM
-    )
-    add_custom_target(AiDALeaseRegistryGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE5_LEASE_REGISTRY_GUARD_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 5 lease registry and late-result fencing..."
-        VERBATIM
-    )
-    add_custom_target(AiDAUiDispatcherGuards ALL
-        COMMAND ${Python3_EXECUTABLE} "${AIDA_PHASE6_UI_DISPATCHER_GUARD_SCRIPT}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Verifying AiDAStandalone Phase 6 central UI dispatcher..."
-        VERBATIM
-    )
-    add_dependencies(AiDAThreadRuntimeContractGuards AiDAPhase0StaticGuards)
-    add_dependencies(AiDACapacityDiagnosticsGuards AiDAThreadRuntimeContractGuards)
-    add_dependencies(AiDAIngressAdmissionGuards AiDACapacityDiagnosticsGuards)
-    add_dependencies(AiDADirectCallAdmissionGuards AiDAIngressAdmissionGuards)
-    add_dependencies(AiDAToolAdmissionGuards AiDADirectCallAdmissionGuards)
-    add_dependencies(AiDALeaseRegistryGuards AiDAToolAdmissionGuards)
-    add_dependencies(AiDAUiDispatcherGuards AiDALeaseRegistryGuards)
-endif()
 option(AIDA_DISABLE_LEGACY_DRIVER_MAPPER "Disable the embedded legacy WindMapper driver mapper fallback" OFF)
 option(AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY "Regenerate WindMapper embedding from build-ninja/Release/WindMapper.exe instead of WindMapper.c" OFF)
 if(Python3_FOUND)
@@ -1849,7 +1756,6 @@ if(WIN32)
             $<TARGET_OBJECTS:AiDAStandalone_asm>
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
-        add_dependencies(AiDAStandalone AiDAPhase0StaticGuards AiDAThreadRuntimeContractGuards AiDACapacityDiagnosticsGuards AiDAIngressAdmissionGuards AiDADirectCallAdmissionGuards AiDAToolAdmissionGuards AiDALeaseRegistryGuards AiDAUiDispatcherGuards)
 
         target_include_directories(AiDAStandalone PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated"

@@ -1687,7 +1687,11 @@ namespace arc_loader
             uint8_t* base;
             volatile LONG completed;
             volatile LONG seh_caught;
+            volatile LONG peb_swapped;
+            volatile LONG peb_restored;
             volatile DWORD seh_code;
+            volatile DWORD peb_restore_exception;
+            void* saved_peb_image_base;
             BOOL result;
         };
 
@@ -1708,20 +1712,82 @@ namespace arc_loader
 
         LPTHREAD_START_ROUTINE inv_thread_proc = [](LPVOID p) -> DWORD {
             auto* c = reinterpret_cast<dllmain_invoker_ctx_t*>(p);
+            const DWORD tid = GetCurrentThreadId();
+            arc_breadcrumb_fmt("load_dllmain_inv_thread_enter tid=%lu ctx=%p entry=%p base=%p",
+                (unsigned long)tid, static_cast<void*>(c),
+                c ? reinterpret_cast<void*>(c->entry) : nullptr,
+                c ? static_cast<void*>(c->base) : nullptr);
+            if (!c || !c->entry || !c->base) {
+                if (c) {
+                    c->result = FALSE;
+                    InterlockedExchange(&c->completed, 1);
+                }
+                arc_breadcrumb_fmt("load_dllmain_inv_thread_invalid_ctx tid=%lu ctx=%p",
+                    (unsigned long)tid, static_cast<void*>(c));
+                return 0;
+            }
+
             BOOL ok = FALSE;
+            constexpr size_t kPebImageBaseOffset = 0x10;
+            auto* peb_bytes = reinterpret_cast<uint8_t*>(NtCurrentTeb()->ProcessEnvironmentBlock);
+            auto** peb_image_base_slot = peb_bytes
+                ? reinterpret_cast<void**>(peb_bytes + kPebImageBaseOffset)
+                : nullptr;
+            void* saved_peb_image_base = nullptr;
             __try {
+                if (peb_image_base_slot) {
+                    saved_peb_image_base = *peb_image_base_slot;
+                    c->saved_peb_image_base = saved_peb_image_base;
+                    *peb_image_base_slot = static_cast<void*>(c->base);
+                    InterlockedExchange(&c->peb_swapped, 1);
+                    arc_breadcrumb_fmt("load_dllmain_inv_thread_peb_swap_in tid=%lu peb=%p saved=%p arc=%p ctx=%p",
+                        (unsigned long)tid, peb_bytes, saved_peb_image_base,
+                        static_cast<void*>(c->base), static_cast<void*>(c));
+                } else {
+                    arc_breadcrumb_fmt("load_dllmain_inv_thread_no_peb tid=%lu ctx=%p",
+                        (unsigned long)tid, static_cast<void*>(c));
+                }
+                arc_breadcrumb_fmt("load_dllmain_inv_thread_entry_call_begin tid=%lu entry=%p base=%p ctx=%p",
+                    (unsigned long)tid, reinterpret_cast<void*>(c->entry),
+                    static_cast<void*>(c->base), static_cast<void*>(c));
                 ok = c->entry(
                     reinterpret_cast<HINSTANCE>(c->base),
                     DLL_PROCESS_ATTACH,
                     nullptr);
+                arc_breadcrumb_fmt("load_dllmain_inv_thread_entry_call_return tid=%lu ok=%d ctx=%p",
+                    (unsigned long)tid, ok ? 1 : 0, static_cast<void*>(c));
             }
             __except (c->seh_code = GetExceptionCode(),
                       InterlockedExchange(&c->seh_caught, 1),
                       EXCEPTION_EXECUTE_HANDLER) {
                 ok = FALSE;
+                arc_breadcrumb_fmt("load_dllmain_inv_thread_entry_seh tid=%lu code=0x%08X ctx=%p",
+                    (unsigned long)tid, (unsigned)c->seh_code, static_cast<void*>(c));
+            }
+            if (InterlockedCompareExchange(&c->peb_swapped, 0, 0) != 0 && peb_image_base_slot) {
+                __try {
+                    *peb_image_base_slot = saved_peb_image_base;
+                    InterlockedExchange(&c->peb_restored, 1);
+                    arc_breadcrumb_fmt("load_dllmain_inv_thread_peb_swap_out tid=%lu restored=%p ctx=%p",
+                        (unsigned long)tid, saved_peb_image_base, static_cast<void*>(c));
+                }
+                __except (c->peb_restore_exception = GetExceptionCode(),
+                          EXCEPTION_EXECUTE_HANDLER) {
+                    arc_breadcrumb_fmt("load_dllmain_inv_thread_peb_restore_seh tid=%lu code=0x%08X ctx=%p",
+                        (unsigned long)tid, (unsigned)c->peb_restore_exception,
+                        static_cast<void*>(c));
+                }
             }
             c->result = ok;
+            arc_breadcrumb_fmt("load_dllmain_inv_thread_result_written tid=%lu ok=%d ctx=%p",
+                (unsigned long)tid, ok ? 1 : 0, static_cast<void*>(c));
             InterlockedExchange(&c->completed, 1);
+            arc_breadcrumb_fmt("load_dllmain_inv_thread_exit tid=%lu ok=%d seh=%ld swapped=%ld restored=%ld ctx=%p",
+                (unsigned long)tid, ok ? 1 : 0,
+                InterlockedCompareExchange(&c->seh_caught, 0, 0),
+                InterlockedCompareExchange(&c->peb_swapped, 0, 0),
+                InterlockedCompareExchange(&c->peb_restored, 0, 0),
+                static_cast<void*>(c));
             return 0;
         };
 
@@ -1750,9 +1816,9 @@ namespace arc_loader
             arc_breadcrumb(wd_ok);
         }
 
-        constexpr size_t kPebImageBaseOffset = 0x10;
+        constexpr size_t kHostPebImageBaseOffset = 0x10;
         auto* peb_bytes = reinterpret_cast<uint8_t*>(NtCurrentTeb()->ProcessEnvironmentBlock);
-        auto** peb_image_base_slot = reinterpret_cast<void**>(peb_bytes + kPebImageBaseOffset);
+        auto** peb_image_base_slot = reinterpret_cast<void**>(peb_bytes + kHostPebImageBaseOffset);
         void* saved_peb_image_base = *peb_image_base_slot;
 
         {
@@ -1764,14 +1830,11 @@ namespace arc_loader
             arc_breadcrumb(pbuf);
         }
 
-        *peb_image_base_slot = static_cast<void*>(image_base);
-        arc_breadcrumb("load_dllmain_peb_swap_in");
-
         auto* inv_ctx = new dllmain_invoker_ctx_t{
-            entry_point, image_base, 0, 0, 0, FALSE };
+            entry_point, image_base, 0, 0, 0, 0, 0, 0, nullptr, FALSE };
 
         DWORD inv_tid = 0;
-        arc_diag_dump_full_state("pre_inv_thread_create_peb_swapped",
+        arc_diag_dump_full_state("pre_inv_thread_create_host_peb",
             reinterpret_cast<void*>(wd_proc),
             reinterpret_cast<void*>(inv_thread_proc));
         SetLastError(0);
@@ -1793,18 +1856,11 @@ namespace arc_loader
                 (void*)entry_point);
             arc_breadcrumb(tbuf);
 
-            arc_diag_dump_full_state("post_inv_thread_FAIL_peb_swapped",
+            arc_diag_dump_full_state("post_inv_thread_FAIL_host_peb",
                 reinterpret_cast<void*>(wd_proc),
                 reinterpret_cast<void*>(inv_thread_proc));
             arc_diag_query_address("arc_entry_point", reinterpret_cast<void*>(entry_point));
             arc_diag_query_address("arc_image_base", reinterpret_cast<void*>(image_base));
-
-            *peb_image_base_slot = saved_peb_image_base;
-            arc_breadcrumb("load_dllmain_peb_swap_out_after_thread_create_fail");
-
-            arc_diag_dump_full_state("post_inv_thread_FAIL_peb_restored",
-                reinterpret_cast<void*>(wd_proc),
-                reinterpret_cast<void*>(inv_thread_proc));
 
             InterlockedExchange(&wd_ctx.done, 1);
             if (wd_thread) {
@@ -1861,8 +1917,18 @@ namespace arc_loader
             }
         }
 
-        *peb_image_base_slot = saved_peb_image_base;
-        arc_breadcrumb("load_dllmain_peb_swap_out");
+        if (InterlockedCompareExchange(&inv_ctx->peb_swapped, 0, 0) != 0 &&
+            InterlockedCompareExchange(&inv_ctx->peb_restored, 0, 0) == 0) {
+            *peb_image_base_slot = inv_ctx->saved_peb_image_base
+                ? inv_ctx->saved_peb_image_base
+                : saved_peb_image_base;
+            arc_breadcrumb_fmt("load_dllmain_host_forced_peb_restore swapped=%ld restored=%ld saved=%p fallback=%p",
+                InterlockedCompareExchange(&inv_ctx->peb_swapped, 0, 0),
+                InterlockedCompareExchange(&inv_ctx->peb_restored, 0, 0),
+                inv_ctx->saved_peb_image_base,
+                saved_peb_image_base);
+        }
+        arc_breadcrumb("load_dllmain_host_peb_verified");
 
         InterlockedExchange(&wd_ctx.done, 1);
         if (wd_thread) {

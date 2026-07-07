@@ -1940,8 +1940,7 @@ static void job_main(std::shared_ptr<job_t> job)
                     job->running.store(false);
                 }
                 for (auto& t : ws) {
-                    std::string err;
-                    t.join(&err);
+                    t.join();
                 }
             }
             break;
@@ -2035,7 +2034,8 @@ uint64_t start(config_t cfg)
     diag::log_tagged_fmt("intruder", "BURP-NETWORK-WORKER-ADMIT job_id=%llu host=%s token=%llu",
         static_cast<unsigned long long>(job->id), job->cfg.host.c_str(),
         static_cast<unsigned long long>(intruder_token));
-    const bool posted = work_queue::post([job, admission = std::move(intruder_admission), intruder_token]() mutable {
+    auto intruder_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(intruder_admission));
+    const bool posted = work_queue::post([job, intruder_admission_ptr, intruder_token]() {
         try {
             job_main(job);
         } catch (const std::exception& ex) {
@@ -2052,7 +2052,7 @@ uint64_t start(config_t cfg)
         diag::log_tagged_fmt("intruder", "BURP-NETWORK-WORKER-RELEASE job_id=%llu token=%llu reason=completed",
             static_cast<unsigned long long>(job->id),
             static_cast<unsigned long long>(intruder_token));
-        admission.release("completed");
+        intruder_admission_ptr->release("completed");
     });
     if (!posted) {
         diag::log_tagged_fmt("intruder", "start_work_queue_rejected job_id=%llu",

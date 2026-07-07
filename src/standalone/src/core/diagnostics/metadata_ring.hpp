@@ -16,6 +16,7 @@
 #include "../../helpers/diag_log.hpp"
 
 namespace aida::diagnostics {
+namespace metadata_ring = ::aida::diagnostics;
 
 inline constexpr std::size_t kMetadataRingCapacity = 512;
 inline constexpr std::size_t kMetadataRingMaxLabelLen = 96;

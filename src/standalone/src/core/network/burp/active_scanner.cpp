@@ -976,15 +976,16 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
         return 0;
     }
     const uint64_t admission_token = admission.token();
+    auto admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(admission));
     diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-ADMIT audit_id=%llu host=%s token=%llu",
         static_cast<unsigned long long>(rt->status.id), host.c_str(),
         static_cast<unsigned long long>(admission_token));
-    const bool posted = work_queue::post([captured, admission = std::move(admission), admission_token]() mutable {
+    const bool posted = work_queue::post([captured, admission_ptr, admission_token]() {
         run_audit(captured);
         diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-RELEASE audit_id=%llu token=%llu reason=completed",
             static_cast<unsigned long long>(captured->status.id),
             static_cast<unsigned long long>(admission_token));
-        admission.release("completed");
+        admission_ptr->release("completed");
     });
     if (!posted) {
         {

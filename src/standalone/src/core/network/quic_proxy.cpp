@@ -264,7 +264,7 @@ bool start(const quic_proxy_config& config, uint64_t* listener_id)
     }
     auto rt_for_thread = rt;
     std::string start_err;
-    if (!rt->worker.start([rt_for_thread]() { listener_loop(rt_for_thread.get()); }, &start_err,
+    if (!rt->worker.start([rt_for_thread]() { listener_loop(rt_for_thread); }, &start_err,
             aida::infra::win_thread::default_stack_reserve, "quic_proxy.listener")) {
         diag::log_tagged_fmt("quic_proxy", "listener_thread_start_failed err=%s", start_err.c_str());
         rt->running.store(false);

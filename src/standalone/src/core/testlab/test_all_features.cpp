@@ -167,6 +167,8 @@ namespace test_all_features {
 		std::atomic<bool>          g_driver_attached{ false };
 		std::atomic<std::uint64_t> g_saved_dtb{ 0 };
 
+		std::uint32_t current_target_pid();
+
 		std::mutex g_launch_state_mtx;
 		std::string g_target_executable_path;
 		std::string g_requested_cwd;

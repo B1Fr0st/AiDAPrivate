@@ -193,8 +193,7 @@ client_replay_result client_replay(const client_replay_options& options)
     }
 
     for (auto& worker : workers) {
-        std::string err;
-        worker.join(&err);
+        worker.join();
     }
 
     diag::log_tagged_fmt("flow_store", "BURP-NETWORK-WORKER-RELEASE token=%llu reason=completed",
