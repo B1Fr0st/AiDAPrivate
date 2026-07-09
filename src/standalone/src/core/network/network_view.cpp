@@ -1,5 +1,7 @@
 #include "network_view.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
+#include "executor_status.hpp"
 #include "standalone_driver.hpp"
 #include "../runtime/standalone_license.hpp"
 #include "protocol_parser.hpp"
@@ -252,49 +254,74 @@ static std::string capture_control_status() {
 }
 
 template <typename Fn>
-static bool post_network_task(const char* name, Fn&& fn) {
+static bool post_network_task(const char* name,
+                              aida::infra::executor::domain_t domain,
+                              const char* thread_class,
+                              Fn&& fn) {
     try {
         std::string task_name = name ? name : "?";
         std::function<void()> task(std::forward<Fn>(fn));
-        bool ok = work_queue::post(std::function<void()>(
-            [task_name, task = std::move(task)]() mutable {
-                const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
-                diag::log_tagged_fmt("network",
-                    "work_queue_task_enter name=%s tid=%lu tls_ready=%d",
-                    task_name.c_str(),
-                    static_cast<unsigned long>(GetCurrentThreadId()),
-                    tls_ready ? 1 : 0);
-                task();
-                diag::log_tagged_fmt("network",
-                    "work_queue_task_exit name=%s tid=%lu",
-                    task_name.c_str(),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
-            }));
-        diag::log_tagged_fmt("network", "work_queue_post name=%s ok=%d",
-            name ? name : "?", ok ? 1 : 0);
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "network.view";
+        sub.label = name ? name : "network.task";
+        sub.thread_class = thread_class ? thread_class : "bounded_task";
+        sub.domain = domain;
+        sub.priority = 3;
+        sub.body = [task_name, task = std::move(task), domain]() mutable {
+            const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
+            diag::log_tagged_fmt("network",
+                "executor_task_enter name=%s domain=%s tid=%lu tls_ready=%d",
+                task_name.c_str(),
+                aida::infra::executor::domain_name(domain),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                tls_ready ? 1 : 0);
+            task();
+            diag::log_tagged_fmt("network",
+                "executor_task_exit name=%s domain=%s tid=%lu",
+                task_name.c_str(),
+                aida::infra::executor::domain_name(domain),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        };
+        auto submit_result = aida::infra::executor::submit(std::move(sub));
+        bool ok = submit_result.submitted;
+        diag::log_tagged_fmt("network", "executor_post name=%s domain=%s ok=%d reject=%s",
+            name ? name : "?",
+            aida::infra::executor::domain_name(domain),
+            ok ? 1 : 0,
+            submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str());
         return ok;
     } catch (const std::exception& e) {
-        diag::log_tagged_fmt("network", "work_queue_post_cpp_exception name=%s what=%s",
+        diag::log_tagged_fmt("network", "executor_post_cpp_exception name=%s what=%s",
             name ? name : "?", e.what());
         return false;
     } catch (...) {
-        diag::log_tagged_fmt("network", "work_queue_post_unknown_exception name=%s",
+        diag::log_tagged_fmt("network", "executor_post_unknown_exception name=%s",
             name ? name : "?");
         return false;
     }
 }
 
-static bool initialize_work_queue_for_network() {
+static bool initialize_executor_for_network() {
     try {
-        diag::log_tagged("network", "work_queue_initialize_begin");
-        work_queue::initialize();
-        diag::log_tagged("network", "work_queue_initialize_ok");
-        return true;
+        const auto snap = aida::infra::taskflow_runtime::active_snapshot(0);
+        const auto work = aida::network::executor_status::work_stats();
+        const auto service = aida::network::executor_status::service_stats();
+        const auto critical = aida::network::executor_status::critical_stats();
+        const bool accepting = snap.accepting && !snap.shutting_down;
+        diag::log_tagged_fmt("network",
+            "executor_runtime_status accepting=%d shutting_down=%d total_active=%u executor_work_pending=%llu executor_service_pending=%llu executor_critical_pending=%llu",
+            snap.accepting ? 1 : 0,
+            snap.shutting_down ? 1 : 0,
+            static_cast<unsigned>(snap.total_active),
+            static_cast<unsigned long long>(work.pending),
+            static_cast<unsigned long long>(service.pending),
+            static_cast<unsigned long long>(critical.pending));
+        return accepting;
     } catch (const std::exception& e) {
-        diag::log_tagged_fmt("network", "work_queue_initialize_cpp_exception what=%s", e.what());
+        diag::log_tagged_fmt("network", "executor_runtime_status_cpp_exception what=%s", e.what());
         return false;
     } catch (...) {
-        diag::log_tagged("network", "work_queue_initialize_unknown_exception");
+        diag::log_tagged("network", "executor_runtime_status_unknown_exception");
         return false;
     }
 }
@@ -859,7 +886,7 @@ static bool start_connection_worker(state_t& state) {
         return true;
     state.conn_polling.store(true);
     state.conn_thread_done.store(false, std::memory_order_release);
-    if (post_network_task("connection_poll", []() {
+    if (post_network_task("connection_poll", aida::infra::executor::domain_t::feature_worker, "bounded_task", []() {
             try {
                 connection_poll_thread(g_state);
             } catch (const std::exception& e) {
@@ -884,7 +911,7 @@ static bool start_capture_worker(state_t& state) {
     }
     state.cap_thread_alive.store(true, std::memory_order_release);
     state.cap_thread_done.store(false, std::memory_order_release);
-    if (post_network_task("capture_poll", []() {
+    if (post_network_task("capture_poll", aida::infra::executor::domain_t::feature_worker, "bounded_task", []() {
             try {
                 capture_poll_thread(g_state);
             } catch (const std::exception& e) {
@@ -909,7 +936,7 @@ static bool start_dns_worker(state_t& state) {
     }
     state.dns_thread_alive.store(true, std::memory_order_release);
     state.dns_thread_done.store(false, std::memory_order_release);
-    if (post_network_task("dns_poll", []() {
+    if (post_network_task("dns_poll", aida::infra::executor::domain_t::feature_worker, "bounded_task", []() {
             try {
                 dns_poll_thread(g_state);
             } catch (const std::exception& e) {
@@ -934,7 +961,7 @@ static bool start_bandwidth_worker(state_t& state) {
     }
     state.bw_thread_alive.store(true, std::memory_order_release);
     state.bw_thread_done.store(false, std::memory_order_release);
-    if (post_network_task("bandwidth_poll", []() {
+    if (post_network_task("bandwidth_poll", aida::infra::executor::domain_t::feature_worker, "bounded_task", []() {
             try {
                 bandwidth_poll_thread(g_state);
             } catch (const std::exception& e) {
@@ -959,7 +986,7 @@ static bool start_fuzzer_worker(state_t& state) {
     }
     state.fuzz_thread_alive.store(true, std::memory_order_release);
     state.fuzz_thread_done.store(false, std::memory_order_release);
-    if (post_network_task("fuzzer", []() {
+    if (post_network_task("fuzzer", aida::infra::executor::domain_t::long_running, "long_running", []() {
             try {
                 diag::log_tagged("network", "fuzzer_thread_started");
                 while (true) {
@@ -994,7 +1021,7 @@ void initialize() {
     diag::log_tagged("network", "initialize_begin");
     anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view initialize begin");
 
-    bool work_queue_ready = initialize_work_queue_for_network();
+    bool executor_ready = initialize_executor_for_network();
 
     mitm_proxy::set_ws_frame_callback([](const mitm_proxy::ws_frame_observed_t& frame) {
         state_t::ws_frame_entry_t entry;
@@ -1032,7 +1059,7 @@ void initialize() {
     });
     anti_tamper::webhook::write_log("net_audit", "[net_audit] websocket ws_frame_callback installed");
 
-    if (work_queue_ready) {
+    if (executor_ready) {
         start_connection_worker(g_state);
         start_capture_worker(g_state);
         start_dns_worker(g_state);
@@ -1904,7 +1931,7 @@ static void request_capture_start(state_t& state) {
         return;
     }
 
-    if (!post_network_task("capture_start_control", [filter_pid, filter_port, filter_protocol]() {
+    if (!post_network_task("capture_start_control", aida::infra::executor::domain_t::feature_worker, "bounded_task", [filter_pid, filter_port, filter_protocol]() {
             ULONGLONG t0 = GetTickCount64();
             bool ok = false;
             try {
@@ -1949,7 +1976,7 @@ static void request_capture_stop(state_t& state) {
     }
     set_capture_control_status("Stopping capture...");
     diag::log_tagged("network", "stop_capture_requested");
-    if (!post_network_task("capture_stop_control", []() {
+    if (!post_network_task("capture_stop_control", aida::infra::executor::domain_t::feature_worker, "bounded_task", []() {
             ULONGLONG t0 = GetTickCount64();
             bool ok = false;
             try {
@@ -3588,7 +3615,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     anti_tamper::webhook::write_log("net_audit",
                         (std::string("[net_audit] repeater send host=") + entry->host + ":" +
                          std::to_string(entry->port) + " tls=" + (entry->use_tls ? "1" : "0")).c_str());
-                    work_queue::post([entry]() {
+                    const bool posted = post_network_task("repeater_send", aida::infra::executor::domain_t::external_tool, "bounded_task", [entry]() {
                         std::vector<uint8_t> raw(entry->raw_request.begin(), entry->raw_request.end());
                         auto t0 = GetTickCount64();
                         auto result = mitm_proxy::repeat_request(
@@ -3615,6 +3642,11 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                         }
                         entry->in_progress.store(false);
                     });
+                    if (!posted) {
+                        entry->raw_response = "Error: executor rejected repeater_send";
+                        entry->status_code = 0;
+                        entry->in_progress.store(false);
+                    }
                 }
             } else {
                 aida::ui::pill_kind("Sending...", aida::ui::pill_kind_t::accent,
@@ -4431,7 +4463,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             anti_tamper::webhook::write_log("net_audit",
                 ("[net_audit] pcap export start path='" + path + "'").c_str());
 
-            work_queue::post([packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
+            const bool posted = post_network_task("pcap_export", aida::infra::executor::domain_t::diagnostics, "bounded_task", [packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
                          st = &state]() {
                 std::ofstream f(path, std::ios::binary);
                 if (!f.is_open()) {
@@ -4462,6 +4494,11 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                 anti_tamper::webhook::write_log("net_audit",
                     ("[net_audit] pcap export ok path='" + path + "' written=" + std::to_string(count)).c_str());
             });
+            if (!posted) {
+                std::lock_guard<std::mutex> elock(state.pcap_error_mutex);
+                state.pcap_last_error = "Executor rejected PCAP export";
+                state.pcap_writing.store(false);
+            }
         }
         if (!can_export) {
             ImGui::SameLine();
@@ -4534,7 +4571,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
         anti_tamper::webhook::write_log("net_audit",
             (std::string("[net_audit] HAR export path='") + har_path + "' count=" +
              std::to_string(history.size())).c_str());
-        work_queue::post([history = std::move(history), har_path]() {
+        (void)post_network_task("har_export", aida::infra::executor::domain_t::diagnostics, "bounded_task", [history = std::move(history), har_path]() {
 
             std::ofstream f(har_path);
             if (!f.is_open()) {
@@ -4818,11 +4855,13 @@ static void run_fuzzer_thread(state_t& state) {
     std::condition_variable done_cv;
 
     for (int t = 0; t < threads; t++) {
-        work_queue::post([&worker, &remaining, &done_cv]() {
+        const bool posted = post_network_task("fuzzer_worker", aida::infra::executor::domain_t::long_running, "long_running", [&worker, &remaining, &done_cv]() {
             worker();
             if (--remaining == 0)
                 done_cv.notify_all();
         });
+        if (!posted && --remaining == 0)
+            done_cv.notify_all();
     }
     {
         std::unique_lock<std::mutex> lk(done_mtx);
@@ -5639,7 +5678,7 @@ static bool start_offensive_workflow(state_t& state, const offensive_workflow_t&
         state.off_result.clear();
     }
     const int workflow_index = clamp_offensive_workflow_index(state.off_workflow);
-    const bool posted = post_network_task("offensive_workflow", [payload = std::move(payload), workflow_index, run_id]() mutable {
+    const bool posted = post_network_task("offensive_workflow", aida::infra::executor::domain_t::long_running, "long_running", [payload = std::move(payload), workflow_index, run_id]() mutable {
         const offensive_workflow_t workflow_copy = offensive_workflow_at(workflow_index);
         offensive_run_result_t result;
         const uint64_t begin = static_cast<uint64_t>(GetTickCount64());
@@ -5696,7 +5735,7 @@ static bool start_offensive_workflow(state_t& state, const offensive_workflow_t&
         state.off_running.store(false, std::memory_order_release);
         std::lock_guard<std::mutex> lk(state.off_mutex);
         state.off_status = "Network work queue unavailable";
-        state.off_result = json{{"success", false}, {"error", "network_work_queue_unavailable"}}.dump(2);
+        state.off_result = json{{"success", false}, {"error", "network_executor_unavailable"}}.dump(2);
         return false;
     }
     return true;
@@ -5710,7 +5749,7 @@ static void stop_offensive_fuzz_job(state_t& state) {
         std::lock_guard<std::mutex> lk(state.off_mutex);
         state.off_status = "Stopping fuzz job";
     }
-    const bool posted = post_network_task("offensive_fuzz_stop", [job_id]() {
+    const bool posted = post_network_task("offensive_fuzz_stop", aida::infra::executor::domain_t::feature_worker, "bounded_task", [job_id]() {
         auto result = aida::burp::offensive::fuzzing::stop(json{{"job_id", job_id}});
         json out;
         out["workflow"] = "Fuzz Stop";
@@ -6496,7 +6535,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                              aida::ui::size_t_::sm, ImVec2(112.f, 30.f), !has_src) && has_src) {
             std::string src(state.script_editor_buf);
             diag::log_tagged_fmt("network", "script_editor_run size=%zu", src.size());
-            work_queue::post([src]() {
+            (void)post_network_task("script_editor_run", aida::infra::executor::domain_t::diagnostics, "bounded_task", [src]() {
                 bool ok = script_engine::load_script_source("_editor_", src);
                 diag::log_tagged_fmt("network", "script_editor_run_result ok=%d size=%zu",
                     ok ? 1 : 0, src.size());
@@ -6564,7 +6603,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
             std::string cmd(state.script_console_buf);
             if (!cmd.empty()) {
                 diag::log_tagged_fmt("network", "script_console_exec size=%zu", cmd.size());
-                work_queue::post([cmd]() {
+                (void)post_network_task("script_console_exec", aida::infra::executor::domain_t::diagnostics, "bounded_task", [cmd]() {
                     std::string out = script_engine::execute(cmd);
                     diag::log_tagged_fmt("network", "script_console_exec_done out_size=%zu",
                         out.size());

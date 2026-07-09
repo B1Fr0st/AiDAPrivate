@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include "work_queue.hpp"
 #include "theme.hpp"
 #include <array>
 #include <atomic>
@@ -23,7 +22,7 @@
 #include "zydis_disasm.hpp"
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "imgui/imgui.h"
 
@@ -1193,7 +1192,15 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 		worker();
 		return;
 	}
-	if (!critical_work_queue::post(worker) && !work_queue::post(worker)) {
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "struct_recon";
+	submission.label = "struct_recon.reconstruct_from_snapshot";
+	submission.thread_class = "struct_reconstruction";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.failure_policy = "reject_not_started";
+	submission.body = std::move(worker);
+	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 		g_state.progress.store(1.f);
 		g_state.monitoring.store(false);
 	}
@@ -1489,7 +1496,15 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
-	const bool posted = work_queue::post([base_address, struct_size, name, request_ms]() {
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "struct_recon";
+	submission.label = "struct_recon.monitor_with_hwbp";
+	submission.thread_class = "struct_monitor";
+	submission.domain = aida::infra::executor::domain_t::long_running;
+	submission.priority = 2;
+	submission.target_pid = driver_bridge::attached_pid();
+	submission.failure_policy = "reject_not_started";
+	submission.body = [base_address, struct_size, name, request_ms]() {
 		const uint64_t worker_start_ms = GetTickCount64();
 		diag::log_tagged_fmt("struct_recon", "monitor_worker_enter base=0x%llX size=%d name=%s pid=%u tid=%lu queued_ms=%llu",
 			static_cast<unsigned long long>(base_address),
@@ -1953,7 +1968,8 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			pid,
 			g_state.cancel.load() ? 1 : 0,
 			static_cast<unsigned long long>(GetTickCount64() - worker_start_ms));
-	});
+	};
+	const bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 	if (!posted) {
 		g_state.monitoring.store(false);
 		diag::log_tagged_fmt("struct_recon", "monitor_post_failed base=0x%llX size=%d name=%s",
@@ -2055,7 +2071,14 @@ inline void ai_name_fields()
 
 	g_state.ai_naming.store(true);
 
-	work_queue::post([snapshot]() {
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "struct_recon";
+	submission.label = "struct_recon.ai_name_fields";
+	submission.thread_class = "external_ai";
+	submission.domain = aida::infra::executor::domain_t::external_tool;
+	submission.priority = 3;
+	submission.failure_policy = "reject_not_started";
+	submission.body = [snapshot]() {
 		std::string prompt = "You are analyzing a reconstructed memory structure from a running process.\n";
 		prompt += "Base address: 0x";
 		char addr_buf[32];
@@ -2167,7 +2190,13 @@ inline void ai_name_fields()
 		}
 
 		g_state.ai_naming.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+		diag::log_tagged_fmt("struct_recon", "ai_name_fields_post_failed base=0x%llX fields=%zu",
+			static_cast<unsigned long long>(snapshot.base_address),
+			snapshot.fields.size());
+		g_state.ai_naming.store(false);
+	}
 }
 
 inline void detect_arrays(std::vector<struct_field_t>& fields)

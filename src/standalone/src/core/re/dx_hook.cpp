@@ -2,7 +2,7 @@
 
 #include "artifact_store.hpp"
 #include "vmt.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -24,6 +24,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #pragma comment(lib, "gdiplus.lib")
 
@@ -5224,7 +5225,15 @@ bool start_dx_debug_loop(std::uint32_t pid, std::string& error)
     state.attached.store(false, std::memory_order_release);
     state.polling.store(true, std::memory_order_release);
     state.running.store(true, std::memory_order_release);
-    if (!work_queue::post_service_labeled("dx_hook.debug_loop", []() { dx_debug_loop(); }))
+    aida::infra::executor::submission_t debug_sub;
+    debug_sub.owner_subsystem = "re.dx_hook";
+    debug_sub.label = "dx_hook.debug_loop";
+    debug_sub.thread_class = "service_loop";
+    debug_sub.domain = aida::infra::executor::domain_t::service;
+    debug_sub.priority = 4;
+    debug_sub.target_pid = pid;
+    debug_sub.body = []() { dx_debug_loop(); };
+    if (!aida::infra::executor::submit(std::move(debug_sub)).submitted)
     {
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);
@@ -5589,7 +5598,15 @@ bool start_staging_watch(std::uint32_t pid, std::uint64_t staging_va,
     state.pid.store(pid, std::memory_order_release);
     state.polling.store(true, std::memory_order_release);
     state.active.store(true, std::memory_order_release);
-    if (!work_queue::post_service_labeled("dx_hook.staging_watch_loop", []() { staging_watch_loop(); }))
+    aida::infra::executor::submission_t staging_sub;
+    staging_sub.owner_subsystem = "re.dx_hook";
+    staging_sub.label = "dx_hook.staging_watch_loop";
+    staging_sub.thread_class = "service_loop";
+    staging_sub.domain = aida::infra::executor::domain_t::service;
+    staging_sub.priority = 4;
+    staging_sub.target_pid = pid;
+    staging_sub.body = []() { staging_watch_loop(); };
+    if (!aida::infra::executor::submit(std::move(staging_sub)).submitted)
     {
         state.polling.store(false, std::memory_order_release);
         state.active.store(false, std::memory_order_release);

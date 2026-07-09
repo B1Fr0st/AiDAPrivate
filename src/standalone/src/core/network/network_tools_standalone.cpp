@@ -31,8 +31,7 @@
 #include "js_analysis_tools_standalone.hpp"
 #include "web_vuln_tools_standalone.hpp"
 #include "../debugger/page_guard_engine.hpp"
-#include "../infra/work_queue.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "executor_status.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 #include "burp/burp_module.hpp"
@@ -765,26 +764,6 @@ static void log_net_tools_failure(const char* op, DWORD gle) {
         dyn.heartbeat_ioctl_seed_hash,
         dyn.loaded ? 1 : 0,
         dyn.connected ? 1 : 0);
-}
-
-template <typename StatsT>
-static json queue_stats_json(const StatsT& s) {
-    json j;
-    j["alive"] = s.alive;
-    j["shutting_down"] = s.shutting_down;
-    j["pool_size"] = s.pool_size;
-    j["workers"] = static_cast<std::uint64_t>(s.workers);
-    j["pending"] = static_cast<std::uint64_t>(s.pending);
-    j["active"] = s.active;
-    j["post_attempts"] = s.post_attempts;
-    j["posted"] = s.posted;
-    j["rejected"] = s.rejected;
-    j["started"] = s.started;
-    j["finished"] = s.finished;
-    j["oldest_active_ms"] = s.oldest_active_ms;
-    j["active_label_count"] = s.active_label_count;
-    j["active_labels"] = s.active_labels;
-    return j;
 }
 
 static json intercept_filter_criteria_json(std::uint32_t pid, std::uint32_t port, std::uint32_t protocol) {
@@ -2942,9 +2921,7 @@ tool_result_t network_capture_status(const json&)
         result["functional_capture_evidence"] = false;
         result["zero_capture_state_contract"] = true;
         result["capture_status_checked_ms"] = static_cast<std::uint64_t>(GetTickCount64());
-        result["work_queue"] = queue_stats_json(work_queue::stats());
-        result["service_work_queue"] = queue_stats_json(work_queue::service_stats());
-        result["critical_work_queue"] = queue_stats_json(critical_work_queue::stats());
+        aida::network::executor_status::attach_executor_snapshots(result);
         diag::log_tagged_fmt("net_tools", "network_capture_status driver_not_connected loaded=%d attached_pid=%u status=%s last_error_len=%zu",
             driver_bridge::is_loaded() ? 1 : 0,
             driver_bridge::attached_pid(),
@@ -2962,8 +2939,8 @@ tool_result_t network_capture_status(const json&)
         captured,
         dropped,
         driver_bridge::attached_pid(),
-        static_cast<unsigned long long>(work_queue::stats().pending),
-        static_cast<unsigned long long>(critical_work_queue::stats().pending));
+        static_cast<unsigned long long>(aida::network::executor_status::work_pending()),
+        static_cast<unsigned long long>(aida::network::executor_status::critical_pending()));
     if (!ok)
         return tool_result_t::error(OBFSTR("Failed to get capture status."));
 
@@ -2983,9 +2960,7 @@ tool_result_t network_capture_status(const json&)
     result["zero_capture_reason"] = result["zero_capture_state_contract"].get<bool>()
         ? "capture_stopped_with_zero_packets"
         : "";
-    result["work_queue"] = queue_stats_json(work_queue::stats());
-    result["service_work_queue"] = queue_stats_json(work_queue::service_stats());
-    result["critical_work_queue"] = queue_stats_json(critical_work_queue::stats());
+    aida::network::executor_status::attach_executor_snapshots(result);
     result["evidence_contract"] = "functional_capture_evidence_requires_active_capture_or_nonzero_packet_counters";
 
     return tool_result_t::ok(active ? OBFSTR("Capture is active") : OBFSTR("Capture is stopped"), result);

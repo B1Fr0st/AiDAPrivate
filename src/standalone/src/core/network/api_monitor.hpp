@@ -7,7 +7,8 @@
 #include <tlhelp32.h>
 
 #include "standalone_driver.hpp"
-#include "../infra/work_queue.hpp"
+#include "executor_status.hpp"
+#include "../infra/executor.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 
@@ -186,11 +187,11 @@ inline bool phase_target_liveness(uint32_t pid) {
 }
 
 inline void log_phase_state(const char* event, const char* phase, uint32_t pid, DWORD tid, uint64_t elapsed_ms, uint32_t timeout_ms) {
-    const auto q = work_queue::stats();
-    const auto sq = work_queue::service_stats();
+    const auto q = aida::network::executor_status::work_stats();
+    const auto sq = aida::network::executor_status::service_stats();
     const bool target_alive = phase_target_liveness(pid);
     diag::log_tagged_fmt("api_monitor",
-        "phase_state event=%s phase=%s pid=%u tid=%lu elapsed_ms=%llu timeout_ms=%u target_alive=%d active=%d polling=%d debug_loop=%d attached=%d cleanup=%d q_alive=%d q_shutdown=%d q_workers=%zu q_pending=%zu q_active=%u q_posted=%llu q_rejected=%llu q_started=%llu q_finished=%llu svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_posted=%llu svc_rejected=%llu svc_started=%llu svc_finished=%llu",
+        "phase_state event=%s phase=%s pid=%u tid=%lu elapsed_ms=%llu timeout_ms=%u target_alive=%d active=%d polling=%d debug_loop=%d attached=%d cleanup=%d q_alive=%d q_shutdown=%d q_workers=%zu q_pending=%llu q_active=%u q_posted=%llu q_rejected=%llu q_started=%llu q_finished=%llu svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%llu svc_active=%u svc_posted=%llu svc_rejected=%llu svc_started=%llu svc_finished=%llu",
         event ? event : "unknown",
         phase ? phase : "unknown",
         pid,
@@ -206,7 +207,7 @@ inline void log_phase_state(const char* event, const char* phase, uint32_t pid, 
         q.alive ? 1 : 0,
         q.shutting_down ? 1 : 0,
         q.workers,
-        q.pending,
+        static_cast<unsigned long long>(q.pending),
         q.active,
         static_cast<unsigned long long>(q.posted),
         static_cast<unsigned long long>(q.rejected),
@@ -215,7 +216,7 @@ inline void log_phase_state(const char* event, const char* phase, uint32_t pid, 
         sq.alive ? 1 : 0,
         sq.shutting_down ? 1 : 0,
         sq.workers,
-        sq.pending,
+        static_cast<unsigned long long>(sq.pending),
         sq.active,
         static_cast<unsigned long long>(sq.posted),
         static_cast<unsigned long long>(sq.rejected),
@@ -309,7 +310,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
     const uint64_t started_ms = GetTickCount64();
     const DWORD caller_tid = GetCurrentThreadId();
     diag::log_tagged_fmt("api_monitor",
-        "phase_begin phase=%s pid=%u backend=work_queue caller_tid=%lu timeout_ms=%u",
+        "phase_begin phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu timeout_ms=%u",
         phase,
         pid,
         caller_tid,
@@ -351,7 +352,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
             "phase_worker_exit phase=%s pid=%u backend=%s worker_tid=%lu elapsed_ms=%llu gle=%lu threw=%d code=%d category=%s late=%d timeout_elapsed_ms=%llu",
             phase,
             pid,
-            backend ? backend : "work_queue",
+            backend ? backend : "executor",
             worker_tid,
             static_cast<unsigned long long>(result.elapsed_ms),
             result.gle,
@@ -365,7 +366,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
                 "phase_late_complete phase=%s pid=%u backend=%s worker_tid=%lu elapsed_ms=%llu timeout_ms=%u timeout_elapsed_ms=%llu gle=%lu threw=%d",
                 phase,
                 pid,
-                backend ? backend : "work_queue",
+                backend ? backend : "executor",
                 worker_tid,
                 static_cast<unsigned long long>(result.elapsed_ms),
                 timeout_ms,
@@ -380,8 +381,8 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         }
     };
 
-    bool posted_service = false;
-    bool posted_work = false;
+    bool posted_executor = false;
+    std::string executor_reject_reason;
     mcp_standalone::downstream::producer_identity_t api_mon_id;
     api_mon_id.kind = mcp_standalone::downstream::producer_kind_t::api_monitor;
     api_mon_id.tool_name = phase ? phase : "api_monitor.phase";
@@ -409,74 +410,68 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         static_cast<unsigned long long>(api_mon_token));
     auto admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(api_mon_admission));
     try {
-        posted_service = work_queue::post_service([worker_body, admission_ptr, phase, pid, api_mon_token]() mutable {
-            worker_body("service_queue");
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "api_monitor";
+        sub.label = phase ? phase : "api_monitor.phase";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::diagnostics;
+        sub.priority = 3;
+        sub.target_pid = pid;
+        sub.lease_token = api_mon_token;
+        sub.body = [worker_body, admission_ptr, phase, pid, api_mon_token]() mutable {
+            worker_body("executor.diagnostics");
             diag::log_tagged_fmt("api_monitor",
                 "BURP-NETWORK-WORKER-RELEASE phase=%s pid=%u token=%llu reason=completed",
                 phase ? phase : "unknown", pid,
                 static_cast<unsigned long long>(api_mon_token));
             admission_ptr->release("completed");
-        });
-        if (!posted_service)
-            posted_work = work_queue::post([worker_body, admission_ptr, phase, pid, api_mon_token]() mutable {
-                worker_body("work_queue");
-                diag::log_tagged_fmt("api_monitor",
-                    "BURP-NETWORK-WORKER-RELEASE phase=%s pid=%u token=%llu reason=completed",
-                    phase ? phase : "unknown", pid,
-                    static_cast<unsigned long long>(api_mon_token));
-                admission_ptr->release("completed");
-            });
+        };
+        auto submit_result = aida::infra::executor::submit(std::move(sub));
+        posted_executor = submit_result.submitted;
+        executor_reject_reason = submit_result.reject_reason;
     } catch (const std::exception& ex) {
         diag::log_tagged_fmt("api_monitor",
-            "phase_queue_post_exception phase=%s pid=%u caller_tid=%lu message=%s",
+            "phase_executor_post_exception phase=%s pid=%u caller_tid=%lu message=%s",
             phase,
             pid,
             caller_tid,
             ex.what());
     } catch (...) {
         diag::log_tagged_fmt("api_monitor",
-            "phase_queue_post_exception phase=%s pid=%u caller_tid=%lu message=<unknown>",
+            "phase_executor_post_exception phase=%s pid=%u caller_tid=%lu message=<unknown>",
             phase,
             pid,
             caller_tid);
     }
 
-    const auto wq = work_queue::stats();
-    const auto sq = work_queue::service_stats();
+    const auto wq = aida::network::executor_status::work_stats();
+    const auto sq = aida::network::executor_status::service_stats();
     diag::log_tagged_fmt("api_monitor",
-        "phase_queue_post phase=%s pid=%u caller_tid=%lu service=%d work=%d elapsed_ms=%llu wq_alive=%d wq_workers=%zu wq_pending=%zu wq_active=%u sq_alive=%d sq_workers=%zu sq_pending=%zu sq_active=%u",
+        "phase_executor_post phase=%s pid=%u caller_tid=%lu diagnostics=%d elapsed_ms=%llu wq_alive=%d wq_workers=%zu wq_pending=%llu wq_active=%u sq_alive=%d sq_workers=%zu sq_pending=%llu sq_active=%u reject=%s",
         phase,
         pid,
         caller_tid,
-        posted_service ? 1 : 0,
-        posted_work ? 1 : 0,
+        posted_executor ? 1 : 0,
         static_cast<unsigned long long>(GetTickCount64() - started_ms),
         wq.alive ? 1 : 0,
         wq.workers,
-        wq.pending,
+        static_cast<unsigned long long>(wq.pending),
         static_cast<unsigned>(wq.active),
         sq.alive ? 1 : 0,
         sq.workers,
-        sq.pending,
-        static_cast<unsigned>(sq.active));
+        static_cast<unsigned long long>(sq.pending),
+        static_cast<unsigned>(sq.active),
+        executor_reject_reason.empty() ? "<none>" : executor_reject_reason.c_str());
 
-    if (!posted_service && !posted_work) {
-        log_phase_state("queue_post_failed_inline_fallback", phase, pid, caller_tid, GetTickCount64() - started_ms, timeout_ms);
-        phase_result_t<T> result = run_phase_inline<T>(phase, pid, timeout_ms, [fn_copy]() mutable {
-            return (*fn_copy)();
-        });
-        if (timeout_ms != 0 && result.elapsed_ms > timeout_ms) {
-            result.completed = false;
-            result.gle = WAIT_TIMEOUT;
-            diag::log_tagged_fmt("api_monitor",
-                "phase_inline_fallback_overtime phase=%s pid=%u caller_tid=%lu elapsed_ms=%llu timeout_ms=%u",
-                phase,
-                pid,
-                caller_tid,
-                static_cast<unsigned long long>(result.elapsed_ms),
-                timeout_ms);
-            log_phase_state("inline_fallback_overtime", phase, pid, caller_tid, result.elapsed_ms, timeout_ms);
-        }
+    if (!posted_executor) {
+        admission_ptr->release("executor_rejected");
+        log_phase_state("executor_post_failed", phase, pid, caller_tid, GetTickCount64() - started_ms, timeout_ms);
+        phase_result_t<T> result;
+        result.completed = false;
+        result.threw = true;
+        result.gle = ERROR_BUSY;
+        result.exception = executor_reject_reason.empty() ? "api_monitor executor submission failed" : executor_reject_reason;
+        result.elapsed_ms = GetTickCount64() - started_ms;
         return result;
     }
 
@@ -488,14 +483,13 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         timeout_elapsed->store(timed_out.elapsed_ms, std::memory_order_release);
         phase_timed_out->store(true, std::memory_order_release);
         diag::log_tagged_fmt("api_monitor",
-            "phase_timeout phase=%s pid=%u backend=work_queue caller_tid=%lu elapsed_ms=%llu timeout_ms=%u service=%d work=%d current_phase=%s",
+            "phase_timeout phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu elapsed_ms=%llu timeout_ms=%u posted=%d current_phase=%s",
             phase,
             pid,
             caller_tid,
             static_cast<unsigned long long>(timed_out.elapsed_ms),
             timeout_ms,
-            posted_service ? 1 : 0,
-            posted_work ? 1 : 0,
+            posted_executor ? 1 : 0,
             phase);
         log_phase_state("timeout", phase, pid, caller_tid, timed_out.elapsed_ms, timeout_ms);
         return timed_out;
@@ -505,7 +499,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         phase_result_t<T> result = future.get();
         if (result.threw) {
             diag::log_tagged_fmt("api_monitor",
-                "phase_fail phase=%s pid=%u backend=work_queue caller_tid=%lu reason=worker_exception elapsed_ms=%llu gle=%lu code=%d category=%s message=%s",
+                "phase_fail phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu reason=worker_exception elapsed_ms=%llu gle=%lu code=%d category=%s message=%s",
                 phase,
                 pid,
                 caller_tid,
@@ -517,14 +511,13 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
             log_phase_state("worker_exception", phase, pid, caller_tid, result.elapsed_ms, timeout_ms);
         } else {
             diag::log_tagged_fmt("api_monitor",
-                "phase_complete phase=%s pid=%u backend=work_queue caller_tid=%lu elapsed_ms=%llu gle=%lu service=%d work=%d",
+                "phase_complete phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu elapsed_ms=%llu gle=%lu posted=%d",
                 phase,
                 pid,
                 caller_tid,
                 static_cast<unsigned long long>(result.elapsed_ms),
                 result.gle,
-                posted_service ? 1 : 0,
-                posted_work ? 1 : 0);
+                posted_executor ? 1 : 0);
             log_phase_state("complete", phase, pid, caller_tid, result.elapsed_ms, timeout_ms);
         }
         return result;
@@ -538,7 +531,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         failed.exception_category = ex.code().category().name();
         failed.elapsed_ms = GetTickCount64() - started_ms;
         diag::log_tagged_fmt("api_monitor",
-            "phase_fail phase=%s pid=%u backend=work_queue caller_tid=%lu reason=future_get_system_error elapsed_ms=%llu gle=%lu code=%d category=%s message=%s",
+            "phase_fail phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu reason=future_get_system_error elapsed_ms=%llu gle=%lu code=%d category=%s message=%s",
             phase,
             pid,
             caller_tid,
@@ -557,7 +550,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         failed.exception = ex.what();
         failed.elapsed_ms = GetTickCount64() - started_ms;
         diag::log_tagged_fmt("api_monitor",
-            "phase_fail phase=%s pid=%u backend=work_queue caller_tid=%lu reason=future_get_exception elapsed_ms=%llu gle=%lu message=%s",
+            "phase_fail phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu reason=future_get_exception elapsed_ms=%llu gle=%lu message=%s",
             phase,
             pid,
             caller_tid,
@@ -574,7 +567,7 @@ inline phase_result_t<T> run_phase_with_timeout(const char* phase,
         failed.exception = "unknown future retrieval exception";
         failed.elapsed_ms = GetTickCount64() - started_ms;
         diag::log_tagged_fmt("api_monitor",
-            "phase_fail phase=%s pid=%u backend=work_queue caller_tid=%lu reason=future_get_unknown elapsed_ms=%llu gle=%lu",
+            "phase_fail phase=%s pid=%u backend=executor.diagnostics caller_tid=%lu reason=future_get_unknown elapsed_ms=%llu gle=%lu",
             phase,
             pid,
             caller_tid,
@@ -2683,27 +2676,41 @@ inline bool start_polling(std::string& error) {
         pid_snapshot(),
         static_cast<unsigned long long>(poll_token));
     auto poll_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(poll_admission));
+    std::string post_reject_reason;
     try {
-        posted = work_queue::post([poll_admission_ptr, poll_token]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "api_monitor";
+        sub.label = "api_monitor.kernel_context_loop";
+        sub.thread_class = "service_loop";
+        sub.domain = aida::infra::executor::domain_t::service;
+        sub.priority = 4;
+        sub.target_pid = pid_snapshot();
+        sub.lease_token = poll_token;
+        sub.body = [poll_admission_ptr, poll_token]() {
             kernel_context_loop();
             diag::log_tagged_fmt("api_monitor",
                 "BURP-NETWORK-WORKER-RELEASE phase=kernel_context_loop token=%llu reason=completed",
                 static_cast<unsigned long long>(poll_token));
             poll_admission_ptr->release("completed");
-        });
+        };
+        auto submit_result = aida::infra::executor::submit(std::move(sub));
+        posted = submit_result.submitted;
+        post_reject_reason = submit_result.reject_reason;
     } catch (...) {
         posted = false;
     }
     diag::log_tagged_fmt("api_monitor",
-        "start_polling_post_end pid=%u posted=%d elapsed_ms=%llu gle=%lu",
+        "start_polling_post_end pid=%u posted=%d elapsed_ms=%llu gle=%lu reject=%s",
         pid_snapshot(),
         posted ? 1 : 0,
         static_cast<unsigned long long>(GetTickCount64() - start_ms),
-        GetLastError());
+        GetLastError(),
+        post_reject_reason.empty() ? "<none>" : post_reject_reason.c_str());
     if (!posted) {
+        poll_admission_ptr->release("executor_rejected");
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
-        error = "Failed to schedule API monitor worker on work queue.";
+        error = "Failed to schedule API monitor worker on executor.";
         diag::log_tagged_fmt("api_monitor",
             "start_polling_post_failed");
         return false;
@@ -3336,16 +3343,16 @@ inline nlohmann::json status_json() {
         {"ioctl_seed_hash", dyn.ioctl_seed_hash},
         {"heartbeat_ioctl_seed_hash", dyn.heartbeat_ioctl_seed_hash}
     };
-    const auto wq = work_queue::stats();
-    const auto sq = work_queue::service_stats();
-    j["work_queue"] = {
+    const auto wq = aida::network::executor_status::work_stats();
+    const auto sq = aida::network::executor_status::service_stats();
+    j["executor_work"] = {
         {"alive", wq.alive},
         {"workers", wq.workers},
         {"pending", wq.pending},
         {"active", wq.active},
         {"rejected", wq.rejected}
     };
-    j["service_queue"] = {
+    j["executor_service"] = {
         {"alive", sq.alive},
         {"workers", sq.workers},
         {"pending", sq.pending},

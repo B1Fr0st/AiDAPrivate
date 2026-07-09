@@ -11,7 +11,8 @@
 #include "comm.h"
 #include "obfuscation.hpp"
 #include "pro.h"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../analysis/stealth_engine.hpp"
 #include "../anti-tamper/state.hpp"
@@ -2578,7 +2579,13 @@ int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> ac
     bool posted = false;
     try
     {
-        posted = work_queue::post([this, id, action_ptr]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "driver_tools";
+        sub.label = "driver_tools.deferred_watcher";
+        sub.thread_class = "blocking_deferred_watcher";
+        sub.domain = aida::infra::executor::domain_t::long_running;
+        sub.priority = 3;
+        sub.body = [this, id, action_ptr]() {
             const DWORD tid = GetCurrentThreadId();
             const ULONGLONG start_ms = GetTickCount64();
             diag::log_tagged_fmt("drv_tools",
@@ -2609,7 +2616,8 @@ int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> ac
                 static_cast<int>(action_ptr->status.load()),
                 static_cast<unsigned long long>(GetTickCount64() - start_ms));
             action_ptr->watcher_done.store(true, std::memory_order_release);
-        });
+        };
+        posted = aida::infra::executor::submit(std::move(sub)).submitted;
     }
     catch (...)
     {
@@ -2619,41 +2627,41 @@ int DeferredActionManager::register_action(std::unique_ptr<deferred_action_t> ac
     if (posted)
     {
         watcher_started = true;
-        const auto qs = work_queue::stats();
+        const auto qs = aida::infra::taskflow_runtime::active_snapshot();
         diag::log_tagged_fmt("drv_tools",
-            "deferred_watcher_posted id=%d cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
+            "deferred_watcher_posted id=%d runtime_accepting=%d runtime_shutdown=%d service_pending=%llu service_active=%u total_submitted=%llu total_failed=%llu",
             id,
-            qs.alive ? 1 : 0,
+            qs.accepting ? 1 : 0,
             qs.shutting_down ? 1 : 0,
-            qs.pending,
-            qs.active,
-            static_cast<unsigned long long>(qs.started),
-            static_cast<unsigned long long>(qs.finished));
+            static_cast<unsigned long long>(qs.service_queue_pending),
+            static_cast<unsigned>(qs.service_queue_active),
+            static_cast<unsigned long long>(qs.total_submitted),
+            static_cast<unsigned long long>(qs.total_failed));
     }
     else
     {
         {
             std::lock_guard<std::mutex> lock(_mutex);
             action_ptr->status.store(deferred_status::failed);
-            action_ptr->error = "Deferred watcher work queue post failed";
+            action_ptr->error = "Deferred watcher executor submit failed";
         }
         action_ptr->watcher_done.store(true, std::memory_order_release);
-        const auto qs = work_queue::stats();
+        const auto qs = aida::infra::taskflow_runtime::active_snapshot();
         diag::log_tagged_fmt("drv_tools",
-            "deferred_watcher_post_failed id=%d cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_posted=%llu cq_rejected=%llu",
+            "deferred_watcher_post_failed id=%d runtime_accepting=%d runtime_shutdown=%d service_pending=%llu service_active=%u total_submitted=%llu total_rejected=%llu",
             id,
-            qs.alive ? 1 : 0,
+            qs.accepting ? 1 : 0,
             qs.shutting_down ? 1 : 0,
-            qs.pending,
-            qs.active,
-            static_cast<unsigned long long>(qs.posted),
-            static_cast<unsigned long long>(qs.rejected));
+            static_cast<unsigned long long>(qs.service_queue_pending),
+            static_cast<unsigned>(qs.service_queue_active),
+            static_cast<unsigned long long>(qs.total_submitted),
+            static_cast<unsigned long long>(qs.total_rejected));
     }
 
     if (!watcher_started)
     {
         if (watcher_error)
-            *watcher_error = action_ptr->error.empty() ? std::string("Deferred watcher work queue post failed") : action_ptr->error;
+            *watcher_error = action_ptr->error.empty() ? std::string("Deferred watcher executor submit failed") : action_ptr->error;
         std::lock_guard<std::mutex> lock(_mutex);
         _actions.erase(id);
         diag::log_tagged_fmt("drv_tools", "deferred_watcher_registration_removed_after_post_failure id=%d", id);

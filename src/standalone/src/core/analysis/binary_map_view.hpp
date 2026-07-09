@@ -26,7 +26,7 @@
 #include "ui/responsive.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../session/analysis_session.hpp"
 
 #include <Windows.h>
@@ -44,6 +44,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 extern DisasmState g_disasm;
@@ -441,7 +442,13 @@ namespace binary_map_view {
 				opts_copy.include_imports ? 1 : 0,
 				opts_copy.include_exports ? 1 : 0);
 
-			const bool posted = work_queue::post([&s, opts_copy]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "analysis";
+			sub.label = "analysis.binary_map.refresh";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::diagnostics;
+			sub.priority = 3;
+			sub.body = [&s, opts_copy]() {
 				const auto start_clock = std::chrono::steady_clock::now();
 				binary_map::clear_cache();
 
@@ -487,12 +494,13 @@ namespace binary_map_view {
 						"refresh FAILED err='%s' duration_ms=%lld",
 						s.last_error.c_str(), static_cast<long long>(dur_ms));
 				}
-			});
+			};
+			const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 
 			if (!posted) {
 				s.refreshing.store(false);
 				diag::log_tagged_fmt("binary_map",
-					"refresh FAILED post rejected by work_queue");
+					"refresh FAILED post rejected by executor");
 			}
 		}
 
@@ -515,7 +523,13 @@ namespace binary_map_view {
 				"live_refresh START pid=%u",
 				static_cast<unsigned>(driver_bridge::attached_pid()));
 
-			const bool posted = work_queue::post([&s]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "analysis";
+			sub.label = "analysis.binary_map.live_refresh";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::diagnostics;
+			sub.priority = 3;
+			sub.body = [&s]() {
 				const auto start_clock = std::chrono::steady_clock::now();
 
 				const uint32_t pid = driver_bridge::attached_pid();
@@ -621,12 +635,13 @@ namespace binary_map_view {
 					static_cast<unsigned long long>(s.live.total_reserved),
 					static_cast<unsigned>(s.live.rwx_count),
 					static_cast<unsigned long long>(s.live.enum_elapsed_ms));
-			});
+			};
+			const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 
 			if (!posted) {
 				s.live_refreshing.store(false);
 				diag::log_tagged_fmt("binary_map",
-					"live_refresh FAILED post rejected by work_queue");
+					"live_refresh FAILED post rejected by executor");
 			}
 		}
 

@@ -3,7 +3,7 @@
 #include "standalone_license.hpp"
 #include "terminal_view.hpp"
 #include "workspace_search.hpp"
-#include "work_queue.hpp"
+#include "../core/infra/executor.hpp"
 #include "diag_log.hpp"
 #include "../core/ui/ui_thread_dispatcher.hpp"
 #include <iostream>
@@ -1038,7 +1038,13 @@ namespace file_tabs {
 			std::string fname = t.filename;
 			std::string fpath = t.filepath;
 			code_editor::load(std::string("Loading..."), fname, fpath);
-			work_queue::post([fname, fpath]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "file_tabs";
+			sub.label = "file_tabs.large_file_load";
+			sub.thread_class = "blocking_file_io";
+			sub.domain = aida::infra::executor::domain_t::long_running;
+			sub.priority = 3;
+			sub.body = [fname, fpath]() {
 				std::string c = read_file_contents(fpath);
 				const bool posted = aida::ui_thread::post(
 					[fname, fpath, content = std::move(c)]() mutable {
@@ -1068,7 +1074,10 @@ namespace file_tabs {
 						static_cast<unsigned long>(aida::ui_thread::owner_tid()),
 						fpath.c_str());
 				}
-			});
+			};
+			const bool submitted = aida::infra::executor::submit(std::move(sub)).submitted;
+			if (!submitted)
+				diag::log_tagged_critical_fmt("file_tabs", "large_file_load_submit_failed path=%.260s", fpath.c_str());
 		}
 	}
 

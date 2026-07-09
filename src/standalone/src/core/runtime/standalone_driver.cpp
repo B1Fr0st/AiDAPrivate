@@ -7,10 +7,9 @@
 #include "toast_notification.hpp"
 #include "arc/arc.h"
 #include "comm.h"
-#include "critical_work_queue.hpp"
 #include "event_bus.hpp"
 #include "win_thread.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../diagnostics/metadata_ring.hpp"
@@ -858,9 +857,9 @@ namespace
 
     struct lower_executor_thread_inventory_t
     {
-        lower_executor_pool_snapshot_t work_queue;
-        lower_executor_pool_snapshot_t service_queue;
-        lower_executor_pool_snapshot_t critical_queue;
+        lower_executor_pool_snapshot_t executor_general;
+        lower_executor_pool_snapshot_t executor_service;
+        lower_executor_pool_snapshot_t executor_critical;
     };
 
     struct lower_executor_process_stats_t
@@ -1045,52 +1044,43 @@ namespace
         return stack;
     }
 
-    lower_executor_pool_snapshot_t lower_executor_pool_from_work_stats(const work_queue::stats_t& in)
+    lower_executor_pool_snapshot_t lower_executor_pool_from_executor_snapshot(
+        const aida::infra::executor::active_snapshot_t& exec,
+        const aida::infra::taskflow_runtime::runtime_snapshot_t& runtime,
+        aida::infra::executor::domain_t domain)
     {
         lower_executor_pool_snapshot_t out{};
-        out.alive = in.alive;
-        out.shutting_down = in.shutting_down;
-        out.pool_size = in.pool_size;
-        out.workers = in.workers;
-        out.pending = in.pending;
-        out.active = in.active;
-        out.post_attempts = in.post_attempts;
-        out.posted = in.posted;
-        out.rejected = in.rejected;
-        out.started = in.started;
-        out.finished = in.finished;
-        out.oldest_active_ms = in.oldest_active_ms;
-        out.active_label_count = in.active_label_count;
-        out.active_labels = in.active_labels;
-        return out;
-    }
-
-    lower_executor_pool_snapshot_t lower_executor_pool_from_critical_stats(const critical_work_queue::stats_t& in)
-    {
-        lower_executor_pool_snapshot_t out{};
-        out.alive = in.alive;
-        out.shutting_down = in.shutting_down;
-        out.pool_size = in.pool_size;
-        out.workers = in.workers;
-        out.pending = in.pending;
-        out.active = in.active;
-        out.post_attempts = in.post_attempts;
-        out.posted = in.posted;
-        out.rejected = in.rejected;
-        out.started = in.started;
-        out.finished = in.finished;
-        out.oldest_active_ms = in.oldest_active_ms;
-        out.active_label_count = in.active_label_count;
-        out.active_labels = in.active_labels;
+        out.alive = runtime.accepting;
+        out.shutting_down = runtime.shutting_down;
+        if (domain == aida::infra::executor::domain_t::service) {
+            out.pending = static_cast<size_t>(exec.service_queue_pending);
+            out.active = exec.service_queue_active;
+        } else if (domain == aida::infra::executor::domain_t::critical) {
+            out.pending = static_cast<size_t>(exec.critical_queue_pending);
+            out.active = exec.critical_queue_active;
+        } else {
+            out.pending = static_cast<size_t>(exec.work_queue_pending);
+            out.active = exec.work_queue_active;
+        }
+        out.post_attempts = aida::infra::executor::total_submits.load(std::memory_order_acquire);
+        out.posted = runtime.total_submitted;
+        out.rejected = runtime.total_rejected;
+        out.started = runtime.total_active;
+        out.finished = runtime.total_submitted >= runtime.total_active ? runtime.total_submitted - runtime.total_active : 0;
+        out.oldest_active_ms = exec.oldest_active_ms;
+        out.active_label_count = static_cast<uint32_t>(runtime.active_jobs.size());
+        out.active_labels = exec.labels_under_pressure;
         return out;
     }
 
     lower_executor_thread_inventory_t capture_lower_executor_thread_inventory()
     {
         lower_executor_thread_inventory_t inv{};
-        inv.work_queue = lower_executor_pool_from_work_stats(work_queue::stats());
-        inv.service_queue = lower_executor_pool_from_work_stats(work_queue::service_stats());
-        inv.critical_queue = lower_executor_pool_from_critical_stats(critical_work_queue::stats());
+        const auto exec = aida::infra::executor::active_snapshot();
+        const auto runtime = aida::infra::taskflow_runtime::active_snapshot(64);
+        inv.executor_general = lower_executor_pool_from_executor_snapshot(exec, runtime, aida::infra::executor::domain_t::general);
+        inv.executor_service = lower_executor_pool_from_executor_snapshot(exec, runtime, aida::infra::executor::domain_t::service);
+        inv.executor_critical = lower_executor_pool_from_executor_snapshot(exec, runtime, aida::infra::executor::domain_t::critical);
         return inv;
     }
 
@@ -1195,12 +1185,12 @@ namespace
         h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.commit_total >> 20));
         h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.commit_limit >> 20));
         h = lower_executor_mix_u64(h, static_cast<uint64_t>(stats.avail_phys >> 20));
-        h = lower_executor_mix_u64(h, stats.pools.work_queue.pending);
-        h = lower_executor_mix_u64(h, stats.pools.service_queue.pending);
-        h = lower_executor_mix_u64(h, stats.pools.critical_queue.pending);
-        h = lower_executor_mix_u64(h, stats.pools.work_queue.active);
-        h = lower_executor_mix_u64(h, stats.pools.service_queue.active);
-        h = lower_executor_mix_u64(h, stats.pools.critical_queue.active);
+        h = lower_executor_mix_u64(h, stats.pools.executor_general.pending);
+        h = lower_executor_mix_u64(h, stats.pools.executor_service.pending);
+        h = lower_executor_mix_u64(h, stats.pools.executor_critical.pending);
+        h = lower_executor_mix_u64(h, stats.pools.executor_general.active);
+        h = lower_executor_mix_u64(h, stats.pools.executor_service.active);
+        h = lower_executor_mix_u64(h, stats.pools.executor_critical.active);
         return h;
     }
 
@@ -1321,9 +1311,9 @@ namespace
             static_cast<unsigned long long>(stats.job.job_memory_limit),
             static_cast<unsigned long long>(stats.job.peak_process_memory_used),
             static_cast<unsigned long long>(stats.job.peak_job_memory_used));
-        log_lower_executor_pool_snapshot(name, "work_queue", stats.pools.work_queue);
-        log_lower_executor_pool_snapshot(name, "service_queue", stats.pools.service_queue);
-        log_lower_executor_pool_snapshot(name, "critical_queue", stats.pools.critical_queue);
+        log_lower_executor_pool_snapshot(name, "executor_general", stats.pools.executor_general);
+        log_lower_executor_pool_snapshot(name, "executor_service", stats.pools.executor_service);
+        log_lower_executor_pool_snapshot(name, "executor_critical", stats.pools.executor_critical);
     }
 
     uint64_t lower_executor_abs_diff(uint64_t a, uint64_t b) noexcept
@@ -4146,7 +4136,14 @@ namespace
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post_service_labeled("driver_watchdog", [epoch]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "runtime_driver";
+        sub.label = "driver_watchdog";
+        sub.thread_class = "security_loop";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.generation = epoch;
+        sub.body = [epoch]() {
             driver_critical_fmt("driver_watchdog_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -4156,7 +4153,8 @@ namespace
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
                 static_cast<unsigned long long>(GetTickCount64()));
-        });
+        };
+        bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
         driver_critical_fmt("driver_watchdog_post_post posted=%d elapsed_ms=%llu",
             posted ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
@@ -4371,7 +4369,13 @@ namespace
         }
 
         const std::string reason_text = (reason && *reason) ? reason : "kernel_stale";
-        bool posted = work_queue::post_service_labeled("kernel_reconnect_after_stale", [reason_text]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "runtime_driver";
+        sub.label = "kernel_reconnect_after_stale";
+        sub.thread_class = "security_task";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.body = [reason_text]() {
             Sleep(kKernelReconnectInitialDelayMs);
             for (int attempt = 1; attempt <= kKernelReconnectMaxAttempts; ++attempt) {
                 runtime_auth_snapshot_t auth = capture_runtime_auth_snapshot();
@@ -4422,7 +4426,8 @@ namespace
                     Sleep(kKernelReconnectRetryDelayMs);
             }
             g_kernel_reconnect_queued.store(false, std::memory_order_release);
-        });
+        };
+        bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 
         driver_critical_fmt("kernel_reconnect_post reason=%s posted=%d", reason_text.c_str(), posted ? 1 : 0);
         if (!posted)
@@ -4675,7 +4680,14 @@ namespace
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
             return;
         }
-        bool posted = work_queue::post_service_labeled("driver_event_poller", [epoch]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "runtime_driver";
+        sub.label = "driver_event_poller";
+        sub.thread_class = "security_loop";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.generation = epoch;
+        sub.body = [epoch]() {
             driver_critical_fmt("event_poller_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -4685,7 +4697,8 @@ namespace
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
                 static_cast<unsigned long long>(GetTickCount64()));
-        });
+        };
+        bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
         driver_critical_fmt("event_poller_post_post posted=%d elapsed_ms=%llu",
             posted ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
@@ -4897,7 +4910,13 @@ namespace driver_bridge
         bool expected_queued = false;
         if (g_post_demote_dtb_resolve_queued.compare_exchange_strong(expected_queued, true, std::memory_order_acq_rel)) {
             const std::string reason_copy = reason ? std::string(reason) : std::string("send_request_invalid_function");
-            work_queue::post_service_labeled("driver_post_demote_dtb_resolve", [reason_copy]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "runtime_driver";
+            sub.label = "driver_post_demote_dtb_resolve";
+            sub.thread_class = "security_task";
+            sub.domain = aida::infra::executor::domain_t::critical;
+            sub.priority = 0;
+            sub.body = [reason_copy]() {
                 Sleep(500);
                 const bool relay_ok = standalone_license::force_relay_now_blocking(2000);
                 diag::log_tagged_critical_fmt("driver",
@@ -4930,7 +4949,10 @@ namespace driver_bridge
                         static_cast<unsigned long long>(device->get_dtb()));
                 }
                 g_post_demote_dtb_resolve_queued.store(false, std::memory_order_release);
-            });
+            };
+            if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+                g_post_demote_dtb_resolve_queued.store(false, std::memory_order_release);
+            }
         }
     }
 

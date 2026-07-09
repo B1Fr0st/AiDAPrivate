@@ -3,7 +3,7 @@
 
 #include "provider_catalog.hpp"
 #include "../auth/auth_http.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -409,7 +410,13 @@ void initialize_async(int max_age_seconds)
 	if (!s_init_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 		return;
 
-	bool posted = work_queue::post([max_age_seconds]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "ai_provider_catalog";
+	sub.label = "provider_catalog.initialize";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::external_tool;
+	sub.priority = 3;
+	sub.body = [max_age_seconds]() {
 		const auto path = cache_path();
 		std::error_code ec;
 		bool cache_fresh = false;
@@ -437,7 +444,8 @@ void initialize_async(int max_age_seconds)
 
 		(void)fetch_and_cache();
 		s_refresh_inflight.store(false, std::memory_order_release);
-	});
+	};
+	bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 	if (!posted) {
 		s_init_started.store(false, std::memory_order_release);
 		set_error("failed to schedule models catalog initialization");

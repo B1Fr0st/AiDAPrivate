@@ -8,7 +8,7 @@
 #include "pe_parser.hpp"
 #include "symbol_store.hpp"
 #include "rename_store.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
@@ -31,6 +31,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <Windows.h>
@@ -967,12 +968,26 @@ namespace functions_panel {
 				uint32_t size = m->size;
 				std::string name = m->name;
 
-				work_queue::post([base, size, name]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "analysis";
+				sub.label = "analysis.functions_panel.live_build";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 2;
+				sub.body = [base, size, name]() {
 					auto& s2 = state();
 					build_locked(s2, base, size, name);
 					s2.ready.store(true, std::memory_order_release);
 					s2.building.store(false, std::memory_order_release);
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+					s.building.store(false, std::memory_order_release);
+					diag::log_tagged_fmt("functions_panel",
+						"live_build_post_failed base=0x%llX size=0x%X name='%s'",
+						static_cast<unsigned long long>(base),
+						size,
+						name.c_str());
+				}
 				return;
 			}
 
@@ -1010,12 +1025,24 @@ namespace functions_panel {
 
 			std::string path_capture = disk_path;
 			std::string name_capture = disk_name;
-			work_queue::post([path_capture, name_capture]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "analysis";
+			sub.label = "analysis.functions_panel.disk_build";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::feature_worker;
+			sub.priority = 2;
+			sub.body = [path_capture, name_capture]() {
 				auto& s2 = state();
 				build_locked_disk(s2, path_capture, name_capture);
 				s2.ready.store(true, std::memory_order_release);
 				s2.building.store(false, std::memory_order_release);
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+				s.building.store(false, std::memory_order_release);
+				diag::log_tagged_fmt("functions_panel",
+					"disk_build_post_failed path='%s'",
+					path_capture.c_str());
+			}
 		}
 
 		inline void rebuild_filter(view_state_t& s) {

@@ -5,10 +5,10 @@
 
 #include "intruder_engine.hpp"
 
-#include "../../infra/work_queue.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../protocol_parser.hpp"
 #include "../../../helpers/diag_log.hpp"
+#include "../../infra/executor.hpp"
 
 #ifdef _WIN32
 #  include <BaseTsd.h>
@@ -39,6 +39,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -2035,7 +2036,14 @@ uint64_t start(config_t cfg)
         static_cast<unsigned long long>(job->id), job->cfg.host.c_str(),
         static_cast<unsigned long long>(intruder_token));
     auto intruder_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(intruder_admission));
-    const bool posted = work_queue::post([job, intruder_admission_ptr, intruder_token]() {
+    const bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.intruder";
+        sub.label = "intruder.job";
+        sub.thread_class = "long_running";
+        sub.domain = aida::infra::executor::domain_t::long_running;
+        sub.priority = 3;
+        sub.body = [job, intruder_admission_ptr, intruder_token]() {
         try {
             job_main(job);
         } catch (const std::exception& ex) {
@@ -2053,9 +2061,11 @@ uint64_t start(config_t cfg)
             static_cast<unsigned long long>(job->id),
             static_cast<unsigned long long>(intruder_token));
         intruder_admission_ptr->release("completed");
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
     if (!posted) {
-        diag::log_tagged_fmt("intruder", "start_work_queue_rejected job_id=%llu",
+        diag::log_tagged_fmt("intruder", "start_executor_rejected job_id=%llu",
             static_cast<unsigned long long>(job->id));
         set_err("intruder: work queue rejected job start");
         job->running.store(false);

@@ -7,6 +7,7 @@
 #include <ctime>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <Windows.h>
@@ -16,7 +17,7 @@
 #include <openssl/evp.h>
 #include <zlib.h>
 
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../ui/fonts.hpp"
 #include "disasm_theme.hpp"
@@ -798,9 +799,19 @@ namespace file_metadata_banner {
 			}
 			if (need_dispatch) {
 				std::string captured = path;
-				work_queue::post([captured]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "disasm";
+				sub.label = "disasm.file_metadata.compute_path";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::diagnostics;
+				sub.priority = 3;
+				sub.body = [captured]() {
 					run_compute_path(captured);
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+					std::lock_guard<std::mutex> lk(c.mtx);
+					c.state.store(static_cast<int>(compute_state_t::failed), std::memory_order_release);
+				}
 			}
 		}
 
@@ -836,9 +847,20 @@ namespace file_metadata_banner {
 				uint32_t size_c = module_size;
 				uint32_t pid_c = pid;
 				std::string name_c = display_name;
-				work_queue::post([base_c, size_c, pid_c, name_c]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "disasm";
+				sub.label = "disasm.file_metadata.compute_image";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::diagnostics;
+				sub.priority = 3;
+				sub.target_pid = pid_c;
+				sub.body = [base_c, size_c, pid_c, name_c]() {
 					run_compute_image(base_c, size_c, pid_c, name_c);
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+					std::lock_guard<std::mutex> lk(c.mtx);
+					c.state.store(static_cast<int>(compute_state_t::failed), std::memory_order_release);
+				}
 			}
 		}
 

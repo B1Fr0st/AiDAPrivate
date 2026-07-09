@@ -6,8 +6,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
-#include <deque>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -16,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include "../../helpers/diag_log.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../infra/win_thread.hpp"
 #include "../runtime/manual_map_tls.hpp"
 
@@ -999,23 +1001,14 @@ class feature_worker_group_t
 {
 public:
     explicit feature_worker_group_t(const feature_worker_group_config_t& cfg)
-        : cfg_(cfg)
-        , shutdown_(false)
-        , active_workers_(0)
-        , queued_tasks_(0)
+        : state_(std::make_shared<state_t>(cfg))
     {
-        workers_.reserve(cfg_.worker_count);
-        for (std::size_t i = 0; i < cfg_.worker_count; ++i) {
-            aida::infra::win_thread::joinable_thread_t worker;
-            std::string err;
-            const std::string label = cfg_.label_prefix.empty()
-                ? (cfg_.owner_subsystem + ".fwt." + std::to_string(i))
-                : (cfg_.label_prefix + "." + std::to_string(i));
-            const bool started = worker.start([this, label]() { worker_loop(label); }, &err,
-                aida::infra::win_thread::default_stack_reserve, label.c_str());
-            if (started)
-                workers_.push_back(std::move(worker));
-        }
+        diag::log_tagged_fmt("mcp_srv",
+            "FEATURE-WORKER-GROUP-READY owner=%s kind=%s workers=%zu queue_depth=%zu runtime=central_taskflow",
+            state_->cfg.owner_subsystem.c_str(),
+            producer_kind_name(state_->cfg.kind),
+            state_->cfg.worker_count,
+            state_->cfg.queue_depth);
     }
 
     ~feature_worker_group_t()
@@ -1025,101 +1018,330 @@ public:
 
     bool post(std::function<void()> task, std::uint64_t timeout_ms = 0)
     {
-        if (shutdown_.load(std::memory_order_acquire))
+        auto state = state_;
+        if (!state || !task)
             return false;
-        if (queued_tasks_.load(std::memory_order_acquire) >= cfg_.queue_depth)
+        if (state->shutdown.load(std::memory_order_acquire)) {
+            state->rejected.fetch_add(1, std::memory_order_acq_rel);
             return false;
-        {
-            std::lock_guard<std::mutex> lk(mutex_);
-            if (queue_.size() >= cfg_.queue_depth)
-                return false;
-            queue_.push({std::move(task), timeout_ms});
-            queued_tasks_.fetch_add(1, std::memory_order_acq_rel);
         }
-        cv_.notify_one();
+        if (state->queued_tasks.load(std::memory_order_acquire) >= state->cfg.queue_depth) {
+            state->rejected.fetch_add(1, std::memory_order_acq_rel);
+            return false;
+        }
+        auto job = std::make_shared<job_t>();
+        job->seq = state->submitted.fetch_add(1, std::memory_order_acq_rel) + 1;
+        job->label = state->cfg.label_prefix.empty()
+            ? (state->cfg.owner_subsystem + ".fwt." + std::to_string(job->seq))
+            : (state->cfg.label_prefix + "." + std::to_string(job->seq));
+        job->fn = std::move(task);
+        job->deadline_ms = now_ms() + (timeout_ms != 0 ? timeout_ms : state->cfg.default_timeout_ms);
+
+        aida::infra::taskflow_runtime::task_descriptor_t desc;
+        desc.owner_subsystem = state->cfg.owner_subsystem.c_str();
+        desc.label = job->label.c_str();
+        desc.thread_class = "feature_worker";
+        desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+        desc.priority = 3;
+        desc.deadline_ms = job->deadline_ms;
+        desc.failure_policy = "reject_not_started";
+        desc.shutdown_policy = "cancel_or_drain";
+        desc.no_capacity_reason = "feature_worker_runtime_rejected";
+        desc.cancel_hook = [state, job]() {
+            cancel_not_started(state, job, "runtime_cancel_hook");
+        };
+        desc.cancellable_body = [state, job](const aida::infra::taskflow_runtime::cancellation_token_t& token) {
+            run_job(state, job, token);
+        };
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            if (state->shutdown.load(std::memory_order_acquire)) {
+                state->rejected.fetch_add(1, std::memory_order_acq_rel);
+                return false;
+            }
+            if (state->queued_jobs.size() >= state->cfg.queue_depth) {
+                state->rejected.fetch_add(1, std::memory_order_acq_rel);
+                return false;
+            }
+            state->queued_jobs[job->seq] = job;
+            state->queued_tasks.fetch_add(1, std::memory_order_acq_rel);
+            auto submit_result = aida::infra::taskflow_runtime::submit(std::move(desc));
+            if (!submit_result.submitted) {
+                state->queued_jobs.erase(job->seq);
+                decrement_counter_if_nonzero(state->queued_tasks);
+                state->rejected.fetch_add(1, std::memory_order_acq_rel);
+                diag::log_tagged_fmt("mcp_srv",
+                    "FEATURE-WORKER-GROUP-REJECT owner=%s label=%s reason=runtime_submit_failed runtime_reason='%s' queued=%zu active=%zu",
+                    state->cfg.owner_subsystem.c_str(),
+                    job->label.c_str(),
+                    submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str(),
+                    state->queued_jobs.size(),
+                    state->active_jobs.size());
+                return false;
+            }
+            job->runtime_job_id.store(submit_result.handle.id, std::memory_order_release);
+            state->outstanding_jobs[job->seq] = job;
+        }
         return true;
     }
 
     void shutdown()
     {
-        if (shutdown_.exchange(true, std::memory_order_acq_rel))
+        auto state = state_;
+        if (!state)
             return;
-        cv_.notify_all();
-        for (auto& w : workers_) {
-            w.join();
+        if (state->shutdown.exchange(true, std::memory_order_acq_rel))
+            return;
+        std::vector<std::shared_ptr<job_t>> outstanding;
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            outstanding.reserve(state->outstanding_jobs.size());
+            for (const auto& kv : state->outstanding_jobs) {
+                if (kv.second)
+                    outstanding.push_back(kv.second);
+            }
         }
-        workers_.clear();
+        for (const auto& job : outstanding) {
+            if (!job)
+                continue;
+            job->cancel_requested.store(true, std::memory_order_release);
+            const std::uint64_t job_id = job->runtime_job_id.load(std::memory_order_acquire);
+            if (job_id != 0)
+                (void)aida::infra::taskflow_runtime::cancel(aida::infra::taskflow_runtime::job_handle_t{job_id});
+        }
+        const std::uint64_t begin = now_ms();
+        const std::uint64_t deadline = begin + 10000ULL;
+        bool timed_out = false;
+        for (const auto& job : outstanding) {
+            if (!job)
+                continue;
+            const std::uint64_t job_id = job->runtime_job_id.load(std::memory_order_acquire);
+            if (job_id == 0)
+                continue;
+            const std::uint64_t current = now_ms();
+            if (current >= deadline) {
+                timed_out = true;
+                break;
+            }
+            const std::uint32_t wait_ms = static_cast<std::uint32_t>((std::min<std::uint64_t>)(deadline - current, 250ULL));
+            auto wait_result = aida::infra::taskflow_runtime::wait_for(aida::infra::taskflow_runtime::job_handle_t{job_id}, wait_ms);
+            if (wait_result.timed_out) {
+                timed_out = true;
+                break;
+            }
+        }
+        std::size_t queued = 0;
+        std::size_t active = 0;
+        std::size_t live = 0;
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            queued = state->queued_jobs.size();
+            active = state->active_jobs.size();
+            live = state->outstanding_jobs.size();
+            if (!timed_out && active == 0) {
+                state->queued_jobs.clear();
+                state->active_jobs.clear();
+                state->outstanding_jobs.clear();
+            }
+        }
+        diag::log_tagged_fmt("mcp_srv",
+            "FEATURE-WORKER-GROUP-SHUTDOWN owner=%s queued=%zu active=%zu outstanding=%zu submitted=%llu finished=%llu rejected=%llu timed_out=%d",
+            state->cfg.owner_subsystem.c_str(),
+            queued,
+            active,
+            live,
+            static_cast<unsigned long long>(state->submitted.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(state->finished.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(state->rejected.load(std::memory_order_acquire)),
+            timed_out ? 1 : 0);
     }
 
-    std::size_t active_workers() const { return active_workers_.load(std::memory_order_acquire); }
-    std::size_t queued_tasks() const { return queued_tasks_.load(std::memory_order_acquire); }
-    std::size_t worker_count() const { return workers_.size(); }
+    std::size_t active_workers() const
+    {
+        auto state = state_;
+        return state ? state->active_workers.load(std::memory_order_acquire) : 0;
+    }
+
+    std::size_t queued_tasks() const
+    {
+        auto state = state_;
+        return state ? state->queued_tasks.load(std::memory_order_acquire) : 0;
+    }
+
+    std::size_t worker_count() const
+    {
+        auto state = state_;
+        return state ? state->cfg.worker_count : 0;
+    }
 
     json stats_json() const
     {
+        auto state = state_;
+        if (!state)
+            return json::object();
         return {
-            {"owner", cfg_.owner_subsystem},
-            {"kind", producer_kind_name(cfg_.kind)},
-            {"workers", workers_.size()},
-            {"active_workers", active_workers_.load(std::memory_order_acquire)},
-            {"queued_tasks", queued_tasks_.load(std::memory_order_acquire)},
-            {"queue_depth", cfg_.queue_depth},
-            {"shutdown", shutdown_.load(std::memory_order_acquire)}
+            {"owner", state->cfg.owner_subsystem},
+            {"kind", producer_kind_name(state->cfg.kind)},
+            {"workers", state->cfg.worker_count},
+            {"active_workers", state->active_workers.load(std::memory_order_acquire)},
+            {"queued_tasks", state->queued_tasks.load(std::memory_order_acquire)},
+            {"queue_depth", state->cfg.queue_depth},
+            {"shutdown", state->shutdown.load(std::memory_order_acquire)},
+            {"submitted", state->submitted.load(std::memory_order_acquire)},
+            {"finished", state->finished.load(std::memory_order_acquire)},
+            {"rejected", state->rejected.load(std::memory_order_acquire)}
         };
     }
 
 private:
-    struct queued_task_t
+    struct job_t
     {
+        std::uint64_t seq = 0;
+        std::string label;
         std::function<void()> fn;
-        std::uint64_t timeout_ms = 0;
+        std::uint64_t deadline_ms = 0;
+        std::atomic<std::uint64_t> runtime_job_id{0};
+        std::atomic<bool> cancel_requested{false};
+        std::atomic<bool> not_started_finalized{false};
     };
 
-    static void invoke_task_seh(const queued_task_t* task, const char* owner, const char* label)
+    struct state_t
     {
-        __try {
-            if (task && task->fn)
-                task->fn();
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        explicit state_t(const feature_worker_group_config_t& input) : cfg(input) {}
+        feature_worker_group_config_t cfg;
+        mutable std::mutex mutex;
+        std::map<std::uint64_t, std::shared_ptr<job_t>> queued_jobs;
+        std::map<std::uint64_t, std::shared_ptr<job_t>> active_jobs;
+        std::map<std::uint64_t, std::shared_ptr<job_t>> outstanding_jobs;
+        std::atomic<bool> shutdown{false};
+        std::atomic<std::size_t> active_workers{0};
+        std::atomic<std::size_t> queued_tasks{0};
+        std::atomic<std::uint64_t> submitted{0};
+        std::atomic<std::uint64_t> finished{0};
+        std::atomic<std::uint64_t> rejected{0};
+    };
+
+    static void decrement_counter_if_nonzero(std::atomic<std::size_t>& value)
+    {
+        std::size_t current = value.load(std::memory_order_acquire);
+        while (current != 0 &&
+               !value.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        }
+    }
+
+    static bool cancel_not_started(const std::shared_ptr<state_t>& state, const std::shared_ptr<job_t>& job, const char* reason)
+    {
+        if (!state || !job)
+            return false;
+        job->cancel_requested.store(true, std::memory_order_release);
+        bool removed = false;
+        std::size_t queued_after = 0;
+        std::size_t active_after = 0;
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            auto it = state->queued_jobs.find(job->seq);
+            if (it != state->queued_jobs.end()) {
+                state->queued_jobs.erase(it);
+                state->outstanding_jobs.erase(job->seq);
+                removed = true;
+                decrement_counter_if_nonzero(state->queued_tasks);
+            }
+            queued_after = state->queued_jobs.size();
+            active_after = state->active_jobs.size();
+        }
+        if (!removed)
+            return false;
+        if (!job->not_started_finalized.exchange(true, std::memory_order_acq_rel)) {
+            job->fn = {};
+            state->finished.fetch_add(1, std::memory_order_acq_rel);
+            diag::log_tagged_fmt("mcp_srv",
+                "FEATURE-WORKER-GROUP-CANCELLED owner=%s label=%s job_id=%llu reason=%s queued=%zu active=%zu",
+                state->cfg.owner_subsystem.c_str(),
+                job->label.c_str(),
+                static_cast<unsigned long long>(job->runtime_job_id.load(std::memory_order_acquire)),
+                reason ? reason : "cancelled",
+                queued_after,
+                active_after);
+        }
+        return true;
+    }
+
+    static DWORD invoke_task_seh(const std::shared_ptr<job_t>& job)
+    {
+        if (!job || !job->fn)
+            return 0;
+        return aida::infra::win_thread::run_function_seh_guarded(job->fn);
+    }
+
+    static void run_job(const std::shared_ptr<state_t>& state,
+                        const std::shared_ptr<job_t>& job,
+                        const aida::infra::taskflow_runtime::cancellation_token_t& token)
+    {
+        if (!state || !job)
+            return;
+        if (token.requested.load(std::memory_order_acquire) || job->cancel_requested.load(std::memory_order_acquire)) {
+            if (cancel_not_started(state, job, "cancelled_before_start"))
+                return;
+            if (job->not_started_finalized.load(std::memory_order_acquire))
+                return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            state->queued_jobs.erase(job->seq);
+            state->active_jobs[job->seq] = job;
+            decrement_counter_if_nonzero(state->queued_tasks);
+        }
+        aida::manual_map_tls::ensure_current_thread();
+        state->active_workers.fetch_add(1, std::memory_order_acq_rel);
+        struct finish_guard_t {
+            std::shared_ptr<state_t> state;
+            std::shared_ptr<job_t> job;
+            ~finish_guard_t()
+            {
+                if (!state || !job)
+                    return;
+                {
+                    std::lock_guard<std::mutex> lk(state->mutex);
+                    state->active_jobs.erase(job->seq);
+                    state->outstanding_jobs.erase(job->seq);
+                }
+                state->active_workers.fetch_sub(1, std::memory_order_acq_rel);
+                job->fn = {};
+                state->finished.fetch_add(1, std::memory_order_acq_rel);
+            }
+        } finish{state, job};
+        if (token.requested.load(std::memory_order_acquire) || job->cancel_requested.load(std::memory_order_acquire)) {
+            diag::log_tagged_fmt("mcp_srv",
+                "FEATURE-WORKER-GROUP-CANCELLED-ACTIVE owner=%s label=%s job_id=%llu",
+                state->cfg.owner_subsystem.c_str(),
+                job->label.c_str(),
+                static_cast<unsigned long long>(job->runtime_job_id.load(std::memory_order_acquire)));
+            return;
+        }
+        DWORD code = 0;
+        try {
+            code = invoke_task_seh(job);
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt("mcp_srv",
+                "FEATURE-WORKER-GROUP-EXCEPTION owner=%s label=%s err='%s'",
+                state->cfg.owner_subsystem.c_str(),
+                job->label.c_str(),
+                ex.what());
+        } catch (...) {
+            diag::log_tagged_fmt("mcp_srv",
+                "FEATURE-WORKER-GROUP-EXCEPTION owner=%s label=%s err='<unknown>'",
+                state->cfg.owner_subsystem.c_str(),
+                job->label.c_str());
+        }
+        if (code != 0)
             diag::log_tagged_fmt("mcp_srv",
                 "FEATURE-WORKER-GROUP-EXCEPTION owner=%s label=%s code=0x%08lX",
-                owner ? owner : "", label ? label : "",
-                static_cast<unsigned long>(GetExceptionCode()));
-        }
+                state->cfg.owner_subsystem.c_str(),
+                job->label.c_str(),
+                static_cast<unsigned long>(code));
     }
 
-    void worker_loop(const std::string& label)
-    {
-        aida::manual_map_tls::ensure_current_thread();
-        active_workers_.fetch_add(1, std::memory_order_acq_rel);
-        while (true) {
-            queued_task_t task;
-            {
-                std::unique_lock<std::mutex> lk(mutex_);
-                cv_.wait(lk, [this]() {
-                    return shutdown_.load(std::memory_order_acquire) || !queue_.empty();
-                });
-                if (shutdown_.load(std::memory_order_acquire) && queue_.empty())
-                    break;
-                if (queue_.empty())
-                    continue;
-                task = std::move(queue_.front());
-                queue_.pop();
-                queued_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-            }
-            invoke_task_seh(&task, cfg_.owner_subsystem.c_str(), label.c_str());
-        }
-        active_workers_.fetch_sub(1, std::memory_order_acq_rel);
-    }
-
-    feature_worker_group_config_t cfg_;
-    std::vector<aida::infra::win_thread::joinable_thread_t> workers_;
-    std::queue<queued_task_t> queue_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::atomic<bool> shutdown_;
-    std::atomic<std::size_t> active_workers_;
-    std::atomic<std::size_t> queued_tasks_;
+    std::shared_ptr<state_t> state_;
 };
 
 }

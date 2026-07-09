@@ -12,9 +12,10 @@
 #include "issue.hpp"
 #include "scope.hpp"
 
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
+#include "../../infra/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -28,6 +29,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -661,7 +663,14 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
             insertion_point_t ip_copy = ip;
             rt_ptr->queued_workers.fetch_add(1, std::memory_order_relaxed);
             rt_ptr->active_workers.fetch_add(1, std::memory_order_relaxed);
-            const bool posted = work_queue::post([captured, mod_copy, ip_copy]() {
+            const bool posted = [&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.active_scanner";
+                sub.label = "active_scanner.probe";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::feature_worker;
+                sub.priority = 3;
+                sub.body = [captured, mod_copy, ip_copy]() {
                 struct worker_guard_t
                 {
                     std::shared_ptr<audit_runtime_t> rt;
@@ -672,7 +681,9 @@ void run_audit(std::shared_ptr<audit_runtime_t> rt_ptr)
                     }
                 } guard{captured};
                 run_module_for_point(captured, mod_copy, ip_copy);
-            });
+            };
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }();
             if (!posted) {
                 rt_ptr->active_workers.fetch_sub(1, std::memory_order_acq_rel);
                 rt_ptr->cancel_cv.notify_all();
@@ -980,13 +991,21 @@ uint64_t enqueue_target(const std::vector<uint8_t>& raw_request,
     diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-ADMIT audit_id=%llu host=%s token=%llu",
         static_cast<unsigned long long>(rt->status.id), host.c_str(),
         static_cast<unsigned long long>(admission_token));
-    const bool posted = work_queue::post([captured, admission_ptr, admission_token]() {
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "burp.active_scanner";
+    sub.label = "active_scanner.run_audit";
+    sub.thread_class = "long_running";
+    sub.domain = aida::infra::executor::domain_t::long_running;
+    sub.priority = 3;
+    sub.lease_token = admission_token;
+    sub.body = [captured, admission_ptr, admission_token]() {
         run_audit(captured);
         diag::log_tagged_fmt("scanner", "BURP-NETWORK-WORKER-RELEASE audit_id=%llu token=%llu reason=completed",
             static_cast<unsigned long long>(captured->status.id),
             static_cast<unsigned long long>(admission_token));
         admission_ptr->release("completed");
-    });
+    };
+    const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
     if (!posted) {
         {
             std::lock_guard<std::mutex> lk(rt->status_mtx);

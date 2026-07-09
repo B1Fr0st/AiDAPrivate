@@ -14,7 +14,7 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../infra/event_bus.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -26,6 +26,7 @@
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -224,9 +225,18 @@ std::string default_path_for(const std::string& request_path)
 
 void handle_exchange_observed(const exchange_observed_t& e)
 {
-    work_queue::post([e]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.cookie_jar";
+        sub.label = "cookie_jar.observe_exchange";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::feature_worker;
+        sub.priority = 3;
+        sub.body = [e]() {
         ingest_set_cookie_headers(e.host, e.resp_headers);
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 }

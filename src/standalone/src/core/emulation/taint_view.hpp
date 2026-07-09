@@ -1,7 +1,6 @@
 #pragma once
 
 #include "symbolic_engine.hpp"
-#include "work_queue.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
@@ -17,6 +16,7 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 extern DisasmState g_disasm;
@@ -29,6 +29,7 @@ extern DisasmState g_disasm;
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace taint_view {
@@ -128,7 +129,13 @@ inline void start_taint_trace(local_state_t& st) {
 
 	symbolic_engine::g_state.processing.store(true);
 	auto t0 = std::chrono::steady_clock::now();
-	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, mem_ranges, t0]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "emulation";
+	sub.label = "emulation.taint.trace";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = [addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, mem_ranges, t0]() {
 		symbolic_engine::taint_result_t result;
 		try {
 			result = symbolic_engine::taint_trace(addr, end, max_i, regs, mem_ranges);
@@ -157,7 +164,13 @@ inline void start_taint_trace(local_state_t& st) {
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_taint = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		symbolic_engine::g_state.processing.store(false);
+		diag::log_tagged_fmt("taint",
+			"taint_trace_post_failed entry=0x%llX",
+			static_cast<unsigned long long>(addr));
+	}
 }
 
 inline std::vector<taint_node_t> build_taint_flow(const symbolic_engine::taint_result_t& res,

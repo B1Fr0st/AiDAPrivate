@@ -4,10 +4,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include "work_queue.hpp"
 
 #include "standalone_driver.hpp"
 #include "../mcp/mcp_standalone.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace driver_bridge {
@@ -2933,9 +2933,18 @@ public:
             return fail_install(reason, "page-guard install cancelled before poll worker scheduling", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
         }
         log_install_phase("poller_post_begin");
-        if (auto_poll && !work_queue::post([worker_session = session]() mutable {
-            poll_ring(std::move(worker_session));
-        })) {
+        if (auto_poll) {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "debugger";
+            sub.label = "debugger.page_guard_poll";
+            sub.thread_class = "debugger_page_guard_poll";
+            sub.domain = aida::infra::executor::domain_t::security_liveness;
+            sub.priority = 1;
+            sub.target_pid = pid;
+            sub.body = [worker_session = session]() mutable {
+                poll_ring(std::move(worker_session));
+            };
+            if (!aida::infra::executor::submit(std::move(sub)).submitted) {
             diag::log_tagged_fmt("pg_sniff", "install_failed reason=poll_worker_post pid=%u target=0x%llX",
                 pid, static_cast<unsigned long long>(target_addr));
             uint32_t cleanup_old_protect = 0;
@@ -2963,6 +2972,7 @@ public:
             session->polling.store(false);
             session->exited.store(true);
             return fail_install("poll_worker_post", "failed to schedule the page-guard poll worker", &mri, target_addr, region_size, orig_protect | PAGE_GUARD);
+            }
         }
 
         if (const char* reason = check_install_cancelled("before_session_register")) {

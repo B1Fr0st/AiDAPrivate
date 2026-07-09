@@ -2,8 +2,7 @@
 #include <windows.h>
 #include <intrin.h>
 
-#include "work_queue.hpp"
-#include "critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "theme.hpp"
 #include "mcp_standalone.hpp"
 #include "mcp_client.hpp"
@@ -57,6 +56,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -65,6 +65,7 @@
 #include <cstring>
 #include <map>
 #include <exception>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -135,65 +136,65 @@ void shutdown_phase_done(const char* phase, ULONGLONG start)
         static_cast<unsigned long>(GetCurrentThreadId()));
 }
 
+bool submit_chat_task(const char* label,
+                      aida::infra::executor::domain_t domain,
+                      const char* thread_class,
+                      int priority,
+                      std::function<void()> body)
+{
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "ai_chat";
+    sub.label = label;
+    sub.thread_class = thread_class;
+    sub.domain = domain;
+    sub.priority = priority;
+    sub.body = std::move(body);
+    return aida::infra::executor::submit(std::move(sub)).submitted;
+}
+
 void log_shutdown_queue_snapshot(const char* phase)
 {
-    auto wq = work_queue::stats();
-    auto svc = work_queue::service_stats();
-    auto cq = critical_work_queue::stats();
+    const auto exec = aida::infra::executor::active_snapshot();
+    const auto runtime = aida::infra::taskflow_runtime::active_snapshot(128);
     diag::log_tagged_critical_fmt("chat",
-        "shutdown_queue_snapshot phase=%s cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_oldest_ms=%llu cq_started=%llu cq_finished=%llu cq_labels=%.420s wq_alive=%d wq_shutdown=%d wq_workers=%zu wq_pending=%zu wq_active=%u wq_oldest_ms=%llu wq_started=%llu wq_finished=%llu wq_labels=%.420s svc_alive=%d svc_shutdown=%d svc_workers=%zu svc_pending=%zu svc_active=%u svc_oldest_ms=%llu svc_started=%llu svc_finished=%llu svc_labels=%.420s",
+        "shutdown_executor_snapshot phase=%s accepting=%d shutting_down=%d total_active=%u general_pending=%llu general_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u oldest_ms=%llu runtime_submitted=%llu runtime_rejected=%llu runtime_cancelled=%llu runtime_failed=%llu runtime_timed_out=%llu labels=%.760s",
         phase && *phase ? phase : "<unknown>",
-        cq.alive ? 1 : 0,
-        cq.shutting_down ? 1 : 0,
-        cq.workers,
-        cq.pending,
-        static_cast<unsigned>(cq.active),
-        static_cast<unsigned long long>(cq.oldest_active_ms),
-        static_cast<unsigned long long>(cq.started),
-        static_cast<unsigned long long>(cq.finished),
-        cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str(),
-        wq.alive ? 1 : 0,
-        wq.shutting_down ? 1 : 0,
-        wq.workers,
-        wq.pending,
-        static_cast<unsigned>(wq.active),
-        static_cast<unsigned long long>(wq.oldest_active_ms),
-        static_cast<unsigned long long>(wq.started),
-        static_cast<unsigned long long>(wq.finished),
-        wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
-        svc.alive ? 1 : 0,
-        svc.shutting_down ? 1 : 0,
-        svc.workers,
-        svc.pending,
-        static_cast<unsigned>(svc.active),
-        static_cast<unsigned long long>(svc.oldest_active_ms),
-        static_cast<unsigned long long>(svc.started),
-        static_cast<unsigned long long>(svc.finished),
-        svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
+        runtime.accepting ? 1 : 0,
+        runtime.shutting_down ? 1 : 0,
+        static_cast<unsigned>(exec.total_active),
+        static_cast<unsigned long long>(exec.work_queue_pending),
+        static_cast<unsigned>(exec.work_queue_active),
+        static_cast<unsigned long long>(exec.service_queue_pending),
+        static_cast<unsigned>(exec.service_queue_active),
+        static_cast<unsigned long long>(exec.critical_queue_pending),
+        static_cast<unsigned>(exec.critical_queue_active),
+        static_cast<unsigned long long>(exec.oldest_active_ms),
+        static_cast<unsigned long long>(runtime.total_submitted),
+        static_cast<unsigned long long>(runtime.total_rejected),
+        static_cast<unsigned long long>(runtime.total_cancelled),
+        static_cast<unsigned long long>(runtime.total_failed),
+        static_cast<unsigned long long>(runtime.total_timed_out),
+        exec.labels_under_pressure.empty() ? "<none>" : exec.labels_under_pressure.c_str());
 }
 
 bool shutdown_queues_quiescent(const char* phase)
 {
-    auto wq = work_queue::stats();
-    auto svc = work_queue::service_stats();
-    auto cq = critical_work_queue::stats();
+    const auto exec = aida::infra::executor::active_snapshot();
     const bool quiescent =
-        cq.pending == 0 && cq.active == 0 &&
-        wq.pending == 0 && wq.active == 0 &&
-        svc.pending == 0 && svc.active == 0;
+        exec.critical_queue_pending == 0 && exec.critical_queue_active == 0 &&
+        exec.work_queue_pending == 0 && exec.work_queue_active == 0 &&
+        exec.service_queue_pending == 0 && exec.service_queue_active == 0;
     if (!quiescent) {
         diag::log_tagged_critical_fmt("chat",
-            "shutdown_queue_drain_incomplete phase=%s cq_pending=%zu cq_active=%u cq_labels=%.420s wq_pending=%zu wq_active=%u wq_labels=%.420s svc_pending=%zu svc_active=%u svc_labels=%.420s",
+            "shutdown_executor_drain_incomplete phase=%s critical_pending=%llu critical_active=%u general_pending=%llu general_active=%u service_pending=%llu service_active=%u labels=%.760s",
             phase && *phase ? phase : "<unknown>",
-            cq.pending,
-            static_cast<unsigned>(cq.active),
-            cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str(),
-            wq.pending,
-            static_cast<unsigned>(wq.active),
-            wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
-            svc.pending,
-            static_cast<unsigned>(svc.active),
-            svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
+            static_cast<unsigned long long>(exec.critical_queue_pending),
+            static_cast<unsigned>(exec.critical_queue_active),
+            static_cast<unsigned long long>(exec.work_queue_pending),
+            static_cast<unsigned>(exec.work_queue_active),
+            static_cast<unsigned long long>(exec.service_queue_pending),
+            static_cast<unsigned>(exec.service_queue_active),
+            exec.labels_under_pressure.empty() ? "<none>" : exec.labels_under_pressure.c_str());
     }
     return quiescent;
 }
@@ -337,11 +338,12 @@ void queue_mcp_services_shutdown(const char* reason, bool stop_server, bool disc
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
     };
 
-    bool posted = work_queue::post_service(task);
-    if (!posted)
-        posted = critical_work_queue::post(task);
-    if (!posted)
-        posted = work_queue::post(std::move(task));
+    bool posted = submit_chat_task(
+        "authorized_mcp_services_shutdown",
+        aida::infra::executor::domain_t::security_liveness,
+        "lifecycle_gate",
+        5,
+        std::move(task));
     if (!posted) {
         s_mcp_shutdown_in_flight.store(false, std::memory_order_release);
         diag::log_tagged_fmt("init_chat",
@@ -453,7 +455,12 @@ void start_authorized_mcp_services_worker()
         if (server_start_result)
         {
             s_server_started.store(true, std::memory_order_release);
-            bool posted = critical_work_queue::post_labeled("authorized_mcp_write_client_configs", [] {
+            bool posted = submit_chat_task(
+                "authorized_mcp_write_client_configs",
+                aida::infra::executor::domain_t::critical,
+                "bounded_task",
+                4,
+                [] {
                 try {
                     diag::log_tagged("init_chat", "authorized_mcp_write_client_configs_start");
                     s_mcp_server.write_client_configs();
@@ -2112,7 +2119,12 @@ void run_agentic(std::string user_message,
                     int64_t used      = get_chat_used_tokens_locked();
                     if (aida::compaction::should_trigger(sid, used, ctx_limit)) {
                         std::string comp_sid = sid;
-                        work_queue::post([comp_sid]() {
+                        (void)submit_chat_task(
+                            "chat.compaction",
+                            aida::infra::executor::domain_t::general,
+                            "bounded_task",
+                            3,
+                            [comp_sid]() {
                             aida::compaction::compaction_options_t opts;
                             aida::compaction::compaction_result_t out;
                             (void)aida::compaction::run(comp_sid, opts, out);
@@ -2741,19 +2753,14 @@ void start_authorized_mcp_services()
     }
 
     s_mcp_start_last_post_ms.store(now_ms, std::memory_order_release);
-    bool posted = work_queue::post_service_labeled("authorized_mcp_services_start", [] {
+    bool posted = submit_chat_task(
+        "authorized_mcp_services_start",
+        aida::infra::executor::domain_t::security_liveness,
+        "lifecycle_gate",
+        5,
+        [] {
         start_authorized_mcp_services_worker();
     });
-    if (!posted) {
-        posted = critical_work_queue::post_labeled("authorized_mcp_services_start", [] {
-            start_authorized_mcp_services_worker();
-        });
-    }
-    if (!posted) {
-        posted = work_queue::post_labeled("authorized_mcp_services_start", [] {
-            start_authorized_mcp_services_worker();
-        });
-    }
     if (!posted) {
         s_mcp_start_in_flight.store(false, std::memory_order_release);
         diag::log_tagged("init_chat", "authorized_mcp_services_start_post_failed");
@@ -2820,11 +2827,9 @@ void shutdown_standalone_chat()
 
     ULONGLONG queue_start = shutdown_phase_begin("queue_drain");
     log_shutdown_queue_snapshot("queue_drain_before");
-    critical_work_queue::shutdown(15000);
-    log_shutdown_queue_snapshot("queue_drain_after_critical");
-    work_queue::shutdown(15000);
-    log_shutdown_queue_snapshot("queue_drain_after_work");
-    const bool queues_quiescent = shutdown_queues_quiescent("queue_drain_after_work");
+    aida::infra::executor::shutdown();
+    log_shutdown_queue_snapshot("queue_drain_after_executor");
+    const bool queues_quiescent = shutdown_queues_quiescent("queue_drain_after_executor");
     shutdown_phase_done("queue_drain", queue_start);
 
     if (queues_quiescent) {
@@ -3019,7 +3024,12 @@ void tick_ai_chat()
             if (user_count == 1) {
                 std::string first_user_text = user_text;
                 std::string provider_id     = g_sa_settings.selected_provider_id();
-                work_queue::post([sid, first_user_text, provider_id]() {
+                (void)submit_chat_task(
+                    "chat.auto_title",
+                    aida::infra::executor::domain_t::general,
+                    "bounded_task",
+                    3,
+                    [sid, first_user_text, provider_id]() {
                     (void)aida::compaction::maybe_auto_title(sid, first_user_text, provider_id);
                 });
             }
@@ -3040,11 +3050,22 @@ void tick_ai_chat()
         s_cancel      = false;
         s_ai_running  = true;
         s_ai_task_done.store(false);
-        work_queue::post([user_text = std::move(user_text), history = std::move(history)]() mutable {
+        const bool posted = submit_chat_task(
+            "chat.agentic_request",
+            aida::infra::executor::domain_t::external_tool,
+            "bounded_task",
+            3,
+            [user_text = std::move(user_text), history = std::move(history)]() mutable {
             run_agentic(std::move(user_text), std::move(history));
             s_ai_task_done.store(true);
             s_ai_task_done_cv.notify_all();
         });
+        if (!posted) {
+            post_update(ai_update_t::ERR, "Error: Service unavailable. Please restart the application.");
+            s_ai_running = false;
+            s_ai_task_done.store(true);
+            s_ai_task_done_cv.notify_all();
+        }
     }
 }
 

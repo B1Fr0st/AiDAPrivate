@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdint>
 #include <atomic>
+#include <functional>
 #include <thread>
 #include <chrono>
 #include <exception>
@@ -54,8 +55,8 @@
 #include "types_hub_view.hpp"
 #include "analysis_hub_view.hpp"
 #include "source_reconstruct_view.hpp"
-#include "work_queue.hpp"
-#include "critical_work_queue.hpp"
+#include "../core/infra/executor.hpp"
+#include "../core/infra/taskflow_runtime.hpp"
 #include "../core/ui/ui_thread_dispatcher.hpp"
 #include "functions_panel.hpp"
 #include "function_index.hpp"
@@ -97,6 +98,24 @@ namespace {
 	std::atomic<bool>          g_settings_saver_started{false};
 	std::atomic<bool>          g_chrome_shutdown_requested{false};
 
+	aida::infra::executor::submit_result_t submit_helpers_executor_task(
+		const char* owner_subsystem,
+		const char* label,
+		aida::infra::executor::domain_t domain,
+		const char* thread_class,
+		std::function<void()> body,
+		int priority = 3)
+	{
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = owner_subsystem;
+		sub.label = label;
+		sub.thread_class = thread_class;
+		sub.domain = domain;
+		sub.priority = priority;
+		sub.body = std::move(body);
+		return aida::infra::executor::submit(std::move(sub));
+	}
+
 	void settings_saver_loop()
 	{
 		while (g_settings_saver_running.load()) {
@@ -121,7 +140,13 @@ namespace {
 		bool expected = false;
 		if (g_settings_saver_started.compare_exchange_strong(expected, true)) {
 			g_settings_saver_running.store(true);
-			if (!work_queue::post([]() { settings_saver_loop(); })) {
+			const auto submit_result = submit_helpers_executor_task(
+				"settings",
+				"settings.saver_loop",
+				aida::infra::executor::domain_t::service,
+				"long_lived_service",
+				[]() { settings_saver_loop(); });
+			if (!submit_result.submitted) {
 				g_settings_saver_running.store(false);
 				g_settings_saver_started.store(false);
 			}
@@ -134,9 +159,7 @@ namespace {
 		const std::string run_id = standalone_license::run_correlation_id();
 		const std::string runtime_snapshot = standalone_license::runtime_state_snapshot();
 		auto dyn = driver_bridge::dynamic_ioctl_state();
-		auto wq = work_queue::stats();
-		auto swq = work_queue::service_stats();
-		auto cwq = critical_work_queue::stats();
+		auto taskflow_snapshot = aida::infra::taskflow_runtime::active_snapshot(64);
 		DWORD qs = ::GetQueueStatus(QS_ALLINPUT);
 		DWORD qs_changed = LOWORD(qs);
 		DWORD qs_current = HIWORD(qs);
@@ -205,25 +228,22 @@ namespace {
 			driver_status.c_str(),
 			runtime_snapshot.c_str());
 		diag::log_tagged_critical_fmt("license",
-			"%s_queues run_id=%s frame=%d work_alive=%d work_pending=%zu work_active=%u work_oldest_ms=%llu work_labels=%.220s svc_alive=%d svc_pending=%zu svc_active=%u svc_oldest_ms=%llu svc_labels=%.220s critical_alive=%d critical_pending=%zu critical_active=%u critical_oldest_ms=%llu critical_labels=%.220s",
+			"%s_taskflow run_id=%s frame=%d accepting=%d shutting_down=%d work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u oldest_ms=%llu total_submitted=%llu total_rejected=%llu labels=%.520s",
 			breadcrumb_event,
 			run_id.c_str(),
 			ImGui::GetFrameCount(),
-			wq.alive ? 1 : 0,
-			wq.pending,
-			wq.active,
-			static_cast<unsigned long long>(wq.oldest_active_ms),
-			wq.active_labels.c_str(),
-			swq.alive ? 1 : 0,
-			swq.pending,
-			swq.active,
-			static_cast<unsigned long long>(swq.oldest_active_ms),
-			swq.active_labels.c_str(),
-			cwq.alive ? 1 : 0,
-			cwq.pending,
-			cwq.active,
-			static_cast<unsigned long long>(cwq.oldest_active_ms),
-			cwq.active_labels.c_str());
+			taskflow_snapshot.accepting ? 1 : 0,
+			taskflow_snapshot.shutting_down ? 1 : 0,
+			static_cast<unsigned long long>(taskflow_snapshot.work_queue_pending),
+			static_cast<unsigned>(taskflow_snapshot.work_queue_active),
+			static_cast<unsigned long long>(taskflow_snapshot.service_queue_pending),
+			static_cast<unsigned>(taskflow_snapshot.service_queue_active),
+			static_cast<unsigned long long>(taskflow_snapshot.critical_queue_pending),
+			static_cast<unsigned>(taskflow_snapshot.critical_queue_active),
+			static_cast<unsigned long long>(taskflow_snapshot.oldest_active_ms),
+			static_cast<unsigned long long>(taskflow_snapshot.total_submitted),
+			static_cast<unsigned long long>(taskflow_snapshot.total_rejected),
+			taskflow_snapshot.labels_under_pressure.empty() ? "<none>" : taskflow_snapshot.labels_under_pressure.c_str());
 	}
 
 	void request_chrome_shutdown_from_render(const char* source, const char* cleanup_reason)
@@ -846,7 +866,12 @@ namespace file_menu_deferred
 		};
 		bool queued = false;
 		try {
-			queued = work_queue::post(std::move(task));
+			queued = submit_helpers_executor_task(
+				"file_dialog",
+				"file_dialog.deferred_worker",
+				aida::infra::executor::domain_t::feature_worker,
+				"bounded_task",
+				std::move(task)).submitted;
 		} catch (const std::exception& ex) {
 			active().store(false, std::memory_order_release);
 			diag::log_tagged_fmt("file_dialog", "deferred_post exception=%s", ex.what());
@@ -1783,12 +1808,17 @@ void helpers::render_title()
 				standalone_license::is_arc_loaded() &&
 				!standalone_license::is_arc_download_in_progress();
 			if (heavy_integrity_ready) {
-				work_queue::post([] {
-					try {
-						anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
-					} catch (...) {
-					}
-				});
+				(void)submit_helpers_executor_task(
+					"anti_tamper",
+					"anti_tamper.code_integrity_check",
+					aida::infra::executor::domain_t::security_liveness,
+					"security_liveness",
+					[] {
+						try {
+							anti_tamper::run_inline_check(anti_tamper::CHECK_CODE_INTEGRITY);
+						} catch (...) {
+						}
+					});
 			}
 		}
 	}
@@ -3235,7 +3265,12 @@ void helpers::render_title()
 				ImGui::GetFrameCount());
 
 			std::string key_copy(license::key_buf);
-			work_queue::post([key_copy]() {
+			const auto submit_result = submit_helpers_executor_task(
+				"license",
+				"license.activation",
+				aida::infra::executor::domain_t::security_liveness,
+				"security_liveness",
+				[key_copy]() {
 				BOOL activation_ok = FALSE;
 				char err_buf[1024] = {};
 				DWORD seh_code = seh_license_activate(key_copy.c_str(),
@@ -3268,6 +3303,16 @@ void helpers::render_title()
 				license::activation_worker_active.store(false, std::memory_order_release);
 				license::checking = false;
 			});
+			if (!submit_result.submitted) {
+				license::activation_worker_active.store(false, std::memory_order_release);
+				license::checking = false;
+				license::check_failed = true;
+				license::error_msg = "License activation could not be scheduled.";
+				diag::log_tagged_fmt("license",
+					"DIAG_DIALOG_SUBMIT_EXECUTOR_REJECT reason=%s frame=%d",
+					submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str(),
+					ImGui::GetFrameCount());
+			}
 		}
 
 
@@ -6934,7 +6979,12 @@ void helpers::render_title()
 				toast_notification::toast_type_t::info, 3.0f);
 
 			g_render_section = "title_spawn_target_post";
-			work_queue::post([opts, exe_log]() {
+			const auto submit_result = submit_helpers_executor_task(
+				"run_target",
+				"run_target.spawn_and_attach",
+				aida::infra::executor::domain_t::long_running,
+				"blocking_process_launch",
+				[opts, exe_log]() {
 				uint32_t new_pid = 0;
 				run_target::launch_result_t lr{};
 				bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, &lr);
@@ -6980,6 +7030,11 @@ void helpers::render_title()
 						toast_notification::toast_type_t::success, 4.0f);
 				}
 			});
+			if (!submit_result.submitted) {
+				anti_tamper::webhook::write_log("run", "launch_dispatch_rejected executor_submit_failed");
+				output_log::push(bottom_tab_t::sandbox_log, "[Run] Launch failed: executor rejected run target task.");
+				toast_notification::push("Run failed: launch task rejected", toast_notification::toast_type_t::error, 5.0f);
+			}
 		}
 	}
 
@@ -9289,7 +9344,12 @@ void helpers::render_title()
 				if ((pa_refresh_timer <= 0.f || pa_proc_list.empty()) &&
 					!pa_refresh_inflight.exchange(true, std::memory_order_acq_rel)) {
 					const uint64_t epoch = ++pa_refresh_epoch;
-					if (!work_queue::post([epoch]() {
+					const auto submit_result = submit_helpers_executor_task(
+						"process_attach",
+						"process_attach.enumerate_processes",
+						aida::infra::executor::domain_t::feature_worker,
+						"bounded_task",
+						[epoch]() {
 						std::vector<driver_bridge::process_info_t> list;
 						try {
 							list = driver_bridge::enumerate_processes();
@@ -9302,7 +9362,8 @@ void helpers::render_title()
 							pa_pending_epoch = epoch;
 						}
 						pa_refresh_ready.store(true, std::memory_order_release);
-					})) {
+					});
+					if (!submit_result.submitted) {
 						pa_refresh_inflight.store(false, std::memory_order_release);
 						pa_refresh_timer = 1.f;
 					} else {
@@ -9579,7 +9640,12 @@ void helpers::render_title()
 						if (need_refresh) {
 							bool expected = false;
 							if (ds_mods_in_flight.compare_exchange_strong(expected, true)) {
-								work_queue::post([cur_pid]() {
+								const auto submit_result = submit_helpers_executor_task(
+									"driver_state",
+									"driver_state.enumerate_modules",
+									aida::infra::executor::domain_t::feature_worker,
+									"bounded_task",
+									[cur_pid]() {
 									std::vector<driver_bridge::module_info_t> fresh;
 									try {
 										fresh = driver_bridge::enumerate_modules();
@@ -9594,6 +9660,8 @@ void helpers::render_title()
 									}
 									ds_mods_in_flight.store(false);
 								});
+								if (!submit_result.submitted)
+									ds_mods_in_flight.store(false);
 							}
 						}
 						std::vector<driver_bridge::module_info_t> mods_view;
@@ -9626,7 +9694,12 @@ void helpers::render_title()
 						if (need_refresh) {
 							bool expected = false;
 							if (ds_threads_in_flight.compare_exchange_strong(expected, true)) {
-								work_queue::post([cur_pid]() {
+								const auto submit_result = submit_helpers_executor_task(
+									"driver_state",
+									"driver_state.enumerate_threads",
+									aida::infra::executor::domain_t::feature_worker,
+									"bounded_task",
+									[cur_pid]() {
 									std::vector<driver_bridge::thread_info_t> fresh;
 									try {
 										fresh = driver_bridge::enumerate_threads();
@@ -9641,6 +9714,8 @@ void helpers::render_title()
 									}
 									ds_threads_in_flight.store(false);
 								});
+								if (!submit_result.submitted)
+									ds_threads_in_flight.store(false);
 							}
 						}
 						std::vector<driver_bridge::thread_info_t> threads_view;

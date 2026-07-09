@@ -10,7 +10,6 @@
 #include <windows.h>
 
 #include <atomic>
-#include "work_queue.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -30,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "comm.h"
 #include "standalone_driver.hpp"
 #include "standalone_ai_client.hpp"
@@ -603,8 +602,16 @@ inline void launch_scan_worker(const char* name, Fn fn)
 			g_state.scanning.store(false);
 		}
 	});
-	if (!critical_work_queue::post([task]() { (*task)(); }) &&
-		!work_queue::post([task]() { (*task)(); })) {
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "crypto_scanner";
+	submission.label = "crypto_scan.worker";
+	submission.thread_class = "scanner_worker";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.diagnostic_id = worker_name.c_str();
+	submission.failure_policy = "reject_not_started";
+	submission.body = [task]() { (*task)(); };
+	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 		diag::log_tagged_fmt("crypto_scan", "%s worker_queue_rejected", worker_name.c_str());
 		g_state.progress.store(1.f);
 		g_state.scanning.store(false);

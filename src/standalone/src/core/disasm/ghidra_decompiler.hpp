@@ -3,7 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -620,8 +620,14 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 
 	std::atomic<bool>* cancel_for_wd = cancel;
 	uint64_t wd_addr = entry_addr;
-	work_queue::post([wd_state, watchdog_fired_elapsed_ms,
-	                  cancel_for_wd, deadline, wd_start, wd_addr]() {
+	aida::infra::executor::submission_t watchdog_sub;
+	watchdog_sub.owner_subsystem = "disasm";
+	watchdog_sub.label = "disasm.ghidra.watchdog";
+	watchdog_sub.thread_class = "bounded_task";
+	watchdog_sub.domain = aida::infra::executor::domain_t::diagnostics;
+	watchdog_sub.priority = 3;
+	watchdog_sub.body = [wd_state, watchdog_fired_elapsed_ms,
+	                     cancel_for_wd, deadline, wd_start, wd_addr]() {
 		while (true) {
 			uint32_t cur = wd_state->load(std::memory_order_acquire);
 			if (cur != static_cast<uint32_t>(wd_state_t::running))
@@ -647,7 +653,12 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 		}
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(watchdog_sub)).submitted) {
+		diag::log_tagged_critical_fmt("dec",
+			"do_decompile_watchdog_post_failed addr=0x%llx",
+			static_cast<unsigned long long>(wd_addr));
+	}
 
 	auto perform_start = std::chrono::steady_clock::now();
 
@@ -1499,7 +1510,13 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 		arch_desc.sleigh_id.c_str());
 
 	for (unsigned int t = 0; t < num_threads; ++t) {
-		if (!work_queue::post([&, t]() {
+		aida::infra::executor::submission_t worker_sub;
+		worker_sub.owner_subsystem = "disasm";
+		worker_sub.label = "disasm.ghidra.batch_worker";
+		worker_sub.thread_class = "external_tool";
+		worker_sub.domain = aida::infra::executor::domain_t::external_tool;
+		worker_sub.priority = 2;
+		worker_sub.body = [&, t]() {
 			const uint64_t worker_start_ms = GetTickCount64();
 			auto& my_indices = partitions[t];
 			auto finish_worker = [&](const char* reason) {
@@ -1598,7 +1615,8 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 				error_count,
 				my_indices.size());
 			finish_worker((cancel && cancel->load(std::memory_order_acquire)) ? "cancelled_or_done" : "done");
-		}))
+		};
+		if (!aida::infra::executor::submit(std::move(worker_sub)).submitted)
 		{
 			const unsigned int before = workers_remaining.fetch_sub(1, std::memory_order_acq_rel);
 			diag::log_tagged_fmt("ghidra",

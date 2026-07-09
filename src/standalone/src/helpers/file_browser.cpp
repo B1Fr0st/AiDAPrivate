@@ -20,7 +20,7 @@
 #include "imgui/imgui.h"
 #include "components.hpp"
 #include "theme.hpp"
-#include "../core/infra/work_queue.hpp"
+#include "../core/infra/executor.hpp"
 #include "../core/ui/ui_thread_dispatcher.hpp"
 
 #include <nlohmann/json.hpp>
@@ -866,7 +866,14 @@ inline void ensure_running_for(const std::string& dir)
     HANDLE we = w.wake_event;
     std::string cap = dir;
     w.worker_done.store(false, std::memory_order_release);
-    if (work_queue::post([cap, we]() { watcher_thread(cap, we); })) {
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "file_browser_watcher";
+    sub.label = "file_browser_watcher.watch";
+    sub.thread_class = "long_lived_service";
+    sub.domain = aida::infra::executor::domain_t::service;
+    sub.priority = 3;
+    sub.body = [cap, we]() { watcher_thread(cap, we); };
+    if (aida::infra::executor::submit(std::move(sub)).submitted) {
         w.running.store(true, std::memory_order_release);
         w.retry_after_ms.store(0, std::memory_order_release);
         diag::log_tagged_fmt("file_browser_watcher", "ensure_running_for dir=%s", dir.c_str());
@@ -881,7 +888,7 @@ inline void ensure_running_for(const std::string& dir)
         w.running.store(false, std::memory_order_release);
         w.worker_done.store(true, std::memory_order_release);
         w.retry_after_ms.store(stamp_ms + 5000ull, std::memory_order_release);
-        diag::log_tagged_fmt("file_browser_watcher", "work_queue_post_failed dir=%s",
+        diag::log_tagged_fmt("file_browser_watcher", "executor_submit_failed dir=%s",
             dir.c_str());
     }
 }

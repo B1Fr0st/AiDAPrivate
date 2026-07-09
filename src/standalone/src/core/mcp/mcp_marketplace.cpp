@@ -11,7 +11,7 @@
 #include <shlobj.h>
 
 #include "mcp_marketplace.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "mcp_client.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
@@ -26,6 +26,8 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <functional>
+#include <utility>
 
 extern mcp_client::manager_t s_mcp_client_mgr;
 
@@ -42,6 +44,18 @@ static std::string              s_search_error;
 
 static install_state_t          s_install_state = install_state_t::idle;
 static std::string              s_install_error;
+
+static bool submit_marketplace_task(const char* label, std::function<void()> body)
+{
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "mcp_marketplace";
+    sub.label = label;
+    sub.thread_class = "bounded_task";
+    sub.domain = aida::infra::executor::domain_t::external_tool;
+    sub.priority = 3;
+    sub.body = std::move(body);
+    return aida::infra::executor::submit(std::move(sub)).submitted;
+}
 
 static std::mutex               s_installed_mtx;
 static std::vector<installed_server_t> s_installed;
@@ -511,7 +525,7 @@ void search_async(const std::string& query, registry_t reg)
     }
 
     std::string q = query;
-    work_queue::post([q, reg]() {
+    const bool posted = submit_marketplace_task("mcp_marketplace.search", [q, reg]() {
         std::vector<package_info_t> results;
         std::string err;
         try {
@@ -551,6 +565,11 @@ void search_async(const std::string& query, registry_t reg)
             s_search_error.clear();
         }
     });
+    if (!posted) {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        s_search_state = search_state_t::error_state;
+        s_search_error = "Failed to schedule marketplace search.";
+    }
 }
 
 
@@ -596,7 +615,7 @@ void install_async(const package_info_t& pkg)
     }
 
     package_info_t p = pkg;
-    work_queue::post([p]() {
+    const bool posted = submit_marketplace_task("mcp_marketplace.install", [p]() {
         std::filesystem::path pkg_path;
         std::string path_error;
         if (!resolve_install_path(p.name, pkg_path, path_error)) {
@@ -678,6 +697,11 @@ void install_async(const package_info_t& pkg)
         enqueue_deferred_log(bottom_tab_t::output,
             "[marketplace] Installed disabled server " + p.name + "@" + p.version);
     });
+    if (!posted) {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        s_install_state = install_state_t::error_state;
+        s_install_error = "Failed to schedule marketplace install.";
+    }
 }
 
 

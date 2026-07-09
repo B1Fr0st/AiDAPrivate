@@ -12,6 +12,7 @@
 #include <random>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -24,7 +25,7 @@
 #include "mcp_standalone.hpp"
 #include "cost_calculator.hpp"
 #include "provider_catalog.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 
 #include "../helpers/diag_log.hpp"
 
@@ -128,7 +129,13 @@ namespace task {
 			       cancel_flag->load(std::memory_order_acquire);
 		};
 
-		work_queue::post([&]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "ai_agent_task";
+		sub.label = "agent_task.execute";
+		sub.thread_class = "bounded_task";
+		sub.domain = aida::infra::executor::domain_t::external_tool;
+		sub.priority = 3;
+		sub.body = [&]() {
 			std::unique_ptr<standalone_ai_client_t> local_client;
 			try {
 				local_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
@@ -352,7 +359,13 @@ namespace task {
 			}
 			active_client_ptr.store(nullptr, std::memory_order_release);
 			done.store(true, std::memory_order_release);
-		});
+		};
+		const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
+		if (!posted) {
+			thread_error = "failed to schedule subagent AI worker";
+			thread_result = "Error: " + thread_error;
+			done.store(true, std::memory_order_release);
+		}
 
 		if (cancel_flag != nullptr) {
 			bool propagated = false;

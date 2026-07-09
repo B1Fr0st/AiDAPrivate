@@ -15,7 +15,7 @@
 #include "event_bus.hpp"
 #include "anti-tamper/webhook.hpp"
 #include "../anti-tamper/mcp_posture.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../network/burp/camoufox_bridge.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -30,6 +30,8 @@
 #include <ctime>
 #include <memory>
 #include <thread>
+#include <functional>
+#include <utility>
 #include <unordered_map>
 
 #pragma comment(lib, "bcrypt.lib")
@@ -49,6 +51,22 @@ static std::mutex& global_mutex()
 {
     static std::mutex m;
     return m;
+}
+
+static bool submit_mcp_client_task(const char* label,
+                                   aida::infra::executor::domain_t domain,
+                                   const char* thread_class,
+                                   int priority,
+                                   std::function<void()> body)
+{
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "mcp_client";
+    sub.label = label;
+    sub.thread_class = thread_class;
+    sub.domain = domain;
+    sub.priority = priority;
+    sub.body = std::move(body);
+    return aida::infra::executor::submit(std::move(sub)).submitted;
 }
 
 static std::string& global_last_error_ref()
@@ -744,7 +762,12 @@ static bool start_oauth_listener(oauth_state_t& state)
     state.listener_handle = holder.release();
     ctx->worker_done.store(false, std::memory_order_release);
     oauth_state_t* state_ptr = &state;
-    if (!work_queue::post([state_ptr, ctx]() {
+    if (!submit_mcp_client_task(
+            "mcp_client.oauth_listener",
+            aida::infra::executor::domain_t::service,
+            "service_loop",
+            4,
+            [state_ptr, ctx]() {
             oauth_listener_thread(state_ptr, ctx);
             ctx->worker_done.store(true, std::memory_order_release);
         }))
@@ -2928,7 +2951,12 @@ void manager_t::poll()
     }
 
     for (const auto& name : needs_reconnect) {
-        work_queue::post([this, name]() { this->connect_server(name); });
+        (void)submit_mcp_client_task(
+            "mcp_client.reconnect",
+            aida::infra::executor::domain_t::external_tool,
+            "bounded_task",
+            3,
+            [this, name]() { this->connect_server(name); });
     }
 }
 
@@ -3285,7 +3313,12 @@ bool trigger_auth_flow(const std::string& server_name, auth_completion_callback_
     if (!state->scope.empty()) stage.metadata["scope"] = state->scope;
     save_mcp_auth(server_name, stage);
 
-    work_queue::post([state, on_complete, server_name]() {
+    const bool posted = submit_mcp_client_task(
+        "mcp_client.oauth_poll",
+        aida::infra::executor::domain_t::external_tool,
+        "bounded_task",
+        3,
+        [state, on_complete, server_name]() {
         for (;;) {
             oauth_status_t st = poll_auth(*state);
             if (st == oauth_status_t::authenticating) {
@@ -3300,6 +3333,12 @@ bool trigger_auth_flow(const std::string& server_name, auth_completion_callback_
             return;
         }
     });
+    if (!posted) {
+        state->error = "failed to schedule OAuth polling";
+        if (on_complete)
+            on_complete(server_name, oauth_status_t::failed, state->error);
+        return false;
+    }
     return true;
 }
 

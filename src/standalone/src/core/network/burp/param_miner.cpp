@@ -7,8 +7,8 @@
 #include "payload_library.hpp"
 
 #include "../../../helpers/diag_log.hpp"
-#include "../../infra/work_queue.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
+#include "../../infra/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -531,7 +532,14 @@ uint64_t start(config_t cfg)
         static_cast<unsigned long long>(job->id), job->cfg.target_url.c_str(),
         static_cast<unsigned long long>(pm_token));
     auto pm_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(pm_admission));
-    const bool posted = work_queue::post([job, pm_admission_ptr, pm_token]() {
+    const bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.param_miner";
+        sub.label = "param_miner.job";
+        sub.thread_class = "long_running";
+        sub.domain = aida::infra::executor::domain_t::long_running;
+        sub.priority = 3;
+        sub.body = [job, pm_admission_ptr, pm_token]() {
         try {
             miner_main(job);
         } catch (const std::exception& ex) {
@@ -549,9 +557,11 @@ uint64_t start(config_t cfg)
             static_cast<unsigned long long>(job->id),
             static_cast<unsigned long long>(pm_token));
         pm_admission_ptr->release("completed");
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
     if (!posted) {
-        diag::log_tagged_fmt("param_miner", "start_work_queue_rejected job_id=%llu",
+        diag::log_tagged_fmt("param_miner", "start_executor_rejected job_id=%llu",
             static_cast<unsigned long long>(job->id));
         set_err("param_miner: work queue rejected job start");
         job->running.store(false);

@@ -19,7 +19,7 @@
 #include "intercept/cert_profile_manager.hpp"
 #include "intercept/diagnostics.hpp"
 #include "intercept/instrumentation_provider.hpp"
-#include "../infra/work_queue.hpp"
+#include "executor_status.hpp"
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "helpers/diag_log.hpp"
@@ -921,8 +921,9 @@ static DWORD ns_tls_timeout_ms(DWORD fallback)
 
 static json ns_udp_live_stimulus_status_json(const char* protocol)
 {
-    const auto wq = work_queue::stats();
-    const auto sq = work_queue::service_stats();
+    const auto wq = aida::network::executor_status::work_stats();
+    const auto sq = aida::network::executor_status::service_stats();
+    const auto cq = aida::network::executor_status::critical_stats();
     const std::uint64_t now = GetTickCount64();
     const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
     json j;
@@ -935,10 +936,12 @@ static json ns_udp_live_stimulus_status_json(const char* protocol)
     j["mcp_cancelled"] = mcp_standalone::current_call_cancelled();
     j["mcp_deadline_ms"] = deadline;
     j["deadline_remaining_ms"] = deadline > now ? deadline - now : 0;
-    j["work_queue_pending"] = static_cast<std::uint64_t>(wq.pending);
-    j["work_queue_active"] = static_cast<std::uint64_t>(wq.active);
-    j["critical_queue_pending"] = static_cast<std::uint64_t>(sq.pending);
-    j["critical_queue_active"] = static_cast<std::uint64_t>(sq.active);
+    j["executor_work_pending"] = static_cast<std::uint64_t>(wq.pending);
+    j["executor_work_active"] = static_cast<std::uint64_t>(wq.active);
+    j["executor_service_pending"] = static_cast<std::uint64_t>(sq.pending);
+    j["executor_service_active"] = static_cast<std::uint64_t>(sq.active);
+    j["executor_critical_pending"] = static_cast<std::uint64_t>(cq.pending);
+    j["executor_critical_active"] = static_cast<std::uint64_t>(cq.active);
     return j;
 }
 
@@ -2466,7 +2469,7 @@ tool_result_t tls_start_keylog(const json& params) {
     r["key_count_after"] = static_cast<std::uint64_t>(seen_after.size());
     r["file_before"] = ns_keylog_probe_to_json(file_before);
     r["file_after"] = ns_keylog_probe_to_json(file_after);
-    r["worker_enter_reason"] = started ? "work_queue_service_posted" : "not_posted";
+    r["worker_enter_reason"] = started ? "executor_service_posted" : "not_posted";
     r["worker_exit_reason"] = started ? "worker_running" : "start_rejected";
     r["win32_last_error"] = static_cast<unsigned long>(gle);
     r["elapsed_ms"] = elapsed_ms;

@@ -9,7 +9,7 @@
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
 #include "../helpers/diag_log.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
@@ -301,10 +301,18 @@ void request_region_refresh() {
 		c.refreshing = true;
 	}
 	diag_log("region_cache refresh_post");
-	bool posted = work_queue::post([]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.region_cache_refresh";
+	sub.thread_class = "scanner_ui_refresh";
+	sub.domain = aida::infra::executor::domain_t::diagnostics;
+	sub.priority = 4;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = []() {
 		refresh_region_cache_locked(g_ui.region_cache);
 		diag::log_tagged("value_scan", "region_cache refresh_done");
-	});
+	};
+	bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 	if (!posted) {
 		std::lock_guard<std::mutex> lk(c.mtx);
 		c.refreshing = false;
@@ -2360,9 +2368,18 @@ void render(float pos_x, float pos_y, float width, float height,
 		ui.refresh_timer += aida::ui::clock::dt();
 		if (ui.refresh_timer >= ui.refresh_interval) {
 			ui.refresh_timer = 0.f;
-			work_queue::post([]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "scanner";
+			sub.label = "scanner.address_list_refresh";
+			sub.thread_class = "scanner_ui_refresh";
+			sub.domain = aida::infra::executor::domain_t::diagnostics;
+			sub.priority = 4;
+			sub.target_pid = driver_bridge::attached_pid();
+			sub.body = []() {
 				memory_scanner::refresh_address_list();
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+				diag::log_tagged("value_scan", "address_list_refresh_post_failed");
 		}
 	}
 

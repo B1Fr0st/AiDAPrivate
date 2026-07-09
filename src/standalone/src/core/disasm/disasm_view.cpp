@@ -18,6 +18,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include "../../helpers/helpers.h"
 #include "ui_anim.hpp"
 #include "decompiler_engine.hpp"
@@ -42,6 +43,8 @@
 #include "function_index.hpp"
 #include "symbol_classifier.hpp"
 #include "file_metadata_banner.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
@@ -886,12 +889,18 @@ static void on_attach_state_changed() {
     instr_cache_clear_all();
     throttle_arm(120);
 
-    const auto wq_stats = work_queue::stats();
+    const auto rt_stats = aida::infra::taskflow_runtime::active_snapshot();
     diag::log_tagged_critical_fmt("disasm_view",
-        "on_attach_state_changed_deferred work_pending_before=%zu work_active=%u",
-        wq_stats.pending,
-        wq_stats.active);
-    const bool posted = work_queue::post_labeled("disasm_view.on_attach_state_changed", []() {
+        "on_attach_state_changed_deferred work_pending_before=%llu work_active=%u",
+        static_cast<unsigned long long>(rt_stats.work_queue_pending),
+        rt_stats.work_queue_active);
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "disasm";
+    sub.label = "disasm_view.on_attach_state_changed";
+    sub.thread_class = "bounded_task";
+    sub.domain = aida::infra::executor::domain_t::diagnostics;
+    sub.priority = 3;
+    sub.body = []() {
         diag::log_tagged_critical_fmt("disasm_view",
             "on_attach_state_changed_worker_enter tid=%lu",
             static_cast<unsigned long>(GetCurrentThreadId()));
@@ -901,7 +910,8 @@ static void on_attach_state_changed() {
         diag::log_tagged_critical_fmt("disasm_view",
             "on_attach_state_changed_worker_exit tid=%lu",
             static_cast<unsigned long>(GetCurrentThreadId()));
-    });
+    };
+    const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
     if (!posted) {
         diag::log_tagged_critical_fmt("disasm_view",
             "on_attach_state_changed_post_failed fallback=inline tid=%lu",
@@ -3551,7 +3561,13 @@ static void launch_xref_scan(uint64_t addr, uint64_t func_start = 0)
         static_cast<unsigned long long>(addr),
         static_cast<unsigned long long>(func_start));
 
-    bool posted = work_queue::post([addr, func_start]() {
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "disasm";
+    sub.label = "disasm.xref.launch_scan";
+    sub.thread_class = "bounded_task";
+    sub.domain = aida::infra::executor::domain_t::feature_worker;
+    sub.priority = 2;
+    sub.body = [addr, func_start]() {
         diag::log_tagged_critical_fmt("xref", "thread_entry addr=0x%llX func_start=0x%llX",
             static_cast<unsigned long long>(addr),
             static_cast<unsigned long long>(func_start));
@@ -3794,7 +3810,8 @@ static void launch_xref_scan(uint64_t addr, uint64_t func_start = 0)
         }
         g_state.xref_scanning.store(false);
         diag::log_tagged_critical("xref", "thread_exit");
-    });
+    };
+    bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 
     if (!posted) {
         diag::log_tagged_critical("xref", "post_failed");

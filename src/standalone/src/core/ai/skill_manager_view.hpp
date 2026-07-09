@@ -6,12 +6,14 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <windows.h>
@@ -24,7 +26,7 @@
 #include "skills.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/brand.hpp"
@@ -128,6 +130,20 @@ namespace skill_manager {
 		state().last_error = msg;
 	}
 
+	inline bool submit_skill_task(const char* label,
+	                              aida::infra::executor::domain_t domain,
+	                              std::function<void()> body)
+	{
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "ai_skill_manager";
+		sub.label = label;
+		sub.thread_class = "bounded_task";
+		sub.domain = domain;
+		sub.priority = 3;
+		sub.body = std::move(body);
+		return aida::infra::executor::submit(std::move(sub)).submitted;
+	}
+
 
 	inline std::string lower_copy(const std::string& s)
 	{
@@ -226,7 +242,10 @@ namespace skill_manager {
 
 	inline void start_remote_fetch(const std::string& url)
 	{
-		work_queue::post([url]() {
+		const bool posted = submit_skill_task(
+			"skill_manager.remote_fetch",
+			aida::infra::executor::domain_t::external_tool,
+			[url]() {
 			::aida::skills::remote_index_t idx;
 			std::string err;
 			const bool ok = ::aida::skills::fetch_remote_index(url, idx, 10000);
@@ -240,6 +259,14 @@ namespace skill_manager {
 			cache.error     = err;
 			cache.index     = std::move(idx);
 		});
+		if (!posted) {
+			std::lock_guard<std::mutex> lk(state_mutex());
+			auto& cache = state().remote_cache[url];
+			cache.url = url;
+			cache.completed = true;
+			cache.success = false;
+			cache.error = "failed to schedule remote skill index fetch";
+		}
 	}
 
 	inline void start_install(const std::string& url, const std::string& name)
@@ -251,12 +278,43 @@ namespace skill_manager {
 			std::lock_guard<std::mutex> lk(state_mutex());
 			state().install_pending[name] = rec;
 		}
-		work_queue::post([rec]() {
+		const bool posted = submit_skill_task(
+			"skill_manager.install_remote",
+			aida::infra::executor::domain_t::external_tool,
+			[rec]() {
 			const bool ok = ::aida::skills::install_remote_skill(rec->url, rec->name);
 			if (!ok) rec->error = ::aida::skills::last_error();
 			rec->success.store(ok);
 			rec->completed.store(true);
 		});
+		if (!posted) {
+			rec->error = "failed to schedule remote skill install";
+			rec->success.store(false);
+			rec->completed.store(true);
+		}
+	}
+
+	inline void start_reindex()
+	{
+		state().refreshing = true;
+		const bool posted = submit_skill_task(
+			"skill_manager.reindex",
+			aida::infra::executor::domain_t::general,
+			[]() {
+			::aida::skills::reindex();
+			{
+				std::lock_guard<std::mutex> lk(state_mutex());
+				state().last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
+				state().refreshing = false;
+			}
+			toast_notification::push("Skills re-indexed",
+				toast_notification::toast_type_t::info, 2.5f);
+		});
+		if (!posted) {
+			state().refreshing = false;
+			toast_notification::push("Skills re-index failed",
+				toast_notification::toast_type_t::error, 4.0f);
+		}
 	}
 
 
@@ -416,17 +474,7 @@ namespace skill_manager {
 					aida::ui::size_t_::sm,
 					ImVec2(compact_refresh_w, ctl_h),
 					false, nullptr, refreshing_local)) {
-				st.refreshing = true;
-				work_queue::post([]() {
-					::aida::skills::reindex();
-					{
-						std::lock_guard<std::mutex> lk(state_mutex());
-						state().last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
-						state().refreshing = false;
-					}
-					toast_notification::push("Skills re-indexed",
-						toast_notification::toast_type_t::info, 2.5f);
-				});
+				start_reindex();
 			}
 
 			const float row3_y = row2_y + (stack_all ? (ctl_h + 6.f) * 2.f : ctl_h + 6.f);
@@ -500,17 +548,7 @@ namespace skill_manager {
 				aida::ui::size_t_::sm,
 				ImVec2(refresh_w, ctl_h),
 				false, nullptr, refreshing_local)) {
-			st.refreshing = true;
-			work_queue::post([]() {
-				::aida::skills::reindex();
-				{
-					std::lock_guard<std::mutex> lk(state_mutex());
-					state().last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
-					state().refreshing = false;
-				}
-				toast_notification::push("Skills re-indexed",
-					toast_notification::toast_type_t::info, 2.5f);
-			});
+			start_reindex();
 		}
 
 		float url_w = url_w_full;

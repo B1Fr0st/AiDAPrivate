@@ -48,8 +48,7 @@
 #include "command_palette_view.hpp"
 #include "agent_picker_view.hpp"
 #include "settings_overlay.hpp"
-#include "work_queue.hpp"
-#include "critical_work_queue.hpp"
+#include "core/infra/taskflow_runtime.hpp"
 #include "core/session/session_health.hpp"
 #include "core/testlab/test_all_features.hpp"
 #include "core/network/burp/camoufox_bridge.hpp"
@@ -2867,18 +2866,42 @@ static void phase0_log_wer_configuration(const char* phase)
         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - start_ms));
 }
 
+static aida::infra::executor::submit_result_t submit_main_executor_task(
+    const char* owner_subsystem,
+    const char* label,
+    aida::infra::executor::domain_t domain,
+    const char* thread_class,
+    std::function<void()> body,
+    int priority = 3)
+{
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = owner_subsystem;
+    submission.label = label;
+    submission.thread_class = thread_class;
+    submission.domain = domain;
+    submission.priority = priority;
+    submission.body = std::move(body);
+    return aida::infra::executor::submit(std::move(submission));
+}
+
 static void phase0_post_wer_configuration_logging(const char* phase)
 {
     std::string phase_copy = phase && phase[0] ? phase : "startup";
     const std::string run_id = standalone_license::run_correlation_id();
-    const bool posted = work_queue::post_service_labeled("phase0.wer_config", [phase_copy]() {
+    const auto submit_result = submit_main_executor_task(
+        "startup",
+        "phase0.wer_config",
+        aida::infra::executor::domain_t::diagnostics,
+        "startup_diagnostics",
+        [phase_copy]() {
         aida::manual_map_tls::ensure_current_thread();
         phase0_log_wer_configuration(phase_copy.c_str());
     });
+    const bool posted = submit_result.submitted;
     char utc[48] = {};
     format_phase0_utc_timestamp(utc, sizeof(utc));
     diag::log_tagged_critical_fmt("WER-CONFIG",
-        "record=localdumps_scan_post phase=%s run_id=%s posted=%d pid=%lu tid=%lu utc=%s tick_ms=%llu worker=service_queue",
+        "record=localdumps_scan_post phase=%s run_id=%s posted=%d pid=%lu tid=%lu utc=%s tick_ms=%llu worker=executor_diagnostics",
         phase_copy.c_str(),
         run_id.c_str(),
         posted ? 1 : 0,
@@ -2886,8 +2909,17 @@ static void phase0_post_wer_configuration_logging(const char* phase)
         GetCurrentThreadId(),
         utc,
         static_cast<unsigned long long>(GetTickCount64()));
-    if (!posted)
-        phase0_log_wer_configuration(phase_copy.c_str());
+    if (!posted) {
+        diag::log_tagged_critical_fmt("WER-CONFIG",
+            "record=localdumps_scan_post_failed phase=%s run_id=%s reason=%.180s pid=%lu tid=%lu utc=%s tick_ms=%llu worker=executor_diagnostics",
+            phase_copy.c_str(),
+            run_id.c_str(),
+            submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str(),
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            utc,
+            static_cast<unsigned long long>(GetTickCount64()));
+    }
 }
 
 static std::string generate_startup_run_correlation_id()
@@ -3911,7 +3943,12 @@ namespace aida_tracer {
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(GetTickCount64()));
-        bool posted = work_queue::post_service_labeled("render_tracer", []() {
+        const auto submit_result = submit_main_executor_task(
+            "render",
+            "render_tracer",
+            aida::infra::executor::domain_t::diagnostics,
+            "render_tracer",
+            []() {
             startup_log_critical_fmt("tracer_thread_entry pid=%lu tid=%lu tick=%llu",
                 GetCurrentProcessId(),
                 GetCurrentThreadId(),
@@ -3922,6 +3959,7 @@ namespace aida_tracer {
                 GetCurrentThreadId(),
                 static_cast<unsigned long long>(GetTickCount64()));
         });
+        bool posted = submit_result.submitted;
         startup_log_critical_fmt("tracer_thread_post_post posted=%d pid=%lu tid=%lu tick=%llu",
             posted ? 1 : 0,
             GetCurrentProcessId(),
@@ -3953,7 +3991,12 @@ namespace aida_focus_monitor {
             static_cast<unsigned long long>(start_tick));
         g_stop.store(false, std::memory_order_release);
         g_focused.store(foreground_belongs_to_process(hwnd), std::memory_order_release);
-        bool posted = work_queue::post_service_labeled("focus_monitor", [hwnd]() {
+        const auto submit_result = submit_main_executor_task(
+            "ui",
+            "focus_monitor",
+            aida::infra::executor::domain_t::service,
+            "long_lived_service",
+            [hwnd]() {
             startup_log_critical_fmt("focus_monitor_worker_enter hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
                 static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
                 GetCurrentProcessId(),
@@ -3969,6 +4012,7 @@ namespace aida_focus_monitor {
                 GetCurrentThreadId(),
                 static_cast<unsigned long long>(GetTickCount64()));
         });
+        bool posted = submit_result.submitted;
         startup_log_critical_fmt("focus_monitor_start_post posted=%d focused=%d elapsed_ms=%llu hwnd=0x%llX",
             posted ? 1 : 0,
             g_focused.load(std::memory_order_acquire) ? 1 : 0,
@@ -4105,9 +4149,15 @@ namespace aida_hotkey_monitor {
             return;
         }
         g_stop.store(false, std::memory_order_release);
-        bool posted = work_queue::post_service_labeled("hotkey_monitor", [hwnd]() {
+        const auto submit_result = submit_main_executor_task(
+            "ui",
+            "hotkey_monitor",
+            aida::infra::executor::domain_t::service,
+            "long_lived_service",
+            [hwnd]() {
             run(hwnd);
         });
+        bool posted = submit_result.submitted;
         if (!posted) {
             g_started.store(false, std::memory_order_release);
             g_stop.store(true, std::memory_order_release);
@@ -5129,98 +5179,155 @@ static void format_context_stack_modules(CONTEXT* ctx, char* out, size_t cap)
         _snprintf_s(out, cap, _TRUNCATE, "<no_module_stack_values>");
 }
 
-static void format_work_queue_crash_snapshot(char* out, size_t cap)
+enum class taskflow_family_diag_kind_t {
+    work,
+    service,
+    critical
+};
+
+struct taskflow_family_diag_t {
+    uint32_t active = 0;
+    uint64_t pending = 0;
+    uint64_t oldest_active_ms = 0;
+    uint32_t active_label_count = 0;
+    std::string active_labels;
+};
+
+static taskflow_family_diag_kind_t taskflow_family_for_domain(aida::infra::taskflow_runtime::executor_domain_t domain)
+{
+    using domain_t = aida::infra::taskflow_runtime::executor_domain_t;
+    switch (domain) {
+    case domain_t::service:
+    case domain_t::long_running:
+        return taskflow_family_diag_kind_t::service;
+    case domain_t::critical:
+    case domain_t::security_liveness:
+        return taskflow_family_diag_kind_t::critical;
+    case domain_t::general:
+    case domain_t::ui_dispatch:
+    case domain_t::external_tool:
+    case domain_t::feature_worker:
+    case domain_t::diagnostics:
+    default:
+        return taskflow_family_diag_kind_t::work;
+    }
+}
+
+static taskflow_family_diag_t make_taskflow_family_diag(
+    const aida::infra::taskflow_runtime::runtime_snapshot_t& snapshot,
+    taskflow_family_diag_kind_t family)
+{
+    taskflow_family_diag_t out;
+    if (family == taskflow_family_diag_kind_t::service) {
+        out.active = snapshot.service_queue_active;
+        out.pending = snapshot.service_queue_pending;
+    } else if (family == taskflow_family_diag_kind_t::critical) {
+        out.active = snapshot.critical_queue_active;
+        out.pending = snapshot.critical_queue_pending;
+    } else {
+        out.active = snapshot.work_queue_active;
+        out.pending = snapshot.work_queue_pending;
+    }
+    for (const auto& job : snapshot.active_jobs) {
+        if (taskflow_family_for_domain(job.domain) != family)
+            continue;
+        ++out.active_label_count;
+        if (job.active_ms > out.oldest_active_ms)
+            out.oldest_active_ms = job.active_ms;
+        if (out.active_labels.size() < 900) {
+            if (!out.active_labels.empty())
+                out.active_labels += ";";
+            out.active_labels += "#";
+            out.active_labels += std::to_string(job.job_id);
+            out.active_labels += ":";
+            out.active_labels += aida::infra::taskflow_runtime::domain_name(job.domain);
+            out.active_labels += ":";
+            out.active_labels += aida::infra::taskflow_runtime::job_state_name(job.state);
+            out.active_labels += ":";
+            out.active_labels += job.label.empty() ? "<unnamed>" : job.label;
+        }
+    }
+    return out;
+}
+
+static void format_taskflow_runtime_crash_snapshot(char* out, size_t cap)
 {
     if (!out || cap == 0)
         return;
     out[0] = 0;
-    const auto work = work_queue::stats();
-    const auto service = work_queue::service_stats();
-    const auto critical = critical_work_queue::stats();
+    const auto runtime_snapshot = aida::infra::taskflow_runtime::active_snapshot(128);
+    const auto work = make_taskflow_family_diag(runtime_snapshot, taskflow_family_diag_kind_t::work);
+    const auto service = make_taskflow_family_diag(runtime_snapshot, taskflow_family_diag_kind_t::service);
+    const auto critical = make_taskflow_family_diag(runtime_snapshot, taskflow_family_diag_kind_t::critical);
     _snprintf_s(out, cap, _TRUNCATE,
-        "work{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.700s} service{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.700s} critical{alive=%d shutdown=%d workers=%zu pending=%zu active=%u active_labels=%u oldest_active_ms=%llu posted=%llu started=%llu finished=%llu rejected=%llu labels=%.700s}",
-        work.alive ? 1 : 0,
-        work.shutting_down ? 1 : 0,
-        work.workers,
-        work.pending,
-        work.active,
-        work.active_label_count,
+        "taskflow{accepting=%d shutdown=%d total_active=%u oldest_active_ms=%llu submitted=%llu rejected=%llu cancelled=%llu failed=%llu timed_out=%llu labels=%.700s} work{pending=%llu active=%u active_labels=%u oldest_active_ms=%llu labels=%.700s} service{pending=%llu active=%u active_labels=%u oldest_active_ms=%llu labels=%.700s} critical{pending=%llu active=%u active_labels=%u oldest_active_ms=%llu labels=%.700s}",
+        runtime_snapshot.accepting ? 1 : 0,
+        runtime_snapshot.shutting_down ? 1 : 0,
+        static_cast<unsigned>(runtime_snapshot.total_active),
+        static_cast<unsigned long long>(runtime_snapshot.oldest_active_ms),
+        static_cast<unsigned long long>(runtime_snapshot.total_submitted),
+        static_cast<unsigned long long>(runtime_snapshot.total_rejected),
+        static_cast<unsigned long long>(runtime_snapshot.total_cancelled),
+        static_cast<unsigned long long>(runtime_snapshot.total_failed),
+        static_cast<unsigned long long>(runtime_snapshot.total_timed_out),
+        runtime_snapshot.labels_under_pressure.empty() ? "<none>" : runtime_snapshot.labels_under_pressure.c_str(),
+        static_cast<unsigned long long>(work.pending),
+        static_cast<unsigned>(work.active),
+        static_cast<unsigned>(work.active_label_count),
         static_cast<unsigned long long>(work.oldest_active_ms),
-        static_cast<unsigned long long>(work.posted),
-        static_cast<unsigned long long>(work.started),
-        static_cast<unsigned long long>(work.finished),
-        static_cast<unsigned long long>(work.rejected),
         work.active_labels.empty() ? "<none>" : work.active_labels.c_str(),
-        service.alive ? 1 : 0,
-        service.shutting_down ? 1 : 0,
-        service.workers,
-        service.pending,
-        service.active,
-        service.active_label_count,
+        static_cast<unsigned long long>(service.pending),
+        static_cast<unsigned>(service.active),
+        static_cast<unsigned>(service.active_label_count),
         static_cast<unsigned long long>(service.oldest_active_ms),
-        static_cast<unsigned long long>(service.posted),
-        static_cast<unsigned long long>(service.started),
-        static_cast<unsigned long long>(service.finished),
-        static_cast<unsigned long long>(service.rejected),
         service.active_labels.empty() ? "<none>" : service.active_labels.c_str(),
-        critical.alive ? 1 : 0,
-        critical.shutting_down ? 1 : 0,
-        critical.workers,
-        critical.pending,
-        critical.active,
-        critical.active_label_count,
+        static_cast<unsigned long long>(critical.pending),
+        static_cast<unsigned>(critical.active),
+        static_cast<unsigned>(critical.active_label_count),
         static_cast<unsigned long long>(critical.oldest_active_ms),
-        static_cast<unsigned long long>(critical.posted),
-        static_cast<unsigned long long>(critical.started),
-        static_cast<unsigned long long>(critical.finished),
-        static_cast<unsigned long long>(critical.rejected),
         critical.active_labels.empty() ? "<none>" : critical.active_labels.c_str());
 }
 
-static void format_work_queue_hung_snapshot(char* out, size_t cap)
+static void format_taskflow_runtime_hung_snapshot(char* out, size_t cap)
 {
     if (!out || cap == 0)
         return;
     out[0] = 0;
     constexpr uint64_t kStuckAgeMs = 5000ULL;
-    const auto work = work_queue::stats();
-    const auto service = work_queue::service_stats();
-    const auto critical = critical_work_queue::stats();
+    const auto runtime_snapshot = aida::infra::taskflow_runtime::active_snapshot(128);
+    const auto work = make_taskflow_family_diag(runtime_snapshot, taskflow_family_diag_kind_t::work);
+    const auto service = make_taskflow_family_diag(runtime_snapshot, taskflow_family_diag_kind_t::service);
+    const auto critical = make_taskflow_family_diag(runtime_snapshot, taskflow_family_diag_kind_t::critical);
     _snprintf_s(out, cap, _TRUNCATE,
-        "work{alive=%d shutdown=%d workers=%zu pending=%zu active=%u stuck=%d oldest_active_ms=%llu hot=%u not_queryable=%u labels=%.520s top_cpu=%.360s} service{alive=%d shutdown=%d workers=%zu pending=%zu active=%u stuck=%d oldest_active_ms=%llu hot=%u not_queryable=%u labels=%.520s top_cpu=%.360s} critical{alive=%d shutdown=%d workers=%zu pending=%zu active=%u stuck=%d oldest_active_ms=%llu hot=%u not_queryable=%u labels=%.520s top_cpu=%.360s}",
-        work.alive ? 1 : 0,
-        work.shutting_down ? 1 : 0,
-        work.workers,
-        work.pending,
-        work.active,
+        "taskflow{accepting=%d shutdown=%d total_active=%u stuck=%d oldest_active_ms=%llu submitted=%llu rejected=%llu failed=%llu timed_out=%llu labels=%.520s} work{pending=%llu active=%u stuck=%d oldest_active_ms=%llu active_labels=%u labels=%.520s} service{pending=%llu active=%u stuck=%d oldest_active_ms=%llu active_labels=%u labels=%.520s} critical{pending=%llu active=%u stuck=%d oldest_active_ms=%llu active_labels=%u labels=%.520s}",
+        runtime_snapshot.accepting ? 1 : 0,
+        runtime_snapshot.shutting_down ? 1 : 0,
+        static_cast<unsigned>(runtime_snapshot.total_active),
+        runtime_snapshot.oldest_active_ms >= kStuckAgeMs ? 1 : 0,
+        static_cast<unsigned long long>(runtime_snapshot.oldest_active_ms),
+        static_cast<unsigned long long>(runtime_snapshot.total_submitted),
+        static_cast<unsigned long long>(runtime_snapshot.total_rejected),
+        static_cast<unsigned long long>(runtime_snapshot.total_failed),
+        static_cast<unsigned long long>(runtime_snapshot.total_timed_out),
+        runtime_snapshot.labels_under_pressure.empty() ? "<none>" : runtime_snapshot.labels_under_pressure.c_str(),
+        static_cast<unsigned long long>(work.pending),
+        static_cast<unsigned>(work.active),
         work.oldest_active_ms >= kStuckAgeMs ? 1 : 0,
         static_cast<unsigned long long>(work.oldest_active_ms),
-        static_cast<unsigned>(work.hot_workers),
-        static_cast<unsigned>(work.not_queryable_workers),
+        static_cast<unsigned>(work.active_label_count),
         work.active_labels.empty() ? "<none>" : work.active_labels.c_str(),
-        work.top_cpu_labels.empty() ? "<none>" : work.top_cpu_labels.c_str(),
-        service.alive ? 1 : 0,
-        service.shutting_down ? 1 : 0,
-        service.workers,
-        service.pending,
-        service.active,
+        static_cast<unsigned long long>(service.pending),
+        static_cast<unsigned>(service.active),
         service.oldest_active_ms >= kStuckAgeMs ? 1 : 0,
         static_cast<unsigned long long>(service.oldest_active_ms),
-        static_cast<unsigned>(service.hot_workers),
-        static_cast<unsigned>(service.not_queryable_workers),
+        static_cast<unsigned>(service.active_label_count),
         service.active_labels.empty() ? "<none>" : service.active_labels.c_str(),
-        service.top_cpu_labels.empty() ? "<none>" : service.top_cpu_labels.c_str(),
-        critical.alive ? 1 : 0,
-        critical.shutting_down ? 1 : 0,
-        critical.workers,
-        critical.pending,
-        critical.active,
+        static_cast<unsigned long long>(critical.pending),
+        static_cast<unsigned>(critical.active),
         critical.oldest_active_ms >= kStuckAgeMs ? 1 : 0,
         static_cast<unsigned long long>(critical.oldest_active_ms),
-        static_cast<unsigned>(critical.hot_workers),
-        static_cast<unsigned>(critical.not_queryable_workers),
-        critical.active_labels.empty() ? "<none>" : critical.active_labels.c_str(),
-        critical.top_cpu_labels.empty() ? "<none>" : critical.top_cpu_labels.c_str());
+        static_cast<unsigned>(critical.active_label_count),
+        critical.active_labels.empty() ? "<none>" : critical.active_labels.c_str());
 }
 
 static DWORD count_current_process_threads(DWORD* err_out)
@@ -5281,7 +5388,7 @@ static void emit_window_hung_snapshot(
     char queue_snapshot[3000] = {};
     char ui_dispatch_snapshot[1400] = {};
     mcp_standalone::format_runtime_diagnostic_snapshot(mcp_snapshot, sizeof(mcp_snapshot));
-    format_work_queue_hung_snapshot(queue_snapshot, sizeof(queue_snapshot));
+    format_taskflow_runtime_hung_snapshot(queue_snapshot, sizeof(queue_snapshot));
     aida::ui_thread::format_snapshot(ui_dispatch_snapshot, sizeof(ui_dispatch_snapshot));
 
     HWND hwnd = g_hwnd;
@@ -5602,9 +5709,10 @@ struct render_diag_cached_snapshot_t {
     process_io_delta_t proc_io;
     log_file_delta_snapshot_t log_files;
     defender_process_snapshot_t defender;
-    work_queue::stats_t wq;
-    work_queue::stats_t svc;
-    critical_work_queue::stats_t cq;
+    aida::infra::taskflow_runtime::runtime_snapshot_t taskflow;
+    taskflow_family_diag_t wq;
+    taskflow_family_diag_t svc;
+    taskflow_family_diag_t cq;
 };
 
 static std::mutex g_render_diag_cache_mutex;
@@ -5639,9 +5747,10 @@ static void request_render_diag_snapshot_async(uint64_t now_ms, bool force)
             render_diag_cached_snapshot_t snapshot;
             snapshot.sample_ms = static_cast<uint64_t>(GetTickCount64());
             snapshot.thread_count = count_current_process_threads(&snapshot.thread_err);
-            snapshot.wq = work_queue::stats();
-            snapshot.svc = work_queue::service_stats();
-            snapshot.cq = critical_work_queue::stats();
+            snapshot.taskflow = aida::infra::taskflow_runtime::active_snapshot(128);
+            snapshot.wq = make_taskflow_family_diag(snapshot.taskflow, taskflow_family_diag_kind_t::work);
+            snapshot.svc = make_taskflow_family_diag(snapshot.taskflow, taskflow_family_diag_kind_t::service);
+            snapshot.cq = make_taskflow_family_diag(snapshot.taskflow, taskflow_family_diag_kind_t::critical);
             snapshot.cpu = sample_current_process_cpu(snapshot.sample_ms);
             snapshot.proc_io = sample_process_io_delta(snapshot.sample_ms);
             snapshot.log_files = sample_log_file_deltas();
@@ -5655,9 +5764,13 @@ static void request_render_diag_snapshot_async(uint64_t now_ms, bool force)
         }
         g_render_diag_sample_inflight.store(false, std::memory_order_release);
     };
-    bool posted = work_queue::post_service_labeled("render.diagnostics.sample", task);
-    if (!posted)
-        posted = work_queue::post_labeled("render.diagnostics.sample", std::move(task));
+    const auto submit_result = submit_main_executor_task(
+        "render",
+        "render.diagnostics.sample",
+        aida::infra::executor::domain_t::diagnostics,
+        "diagnostics",
+        std::move(task));
+    bool posted = submit_result.submitted;
     if (!posted) {
         g_render_diag_sample_inflight.store(false, std::memory_order_release);
         static std::atomic<uint64_t> s_last_diag_post_fail_ms{0};
@@ -5763,7 +5876,7 @@ static void format_message_pump_stall_context(char* out, size_t cap)
     test_all_features::format_debug_snapshot(full_snapshot, sizeof(full_snapshot));
     test_all_features::format_ui_phase_snapshot(ui_phase, sizeof(ui_phase));
     aida::ui_thread::format_snapshot(ui_dispatch, sizeof(ui_dispatch));
-    format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
+    format_taskflow_runtime_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
     DWORD thread_err = 0;
     const DWORD threads = count_current_process_threads(&thread_err);
     DWORD handles = 0;
@@ -5807,7 +5920,7 @@ static void format_shutdown_crash_snapshot(char* out, size_t cap)
     char thread_desc[512] = {};
     char queue_snapshot[2400] = {};
     format_current_thread_description(thread_desc, sizeof(thread_desc));
-    format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
+    format_taskflow_runtime_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
     const char* shutdown_phase = aida_shutdown_diag::g_phase.load(std::memory_order_acquire);
     const char* render_phase = aida_tracer::g_render_phase_name.load(std::memory_order_acquire);
     const char* dispatch_stage = aida_tracer::g_dispatch_stage.load(std::memory_order_acquire);
@@ -5968,7 +6081,12 @@ static void post_arc_startup_gate_unseal()
     const uint64_t queued_at = static_cast<uint64_t>(GetTickCount64());
     bool posted = false;
     try {
-        posted = critical_work_queue::post_labeled("license.arc_startup_gate_unseal", [queued_at]() {
+        const auto submit_result = submit_main_executor_task(
+            "license",
+            "license.arc_startup_gate_unseal",
+            aida::infra::executor::domain_t::security_liveness,
+            "security_liveness",
+            [queued_at]() {
         uint8_t gate_nonce[32] = {};
         uint8_t poly_seed[32] = {};
         uint32_t poly_seed_len = 0;
@@ -6037,6 +6155,7 @@ static void post_arc_startup_gate_unseal()
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at),
             bind_token_len);
         });
+        posted = submit_result.submitted;
     } catch (const std::exception& e) {
         diag::log_tagged_critical_fmt("license", "arc_render_gate_unseal_post_exception what=%.180s", e.what());
     } catch (...) {
@@ -6094,17 +6213,25 @@ static void post_script_engine_startup_initialize()
             g_script_engine_startup_init_posted.store(false, std::memory_order_release);
     };
 
-    bool posted_service = false;
-    bool posted_work = false;
+    bool posted_executor = false;
+    std::string reject_reason = "<none>";
     try {
-        posted_service = work_queue::post_service_labeled("script_engine_startup_init", init_task);
-        if (!posted_service)
-            posted_work = work_queue::post_labeled("script_engine_startup_init_fallback", init_task);
-        startup_log_critical_fmt("script_engine_startup_async_posted pid=%lu tid=%lu service=%d work=%d elapsed_ms=%llu",
+        const auto submit_result = submit_main_executor_task(
+            "startup",
+            "script_engine_startup_init",
+            aida::infra::executor::domain_t::long_running,
+            "startup_init",
+            std::move(init_task));
+        posted_executor = submit_result.submitted;
+        if (!submit_result.reject_reason.empty())
+            reject_reason = submit_result.reject_reason;
+        startup_log_critical_fmt("script_engine_startup_async_posted pid=%lu tid=%lu service=%d work=%d executor=%d domain=long_running reject_reason=%.160s elapsed_ms=%llu",
             GetCurrentProcessId(),
             GetCurrentThreadId(),
-            posted_service ? 1 : 0,
-            posted_work ? 1 : 0,
+            0,
+            0,
+            posted_executor ? 1 : 0,
+            reject_reason.c_str(),
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
     } catch (const std::exception& e) {
         g_script_engine_startup_init_posted.store(false, std::memory_order_release);
@@ -6118,20 +6245,14 @@ static void post_script_engine_startup_initialize()
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at));
     }
 
-    if (!posted_service && !posted_work && !script_engine::is_initialized()) {
-        const uint64_t inline_started = static_cast<uint64_t>(GetTickCount64());
-        startup_log_critical_fmt("script_engine_startup_inline_fallback_enter pid=%lu tid=%lu queued_ms=%llu",
+    if (!posted_executor && !script_engine::is_initialized()) {
+        g_script_engine_startup_init_posted.store(false, std::memory_order_release);
+        startup_log_critical_fmt("script_engine_startup_async_post_failed pid=%lu tid=%lu queued_ms=%llu reason=%.160s initialized=%d",
             GetCurrentProcessId(),
             GetCurrentThreadId(),
-            static_cast<unsigned long long>(inline_started - queued_at));
-        DWORD seh = seh_script_engine_initialize();
-        startup_log_critical_fmt("script_engine_startup_inline_fallback_exit seh=0x%08X initialized=%d elapsed_ms=%llu last_err=%lu",
-            seh,
-            script_engine::is_initialized() ? 1 : 0,
-            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - inline_started),
-            static_cast<unsigned long>(GetLastError()));
-        if (seh != 0 && !script_engine::is_initialized())
-            g_script_engine_startup_init_posted.store(false, std::memory_order_release);
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - queued_at),
+            reject_reason.c_str(),
+            script_engine::is_initialized() ? 1 : 0);
     }
 }
 
@@ -6719,49 +6840,35 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()));
     crash_log_write("main_enter");
 
-    startup_log_critical_fmt("work_queue_initialize_pre pid=%lu tid=%lu tick=%llu pool_size=%d",
+    const int taskflow_general_pool_size = aida::infra::taskflow_runtime::general_pool_size();
+    const int taskflow_service_pool_size = aida::infra::taskflow_runtime::service_pool_size();
+    const int taskflow_critical_pool_size = aida::infra::taskflow_runtime::domain_pool(
+        aida::infra::taskflow_runtime::executor_domain_t::critical).configured_pool_size;
+    startup_log_critical_fmt("taskflow_runtime_initialize_pre pid=%lu tid=%lu tick=%llu general_pool_size=%d service_pool_size=%d critical_pool_size=%d",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()),
-        work_queue::POOL_SIZE);
-    work_queue::initialize();
-    startup_log_critical_fmt("work_queue_initialize_post pid=%lu tid=%lu tick=%llu pool_size=%d",
+        taskflow_general_pool_size,
+        taskflow_service_pool_size,
+        taskflow_critical_pool_size);
+    aida::infra::taskflow_runtime::initialize();
+    const auto taskflow_init_snapshot = aida::infra::taskflow_runtime::active_snapshot();
+    startup_log_critical_fmt("taskflow_runtime_initialize_post pid=%lu tid=%lu tick=%llu accepting=%d shutdown=%d total_active=%u work_pending=%llu service_pending=%llu critical_pending=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()),
-        work_queue::POOL_SIZE);
-    crash_log_write("work_queue_init_ok");
-
-    startup_log_critical_fmt("work_queue_service_initialize_pre pid=%lu tid=%lu tick=%llu pool_size=%d",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()),
-        work_queue::SERVICE_POOL_SIZE);
-    work_queue::initialize_services();
-    startup_log_critical_fmt("work_queue_service_initialize_post pid=%lu tid=%lu tick=%llu pool_size=%d",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()),
-        work_queue::SERVICE_POOL_SIZE);
-    crash_log_write("work_queue_service_init_ok");
-    phase0_post_wer_configuration_logging("post_work_queue_service_init");
+        taskflow_init_snapshot.accepting ? 1 : 0,
+        taskflow_init_snapshot.shutting_down ? 1 : 0,
+        static_cast<unsigned>(taskflow_init_snapshot.total_active),
+        static_cast<unsigned long long>(taskflow_init_snapshot.work_queue_pending),
+        static_cast<unsigned long long>(taskflow_init_snapshot.service_queue_pending),
+        static_cast<unsigned long long>(taskflow_init_snapshot.critical_queue_pending));
+    crash_log_write("taskflow_runtime_init_ok");
+    phase0_post_wer_configuration_logging("post_taskflow_runtime_init");
     aida::diagnostics::metadata_ring::emit(
         aida::diagnostics::metadata_ring::breadcrumb_category_t::startup_shutdown,
         "standalone_startup_begin", "phase0_complete", true);
     aida::diagnostics::wer::log_wer_correlation("startup");
-
-    startup_log_critical_fmt("critical_work_queue_initialize_pre pid=%lu tid=%lu tick=%llu pool_size=%d",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()),
-        critical_work_queue::POOL_SIZE);
-    critical_work_queue::initialize();
-    startup_log_critical_fmt("critical_work_queue_initialize_post pid=%lu tid=%lu tick=%llu pool_size=%d",
-        GetCurrentProcessId(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(GetTickCount64()),
-        critical_work_queue::POOL_SIZE);
-    crash_log_write("critical_work_queue_init_ok");
 
     startup_log_critical_fmt("tracer_start_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
@@ -7033,7 +7140,7 @@ int main(int, char**)
             char queue_snap[3000] = {};
             char ui_dispatch_snap[1400] = {};
             mcp_standalone::format_runtime_diagnostic_snapshot(mcp_snap, sizeof(mcp_snap));
-            format_work_queue_hung_snapshot(queue_snap, sizeof(queue_snap));
+            format_taskflow_runtime_hung_snapshot(queue_snap, sizeof(queue_snap));
             aida::ui_thread::format_snapshot(ui_dispatch_snap, sizeof(ui_dispatch_snap));
             ctx.mcp_snapshot = mcp_snap;
             ctx.queue_snapshot = queue_snap;
@@ -7454,7 +7561,12 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    bool bg_posted = critical_work_queue::post_labeled("startup.bg_init", []() {
+    const auto bg_submit_result = submit_main_executor_task(
+        "startup",
+        "startup.bg_init",
+        aida::infra::executor::domain_t::security_liveness,
+        "security_liveness",
+        []() {
         const uint64_t thread_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("bg_init_thread_entry pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -7698,6 +7810,7 @@ int main(int, char**)
             static_cast<unsigned long long>(GetTickCount64()));
         diag::log_tagged("bg_init", "thread_exit");
     });
+    bool bg_posted = bg_submit_result.submitted;
     startup_log_critical_fmt("bg_init_critical_post_post posted=%d pid=%lu tid=%lu tick=%llu",
         bg_posted ? 1 : 0,
         GetCurrentProcessId(),
@@ -7732,7 +7845,12 @@ int main(int, char**)
             dyn.ioctl_seed_hash,
             dyn.heartbeat_ioctl_seed_hash);
     }
-    bool driver_posted = critical_work_queue::post_labeled("startup.driver_bridge_init", [] {
+    const auto driver_submit_result = submit_main_executor_task(
+        "startup",
+        "startup.driver_bridge_init",
+        aida::infra::executor::domain_t::security_liveness,
+        "driver",
+        [] {
         const uint64_t driver_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("driver_bridge_init_thread_entry pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -7810,6 +7928,7 @@ int main(int, char**)
             static_cast<unsigned long>(GetLastError()));
         diag::log_tagged("drv_init", "thread_exit");
     });
+    bool driver_posted = driver_submit_result.submitted;
     startup_log_critical_fmt("driver_bridge_init_critical_post_post posted=%d pid=%lu tid=%lu tick=%llu",
         driver_posted ? 1 : 0,
         GetCurrentProcessId(),
@@ -8281,7 +8400,12 @@ int main(int, char**)
                     GetCurrentProcessId(),
                     GetCurrentThreadId(),
                     static_cast<unsigned long long>(GetTickCount64()));
-                bool posted = critical_work_queue::post_labeled("render.authorized_feature_init", [] {
+                const auto submit_result = submit_main_executor_task(
+                    "startup",
+                    "render.authorized_feature_init",
+                    aida::infra::executor::domain_t::long_running,
+                    "startup_init",
+                    [] {
                     startup_log_critical_fmt("render_authorized_feature_worker_enter pid=%lu tid=%lu tick=%llu",
                         GetCurrentProcessId(),
                         GetCurrentThreadId(),
@@ -8292,6 +8416,7 @@ int main(int, char**)
                         GetCurrentThreadId(),
                         static_cast<unsigned long long>(GetTickCount64()));
                 });
+                bool posted = submit_result.submitted;
                 startup_log_critical_fmt("render_authorized_feature_critical_post_post posted=%d frame=%llu",
                     posted ? 1 : 0,
                     static_cast<unsigned long long>(frame_number));
@@ -8860,6 +8985,7 @@ int main(int, char**)
                 const auto wq = diag_snapshot.wq;
                 const auto svc = diag_snapshot.svc;
                 const auto cq = diag_snapshot.cq;
+                const auto taskflow = diag_snapshot.taskflow;
                 const bool idle_unhealthy =
                     thread_err != 0 ||
                     wq.pending != 0 ||
@@ -8871,7 +8997,7 @@ int main(int, char**)
                 if (idle_unhealthy && tick_now_ms - s_last_idle_pacing_log_ms >= 30000ULL) {
                     s_last_idle_pacing_log_ms = tick_now_ms;
                     diag::log_tagged_fmt("render",
-                        "idle_pacing_anomaly frame=%llu pre_render_wait_ms=%lu idle_wait_request_ms=%lu dirty_mask=0x%08X block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d recent_input=%d last_input_age_ms=%llu interactive_pending=%d qs=0x%08lX bulk_busy=%d full_test=%d skipped=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu svc_active=%u svc_pending=%zu svc_oldest_ms=%llu cq_active=%u cq_pending=%zu cq_oldest_ms=%llu",
+                        "idle_pacing_anomaly frame=%llu pre_render_wait_ms=%lu idle_wait_request_ms=%lu dirty_mask=0x%08X block_mask=0x%08X foreground=%d foreground_like=%d cursor_over=%d recent_input=%d last_input_age_ms=%llu interactive_pending=%d qs=0x%08lX bulk_busy=%d full_test=%d skipped=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%llu wq_oldest_ms=%llu svc_active=%u svc_pending=%llu svc_oldest_ms=%llu cq_active=%u cq_pending=%llu cq_oldest_ms=%llu",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long>(pre_render_wait.actual_ms),
                         static_cast<unsigned long>(idle_wait_request_ms),
@@ -8890,74 +9016,79 @@ int main(int, char**)
                         static_cast<unsigned long>(thread_count),
                         static_cast<unsigned long>(thread_err),
                         static_cast<unsigned>(wq.active),
-                        wq.pending,
+                        static_cast<unsigned long long>(wq.pending),
                         static_cast<unsigned long long>(wq.oldest_active_ms),
                         static_cast<unsigned>(svc.active),
-                        svc.pending,
+                        static_cast<unsigned long long>(svc.pending),
                         static_cast<unsigned long long>(svc.oldest_active_ms),
                         static_cast<unsigned>(cq.active),
-                        cq.pending,
+                        static_cast<unsigned long long>(cq.pending),
                         static_cast<unsigned long long>(cq.oldest_active_ms));
                     diag::log_tagged_fmt("render",
-                        "idle_pacing_queue frame=%llu queue=general attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        "idle_pacing_taskflow_family frame=%llu family=work submitted=%llu rejected=%llu failed=%llu timed_out=%llu active=%u pending=%llu oldest_ms=%llu label_count=%u labels={%.900s}",
                         static_cast<unsigned long long>(frame_number),
-                        static_cast<unsigned long long>(wq.post_attempts),
-                        static_cast<unsigned long long>(wq.posted),
-                        static_cast<unsigned long long>(wq.rejected),
-                        static_cast<unsigned long long>(wq.started),
-                        static_cast<unsigned long long>(wq.finished),
+                        static_cast<unsigned long long>(taskflow.total_submitted),
+                        static_cast<unsigned long long>(taskflow.total_rejected),
+                        static_cast<unsigned long long>(taskflow.total_failed),
+                        static_cast<unsigned long long>(taskflow.total_timed_out),
                         static_cast<unsigned>(wq.active),
-                        wq.pending,
+                        static_cast<unsigned long long>(wq.pending),
                         static_cast<unsigned long long>(wq.oldest_active_ms),
                         static_cast<unsigned>(wq.active_label_count),
-                        static_cast<unsigned>(wq.healthy_long_lived),
-                        static_cast<unsigned>(wq.hot_workers),
-                        static_cast<unsigned>(wq.not_queryable_workers),
-                        wq.top_cpu_labels.empty() ? "<none>" : wq.top_cpu_labels.c_str(),
                         wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str());
                     diag::log_tagged_fmt("render",
-                        "idle_pacing_queue frame=%llu queue=service attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        "idle_pacing_taskflow_family frame=%llu family=service submitted=%llu rejected=%llu failed=%llu timed_out=%llu active=%u pending=%llu oldest_ms=%llu label_count=%u labels={%.900s}",
                         static_cast<unsigned long long>(frame_number),
-                        static_cast<unsigned long long>(svc.post_attempts),
-                        static_cast<unsigned long long>(svc.posted),
-                        static_cast<unsigned long long>(svc.rejected),
-                        static_cast<unsigned long long>(svc.started),
-                        static_cast<unsigned long long>(svc.finished),
+                        static_cast<unsigned long long>(taskflow.total_submitted),
+                        static_cast<unsigned long long>(taskflow.total_rejected),
+                        static_cast<unsigned long long>(taskflow.total_failed),
+                        static_cast<unsigned long long>(taskflow.total_timed_out),
                         static_cast<unsigned>(svc.active),
-                        svc.pending,
+                        static_cast<unsigned long long>(svc.pending),
                         static_cast<unsigned long long>(svc.oldest_active_ms),
                         static_cast<unsigned>(svc.active_label_count),
-                        static_cast<unsigned>(svc.healthy_long_lived),
-                        static_cast<unsigned>(svc.hot_workers),
-                        static_cast<unsigned>(svc.not_queryable_workers),
-                        svc.top_cpu_labels.empty() ? "<none>" : svc.top_cpu_labels.c_str(),
                         svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
                     diag::log_tagged_fmt("render",
-                        "idle_pacing_queue frame=%llu queue=critical attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        "idle_pacing_taskflow_family frame=%llu family=critical submitted=%llu rejected=%llu failed=%llu timed_out=%llu active=%u pending=%llu oldest_ms=%llu label_count=%u labels={%.900s}",
                         static_cast<unsigned long long>(frame_number),
-                        static_cast<unsigned long long>(cq.post_attempts),
-                        static_cast<unsigned long long>(cq.posted),
-                        static_cast<unsigned long long>(cq.rejected),
-                        static_cast<unsigned long long>(cq.started),
-                        static_cast<unsigned long long>(cq.finished),
+                        static_cast<unsigned long long>(taskflow.total_submitted),
+                        static_cast<unsigned long long>(taskflow.total_rejected),
+                        static_cast<unsigned long long>(taskflow.total_failed),
+                        static_cast<unsigned long long>(taskflow.total_timed_out),
                         static_cast<unsigned>(cq.active),
-                        cq.pending,
+                        static_cast<unsigned long long>(cq.pending),
                         static_cast<unsigned long long>(cq.oldest_active_ms),
                         static_cast<unsigned>(cq.active_label_count),
-                        static_cast<unsigned>(cq.healthy_long_lived),
-                        static_cast<unsigned>(cq.hot_workers),
-                        static_cast<unsigned>(cq.not_queryable_workers),
-                        cq.top_cpu_labels.empty() ? "<none>" : cq.top_cpu_labels.c_str(),
                         cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
                     std::function<void()> stuck_log_task = [] {
-                        work_queue::log_stuck_workers(30000ULL, 8);
-                        work_queue::log_service_stuck_workers(30000ULL, 8);
-                        critical_work_queue::log_stuck_workers(30000ULL, 8);
+                        const auto stuck = aida::infra::taskflow_runtime::stuck_workers(30000ULL, 24);
+                        for (const auto& s : stuck) {
+                            diag::log_tagged_fmt("taskflow_runtime",
+                                "stuck_worker task_id=%llu label=%s class=%s lifetime=%s health=%s worker_index=%zu tid=%lu thread_alive=%d thread_gle=%lu exit_code=0x%08lX active_ms=%llu queued_ms=%llu cpu_delta_100ns=%llu cpu_pct_x100=%u",
+                                static_cast<unsigned long long>(s.task_id),
+                                s.label.empty() ? "<unnamed>" : s.label.c_str(),
+                                s.label_class,
+                                s.lifetime,
+                                s.health,
+                                s.worker_index,
+                                static_cast<unsigned long>(s.tid),
+                                s.thread_alive ? 1 : 0,
+                                static_cast<unsigned long>(s.thread_query_gle),
+                                static_cast<unsigned long>(s.exit_code),
+                                static_cast<unsigned long long>(s.active_ms),
+                                static_cast<unsigned long long>(s.queued_ms),
+                                static_cast<unsigned long long>(s.cpu_delta_100ns),
+                                static_cast<unsigned>(s.cpu_pct_x100));
+                        }
                         aida::infra::executor::check_deadlines();
                     };
-                    bool stuck_log_posted = work_queue::post_service_labeled("render.idle_stuck_worker_log", stuck_log_task);
-                    if (!stuck_log_posted)
-                        stuck_log_posted = work_queue::post_labeled("render.idle_stuck_worker_log", std::move(stuck_log_task));
+                    const auto submit_result = submit_main_executor_task(
+                        "render",
+                        "render.idle_stuck_worker_log",
+                        aida::infra::executor::domain_t::diagnostics,
+                        "diagnostics",
+                        std::move(stuck_log_task));
+                    bool stuck_log_posted = submit_result.submitted;
                     if (!stuck_log_posted)
                         diag::log_tagged_fmt("render", "idle_pacing_stuck_worker_log_post_failed frame=%llu", static_cast<unsigned long long>(frame_number));
                 }
@@ -8988,6 +9119,7 @@ int main(int, char**)
                     const auto wq = diag_snapshot.wq;
                     const auto svc = diag_snapshot.svc;
                     const auto cq = diag_snapshot.cq;
+                    const auto taskflow = diag_snapshot.taskflow;
                     const process_cpu_delta_t cpu = diag_snapshot.cpu;
                     const process_io_delta_t proc_io = diag_snapshot.proc_io;
                     const log_file_delta_snapshot_t log_files = diag_snapshot.log_files;
@@ -9001,7 +9133,7 @@ int main(int, char**)
                     const auto log_stats = diag::async_log_stats();
                     const auto blur_stats = Blur::SnapshotStats();
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu wq_active=%u wq_pending=%zu wq_oldest_ms=%llu wq_healthy_long=%u wq_hot=%u wq_not_queryable=%u svc_active=%u svc_pending=%zu svc_oldest_ms=%llu svc_healthy_long=%u svc_hot=%u svc_not_queryable=%u cq_active=%u cq_pending=%zu cq_oldest_ms=%llu cq_healthy_long=%u cq_hot=%u cq_not_queryable=%u",
+                        "frame_pacing_sample frame=%llu frames_delta=%llu skipped_delta=%llu skipped_total=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d cpu_wall_ms=%llu cpu_busy_100ns=%llu cpu_gle=%lu logical_processors=%lu gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f gpu_frame=%llu gpu_ready_frame=%llu gpu_disjoint=%d gpu_data_hr=0x%08X gpu_create_hr=0x%08X gpu_frequency=%llu gpu_samples=%llu gpu_misses=%llu sync=%u flags=0x%08X frame_ms=%llu present_ms=%llu pre_wait_request_ms=%lu pre_wait_actual_ms=%lu pre_wait_result=0x%08lX pre_wait_gle=%lu pre_wait_input=%d dirty_mask=0x%08X idle_wait_request_ms=%lu foreground=%d foreground_like=%d cursor_over=%d interactive_pending=%d qs=0x%08lX block_mask=0x%08X bulk_busy=%d full_test=%d modal=%d activation=%d ai_thinking=%d pumped=%u pumped_input=%u pumped_resize=%u pumped_paint=%u draw_lists=%d draw_cmds=%d draw_vtx=%d draw_idx=%d callbacks=%d reset_callbacks=%d overlay_visible=%d overlay_running=%d overlay_total=%zu overlay_cached=%zu overlay_rendered=%zu overlay_log_version=%llu overlay_dirty=0x%016llX overlay_snapshot_changed=%d overlay_snapshot_busy=%d overlay_lock_busy=%llu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu thread_err=%lu taskflow_active=%u taskflow_submitted=%llu taskflow_rejected=%llu taskflow_failed=%llu taskflow_timed_out=%llu wq_active=%u wq_pending=%llu wq_oldest_ms=%llu wq_label_count=%u svc_active=%u svc_pending=%llu svc_oldest_ms=%llu svc_label_count=%u cq_active=%u cq_pending=%llu cq_oldest_ms=%llu cq_label_count=%u",
                         static_cast<unsigned long long>(frame_number),
                         static_cast<unsigned long long>(frame_delta),
                         static_cast<unsigned long long>(skipped_delta),
@@ -9076,24 +9208,23 @@ int main(int, char**)
                         static_cast<unsigned long long>(g_resize_perf.blur_resize_calls),
                         static_cast<unsigned long>(thread_count),
                         static_cast<unsigned long>(thread_err),
+                        static_cast<unsigned>(taskflow.total_active),
+                        static_cast<unsigned long long>(taskflow.total_submitted),
+                        static_cast<unsigned long long>(taskflow.total_rejected),
+                        static_cast<unsigned long long>(taskflow.total_failed),
+                        static_cast<unsigned long long>(taskflow.total_timed_out),
                         static_cast<unsigned>(wq.active),
-                        wq.pending,
+                        static_cast<unsigned long long>(wq.pending),
                         static_cast<unsigned long long>(wq.oldest_active_ms),
-                        static_cast<unsigned>(wq.healthy_long_lived),
-                        static_cast<unsigned>(wq.hot_workers),
-                        static_cast<unsigned>(wq.not_queryable_workers),
+                        static_cast<unsigned>(wq.active_label_count),
                         static_cast<unsigned>(svc.active),
-                        svc.pending,
+                        static_cast<unsigned long long>(svc.pending),
                         static_cast<unsigned long long>(svc.oldest_active_ms),
-                        static_cast<unsigned>(svc.healthy_long_lived),
-                        static_cast<unsigned>(svc.hot_workers),
-                        static_cast<unsigned>(svc.not_queryable_workers),
+                        static_cast<unsigned>(svc.active_label_count),
                         static_cast<unsigned>(cq.active),
-                        cq.pending,
+                        static_cast<unsigned long long>(cq.pending),
                         static_cast<unsigned long long>(cq.oldest_active_ms),
-                        static_cast<unsigned>(cq.healthy_long_lived),
-                        static_cast<unsigned>(cq.hot_workers),
-                        static_cast<unsigned>(cq.not_queryable_workers));
+                        static_cast<unsigned>(cq.active_label_count));
                     diag::log_tagged_fmt("render",
                         "frame_pacing_io frame=%llu present_hr=0x%08X input_seen=%d last_input_msg=0x%04X last_input_msg_time=%lu last_input_age_newframe_ms=%llu input_to_present_ms=%llu input_events_delta=%llu input_events_this_frame=%llu proc_io_valid=%d proc_io_gle=%lu proc_io_wall_ms=%llu proc_read_ops_delta=%llu proc_write_ops_delta=%llu proc_other_ops_delta=%llu proc_read_bytes_delta=%llu proc_write_bytes_delta=%llu proc_other_bytes_delta=%llu proc_total_read_bytes=%llu proc_total_write_bytes=%llu debug_log_valid=%d debug_log_size=%llu debug_log_delta=%llu debug_log_reset=%d debug_log_gle=%lu kernel_log_valid=%d kernel_log_size=%llu kernel_log_delta=%llu kernel_log_reset=%d kernel_log_gle=%lu full_test_log_valid=%d full_test_log_size=%llu full_test_log_delta=%llu full_test_log_reset=%d full_test_log_gle=%lu camoufox_log_valid=%d camoufox_log_size=%llu camoufox_log_delta=%llu camoufox_log_reset=%d camoufox_log_gle=%lu defender_valid=%d defender_gle=%lu defender_msmpeng=%u defender_mpcmdrun=%u log_started=%d log_start_failed=%d log_queue_depth=%llu log_max_queue_depth=%llu log_queue_lock_busy=%d log_file_lock_busy=%d log_queued=%llu log_queued_bytes=%llu log_written=%llu log_written_bytes=%llu log_direct=%llu log_force_batches=%llu log_force_flushes=%llu log_normal_flushes=%llu log_flush_ms_total=%llu log_flush_ms_max=%llu log_flush_failures=%llu log_last_flush_error=%llu log_pending_flush_bytes=%llu log_tag_events=%llu log_tag_bytes=%llu log_tag_forced=%llu log_coalesced_success=%llu log_coalesced_bytes=%llu log_coalesced_summaries=%llu log_force_downgraded=%llu",
                         static_cast<unsigned long long>(frame_number),
@@ -9205,62 +9336,47 @@ int main(int, char**)
                         static_cast<unsigned long long>(blur_stats.last_restore_ms),
                         static_cast<unsigned long>(blur_stats.last_device_removed));
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_queue frame=%llu queue=general attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        "frame_pacing_taskflow_family frame=%llu family=work submitted=%llu rejected=%llu failed=%llu timed_out=%llu active=%u pending=%llu oldest_ms=%llu label_count=%u labels={%.900s}",
                         static_cast<unsigned long long>(frame_number),
-                        static_cast<unsigned long long>(wq.post_attempts),
-                        static_cast<unsigned long long>(wq.posted),
-                        static_cast<unsigned long long>(wq.rejected),
-                        static_cast<unsigned long long>(wq.started),
-                        static_cast<unsigned long long>(wq.finished),
+                        static_cast<unsigned long long>(taskflow.total_submitted),
+                        static_cast<unsigned long long>(taskflow.total_rejected),
+                        static_cast<unsigned long long>(taskflow.total_failed),
+                        static_cast<unsigned long long>(taskflow.total_timed_out),
                         static_cast<unsigned>(wq.active),
-                        wq.pending,
+                        static_cast<unsigned long long>(wq.pending),
                         static_cast<unsigned long long>(wq.oldest_active_ms),
                         static_cast<unsigned>(wq.active_label_count),
-                        static_cast<unsigned>(wq.healthy_long_lived),
-                        static_cast<unsigned>(wq.hot_workers),
-                        static_cast<unsigned>(wq.not_queryable_workers),
-                        wq.top_cpu_labels.empty() ? "<none>" : wq.top_cpu_labels.c_str(),
                         wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str());
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_queue frame=%llu queue=service attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        "frame_pacing_taskflow_family frame=%llu family=service submitted=%llu rejected=%llu failed=%llu timed_out=%llu active=%u pending=%llu oldest_ms=%llu label_count=%u labels={%.900s}",
                         static_cast<unsigned long long>(frame_number),
-                        static_cast<unsigned long long>(svc.post_attempts),
-                        static_cast<unsigned long long>(svc.posted),
-                        static_cast<unsigned long long>(svc.rejected),
-                        static_cast<unsigned long long>(svc.started),
-                        static_cast<unsigned long long>(svc.finished),
+                        static_cast<unsigned long long>(taskflow.total_submitted),
+                        static_cast<unsigned long long>(taskflow.total_rejected),
+                        static_cast<unsigned long long>(taskflow.total_failed),
+                        static_cast<unsigned long long>(taskflow.total_timed_out),
                         static_cast<unsigned>(svc.active),
-                        svc.pending,
+                        static_cast<unsigned long long>(svc.pending),
                         static_cast<unsigned long long>(svc.oldest_active_ms),
                         static_cast<unsigned>(svc.active_label_count),
-                        static_cast<unsigned>(svc.healthy_long_lived),
-                        static_cast<unsigned>(svc.hot_workers),
-                        static_cast<unsigned>(svc.not_queryable_workers),
-                        svc.top_cpu_labels.empty() ? "<none>" : svc.top_cpu_labels.c_str(),
                         svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str());
                     diag::log_tagged_fmt("render",
-                        "frame_pacing_queue frame=%llu queue=critical attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu active=%u pending=%zu oldest_ms=%llu label_count=%u healthy_long=%u hot=%u not_queryable=%u top_cpu={%.700s} labels={%.900s}",
+                        "frame_pacing_taskflow_family frame=%llu family=critical submitted=%llu rejected=%llu failed=%llu timed_out=%llu active=%u pending=%llu oldest_ms=%llu label_count=%u labels={%.900s}",
                         static_cast<unsigned long long>(frame_number),
-                        static_cast<unsigned long long>(cq.post_attempts),
-                        static_cast<unsigned long long>(cq.posted),
-                        static_cast<unsigned long long>(cq.rejected),
-                        static_cast<unsigned long long>(cq.started),
-                        static_cast<unsigned long long>(cq.finished),
+                        static_cast<unsigned long long>(taskflow.total_submitted),
+                        static_cast<unsigned long long>(taskflow.total_rejected),
+                        static_cast<unsigned long long>(taskflow.total_failed),
+                        static_cast<unsigned long long>(taskflow.total_timed_out),
                         static_cast<unsigned>(cq.active),
-                        cq.pending,
+                        static_cast<unsigned long long>(cq.pending),
                         static_cast<unsigned long long>(cq.oldest_active_ms),
                         static_cast<unsigned>(cq.active_label_count),
-                        static_cast<unsigned>(cq.healthy_long_lived),
-                        static_cast<unsigned>(cq.hot_workers),
-                        static_cast<unsigned>(cq.not_queryable_workers),
-                        cq.top_cpu_labels.empty() ? "<none>" : cq.top_cpu_labels.c_str(),
                         cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
                     static uint64_t s_last_post_test_cpu_correlation_ms = 0;
                     const bool post_test_cpu_pressure = !full_test_running_pre && cpu.valid && cpu.cpu_percent >= 25.0;
                     if (post_test_cpu_pressure && (s_last_post_test_cpu_correlation_ms == 0 || tick_now_ms - s_last_post_test_cpu_correlation_ms >= 10000ULL)) {
                         s_last_post_test_cpu_correlation_ms = tick_now_ms;
                         diag::log_tagged_fmt("render",
-                            "post_test_cpu_correlation frame=%llu cpu_pct=%.2f cpu_wall_ms=%llu cpu_busy_100ns=%llu proc_io_valid=%d proc_write_bytes_delta=%llu proc_read_bytes_delta=%llu debug_log_delta=%llu kernel_log_delta=%llu full_test_log_delta=%llu camoufox_log_delta=%llu defender_valid=%d defender_msmpeng=%u defender_mpcmdrun=%u wq_top_cpu={%.700s} svc_top_cpu={%.700s} cq_top_cpu={%.700s} wq_labels={%.900s} svc_labels={%.900s} cq_labels={%.900s}",
+                            "post_test_cpu_correlation frame=%llu cpu_pct=%.2f cpu_wall_ms=%llu cpu_busy_100ns=%llu proc_io_valid=%d proc_write_bytes_delta=%llu proc_read_bytes_delta=%llu debug_log_delta=%llu kernel_log_delta=%llu full_test_log_delta=%llu camoufox_log_delta=%llu defender_valid=%d defender_msmpeng=%u defender_mpcmdrun=%u taskflow_labels={%.900s} wq_labels={%.900s} svc_labels={%.900s} cq_labels={%.900s}",
                             static_cast<unsigned long long>(frame_number),
                             cpu.cpu_percent,
                             static_cast<unsigned long long>(cpu.wall_ms),
@@ -9275,9 +9391,7 @@ int main(int, char**)
                             defender.valid ? 1 : 0,
                             static_cast<unsigned>(defender.msmpeng),
                             static_cast<unsigned>(defender.mpcmdrun),
-                            wq.top_cpu_labels.empty() ? "<none>" : wq.top_cpu_labels.c_str(),
-                            svc.top_cpu_labels.empty() ? "<none>" : svc.top_cpu_labels.c_str(),
-                            cq.top_cpu_labels.empty() ? "<none>" : cq.top_cpu_labels.c_str(),
+                            taskflow.labels_under_pressure.empty() ? "<none>" : taskflow.labels_under_pressure.c_str(),
                             wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
                             svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str(),
                             cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
@@ -9290,7 +9404,7 @@ int main(int, char**)
                     if (s_last_runtime_acceptance_log_ms == 0 || tick_now_ms - s_last_runtime_acceptance_log_ms >= kAidaRuntimeAcceptanceLogIntervalMs) {
                         s_last_runtime_acceptance_log_ms = tick_now_ms;
                         diag::log_tagged_fmt("render",
-                            "runtime_acceptance_sample frame=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f sync=%u flags=0x%08X dirty_mask=0x%08X skipped_total=%llu overlay_visible=%d overlay_running=%d overlay_rendered=%zu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu wq_active=%u wq_pending=%zu svc_active=%u svc_pending=%zu cq_active=%u cq_pending=%zu",
+                            "runtime_acceptance_sample frame=%llu fps=%.2f cpu_pct=%.2f cpu_valid=%d gpu_available=%d gpu_valid=%d gpu_pending=%d gpu_ms=%.3f sync=%u flags=0x%08X dirty_mask=0x%08X skipped_total=%llu overlay_visible=%d overlay_running=%d overlay_rendered=%zu overlay_render_us=%llu resize_requests=%llu resize_applied=%llu resize_coalesced=%llu resize_skipped=%llu rt_recreates=%llu blur_resizes=%llu threads=%lu taskflow_active=%u taskflow_submitted=%llu taskflow_rejected=%llu wq_active=%u wq_pending=%llu svc_active=%u svc_pending=%llu cq_active=%u cq_pending=%llu",
                             static_cast<unsigned long long>(frame_number),
                             fps,
                             cpu.cpu_percent,
@@ -9314,12 +9428,15 @@ int main(int, char**)
                             static_cast<unsigned long long>(g_resize_perf.render_target_recreates),
                             static_cast<unsigned long long>(g_resize_perf.blur_resize_calls),
                             static_cast<unsigned long>(thread_count),
+                            static_cast<unsigned>(taskflow.total_active),
+                            static_cast<unsigned long long>(taskflow.total_submitted),
+                            static_cast<unsigned long long>(taskflow.total_rejected),
                             static_cast<unsigned>(wq.active),
-                            wq.pending,
+                            static_cast<unsigned long long>(wq.pending),
                             static_cast<unsigned>(svc.active),
-                            svc.pending,
+                            static_cast<unsigned long long>(svc.pending),
                             static_cast<unsigned>(cq.active),
-                            cq.pending);
+                            static_cast<unsigned long long>(cq.pending));
                     }
                 }
             }
@@ -9342,7 +9459,7 @@ int main(int, char**)
     aida::ui_thread::shutdown();
     {
         char queue_snapshot[2400] = {};
-        format_work_queue_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
+        format_taskflow_runtime_crash_snapshot(queue_snapshot, sizeof(queue_snapshot));
         diag::log_tagged_critical_fmt("main", "shutdown_queue_snapshot_pre %s", queue_snapshot);
     }
     aida_shutdown_diag::mark("shutdown_testlab_cancel");
@@ -9394,19 +9511,19 @@ int main(int, char**)
 
     aida_shutdown_diag::mark("shutdown_network");
     {
-        char network_queue_pre[2400] = {};
-        format_work_queue_crash_snapshot(network_queue_pre, sizeof(network_queue_pre));
-        diag::log_tagged_critical_fmt("main", "shutdown_network_cleanup_pre %s", network_queue_pre);
+        char network_taskflow_pre[2400] = {};
+        format_taskflow_runtime_crash_snapshot(network_taskflow_pre, sizeof(network_taskflow_pre));
+        diag::log_tagged_critical_fmt("main", "shutdown_network_cleanup_pre %s", network_taskflow_pre);
     }
     const uint64_t shutdown_network_start_ms = static_cast<uint64_t>(GetTickCount64());
     network_view::shutdown();
     const uint64_t shutdown_network_elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - shutdown_network_start_ms;
     {
-        char network_queue_post[2400] = {};
-        format_work_queue_crash_snapshot(network_queue_post, sizeof(network_queue_post));
+        char network_taskflow_post[2400] = {};
+        format_taskflow_runtime_crash_snapshot(network_taskflow_post, sizeof(network_taskflow_post));
         diag::log_tagged_critical_fmt("main", "shutdown_network_cleanup_done elapsed_ms=%llu %s",
             static_cast<unsigned long long>(shutdown_network_elapsed_ms),
-            network_queue_post);
+            network_taskflow_post);
     }
     aida_shutdown_diag::mark("shutdown_script_engine");
     script_engine::shutdown();
@@ -9420,6 +9537,9 @@ int main(int, char**)
     aida_shutdown_diag::mark("shutdown_auth_http");
     aida::auth::http::cleanup();
     diag::log_tagged_critical("main", "shutdown_auth_http_done");
+    aida_shutdown_diag::mark("shutdown_executor");
+    aida::infra::executor::shutdown();
+    diag::log_tagged_critical("main", "shutdown_executor_done");
     aida_shutdown_diag::mark("shutdown_blur");
     if (aida::ui_thread::require_owner("blur", "shutdown", "shutdown"))
         Blur::Shutdown();

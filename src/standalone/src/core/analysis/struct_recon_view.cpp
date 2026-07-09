@@ -18,7 +18,7 @@
 #include "imgui.h"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../anti-tamper/webhook.hpp"
 
 #include <algorithm>
@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace struct_recon_view {
 
@@ -289,9 +290,20 @@ void render(float pos_x, float pos_y, float width, float height,
 						"live_monitor_start_clicked addr=0x%llX size=%d name='%s'",
 						static_cast<unsigned long long>(addr), sz, sr.name_input);
 					std::string nm = sr.name_input;
-					work_queue::post([addr, sz, nm]() {
+					aida::infra::executor::submission_t sub;
+					sub.owner_subsystem = "analysis";
+					sub.label = "analysis.struct_recon.live_monitor_start";
+					sub.thread_class = "long_running";
+					sub.domain = aida::infra::executor::domain_t::long_running;
+					sub.priority = 2;
+					sub.body = [addr, sz, nm]() {
 						struct_monitor::start(addr, sz, nm);
-					});
+					};
+					if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+						diag::log_tagged_fmt("struct_recon",
+							"live_monitor_start_post_failed addr=0x%llX size=%d name='%s'",
+							static_cast<unsigned long long>(addr), sz, nm.c_str());
+					}
 				} else {
 					diag::log_tagged_fmt("struct_recon",
 						"live_monitor_skipped reason='addr_zero' input='%s'", sr.address_input);
@@ -369,12 +381,23 @@ void render(float pos_x, float pos_y, float width, float height,
 			std::lock_guard<std::mutex> lk(sr.mutex);
 			snap = sr.current;
 		}
-		work_queue::post([snap]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "analysis";
+		sub.label = "analysis.struct_recon.save_struct";
+		sub.thread_class = "bounded_task";
+		sub.domain = aida::infra::executor::domain_t::diagnostics;
+		sub.priority = 4;
+		sub.body = [snap]() {
 			struct_recon::save_struct_to_disk(snap);
 			diag::log_tagged_fmt("struct_recon",
 				"save_disk_done name='%s' fields=%zu",
 				snap.name.c_str(), snap.fields.size());
-		});
+		};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+			diag::log_tagged_fmt("struct_recon",
+				"save_disk_post_failed name='%s' fields=%zu",
+				snap.name.c_str(), snap.fields.size());
+		}
 		diag::log_tagged_fmt("struct_recon",
 			"save_clicked name='%s' fields=%zu",
 			snap.name.c_str(), snap.fields.size());
@@ -382,7 +405,13 @@ void render(float pos_x, float pos_y, float width, float height,
 	ImGui::SameLine(0.f, 6.f);
 	if (aida::ui::button("Load All", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(82.f, 28.f))) {
-		work_queue::post([]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "analysis";
+		sub.label = "analysis.struct_recon.load_all";
+		sub.thread_class = "bounded_task";
+		sub.domain = aida::infra::executor::domain_t::diagnostics;
+		sub.priority = 4;
+		sub.body = []() {
 			struct_recon::load_structs_from_disk();
 			size_t loaded = 0;
 			{
@@ -391,7 +420,9 @@ void render(float pos_x, float pos_y, float width, float height,
 			}
 			diag::log_tagged_fmt("struct_recon",
 				"load_all_done count=%zu", loaded);
-		});
+		};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted)
+			diag::log_tagged_fmt("struct_recon", "load_all_post_failed");
 		diag::log_tagged_fmt("struct_recon", "load_all_clicked");
 	}
 	ImGui::SameLine(0.f, 6.f);
@@ -407,11 +438,19 @@ void render(float pos_x, float pos_y, float width, float height,
 			any_fields = !sr.current.fields.empty();
 		}
 		if (active && base != 0 && any_fields) {
-			work_queue::post([]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "analysis";
+			sub.label = "analysis.struct_recon.refresh_values";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::diagnostics;
+			sub.priority = 4;
+			sub.body = []() {
 				struct_recon::refresh_value_history();
 				diag::log_tagged_fmt("struct_recon",
 					"refresh_value_history_done");
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+				diag::log_tagged_fmt("struct_recon", "refresh_value_history_post_failed");
 			diag::log_tagged_fmt("struct_recon",
 				"refresh_clicked base=0x%llX",
 				static_cast<unsigned long long>(base));

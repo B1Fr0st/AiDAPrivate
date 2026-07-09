@@ -1,7 +1,6 @@
 #pragma once
 
 #include "deobfuscation_engine.hpp"
-#include "work_queue.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
@@ -16,6 +15,7 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace deobfuscation_view {
@@ -82,7 +83,13 @@ inline void start_deobfuscate(local_state_t& st) {
 	deobfuscation_engine::g_state.progress_current.store(0);
 	deobfuscation_engine::g_state.progress_total.store(5);
 	auto t0 = std::chrono::steady_clock::now();
-	work_queue::post([addr, max_insn, t0]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "emulation";
+	sub.label = "emulation.deobfuscation.view";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = [addr, max_insn, t0]() {
 		deobfuscation_engine::deobfuscated_result_t result;
 		try {
 			result = deobfuscation_engine::deobfuscate_function(addr, max_insn);
@@ -111,7 +118,13 @@ inline void start_deobfuscate(local_state_t& st) {
 		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 		deobfuscation_engine::g_state.last_result = std::move(result);
 		deobfuscation_engine::g_state.processing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		deobfuscation_engine::g_state.processing.store(false);
+		diag::log_tagged_fmt("deobf",
+			"deob_view_post_failed entry=0x%llX",
+			static_cast<unsigned long long>(addr));
+	}
 }
 
 inline void render_glass_panel(ImDrawList* dl, ImVec2 a, ImVec2 b, float radius,

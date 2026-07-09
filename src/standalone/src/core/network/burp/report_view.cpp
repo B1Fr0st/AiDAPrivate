@@ -13,7 +13,7 @@
 #include "../../ui/components.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -104,7 +105,14 @@ void render(float pos_x, float pos_y, float width, float height,
         ::diag::log_tagged_fmt("report_v", "generate_report title='%s' format=%d path='%s' issues=%zu",
             cfg.title.c_str(), s_state.format_idx, cfg.output_path.c_str(), cnt);
         s_state.generating.store(true);
-        work_queue::post([cfg]() {
+        {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.report_view";
+            sub.label = "report.generate";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::diagnostics;
+            sub.priority = 3;
+            sub.body = [cfg]() {
             std::string out;
             bool ok = report::generate(cfg, out);
             {
@@ -114,7 +122,9 @@ void render(float pos_x, float pos_y, float width, float height,
             }
             ::diag::log_tagged_fmt("report_v", "generate_result ok=%d path='%s'", ok ? 1 : 0, out.c_str());
             s_state.generating.store(false);
-        });
+        };
+            (void)::aida::infra::executor::submit(std::move(sub));
+        }
     }
     if (gen) ImGui::EndDisabled();
     {

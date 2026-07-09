@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "function_index.hpp"
@@ -19,8 +20,8 @@
 #include "pe_parser.hpp"
 #include "xref_engine.hpp"
 #include "standalone_driver.hpp"
-#include "work_queue.hpp"
 #include "zydis_disasm.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace xref_index {
@@ -930,11 +931,25 @@ namespace xref_index {
 				static_cast<unsigned long long>(warm_lo),
 				static_cast<unsigned long long>(warm_hi),
 				current_worker_tid());
-			work_queue::post([weak, warm_lo, warm_hi]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "disasm";
+			sub.label = "disasm.xref_index.build_module";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::feature_worker;
+			sub.priority = 2;
+			sub.body = [weak, warm_lo, warm_hi]() {
 				auto strong = weak.lock();
 				if (!strong) return;
 				build_module_to_index(strong, warm_lo, warm_hi);
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+				mod->state.store(static_cast<uint32_t>(build_state_t::failed), std::memory_order_release);
+				diag::log_tagged_critical_fmt("xref",
+					"warm_range_schedule_post_failed module=%s base=0x%llX size=0x%llX",
+					mod->name.c_str(),
+					static_cast<unsigned long long>(mod->base),
+					static_cast<unsigned long long>(mod->size));
+			}
 		}
 
 	}
@@ -1020,7 +1035,13 @@ namespace xref_index {
 			if (reg.rebuild_in_flight.compare_exchange_strong(expected, true,
 				std::memory_order_acq_rel))
 			{
-				work_queue::post([&reg]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "disasm";
+				sub.label = "disasm.xref_index.rebuild_module_table";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 2;
+				sub.body = [&reg]() {
 					const auto rebuild_started = std::chrono::steady_clock::now();
 					diag::log_tagged_critical_fmt("xref",
 						"warm_range_rebuild_worker_enter tid=%lu",
@@ -1032,13 +1053,23 @@ namespace xref_index {
 						detail::current_worker_tid(),
 						reg.table_built.load(std::memory_order_acquire) ? 1 : 0,
 						static_cast<unsigned long long>(detail::elapsed_us_since(rebuild_started)));
-				});
-				diag::log_tagged_critical_fmt("xref",
-					"warm_range_exit lo=0x%llX hi=0x%llX reason=rebuild_queued tid=%lu elapsed_us=%llu",
-					static_cast<unsigned long long>(lo_addr),
-					static_cast<unsigned long long>(hi_addr),
-					detail::current_worker_tid(),
-					static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+				};
+				if (aida::infra::executor::submit(std::move(sub)).submitted) {
+					diag::log_tagged_critical_fmt("xref",
+						"warm_range_exit lo=0x%llX hi=0x%llX reason=rebuild_queued tid=%lu elapsed_us=%llu",
+						static_cast<unsigned long long>(lo_addr),
+						static_cast<unsigned long long>(hi_addr),
+						detail::current_worker_tid(),
+						static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+				} else {
+					reg.rebuild_in_flight.store(false, std::memory_order_release);
+					diag::log_tagged_critical_fmt("xref",
+						"warm_range_exit lo=0x%llX hi=0x%llX reason=rebuild_post_failed tid=%lu elapsed_us=%llu",
+						static_cast<unsigned long long>(lo_addr),
+						static_cast<unsigned long long>(hi_addr),
+						detail::current_worker_tid(),
+						static_cast<unsigned long long>(detail::elapsed_us_since(started)));
+				}
 			}
 			else {
 				diag::log_tagged_critical_fmt("xref",
@@ -1538,10 +1569,18 @@ namespace xref_index {
 			if (reg.rebuild_in_flight.compare_exchange_strong(expected, true,
 				std::memory_order_acq_rel))
 			{
-				work_queue::post([&reg]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "disasm";
+				sub.label = "disasm.xref_index.file_loaded_rebuild";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 2;
+				sub.body = [&reg]() {
 					detail::rebuild_module_table_offlock(reg);
 					reg.rebuild_in_flight.store(false, std::memory_order_release);
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted)
+					reg.rebuild_in_flight.store(false, std::memory_order_release);
 			}
 		}
 	}

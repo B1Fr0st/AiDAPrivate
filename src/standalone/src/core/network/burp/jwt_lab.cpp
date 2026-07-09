@@ -9,7 +9,7 @@
 #include "jwt_lab.hpp"
 
 #include "payload_library.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -28,6 +28,7 @@
 #include <openssl/pem.h>
 #include <openssl/params.h>
 #include <openssl/core_names.h>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -745,9 +746,29 @@ uint64_t start_crack(const crack_config_t& cfg)
         st.cracks[rec->id] = rec;
     }
 
+    size_t posted_workers = 0;
     for (size_t i = 0; i < rec->concurrency; ++i) {
         std::shared_ptr<crack_record_t> rec_copy = rec;
-        work_queue::post([rec_copy]() { run_crack_worker(rec_copy); });
+        if ([&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.jwt_lab";
+            sub.label = "jwt.crack_worker";
+            sub.thread_class = "long_running";
+            sub.domain = aida::infra::executor::domain_t::long_running;
+            sub.priority = 3;
+            sub.body = [rec_copy]() { run_crack_worker(rec_copy); };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }())
+            ++posted_workers;
+    }
+    if (posted_workers == 0) {
+        rec->running.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(st.cracks_mtx);
+            st.cracks.erase(rec->id);
+        }
+        set_err("jwt crack executor submission failed");
+        return 0;
     }
     diag::log_tagged_fmt("burp", "jwt_crack_start id=%llu words=%zu concurrency=%zu",
         static_cast<unsigned long long>(rec->id), rec->words.size(), rec->concurrency);

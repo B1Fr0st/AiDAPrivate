@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -16,12 +15,15 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "standalone_driver.hpp"
 #include "pe_parser.hpp"
 #include "ghidra_decompiler.hpp"
 #include "zydis_disasm.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Zydis/Zydis.h>
@@ -710,7 +712,15 @@ inline void reconstruct(const reconstruction_config_t& config) {
 		g_state.last_result.module_size = config.module_size;
 	}
 
-	const bool posted = work_queue::post([config]() {
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "source_reconstructor";
+	submission.label = "source_recon.reconstruct";
+	submission.thread_class = "source_reconstruction";
+	submission.domain = aida::infra::executor::domain_t::long_running;
+	submission.priority = 2;
+	submission.target_id = config.module_name.c_str();
+	submission.failure_policy = "reject_not_started";
+	submission.body = [config]() {
 		const uint64_t worker_start_ms = GetTickCount64();
 		diag::log_tagged_fmt("source_recon",
 			"worker_enter module=%s base=%s size=%u max_functions=%d tid=%lu",
@@ -913,72 +923,60 @@ inline void reconstruct(const reconstruction_config_t& config) {
 				}
 			};
 		};
-		auto wq_before_progress = work_queue::stats();
-		auto sq_before_progress = work_queue::service_stats();
+		auto rt_before_progress = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("source_recon",
-			"progress_updater_schedule_begin total=%d work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu",
+			"progress_updater_schedule_begin total=%d work_pending=%llu work_active=%u service_pending=%llu service_active=%u total_rejected=%llu",
 			total,
-			wq_before_progress.pending,
-			wq_before_progress.active,
-			static_cast<unsigned long long>(wq_before_progress.rejected),
-			sq_before_progress.pending,
-			sq_before_progress.active,
-			static_cast<unsigned long long>(sq_before_progress.rejected));
+			static_cast<unsigned long long>(rt_before_progress.work_queue_pending),
+			rt_before_progress.work_queue_active,
+			static_cast<unsigned long long>(rt_before_progress.service_queue_pending),
+			rt_before_progress.service_queue_active,
+			static_cast<unsigned long long>(rt_before_progress.total_rejected));
 		bool progress_posted = false;
 		const char* progress_queue = "none";
 		try {
-			progress_posted = work_queue::post_service(make_progress_task());
+			aida::infra::executor::submission_t progress_submission;
+			progress_submission.owner_subsystem = "source_reconstructor";
+			progress_submission.label = "source_recon.progress_updater";
+			progress_submission.thread_class = "source_reconstruction_progress";
+			progress_submission.domain = aida::infra::executor::domain_t::diagnostics;
+			progress_submission.priority = 4;
+			progress_submission.failure_policy = "reject_not_started";
+			progress_submission.shutdown_policy = "abandon_on_shutdown";
+			progress_submission.body = make_progress_task();
+			progress_posted = aida::infra::executor::submit(std::move(progress_submission)).submitted;
 			if (progress_posted)
-				progress_queue = "service";
+				progress_queue = "diagnostics";
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("source_recon",
-				"progress_updater_schedule_exception queue=service total=%d err=%s",
+				"progress_updater_schedule_exception queue=diagnostics total=%d err=%s",
 				total,
 				ex.what());
 		} catch (...) {
 			diag::log_tagged_fmt("source_recon",
-				"progress_updater_schedule_exception queue=service total=%d err=<unknown>",
+				"progress_updater_schedule_exception queue=diagnostics total=%d err=<unknown>",
 				total);
 		}
-		if (!progress_posted) {
-			try {
-				progress_posted = work_queue::post(make_progress_task());
-				if (progress_posted)
-					progress_queue = "work";
-			} catch (const std::exception& ex) {
-				diag::log_tagged_fmt("source_recon",
-					"progress_updater_schedule_exception queue=work total=%d err=%s",
-					total,
-					ex.what());
-			} catch (...) {
-				diag::log_tagged_fmt("source_recon",
-					"progress_updater_schedule_exception queue=work total=%d err=<unknown>",
-					total);
-			}
-		}
-		auto wq_after_progress = work_queue::stats();
-		auto sq_after_progress = work_queue::service_stats();
+		auto rt_after_progress = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("source_recon",
-			"progress_updater_schedule_end posted=%d queue=%s total=%d work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu",
+			"progress_updater_schedule_end posted=%d queue=%s total=%d work_pending=%llu work_active=%u service_pending=%llu service_active=%u total_rejected=%llu",
 			progress_posted ? 1 : 0,
 			progress_queue,
 			total,
-			wq_after_progress.pending,
-			wq_after_progress.active,
-			static_cast<unsigned long long>(wq_after_progress.rejected),
-			sq_after_progress.pending,
-			sq_after_progress.active,
-			static_cast<unsigned long long>(sq_after_progress.rejected));
+			static_cast<unsigned long long>(rt_after_progress.work_queue_pending),
+			rt_after_progress.work_queue_active,
+			static_cast<unsigned long long>(rt_after_progress.service_queue_pending),
+			rt_after_progress.service_queue_active,
+			static_cast<unsigned long long>(rt_after_progress.total_rejected));
 		if (!progress_posted) {
 			diag::log_tagged_fmt("source_recon",
-				"progress_updater_inline_fallback total=%d work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu",
+				"progress_updater_inline_fallback total=%d work_pending=%llu work_active=%u service_pending=%llu service_active=%u total_rejected=%llu",
 				total,
-				wq_after_progress.pending,
-				wq_after_progress.active,
-				static_cast<unsigned long long>(wq_after_progress.rejected),
-				sq_after_progress.pending,
-				sq_after_progress.active,
-				static_cast<unsigned long long>(sq_after_progress.rejected));
+				static_cast<unsigned long long>(rt_after_progress.work_queue_pending),
+				rt_after_progress.work_queue_active,
+				static_cast<unsigned long long>(rt_after_progress.service_queue_pending),
+				rt_after_progress.service_queue_active,
+				static_cast<unsigned long long>(rt_after_progress.total_rejected));
 			publish_progress();
 		}
 
@@ -1217,7 +1215,8 @@ inline void reconstruct(const reconstruction_config_t& config) {
 				g_state.running.store(false, std::memory_order_release);
 			}
 		}
-	});
+	};
+	const bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 	if (!posted) {
 		diag::log_tagged_fmt("source_recon",
 			"reconstruct_post_failed module=%s base=%s size=%u",

@@ -4,7 +4,7 @@
 #include <shlobj.h>
 
 #include "cert_generator.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <openssl/bn.h>
@@ -82,7 +82,13 @@ static bool run_cert_store_operation_bounded(const char* op_name,
     auto state = std::make_shared<cert_store_async_state_t>();
     std::string op = op_name ? op_name : "cert_store_operation";
     try {
-        if (!work_queue::post([state, op, fn = std::move(fn)]() mutable {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "network.cert";
+        sub.label = "cert.store_operation";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::feature_worker;
+        sub.priority = 3;
+        sub.body = [state, op, fn = std::move(fn)]() mutable {
             const ULONGLONG t0 = GetTickCount64();
             diag::log_tagged_fmt("cert", "%s worker_entry tid=%lu active_workers=%ld",
                 op.c_str(),
@@ -111,7 +117,8 @@ static bool run_cert_store_operation_bounded(const char* op_name,
                 static_cast<unsigned long long>(elapsed));
             g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
             state->done.store(true, std::memory_order_release);
-        })) {
+        };
+        if (!aida::infra::executor::submit(std::move(sub)).submitted) {
             DWORD start_gle = ERROR_NOT_READY;
             g_cert_store_workers.fetch_sub(1, std::memory_order_acq_rel);
             diag::log_tagged_fmt("cert", "%s worker_post_failed gle=%lu",

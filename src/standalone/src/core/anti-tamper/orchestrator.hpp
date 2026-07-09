@@ -53,7 +53,7 @@
 
 #include "obfuscation.hpp"
 #include "standalone_license.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../arc/arc.h"
 #include "../runtime/loader_header_invariant.hpp"
 #include "../runtime/reason_ids.hpp"
@@ -2435,10 +2435,17 @@ inline bool finalize_thread_creation_probe(const char* phase)
     bool posted = false;
     try
     {
-        posted = work_queue::post_labeled(phase, [state]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "anti_tamper_orchestrator";
+        sub.label = phase && *phase ? phase : "anti_tamper.worker_probe";
+        sub.thread_class = "security_task";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.body = [state]() {
                 state->ran.store(true, std::memory_order_release);
                 SetEvent(state->event_handle);
-            });
+            };
+        posted = aida::infra::executor::submit(std::move(sub)).submitted;
     }
     catch (const std::exception& ex)
     {
@@ -4256,7 +4263,14 @@ inline bool post_monitor_task(const char* ok_tag, const char* fail_tag, std::fun
         static_cast<unsigned long long>(tick));
     try
     {
-        bool posted = work_queue::post_labeled(ok_tag, std::move(task));
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "anti_tamper_orchestrator";
+        sub.label = ok_tag && *ok_tag ? ok_tag : "anti_tamper.monitor_task";
+        sub.thread_class = "security_task";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.body = std::move(task);
+        bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
         webhook::write_log_critical_fmt("init",
             "post_monitor_task_post ok_tag=%s fail_tag=%s posted=%d elapsed_ms=%llu",
             ok_tag ? ok_tag : "<null>",

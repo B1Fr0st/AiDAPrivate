@@ -4,7 +4,6 @@
 #include <shlobj.h>
 #include <algorithm>
 #include <atomic>
-#include "work_queue.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -17,11 +16,13 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "standalone_driver.hpp"
 #include "xref_engine.hpp"
 #include "zydis_disasm.hpp"
+#include "../infra/executor.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -422,7 +423,13 @@ inline void build_module_index(const std::string& name, uint64_t base, uint32_t 
 	g_state.progress.store(0.f);
 	g_state.building_module = name;
 
-	if (!work_queue::post([name, base, size]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "analysis";
+	sub.label = "analysis.xref_db.build_module_index";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = [name, base, size]() {
 		struct build_finish_t {
 			~build_finish_t() { g_state.building.store(false); }
 		} build_finish;
@@ -436,7 +443,8 @@ inline void build_module_index(const std::string& name, uint64_t base, uint32_t 
 		}
 
 		g_state.building.store(false);
-	})) {
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 		g_state.building.store(false);
 	}
 }

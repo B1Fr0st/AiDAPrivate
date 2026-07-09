@@ -16,8 +16,8 @@
 
 #include "helpers/diag_log.hpp"
 #include "../../infra/event_bus.hpp"
-#include "../../infra/work_queue.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
+#include "../../infra/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +32,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -684,14 +685,23 @@ void worker_step(std::shared_ptr<crawl_t> ctx, queue_item_t item)
             static_cast<unsigned long long>(c.id),
             static_cast<unsigned long long>(cont_token));
         auto cont_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(cont_admission));
-        if (!work_queue::post([ctx, cont_admission_ptr, cont_token]() {
+        if (![&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.crawler";
+            sub.label = "crawler.run_crawl";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 3;
+            sub.body = [ctx, cont_admission_ptr, cont_token]() {
             run_crawl(ctx);
             diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=continuation",
                 static_cast<unsigned long long>(ctx->id),
                 static_cast<unsigned long long>(cont_token));
             cont_admission_ptr->release("completed");
-        })) {
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable phase=continuation",
+        };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }()) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable phase=continuation",
                 static_cast<unsigned long long>(c.id),
                 static_cast<unsigned long long>(cont_token));
         }
@@ -766,15 +776,24 @@ void run_crawl(std::shared_ptr<crawl_t> ctx)
             static_cast<unsigned long long>(c.id),
             static_cast<unsigned long long>(wait_token));
         auto wait_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(wait_admission));
-        if (!work_queue::post([ctx, wait_admission_ptr, wait_token]() {
+        if (![&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.crawler";
+            sub.label = "crawler.wait";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 3;
+            sub.body = [ctx, wait_admission_ptr, wait_token]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             run_crawl(ctx);
             diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=wait",
                 static_cast<unsigned long long>(ctx->id),
                 static_cast<unsigned long long>(wait_token));
             wait_admission_ptr->release("completed");
-        })) {
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable phase=wait",
+        };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }()) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable phase=wait",
                 static_cast<unsigned long long>(c.id),
                 static_cast<unsigned long long>(wait_token));
         }
@@ -875,14 +894,23 @@ uint64_t start(const crawl_config_t& config)
             static_cast<unsigned long long>(ctx->id),
             static_cast<unsigned long long>(kick_token));
         auto kick_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(kick_admission));
-        if (!work_queue::post([ctx, kick_admission_ptr, kick_token]() {
+        if (![&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.crawler";
+            sub.label = "crawler.kick";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 3;
+            sub.body = [ctx, kick_admission_ptr, kick_token]() {
             run_crawl(ctx);
             diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
                 static_cast<unsigned long long>(ctx->id),
                 static_cast<unsigned long long>(kick_token));
             kick_admission_ptr->release("completed");
-        })) {
-            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable phase=kick",
+        };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }()) {
+            diag::log_tagged_fmt("burp.crawler", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable phase=kick",
                 static_cast<unsigned long long>(ctx->id),
                 static_cast<unsigned long long>(kick_token));
         }

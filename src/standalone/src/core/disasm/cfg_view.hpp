@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "imgui/imgui.h"
@@ -24,10 +25,10 @@
 #include "debugger_engine.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
-#include "work_queue.hpp"
 #include "../analysis/pdb_events.hpp"
 #include "../analysis/symbol_store.hpp"
 #include "../anti-tamper/webhook.hpp"
+#include "../infra/executor.hpp"
 #include "../infra/event_bus.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
@@ -490,7 +491,13 @@ inline void build_cfg(uint64_t entry_address)
 	}
 
 	try {
-		if (!work_queue::post([entry_address]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "disasm";
+		sub.label = "disasm.cfg.build";
+		sub.thread_class = "bounded_task";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 2;
+		sub.body = [entry_address]() {
 		try {
 		struct build_guard_t {
 			~build_guard_t()
@@ -826,7 +833,8 @@ inline void build_cfg(uint64_t entry_address)
 				static_cast<unsigned long long>(entry_address));
 			g_state.building.store(false);
 		}
-	})) {
+	};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 			diag::log_tagged_fmt("cfg", "build_cfg worker_post_failed entry=0x%llX",
 				static_cast<unsigned long long>(entry_address));
 			g_state.building.store(false);

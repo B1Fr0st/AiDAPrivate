@@ -12,7 +12,7 @@
 #include "../../ui/components.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
@@ -23,6 +23,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -136,7 +137,14 @@ void render(float pos_x, float pos_y, float width, float height,
         cfg.headers      = parse_headers(s_state.headers_buf);
         ::diag::log_tagged_fmt("ws_v", "connect scheme=%s host=%s port=%d path=%s",
             cfg.scheme.c_str(), cfg.host.c_str(), cfg.port, cfg.path.c_str());
-        work_queue::post([cfg]() {
+        {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.ws_view";
+            sub.label = "ws.connect";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::external_tool;
+            sub.priority = 3;
+            sub.body = [cfg]() {
             uint64_t id = ws_editor::connect(cfg);
             std::lock_guard<std::mutex> lk(s_state.lock);
             if (id != 0) {
@@ -148,7 +156,9 @@ void render(float pos_x, float pos_y, float width, float height,
                 s_state.last_action_kind = "error";
                 s_state.last_action = ws_editor::last_error();
             }
-        });
+        };
+            (void)::aida::infra::executor::submit(std::move(sub));
+        }
     }
 
     ImGui::SetCursorPos(ImVec2(8.f, 40.f));
@@ -217,7 +227,16 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::SameLine();
         if (aida::ui::button("Disconnect", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
             ::diag::log_tagged_fmt("ws_v", "disconnect id=%llu", static_cast<unsigned long long>(cid));
-            work_queue::post([cid]() { ws_editor::disconnect(cid); });
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.ws_view";
+                sub.label = "ws.disconnect";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [cid]() { ws_editor::disconnect(cid); };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
         ImGui::SameLine();
         if (aida::ui::button("Clear log", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
@@ -227,12 +246,30 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::SameLine();
         if (aida::ui::button("Ping", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             ::diag::log_tagged_fmt("ws_v", "send_ping id=%llu", static_cast<unsigned long long>(cid));
-            work_queue::post([cid]() { ws_editor::send_ping(cid, {}); });
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.ws_view";
+                sub.label = "ws.send_ping";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [cid]() { ws_editor::send_ping(cid, {}); };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
         ImGui::SameLine();
         if (aida::ui::button("Close", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
             ::diag::log_tagged_fmt("ws_v", "send_close id=%llu", static_cast<unsigned long long>(cid));
-            work_queue::post([cid]() { ws_editor::send_close(cid, 1000, "user_close"); });
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.ws_view";
+                sub.label = "ws.send_close";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [cid]() { ws_editor::send_close(cid, 1000, "user_close"); };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
 
         float log_h = content_h * 0.55f;
@@ -286,7 +323,14 @@ void render(float pos_x, float pos_y, float width, float height,
                 static_cast<unsigned long long>(cid),
                 mode,
                 mode == 0 ? text.size() : hex.size());
-            work_queue::post([cid, mode, text, hex, opcode, fin, masked]() {
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.ws_view";
+                sub.label = "ws.send_frame";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [cid, mode, text, hex, opcode, fin, masked]() {
                 if (mode == 0) {
                     ws_editor::send_text(cid, text);
                 } else if (mode == 1) {
@@ -297,7 +341,9 @@ void render(float pos_x, float pos_y, float width, float height,
                     parse_hex_payload(hex, bin);
                     ws_editor::send_raw_frame(cid, static_cast<uint8_t>(opcode), fin, masked, bin);
                 }
-            });
+            };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
     } else {
         aida::ui::empty_state::config_t cfg;

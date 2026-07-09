@@ -1,7 +1,7 @@
 #pragma once
 
 #include <windows.h>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include <psapi.h>
 #include <intrin.h>
 #include <winternl.h>
@@ -1040,15 +1040,13 @@ namespace handle_strip
             return false;
         }
 
-        auto wait_for_worker = [&](HANDLE thread, const char* path) -> bool
+        auto wait_for_worker = [&](const char* path) -> bool
         {
             DWORD wait = WaitForSingleObject(state->done_event, timeout_ms);
             if (wait == WAIT_OBJECT_0)
             {
                 bool ok = state->ok.load(std::memory_order_acquire);
                 DWORD seh = state->seh_code.load(std::memory_order_acquire);
-                if (thread)
-                    CloseHandle(thread);
                 CloseHandle(state->done_event);
                 delete state;
                 if (seh != 0)
@@ -1064,37 +1062,31 @@ namespace handle_strip
             anti_tamper::webhook::write_log_critical_fmt("anti_dump",
                 "sa_seal_dacl_worker_timeout path=%s wait=0x%08lX timeout_ms=%lu",
                 path ? path : "unknown", wait, timeout_ms);
-            if (thread)
-                CloseHandle(thread);
             return false;
         };
 
-        bool posted = work_queue::post_labeled("anti_dump.dacl_seal_worker", [state]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "runtime_anti_dump";
+        sub.label = "anti_dump.dacl_seal_worker";
+        sub.thread_class = "security_task";
+        sub.domain = aida::infra::executor::domain_t::critical;
+        sub.priority = 0;
+        sub.body = [state]() {
             dacl_seal_worker_proc(state);
-        });
+        };
+        bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
         if (posted)
         {
             anti_tamper::webhook::write_log_critical("anti_dump",
-                "sa_seal_dacl_worker_work_queue_posted");
-            return wait_for_worker(nullptr, "work_queue");
+                "sa_seal_dacl_worker_executor_posted");
+            return wait_for_worker("executor");
         }
 
         anti_tamper::webhook::write_log_critical("anti_dump",
-            "sa_seal_dacl_worker_work_queue_post_failed");
-
-        SetLastError(ERROR_SUCCESS);
-        HANDLE thread = CreateThread(nullptr, 0, dacl_seal_worker_proc, state, 0, nullptr);
-        if (!thread)
-        {
-            DWORD create_gle = GetLastError();
-            anti_tamper::webhook::write_log_critical_fmt("anti_dump",
-                "sa_seal_dacl_worker_create_failed gle=%lu", create_gle);
-            CloseHandle(state->done_event);
-            delete state;
-            return false;
-        }
-
-        return wait_for_worker(thread, "thread");
+            "sa_seal_dacl_worker_executor_post_failed");
+        CloseHandle(state->done_event);
+        delete state;
+        return false;
     }
 
     inline NtSetInformationProcess_t get_nt_set_info()
@@ -1433,12 +1425,19 @@ inline bool initialize()
     bool expected_posted = false;
     if (s_anti_dump_reencrypt_posted.compare_exchange_strong(expected_posted, true, std::memory_order_acq_rel))
     {
-        if (work_queue::post_service_labeled("anti_dump.periodic_reencrypt", []() { monitor::run_periodic_reencrypt(); }))
-            anti_tamper::webhook::write_log("anti_dump", "sa_monitor_work_queue_ok");
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "runtime_anti_dump";
+        sub.label = "anti_dump.periodic_reencrypt";
+        sub.thread_class = "service_loop";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.body = []() { monitor::run_periodic_reencrypt(); };
+        if (aida::infra::executor::submit(std::move(sub)).submitted)
+            anti_tamper::webhook::write_log("anti_dump", "sa_monitor_executor_ok");
         else
         {
             s_anti_dump_reencrypt_posted.store(false, std::memory_order_release);
-            anti_tamper::webhook::write_log("anti_dump", "sa_monitor_work_queue_fail");
+            anti_tamper::webhook::write_log("anti_dump", "sa_monitor_executor_fail");
         }
     }
 

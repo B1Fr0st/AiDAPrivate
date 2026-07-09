@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include "work_queue.hpp"
 #include "zydis_disasm.hpp"
 #include <atomic>
 #include <chrono>
@@ -16,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "standalone_driver.hpp"
@@ -25,7 +25,7 @@
 #include "function_index.hpp"
 #include "../analysis/pdb_events.hpp"
 #include "../infra/event_bus.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
@@ -851,14 +851,24 @@ inline void decompile_function_native(uint64_t func_addr, const DisasmFile* file
 		static_cast<unsigned long long>(func_addr),
 		static_cast<unsigned long long>(dec_admission.token()));
 
-	if (!critical_work_queue::post(worker_with_drain) && !work_queue::post(std::move(worker_with_drain))) {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "disasm";
+	sub.label = "disasm.decompiler.native";
+	sub.thread_class = "external_tool";
+	sub.domain = aida::infra::executor::domain_t::external_tool;
+	sub.priority = 1;
+	sub.target_id = "decompile_function_native";
+	sub.lease_token = dec_admission.token();
+	sub.failure_policy = "reject_not_started";
+	sub.body = std::move(worker_with_drain);
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 		diag::log_tagged_critical_fmt("dec",
-			"decompile_function_native_dispatch_failed addr=0x%llX reason=work_queue_unavailable",
+			"decompile_function_native_dispatch_failed addr=0x%llX reason=executor_unavailable",
 			static_cast<unsigned long long>(func_addr));
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.current.function_addr = func_addr;
 		g_state.current.is_error = true;
-		g_state.current.error_text = "work queue not available";
+		g_state.current.error_text = "executor not available";
 		g_state.current.complete = true;
 		g_state.decompiling.store(false);
 		return;
@@ -1010,7 +1020,14 @@ inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
 		g_state.batch_queue = addresses;
 	}
 
-	if (!work_queue::post([addresses]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "disasm";
+	sub.label = "disasm.decompiler.batch_native";
+	sub.thread_class = "long_running";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.failure_policy = "reject_not_started";
+	sub.body = [addresses]() {
 		if (addresses.empty()) {
 			g_state.batch_running.store(false);
 			return;
@@ -1075,9 +1092,10 @@ inline void batch_decompile_native(const std::vector<uint64_t>& addresses) {
 
 		g_state.batch_running.store(false);
 		g_state.decompiling.store(false);
-	})) {
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 		diag::log_tagged_critical("dec",
-			"batch_decompile_native_dispatch_failed reason=work_queue_unavailable");
+			"batch_decompile_native_dispatch_failed reason=executor_unavailable");
 		g_state.batch_running.store(false);
 	}
 }

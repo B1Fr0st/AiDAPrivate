@@ -16,8 +16,8 @@
 
 #include "helpers/diag_log.hpp"
 #include "../../infra/event_bus.hpp"
-#include "../../infra/work_queue.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
+#include "../../infra/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +32,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -537,14 +538,23 @@ void worker_one(std::shared_ptr<disc_t> ctx, candidate_t cand)
             static_cast<unsigned long long>(d.id),
             static_cast<unsigned long long>(cont_token));
         auto cont_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(cont_admission));
-        if (!work_queue::post([ctx, cont_admission_ptr, cont_token]() {
+        if (![&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.content_discovery";
+            sub.label = "content_discovery.run_disc";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 3;
+            sub.body = [ctx, cont_admission_ptr, cont_token]() {
             run_disc(ctx);
             diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
                 static_cast<unsigned long long>(ctx->id),
                 static_cast<unsigned long long>(cont_token));
             cont_admission_ptr->release("completed");
-        })) {
-            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable",
+        };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }()) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable",
                 static_cast<unsigned long long>(d.id),
                 static_cast<unsigned long long>(cont_token));
         }
@@ -605,15 +615,24 @@ void run_disc(std::shared_ptr<disc_t> ctx)
             static_cast<unsigned long long>(d.id),
             static_cast<unsigned long long>(wait_token));
         auto wait_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(wait_admission));
-        if (!work_queue::post([ctx, wait_admission_ptr, wait_token]() {
+        if (![&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.content_discovery";
+            sub.label = "content_discovery.wait";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 3;
+            sub.body = [ctx, wait_admission_ptr, wait_token]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             run_disc(ctx);
             diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed",
                 static_cast<unsigned long long>(ctx->id),
                 static_cast<unsigned long long>(wait_token));
             wait_admission_ptr->release("completed");
-        })) {
-            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=work_queue_unavailable",
+        };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }()) {
+            diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=executor_unavailable",
                 static_cast<unsigned long long>(d.id),
                 static_cast<unsigned long long>(wait_token));
         }
@@ -819,7 +838,14 @@ uint64_t start(const config_t& cfg)
         static_cast<unsigned long long>(start_token));
 
     auto start_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(start_admission));
-    bool posted = work_queue::post([ctx, start_admission_ptr, start_token]() {
+    bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.content_discovery";
+        sub.label = "content_discovery.start";
+        sub.thread_class = "long_running";
+        sub.domain = aida::infra::executor::domain_t::long_running;
+        sub.priority = 3;
+        sub.body = [ctx, start_admission_ptr, start_token]() {
         if (ctx->config.auto_calibrate) auto_calibrate(*ctx);
         {
             std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
@@ -848,20 +874,30 @@ uint64_t start(const config_t& cfg)
             }
             const uint64_t kick_token = kick_admission.token();
             auto kick_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(kick_admission));
-            if (work_queue::post([ctx, kick_admission_ptr, kick_token]() {
-                run_disc(ctx);
-                diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
-                    static_cast<unsigned long long>(ctx->id),
-                    static_cast<unsigned long long>(kick_token));
-                kick_admission_ptr->release("completed");
-            }))
+            const bool kick_posted = [&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.content_discovery";
+                sub.label = "content_discovery.kick";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::feature_worker;
+                sub.priority = 3;
+                sub.body = [ctx, kick_admission_ptr, kick_token]() {
+                    run_disc(ctx);
+                    diag::log_tagged_fmt("burp.content_discovery", "BURP-NETWORK-WORKER-RELEASE id=%llu token=%llu reason=completed phase=kick",
+                        static_cast<unsigned long long>(ctx->id),
+                        static_cast<unsigned long long>(kick_token));
+                    kick_admission_ptr->release("completed");
+                };
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }();
+            if (kick_posted)
                 ++posted_kicks;
         }
         if (posted_kicks == 0) {
             std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
             if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
                 ctx->phase.store(disc_phase_t::error, std::memory_order_release);
-                ctx->last_error = "work queue post failed";
+                ctx->last_error = "executor post failed";
                 ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
             }
             ctx->finished.store(true, std::memory_order_release);
@@ -873,18 +909,20 @@ uint64_t start(const config_t& cfg)
             static_cast<unsigned long long>(ctx->id),
             static_cast<unsigned long long>(start_token));
         start_admission_ptr->release("completed");
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
     if (!posted) {
         {
             std::unique_lock<std::timed_mutex> lk(ctx->mtx, std::defer_lock);
             if (lk.try_lock_for(std::chrono::milliseconds(kRunLockTimeoutMs))) {
                 ctx->phase.store(disc_phase_t::error, std::memory_order_release);
-                ctx->last_error = "work queue post failed";
+                ctx->last_error = "executor post failed";
                 ctx->finished_unix_ms.store(now_ms(), std::memory_order_release);
             }
         }
         ctx->finished.store(true, std::memory_order_release);
-        set_err("work queue post failed");
+        set_err("executor post failed");
         diag::log_tagged_fmt("content_discovery", "start_post_failed id=%llu target=%s",
             static_cast<unsigned long long>(ctx->id),
             cfg.target_url.c_str());

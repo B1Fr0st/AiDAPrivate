@@ -17,7 +17,7 @@
 #include "../session/session_store.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -29,6 +29,7 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <utility>
 
 using json = nlohmann::json;
 
@@ -260,7 +261,13 @@ void standalone_ai_client_t::chat_async(
     auto prompt = build_chat_prompt(user_message, history);
 
 
-    work_queue::post([this, prompt, on_complete, on_chunk]() {
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "ai_client";
+    sub.label = "ai_client.chat_async";
+    sub.thread_class = "bounded_task";
+    sub.domain = aida::infra::executor::domain_t::external_tool;
+    sub.priority = 3;
+    sub.body = [this, prompt, on_complete, on_chunk]() {
         std::string result;
         try {
 
@@ -284,7 +291,12 @@ void standalone_ai_client_t::chat_async(
 
         std::lock_guard<std::mutex> rl(_result_mtx);
         _results.push_back({on_complete, std::move(result)});
-    });
+    };
+    if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+        _task_done = true;
+        std::lock_guard<std::mutex> rl(_result_mtx);
+        _results.push_back({on_complete, "Error: Service unavailable. Please restart the application."});
+    }
 }
 
 

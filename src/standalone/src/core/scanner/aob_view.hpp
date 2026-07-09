@@ -11,6 +11,7 @@
 #include "../anti-tamper/webhook.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -341,12 +342,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] aob optimize invoked");
-			work_queue::post([to_optimize]() mutable {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "scanner";
+			sub.label = "scanner.aob_optimize";
+			sub.thread_class = "scanner_sweep";
+			sub.domain = aida::infra::executor::domain_t::long_running;
+			sub.priority = 2;
+			sub.target_pid = driver_bridge::attached_pid();
+			sub.body = [to_optimize]() mutable {
 				aob_generator::optimize_signature(to_optimize);
 				std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
 				if (aob_generator::g_state.current.id == to_optimize.id)
 					aob_generator::g_state.current = std::move(to_optimize);
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+				diag::log_tagged("aob", "optimize worker_queue_rejected");
 		}
 		run_x = ImGui::GetItemRectMax().x + btn_gap + 6.f;
 
@@ -571,7 +581,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob compare invoked");
-				work_queue::post([sigs_copy]() mutable {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "scanner";
+				sub.label = "scanner.aob_compare";
+				sub.thread_class = "scanner_sweep";
+				sub.domain = aida::infra::executor::domain_t::long_running;
+				sub.priority = 2;
+				sub.target_pid = driver_bridge::attached_pid();
+				sub.body = [sigs_copy]() mutable {
 					auto results = aob_generator::compare_signatures_against_process(sigs_copy);
 					std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
 					auto& saved = aob_generator::g_state.saved_signatures;
@@ -581,7 +598,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						saved[ri].uniqueness_count = results[ri].match_count;
 						saved[ri].quality_score = aob_generator::compute_quality_score(saved[ri]);
 					}
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted)
+					diag::log_tagged("aob", "compare worker_queue_rejected");
 			}
 			bx += 90.f;
 

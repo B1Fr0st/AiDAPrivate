@@ -1,7 +1,7 @@
 #include "heap_track.hpp"
 
 #include "artifact_store.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <utility>
 
 namespace re::heap_track
 {
@@ -942,7 +943,15 @@ bool start_heap_debug_loop(std::uint32_t pid, std::string& error)
     state.attached.store(false, std::memory_order_release);
     state.polling.store(true, std::memory_order_release);
     state.running.store(true, std::memory_order_release);
-    if (!work_queue::post_service([]() { heap_debug_loop(); }))
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "re.heap_track";
+    sub.label = "heap_track.debug_loop";
+    sub.thread_class = "service_loop";
+    sub.domain = aida::infra::executor::domain_t::service;
+    sub.priority = 4;
+    sub.target_pid = pid;
+    sub.body = []() { heap_debug_loop(); };
+    if (!aida::infra::executor::submit(std::move(sub)).submitted)
     {
         state.polling.store(false, std::memory_order_release);
         state.running.store(false, std::memory_order_release);

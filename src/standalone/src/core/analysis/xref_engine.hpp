@@ -1,16 +1,16 @@
 #pragma once
 
 #include <atomic>
-#include "work_queue.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 
@@ -196,7 +196,14 @@ inline bool find_xrefs_to(uint64_t target_addr, uint64_t search_start, uint64_t 
 		worker();
 		return true;
 	}
-	if (!critical_work_queue::post(worker) && !work_queue::post(worker)) {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "analysis";
+	sub.label = "analysis.xref.find_to";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = std::move(worker);
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 		g_state.scanning.store(false, std::memory_order_release);
 		return false;
 	}

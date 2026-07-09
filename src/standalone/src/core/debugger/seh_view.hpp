@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include "work_queue.hpp"
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -22,6 +21,7 @@
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
 
 extern DisasmState g_disasm;
 
@@ -122,7 +122,14 @@ inline void refresh()
 		static_cast<unsigned>(driver_bridge::attached_pid()),
 		static_cast<unsigned>(debugger_engine::g_state.active_tid));
 	try {
-		if (!work_queue::post([]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "debugger";
+		sub.label = "debugger.seh_refresh";
+		sub.thread_class = "debugger_refresh";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.target_pid = driver_bridge::attached_pid();
+		sub.body = []() {
 		try {
 		std::vector<seh_entry_t> entries;
 		seh_diagnostics_t diag_state{};
@@ -319,7 +326,8 @@ inline void refresh()
 			diag::log_tagged("seh", "seh_refresh_worker_exception err='<unknown>'");
 			g_ui.refreshing.store(false);
 		}
-	})) {
+	};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 			diag::log_tagged("seh", "seh_refresh_worker_post_failed");
 			g_ui.refreshing.store(false);
 		}

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -73,7 +73,14 @@ public:
 
 		bool posted = false;
 		try {
-			posted = critical_work_queue::post([state, task, active]() mutable {
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "test_lab";
+			submission.label = "test_lab.bounded_runner";
+			submission.thread_class = "testlab_bounded_runner";
+			submission.domain = aida::infra::executor::domain_t::feature_worker;
+			submission.priority = 2;
+			submission.failure_policy = "reject_not_started";
+			submission.body = [state, task, active]() mutable {
 				std::string error;
 				try {
 					(*task)();
@@ -87,7 +94,8 @@ public:
 				}
 				state->cv.notify_all();
 				active->fetch_sub(1u, std::memory_order_acq_rel);
-			});
+			};
+			posted = aida::infra::executor::submit(std::move(submission)).submitted;
 		} catch (...) {
 			active->fetch_sub(1u, std::memory_order_acq_rel);
 			return { bounded_run_status_t::post_failed, detail::describe_current_exception() };

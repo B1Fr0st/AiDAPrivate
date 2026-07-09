@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -16,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "../helpers/diag_log.hpp"
@@ -647,7 +646,15 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		}
 	};
 
-	const bool posted = critical_work_queue::post(task) || work_queue::post(task);
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.aob_generate_process";
+	sub.thread_class = "scanner_aob";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 3;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = std::move(task);
+	const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 	if (!posted) {
 		diag::log_tagged("aob", "worker_queue_rejected clearing_generating_flag");
 		anti_tamper::webhook::write_log("aob", "worker queue rejected");
@@ -709,7 +716,13 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 	g_state.generating.store(true);
 
 	auto file_copy = file;
-	work_queue::post([file_copy, address, num_instructions, auto_wildcard]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.aob_generate_file";
+	sub.thread_class = "scanner_aob";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 3;
+	sub.body = [file_copy, address, num_instructions, auto_wildcard]() {
 		signature_t sig;
 		sig.id = allocate_signature_id();
 		sig.address = address;
@@ -782,7 +795,13 @@ inline void generate_from_file(const DisasmFile& file, uint64_t address, int num
 		}
 
 		g_state.generating.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("aob", "generate_from_file worker_queue_rejected");
+		g_state.generating.store(false);
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		g_state.last_error = "AOB file worker queue rejected the task.";
+	}
 #else
 	(void)file;
 	(void)address;
@@ -802,7 +821,14 @@ inline void validate_uniqueness_process(signature_t& sig)
 		static_cast<unsigned long long>(sig.id), sig.bytes.size());
 	g_state.validating.store(true);
 
-	work_queue::post([sig_copy = sig]() mutable {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.aob_validate_uniqueness";
+	sub.thread_class = "scanner_sweep";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = [sig_copy = sig]() mutable {
 		int total_count = 0;
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
 
@@ -848,7 +874,11 @@ inline void validate_uniqueness_process(signature_t& sig)
 		}
 
 		g_state.validating.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("aob", "validate_uniqueness_process worker_queue_rejected");
+		g_state.validating.store(false);
+	}
 }
 
 inline void validate_uniqueness_file(const DisasmFile& file, signature_t& sig)
@@ -905,7 +935,14 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 	g_state.batch_done.store(0);
 
 	auto addrs = addresses;
-	work_queue::post([addrs, num_instructions, auto_wildcard]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.aob_generate_batch";
+	sub.thread_class = "scanner_aob_batch";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = [addrs, num_instructions, auto_wildcard]() {
 		auto t_start = std::chrono::steady_clock::now();
 		ZydisDecoder decoder;
 		ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -990,7 +1027,12 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 		diag::log_tagged_fmt("aob", "generate_batch done total=%zu done=%d duration_ms=%llu",
 			addrs.size(), g_state.batch_done.load(), static_cast<unsigned long long>(dur_ms));
 		g_state.batch_generating.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("aob", "generate_batch worker_queue_rejected");
+		g_state.batch_generating.store(false);
+		g_state.batch_done.store(g_state.batch_total.load());
+	}
 #else
 	(void)addresses;
 	(void)num_instructions;

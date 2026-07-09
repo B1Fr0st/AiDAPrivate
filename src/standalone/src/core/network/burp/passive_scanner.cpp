@@ -4,7 +4,7 @@
 #include "issue.hpp"
 
 #include "../../infra/event_bus.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -1154,9 +1155,18 @@ bool initialize()
     s.sub = aida::events::subscribe(kExchangeObservedEvent,
                                     [](const exchange_observed_t& ex) {
                                         exchange_observed_t copy = ex;
-                                        work_queue::post([copy]() {
+                                        {
+                                            ::aida::infra::executor::submission_t sub;
+                                            sub.owner_subsystem = "burp.passive_scanner";
+                                            sub.label = "passive.scan_exchange";
+                                            sub.thread_class = "bounded_task";
+                                            sub.domain = aida::infra::executor::domain_t::feature_worker;
+                                            sub.priority = 3;
+                                            sub.body = [copy]() {
                                             scan_one(copy);
-                                        });
+                                        };
+                                            (void)::aida::infra::executor::submit(std::move(sub));
+                                        }
                                     });
     if (!s.sub.valid()) {
         diag::log_tagged_fmt("passive", "initialize failed subscription_invalid");

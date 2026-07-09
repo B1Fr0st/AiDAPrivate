@@ -10,7 +10,8 @@
 #include <cstddef>
 #include <windows.h>
 #include <tlhelp32.h>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -1286,34 +1287,41 @@ inline bool start_polling() {
 
     bool posted = false;
     try {
-        posted = work_queue::post([]() { kernel_context_loop(); });
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "pre_encrypt_hook";
+        sub.label = "pre_encrypt_hook.kernel_context_loop";
+        sub.thread_class = "long_lived_service";
+        sub.domain = aida::infra::executor::domain_t::service;
+        sub.priority = 3;
+        sub.body = []() { kernel_context_loop(); };
+        posted = aida::infra::executor::submit(std::move(sub)).submitted;
     } catch (...) {
         posted = false;
     }
     if (!posted) {
-        const auto qs = work_queue::stats();
+        const auto qs = aida::infra::taskflow_runtime::active_snapshot();
         diag::log_tagged_fmt("pre_encrypt_hook",
-            "kernel_context_loop_post_failed cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_posted=%llu cq_rejected=%llu",
-            qs.alive ? 1 : 0,
+            "kernel_context_loop_post_failed runtime_accepting=%d runtime_shutdown=%d service_pending=%llu service_active=%u total_submitted=%llu total_rejected=%llu",
+            qs.accepting ? 1 : 0,
             qs.shutting_down ? 1 : 0,
-            qs.pending,
-            qs.active,
-            static_cast<unsigned long long>(qs.posted),
-            static_cast<unsigned long long>(qs.rejected));
+            static_cast<unsigned long long>(qs.service_queue_pending),
+            static_cast<unsigned>(qs.service_queue_active),
+            static_cast<unsigned long long>(qs.total_submitted),
+            static_cast<unsigned long long>(qs.total_rejected));
         g_state.polling.store(false);
         g_state.debug_loop_running.store(false);
         g_state.debugger_error.store(ERROR_NOT_ENOUGH_MEMORY);
         return false;
     }
-    const auto qs = work_queue::stats();
+    const auto qs = aida::infra::taskflow_runtime::active_snapshot();
     diag::log_tagged_fmt("pre_encrypt_hook",
-        "kernel_context_loop_posted cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
-        qs.alive ? 1 : 0,
+        "kernel_context_loop_posted runtime_accepting=%d runtime_shutdown=%d service_pending=%llu service_active=%u total_submitted=%llu total_failed=%llu",
+        qs.accepting ? 1 : 0,
         qs.shutting_down ? 1 : 0,
-        qs.pending,
-        qs.active,
-        static_cast<unsigned long long>(qs.started),
-        static_cast<unsigned long long>(qs.finished));
+        static_cast<unsigned long long>(qs.service_queue_pending),
+        static_cast<unsigned>(qs.service_queue_active),
+        static_cast<unsigned long long>(qs.total_submitted),
+        static_cast<unsigned long long>(qs.total_failed));
 
     for (int i = 0; i < 40; ++i) {
         if (g_state.debug_attached.load())

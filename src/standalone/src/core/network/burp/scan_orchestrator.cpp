@@ -23,9 +23,9 @@
 #include "vuln_taxonomy.hpp"
 
 #include "../../infra/event_bus.hpp"
-#include "../../infra/work_queue.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
+#include "../../infra/executor.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1992,16 +1992,25 @@ tool_result_t tool_orchestrate(const json& params)
             static_cast<unsigned long long>(job->scan_id),
             static_cast<unsigned long long>(def_token));
         auto def_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(def_admission));
-        const bool posted = work_queue::post([job, check, def_admission_ptr, def_token]() {
+        const bool posted = [&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.scan_orchestrator";
+            sub.label = "scan.defensive_check";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 3;
+            sub.body = [job, check, def_admission_ptr, def_token]() {
             run_defensive_check(job, check);
             diag::log_tagged_fmt("scan_orchestrator", "BURP-NETWORK-WORKER-RELEASE check=%s scan_id=%llu token=%llu reason=completed",
                 check.c_str(),
                 static_cast<unsigned long long>(job->scan_id),
                 static_cast<unsigned long long>(def_token));
             def_admission_ptr->release("completed");
-        });
+        };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }();
         if (!posted)
-            update_defensive_status(job, check, "error", 0, "work_queue unavailable");
+            update_defensive_status(job, check, "error", 0, "executor unavailable");
     }
     publish_scan_started(job);
     json initial_status = scan_status_json(job);

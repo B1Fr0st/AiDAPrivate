@@ -19,6 +19,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -36,7 +37,7 @@
 #include "standalone_settings.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/brand.hpp"
@@ -58,6 +59,20 @@ namespace {
 	using catalog_model_t = aida::provider::model_info_t;
 	using auth_info_t = aida::auth::auth_info_t;
 	using auth_kind_t = aida::auth::auth_kind_t;
+
+	bool submit_provider_view_task(const char* label,
+	                               aida::infra::executor::domain_t domain,
+	                               std::function<void()> body)
+	{
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "ai_provider_view";
+		sub.label = label;
+		sub.thread_class = "bounded_task";
+		sub.domain = domain;
+		sub.priority = 3;
+		sub.body = std::move(body);
+		return aida::infra::executor::submit(std::move(sub)).submitted;
+	}
 
 	struct test_result_t
 	{
@@ -445,7 +460,10 @@ namespace {
 			st.pending_results[job->key] = pending;
 		}
 
-		const bool posted = work_queue::post([job]() {
+		const bool posted = submit_provider_view_task(
+			"provider_view.test_connection",
+			aida::infra::executor::domain_t::external_tool,
+			[job]() {
 			auto& st_w = g_state();
 			if (st_w.shutdown_flag.load()) {
 				std::lock_guard<std::mutex> lk(st_w.mtx);
@@ -606,7 +624,10 @@ namespace {
 		st.refresh.success.store(false);
 		st.refresh.message.clear();
 
-		const bool posted = work_queue::post([]() {
+		const bool posted = submit_provider_view_task(
+			"provider_view.refresh_catalog",
+			aida::infra::executor::domain_t::external_tool,
+			[]() {
 			auto& s = g_state();
 			if (s.shutdown_flag.load()) {
 				s.refresh.completed.store(false);
@@ -1252,7 +1273,10 @@ void initialize()
 	st.initialized = true;
 	st.shutdown_flag.store(false);
 	if (aida::provider::catalog::list_providers().empty()) {
-		work_queue::post([]() {
+		(void)submit_provider_view_task(
+			"provider_view.load_catalog",
+			aida::infra::executor::domain_t::external_tool,
+			[]() {
 			auto& s = g_state();
 			if (s.shutdown_flag.load())
 				return;

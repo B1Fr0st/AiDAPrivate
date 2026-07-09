@@ -7,7 +7,7 @@
 
 #include "sequencer.hpp"
 #include "audit_http.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -22,6 +22,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -285,7 +286,16 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
         };
         bool posted = false;
         try {
-            posted = work_queue::post(sample_task);
+            posted = [&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.sequencer";
+                sub.label = "sequencer.sample";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = sample_task;
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }();
         } catch (...) {
             posted = false;
         }
@@ -294,7 +304,12 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
                 static_cast<unsigned long long>(coll->id),
                 total_attempts,
                 coll->in_flight.load());
-            sample_task();
+            {
+                std::lock_guard<std::mutex> lk(coll->err_mtx);
+                if (coll->error_message.empty()) coll->error_message = "sample_executor_post_failed";
+            }
+            coll->error_flag.store(true);
+            coll->in_flight.fetch_sub(1);
         }
     }
 
@@ -791,20 +806,29 @@ uint64_t start_collection(const collection_config_t& cfg)
     std::shared_ptr<collection_t> coll_ref = coll;
     bool posted = false;
     try {
-        posted = work_queue::post([coll_ref]() {
+        posted = [&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.sequencer";
+            sub.label = "sequencer.collection_worker";
+            sub.thread_class = "long_running";
+            sub.domain = aida::infra::executor::domain_t::long_running;
+            sub.priority = 3;
+            sub.body = [coll_ref]() {
             collection_worker(coll_ref);
-        });
+        };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }();
     } catch (...) {
         posted = false;
     }
     if (!posted) {
         {
             std::lock_guard<std::mutex> lk(coll->err_mtx);
-            coll->error_message = "collection_worker_queue_failed";
+            coll->error_message = "collection_worker_executor_failed";
         }
         coll->error_flag.store(true);
         coll->running.store(false);
-        set_last_error("collection_worker_queue_failed");
+        set_last_error("collection_worker_executor_failed");
         ::diag::log_tagged_fmt("sequencer", "collection_worker_post_failed id=%llu url='%s'",
             static_cast<unsigned long long>(coll->id),
             cfg.url.c_str());

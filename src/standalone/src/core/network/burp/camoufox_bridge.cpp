@@ -9,12 +9,13 @@
 #include "camoufox_install.hpp"
 
 #include "../../infra/event_bus.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "../../mcp/mcp_client.hpp"
 #include "../../mcp/mcp_standalone.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
 #include "../../diagnostics/metadata_ring.hpp"
+#include "../executor_status.hpp"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -208,24 +209,35 @@ bool post_bridge_task(const char* name, std::function<void()> task)
 {
     const uint64_t t0 = now_ms();
     bool posted = false;
+    std::string reject_reason;
     try
     {
-        posted = work_queue::post_service(std::move(task));
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.camoufox";
+        sub.label = name ? name : "camoufox.task";
+        sub.thread_class = "external_tool";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = std::move(task);
+        auto submit_result = aida::infra::executor::submit(std::move(sub));
+        posted = submit_result.submitted;
+        reject_reason = submit_result.reject_reason;
     }
     catch (...)
     {
         posted = false;
     }
-    const auto st = work_queue::service_stats();
-    diag::log_tagged_fmt("camoufox", "service_queue_post name=%s posted=%d alive=%d shutting_down=%d workers=%zu pending=%zu active=%lu elapsed_ms=%llu",
+    const auto st = aida::network::executor_status::work_stats();
+    diag::log_tagged_fmt("camoufox", "external_tool_executor_post name=%s posted=%d alive=%d shutting_down=%d workers=%zu pending=%llu active=%lu elapsed_ms=%llu reject=%s",
         name ? name : "<null>",
         posted ? 1 : 0,
         st.alive ? 1 : 0,
         st.shutting_down ? 1 : 0,
         st.workers,
-        st.pending,
+        static_cast<unsigned long long>(st.pending),
         static_cast<unsigned long>(st.active),
-        static_cast<unsigned long long>(now_ms() - t0));
+        static_cast<unsigned long long>(now_ms() - t0),
+        reject_reason.empty() ? "<none>" : reject_reason.c_str());
     return posted;
 }
 
@@ -11176,7 +11188,13 @@ bool prewarm_default_async(const char* reason)
         return true;
     }
     std::string reason_copy(owner);
-    bool posted = work_queue::post([reason_copy]() {
+    aida::infra::executor::submission_t prewarm_sub;
+    prewarm_sub.owner_subsystem = "burp.camoufox";
+    prewarm_sub.label = "camoufox.prewarm_default";
+    prewarm_sub.thread_class = "external_tool";
+    prewarm_sub.domain = aida::infra::executor::domain_t::external_tool;
+    prewarm_sub.priority = 3;
+    prewarm_sub.body = [reason_copy]() {
         const uint64_t t0 = now_ms();
         diag::log_tagged_fmt("camoufox", "prewarm_default_worker_begin reason=%s pid=%lu tid=%lu",
             reason_copy.c_str(),
@@ -11213,7 +11231,8 @@ bool prewarm_default_async(const char* reason)
             after.last_error.size());
         if (!ok)
             prewarm_default_requested().store(false, std::memory_order_release);
-    });
+    };
+    bool posted = aida::infra::executor::submit(std::move(prewarm_sub)).submitted;
     if (!posted)
     {
         prewarm_default_requested().store(false, std::memory_order_release);

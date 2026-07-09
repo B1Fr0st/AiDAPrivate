@@ -21,7 +21,7 @@
 #include "run_target.hpp"
 #include "vm_guest_bridge.hpp"
 #include "standalone_driver.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <atomic>
@@ -774,7 +774,14 @@ void spawn_watchdog_kill(HANDLE process_handle, HANDLE job_handle, uint32_t sec,
 	uint32_t local_pid = pid;
 	try {
 		const ULONGLONG post_ms = GetTickCount64();
-		const bool posted = work_queue::post([dup_proc, dup_job, timeout_ms, local_pid, post_ms]() mutable {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "runtime_target";
+		sub.label = "run_target.watchdog_kill";
+		sub.thread_class = "target_wait";
+		sub.domain = aida::infra::executor::domain_t::long_running;
+		sub.priority = 1;
+		sub.target_pid = local_pid;
+		sub.body = [dup_proc, dup_job, timeout_ms, local_pid, post_ms]() mutable {
 			const ULONGLONG start_ms = GetTickCount64();
 			const DWORD tid = GetCurrentThreadId();
 			diag::log_tagged_critical_fmt("run_target",
@@ -805,18 +812,20 @@ void spawn_watchdog_kill(HANDLE process_handle, HANDLE job_handle, uint32_t sec,
 				static_cast<unsigned long>(w),
 				static_cast<unsigned long long>(GetTickCount64() - start_ms),
 				static_cast<unsigned long>(tid));
-		});
+		};
+		const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 		if (!posted) {
-			const auto qs = work_queue::stats();
+			const auto qs = aida::infra::executor::active_snapshot();
 			diag::log_tagged_critical_fmt("run_target",
-				"watchdog worker post failed pid=%u queue_alive=%d queue_shutdown=%d queue_pending=%llu queue_active=%u queue_posted=%llu queue_rejected=%llu",
+				"watchdog worker post failed pid=%u executor_total_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u work_pending=%llu work_active=%u",
 				static_cast<unsigned>(local_pid),
-				qs.alive ? 1 : 0,
-				qs.shutting_down ? 1 : 0,
-				static_cast<unsigned long long>(qs.pending),
-				qs.active,
-				static_cast<unsigned long long>(qs.posted),
-				static_cast<unsigned long long>(qs.rejected));
+				static_cast<unsigned>(qs.total_active),
+				static_cast<unsigned long long>(qs.service_queue_pending),
+				static_cast<unsigned>(qs.service_queue_active),
+				static_cast<unsigned long long>(qs.critical_queue_pending),
+				static_cast<unsigned>(qs.critical_queue_active),
+				static_cast<unsigned long long>(qs.work_queue_pending),
+				static_cast<unsigned>(qs.work_queue_active));
 			if (dup_job) CloseHandle(dup_job);
 			CloseHandle(dup_proc);
 		}

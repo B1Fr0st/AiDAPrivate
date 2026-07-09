@@ -2,7 +2,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <openssl/evp.h>
@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ssl_keylog {
@@ -182,7 +183,13 @@ inline void start_watching(const std::string& keylog_path) {
     g_state.watching.store(true);
     diag::log_tagged_fmt("network", "ssl_keylog_watch_started path='%s'", keylog_path.c_str());
 
-    work_queue::post([&state = g_state]() {
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "network.ssl_keylog";
+    sub.label = "ssl_keylog.watch_loop";
+    sub.thread_class = "service_loop";
+    sub.domain = aida::infra::executor::domain_t::service;
+    sub.priority = 4;
+    sub.body = [&state = g_state]() {
         bool warned_missing = false;
         while (state.watching.load()) {
             std::ifstream file(state.keylog_path, std::ios::binary);
@@ -224,7 +231,11 @@ inline void start_watching(const std::string& keylog_path) {
                 Sleep(10);
         }
         diag::log_tagged("network", "ssl_keylog_watch_loop_exited");
-    });
+    };
+    if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+        g_state.watching.store(false);
+        diag::log_tagged_fmt("network", "ssl_keylog_watch_post_failed path='%s'", keylog_path.c_str());
+    }
 }
 
 inline void stop_watching() {

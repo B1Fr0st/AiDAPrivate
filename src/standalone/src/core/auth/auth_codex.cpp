@@ -4,7 +4,7 @@
 
 #include "auth_store.hpp"
 #include "anti-tamper/webhook.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -487,10 +487,17 @@ namespace codex {
 			state.listener_handle = holder.release();
 			ctx->worker_done.store(false, std::memory_order_release);
 			codex_login_state_t* state_ptr = &state;
-			if (!work_queue::post([state_ptr, ctx]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = "auth.codex.listener";
+			sub.thread_class = "service_loop";
+			sub.domain = aida::infra::executor::domain_t::security_liveness;
+			sub.priority = 1;
+			sub.body = [state_ptr, ctx]() {
 					listener_thread(state_ptr, ctx);
 					ctx->worker_done.store(true, std::memory_order_release);
-				}))
+				};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 			{
 				ctx->worker_done.store(true, std::memory_order_release);
 				return false;

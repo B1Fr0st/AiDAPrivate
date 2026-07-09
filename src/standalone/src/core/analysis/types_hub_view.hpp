@@ -15,7 +15,7 @@
 #include "symbol_store.hpp"
 #include "builtin_typelib.hpp"
 #include "functions_panel.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../disasm/function_index.hpp"
@@ -49,6 +49,7 @@ bool has_active_target();
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 extern HWND g_hwnd;
@@ -913,7 +914,13 @@ inline void start_manual_pdb_load(const std::string& pdb_path)
 		"manual_load_begin path='%s' module='%s'",
 		pdb_path.c_str(), job->module_key.c_str());
 
-	work_queue::post([job]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "analysis";
+	sub.label = "analysis.types_hub.manual_pdb_load";
+	sub.thread_class = "external_tool";
+	sub.domain = aida::infra::executor::domain_t::external_tool;
+	sub.priority = 2;
+	sub.body = [job]() {
 		uint64_t t0 = GetTickCount64();
 		bool ok = pdb_parser::parse_pdb_bounded(job->pdb_path, std::string{}, *job->info, job->progress.get(),
 			nullptr, symbol_store::k_explicit_pdb_load_timeout_ms);
@@ -955,7 +962,15 @@ inline void start_manual_pdb_load(const std::string& pdb_path)
 			job->module_key.c_str(),
 			sym_count, struct_count, enum_count,
 			static_cast<unsigned long long>(elapsed_ms));
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		job->ok->store(false, std::memory_order_release);
+		job->done->store(true, std::memory_order_release);
+		diag::log_tagged_fmt("pdb",
+			"manual_load_post_failed path='%s' module='%s'",
+			job->pdb_path.c_str(),
+			job->module_key.c_str());
+	}
 }
 
 inline void invalidate_merged_cache()

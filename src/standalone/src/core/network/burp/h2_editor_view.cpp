@@ -13,7 +13,8 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../executor_status.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -25,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -258,7 +260,14 @@ void render(float pos_x, float pos_y, float width, float height,
             st.in_flight.store(true);
             try {
                 const ULONGLONG post_ms = GetTickCount64();
-                const bool posted = work_queue::post([&st, req, post_ms]() {
+                const bool posted = [&]() {
+                    ::aida::infra::executor::submission_t sub;
+                    sub.owner_subsystem = "burp.h2_view";
+                    sub.label = "h2.send_request";
+                    sub.thread_class = "bounded_task";
+                    sub.domain = aida::infra::executor::domain_t::external_tool;
+                    sub.priority = 3;
+                    sub.body = [&st, req, post_ms]() {
                     const DWORD tid = GetCurrentThreadId();
                     const ULONGLONG start_ms = GetTickCount64();
                     ::diag::log_tagged_fmt("h2_v",
@@ -298,12 +307,14 @@ void render(float pos_x, float pos_y, float width, float height,
                             static_cast<unsigned long>(tid));
                     }
                     st.in_flight.store(false);
-                });
+                };
+                    return ::aida::infra::executor::submit(std::move(sub)).submitted;
+                }();
                 if (!posted) {
-                    const auto qs = work_queue::stats();
+                    const auto qs = aida::network::executor_status::work_stats();
                     st.in_flight.store(false);
                     ::diag::log_tagged_fmt("h2_v",
-                        "send_worker_post_failed host=%s port=%u raw=%d queue_alive=%d queue_shutdown=%d queue_pending=%llu queue_active=%u queue_posted=%llu queue_rejected=%llu",
+                        "send_worker_post_failed host=%s port=%u raw=%d executor_alive=%d executor_shutdown=%d executor_pending=%llu executor_active=%u executor_posted=%llu executor_rejected=%llu",
                         req.host.c_str(),
                         static_cast<unsigned>(req.port),
                         req.use_raw_frames ? 1 : 0,

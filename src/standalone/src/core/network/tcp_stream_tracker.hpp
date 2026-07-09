@@ -1,7 +1,7 @@
 #pragma once
 
 #include "standalone_driver.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <Windows.h>
@@ -15,6 +15,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace driver_bridge {
@@ -133,7 +134,14 @@ public:
             state_ = state;
         }
         diag::log_tagged_fmt("tcp_tracker", "start this=%p state=%p filter_pid=%u", this, state.get(), filter_pid);
-        if (!work_queue::post([state]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "network.tcp_tracker";
+        sub.label = "tcp_tracker.poll_loop";
+        sub.thread_class = "service_loop";
+        sub.domain = aida::infra::executor::domain_t::service;
+        sub.priority = 4;
+        sub.target_pid = filter_pid;
+        sub.body = [state]() {
             state->worker_entered.store(true, std::memory_order_release);
             diag::log_tagged_fmt("tcp_tracker", "worker_enter state=%p tid=%lu", state.get(), static_cast<unsigned long>(GetCurrentThreadId()));
             poll_loop(state);
@@ -144,7 +152,8 @@ public:
             state->worker_cv.notify_all();
             diag::log_tagged_fmt("tcp_tracker", "worker_exit state=%p tid=%lu timed_out=%d", state.get(), static_cast<unsigned long>(GetCurrentThreadId()),
                 state->stop_timed_out.load(std::memory_order_acquire) ? 1 : 0);
-        })) {
+        };
+        if (!aida::infra::executor::submit(std::move(sub)).submitted) {
             state->running.store(false, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(state->worker_mutex);

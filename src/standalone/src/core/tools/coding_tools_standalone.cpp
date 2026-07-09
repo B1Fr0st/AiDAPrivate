@@ -15,7 +15,8 @@
 #include "command_sessions.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 #include "../helpers/globals.h"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -883,7 +884,13 @@ static tool_result_t tool_run_command(const json& params)
         raw->reader_done.store(false, std::memory_order_release);
         bool reader_posted = false;
         try {
-            reader_posted = work_queue::post([raw, timeout_ms]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "coding_tools";
+            sub.label = "coding_tools.run_command.reader";
+            sub.thread_class = "blocking_command_reader";
+            sub.domain = aida::infra::executor::domain_t::long_running;
+            sub.priority = 3;
+            sub.body = [raw, timeout_ms]() {
                 const DWORD tid = GetCurrentThreadId();
                 const ULONGLONG start_tick = GetTickCount64();
                 diag::log_tagged_fmt("coding",
@@ -975,22 +982,23 @@ static tool_result_t tool_run_command(const json& params)
                     raw->timed_out.load() ? 1 : 0,
                     static_cast<long long>(raw->exit_code.load()));
                 raw->reader_done.store(true, std::memory_order_release);
-            });
+            };
+            reader_posted = aida::infra::executor::submit(std::move(sub)).submitted;
         } catch (...) {
             reader_posted = false;
         }
         if (!reader_posted) {
-            const auto qs = work_queue::stats();
+            const auto qs = aida::infra::taskflow_runtime::active_snapshot();
             diag::log_tagged_fmt("coding",
-                "run_command reader_post_failed session_id='%s' pid=%lu cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_posted=%llu cq_rejected=%llu",
+                "run_command reader_post_failed session_id='%s' pid=%lu runtime_accepting=%d runtime_shutdown=%d service_pending=%llu service_active=%u total_submitted=%llu total_rejected=%llu",
                 session_id_copy.c_str(),
                 static_cast<unsigned long>(pi.dwProcessId),
-                qs.alive ? 1 : 0,
+                qs.accepting ? 1 : 0,
                 qs.shutting_down ? 1 : 0,
-                qs.pending,
-                qs.active,
-                static_cast<unsigned long long>(qs.posted),
-                static_cast<unsigned long long>(qs.rejected));
+                static_cast<unsigned long long>(qs.service_queue_pending),
+                static_cast<unsigned>(qs.service_queue_active),
+                static_cast<unsigned long long>(qs.total_submitted),
+                static_cast<unsigned long long>(qs.total_rejected));
             raw->alive.store(false, std::memory_order_release);
             if (raw->process_info.hProcess) {
                 DWORD code = 0;
@@ -999,7 +1007,7 @@ static tool_result_t tool_run_command(const json& params)
             }
             raw->reader_done.store(true, std::memory_order_release);
             command_sessions::remove_session(session_id_copy);
-            return tool_result_t::error("Failed to schedule command reader on work queue.");
+            return tool_result_t::error("Failed to schedule command reader on executor.");
         }
 
         if (wait) {

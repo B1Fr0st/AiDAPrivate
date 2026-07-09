@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include "work_queue.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +19,7 @@
 #include "event_bus.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
 
 namespace module_view {
 
@@ -129,7 +129,14 @@ inline void refresh()
 		"modules_refresh_request attached_pid=%u",
 		static_cast<unsigned>(driver_bridge::attached_pid()));
 	try {
-		if (!work_queue::post([]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "debugger";
+		sub.label = "debugger.modules_refresh";
+		sub.thread_class = "debugger_refresh";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.target_pid = driver_bridge::attached_pid();
+		sub.body = []() {
 		try {
 		auto mods = driver_bridge::enumerate_modules();
 		size_t n = mods.size();
@@ -148,7 +155,8 @@ inline void refresh()
 			diag::log_tagged("modules", "modules_refresh_worker_exception err='<unknown>'");
 			g_ui.loading.store(false);
 		}
-	})) {
+	};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 			diag::log_tagged("modules", "modules_refresh_worker_post_failed");
 			g_ui.loading.store(false);
 		}
@@ -206,7 +214,14 @@ inline void load_module_details_by_base(uint64_t base)
 		"module_details_request base=0x%llx",
 		static_cast<unsigned long long>(base));
 	try {
-		if (!work_queue::post([base]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "debugger";
+		sub.label = "debugger.module_details";
+		sub.thread_class = "debugger_refresh";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.target_pid = driver_bridge::attached_pid();
+		sub.body = [base]() {
 		try {
 		pe_parser::pe_info_t pe;
 		pe_parser::parse(base, pe);
@@ -233,7 +248,8 @@ inline void load_module_details_by_base(uint64_t base)
 				static_cast<unsigned long long>(base));
 			g_ui.loading.store(false);
 		}
-	})) {
+	};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 			diag::log_tagged_fmt("modules", "module_details_worker_post_failed base=0x%llx",
 				static_cast<unsigned long long>(base));
 			g_ui.loading.store(false);

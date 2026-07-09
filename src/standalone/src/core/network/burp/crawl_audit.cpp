@@ -9,7 +9,6 @@
 #include "crawler.hpp"
 #include "active_scanner.hpp"
 #include "audit_http.hpp"
-#include "../../infra/work_queue.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 

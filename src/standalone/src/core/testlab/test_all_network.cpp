@@ -16,8 +16,7 @@
 #include "../network/protobuf_codec.hpp"
 #include "../network/http2_session.hpp"
 #include "../network/burp/match_replace.hpp"
-#include "../infra/critical_work_queue.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "net_security.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -172,7 +171,15 @@ namespace {
                 op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
             return result;
         }
-        const bool started = work_queue::post([promise, start, tag, op, task_ptr]() mutable {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "testlab_network";
+        sub.label = op ? op : "testlab.network.bounded_bool";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::feature_worker;
+        sub.priority = 3;
+        sub.failure_policy = "reject_not_started";
+        sub.shutdown_policy = "drain";
+        sub.body = [promise, start, tag, op, task_ptr]() mutable {
             bounded_bool_result_t result;
             result.worker_pid = static_cast<unsigned long>(GetCurrentProcessId());
             result.worker_tid = static_cast<unsigned long>(GetCurrentThreadId());
@@ -194,15 +201,16 @@ namespace {
                 promise->set_value(std::move(result));
             } catch (...) {
             }
-        });
+        };
+        const bool started = aida::infra::executor::submit(std::move(sub)).submitted;
         if (!started) {
             bounded_bool_result_t result;
             result.threw = true;
-            result.exception = "work_queue_post_failed";
+            result.exception = "taskflow_executor_post_failed";
             result.win32_error = ERROR_NOT_READY;
             const ULONGLONG now = GetTickCount64();
             result.elapsed_ms = static_cast<unsigned long long>(now >= start ? now - start : 0);
-            log_msg(hf, tag, "BOUNDED-WORK-QUEUE-POST-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
+            log_msg(hf, tag, "BOUNDED-TASKFLOW-EXECUTOR-POST-FAIL -- op=%s gle=%lu elapsed_ms=%llu exception=%s",
                 op, static_cast<unsigned long>(result.win32_error), result.elapsed_ms, result.exception.c_str());
             return result;
         }
@@ -923,7 +931,15 @@ namespace {
         }
         const uint16_t port = ntohs(actual_addr.sin_port);
         log_msg(hf, tag, "INFO -- loopback fixture listening on 127.0.0.1:%u", static_cast<unsigned>(port));
-        const bool server_posted = critical_work_queue::post([ctx, close_listener]() {
+        aida::infra::executor::submission_t server_sub;
+        server_sub.owner_subsystem = "testlab_network";
+        server_sub.label = "testlab.network.loopback_fixture";
+        server_sub.thread_class = "bounded_task";
+        server_sub.domain = aida::infra::executor::domain_t::critical;
+        server_sub.priority = 1;
+        server_sub.failure_policy = "reject_not_started";
+        server_sub.shutdown_policy = "drain";
+        server_sub.body = [ctx, close_listener]() {
             SOCKET listener = INVALID_SOCKET;
             {
                 std::lock_guard<std::mutex> lk(ctx->socket_mtx);
@@ -940,10 +956,11 @@ namespace {
             }
             close_listener();
             ctx->server_done.store(true);
-        });
+        };
+        const bool server_posted = aida::infra::executor::submit(std::move(server_sub)).submitted;
         if (!server_posted) {
             close_listener();
-            log_msg(hf, tag, "FAIL -- loopback fixture critical_queue post failed");
+            log_msg(hf, tag, "FAIL -- loopback fixture taskflow critical executor post failed");
             failed.fetch_add(1);
             WSACleanup();
             return;

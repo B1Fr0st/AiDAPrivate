@@ -2,10 +2,10 @@
 #include <windows.h>
 
 #include "memory_scanner.hpp"
-#include "work_queue.hpp"
 #include "standalone_driver.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
@@ -1376,10 +1376,19 @@ void initialize() {
 	diag::log_tagged_fmt("mem_scanner",
 		"FEATURE-WORKER-GROUP-ADMIT freeze_loop token=%llu",
 		static_cast<unsigned long long>(freeze_admission.token()));
-	if (!work_queue::post([]() {
+	aida::infra::executor::submission_t freeze_sub;
+	freeze_sub.owner_subsystem = "scanner";
+	freeze_sub.label = "scanner.freeze_loop";
+	freeze_sub.thread_class = "scanner_freeze_loop";
+	freeze_sub.domain = aida::infra::executor::domain_t::long_running;
+	freeze_sub.priority = 2;
+	freeze_sub.target_pid = driver_bridge::attached_pid();
+	freeze_sub.lease_token = freeze_admission.token();
+	freeze_sub.body = []() {
 			freeze_loop();
 			g_state.freeze_thread_done.store(true, std::memory_order_release);
-		}))
+		};
+	if (!aida::infra::executor::submit(std::move(freeze_sub)).submitted)
 	{
 		diag::log_tagged("mem_scanner", "initialize freeze_loop_post_failed");
 		st.freeze_thread_done.store(true, std::memory_order_release);
@@ -1476,7 +1485,15 @@ bool first_scan(const scan_config_t& config) {
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-ADMIT first_scan_dispatch token=%llu",
 			static_cast<unsigned long long>(fs_admission.token()));
-		if (!work_queue::post([config]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "scanner";
+		sub.label = "scanner.memory_first_scan";
+		sub.thread_class = "scanner_scan";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.target_pid = driver_bridge::attached_pid();
+		sub.lease_token = fs_admission.token();
+		sub.body = [config]() {
 			try {
 				first_scan_thread(config);
 			} catch (const std::exception& ex) {
@@ -1489,7 +1506,8 @@ bool first_scan(const scan_config_t& config) {
 				g_state.scan_progress.store(1.f, std::memory_order_release);
 			}
 			g_state.scan_thread_done.store(true, std::memory_order_release);
-		})) {
+		};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 			diag::log_tagged("mem_scanner", "first_scan worker_post_failed");
 			st.scan_thread_done.store(true, std::memory_order_release);
 			st.scanning.store(false);
@@ -1572,7 +1590,15 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-ADMIT next_scan_dispatch token=%llu",
 			static_cast<unsigned long long>(ns_admission.token()));
-		if (!work_queue::post([mode, value_text, value_text2]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "scanner";
+		sub.label = "scanner.memory_next_scan";
+		sub.thread_class = "scanner_scan";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.target_pid = driver_bridge::attached_pid();
+		sub.lease_token = ns_admission.token();
+		sub.body = [mode, value_text, value_text2]() {
 			try {
 				next_scan_thread(mode, value_text, value_text2);
 			} catch (const std::exception& ex) {
@@ -1585,7 +1611,8 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 				g_state.scan_progress.store(1.f, std::memory_order_release);
 			}
 			g_state.scan_thread_done.store(true, std::memory_order_release);
-		})) {
+		};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 			diag::log_tagged("mem_scanner", "next_scan worker_post_failed");
 			st.scan_thread_done.store(true, std::memory_order_release);
 			st.scanning.store(false);
@@ -1810,11 +1837,21 @@ bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, 
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-ADMIT pointer_scan_dispatch token=%llu",
 		static_cast<unsigned long long>(ps_admission.token()));
-	if (!work_queue::post([target_address, max_depth, max_offset, scan_base, scan_size]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.pointer_scan";
+	sub.thread_class = "scanner_pointer_scan";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.lease_token = ps_admission.token();
+	sub.body = [target_address, max_depth, max_offset, scan_base, scan_size]() {
 			pointer_scan_thread(target_address, max_depth, max_offset, scan_base, scan_size);
 			g_state.pointer_thread_done.store(true, std::memory_order_release);
-		}))
+		};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted)
 	{
+		diag::log_tagged("pointer_scan", "start_pointer_scan worker_post_failed");
 		st.pointer_thread_done.store(true, std::memory_order_release);
 		st.pointer_scanning.store(false);
 		return false;

@@ -31,7 +31,8 @@
 #include "builtin_typelib.hpp"
 #include "function_index.hpp"
 #include "xref_index.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
 #include "../anti-tamper/webhook.hpp"
@@ -1964,21 +1965,28 @@ inline void run_initial_analysis(const std::string& path, const std::string& fil
 	};
 	bool posted = false;
 	try {
-		posted = work_queue::post(std::move(run_worker));
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "analysis";
+		sub.label = "analysis.initial_pipeline";
+		sub.thread_class = "long_running_analysis";
+		sub.domain = aida::infra::executor::domain_t::long_running;
+		sub.priority = 2;
+		sub.body = std::move(run_worker);
+		posted = aida::infra::executor::submit(std::move(sub)).submitted;
 	} catch (...) {
 		posted = false;
 	}
 	if (!posted) {
-		const auto qs = work_queue::stats();
-		detail::push_log_fmt("run_initial_analysis_post_failed_queue path=%s filename=%s alive=%d shutdown=%d pending=%llu active=%u posted=%llu rejected=%llu",
+		const auto qs = aida::infra::taskflow_runtime::active_snapshot();
+		detail::push_log_fmt("run_initial_analysis_post_failed_queue path=%s filename=%s accepting=%d shutdown=%d work_pending=%llu work_active=%u submitted=%llu rejected=%llu",
 			path.c_str(),
 			filename.c_str(),
-			qs.alive ? 1 : 0,
+			qs.accepting ? 1 : 0,
 			qs.shutting_down ? 1 : 0,
-			static_cast<unsigned long long>(qs.pending),
-			qs.active,
-			static_cast<unsigned long long>(qs.posted),
-			static_cast<unsigned long long>(qs.rejected));
+			static_cast<unsigned long long>(qs.work_queue_pending),
+			qs.work_queue_active,
+			static_cast<unsigned long long>(qs.total_submitted),
+			static_cast<unsigned long long>(qs.total_rejected));
 	}
 	detail::push_log_fmt("run_initial_analysis_post path=%s filename=%s posted=%d",
 		path.c_str(),

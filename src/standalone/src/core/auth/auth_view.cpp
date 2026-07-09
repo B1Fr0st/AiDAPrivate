@@ -22,7 +22,7 @@
 #include "avatar.hpp"
 #include "empty_state.hpp"
 #include "fonts.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
 
@@ -309,7 +309,13 @@ namespace auth_view {
 			if (!auth_snapshot_refreshing().compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 				return;
 			const uint64_t start_ms = GetTickCount64();
-			if (!work_queue::post([start_ms]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_view";
+			sub.label = "auth.snapshot_refresh";
+			sub.thread_class = "service_task";
+			sub.domain = aida::infra::executor::domain_t::security_liveness;
+			sub.priority = 1;
+			sub.body = [start_ms]() {
 					bool success = false;
 					size_t provider_count = 0;
 					try {
@@ -328,7 +334,8 @@ namespace auth_view {
 							provider_count,
 							static_cast<unsigned long long>(elapsed_ms));
 					}
-				})) {
+				};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 				auth_snapshot_refreshing().store(false, std::memory_order_release);
 			}
 		}
@@ -394,7 +401,13 @@ namespace auth_view {
 				codex_ref = g_state.codex_state;
 			}
 			g_state.codex_start_done.store(false, std::memory_order_release);
-			if (!work_queue::post([codex_ref]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = "auth.codex.start_login";
+			sub.thread_class = "service_task";
+			sub.domain = aida::infra::executor::domain_t::security_liveness;
+			sub.priority = 1;
+			sub.body = [codex_ref]() {
 					if (!codex_ref) {
 						g_state.codex_starting.store(false);
 						g_state.codex_start_done.store(true, std::memory_order_release);
@@ -411,7 +424,8 @@ namespace auth_view {
 					}
 					g_state.codex_starting.store(false);
 					g_state.codex_start_done.store(true, std::memory_order_release);
-				}))
+				};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 			{
 				g_state.codex_starting.store(false);
 				g_state.codex_start_done.store(true, std::memory_order_release);
@@ -460,7 +474,13 @@ namespace auth_view {
 			while (!g_state.copilot_start_done.load(std::memory_order_acquire))
 				std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			g_state.copilot_start_done.store(false, std::memory_order_release);
-			if (!work_queue::post([copilot_ref, enterprise_url]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = "auth.copilot.start_login";
+			sub.thread_class = "service_task";
+			sub.domain = aida::infra::executor::domain_t::security_liveness;
+			sub.priority = 1;
+			sub.body = [copilot_ref, enterprise_url]() {
 					if (!copilot_ref) {
 						g_state.copilot_starting.store(false);
 						g_state.copilot_start_done.store(true, std::memory_order_release);
@@ -477,7 +497,8 @@ namespace auth_view {
 					}
 					g_state.copilot_starting.store(false);
 					g_state.copilot_start_done.store(true, std::memory_order_release);
-				}))
+				};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 			{
 				g_state.copilot_starting.store(false);
 				g_state.copilot_start_done.store(true, std::memory_order_release);
@@ -508,7 +529,13 @@ namespace auth_view {
 				claude_ref = g_state.claude_code_state;
 			}
 			g_state.claude_code_start_done.store(false, std::memory_order_release);
-			if (!work_queue::post([claude_ref]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = "auth.claude_code.start_login";
+			sub.thread_class = "service_task";
+			sub.domain = aida::infra::executor::domain_t::security_liveness;
+			sub.priority = 1;
+			sub.body = [claude_ref]() {
 					if (!claude_ref) {
 						g_state.claude_code_starting.store(false);
 						g_state.claude_code_start_done.store(true, std::memory_order_release);
@@ -525,7 +552,8 @@ namespace auth_view {
 					}
 					g_state.claude_code_starting.store(false);
 					g_state.claude_code_start_done.store(true, std::memory_order_release);
-				}))
+				};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 			{
 				g_state.claude_code_starting.store(false);
 				g_state.claude_code_start_done.store(true, std::memory_order_release);
@@ -543,9 +571,16 @@ namespace auth_view {
 					state_ref->cancelled.store(true);
 			}
 			if (state_ref) {
-				if (!work_queue::post([state_ref]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "auth_provider";
+				sub.label = "auth.codex.cancel_login";
+				sub.thread_class = "service_task";
+				sub.domain = aida::infra::executor::domain_t::security_liveness;
+				sub.priority = 1;
+				sub.body = [state_ref]() {
 						aida::auth::codex::cancel_login(*state_ref);
-					})) {
+					};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 					aida::auth::codex::cancel_login(*state_ref);
 				}
 			}
@@ -564,9 +599,16 @@ namespace auth_view {
 					state_ref->cancelled.store(true);
 			}
 			if (state_ref) {
-				if (!work_queue::post([state_ref]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "auth_provider";
+				sub.label = "auth.copilot.cancel_login";
+				sub.thread_class = "service_task";
+				sub.domain = aida::infra::executor::domain_t::security_liveness;
+				sub.priority = 1;
+				sub.body = [state_ref]() {
 						aida::auth::copilot::cancel_login(*state_ref);
-					})) {
+					};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 					aida::auth::copilot::cancel_login(*state_ref);
 				}
 			}
@@ -583,9 +625,16 @@ namespace auth_view {
 					state_ref->cancelled.store(true);
 			}
 			if (state_ref) {
-				if (!work_queue::post([state_ref]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "auth_provider";
+				sub.label = "auth.claude_code.cancel_login";
+				sub.thread_class = "service_task";
+				sub.domain = aida::infra::executor::domain_t::security_liveness;
+				sub.priority = 1;
+				sub.body = [state_ref]() {
 						aida::auth::claude_code::cancel_login(*state_ref);
-					})) {
+					};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 					aida::auth::claude_code::cancel_login(*state_ref);
 				}
 			}
@@ -620,7 +669,13 @@ namespace auth_view {
 					&& prior_result == static_cast<int>(exchange_result_t::pending)) {
 					g_state.codex_exchange_in_flight.store(true);
 					auto state_ref = sp;
-					if (!work_queue::post([state_ref]() {
+					aida::infra::executor::submission_t sub;
+					sub.owner_subsystem = "auth_provider";
+					sub.label = "auth.codex.poll_login";
+					sub.thread_class = "service_task";
+					sub.domain = aida::infra::executor::domain_t::security_liveness;
+					sub.priority = 1;
+					sub.body = [state_ref]() {
 						if (!state_ref) {
 							g_state.codex_exchange_result.store(
 								static_cast<int>(exchange_result_t::failure));
@@ -634,7 +689,8 @@ namespace auth_view {
 								ok ? exchange_result_t::success : exchange_result_t::failure));
 						}
 						g_state.codex_exchange_in_flight.store(false);
-					})) {
+					};
+					if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 						g_state.codex_exchange_in_flight.store(false);
 						g_state.codex_exchange_result.store(
 							static_cast<int>(exchange_result_t::failure));
@@ -687,7 +743,13 @@ namespace auth_view {
 					&& prior_result == static_cast<int>(exchange_result_t::pending)) {
 					g_state.copilot_poll_in_flight.store(true);
 					auto state_ref = sp;
-					if (!work_queue::post([state_ref]() {
+					aida::infra::executor::submission_t sub;
+					sub.owner_subsystem = "auth_provider";
+					sub.label = "auth.copilot.poll_login";
+					sub.thread_class = "service_task";
+					sub.domain = aida::infra::executor::domain_t::security_liveness;
+					sub.priority = 1;
+					sub.body = [state_ref]() {
 						if (!state_ref) {
 							g_state.copilot_poll_in_flight.store(false);
 							return;
@@ -704,7 +766,8 @@ namespace auth_view {
 							}
 						}
 						g_state.copilot_poll_in_flight.store(false);
-					})) {
+					};
+					if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 						g_state.copilot_poll_in_flight.store(false);
 					}
 				}
@@ -749,7 +812,13 @@ namespace auth_view {
 					&& prior_result == static_cast<int>(exchange_result_t::pending)) {
 					g_state.claude_code_exchange_in_flight.store(true);
 					auto state_ref = sp;
-					if (!work_queue::post([state_ref]() {
+					aida::infra::executor::submission_t sub;
+					sub.owner_subsystem = "auth_provider";
+					sub.label = "auth.claude_code.poll_login";
+					sub.thread_class = "service_task";
+					sub.domain = aida::infra::executor::domain_t::security_liveness;
+					sub.priority = 1;
+					sub.body = [state_ref]() {
 						if (!state_ref) {
 							g_state.claude_code_exchange_result.store(
 								static_cast<int>(exchange_result_t::failure));
@@ -763,7 +832,8 @@ namespace auth_view {
 								ok ? exchange_result_t::success : exchange_result_t::failure));
 						}
 						g_state.claude_code_exchange_in_flight.store(false);
-					})) {
+					};
+					if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 						g_state.claude_code_exchange_in_flight.store(false);
 						g_state.claude_code_exchange_result.store(
 							static_cast<int>(exchange_result_t::failure));
@@ -994,7 +1064,13 @@ namespace auth_view {
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				g_state.refresh.message.clear();
 			}
-			const bool posted = work_queue::post([]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = "auth.catalog.refresh";
+			sub.thread_class = "service_task";
+			sub.domain = aida::infra::executor::domain_t::service;
+			sub.priority = 2;
+			sub.body = []() {
 				if (g_state.shutdown_flag.load()) {
 					g_state.refresh.in_flight.store(false);
 					g_state.refresh.completed.store(false);
@@ -1014,7 +1090,8 @@ namespace auth_view {
 				}
 				g_state.refresh.completed.store(true);
 				g_state.refresh.in_flight.store(false);
-			});
+			};
+			const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 			if (!posted) {
 				g_state.refresh.in_flight.store(false);
 				g_state.refresh.completed.store(false);
@@ -1039,14 +1116,21 @@ namespace auth_view {
 			}
 			schedule_auth_snapshot_refresh(true);
 			if (revoke_oauth) {
-				work_queue::post([provider_id, access, refresh]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "auth_provider";
+				sub.label = "auth.credentials.revoke";
+				sub.thread_class = "service_task";
+				sub.domain = aida::infra::executor::domain_t::security_liveness;
+				sub.priority = 1;
+				sub.body = [provider_id, access, refresh]() {
 					if (provider_id == "anthropic")
 						aida::auth::claude_code::revoke_tokens(access, refresh, std::string());
 					else if (provider_id == "openai")
 						aida::auth::codex::revoke_tokens(access, refresh, std::string());
 					else if (provider_id == "github-copilot")
 						aida::auth::copilot::revoke_tokens(access, refresh, std::string());
-				});
+				};
+				aida::infra::executor::submit(std::move(sub));
 			}
 			toast_notification::push(provider_id + " signed out",
 				toast_notification::toast_type_t::info, 3.5f);
@@ -1202,7 +1286,13 @@ namespace auth_view {
 			const std::string captured_key = key;
 			chatbox_provider_entry_t entry_copy = *entry;
 
-			const bool posted = work_queue::post([captured_id, captured_key, entry_copy, flag]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = "auth.provider_key.validate";
+			sub.thread_class = "service_task";
+			sub.domain = aida::infra::executor::domain_t::security_liveness;
+			sub.priority = 1;
+			sub.body = [captured_id, captured_key, entry_copy, flag]() {
 				if (g_state.shutdown_flag.load()) {
 					std::lock_guard<std::mutex> lk(g_state.mtx);
 					if (flag) flag->store(false);
@@ -1340,7 +1430,8 @@ namespace auth_view {
 					toast_notification::push(captured_id + " connected",
 						toast_notification::toast_type_t::info, 3.5f);
 				}
-			});
+			};
+			const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 
 			if (!posted) {
 				std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -2855,10 +2946,17 @@ namespace auth_view {
 		ImGui::PushID("aida_auth_view");
 
 		if (aida::provider::catalog::list_providers().empty()) {
-			work_queue::post([]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = "auth.catalog.load_cached_or_fetch";
+			sub.thread_class = "service_task";
+			sub.domain = aida::infra::executor::domain_t::service;
+			sub.priority = 3;
+			sub.body = []() {
 				if (g_state.shutdown_flag.load()) return;
 				aida::provider::catalog::load_cached_or_fetch(86400);
-			});
+			};
+			aida::infra::executor::submit(std::move(sub));
 		}
 
 		float content_h = panel_h > 0.f ? panel_h : ImGui::GetContentRegionAvail().y;

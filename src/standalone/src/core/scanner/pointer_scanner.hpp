@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -16,6 +15,7 @@
 
 #include "standalone_driver.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 namespace pointer_scanner {
@@ -270,7 +270,15 @@ inline void build_reverse_map()
 		"FEATURE-WORKER-GROUP-ADMIT build_reverse_map token=%llu",
 		static_cast<unsigned long long>(brm_admission.token()));
 
-	work_queue::post([]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.pointer_build_reverse_map";
+	sub.thread_class = "scanner_pointer_map";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.lease_token = brm_admission.token();
+	sub.body = []() {
 		auto t_start = std::chrono::steady_clock::now();
 		auto modules = driver_bridge::enumerate_modules();
 		auto regions = driver_bridge::enumerate_memory_regions(4096);
@@ -383,7 +391,12 @@ inline void build_reverse_map()
 			static_cast<int>(g_state.map_cancel.load()));
 
 		g_state.map_building.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("pointer_scan", "build_reverse_map worker_queue_rejected");
+		g_state.map_building.store(false);
+		return;
+	}
 
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-RELEASE build_reverse_map token=%llu reason=dispatched",
@@ -462,7 +475,15 @@ inline void start_scan()
 		"FEATURE-WORKER-GROUP-ADMIT pointer_start_scan token=%llu",
 		static_cast<unsigned long long>(ss_admission.token()));
 
-	if (!work_queue::post([]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.pointer_start_scan";
+	sub.thread_class = "scanner_pointer_scan";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.lease_token = ss_admission.token();
+	sub.body = []() {
 		try {
 		auto t_start = std::chrono::steady_clock::now();
 		std::vector<pointer_chain_t> results;
@@ -531,10 +552,12 @@ inline void start_scan()
 			g_state.scan_progress.store(1.f);
 			g_state.scanning.store(false);
 		}
-	})) {
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 		diag::log_tagged("pointer_scan", "start_scan worker_queue_rejected");
 		g_state.scan_progress.store(1.f);
 		g_state.scanning.store(false);
+		return;
 	}
 
 	diag::log_tagged_fmt("pointer_scan",
@@ -622,7 +645,15 @@ inline void validate_all_results()
 		"FEATURE-WORKER-GROUP-ADMIT validate_all_results token=%llu",
 		static_cast<unsigned long long>(va_admission.token()));
 
-	work_queue::post([]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.pointer_validate_all";
+	sub.thread_class = "scanner_pointer_validate";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.lease_token = va_admission.token();
+	sub.body = []() {
 		auto t_start = std::chrono::steady_clock::now();
 		std::vector<pointer_chain_t> work;
 		{
@@ -656,7 +687,13 @@ inline void validate_all_results()
 
 		g_state.validate_progress.store(1.f);
 		g_state.validating.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("pointer_scan", "validate_all_results worker_queue_rejected");
+		g_state.validate_progress.store(1.f);
+		g_state.validating.store(false);
+		return;
+	}
 
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-RELEASE validate_all_results token=%llu reason=dispatched",

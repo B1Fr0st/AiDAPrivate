@@ -22,7 +22,7 @@
 #include "pe_parser.hpp"
 #include "standalone_driver.hpp"
 #include "symbol_store.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 
 namespace symbol_classifier {
 
@@ -938,11 +938,20 @@ namespace symbol_classifier {
 				std::memory_order_acq_rel))
 				return;
 			std::weak_ptr<module_entry_t> weak = mod;
-			work_queue::post([weak]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "disasm";
+			sub.label = "disasm.symbol_classifier.build_module";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::feature_worker;
+			sub.priority = 2;
+			sub.body = [weak]() {
 				auto strong = weak.lock();
 				if (!strong) return;
 				build_module_classification(strong);
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+				mod->state.store(static_cast<uint32_t>(build_state_t::failed),
+					std::memory_order_release);
 		}
 
 		inline void clear_caches() {
@@ -963,10 +972,18 @@ namespace symbol_classifier {
 			if (!reg.rebuild_in_flight.compare_exchange_strong(expected, true,
 				std::memory_order_acq_rel))
 				return;
-			work_queue::post([&reg]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "disasm";
+			sub.label = "disasm.symbol_classifier.rebuild_table";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::feature_worker;
+			sub.priority = 2;
+			sub.body = [&reg]() {
 				rebuild_module_table_offlock(reg);
 				reg.rebuild_in_flight.store(false, std::memory_order_release);
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+				reg.rebuild_in_flight.store(false, std::memory_order_release);
 		}
 
 		inline void ensure_subscription() {
@@ -1167,10 +1184,18 @@ namespace symbol_classifier {
 			if (reg.rebuild_in_flight.compare_exchange_strong(expected, true,
 				std::memory_order_acq_rel))
 			{
-				work_queue::post([&reg]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "disasm";
+				sub.label = "disasm.symbol_classifier.warm_rebuild_table";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 2;
+				sub.body = [&reg]() {
 					detail::rebuild_module_table_offlock(reg);
 					reg.rebuild_in_flight.store(false, std::memory_order_release);
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted)
+					reg.rebuild_in_flight.store(false, std::memory_order_release);
 			}
 			return;
 		}
@@ -1336,13 +1361,21 @@ namespace symbol_classifier {
 					continue;
 				}
 				std::weak_ptr<module_entry_t> weak = mod;
-				work_queue::post([weak]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "disasm";
+				sub.label = "disasm.symbol_classifier.apply_pdb";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 2;
+				sub.body = [weak]() {
 					auto strong = weak.lock();
 					if (!strong) return;
 					apply_pdb_symbols(strong);
 					apply_pdb_types(strong);
 					strong->apply_in_flight.store(false, std::memory_order_release);
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted)
+					mod->apply_in_flight.store(false, std::memory_order_release);
 			}
 		}
 

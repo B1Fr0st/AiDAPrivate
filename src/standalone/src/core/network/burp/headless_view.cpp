@@ -16,7 +16,7 @@
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
 #include "../../infra/event_bus.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -30,6 +30,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -210,7 +211,14 @@ void schedule_status_poll()
 {
     bool expected = false;
     if (!g_state.poll_in_flight.compare_exchange_strong(expected, true)) return;
-    work_queue::post([]() {
+    const bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.status_poll";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         aida::burp::camoufox::bridge_status_t s = aida::burp::camoufox::get_status();
         {
             std::lock_guard<std::mutex> lk(g_state.status_mtx);
@@ -264,14 +272,25 @@ void schedule_status_poll()
         }
 
         g_state.poll_in_flight.store(false, std::memory_order_release);
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
+    if (!posted)
+        g_state.poll_in_flight.store(false, std::memory_order_release);
 }
 
 void schedule_install_probe(bool also_log)
 {
     bool expected = false;
     if (!g_state.install_poll_in_flight.compare_exchange_strong(expected, true)) return;
-    work_queue::post([also_log]() {
+    const bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.install_probe";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = [also_log]() {
         aida::burp::camoufox::install::status_t s = aida::burp::camoufox::install::probe();
         {
             std::lock_guard<std::mutex> lk(g_state.status_mtx);
@@ -284,14 +303,25 @@ void schedule_install_probe(bool also_log)
             g_state.show_install_panel = need_install_panel(s);
         }
         g_state.install_poll_in_flight.store(false, std::memory_order_release);
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
+    if (!posted)
+        g_state.install_poll_in_flight.store(false, std::memory_order_release);
 }
 
 void run_async_install_module()
 {
     ::diag::log_tagged("headless_v", "install_module_start");
     append_install_log_line(std::string("[install_module] starting pip install"));
-    work_queue::post([]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.install_module";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         std::string log;
         bool ok = false;
         try { ok = aida::burp::camoufox::install::pip_install_module(log); } catch (...) { ok = false; }
@@ -309,14 +339,23 @@ void run_async_install_module()
             append_install_log_line(std::string("[install_module] completed"));
         }
         schedule_install_probe(true);
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_async_fetch_browser()
 {
     ::diag::log_tagged("headless_v", "fetch_browser_start");
     append_install_log_line(std::string("[fetch_browser] starting download"));
-    work_queue::post([]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.fetch_browser";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         std::string log;
         bool ok = false;
         try { ok = aida::burp::camoufox::install::fetch_browser(log); } catch (...) { ok = false; }
@@ -334,7 +373,9 @@ void run_async_fetch_browser()
             append_install_log_line(std::string("[fetch_browser] completed"));
         }
         schedule_install_probe(true);
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 aida::burp::camoufox::launch_config_t build_launch_config()
@@ -356,7 +397,14 @@ aida::burp::camoufox::launch_config_t build_launch_config()
 void run_start_bridge()
 {
     aida::burp::camoufox::launch_config_t cfg = build_launch_config();
-    work_queue::post([cfg]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.start_bridge";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = [cfg]() {
         bool ok = false;
         try { ok = aida::burp::camoufox::start_bridge(cfg); } catch (...) { ok = false; }
         if (!ok) {
@@ -368,12 +416,21 @@ void run_start_bridge()
             ::diag::log_tagged("headless_v", "start_bridge_completed");
         }
         schedule_status_poll();
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_stop_bridge()
 {
-    work_queue::post([]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.stop_bridge";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         bool ok = false;
         try { ok = aida::burp::camoufox::stop_bridge("headless_view.stop"); } catch (...) { ok = false; }
         if (!ok) {
@@ -385,7 +442,9 @@ void run_stop_bridge()
             ::diag::log_tagged("headless_v", "stop_bridge_completed");
         }
         schedule_status_poll();
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_navigate(const std::string& url)
@@ -393,7 +452,14 @@ void run_navigate(const std::string& url)
     if (url.empty()) { set_err("navigate: empty url"); return; }
     std::string copy = url;
     ::diag::log_tagged_fmt("headless_v", "navigate url='%s'", copy.c_str());
-    work_queue::post([copy]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.navigate";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = [copy]() {
         bool ok = false;
         try { ok = aida::burp::camoufox::navigate(copy, std::string("load"), 30000); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "navigate_result ok=%d url='%s'", ok ? 1 : 0, copy.c_str());
@@ -403,13 +469,22 @@ void run_navigate(const std::string& url)
             set_err(msg);
         }
         schedule_status_poll();
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_reload()
 {
     ::diag::log_tagged("headless_v", "reload");
-    work_queue::post([]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.reload";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         bool ok = false;
         try { ok = aida::burp::camoufox::reload(std::string("load")); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "reload_result ok=%d", ok ? 1 : 0);
@@ -419,7 +494,9 @@ void run_reload()
             set_err(msg);
         }
         schedule_status_poll();
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 std::string compute_screenshot_path()
@@ -443,7 +520,14 @@ void run_screenshot()
 {
     std::string out = compute_screenshot_path();
     ::diag::log_tagged_fmt("headless_v", "screenshot path='%s'", out.c_str());
-    work_queue::post([out]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.screenshot";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = [out]() {
         bool ok = false;
         try { ok = aida::burp::camoufox::take_screenshot(out, true); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "screenshot_result ok=%d path='%s'", ok ? 1 : 0, out.c_str());
@@ -455,13 +539,22 @@ void run_screenshot()
             if (msg.empty()) msg = "take_screenshot returned false";
             set_err(msg);
         }
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_reset_state()
 {
     ::diag::log_tagged("headless_v", "reset_state");
-    work_queue::post([]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.reset_state";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         bool ok = false;
         try { ok = aida::burp::camoufox::reset_browser_state(); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "reset_state_result ok=%d", ok ? 1 : 0);
@@ -471,7 +564,9 @@ void run_reset_state()
             set_err(msg);
         }
         schedule_status_poll();
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_inject_preset(int idx)
@@ -479,7 +574,14 @@ void run_inject_preset(int idx)
     if (idx < 0 || idx >= kHookPresetCount) return;
     std::string name = kHookPresets[idx];
     ::diag::log_tagged_fmt("headless_v", "inject_hook preset='%s'", name.c_str());
-    work_queue::post([name]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.inject_preset";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = [name]() {
         bool ok = false;
         try { ok = aida::burp::camoufox::inject_hook_preset(name); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "inject_hook_result ok=%d preset='%s'", ok ? 1 : 0, name.c_str());
@@ -488,13 +590,22 @@ void run_inject_preset(int idx)
             if (msg.empty()) msg = "inject_hook_preset returned false";
             set_err(msg);
         }
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_remove_hooks()
 {
     ::diag::log_tagged("headless_v", "remove_hooks");
-    work_queue::post([]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.remove_hooks";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         bool ok = false;
         try { ok = aida::burp::camoufox::remove_hooks(); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "remove_hooks_result ok=%d", ok ? 1 : 0);
@@ -503,7 +614,9 @@ void run_remove_hooks()
             if (msg.empty()) msg = "remove_hooks returned false";
             set_err(msg);
         }
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_evaluate_js(const std::string& expr)
@@ -514,7 +627,14 @@ void run_evaluate_js(const std::string& expr)
         return;
     }
     ::diag::log_tagged_fmt("headless_v", "evaluate_js expr_len=%zu", expr.size());
-    work_queue::post([expr]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.evaluate_js";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = [expr]() {
         aida::burp::camoufox::call_result_t r;
         try { r = aida::burp::camoufox::evaluate_js(expr, true); } catch (...) { r.ok = false; r.error = "evaluate_js threw"; }
         ::diag::log_tagged_fmt("headless_v", "evaluate_js_result ok=%d error='%s'",
@@ -538,14 +658,23 @@ void run_evaluate_js(const std::string& expr)
         }
         std::lock_guard<std::mutex> lk(g_state.status_mtx);
         g_state.eval_output = std::move(txt);
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void run_add_init_script(const std::string& js)
 {
     if (js.empty()) { set_err("add_init_script: empty"); return; }
     ::diag::log_tagged_fmt("headless_v", "add_init_script js_len=%zu", js.size());
-    work_queue::post([js]() {
+    {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.headless_view";
+        sub.label = "headless.add_init_script";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = [js]() {
         bool ok = false;
         try { ok = aida::burp::camoufox::add_init_script(js); } catch (...) { ok = false; }
         ::diag::log_tagged_fmt("headless_v", "add_init_script_result ok=%d", ok ? 1 : 0);
@@ -554,7 +683,9 @@ void run_add_init_script(const std::string& js)
             if (msg.empty()) msg = "add_init_script returned false";
             set_err(msg);
         }
-    });
+    };
+        (void)::aida::infra::executor::submit(std::move(sub));
+    }
 }
 
 void open_in_explorer(const std::string& path)

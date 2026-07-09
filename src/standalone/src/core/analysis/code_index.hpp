@@ -9,7 +9,8 @@
 #include <windows.h>
 
 #include <string>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
 #include <vector>
 #include <map>
@@ -313,7 +314,13 @@ public:
         };
         bool posted = false;
         try {
-            posted = work_queue::post([index_task = std::move(index_task)]() mutable {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "analysis";
+            sub.label = "analysis.code_index.index_workspace";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 3;
+            sub.body = [index_task = std::move(index_task)]() mutable {
                 const DWORD tid = GetCurrentThreadId();
                 const ULONGLONG start_ms = GetTickCount64();
                 diag::log_tagged_fmt("code_index",
@@ -324,20 +331,21 @@ public:
                     "worker_exit tid=%lu elapsed_ms=%llu",
                     static_cast<unsigned long>(tid),
                     static_cast<unsigned long long>(GetTickCount64() - start_ms));
-            });
+            };
+            posted = aida::infra::executor::submit(std::move(sub)).submitted;
         } catch (...) {
             posted = false;
         }
         if (!posted) {
-            const auto qs = work_queue::stats();
+            const auto qs = aida::infra::taskflow_runtime::active_snapshot();
             diag::log_tagged_fmt("code_index",
-                "worker_post_failed alive=%d shutdown=%d pending=%llu active=%u posted=%llu rejected=%llu",
-                qs.alive ? 1 : 0,
+                "worker_post_failed accepting=%d shutdown=%d work_pending=%llu work_active=%u submitted=%llu rejected=%llu",
+                qs.accepting ? 1 : 0,
                 qs.shutting_down ? 1 : 0,
-                static_cast<unsigned long long>(qs.pending),
-                qs.active,
-                static_cast<unsigned long long>(qs.posted),
-                static_cast<unsigned long long>(qs.rejected));
+                static_cast<unsigned long long>(qs.work_queue_pending),
+                qs.work_queue_active,
+                static_cast<unsigned long long>(qs.total_submitted),
+                static_cast<unsigned long long>(qs.total_rejected));
             _state = index_state_t::error;
             _running = false;
             _done_cv.notify_all();

@@ -13,7 +13,7 @@
 #include "../../ui/components.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <map>
 #include <string>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -108,7 +109,14 @@ void render(float pos_x, float pos_y, float width, float height,
         api_definition::api_format_t fmt = fmt_from_idx(s_state.import_format_idx);
         ::diag::log_tagged_fmt("api_v", "import what='%s' format_idx=%d", what.c_str(), s_state.import_format_idx);
         s_state.importing.store(true);
-        work_queue::post([what, fmt]() {
+        {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.api_view";
+            sub.label = "api_view.import";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::external_tool;
+            sub.priority = 3;
+            sub.body = [what, fmt]() {
             uint64_t id = 0;
             if (what.rfind("http://", 0) == 0 || what.rfind("https://", 0) == 0)
                 id = api_definition::import_from_url(what);
@@ -127,7 +135,9 @@ void render(float pos_x, float pos_y, float width, float height,
                 }
             }
             s_state.importing.store(false);
-        });
+        };
+            (void)::aida::infra::executor::submit(std::move(sub));
+        }
     }
     if (importing) ImGui::EndDisabled();
 
@@ -217,7 +227,14 @@ void render(float pos_x, float pos_y, float width, float height,
             ::diag::log_tagged_fmt("api_v", "audit_collection id=%llu name='%s'",
                 static_cast<unsigned long long>(cid), c.name.c_str());
             s_state.auditing.store(true);
-            work_queue::post([cid, auth]() {
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.api_view";
+                sub.label = "api_view.audit_collection";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [cid, auth]() {
                 api_definition::audit_result_t res;
                 bool ok = api_definition::audit_entire_collection(cid, auth, res);
                 {
@@ -234,7 +251,9 @@ void render(float pos_x, float pos_y, float width, float height,
                     s_state.last_action_message = msg;
                 }
                 s_state.auditing.store(false);
-            });
+            };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
         if (auditing) ImGui::EndDisabled();
     }
@@ -283,7 +302,14 @@ void render(float pos_x, float pos_y, float width, float height,
             ::diag::log_tagged_fmt("api_v", "send_request method='%s' path='%s' base='%s'",
                 r.method.c_str(), r.path.c_str(), r.base_url.c_str());
             s_state.sending.store(true);
-            work_queue::post([tpl_copy, pv, qv, hv]() {
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.api_view";
+                sub.label = "api_view.send_request";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [tpl_copy, pv, qv, hv]() {
                 std::string scheme, host, path; uint16_t port = 0;
                 std::vector<uint8_t> raw = api_definition::render_to_raw_request(tpl_copy, pv, qv, hv, std::string());
                 bool tls = false;
@@ -317,7 +343,9 @@ void render(float pos_x, float pos_y, float width, float height,
                     s_state.last_action_message = audit_http::last_error();
                 }
                 s_state.sending.store(false);
-            });
+            };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
         if (sending) ImGui::EndDisabled();
 

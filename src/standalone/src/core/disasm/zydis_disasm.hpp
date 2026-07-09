@@ -1,7 +1,7 @@
 
 #pragma once
 #include <windows.h>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include <commdlg.h>
 
 #include <Zydis/Zydis.h>
@@ -15,6 +15,7 @@
 #include <thread>
 #include <algorithm>
 #include <mutex>
+#include <utility>
 
 #include "standalone_driver.hpp"
 #include "../analysis/pe_parser.hpp"
@@ -570,10 +571,18 @@ namespace disasm
     {
         if (file.decoding) return;
         file.decoding = true;
-        work_queue::post([&file]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "disasm";
+        sub.label = "disasm.decode_section";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::feature_worker;
+        sub.priority = 2;
+        sub.body = [&file]() {
             decode_section(file);
             file.decoding = false;
-        });
+        };
+        if (!aida::infra::executor::submit(std::move(sub)).submitted)
+            file.decoding = false;
     }
 
 
@@ -633,7 +642,7 @@ namespace disasm
             static_cast<unsigned long long>(read_sz),
             state.live_pid);
         diag::log_tagged_critical_fmt("disasm",
-            "request_live_decode_posting_to_work_queue win_start=0x%llX read_sz=%llu pid=%u",
+            "request_live_decode_posting_to_executor domain=feature_worker win_start=0x%llX read_sz=%llu pid=%u",
             static_cast<unsigned long long>(win_start),
             static_cast<unsigned long long>(read_sz),
             state.live_pid);
@@ -642,7 +651,14 @@ namespace disasm
         DisasmState* state_ptr = &state;
         bool decode_is_64bit = state.file.is_64bit;
 
-        work_queue::post([state_ptr, pid, win_start, read_sz, decode_is_64bit]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "disasm";
+        sub.label = "disasm.live_decode";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::feature_worker;
+        sub.priority = 2;
+        sub.target_pid = pid;
+        sub.body = [state_ptr, pid, win_start, read_sz, decode_is_64bit]() {
             diag::log_tagged_critical_fmt("disasm",
                 "live_decode_worker_enter pid=%u win_start=0x%llX read_sz=%llu tid=%lu",
                 pid,
@@ -712,7 +728,17 @@ namespace disasm
                 "live_decode_worker_exit pid=%u win_start=0x%llX",
                 pid,
                 static_cast<unsigned long long>(win_start));
-        });
+        };
+        if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+            state_ptr->live_decode_failed.store(true, std::memory_order_release);
+            state_ptr->live_fail_count.fetch_add(1, std::memory_order_acq_rel);
+            state_ptr->live_decoding.store(false, std::memory_order_release);
+            diag::log_tagged_critical_fmt("disasm",
+                "live_decode_post_failed pid=%u win_start=0x%llX read_sz=%llu",
+                pid,
+                static_cast<unsigned long long>(win_start),
+                static_cast<unsigned long long>(read_sz));
+        }
     }
 
 

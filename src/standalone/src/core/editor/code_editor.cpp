@@ -28,7 +28,7 @@
 #include "blur_layer.hpp"
 #include "fonts.hpp"
 #include "ui_anim.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../helpers/diag_log.hpp"
 
 
@@ -2200,7 +2200,13 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                         s_ghost_debounce = 0.f;
                     } else {
                     s_ghost_requesting = true;
-                    work_queue::post([context]() {
+                    aida::infra::executor::submission_t sub;
+                    sub.owner_subsystem = "code_editor";
+                    sub.label = "code_editor.ghost_completion";
+                    sub.thread_class = "bounded_task";
+                    sub.domain = aida::infra::executor::domain_t::feature_worker;
+                    sub.priority = 3;
+                    sub.body = [context]() {
                         std::string prompt = "Complete the following code. Output ONLY the completion text (the part that comes after the cursor), nothing else. No explanation, no markdown. If there's nothing meaningful to suggest, output nothing.\n\n```\n" + context + "```";
                         std::vector<std::pair<std::string, std::string>> empty_history;
                         std::string result = g_sa_ai_client->chat_blocking(prompt, empty_history);
@@ -2227,7 +2233,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                         std::lock_guard<std::mutex> lk(s_ghost_mtx);
                         s_ghost_pending = std::move(result);
                         s_ghost_has_pending = true;
-                    });
+                    };
+                    if (!aida::infra::executor::submit(std::move(sub)).submitted)
+                        s_ghost_requesting = false;
                     }
                 }
             }

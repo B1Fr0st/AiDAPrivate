@@ -11,7 +11,7 @@
 
 #include "ws_editor.hpp"
 
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <openssl/ssl.h>
@@ -30,6 +30,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <utility>
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Bcrypt.lib")
@@ -972,7 +973,16 @@ uint64_t connect(const ws_connection_config_t& cfg)
     cptr->recv_worker_alive.store(true, std::memory_order_release);
     bool recv_posted = false;
     try {
-        recv_posted = work_queue::post_service([cptr]() { receive_loop(cptr); });
+        recv_posted = [&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.ws_editor";
+            sub.label = "ws.receive_loop";
+            sub.thread_class = "service_loop";
+            sub.domain = aida::infra::executor::domain_t::service;
+            sub.priority = 4;
+            sub.body = [cptr]() { receive_loop(cptr); };
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }();
     } catch (...) {
         recv_posted = false;
     }

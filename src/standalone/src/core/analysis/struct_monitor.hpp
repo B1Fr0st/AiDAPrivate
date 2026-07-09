@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include "work_queue.hpp"
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -11,12 +10,14 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "struct_recon_engine.hpp"
 #include "page_guard_engine.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace struct_monitor {
@@ -216,7 +217,14 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 		sess.using_polling ? 1 : 0,
 		sess.using_hwbp ? 1 : 0);
 
-	work_queue::post([base_address, struct_size]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "analysis";
+	sub.label = "analysis.struct_monitor.loop";
+	sub.thread_class = "long_running";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = pid;
+	sub.body = [base_address, struct_size]() {
 		monitor_session_t& sess = g_state.session;
 
 		uint64_t total = 0;
@@ -422,7 +430,21 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 		}
 
 		g_state.active.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		if (sess.using_page_guard && sess.pg_session_id != 0)
+			page_guard_engine::g_pg_engine.uninstall(sess.pg_session_id);
+		if (sess.using_hwbp && sess.primary_tid != 0) {
+			for (int i = 0; i < 4; ++i)
+				driver_bridge::clear_hardware_breakpoint(sess.primary_tid, i);
+		}
+		g_state.active.store(false);
+		diag::log_tagged_fmt("struct_monitor",
+			"monitor_loop_post_failed base=0x%llX size=%d pid=%u",
+			static_cast<unsigned long long>(base_address),
+			struct_size,
+			pid);
+	}
 }
 
 inline void stop()

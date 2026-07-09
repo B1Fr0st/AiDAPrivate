@@ -14,7 +14,7 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -22,6 +22,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -253,7 +254,14 @@ void render(float pos_x, float pos_y, float width, float height,
             const uint64_t mid = cur.id;
             ::diag::log_tagged_fmt("session_v", "macro_run id=%llu name='%s'",
                 static_cast<unsigned long long>(mid), cur.name.c_str());
-            work_queue::post([mid]() {
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.session_view";
+                sub.label = "session.macro_run";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [mid]() {
                 std::map<std::string, std::string> values;
                 const bool ok = session_handler::run_macro(mid, values);
                 ::diag::log_tagged_fmt("session_v", "macro_run_result id=%llu ok=%d extracted=%zu",
@@ -263,7 +271,9 @@ void render(float pos_x, float pos_y, float width, float height,
                 vs.last_run_values = std::move(values);
                 vs.last_run_ok = ok;
                 vs.last_run_macro_id = mid;
-            });
+            };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
 
         ImGui::Separator();

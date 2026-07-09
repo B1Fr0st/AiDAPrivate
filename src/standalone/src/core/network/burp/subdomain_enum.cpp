@@ -18,7 +18,7 @@
 #include "payload_library.hpp"
 
 #include "helpers/diag_log.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -33,6 +33,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -490,10 +491,20 @@ void run_enum(std::shared_ptr<enum_t> ctx)
             if (ctx->stop_flag.load()) break;
             const std::string w = words[i++];
             running->fetch_add(1);
-            work_queue::post([ctx, w, running]() {
+            if (![&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.subdomain_enum";
+                sub.label = "subdomain.brute_one";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::feature_worker;
+                sub.priority = 3;
+                sub.body = [ctx, w, running]() {
                 brute_one(ctx, w);
                 running->fetch_sub(1);
-            });
+            };
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }())
+                running->fetch_sub(1);
         }
         while (running->load() > 0)
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -563,7 +574,22 @@ uint64_t start(const config_t& cfg)
     }
     diag::log_tagged_fmt("burp.subdomain_enum", "enum_start id=%llu domain=%s passive=%d brute=%d",
         static_cast<unsigned long long>(ctx->id), cfg.domain.c_str(), cfg.run_passive ? 1 : 0, cfg.run_brute ? 1 : 0);
-    work_queue::post([ctx] { run_enum(ctx); });
+    if (![&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.subdomain_enum";
+        sub.label = "subdomain.run_enum";
+        sub.thread_class = "long_running";
+        sub.domain = aida::infra::executor::domain_t::long_running;
+        sub.priority = 3;
+        sub.body = [ctx] { run_enum(ctx); };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }()) {
+        ctx->finished.store(true, std::memory_order_release);
+        set_err("subdomain enum executor submission failed");
+        std::lock_guard<std::mutex> lk(reg().mtx);
+        reg().by_id.erase(ctx->id);
+        return 0;
+    }
     return ctx->id;
 }
 

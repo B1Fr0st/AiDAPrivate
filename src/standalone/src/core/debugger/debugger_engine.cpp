@@ -9,7 +9,7 @@
 #include "../analysis/symbol_store.hpp"
 #include "../editor/expression_eval.hpp"
 #include "../runtime/run_target.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "event_bus.hpp"
 #include "toast_notification.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -3988,7 +3988,15 @@ void find_strings_async(size_t min_length) {
 		static_cast<unsigned>(st.target_pid));
 
 	try {
-		const bool posted = work_queue::post([min_length]() {
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "debugger";
+		submission.label = "debugger.find_strings";
+		submission.thread_class = "debugger_strings";
+		submission.domain = aida::infra::executor::domain_t::long_running;
+		submission.priority = 2;
+		submission.target_pid = st.target_pid;
+		submission.failure_policy = "reject_not_started";
+		submission.body = [min_length]() {
 		try {
 			find_strings(min_length);
 		} catch (const std::exception& ex) {
@@ -4010,7 +4018,8 @@ void find_strings_async(size_t min_length) {
 			static_cast<unsigned long long>(s.strings_pages_scanned.load()));
 		s.strings_cancel.store(false, std::memory_order_release);
 		s.strings_scanning.store(false, std::memory_order_release);
-		});
+		};
+		const bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 		if (!posted) {
 			st.strings_scanning.store(false, std::memory_order_release);
 			st.strings_cancel.store(false, std::memory_order_release);
@@ -4373,7 +4382,15 @@ void request_refresh(uint32_t max_age_ms) {
 	if (!st.refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
 	try {
-		if (!work_queue::post([]() {
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "debugger";
+		submission.label = "debugger.register_refresh";
+		submission.thread_class = "debugger_refresh";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 3;
+		submission.target_pid = st.target_pid;
+		submission.failure_policy = "reject_not_started";
+		submission.body = []() {
 			auto& s = g_state;
 			try {
 				if (s.active_tid == 0 && s.target_pid != 0) {
@@ -4397,7 +4414,8 @@ void request_refresh(uint32_t max_age_ms) {
 				diag::log_tagged("debugger", "request_refresh_worker_exception err='<unknown>'");
 			}
 			s.refresh_in_flight.store(false);
-		})) {
+		};
+		if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 			diag::log_tagged("debugger", "request_refresh_worker_post_failed");
 			st.refresh_in_flight.store(false);
 		}
@@ -4420,7 +4438,15 @@ void request_thread_refresh(uint32_t max_age_ms) {
 	if (!st.thread_refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
 	try {
-		if (!work_queue::post([]() {
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "debugger";
+		submission.label = "debugger.thread_refresh";
+		submission.thread_class = "debugger_refresh";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 3;
+		submission.target_pid = st.target_pid;
+		submission.failure_policy = "reject_not_started";
+		submission.body = []() {
 			auto& s = g_state;
 			try {
 				auto raw = driver_bridge::enumerate_threads();
@@ -4450,7 +4476,8 @@ void request_thread_refresh(uint32_t max_age_ms) {
 				diag::log_tagged("debugger", "request_thread_refresh_worker_exception err='<unknown>'");
 			}
 			s.thread_refresh_in_flight.store(false);
-		})) {
+		};
+		if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 			diag::log_tagged("debugger", "request_thread_refresh_worker_post_failed");
 			st.thread_refresh_in_flight.store(false);
 		}
@@ -4472,7 +4499,15 @@ void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms) {
 	if (!st.stack_refresh_in_flight.compare_exchange_strong(expected, true)) return;
 
 	try {
-		if (!work_queue::post([rsp, bytes]() {
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "debugger";
+		submission.label = "debugger.stack_refresh";
+		submission.thread_class = "debugger_refresh";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 3;
+		submission.target_pid = st.target_pid;
+		submission.failure_policy = "reject_not_started";
+		submission.body = [rsp, bytes]() {
 			auto& s = g_state;
 			try {
 				std::vector<uint8_t> buf;
@@ -4489,7 +4524,8 @@ void request_stack_refresh(uint64_t rsp, size_t bytes, uint32_t max_age_ms) {
 				diag::log_tagged("debugger", "request_stack_refresh_worker_exception err='<unknown>'");
 			}
 			s.stack_refresh_in_flight.store(false);
-		})) {
+		};
+		if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 			diag::log_tagged("debugger", "request_stack_refresh_worker_post_failed");
 			st.stack_refresh_in_flight.store(false);
 		}
@@ -4531,7 +4567,15 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 	}
 
 	try {
-		if (!work_queue::post([addr, bytes, now]() {
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "debugger";
+		submission.label = "debugger.dump_refresh";
+		submission.thread_class = "debugger_refresh";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 2;
+		submission.target_pid = st.target_pid;
+		submission.failure_policy = "reject_not_started";
+		submission.body = [addr, bytes, now]() {
 			auto& s = g_state;
 			const uint64_t worker_start = now_ms();
 			diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_entry addr=0x%llX bytes=%zu request_age_ms=%llu attached_pid=%u",
@@ -4576,7 +4620,8 @@ void request_dump_refresh(uint64_t addr, size_t bytes, uint32_t max_age_ms) {
 					static_cast<unsigned long long>(addr), bytes, static_cast<unsigned long long>(now_ms() - worker_start));
 			}
 			s.dump_refresh_in_flight.store(false);
-		})) {
+		};
+		if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 			diag::log_tagged_fmt("debugger_engine", "dump_refresh_worker_post_failed addr=0x%llX bytes=%zu", static_cast<unsigned long long>(addr), bytes);
 			st.dump_refresh_in_flight.store(false);
 		}
@@ -4652,9 +4697,17 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 	}
 
 	try {
-		if (!work_queue::post([rip]() {
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "debugger";
+		submission.label = "debugger.disasm_refresh";
+		submission.thread_class = "debugger_refresh";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 2;
+		submission.target_pid = st.target_pid;
+		submission.failure_policy = "reject_not_started";
+		submission.body = [rip]() {
 			try {
-				(void)refresh_disasm_window_now(rip, "work_queue");
+				(void)refresh_disasm_window_now(rip, "executor");
 			} catch (const std::exception& ex) {
 				g_state.disasm_refresh_in_flight.store(false);
 				set_last_error(std::string("request_disasm_refresh worker exception: ") + ex.what());
@@ -4666,7 +4719,8 @@ void request_disasm_refresh(uint64_t rip, uint32_t max_age_ms) {
 				diag::log_tagged_fmt("debugger_engine", "disasm_refresh worker_unknown_exception rip=0x%llX",
 					static_cast<unsigned long long>(rip));
 			}
-		})) {
+		};
+		if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 			set_last_error("request_disasm_refresh worker post failed");
 			diag::log_tagged_fmt("debugger_engine",
 				"disasm_refresh worker_post_failed rip=0x%llX pid=%u target_pid=%u",

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "symbolic_engine.hpp"
-#include "work_queue.hpp"
 #include "deobfuscation_engine.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
@@ -17,6 +16,7 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -29,6 +29,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace symbolic_view {
@@ -145,7 +146,13 @@ inline void start_symbolic_exec(local_state_t& st) {
 
 	symbolic_engine::g_state.processing.store(true);
 	auto t0 = std::chrono::steady_clock::now();
-	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, t0]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "emulation";
+	sub.label = "emulation.symbolic.execute";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = [addr, end, max_i = static_cast<uint32_t>(st.max_insns), regs, t0]() {
 		symbolic_engine::symbolic_result_t result;
 		try {
 			result = symbolic_engine::execute_symbolic(addr, end, max_i, regs, {});
@@ -174,7 +181,13 @@ inline void start_symbolic_exec(local_state_t& st) {
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_result = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		symbolic_engine::g_state.processing.store(false);
+		diag::log_tagged_fmt("symbolic",
+			"symbolic_exec_post_failed entry=0x%llX",
+			static_cast<unsigned long long>(addr));
+	}
 }
 
 inline void start_deobfuscate(local_state_t& st) {
@@ -193,7 +206,13 @@ inline void start_deobfuscate(local_state_t& st) {
 
 	deobfuscation_engine::g_state.processing.store(true);
 	auto t0 = std::chrono::steady_clock::now();
-	work_queue::post([addr, max_i = static_cast<uint32_t>(st.max_insns), t0]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "emulation";
+	sub.label = "emulation.deobfuscate.from_symbolic";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = [addr, max_i = static_cast<uint32_t>(st.max_insns), t0]() {
 		deobfuscation_engine::deobfuscated_result_t result;
 		try {
 			result = deobfuscation_engine::deobfuscate_function(addr, max_i);
@@ -222,7 +241,13 @@ inline void start_deobfuscate(local_state_t& st) {
 		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
 		deobfuscation_engine::g_state.last_result = std::move(result);
 		deobfuscation_engine::g_state.processing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		deobfuscation_engine::g_state.processing.store(false);
+		diag::log_tagged_fmt("deobf",
+			"deobfuscate_post_failed entry=0x%llX",
+			static_cast<unsigned long long>(addr));
+	}
 }
 
 inline void start_slice(local_state_t& st) {
@@ -251,7 +276,13 @@ inline void start_slice(local_state_t& st) {
 
 	symbolic_engine::g_state.processing.store(true);
 	auto t0 = std::chrono::steady_clock::now();
-	work_queue::post([addr, end, max_i = static_cast<uint32_t>(st.max_insns), target, t0]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "emulation";
+	sub.label = "emulation.symbolic.slice";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = [addr, end, max_i = static_cast<uint32_t>(st.max_insns), target, t0]() {
 		symbolic_engine::slice_result_t result;
 		try {
 			result = symbolic_engine::slice_to_register(addr, end, max_i, target);
@@ -279,7 +310,14 @@ inline void start_slice(local_state_t& st) {
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_slice = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		symbolic_engine::g_state.processing.store(false);
+		diag::log_tagged_fmt("symbolic",
+			"slice_post_failed entry=0x%llX target='%s'",
+			static_cast<unsigned long long>(addr),
+			target.c_str());
+	}
 }
 
 inline void start_solve(local_state_t& st) {
@@ -308,7 +346,13 @@ inline void start_solve(local_state_t& st) {
 
 	symbolic_engine::g_state.processing.store(true);
 	auto t0 = std::chrono::steady_clock::now();
-	work_queue::post([addr, target, max_i = static_cast<uint32_t>(st.max_insns), regs, t0]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "emulation";
+	sub.label = "emulation.symbolic.solve";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.body = [addr, target, max_i = static_cast<uint32_t>(st.max_insns), regs, t0]() {
 		symbolic_engine::solve_result_t result;
 		try {
 			result = symbolic_engine::solve_for_path(addr, target, max_i, regs);
@@ -338,7 +382,14 @@ inline void start_solve(local_state_t& st) {
 		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 		symbolic_engine::g_state.last_solve = std::move(result);
 		symbolic_engine::g_state.processing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		symbolic_engine::g_state.processing.store(false);
+		diag::log_tagged_fmt("symbolic",
+			"solve_post_failed entry=0x%llX target=0x%llX",
+			static_cast<unsigned long long>(addr),
+			static_cast<unsigned long long>(target));
+	}
 }
 
 inline std::shared_ptr<ast_node_t> parse_ast(const std::string& expr) {
@@ -1357,13 +1408,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (simplify_clicked && !simplifying_now && !st.expression_text.empty()) {
 			st.simplifying.store(true);
 			std::string text_copy = st.expression_text;
-			work_queue::post([text_copy]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "emulation";
+			sub.label = "emulation.symbolic.simplify_ast";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::diagnostics;
+			sub.priority = 4;
+			sub.body = [text_copy]() {
 				auto root = detail::parse_ast(text_copy);
 				std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
 				s_state.ast_root = root;
 				s_state.simplified_text = text_copy;
 				s_state.simplifying.store(false);
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+				st.simplifying.store(false);
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(cx + pad + 110.f, ty));

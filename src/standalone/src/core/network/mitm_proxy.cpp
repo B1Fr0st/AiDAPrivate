@@ -10,7 +10,7 @@
 #include "pac_resolver.hpp"
 #include "conn_pool.hpp"
 #include "script_engine.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../infra/event_bus.hpp"
 #include "../infra/win_thread.hpp"
 #include "helpers/diag_log.hpp"
@@ -45,6 +45,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -101,9 +102,16 @@ static void publish_exchange_event(const http_exchange& ex) {
     e.client_addr = ex.client_addr;
     e.client_port = ex.client_port;
 
-    work_queue::post([copy = std::move(e)]() mutable {
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "network.mitm";
+    sub.label = "mitm.exchange_observed";
+    sub.thread_class = "bounded_task";
+    sub.domain = aida::infra::executor::domain_t::feature_worker;
+    sub.priority = 3;
+    sub.body = [copy = std::move(e)]() mutable {
         aida::events::publish(aida::burp::kExchangeObservedEvent, copy);
-    });
+    };
+    (void)aida::infra::executor::submit(std::move(sub));
 }
 
 
@@ -2902,12 +2910,12 @@ static void worker_thread_func(state_t& state) {
             {
                 std::unique_lock<std::mutex> lock(state.work_mutex);
                 state.work_cv.wait(lock, [&] {
-                    return !state.work_queue.empty() || !state.running.load() || !state.proxy_alive.load();
+                    return !state.pending_work.empty() || !state.running.load() || !state.proxy_alive.load();
                 });
-                if (!state.running.load() && state.work_queue.empty()) break;
-                if (state.work_queue.empty()) continue;
-                item = state.work_queue.front();
-                state.work_queue.pop();
+                if (!state.running.load() && state.pending_work.empty()) break;
+                if (state.pending_work.empty()) continue;
+                item = state.pending_work.front();
+                state.pending_work.pop();
             }
             diag::log_tagged_fmt("mitm", "worker_thread_func dequeued client_port=%u", item.client_port);
 
@@ -2961,7 +2969,7 @@ static void listener_thread_func(state_t& state) {
                 addr_buf, item.client_port);
             {
                 std::lock_guard<std::mutex> lock(state.work_mutex);
-                state.work_queue.push(item);
+                state.pending_work.push(item);
             }
             state.work_cv.notify_one();
         }
@@ -3065,7 +3073,7 @@ static void extra_listener_loop(std::shared_ptr<extra_listener_runtime_t> rt) {
         rt->accepted.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(g_state.work_mutex);
-            g_state.work_queue.push(item);
+            g_state.pending_work.push(item);
         }
         g_state.work_cv.notify_one();
     }
@@ -3334,10 +3342,17 @@ void pre_initialize() {
     state_t* st_ptr = &st;
 
     st.listener_done.store(false, std::memory_order_release);
-    bool listener_posted = work_queue::post([st_ptr]() {
+    aida::infra::executor::submission_t listener_sub;
+    listener_sub.owner_subsystem = "network.mitm";
+    listener_sub.label = "mitm.listener";
+    listener_sub.thread_class = "service_loop";
+    listener_sub.domain = aida::infra::executor::domain_t::service;
+    listener_sub.priority = 4;
+    listener_sub.body = [st_ptr]() {
             listener_thread_func(*st_ptr);
             st_ptr->listener_done.store(true, std::memory_order_release);
-        });
+        };
+    bool listener_posted = aida::infra::executor::submit(std::move(listener_sub)).submitted;
     if (!listener_posted) {
         diag::log_tagged("mitm", "pre_initialize listener_post_failed");
         st.listener_done.store(true, std::memory_order_release);
@@ -3347,10 +3362,17 @@ void pre_initialize() {
 
     for (uint32_t i = 0; i < WORKER_POOL_SIZE; ++i) {
         st.active_worker_count.fetch_add(1, std::memory_order_acq_rel);
-        bool worker_posted = work_queue::post([st_ptr]() {
+        aida::infra::executor::submission_t worker_sub;
+        worker_sub.owner_subsystem = "network.mitm";
+        worker_sub.label = "mitm.worker";
+        worker_sub.thread_class = "service_loop";
+        worker_sub.domain = aida::infra::executor::domain_t::service;
+        worker_sub.priority = 4;
+        worker_sub.body = [st_ptr]() {
                 worker_thread_func(*st_ptr);
                 st_ptr->active_worker_count.fetch_sub(1, std::memory_order_acq_rel);
-            });
+            };
+        bool worker_posted = aida::infra::executor::submit(std::move(worker_sub)).submitted;
         if (!worker_posted) {
             diag::log_tagged_fmt("mitm", "pre_initialize worker_post_failed i=%u", i);
             st.active_worker_count.fetch_sub(1, std::memory_order_acq_rel);

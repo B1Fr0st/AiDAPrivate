@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include "work_queue.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +15,8 @@
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
 
 extern DisasmState g_disasm;
 
@@ -56,7 +57,14 @@ inline void refresh()
 	if (!g_ui.refreshing.compare_exchange_strong(expected, true))
 		return;
 
-	work_queue::post([]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "debugger";
+	sub.label = "debugger.threads_refresh";
+	sub.thread_class = "debugger_refresh";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 3;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = []() {
 		auto raw_threads = driver_bridge::enumerate_threads();
 		auto modules = driver_bridge::enumerate_modules();
 
@@ -121,7 +129,11 @@ inline void refresh()
 			g_ui.threads = std::move(entries);
 		}
 		g_ui.refreshing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("threads", "threads_refresh_post_failed");
+		g_ui.refreshing.store(false);
+	}
 }
 
 namespace detail {
@@ -343,7 +355,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ImGui::MenuItem("Suspend")) {
 				uint32_t target_tid = snapshot[g_ui.context_idx].tid;
 				int target_idx = g_ui.context_idx;
-				work_queue::post([target_tid, target_idx]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "debugger";
+				sub.label = "debugger.thread_suspend";
+				sub.thread_class = "debugger_thread_control";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 3;
+				sub.target_pid = driver_bridge::attached_pid();
+				sub.body = [target_tid, target_idx]() {
 					if (driver_bridge::suspend_thread(target_tid, nullptr)) {
 						std::lock_guard<std::mutex> lk(g_ui.threads_mutex);
 						if (target_idx < static_cast<int>(g_ui.threads.size()) &&
@@ -352,12 +371,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							g_ui.threads[target_idx].state_text = "Suspended";
 						}
 					}
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted)
+					diag::log_tagged("threads", "thread_suspend_post_failed");
 			}
 			if (ImGui::MenuItem("Resume")) {
 				uint32_t target_tid = snapshot[g_ui.context_idx].tid;
 				int target_idx = g_ui.context_idx;
-				work_queue::post([target_tid, target_idx]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "debugger";
+				sub.label = "debugger.thread_resume";
+				sub.thread_class = "debugger_thread_control";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 3;
+				sub.target_pid = driver_bridge::attached_pid();
+				sub.body = [target_tid, target_idx]() {
 					if (driver_bridge::resume_thread(target_tid, nullptr)) {
 						std::lock_guard<std::mutex> lk(g_ui.threads_mutex);
 						if (target_idx < static_cast<int>(g_ui.threads.size()) &&
@@ -366,7 +394,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							g_ui.threads[target_idx].state_text = "Running";
 						}
 					}
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted)
+					diag::log_tagged("threads", "thread_resume_post_failed");
 			}
 			if (ImGui::MenuItem("Switch To")) {
 				debugger_engine::g_state.active_tid = snapshot[g_ui.context_idx].tid;

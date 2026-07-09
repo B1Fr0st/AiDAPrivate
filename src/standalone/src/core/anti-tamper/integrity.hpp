@@ -20,7 +20,7 @@
 #include "key_pipeline.hpp"
 #include "tpm_attest.hpp"
 #include "webhook.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -2362,9 +2362,17 @@ namespace periodic {
         {
             try
             {
-                bool ok = work_queue::post([i, generation]() {
+                aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "anti_tamper_integrity";
+                sub.label = "page_mac.periodic_worker";
+                sub.thread_class = "security_loop";
+                sub.domain = aida::infra::executor::domain_t::security_liveness;
+                sub.priority = 0;
+                sub.generation = generation;
+                sub.body = [i, generation]() {
                     worker_loop(i, generation);
-                });
+                };
+                bool ok = aida::infra::executor::submit(std::move(sub)).submitted;
                 if (!ok)
                 {
                     webhook::write_log_critical_fmt("page_mac",

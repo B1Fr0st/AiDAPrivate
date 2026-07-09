@@ -1,0 +1,1970 @@
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <taskflow/taskflow.hpp>
+
+#include "../diagnostics/metadata_ring.hpp"
+#include "../runtime/manual_map_tls.hpp"
+#include "../../helpers/diag_log.hpp"
+#include "win_thread.hpp"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
+namespace aida::infra::taskflow_runtime {
+
+enum class pool_family_t : std::uint8_t {
+    general = 0,
+    service = 1,
+    critical = 2
+};
+
+enum class executor_domain_t : std::uint8_t {
+    general = 0,
+    service = 1,
+    critical = 2,
+    ui_dispatch = 3,
+    external_tool = 4,
+    long_running = 5,
+    security_liveness = 6,
+    feature_worker = 7,
+    diagnostics = 8
+};
+
+inline constexpr std::size_t executor_domain_count = 9;
+
+enum class job_state_t : std::uint8_t {
+    queued = 0,
+    not_started = 1,
+    running = 2,
+    completed = 3,
+    cancelled = 4,
+    failed = 5,
+    timed_out = 6
+};
+
+struct cancellation_token_t {
+    std::atomic<bool> requested{false};
+};
+
+struct job_handle_t {
+    std::uint64_t id = 0;
+    bool valid() const noexcept { return id != 0; }
+};
+
+struct task_descriptor_t {
+    std::function<void()> body;
+    std::function<void(const cancellation_token_t&)> cancellable_body;
+    std::function<void()> cancel_hook;
+    executor_domain_t domain = executor_domain_t::general;
+    const char* owner_subsystem = nullptr;
+    const char* label = nullptr;
+    const char* thread_class = nullptr;
+    const char* session_id = nullptr;
+    const char* target_id = nullptr;
+    const char* diagnostic_id = nullptr;
+    const char* request_id = nullptr;
+    const char* ui_access_policy = "none";
+    const char* failure_policy = "reject_not_started";
+    const char* shutdown_policy = "drain";
+    const char* no_capacity_reason = nullptr;
+    int priority = 3;
+    std::uint32_t target_pid = 0;
+    std::uint64_t deadline_ms = 0;
+    std::uint64_t capacity_lease = 0;
+    std::uint64_t lease_token = 0;
+    std::uint64_t generation = 0;
+};
+
+struct graph_node_descriptor_t {
+    std::uint64_t node_id = 0;
+    const char* label = nullptr;
+    std::vector<std::uint64_t> depends_on;
+    std::function<void()> body;
+    std::function<void(const cancellation_token_t&)> cancellable_body;
+};
+
+struct graph_descriptor_t {
+    executor_domain_t domain = executor_domain_t::general;
+    const char* owner_subsystem = nullptr;
+    const char* label = nullptr;
+    const char* phase = nullptr;
+    const char* session_id = nullptr;
+    const char* target_id = nullptr;
+    const char* diagnostic_id = nullptr;
+    const char* request_id = nullptr;
+    std::function<void()> cancel_hook;
+    int priority = 3;
+    std::uint32_t target_pid = 0;
+    std::uint64_t deadline_ms = 0;
+    std::uint64_t generation = 0;
+    std::vector<graph_node_descriptor_t> nodes;
+};
+
+struct submit_result_t {
+    bool submitted = false;
+    job_handle_t handle;
+    std::string reject_reason;
+};
+
+struct wait_result_t {
+    bool completed = false;
+    bool timed_out = false;
+    bool rejected = false;
+    bool cancelled = false;
+    bool failed = false;
+};
+
+struct task_t {
+    std::function<void()> fn;
+    std::string label;
+    std::uint64_t id = 0;
+    std::uint64_t queued_ms = 0;
+};
+
+struct active_task_t {
+    std::string label;
+    std::uint64_t id = 0;
+    std::uint64_t queued_ms = 0;
+    std::uint64_t started_ms = 0;
+    std::uint64_t last_cpu_100ns = 0;
+    std::uint64_t last_cpu_sample_ms = 0;
+    std::uint64_t cpu_delta_100ns = 0;
+    std::uint32_t cpu_pct_x100 = 0;
+    DWORD thread_query_gle = 0;
+    DWORD exit_code = 0;
+    DWORD tid = 0;
+    bool thread_alive = false;
+};
+
+struct stats_t {
+    bool alive = false;
+    bool shutting_down = false;
+    int pool_size = 0;
+    std::size_t workers = 0;
+    std::size_t pending = 0;
+    std::uint32_t active = 0;
+    std::uint64_t post_attempts = 0;
+    std::uint64_t posted = 0;
+    std::uint64_t rejected = 0;
+    std::uint64_t started = 0;
+    std::uint64_t finished = 0;
+    std::uint64_t cancelled = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t timed_out = 0;
+    std::uint64_t oldest_active_ms = 0;
+    std::uint32_t active_label_count = 0;
+    std::uint32_t healthy_long_lived = 0;
+    std::uint32_t hot_workers = 0;
+    std::uint32_t not_queryable_workers = 0;
+    std::string active_labels;
+    std::string top_cpu_labels;
+};
+
+struct stuck_worker_diag_t {
+    std::uint64_t task_id = 0;
+    std::string label;
+    const char* label_class = "general";
+    const char* lifetime = "bounded_task";
+    const char* health = "needs_progress";
+    DWORD tid = 0;
+    DWORD thread_query_gle = 0;
+    DWORD exit_code = 0;
+    std::uint64_t queued_ms = 0;
+    std::uint64_t started_ms = 0;
+    std::uint64_t active_ms = 0;
+    std::uint64_t cpu_delta_100ns = 0;
+    std::uint32_t cpu_pct_x100 = 0;
+    std::size_t worker_index = 0;
+    bool thread_alive = false;
+};
+
+struct active_job_snapshot_t {
+    std::uint64_t job_id = 0;
+    executor_domain_t domain = executor_domain_t::general;
+    job_state_t state = job_state_t::queued;
+    std::string label;
+    std::string owner_subsystem;
+    std::string exception_text;
+    std::uint64_t queued_ms = 0;
+    std::uint64_t started_ms = 0;
+    std::uint64_t finished_ms = 0;
+    std::uint64_t deadline_ms = 0;
+    std::uint64_t capacity_lease = 0;
+    std::uint64_t active_ms = 0;
+    std::uint32_t node_count = 0;
+    bool graph = false;
+    bool cancellation_requested = false;
+};
+
+struct runtime_snapshot_t {
+    std::uint64_t total_submitted = 0;
+    std::uint64_t total_rejected = 0;
+    std::uint64_t total_cancelled = 0;
+    std::uint64_t total_failed = 0;
+    std::uint64_t total_timed_out = 0;
+    std::uint32_t total_active = 0;
+    std::uint32_t active_per_domain[executor_domain_count] = {};
+    std::uint64_t oldest_active_ms = 0;
+    std::uint64_t work_queue_pending = 0;
+    std::uint64_t service_queue_pending = 0;
+    std::uint64_t critical_queue_pending = 0;
+    std::uint32_t work_queue_active = 0;
+    std::uint32_t service_queue_active = 0;
+    std::uint32_t critical_queue_active = 0;
+    bool accepting = true;
+    bool shutting_down = false;
+    std::string labels_under_pressure;
+    std::vector<active_job_snapshot_t> active_jobs;
+};
+
+struct pool_t;
+
+class worker_interface_t final : public tf::WorkerInterface {
+public:
+    explicit worker_interface_t(pool_t* pool) noexcept : pool_(pool) {}
+    void scheduler_prologue(tf::Worker& worker) override;
+    void scheduler_epilogue(tf::Worker& worker, std::exception_ptr ptr) override;
+
+private:
+    pool_t* pool_ = nullptr;
+};
+
+struct pool_t {
+    const char* pool_name = nullptr;
+    const char* log_tag = nullptr;
+    const char* default_label = nullptr;
+    pool_family_t family = pool_family_t::general;
+    int configured_pool_size = 0;
+    std::unique_ptr<tf::Executor> executor;
+    std::vector<active_task_t> active_snapshots;
+    std::mutex mtx;
+    std::atomic<bool> alive{false};
+    std::atomic<bool> shutting_down{false};
+    std::atomic<bool> shutdown_called{false};
+    std::atomic<bool> stop_accepting{false};
+    std::atomic<std::uint32_t> active_tasks{0};
+    std::atomic<std::uint64_t> pending_tasks{0};
+    std::atomic<std::uint64_t> post_attempts{0};
+    std::atomic<std::uint64_t> posted_tasks{0};
+    std::atomic<std::uint64_t> rejected_tasks{0};
+    std::atomic<std::uint64_t> started_tasks{0};
+    std::atomic<std::uint64_t> finished_tasks{0};
+    std::atomic<std::uint64_t> cancelled_tasks{0};
+    std::atomic<std::uint64_t> failed_tasks{0};
+    std::atomic<std::uint64_t> timed_out_tasks{0};
+    std::atomic<std::uint64_t> next_task_id{0};
+    std::atomic<std::size_t> worker_count{0};
+
+    pool_t(const char* pool_name_in, const char* log_tag_in, const char* default_label_in, pool_family_t family_in, int configured_pool_size_in) noexcept
+        : pool_name(pool_name_in),
+          log_tag(log_tag_in),
+          default_label(default_label_in),
+          family(family_in),
+          configured_pool_size(configured_pool_size_in) {}
+};
+
+struct graph_node_record_t {
+    std::uint64_t node_id = 0;
+    std::uint64_t active_id = 0;
+    std::string label;
+    std::vector<std::uint64_t> depends_on;
+    std::function<void()> body;
+    std::function<void(const cancellation_token_t&)> cancellable_body;
+    job_state_t state = job_state_t::queued;
+    std::uint64_t started_ms = 0;
+    std::uint64_t finished_ms = 0;
+    std::string exception_text;
+};
+
+struct job_record_t {
+    std::uint64_t id = 0;
+    executor_domain_t domain = executor_domain_t::general;
+    pool_t* pool = nullptr;
+    std::string owner_subsystem;
+    std::string label;
+    std::string thread_class;
+    std::string session_id;
+    std::string target_id;
+    std::string diagnostic_id;
+    std::string request_id;
+    std::string phase;
+    std::string ui_access_policy;
+    std::string failure_policy;
+    std::string shutdown_policy;
+    std::string no_capacity_reason;
+    int priority = 3;
+    std::uint32_t target_pid = 0;
+    std::uint64_t deadline_ms = 0;
+    std::uint64_t capacity_lease = 0;
+    std::uint64_t lease_token = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t queued_ms = 0;
+    std::uint64_t started_ms = 0;
+    std::uint64_t finished_ms = 0;
+    std::function<void()> body;
+    std::function<void(const cancellation_token_t&)> cancellable_body;
+    std::function<void()> cancel_hook;
+    std::shared_ptr<cancellation_token_t> cancel_token;
+    tf::Future<void> future;
+    bool has_future = false;
+    bool graph = false;
+    bool active = true;
+    bool deadline_reported = false;
+    job_state_t state = job_state_t::queued;
+    std::string exception_text;
+    std::vector<graph_node_record_t> nodes;
+    mutable std::mutex mtx;
+    std::condition_variable cv;
+};
+
+inline std::atomic<std::uint64_t> g_next_job_id{0};
+inline std::atomic<std::uint64_t> g_total_submitted{0};
+inline std::atomic<std::uint64_t> g_total_rejected{0};
+inline std::atomic<std::uint64_t> g_total_cancelled{0};
+inline std::atomic<std::uint64_t> g_total_failed{0};
+inline std::atomic<std::uint64_t> g_total_timed_out{0};
+inline std::atomic<bool> g_stop_accepting{false};
+inline std::atomic<bool> g_shutdown_requested{false};
+inline std::mutex g_jobs_mtx;
+inline std::map<std::uint64_t, std::shared_ptr<job_record_t>> g_jobs;
+inline std::mutex g_pool_registry_mtx;
+inline std::vector<pool_t*> g_registered_pools;
+
+inline const char* safe_pool_name(const pool_t& p) {
+    return p.pool_name && *p.pool_name ? p.pool_name : "<unnamed>";
+}
+
+inline const char* safe_log_tag(const pool_t& p) {
+    return p.log_tag && *p.log_tag ? p.log_tag : "taskflow_runtime";
+}
+
+inline const char* domain_name(executor_domain_t d) {
+    switch (d) {
+    case executor_domain_t::general: return "general";
+    case executor_domain_t::service: return "service";
+    case executor_domain_t::critical: return "critical";
+    case executor_domain_t::ui_dispatch: return "ui_dispatch";
+    case executor_domain_t::external_tool: return "external_tool";
+    case executor_domain_t::long_running: return "long_running";
+    case executor_domain_t::security_liveness: return "security_liveness";
+    case executor_domain_t::feature_worker: return "feature_worker";
+    case executor_domain_t::diagnostics: return "diagnostics";
+    default: return "unknown";
+    }
+}
+
+inline const char* job_state_name(job_state_t s) {
+    switch (s) {
+    case job_state_t::queued: return "queued";
+    case job_state_t::not_started: return "not_started";
+    case job_state_t::running: return "running";
+    case job_state_t::completed: return "completed";
+    case job_state_t::cancelled: return "cancelled";
+    case job_state_t::failed: return "failed";
+    case job_state_t::timed_out: return "timed_out";
+    default: return "unknown";
+    }
+}
+
+inline std::size_t domain_index(executor_domain_t d) {
+    return static_cast<std::size_t>(d);
+}
+
+inline bool terminal_state(job_state_t s) {
+    return s == job_state_t::completed || s == job_state_t::cancelled || s == job_state_t::failed || s == job_state_t::timed_out;
+}
+
+inline std::uint64_t now_ms() {
+    return static_cast<std::uint64_t>(GetTickCount64());
+}
+
+inline int clamp_pool_size(unsigned value, unsigned low, unsigned high) {
+    if (value < low)
+        value = low;
+    if (value > high)
+        value = high;
+    return static_cast<int>(value);
+}
+
+inline unsigned host_worker_count(unsigned fallback) {
+    const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return n == 0 ? fallback : static_cast<unsigned>(n);
+}
+
+inline int general_pool_size() {
+    return clamp_pool_size(host_worker_count(32u), 32u, 64u);
+}
+
+inline int service_pool_size() {
+    return clamp_pool_size(host_worker_count(16u), 16u, 32u);
+}
+
+inline int narrow_pool_size(unsigned fallback, unsigned high) {
+    return clamp_pool_size(host_worker_count(fallback), 4u, high);
+}
+
+inline void register_pool(pool_t& p) {
+    std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
+    if (std::find(g_registered_pools.begin(), g_registered_pools.end(), &p) == g_registered_pools.end())
+        g_registered_pools.push_back(&p);
+}
+
+inline pool_t& domain_pool(executor_domain_t d) {
+    static pool_t general{"runtime.general", "taskflow_runtime", "runtime.general", pool_family_t::general, general_pool_size()};
+    static pool_t service{"runtime.service", "taskflow_runtime", "runtime.service", pool_family_t::service, service_pool_size()};
+    static pool_t critical{"runtime.critical", "taskflow_runtime", "runtime.critical", pool_family_t::critical, 24};
+    static pool_t ui_dispatch{"runtime.ui_dispatch", "taskflow_runtime", "runtime.ui_dispatch", pool_family_t::general, narrow_pool_size(4u, 8u)};
+    static pool_t external_tool{"runtime.external_tool", "taskflow_runtime", "runtime.external_tool", pool_family_t::general, narrow_pool_size(8u, 16u)};
+    static pool_t long_running{"runtime.long_running", "taskflow_runtime", "runtime.long_running", pool_family_t::service, narrow_pool_size(8u, 16u)};
+    static pool_t security_liveness{"runtime.security_liveness", "taskflow_runtime", "runtime.security_liveness", pool_family_t::critical, 8};
+    static pool_t feature_worker{"runtime.feature_worker", "taskflow_runtime", "runtime.feature_worker", pool_family_t::general, narrow_pool_size(8u, 16u)};
+    static pool_t diagnostics{"runtime.diagnostics", "taskflow_runtime", "runtime.diagnostics", pool_family_t::general, narrow_pool_size(4u, 8u)};
+    switch (d) {
+    case executor_domain_t::service: return service;
+    case executor_domain_t::critical: return critical;
+    case executor_domain_t::ui_dispatch: return ui_dispatch;
+    case executor_domain_t::external_tool: return external_tool;
+    case executor_domain_t::long_running: return long_running;
+    case executor_domain_t::security_liveness: return security_liveness;
+    case executor_domain_t::feature_worker: return feature_worker;
+    case executor_domain_t::diagnostics: return diagnostics;
+    case executor_domain_t::general:
+    default:
+        return general;
+    }
+}
+
+inline std::uint64_t filetime_to_100ns(const FILETIME& ft)
+{
+    ULARGE_INTEGER v{};
+    v.LowPart = ft.dwLowDateTime;
+    v.HighPart = ft.dwHighDateTime;
+    return v.QuadPart;
+}
+
+inline bool sample_thread_cpu_100ns(DWORD tid, std::uint64_t& cpu_100ns, DWORD& gle, DWORD& exit_code)
+{
+    cpu_100ns = 0;
+    gle = 0;
+    exit_code = 0;
+    if (tid == 0) {
+        gle = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!th) {
+        gle = GetLastError();
+        return false;
+    }
+    FILETIME create_time{};
+    FILETIME exit_time{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    SetLastError(0);
+    const BOOL exit_ok = GetExitCodeThread(th, &exit_code);
+    const DWORD exit_gle = exit_ok ? 0UL : GetLastError();
+    SetLastError(0);
+    const BOOL times_ok = GetThreadTimes(th, &create_time, &exit_time, &kernel_time, &user_time);
+    gle = times_ok ? 0UL : GetLastError();
+    CloseHandle(th);
+    if (!exit_ok) {
+        gle = exit_gle;
+        return false;
+    }
+    if (!times_ok)
+        return false;
+    cpu_100ns = filetime_to_100ns(kernel_time) + filetime_to_100ns(user_time);
+    return exit_code == STILL_ACTIVE;
+}
+
+inline const char* classify_worker_label(const std::string& label, const char* default_class) {
+    if (label.find("full_test") != std::string::npos || label.find("test_all") != std::string::npos)
+        return "full_test";
+    if (label.find("heartbeat") != std::string::npos || label.find("session_health") != std::string::npos)
+        return "heartbeat";
+    if (label.find("mcp") != std::string::npos || label.find("http") != std::string::npos || label.find("sse") != std::string::npos)
+        return "mcp_or_http";
+    if (label.find("camoufox") != std::string::npos || label.find("browser") != std::string::npos)
+        return "camoufox";
+    if (label.find("driver") != std::string::npos || label.find("kernel") != std::string::npos || label.find("tctx") != std::string::npos)
+        return "driver";
+    if (label.find("scanner") != std::string::npos || label.find("scan") != std::string::npos)
+        return "scanner";
+    if (label.find("ui") != std::string::npos || label.find("render") != std::string::npos || label.find("dialog") != std::string::npos)
+        return "ui_adjacent";
+    if (label.find("service") != std::string::npos || label.find("listener") != std::string::npos || label.find("watch") != std::string::npos)
+        return "long_lived_service";
+    return default_class && *default_class ? default_class : "general";
+}
+
+inline bool worker_label_long_lived_hint(const char* label_class) {
+    return label_class &&
+        (std::strcmp(label_class, "heartbeat") == 0 ||
+         std::strcmp(label_class, "mcp_or_http") == 0 ||
+         std::strcmp(label_class, "camoufox") == 0 ||
+         std::strcmp(label_class, "driver") == 0 ||
+         std::strcmp(label_class, "long_lived_service") == 0);
+}
+
+inline const char* worker_lifetime_label(pool_family_t family, const char* pool_name, const char* label_class)
+{
+    if (family == pool_family_t::critical)
+        return worker_label_long_lived_hint(label_class) ? "long_lived_critical" : "bounded_critical";
+    const bool service_pool = (family == pool_family_t::service) || (pool_name && std::strcmp(pool_name, "service") == 0);
+    if (service_pool && worker_label_long_lived_hint(label_class))
+        return "intentional_service";
+    if (service_pool)
+        return "service_task";
+    if (worker_label_long_lived_hint(label_class))
+        return "long_lived_hint";
+    return "bounded_task";
+}
+
+inline const char* worker_health_label(pool_family_t family, const char* lifetime, bool thread_alive, std::uint32_t cpu_pct_x100, std::size_t pending, bool shutting_down)
+{
+    if (!thread_alive)
+        return "thread_not_queryable";
+    if (shutting_down)
+        return "shutdown_waiting";
+    if (cpu_pct_x100 >= 2500)
+        return "hot_cpu";
+    if (family == pool_family_t::critical) {
+        if (lifetime && std::strcmp(lifetime, "long_lived_critical") == 0 && pending == 0)
+            return "healthy_long_lived";
+        if (lifetime && std::strcmp(lifetime, "long_lived_critical") == 0)
+            return "critical_backlog";
+    } else {
+        if (lifetime && std::strcmp(lifetime, "intentional_service") == 0 && pending == 0)
+            return "healthy_long_lived";
+        if (lifetime && std::strcmp(lifetime, "intentional_service") == 0)
+            return "service_backlog";
+    }
+    return "needs_progress";
+}
+
+inline void refresh_active_thread_sample(active_task_t& active, std::uint64_t now)
+{
+    std::uint64_t cpu_100ns = 0;
+    DWORD gle = 0;
+    DWORD exit_code = 0;
+    const bool alive = sample_thread_cpu_100ns(active.tid, cpu_100ns, gle, exit_code);
+    active.thread_query_gle = gle;
+    active.exit_code = exit_code;
+    active.thread_alive = alive;
+    if (active.last_cpu_sample_ms != 0 && now > active.last_cpu_sample_ms && cpu_100ns >= active.last_cpu_100ns) {
+        active.cpu_delta_100ns = cpu_100ns - active.last_cpu_100ns;
+        const std::uint64_t wall_100ns = (now - active.last_cpu_sample_ms) * 10000ULL;
+        active.cpu_pct_x100 = wall_100ns != 0 ? static_cast<std::uint32_t>((active.cpu_delta_100ns * 10000ULL) / wall_100ns) : 0U;
+        if (active.cpu_pct_x100 > 10000U)
+            active.cpu_pct_x100 = 10000U;
+    } else {
+        active.cpu_delta_100ns = 0;
+        active.cpu_pct_x100 = 0;
+    }
+    active.last_cpu_100ns = cpu_100ns;
+    active.last_cpu_sample_ms = now;
+}
+
+inline const char* default_class_for(pool_family_t family) {
+    return family == pool_family_t::critical ? "critical" : "general";
+}
+
+inline void decrement_atomic_if_nonzero(std::atomic<std::uint64_t>& value) {
+    std::uint64_t current = value.load(std::memory_order_acquire);
+    while (current != 0 &&
+           !value.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+}
+
+inline std::size_t resolve_worker_index(tf::Executor* executor) {
+    if (!executor)
+        return (std::numeric_limits<std::size_t>::max)();
+    const int id = executor->this_worker_id();
+    if (id < 0)
+        return (std::numeric_limits<std::size_t>::max)();
+    return static_cast<std::size_t>(id);
+}
+
+inline void worker_interface_t::scheduler_prologue(tf::Worker& worker) {
+    pool_t* p = pool_;
+    const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
+    if (!p)
+        return;
+    if (!tls_ready) {
+        diag::log_tagged_fmt(safe_log_tag(*p),
+            "taskflow_worker_tls_unavailable phase=worker_start pool=%s worker_id=%zu tid=%lu",
+            safe_pool_name(*p),
+            worker.id(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+}
+
+inline void worker_interface_t::scheduler_epilogue(tf::Worker& worker, std::exception_ptr ptr) {
+    pool_t* p = pool_;
+    if (!p)
+        return;
+    if (ptr) {
+        try {
+            std::rethrow_exception(ptr);
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt(safe_log_tag(*p),
+                "taskflow_worker_scheduler_exception pool=%s worker_id=%zu tid=%lu err=%s",
+                safe_pool_name(*p),
+                worker.id(),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                ex.what());
+        } catch (...) {
+            diag::log_tagged_fmt(safe_log_tag(*p),
+                "taskflow_worker_scheduler_exception pool=%s worker_id=%zu tid=%lu err=unknown",
+                safe_pool_name(*p),
+                worker.id(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+    }
+}
+
+inline void initialize_pool(pool_t& p, int pool_size) {
+    register_pool(p);
+    if (pool_size <= 0 || p.shutdown_called.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire))
+        return;
+    bool expected = false;
+    if (!p.alive.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    std::lock_guard<std::mutex> lk(p.mtx);
+    if (p.shutdown_called.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) {
+        p.alive.store(false, std::memory_order_release);
+        return;
+    }
+    try {
+        p.configured_pool_size = pool_size;
+        p.active_snapshots.assign(static_cast<std::size_t>(pool_size), {});
+        p.executor.reset(new tf::Executor(static_cast<std::size_t>(pool_size), std::unique_ptr<tf::WorkerInterface>(new worker_interface_t(&p))));
+        p.worker_count.store(p.executor ? p.executor->num_workers() : 0, std::memory_order_release);
+        p.stop_accepting.store(false, std::memory_order_release);
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_pool_started pool=%s workers=%zu configured_pool_size=%d tf_version=%d tid=%lu",
+            safe_pool_name(p),
+            p.worker_count.load(std::memory_order_acquire),
+            pool_size,
+            TF_VERSION,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    } catch (const std::exception& ex) {
+        p.executor.reset();
+        p.active_snapshots.clear();
+        p.worker_count.store(0, std::memory_order_release);
+        p.alive.store(false, std::memory_order_release);
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_pool_start_failed pool=%s configured_pool_size=%d err=%s tid=%lu",
+            safe_pool_name(p),
+            pool_size,
+            ex.what(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    } catch (...) {
+        p.executor.reset();
+        p.active_snapshots.clear();
+        p.worker_count.store(0, std::memory_order_release);
+        p.alive.store(false, std::memory_order_release);
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_pool_start_failed pool=%s configured_pool_size=%d err=unknown tid=%lu",
+            safe_pool_name(p),
+            pool_size,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+}
+
+inline void initialize() {
+    for (std::size_t i = 0; i < executor_domain_count; ++i) {
+        pool_t& p = domain_pool(static_cast<executor_domain_t>(i));
+        initialize_pool(p, p.configured_pool_size);
+    }
+}
+
+inline void mark_record_inactive(const std::shared_ptr<job_record_t>& record, job_state_t final_state, const std::string& exception_text) {
+    if (!record)
+        return;
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        if (record->finished_ms == 0)
+            record->finished_ms = now_ms();
+        if (!exception_text.empty())
+            record->exception_text = exception_text;
+        if (record->state != job_state_t::timed_out && record->state != job_state_t::failed)
+            record->state = final_state;
+        record->active = false;
+    }
+    record->cv.notify_all();
+}
+
+inline void complete_not_started_record(const std::shared_ptr<job_record_t>& record) {
+    if (!record)
+        return;
+    pool_t* p = record->pool;
+    bool adjust_pending = false;
+    job_state_t final_state = job_state_t::completed;
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        if (record->started_ms != 0 || !record->active)
+            return;
+        adjust_pending = true;
+        if (record->state == job_state_t::timed_out) {
+            final_state = job_state_t::timed_out;
+        } else if (record->cancel_token && record->cancel_token->requested.load(std::memory_order_acquire)) {
+            final_state = job_state_t::cancelled;
+        }
+    }
+    if (p && adjust_pending)
+        decrement_atomic_if_nonzero(p->pending_tasks);
+    mark_record_inactive(record, final_state, {});
+    if (p) {
+        p->finished_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        if (final_state == job_state_t::cancelled)
+            p->cancelled_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        if (final_state == job_state_t::timed_out)
+            p->timed_out_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    }
+}
+
+inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint64_t active_id, const std::string& active_label) {
+    pool_t* p = record ? record->pool : nullptr;
+    if (!record || !p)
+        return;
+    p->active_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    p->started_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    decrement_atomic_if_nonzero(p->pending_tasks);
+    const std::uint64_t start = now_ms();
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        if (record->started_ms == 0)
+            record->started_ms = start;
+        if (record->state == job_state_t::queued || record->state == job_state_t::not_started)
+            record->state = job_state_t::running;
+    }
+    const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
+    const DWORD tid = GetCurrentThreadId();
+    if (!task_tls_ready) {
+        diag::log_tagged_fmt(safe_log_tag(*p),
+            "taskflow_task_tls_unavailable phase=task_start pool=%s job_id=%llu label=%s tid=%lu",
+            safe_pool_name(*p),
+            static_cast<unsigned long long>(record->id),
+            active_label.empty() ? "<unnamed>" : active_label.c_str(),
+            static_cast<unsigned long>(tid));
+    }
+    const std::size_t worker_index = resolve_worker_index(p->executor.get());
+    {
+        std::lock_guard<std::mutex> lk(p->mtx);
+        if (worker_index < p->active_snapshots.size()) {
+            auto& active = p->active_snapshots[worker_index];
+            active = {};
+            active.label = active_label;
+            active.id = active_id;
+            active.queued_ms = record->queued_ms;
+            active.started_ms = start;
+            active.tid = tid;
+        }
+    }
+}
+
+inline void clear_active_slot(pool_t& p, std::uint64_t active_id) {
+    std::lock_guard<std::mutex> lk(p.mtx);
+    for (auto& active : p.active_snapshots) {
+        if (active.id == active_id)
+            active = {};
+    }
+}
+
+inline void finish_started_record(const std::shared_ptr<job_record_t>& record, std::uint64_t active_id, job_state_t final_state, const std::string& exception_text) {
+    pool_t* p = record ? record->pool : nullptr;
+    if (!record || !p)
+        return;
+    clear_active_slot(*p, active_id);
+    p->finished_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    p->active_tasks.fetch_sub(1u, std::memory_order_acq_rel);
+    if (final_state == job_state_t::cancelled)
+        p->cancelled_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    if (final_state == job_state_t::failed)
+        p->failed_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    if (final_state == job_state_t::timed_out)
+        p->timed_out_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    mark_record_inactive(record, final_state, exception_text);
+}
+
+inline void invoke_body(const std::function<void()>& body, const std::function<void(const cancellation_token_t&)>& cancellable_body, const std::shared_ptr<cancellation_token_t>& token) {
+    if (cancellable_body) {
+        static cancellation_token_t never_cancelled;
+        cancellable_body(token ? *token : never_cancelled);
+    } else if (body) {
+        body();
+    }
+}
+
+inline std::string seh_text(DWORD code) {
+    if (code == 0)
+        return {};
+    char buf[64];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "seh=0x%08lX", static_cast<unsigned long>(code));
+    return std::string(buf);
+}
+
+inline void execute_single_record(const std::shared_ptr<job_record_t>& record) {
+    if (!record)
+        return;
+    const std::uint64_t active_id = record->id;
+    start_record(record, active_id, record->label);
+    job_state_t final_state = job_state_t::completed;
+    std::string exception_text;
+    if (record->cancel_token && record->cancel_token->requested.load(std::memory_order_acquire)) {
+        final_state = job_state_t::cancelled;
+    } else {
+        try {
+            std::function<void()> guarded = [record]() {
+                invoke_body(record->body, record->cancellable_body, record->cancel_token);
+            };
+            const DWORD task_seh = aida::infra::win_thread::run_function_seh_guarded(guarded);
+            if (task_seh != 0) {
+                final_state = job_state_t::failed;
+                exception_text = seh_text(task_seh);
+            }
+        } catch (const std::exception& ex) {
+            final_state = job_state_t::failed;
+            exception_text = ex.what();
+        } catch (...) {
+            final_state = job_state_t::failed;
+            exception_text = "unknown";
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        if (record->state == job_state_t::timed_out)
+            final_state = job_state_t::timed_out;
+    }
+    if (final_state == job_state_t::failed) {
+        g_total_failed.fetch_add(1u, std::memory_order_acq_rel);
+        if (record->cancel_token)
+            record->cancel_token->requested.store(true, std::memory_order_release);
+    }
+    finish_started_record(record, active_id, final_state, exception_text);
+    diag::log_tagged_fmt(safe_log_tag(*record->pool),
+        "taskflow_job_finish job_id=%llu state=%s label=%s owner=%s domain=%s err=%.300s tid=%lu",
+        static_cast<unsigned long long>(record->id),
+        job_state_name(final_state),
+        record->label.c_str(),
+        record->owner_subsystem.c_str(),
+        domain_name(record->domain),
+        exception_text.empty() ? "<none>" : exception_text.c_str(),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+}
+
+inline void execute_graph_node(const std::shared_ptr<job_record_t>& record, std::size_t node_index) {
+    if (!record || node_index >= record->nodes.size())
+        return;
+    const std::uint64_t active_id = record->nodes[node_index].active_id;
+    const std::string label = record->nodes[node_index].label;
+    start_record(record, active_id, label);
+    job_state_t node_state = job_state_t::completed;
+    std::string exception_text;
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        record->nodes[node_index].started_ms = now_ms();
+        record->nodes[node_index].state = job_state_t::running;
+    }
+    if (record->cancel_token && record->cancel_token->requested.load(std::memory_order_acquire)) {
+        node_state = job_state_t::cancelled;
+    } else {
+        try {
+            std::function<void()> guarded = [record, node_index]() {
+                auto& node = record->nodes[node_index];
+                invoke_body(node.body, node.cancellable_body, record->cancel_token);
+            };
+            const DWORD task_seh = aida::infra::win_thread::run_function_seh_guarded(guarded);
+            if (task_seh != 0) {
+                node_state = job_state_t::failed;
+                exception_text = seh_text(task_seh);
+            }
+        } catch (const std::exception& ex) {
+            node_state = job_state_t::failed;
+            exception_text = ex.what();
+        } catch (...) {
+            node_state = job_state_t::failed;
+            exception_text = "unknown";
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        record->nodes[node_index].finished_ms = now_ms();
+        record->nodes[node_index].state = node_state;
+        record->nodes[node_index].exception_text = exception_text;
+        if (node_state == job_state_t::failed) {
+            record->state = job_state_t::failed;
+            record->exception_text = exception_text;
+        } else if (node_state == job_state_t::cancelled && record->state != job_state_t::failed && record->state != job_state_t::timed_out) {
+            record->state = job_state_t::cancelled;
+        }
+    }
+    if (node_state == job_state_t::failed) {
+        g_total_failed.fetch_add(1u, std::memory_order_acq_rel);
+        if (record->cancel_token)
+            record->cancel_token->requested.store(true, std::memory_order_release);
+    }
+    clear_active_slot(*record->pool, active_id);
+    record->pool->active_tasks.fetch_sub(1u, std::memory_order_acq_rel);
+    diag::log_tagged_fmt(safe_log_tag(*record->pool),
+        "taskflow_graph_node_finish job_id=%llu node_id=%llu state=%s label=%s owner=%s domain=%s err=%.300s tid=%lu",
+        static_cast<unsigned long long>(record->id),
+        static_cast<unsigned long long>(record->nodes[node_index].node_id),
+        job_state_name(node_state),
+        label.c_str(),
+        record->owner_subsystem.c_str(),
+        domain_name(record->domain),
+        exception_text.empty() ? "<none>" : exception_text.c_str(),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+}
+
+inline void complete_graph_record(const std::shared_ptr<job_record_t>& record) {
+    if (!record)
+        return;
+    pool_t* p = record->pool;
+    job_state_t final_state = job_state_t::completed;
+    std::string exception_text;
+    std::size_t not_started_nodes = 0;
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        if (!record->active)
+            return;
+        if (record->state == job_state_t::timed_out) {
+            final_state = job_state_t::timed_out;
+        } else if (record->state == job_state_t::failed) {
+            final_state = job_state_t::failed;
+            exception_text = record->exception_text;
+        } else if (record->cancel_token && record->cancel_token->requested.load(std::memory_order_acquire)) {
+            final_state = job_state_t::cancelled;
+        }
+        record->state = final_state;
+        record->finished_ms = now_ms();
+        record->active = false;
+        for (auto& node : record->nodes) {
+            if (node.started_ms == 0) {
+                ++not_started_nodes;
+                node.state = final_state == job_state_t::completed ? job_state_t::cancelled : final_state;
+                node.finished_ms = record->finished_ms;
+            }
+        }
+    }
+    if (p) {
+        for (std::size_t i = 0; i < not_started_nodes; ++i)
+            decrement_atomic_if_nonzero(p->pending_tasks);
+        p->finished_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        if (final_state == job_state_t::cancelled)
+            p->cancelled_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        if (final_state == job_state_t::failed)
+            p->failed_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        if (final_state == job_state_t::timed_out)
+            p->timed_out_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    }
+    record->cv.notify_all();
+    diag::log_tagged_fmt(p ? safe_log_tag(*p) : "taskflow_runtime",
+        "taskflow_graph_finish job_id=%llu state=%s label=%s owner=%s domain=%s nodes=%zu err=%.300s tid=%lu",
+        static_cast<unsigned long long>(record->id),
+        job_state_name(final_state),
+        record->label.c_str(),
+        record->owner_subsystem.c_str(),
+        domain_name(record->domain),
+        record->nodes.size(),
+        exception_text.empty() ? "<none>" : exception_text.c_str(),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+}
+
+inline void prune_completed_jobs_locked() {
+    constexpr std::size_t kMaxRetainedJobs = 8192;
+    if (g_jobs.size() <= kMaxRetainedJobs)
+        return;
+    for (auto it = g_jobs.begin(); it != g_jobs.end() && g_jobs.size() > kMaxRetainedJobs;) {
+        bool erase = false;
+        if (it->second) {
+            std::lock_guard<std::mutex> lk(it->second->mtx);
+            erase = !it->second->active && it->second->finished_ms != 0;
+        } else {
+            erase = true;
+        }
+        if (erase)
+            it = g_jobs.erase(it);
+        else
+            ++it;
+    }
+}
+
+inline bool valid_descriptor_body(const task_descriptor_t& desc) {
+    return static_cast<bool>(desc.body) || static_cast<bool>(desc.cancellable_body);
+}
+
+inline std::string copy_or_default(const char* value, const char* fallback) {
+    return value && *value ? std::string(value) : std::string(fallback ? fallback : "");
+}
+
+inline std::shared_ptr<job_record_t> make_record_from_descriptor(task_descriptor_t&& desc, pool_t& p) {
+    auto record = std::make_shared<job_record_t>();
+    record->id = g_next_job_id.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    record->domain = desc.domain;
+    record->pool = &p;
+    record->owner_subsystem = copy_or_default(desc.owner_subsystem, "taskflow_runtime");
+    record->label = copy_or_default(desc.label, p.default_label ? p.default_label : "taskflow.job");
+    record->thread_class = copy_or_default(desc.thread_class, "");
+    record->session_id = copy_or_default(desc.session_id, "");
+    record->target_id = copy_or_default(desc.target_id, "");
+    record->diagnostic_id = copy_or_default(desc.diagnostic_id, "");
+    record->request_id = copy_or_default(desc.request_id, "");
+    record->ui_access_policy = copy_or_default(desc.ui_access_policy, "none");
+    record->failure_policy = copy_or_default(desc.failure_policy, "reject_not_started");
+    record->shutdown_policy = copy_or_default(desc.shutdown_policy, "drain");
+    record->no_capacity_reason = copy_or_default(desc.no_capacity_reason, "");
+    record->priority = desc.priority;
+    record->target_pid = desc.target_pid;
+    record->deadline_ms = desc.deadline_ms;
+    record->capacity_lease = desc.capacity_lease;
+    record->lease_token = desc.lease_token;
+    record->generation = desc.generation;
+    record->queued_ms = now_ms();
+    record->body = std::move(desc.body);
+    record->cancellable_body = std::move(desc.cancellable_body);
+    record->cancel_hook = std::move(desc.cancel_hook);
+    record->cancel_token = std::make_shared<cancellation_token_t>();
+    return record;
+}
+
+inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_t&& desc) {
+    submit_result_t result;
+    p.post_attempts.fetch_add(1u, std::memory_order_acq_rel);
+    if (!desc.owner_subsystem || !*desc.owner_subsystem) {
+        result.reject_reason = "missing_owner_subsystem";
+    } else if (!desc.label || !*desc.label) {
+        result.reject_reason = "missing_label";
+    } else if (!valid_descriptor_body(desc)) {
+        result.reject_reason = "missing_body";
+    } else if (g_stop_accepting.load(std::memory_order_acquire) || p.stop_accepting.load(std::memory_order_acquire) || p.shutdown_called.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)) {
+        result.reject_reason = "runtime_shutdown_requested";
+    }
+    if (!result.reject_reason.empty()) {
+        p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_submit_rejected pool=%s reason=%s owner=%s label=%s domain=%s tid=%lu",
+            safe_pool_name(p),
+            result.reject_reason.c_str(),
+            desc.owner_subsystem ? desc.owner_subsystem : "<null>",
+            desc.label ? desc.label : "<null>",
+            domain_name(desc.domain),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return result;
+    }
+    if (!p.alive.load(std::memory_order_acquire))
+        initialize_pool(p, pool_size);
+    std::shared_ptr<job_record_t> record = make_record_from_descriptor(std::move(desc), p);
+    tf::Taskflow flow;
+    auto task = flow.emplace([record]() { execute_single_record(record); });
+    task.name(record->label);
+    {
+        std::lock_guard<std::mutex> jobs_lk(g_jobs_mtx);
+        prune_completed_jobs_locked();
+        g_jobs[record->id] = record;
+    }
+    bool pending_incremented = false;
+    try {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire) || p.stop_accepting.load(std::memory_order_acquire) || !p.executor) {
+            result.reject_reason = "pool_not_accepting";
+        } else {
+            p.pending_tasks.fetch_add(1u, std::memory_order_acq_rel);
+            pending_incremented = true;
+            auto future = p.executor->run(std::move(flow), [record]() { complete_not_started_record(record); });
+            {
+                std::lock_guard<std::mutex> record_lk(record->mtx);
+                record->future = std::move(future);
+                record->has_future = true;
+                if (record->state == job_state_t::queued)
+                    record->state = job_state_t::not_started;
+            }
+            p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
+            g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
+            result.submitted = true;
+            result.handle.id = record->id;
+        }
+    } catch (const std::exception& ex) {
+        result.reject_reason = ex.what();
+    } catch (...) {
+        result.reject_reason = "unknown_exception";
+    }
+    if (!result.submitted) {
+        if (pending_incremented)
+            decrement_atomic_if_nonzero(p.pending_tasks);
+        p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
+        mark_record_inactive(record, job_state_t::failed, result.reject_reason);
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_submit_failed pool=%s reason=%.300s owner=%s label=%s domain=%s tid=%lu",
+            safe_pool_name(p),
+            result.reject_reason.empty() ? "<none>" : result.reject_reason.c_str(),
+            record->owner_subsystem.c_str(),
+            record->label.c_str(),
+            domain_name(record->domain),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    } else {
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_submit job_id=%llu pool=%s owner=%s label=%s domain=%s deadline_ms=%llu priority=%d tid=%lu",
+            static_cast<unsigned long long>(record->id),
+            safe_pool_name(p),
+            record->owner_subsystem.c_str(),
+            record->label.c_str(),
+            domain_name(record->domain),
+            static_cast<unsigned long long>(record->deadline_ms),
+            record->priority,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+    return result;
+}
+
+inline submit_result_t submit(task_descriptor_t&& desc) {
+    pool_t& p = domain_pool(desc.domain);
+    return submit_to_pool(p, p.configured_pool_size, std::move(desc));
+}
+
+inline submit_result_t submit_graph(graph_descriptor_t&& graph) {
+    submit_result_t result;
+    if (!graph.owner_subsystem || !*graph.owner_subsystem) {
+        result.reject_reason = "missing_owner_subsystem";
+    } else if (!graph.label || !*graph.label) {
+        result.reject_reason = "missing_label";
+    } else if (graph.nodes.empty()) {
+        result.reject_reason = "missing_graph_nodes";
+    } else if (g_stop_accepting.load(std::memory_order_acquire)) {
+        result.reject_reason = "runtime_shutdown_requested";
+    }
+    pool_t& p = domain_pool(graph.domain);
+    p.post_attempts.fetch_add(1u, std::memory_order_acq_rel);
+    if (!result.reject_reason.empty()) {
+        p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
+        return result;
+    }
+    if (!p.alive.load(std::memory_order_acquire))
+        initialize_pool(p, p.configured_pool_size);
+    auto record = std::make_shared<job_record_t>();
+    record->id = g_next_job_id.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    record->domain = graph.domain;
+    record->pool = &p;
+    record->owner_subsystem = copy_or_default(graph.owner_subsystem, "taskflow_runtime");
+    record->label = copy_or_default(graph.label, "taskflow.graph");
+    record->phase = copy_or_default(graph.phase, "");
+    record->session_id = copy_or_default(graph.session_id, "");
+    record->target_id = copy_or_default(graph.target_id, "");
+    record->diagnostic_id = copy_or_default(graph.diagnostic_id, "");
+    record->request_id = copy_or_default(graph.request_id, "");
+    record->priority = graph.priority;
+    record->target_pid = graph.target_pid;
+    record->deadline_ms = graph.deadline_ms;
+    record->generation = graph.generation;
+    record->queued_ms = now_ms();
+    record->cancel_hook = std::move(graph.cancel_hook);
+    record->cancel_token = std::make_shared<cancellation_token_t>();
+    record->graph = true;
+    record->nodes.reserve(graph.nodes.size());
+    std::unordered_map<std::uint64_t, std::size_t> node_index;
+    for (std::size_t i = 0; i < graph.nodes.size(); ++i) {
+        const auto& node = graph.nodes[i];
+        if ((!node.body && !node.cancellable_body) || node.node_id == 0) {
+            result.reject_reason = "invalid_graph_node";
+            p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
+            g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
+            return result;
+        }
+        graph_node_record_t rec;
+        rec.node_id = node.node_id;
+        rec.active_id = (record->id * 100000ULL) + static_cast<std::uint64_t>(i + 1u);
+        rec.label = copy_or_default(node.label, "taskflow.graph.node");
+        rec.depends_on = node.depends_on;
+        rec.body = std::move(graph.nodes[i].body);
+        rec.cancellable_body = std::move(graph.nodes[i].cancellable_body);
+        node_index[rec.node_id] = i;
+        record->nodes.push_back(std::move(rec));
+    }
+    tf::Taskflow flow;
+    std::vector<tf::Task> tasks;
+    tasks.reserve(record->nodes.size());
+    for (std::size_t i = 0; i < record->nodes.size(); ++i) {
+        auto t = flow.emplace([record, i]() { execute_graph_node(record, i); });
+        t.name(record->nodes[i].label);
+        tasks.push_back(t);
+    }
+    for (std::size_t i = 0; i < record->nodes.size(); ++i) {
+        for (const auto dep : record->nodes[i].depends_on) {
+            auto it = node_index.find(dep);
+            if (it == node_index.end()) {
+                result.reject_reason = "missing_graph_dependency";
+                p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
+                g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
+                return result;
+            }
+            tasks[it->second].precede(tasks[i]);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> jobs_lk(g_jobs_mtx);
+        prune_completed_jobs_locked();
+        g_jobs[record->id] = record;
+    }
+    bool pending_incremented = false;
+    try {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire) || p.stop_accepting.load(std::memory_order_acquire) || !p.executor) {
+            result.reject_reason = "pool_not_accepting";
+        } else {
+            p.pending_tasks.fetch_add(static_cast<std::uint64_t>(record->nodes.size()), std::memory_order_acq_rel);
+            pending_incremented = true;
+            auto future = p.executor->run(std::move(flow), [record]() { complete_graph_record(record); });
+            {
+                std::lock_guard<std::mutex> record_lk(record->mtx);
+                record->future = std::move(future);
+                record->has_future = true;
+                if (record->state == job_state_t::queued)
+                    record->state = job_state_t::not_started;
+            }
+            p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
+            g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
+            result.submitted = true;
+            result.handle.id = record->id;
+        }
+    } catch (const std::exception& ex) {
+        result.reject_reason = ex.what();
+    } catch (...) {
+        result.reject_reason = "unknown_exception";
+    }
+    if (!result.submitted) {
+        if (pending_incremented) {
+            for (std::size_t i = 0; i < record->nodes.size(); ++i)
+                decrement_atomic_if_nonzero(p.pending_tasks);
+        }
+        p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
+        mark_record_inactive(record, job_state_t::failed, result.reject_reason);
+    } else {
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_graph_submit job_id=%llu pool=%s owner=%s label=%s phase=%s domain=%s nodes=%zu deadline_ms=%llu tid=%lu",
+            static_cast<unsigned long long>(record->id),
+            safe_pool_name(p),
+            record->owner_subsystem.c_str(),
+            record->label.c_str(),
+            record->phase.empty() ? "<none>" : record->phase.c_str(),
+            domain_name(record->domain),
+            record->nodes.size(),
+            static_cast<unsigned long long>(record->deadline_ms),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+    return result;
+}
+
+inline std::shared_ptr<job_record_t> find_job(std::uint64_t job_id) {
+    std::lock_guard<std::mutex> lk(g_jobs_mtx);
+    auto it = g_jobs.find(job_id);
+    return it == g_jobs.end() ? nullptr : it->second;
+}
+
+inline bool cancel(job_handle_t handle) {
+    if (!handle.valid())
+        return false;
+    auto record = find_job(handle.id);
+    if (!record)
+        return false;
+    bool signalled = false;
+    std::function<void()> cancel_hook;
+    {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        if (!record->active && terminal_state(record->state))
+            return false;
+        if (record->cancel_token)
+            record->cancel_token->requested.store(true, std::memory_order_release);
+        if (record->state != job_state_t::failed && record->state != job_state_t::timed_out)
+            record->state = job_state_t::cancelled;
+        if (record->has_future)
+            signalled = record->future.cancel();
+        cancel_hook = record->cancel_hook;
+    }
+    if (cancel_hook) {
+        try {
+            cancel_hook();
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt("taskflow_runtime",
+                "taskflow_cancel_hook_exception job_id=%llu err=%s tid=%lu",
+                static_cast<unsigned long long>(handle.id),
+                ex.what(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        } catch (...) {
+            diag::log_tagged_fmt("taskflow_runtime",
+                "taskflow_cancel_hook_exception job_id=%llu err=unknown tid=%lu",
+                static_cast<unsigned long long>(handle.id),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+    }
+    g_total_cancelled.fetch_add(1u, std::memory_order_acq_rel);
+    if (record->pool)
+        record->pool->cancelled_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    record->cv.notify_all();
+    diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
+        "taskflow_cancel job_id=%llu state=cancelled future_signalled=%d label=%s owner=%s domain=%s tid=%lu",
+        static_cast<unsigned long long>(handle.id),
+        signalled ? 1 : 0,
+        record->label.c_str(),
+        record->owner_subsystem.c_str(),
+        domain_name(record->domain),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    return true;
+}
+
+inline bool cancel(std::uint64_t job_id) {
+    return cancel(job_handle_t{job_id});
+}
+
+inline bool cooperative_cancel_requested(job_handle_t handle) {
+    auto record = find_job(handle.id);
+    return record && record->cancel_token && record->cancel_token->requested.load(std::memory_order_acquire);
+}
+
+inline wait_result_t wait_for(job_handle_t handle, std::uint32_t timeout_ms) {
+    wait_result_t result;
+    if (!handle.valid()) {
+        result.completed = true;
+        return result;
+    }
+    auto record = find_job(handle.id);
+    if (!record) {
+        result.completed = true;
+        return result;
+    }
+    std::unique_lock<std::mutex> lk(record->mtx);
+    const std::uint64_t start = now_ms();
+    const std::uint64_t deadline = start + static_cast<std::uint64_t>(timeout_ms);
+    while (record->active) {
+        const std::uint64_t current = now_ms();
+        if (current >= deadline) {
+            result.timed_out = true;
+            return result;
+        }
+        const DWORD remaining = static_cast<DWORD>((std::min<std::uint64_t>)(deadline - current, 25ULL));
+        record->cv.wait_for(lk, std::chrono::milliseconds(remaining));
+    }
+    result.completed = record->state == job_state_t::completed;
+    result.cancelled = record->state == job_state_t::cancelled;
+    result.failed = record->state == job_state_t::failed;
+    result.timed_out = record->state == job_state_t::timed_out;
+    return result;
+}
+
+inline wait_result_t wait_for(std::uint64_t job_id, std::uint32_t timeout_ms) {
+    return wait_for(job_handle_t{job_id}, timeout_ms);
+}
+
+inline void check_deadlines() {
+    const std::uint64_t current = now_ms();
+    std::vector<std::shared_ptr<job_record_t>> expired;
+    {
+        std::lock_guard<std::mutex> lk(g_jobs_mtx);
+        for (const auto& kv : g_jobs) {
+            auto& record = kv.second;
+            if (!record)
+                continue;
+            std::lock_guard<std::mutex> record_lk(record->mtx);
+            if (!record->active || record->deadline_ms == 0 || record->deadline_reported || current < record->deadline_ms)
+                continue;
+            record->deadline_reported = true;
+            record->state = job_state_t::timed_out;
+            if (record->cancel_token)
+                record->cancel_token->requested.store(true, std::memory_order_release);
+            expired.push_back(record);
+        }
+    }
+    for (const auto& record : expired) {
+        bool signalled = false;
+        std::function<void()> cancel_hook;
+        {
+            std::lock_guard<std::mutex> lk(record->mtx);
+            if (record->has_future)
+                signalled = record->future.cancel();
+            cancel_hook = record->cancel_hook;
+        }
+        if (cancel_hook) {
+            try {
+                cancel_hook();
+            } catch (...) {
+            }
+        }
+        g_total_timed_out.fetch_add(1u, std::memory_order_acq_rel);
+        if (record->pool)
+            record->pool->timed_out_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
+            "taskflow_deadline_timeout job_id=%llu label=%s owner=%s domain=%s deadline_ms=%llu now_ms=%llu future_signalled=%d tid=%lu",
+            static_cast<unsigned long long>(record->id),
+            record->label.c_str(),
+            record->owner_subsystem.c_str(),
+            domain_name(record->domain),
+            static_cast<unsigned long long>(record->deadline_ms),
+            static_cast<unsigned long long>(current),
+            signalled ? 1 : 0,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        record->cv.notify_all();
+    }
+}
+
+inline stats_t stats_for(pool_t& p, int pool_size, const char* pool_name) {
+    register_pool(p);
+    stats_t s;
+    s.alive = p.alive.load(std::memory_order_acquire);
+    s.shutting_down = p.shutting_down.load(std::memory_order_acquire);
+    s.pool_size = pool_size;
+    s.active = p.active_tasks.load(std::memory_order_acquire);
+    s.pending = static_cast<std::size_t>(p.pending_tasks.load(std::memory_order_acquire));
+    s.workers = p.worker_count.load(std::memory_order_acquire);
+    s.post_attempts = p.post_attempts.load(std::memory_order_acquire);
+    s.posted = p.posted_tasks.load(std::memory_order_acquire);
+    s.rejected = p.rejected_tasks.load(std::memory_order_acquire);
+    s.started = p.started_tasks.load(std::memory_order_acquire);
+    s.finished = p.finished_tasks.load(std::memory_order_acquire);
+    s.cancelled = p.cancelled_tasks.load(std::memory_order_acquire);
+    s.failed = p.failed_tasks.load(std::memory_order_acquire);
+    s.timed_out = p.timed_out_tasks.load(std::memory_order_acquire);
+    {
+        std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
+        if (!lk.owns_lock()) {
+            s.active_labels = "<stats_lock_busy>";
+            s.top_cpu_labels = "<stats_lock_busy>";
+            return s;
+        }
+        const std::uint64_t current = now_ms();
+        struct top_cpu_item_t {
+            std::uint64_t task_id = 0;
+            std::string label;
+            const char* label_class = "general";
+            const char* health = "needs_progress";
+            std::uint64_t cpu_delta_100ns = 0;
+            std::uint32_t cpu_pct_x100 = 0;
+        };
+        top_cpu_item_t top_cpu[4];
+        std::size_t top_cpu_count = 0;
+        for (auto& active : p.active_snapshots) {
+            if (active.id == 0)
+                continue;
+            refresh_active_thread_sample(active, current);
+            const char* cls = classify_worker_label(active.label, default_class_for(p.family));
+            const char* lifetime = worker_lifetime_label(p.family, pool_name, cls);
+            const char* health = worker_health_label(p.family, lifetime, active.thread_alive, active.cpu_pct_x100, s.pending, s.shutting_down);
+            if (std::strcmp(health, "healthy_long_lived") == 0)
+                ++s.healthy_long_lived;
+            if (std::strcmp(health, "hot_cpu") == 0)
+                ++s.hot_workers;
+            if (!active.thread_alive)
+                ++s.not_queryable_workers;
+            const std::uint64_t age_ms = current >= active.started_ms ? current - active.started_ms : 0;
+            if (s.oldest_active_ms < age_ms)
+                s.oldest_active_ms = age_ms;
+            ++s.active_label_count;
+            const std::uint64_t queued_age_ms = active.queued_ms != 0 && current >= active.queued_ms ? current - active.queued_ms : 0;
+            if (active.cpu_delta_100ns != 0) {
+                std::size_t pos = top_cpu_count;
+                while (pos > 0 && active.cpu_delta_100ns > top_cpu[pos - 1].cpu_delta_100ns)
+                    --pos;
+                if (pos < 4) {
+                    if (top_cpu_count < 4)
+                        ++top_cpu_count;
+                    for (std::size_t j = top_cpu_count - 1; j > pos; --j)
+                        top_cpu[j] = std::move(top_cpu[j - 1]);
+                    top_cpu[pos].task_id = active.id;
+                    top_cpu[pos].label = active.label;
+                    top_cpu[pos].label_class = cls;
+                    top_cpu[pos].health = health;
+                    top_cpu[pos].cpu_delta_100ns = active.cpu_delta_100ns;
+                    top_cpu[pos].cpu_pct_x100 = active.cpu_pct_x100;
+                }
+            }
+            if (s.active_labels.size() < 900) {
+                char item[360];
+                _snprintf_s(item, sizeof(item), _TRUNCATE,
+                    "%s#%llu:%s:class=%s:life=%s:health=%s:tid=%lu:age_ms=%llu:queued_age_ms=%llu:cpu_delta_100ns=%llu:cpu_pct_x100=%u:alive=%d:gle=%lu",
+                    s.active_labels.empty() ? "" : ";",
+                    static_cast<unsigned long long>(active.id),
+                    active.label.empty() ? "<unnamed>" : active.label.c_str(),
+                    cls,
+                    lifetime,
+                    health,
+                    static_cast<unsigned long>(active.tid),
+                    static_cast<unsigned long long>(age_ms),
+                    static_cast<unsigned long long>(queued_age_ms),
+                    static_cast<unsigned long long>(active.cpu_delta_100ns),
+                    static_cast<unsigned>(active.cpu_pct_x100),
+                    active.thread_alive ? 1 : 0,
+                    static_cast<unsigned long>(active.thread_query_gle));
+                s.active_labels += item;
+            }
+        }
+        for (std::size_t i = 0; i < top_cpu_count; ++i) {
+            char item[260];
+            _snprintf_s(item, sizeof(item), _TRUNCATE,
+                "%s#%llu:%s:class=%s:cpu_delta_100ns=%llu:cpu_pct_x100=%u:health=%s",
+                s.top_cpu_labels.empty() ? "" : ";",
+                static_cast<unsigned long long>(top_cpu[i].task_id),
+                top_cpu[i].label.empty() ? "<unnamed>" : top_cpu[i].label.c_str(),
+                top_cpu[i].label_class,
+                static_cast<unsigned long long>(top_cpu[i].cpu_delta_100ns),
+                static_cast<unsigned>(top_cpu[i].cpu_pct_x100),
+                top_cpu[i].health);
+            s.top_cpu_labels += item;
+        }
+    }
+    return s;
+}
+
+inline stats_t domain_stats(executor_domain_t d) {
+    pool_t& p = domain_pool(d);
+    return stats_for(p, p.configured_pool_size, safe_pool_name(p));
+}
+
+inline std::vector<stuck_worker_diag_t> stuck_workers_for(pool_t& p, const char* pool_name, std::uint64_t threshold_ms, std::size_t max_records) {
+    register_pool(p);
+    std::vector<stuck_worker_diag_t> result;
+    const std::uint64_t current = now_ms();
+    std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
+    if (!lk.owns_lock())
+        return result;
+    const std::size_t pending = static_cast<std::size_t>(p.pending_tasks.load(std::memory_order_acquire));
+    for (std::size_t i = 0; i < p.active_snapshots.size(); ++i) {
+        if (max_records != 0 && result.size() >= max_records)
+            break;
+        auto& active = p.active_snapshots[i];
+        if (active.id == 0)
+            continue;
+        refresh_active_thread_sample(active, current);
+        const std::uint64_t age_ms = current >= active.started_ms ? current - active.started_ms : 0;
+        if (age_ms < threshold_ms)
+            continue;
+        const char* cls = classify_worker_label(active.label, default_class_for(p.family));
+        const char* lifetime = worker_lifetime_label(p.family, pool_name, cls);
+        stuck_worker_diag_t d;
+        d.task_id = active.id;
+        d.label = active.label;
+        d.label_class = cls;
+        d.lifetime = lifetime;
+        d.health = worker_health_label(p.family, lifetime, active.thread_alive, active.cpu_pct_x100, pending, p.shutting_down.load(std::memory_order_acquire));
+        d.tid = active.tid;
+        d.thread_query_gle = active.thread_query_gle;
+        d.exit_code = active.exit_code;
+        d.queued_ms = active.queued_ms;
+        d.started_ms = active.started_ms;
+        d.active_ms = age_ms;
+        d.cpu_delta_100ns = active.cpu_delta_100ns;
+        d.cpu_pct_x100 = active.cpu_pct_x100;
+        d.worker_index = i;
+        d.thread_alive = active.thread_alive;
+        result.push_back(std::move(d));
+    }
+    return result;
+}
+
+inline std::vector<stuck_worker_diag_t> stuck_workers(std::uint64_t threshold_ms, std::size_t max_records) {
+    std::vector<pool_t*> pools;
+    {
+        std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
+        pools = g_registered_pools;
+    }
+    std::vector<stuck_worker_diag_t> out;
+    for (auto* p : pools) {
+        if (!p)
+            continue;
+        auto part = stuck_workers_for(*p, safe_pool_name(*p), threshold_ms, max_records == 0 ? 0 : max_records - out.size());
+        out.insert(out.end(), part.begin(), part.end());
+        if (max_records != 0 && out.size() >= max_records)
+            break;
+    }
+    return out;
+}
+
+inline void log_stuck_workers_for(pool_t& p, const char* pool_name, std::uint64_t threshold_ms, std::size_t max_records) {
+    auto stuck = stuck_workers_for(p, pool_name, threshold_ms, max_records);
+    if (stuck.empty())
+        return;
+    std::size_t pending = static_cast<std::size_t>(p.pending_tasks.load(std::memory_order_acquire));
+    bool lock_busy = false;
+    {
+        std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
+        if (lk.owns_lock())
+            pending = static_cast<std::size_t>(p.pending_tasks.load(std::memory_order_acquire));
+        else
+            lock_busy = true;
+    }
+    const std::uint64_t current = now_ms();
+    for (const auto& s : stuck) {
+        const std::uint64_t queued_age_ms = s.queued_ms != 0 && current >= s.queued_ms ? current - s.queued_ms : 0;
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "stuck_worker pool=%s task_id=%llu label=%s class=%s lifetime=%s health=%s long_lived_hint=%d worker_index=%zu tid=%lu thread_alive=%d thread_gle=%lu exit_code=0x%08lX active_ms=%llu queued_age_ms=%llu threshold_ms=%llu cpu_delta_100ns=%llu cpu_pct_x100=%u cancellation=%s active=%u pending=%zu pending_lock_busy=%d post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu shutting_down=%d",
+            pool_name ? pool_name : safe_pool_name(p),
+            static_cast<unsigned long long>(s.task_id),
+            s.label.empty() ? "<unnamed>" : s.label.c_str(),
+            s.label_class,
+            s.lifetime,
+            s.health,
+            worker_label_long_lived_hint(s.label_class) ? 1 : 0,
+            s.worker_index,
+            static_cast<unsigned long>(s.tid),
+            s.thread_alive ? 1 : 0,
+            static_cast<unsigned long>(s.thread_query_gle),
+            static_cast<unsigned long>(s.exit_code),
+            static_cast<unsigned long long>(s.active_ms),
+            static_cast<unsigned long long>(queued_age_ms),
+            static_cast<unsigned long long>(threshold_ms),
+            static_cast<unsigned long long>(s.cpu_delta_100ns),
+            static_cast<unsigned>(s.cpu_pct_x100),
+            p.shutting_down.load(std::memory_order_acquire) ? "shutdown_requested" : "not_requested",
+            static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+            pending,
+            lock_busy ? 1 : 0,
+            static_cast<unsigned long long>(p.post_attempts.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.posted_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.rejected_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
+            p.shutting_down.load(std::memory_order_acquire) ? 1 : 0);
+    }
+}
+
+inline void log_stuck_workers(std::uint64_t threshold_ms, std::size_t max_records) {
+    std::vector<pool_t*> pools;
+    {
+        std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
+        pools = g_registered_pools;
+    }
+    std::size_t emitted = 0;
+    for (auto* p : pools) {
+        if (!p)
+            continue;
+        const std::size_t remaining = max_records == 0 ? 0 : max_records - emitted;
+        auto stuck = stuck_workers_for(*p, safe_pool_name(*p), threshold_ms, remaining);
+        if (stuck.empty())
+            continue;
+        emitted += stuck.size();
+        log_stuck_workers_for(*p, safe_pool_name(*p), threshold_ms, remaining);
+        if (max_records != 0 && emitted >= max_records)
+            break;
+    }
+}
+
+inline bool post_to(pool_t& p, int pool_size, std::function<void()> f, const char* label) {
+    task_descriptor_t desc;
+    desc.owner_subsystem = safe_pool_name(p);
+    desc.label = label && *label ? label : (p.default_label && *p.default_label ? p.default_label : "taskflow.task");
+    desc.domain = p.family == pool_family_t::critical ? executor_domain_t::critical : (p.family == pool_family_t::service ? executor_domain_t::service : executor_domain_t::general);
+    desc.body = std::move(f);
+    auto result = submit_to_pool(p, pool_size, std::move(desc));
+    return result.submitted;
+}
+
+inline bool pool_drained(const pool_t& p) {
+    return p.pending_tasks.load(std::memory_order_acquire) == 0 &&
+           p.active_tasks.load(std::memory_order_acquire) == 0;
+}
+
+inline bool all_pools_quiescent() {
+    std::vector<pool_t*> pools;
+    {
+        std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
+        pools = g_registered_pools;
+    }
+    for (auto* p : pools) {
+        if (p && !pool_drained(*p))
+            return false;
+    }
+    return true;
+}
+
+inline void shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms) {
+    register_pool(p);
+    bool expected = false;
+    if (!p.shutdown_called.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    p.stop_accepting.store(true, std::memory_order_release);
+    p.shutting_down.store(true, std::memory_order_release);
+    p.alive.store(false, std::memory_order_release);
+    tf::Executor* executor = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        executor = p.executor.get();
+    }
+    const bool called_from_taskflow_worker = executor && executor->this_worker_id() >= 0;
+    if (called_from_taskflow_worker) {
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_shutdown_deferred pool=%s reason=called_from_taskflow_worker active=%u pending=%llu started=%llu finished=%llu tid=%lu",
+            name ? name : safe_pool_name(p),
+            static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.pending_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return;
+    }
+    const ULONGLONG start = GetTickCount64();
+    const bool infinite_wait = timeout_ms == INFINITE;
+    const ULONGLONG deadline = infinite_wait ? 0 : start + timeout_ms;
+    while (!pool_drained(p)) {
+        if (!infinite_wait && GetTickCount64() >= deadline)
+            break;
+        Sleep(10);
+    }
+    if (!pool_drained(p)) {
+        const ULONGLONG current = GetTickCount64();
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "taskflow_shutdown_timeout pool=%s timeout_ms=%lu elapsed_ms=%llu active=%u pending=%llu started=%llu finished=%llu tid=%lu",
+            name ? name : safe_pool_name(p),
+            static_cast<unsigned long>(timeout_ms),
+            static_cast<unsigned long long>(current >= start ? current - start : 0),
+            static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.pending_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        log_stuck_workers_for(p, name, 0ULL, 16);
+        return;
+    }
+    std::unique_ptr<tf::Executor> owned_executor;
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        owned_executor = std::move(p.executor);
+    }
+    if (owned_executor) {
+        try {
+            owned_executor->wait_for_all();
+        } catch (const std::exception& ex) {
+            diag::log_tagged_fmt(safe_log_tag(p),
+                "taskflow_wait_for_all_exception pool=%s err=%s tid=%lu",
+                name ? name : safe_pool_name(p),
+                ex.what(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        } catch (...) {
+            diag::log_tagged_fmt(safe_log_tag(p),
+                "taskflow_wait_for_all_exception pool=%s err=unknown tid=%lu",
+                name ? name : safe_pool_name(p),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+        owned_executor.reset();
+    }
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        for (auto& active : p.active_snapshots)
+            active = {};
+    }
+    p.worker_count.store(0, std::memory_order_release);
+    const ULONGLONG end = GetTickCount64();
+    diag::log_tagged_fmt(safe_log_tag(p),
+        "taskflow_shutdown_complete pool=%s elapsed_ms=%llu active=%u pending=%llu started=%llu finished=%llu tid=%lu",
+        name ? name : safe_pool_name(p),
+        static_cast<unsigned long long>(end >= start ? end - start : 0),
+        static_cast<unsigned>(p.active_tasks.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(p.pending_tasks.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+}
+
+inline runtime_snapshot_t active_snapshot(std::size_t max_jobs = 64) {
+    runtime_snapshot_t snap;
+    snap.total_submitted = g_total_submitted.load(std::memory_order_acquire);
+    snap.total_rejected = g_total_rejected.load(std::memory_order_acquire);
+    snap.total_cancelled = g_total_cancelled.load(std::memory_order_acquire);
+    snap.total_failed = g_total_failed.load(std::memory_order_acquire);
+    snap.total_timed_out = g_total_timed_out.load(std::memory_order_acquire);
+    snap.accepting = !g_stop_accepting.load(std::memory_order_acquire);
+    snap.shutting_down = g_shutdown_requested.load(std::memory_order_acquire);
+    const std::uint64_t current = now_ms();
+    {
+        std::lock_guard<std::mutex> jobs_lk(g_jobs_mtx);
+        for (const auto& kv : g_jobs) {
+            auto record = kv.second;
+            if (!record)
+                continue;
+            std::lock_guard<std::mutex> record_lk(record->mtx);
+            if (!record->active)
+                continue;
+            ++snap.total_active;
+            const std::size_t idx = domain_index(record->domain);
+            if (idx < executor_domain_count)
+                ++snap.active_per_domain[idx];
+            const std::uint64_t age = record->queued_ms != 0 && current >= record->queued_ms ? current - record->queued_ms : 0;
+            if (age > snap.oldest_active_ms)
+                snap.oldest_active_ms = age;
+            if (snap.labels_under_pressure.size() < 900) {
+                if (!snap.labels_under_pressure.empty())
+                    snap.labels_under_pressure += ";";
+                snap.labels_under_pressure += "#";
+                snap.labels_under_pressure += std::to_string(record->id);
+                snap.labels_under_pressure += ":";
+                snap.labels_under_pressure += record->label;
+                snap.labels_under_pressure += ":";
+                snap.labels_under_pressure += job_state_name(record->state);
+            }
+            if (snap.active_jobs.size() < max_jobs) {
+                active_job_snapshot_t item;
+                item.job_id = record->id;
+                item.domain = record->domain;
+                item.state = record->state;
+                item.label = record->label;
+                item.owner_subsystem = record->owner_subsystem;
+                item.exception_text = record->exception_text;
+                item.queued_ms = record->queued_ms;
+                item.started_ms = record->started_ms;
+                item.finished_ms = record->finished_ms;
+                item.deadline_ms = record->deadline_ms;
+                item.capacity_lease = record->capacity_lease;
+                item.active_ms = age;
+                item.node_count = static_cast<std::uint32_t>(record->nodes.size());
+                item.graph = record->graph;
+                item.cancellation_requested = record->cancel_token && record->cancel_token->requested.load(std::memory_order_acquire);
+                snap.active_jobs.push_back(std::move(item));
+            }
+        }
+    }
+    std::vector<pool_t*> pools;
+    {
+        std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
+        pools = g_registered_pools;
+    }
+    for (auto* p : pools) {
+        if (!p)
+            continue;
+        const auto active = p->active_tasks.load(std::memory_order_acquire);
+        const auto pending = p->pending_tasks.load(std::memory_order_acquire);
+        if (p->family == pool_family_t::service) {
+            snap.service_queue_active += active;
+            snap.service_queue_pending += pending;
+        } else if (p->family == pool_family_t::critical) {
+            snap.critical_queue_active += active;
+            snap.critical_queue_pending += pending;
+        } else {
+            snap.work_queue_active += active;
+            snap.work_queue_pending += pending;
+        }
+    }
+    return snap;
+}
+
+inline void json_append_escaped(std::string& out, const std::string& s) {
+    for (char c : s) {
+        if (c == '"' || c == '\\')
+            out += '\\';
+        if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else {
+            out += c;
+        }
+    }
+}
+
+inline std::string snapshot_json_string() {
+    auto snap = active_snapshot(32);
+    std::string out;
+    out.reserve(4096);
+    char buf[512];
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+        "{\"total_submitted\":%llu,\"total_rejected\":%llu,\"total_cancelled\":%llu,\"total_failed\":%llu,\"total_timed_out\":%llu,\"total_active\":%u,\"oldest_active_ms\":%llu,\"accepting\":%d,\"shutting_down\":%d,\"work_queue_active\":%u,\"service_queue_active\":%u,\"critical_queue_active\":%u,\"work_queue_pending\":%llu,\"service_queue_pending\":%llu,\"critical_queue_pending\":%llu,\"domains\":[",
+        static_cast<unsigned long long>(snap.total_submitted),
+        static_cast<unsigned long long>(snap.total_rejected),
+        static_cast<unsigned long long>(snap.total_cancelled),
+        static_cast<unsigned long long>(snap.total_failed),
+        static_cast<unsigned long long>(snap.total_timed_out),
+        static_cast<unsigned>(snap.total_active),
+        static_cast<unsigned long long>(snap.oldest_active_ms),
+        snap.accepting ? 1 : 0,
+        snap.shutting_down ? 1 : 0,
+        static_cast<unsigned>(snap.work_queue_active),
+        static_cast<unsigned>(snap.service_queue_active),
+        static_cast<unsigned>(snap.critical_queue_active),
+        static_cast<unsigned long long>(snap.work_queue_pending),
+        static_cast<unsigned long long>(snap.service_queue_pending),
+        static_cast<unsigned long long>(snap.critical_queue_pending));
+    out += buf;
+    for (std::size_t i = 0; i < executor_domain_count; ++i) {
+        if (i > 0)
+            out += ",";
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "{\"name\":\"%s\",\"active\":%u}",
+            domain_name(static_cast<executor_domain_t>(i)),
+            static_cast<unsigned>(snap.active_per_domain[i]));
+        out += buf;
+    }
+    out += "],\"active_jobs\":[";
+    for (std::size_t i = 0; i < snap.active_jobs.size(); ++i) {
+        const auto& j = snap.active_jobs[i];
+        if (i > 0)
+            out += ",";
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "{\"id\":%llu,\"domain\":\"%s\",\"state\":\"%s\",\"active_ms\":%llu,\"deadline_ms\":%llu,\"graph\":%d,\"nodes\":%u,\"cancel\":%d,\"owner\":\"",
+            static_cast<unsigned long long>(j.job_id),
+            domain_name(j.domain),
+            job_state_name(j.state),
+            static_cast<unsigned long long>(j.active_ms),
+            static_cast<unsigned long long>(j.deadline_ms),
+            j.graph ? 1 : 0,
+            static_cast<unsigned>(j.node_count),
+            j.cancellation_requested ? 1 : 0);
+        out += buf;
+        json_append_escaped(out, j.owner_subsystem);
+        out += "\",\"label\":\"";
+        json_append_escaped(out, j.label);
+        out += "\",\"exception\":\"";
+        json_append_escaped(out, j.exception_text);
+        out += "\"}";
+    }
+    out += "],\"labels_under_pressure\":\"";
+    json_append_escaped(out, snap.labels_under_pressure);
+    out += "\"}";
+    return out;
+}
+
+inline void shutdown(std::uint32_t timeout_ms = 15000) {
+    g_shutdown_requested.store(true, std::memory_order_release);
+    g_stop_accepting.store(true, std::memory_order_release);
+    std::vector<pool_t*> pools;
+    {
+        std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
+        pools = g_registered_pools;
+    }
+    for (auto* p : pools) {
+        if (p)
+            shutdown_pool(*p, safe_pool_name(*p), timeout_ms);
+    }
+}
+
+struct shutdown_guard_t {
+    ~shutdown_guard_t() { shutdown(); }
+};
+
+inline shutdown_guard_t g_shutdown_guard;
+
+}

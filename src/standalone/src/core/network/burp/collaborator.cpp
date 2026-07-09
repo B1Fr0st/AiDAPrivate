@@ -5,8 +5,8 @@
 #include <bcrypt.h>
 
 #include "collaborator.hpp"
-#include "../../infra/critical_work_queue.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../executor_status.hpp"
+#include "../../infra/executor.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "helpers/diag_log.hpp"
 
@@ -1803,13 +1803,22 @@ static void smtp_thread_main(std::string bind_ip, uint16_t port, std::string pub
             g_state.smtp_sessions_active.load(std::memory_order_acquire),
             static_cast<unsigned long>(GetCurrentProcessId()),
             static_cast<unsigned long>(GetCurrentThreadId()));
-        const bool posted = work_queue::post(task);
+        const bool posted = [&]() {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.collaborator";
+            sub.label = "collaborator.smtp_session";
+            sub.thread_class = "service_loop";
+            sub.domain = aida::infra::executor::domain_t::security_liveness;
+            sub.priority = 4;
+            sub.body = task;
+            return ::aida::infra::executor::submit(std::move(sub)).submitted;
+        }();
         if (!posted) {
-            ::diag::log_tagged_fmt("collaborator", "smtp_session_post_failed client=%s:%u fallback=inline active=%u",
+            closesocket(client_sock);
+            ::diag::log_tagged_fmt("collaborator", "smtp_session_post_failed client=%s:%u active=%u",
                 client_ip.c_str(),
                 static_cast<unsigned>(client_port),
                 g_state.smtp_sessions_active.load(std::memory_order_acquire));
-            task();
         } else {
             ::diag::log_tagged_fmt("collaborator", "smtp_session_posted client=%s:%u active=%u",
                 client_ip.c_str(),
@@ -1903,8 +1912,8 @@ bool start(const collaborator_config_t& cfg)
         g_state.http_alive.store(false);
         DWORD thread_start_tick = GetTickCount();
         const uint64_t post_ms = now_ms();
-        const auto cq_before = critical_work_queue::stats();
-        const auto wq_before = work_queue::stats();
+        const auto cq_before = aida::network::executor_status::critical_stats();
+        const auto wq_before = aida::network::executor_status::work_stats();
         diag::log_tagged_fmt("collaborator",
             "http_thread_post requested bind=%s:%u generation=%llu host_pid=%lu host_tid=%lu cq_alive=%d cq_shutdown=%d cq_pending=%llu cq_active=%u cq_started=%llu cq_finished=%llu wq_alive=%d wq_shutdown=%d wq_pending=%llu wq_active=%u wq_started=%llu wq_finished=%llu",
             bind_ip.c_str(),
@@ -1925,24 +1934,28 @@ bool start(const collaborator_config_t& cfg)
             static_cast<unsigned long long>(wq_before.started),
             static_cast<unsigned long long>(wq_before.finished));
         bool posted = false;
-        bool posted_critical = false;
-        bool posted_work = false;
         try {
             std::function<void()> task = [bind_ip, port, generation, post_ms]() {
                 http_thread_main(bind_ip, port, generation, post_ms);
             };
-            posted_critical = critical_work_queue::post(task);
-            if (!posted_critical)
-                posted_work = work_queue::post(std::move(task));
-            posted = posted_critical || posted_work;
+            posted = [&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.collaborator";
+                sub.label = "collaborator.http_thread";
+                sub.thread_class = "service_loop";
+                sub.domain = aida::infra::executor::domain_t::security_liveness;
+                sub.priority = 4;
+                sub.body = std::move(task);
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }();
         } catch (...) {
             posted = false;
         }
         if (!posted) {
             g_state.http_thread_alive.store(false);
             g_state.http_alive.store(false);
-            const auto cq_after = critical_work_queue::stats();
-            const auto wq_after = work_queue::stats();
+            const auto cq_after = aida::network::executor_status::critical_stats();
+            const auto wq_after = aida::network::executor_status::work_stats();
             diag::log_tagged_fmt("collaborator",
                 "http_thread_post_failed elapsed_ms=%lu bind=%s:%u generation=%llu cq_alive=%d cq_shutdown=%d cq_pending=%llu cq_active=%u cq_rejected=%llu wq_alive=%d wq_shutdown=%d wq_pending=%llu wq_active=%u wq_rejected=%llu",
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick),
@@ -1965,7 +1978,7 @@ bool start(const collaborator_config_t& cfg)
         }
         diag::log_tagged_fmt("collaborator",
             "http_thread_posted queue=%s bind=%s:%u generation=%llu elapsed_ms=%lu",
-            posted_critical ? "critical_work_queue" : "work_queue",
+            "security_liveness",
             bind_ip.c_str(),
             port,
             static_cast<unsigned long long>(generation),
@@ -1980,8 +1993,8 @@ bool start(const collaborator_config_t& cfg)
                 });
             const uint32_t start_state = g_state.http_start_state.load(std::memory_order_acquire);
             if (!ready || start_state != 2u || !g_state.http_alive.load(std::memory_order_acquire)) {
-                const auto cq_after = critical_work_queue::stats();
-                const auto wq_after = work_queue::stats();
+                const auto cq_after = aida::network::executor_status::critical_stats();
+                const auto wq_after = aida::network::executor_status::work_stats();
                 diag::log_tagged_fmt("collaborator",
                     "http_thread_ready_wait_failed ready=%d state=%u alive=%d thread_alive=%d tid=%lu elapsed_ms=%lu bind=%s:%u generation=%llu queue=%s cq_pending=%llu cq_active=%u cq_started=%llu cq_finished=%llu wq_pending=%llu wq_active=%u wq_started=%llu wq_finished=%llu",
                     ready ? 1 : 0,
@@ -1993,7 +2006,7 @@ bool start(const collaborator_config_t& cfg)
                     bind_ip.c_str(),
                     port,
                     static_cast<unsigned long long>(generation),
-                    posted_critical ? "critical_work_queue" : "work_queue",
+                    "security_liveness",
                     static_cast<unsigned long long>(cq_after.pending),
                     cq_after.active,
                     static_cast<unsigned long long>(cq_after.started),
@@ -2024,8 +2037,8 @@ bool start(const collaborator_config_t& cfg)
         g_state.dns_worker_tid.store(0);
         DWORD thread_start_tick = GetTickCount();
         const uint64_t post_ms = now_ms();
-        const auto cq_before = critical_work_queue::stats();
-        const auto wq_before = work_queue::stats();
+        const auto cq_before = aida::network::executor_status::critical_stats();
+        const auto wq_before = aida::network::executor_status::work_stats();
         diag::log_tagged_fmt("collaborator",
             "dns_thread_post requested bind=%s:%u host=%s ip=%s generation=%llu host_pid=%lu host_tid=%lu cq_pending=%llu cq_active=%u wq_pending=%llu wq_active=%u",
             bind_ip.c_str(),
@@ -2040,22 +2053,26 @@ bool start(const collaborator_config_t& cfg)
             static_cast<unsigned long long>(wq_before.pending),
             wq_before.active);
         bool posted = false;
-        bool posted_critical = false;
         try {
             std::function<void()> task = [bind_ip, port, public_host, public_ip, generation, post_ms]() {
                 dns_thread_main(bind_ip, port, public_host, public_ip, generation, post_ms);
             };
-            posted_critical = critical_work_queue::post(task);
-            if (!posted_critical)
-                posted = work_queue::post(std::move(task));
-            else
-                posted = true;
+            posted = [&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.collaborator";
+                sub.label = "collaborator.dns_thread";
+                sub.thread_class = "service_loop";
+                sub.domain = aida::infra::executor::domain_t::security_liveness;
+                sub.priority = 4;
+                sub.body = std::move(task);
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }();
         } catch (...) {
             posted = false;
         }
         if (!posted) {
-            const auto cq_after = critical_work_queue::stats();
-            const auto wq_after = work_queue::stats();
+            const auto cq_after = aida::network::executor_status::critical_stats();
+            const auto wq_after = aida::network::executor_status::work_stats();
             diag::log_tagged_fmt("collaborator",
                 "dns_thread_post_failed elapsed_ms=%lu bind=%s:%u generation=%llu cq_pending=%llu cq_active=%u cq_rejected=%llu wq_pending=%llu wq_active=%u wq_rejected=%llu",
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick),
@@ -2074,7 +2091,7 @@ bool start(const collaborator_config_t& cfg)
         }
         diag::log_tagged_fmt("collaborator",
             "dns_thread_posted queue=%s bind=%s:%u generation=%llu elapsed_ms=%lu",
-            posted_critical ? "critical_work_queue" : "work_queue",
+            "security_liveness",
             bind_ip.c_str(),
             port,
             static_cast<unsigned long long>(generation),
@@ -2104,8 +2121,8 @@ bool start(const collaborator_config_t& cfg)
         g_state.smtp_sessions_active.store(0);
         DWORD thread_start_tick = GetTickCount();
         const uint64_t post_ms = now_ms();
-        const auto cq_before = critical_work_queue::stats();
-        const auto wq_before = work_queue::stats();
+        const auto cq_before = aida::network::executor_status::critical_stats();
+        const auto wq_before = aida::network::executor_status::work_stats();
         diag::log_tagged_fmt("collaborator",
             "smtp_thread_post requested bind=%s:%u host=%s max_msg=%d generation=%llu host_pid=%lu host_tid=%lu cq_pending=%llu cq_active=%u wq_pending=%llu wq_active=%u",
             bind_ip.c_str(),
@@ -2120,22 +2137,26 @@ bool start(const collaborator_config_t& cfg)
             static_cast<unsigned long long>(wq_before.pending),
             wq_before.active);
         bool posted = false;
-        bool posted_critical = false;
         try {
             std::function<void()> task = [bind_ip, port, public_host, max_msg, generation, post_ms]() {
                 smtp_thread_main(bind_ip, port, public_host, max_msg, generation, post_ms);
             };
-            posted_critical = critical_work_queue::post(task);
-            if (!posted_critical)
-                posted = work_queue::post(std::move(task));
-            else
-                posted = true;
+            posted = [&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.collaborator";
+                sub.label = "collaborator.smtp_thread";
+                sub.thread_class = "service_loop";
+                sub.domain = aida::infra::executor::domain_t::security_liveness;
+                sub.priority = 4;
+                sub.body = std::move(task);
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }();
         } catch (...) {
             posted = false;
         }
         if (!posted) {
-            const auto cq_after = critical_work_queue::stats();
-            const auto wq_after = work_queue::stats();
+            const auto cq_after = aida::network::executor_status::critical_stats();
+            const auto wq_after = aida::network::executor_status::work_stats();
             diag::log_tagged_fmt("collaborator",
                 "smtp_thread_post_failed elapsed_ms=%lu bind=%s:%u generation=%llu cq_pending=%llu cq_active=%u cq_rejected=%llu wq_pending=%llu wq_active=%u wq_rejected=%llu",
                 static_cast<unsigned long>(GetTickCount() - thread_start_tick),
@@ -2154,7 +2175,7 @@ bool start(const collaborator_config_t& cfg)
         }
         diag::log_tagged_fmt("collaborator",
             "smtp_thread_posted queue=%s bind=%s:%u generation=%llu elapsed_ms=%lu",
-            posted_critical ? "critical_work_queue" : "work_queue",
+            "security_liveness",
             bind_ip.c_str(),
             port,
             static_cast<unsigned long long>(generation),

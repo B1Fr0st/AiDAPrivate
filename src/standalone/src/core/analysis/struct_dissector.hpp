@@ -1,7 +1,7 @@
 #pragma once
 
 #include "standalone_driver.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace struct_dissector {
@@ -534,7 +535,13 @@ inline void refresh_values() {
 
 	uint64_t seq = g_state.refresh_seq.fetch_add(1) + 1;
 
-	work_queue::post([base, total_size, active, seq, field_count]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "analysis";
+	sub.label = "analysis.struct_dissector.refresh_values";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::diagnostics;
+	sub.priority = 4;
+	sub.body = [base, total_size, active, seq, field_count]() {
 		std::vector<uint8_t> block;
 		bool ok = driver_bridge::read_memory(base, total_size, block);
 		if (!ok || block.empty()) {
@@ -586,7 +593,14 @@ inline void refresh_values() {
 			static_cast<unsigned long long>(base), total_size,
 			field_count, changed_count, oor_count,
 			static_cast<unsigned long long>(seq));
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		g_state.refresh_in_flight.store(false);
+		diag::log_tagged_fmt("dissector",
+			"refresh_values_post_failed base=0x%llX size=%u fields=%zu seq=%llu",
+			static_cast<unsigned long long>(base), total_size, field_count,
+			static_cast<unsigned long long>(seq));
+	}
 }
 
 inline std::string auto_detect_type(uint64_t address, size_t size) {

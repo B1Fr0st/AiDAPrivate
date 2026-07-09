@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include "work_queue.hpp"
 #include <cstdint>
 #include <cinttypes>
 #include <cstdio>
@@ -20,6 +19,7 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
+#include "../infra/executor.hpp"
 #include "disasm_view.hpp"
 #include "hex_view.hpp"
 #include "toast_notification.hpp"
@@ -111,7 +111,14 @@ inline void refresh()
 	diag::log_tagged_fmt("memmap",
 		"memmap_refresh_request attached_pid=%u",
 		static_cast<unsigned>(driver_bridge::attached_pid()));
-	work_queue::post([]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "debugger";
+	sub.label = "debugger.memory_map_refresh";
+	sub.thread_class = "debugger_refresh";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 3;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = []() {
 		auto map = debugger_engine::get_memory_map();
 		size_t n = map.size();
 		{
@@ -121,7 +128,11 @@ inline void refresh()
 		diag::log_tagged_fmt("memmap",
 			"memmap_refresh_done regions=%zu", n);
 		g_ui.refreshing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("memmap", "memmap_refresh_post_failed");
+		g_ui.refreshing.store(false);
+	}
 }
 
 namespace detail {

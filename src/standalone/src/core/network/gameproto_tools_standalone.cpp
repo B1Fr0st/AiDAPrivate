@@ -5,8 +5,7 @@
 #include "game_protocol.hpp"
 #include "obfuscation.hpp"
 #include "helpers/diag_log.hpp"
-#include "../infra/work_queue.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "executor_status.hpp"
 #include "../runtime/standalone_driver.hpp"
 
 #include <algorithm>
@@ -24,27 +23,6 @@ using tool_result_t = mcp_standalone::tool_result_t;
 
 namespace gameproto_tools {
 namespace {
-
-template <typename StatsT>
-json work_queue_stats_to_json(const StatsT& s)
-{
-    json j;
-    j["alive"] = s.alive;
-    j["shutting_down"] = s.shutting_down;
-    j["pool_size"] = s.pool_size;
-    j["workers"] = static_cast<std::uint64_t>(s.workers);
-    j["pending"] = static_cast<std::uint64_t>(s.pending);
-    j["active"] = s.active;
-    j["post_attempts"] = s.post_attempts;
-    j["posted"] = s.posted;
-    j["rejected"] = s.rejected;
-    j["started"] = s.started;
-    j["finished"] = s.finished;
-    j["oldest_active_ms"] = s.oldest_active_ms;
-    j["active_label_count"] = s.active_label_count;
-    j["active_labels"] = s.active_labels;
-    return j;
-}
 
 int current_wsa_last_error()
 {
@@ -191,9 +169,7 @@ json protocol_runtime_status(const json& params, const game_protocol::capture_op
     j["wsa_error"] = current_wsa_last_error();
     j["handle_count_ok"] = handle_count_ok;
     j["process_handle_count"] = handle_count_ok ? static_cast<std::uint32_t>(handle_count) : 0u;
-    j["work_queue"] = work_queue_stats_to_json(work_queue::stats());
-    j["service_work_queue"] = work_queue_stats_to_json(work_queue::service_stats());
-    j["critical_work_queue"] = work_queue_stats_to_json(critical_work_queue::stats());
+    aida::network::executor_status::attach_executor_snapshots(j);
     j["selected_protocol"] = options.protocol;
     j["selected_capture_ms"] = options.capture_ms;
     j["selected_max_packets"] = options.max_packets;
@@ -230,10 +206,10 @@ void attach_protocol_stimulus_status(json& result, const json& params, const gam
         current_wsa_last_error(),
         params.value("local_port", params.value("source_port", 0u)),
         params.value("remote_port", params.value("target_port", 0u)),
-        static_cast<unsigned long long>(work_queue::stats().pending),
-        work_queue::stats().active,
-        static_cast<unsigned long long>(critical_work_queue::stats().pending),
-        critical_work_queue::stats().active);
+        static_cast<unsigned long long>(aida::network::executor_status::work_pending()),
+        aida::network::executor_status::work_active(),
+        static_cast<unsigned long long>(aida::network::executor_status::critical_pending()),
+        aida::network::executor_status::critical_active());
 }
 
 std::uint32_t protocol_from_param(const json& params)

@@ -56,10 +56,11 @@
 #include "offensive/offensive_xss.hpp"
 
 #include "../../../helpers/diag_log.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 
 #include <atomic>
 #include <exception>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -159,13 +160,19 @@ bool initialize()
         run_init_phase("upstream", []() { (void)upstream::initialize(); });
 
         run_init_phase("camoufox_install", []() {
-            const bool posted = work_queue::post([]() {
+            const bool posted = [&]() {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.module";
+                sub.label = "camoufox.install_initialize";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = []() {
                 (void)camoufox::install::initialize();
-            });
+            };
+                return ::aida::infra::executor::submit(std::move(sub)).submitted;
+            }();
             diag::log_tagged_fmt("burp_module", "camoufox_install async_offload posted=%d", posted ? 1 : 0);
-            if (!posted) {
-                (void)camoufox::install::initialize();
-            }
         });
         run_init_phase("headless_view", []() { (void)headless_view::initialize(); });
 

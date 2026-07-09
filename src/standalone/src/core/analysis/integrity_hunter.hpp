@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include "work_queue.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -10,12 +9,14 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "page_guard_engine.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace integrity_hunter {
@@ -733,23 +734,28 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 			static_cast<unsigned long long>(target_address),
 			static_cast<unsigned long long>(target_size),
 			static_cast<unsigned long long>(generation));
-		if (critical_work_queue::post(worker) || work_queue::post(worker))
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "integrity_hunter";
+		submission.label = "integrity_hunter.worker";
+		submission.thread_class = "integrity_hunter";
+		submission.domain = aida::infra::executor::domain_t::long_running;
+		submission.priority = 1;
+		submission.generation = generation;
+		submission.failure_policy = "reject_not_started";
+		submission.body = worker;
+		if (aida::infra::executor::submit(std::move(submission)).submitted)
 			return true;
-		const auto cq = critical_work_queue::stats();
-		const auto wq = work_queue::stats();
+		const auto rt = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("integrity_hunter",
-			"start_reject reason=worker_post_failed gen=%llu cq_alive=%d cq_shutdown=%d cq_pending=%llu cq_active=%u cq_rejected=%llu wq_alive=%d wq_shutdown=%d wq_pending=%llu wq_active=%u wq_rejected=%llu",
+			"start_reject reason=worker_post_failed gen=%llu accepting=%d shutdown=%d critical_pending=%llu critical_active=%u work_pending=%llu work_active=%u total_rejected=%llu",
 			static_cast<unsigned long long>(generation),
-			cq.alive ? 1 : 0,
-			cq.shutting_down ? 1 : 0,
-			static_cast<unsigned long long>(cq.pending),
-			cq.active,
-			static_cast<unsigned long long>(cq.rejected),
-			wq.alive ? 1 : 0,
-			wq.shutting_down ? 1 : 0,
-			static_cast<unsigned long long>(wq.pending),
-			wq.active,
-			static_cast<unsigned long long>(wq.rejected));
+			rt.accepting ? 1 : 0,
+			rt.shutting_down ? 1 : 0,
+			static_cast<unsigned long long>(rt.critical_queue_pending),
+			rt.critical_queue_active,
+			static_cast<unsigned long long>(rt.work_queue_pending),
+			rt.work_queue_active,
+			static_cast<unsigned long long>(rt.total_rejected));
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.status_text = "Failed to queue integrity hunter worker";
 		g_state.worker_active.store(false);
@@ -759,7 +765,16 @@ inline bool start_hunt(uint64_t target_address, uint64_t target_size)
 		g_state.hunting.store(false);
 		return false;
 	}
-	const bool posted = critical_work_queue::post(worker) || work_queue::post(std::move(worker));
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "integrity_hunter";
+	submission.label = "integrity_hunter.worker";
+	submission.thread_class = "integrity_hunter";
+	submission.domain = aida::infra::executor::domain_t::long_running;
+	submission.priority = 1;
+	submission.generation = generation;
+	submission.failure_policy = "reject_not_started";
+	submission.body = std::move(worker);
+	const bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 	if (!posted) {
 		diag::log_tagged_fmt("integrity_hunter",
 			"start_reject reason=worker_post_failed gen=%llu",

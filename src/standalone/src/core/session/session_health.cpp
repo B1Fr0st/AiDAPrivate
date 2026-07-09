@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "analysis_session.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace session_health {
@@ -120,12 +120,22 @@ bool initialize() {
 		return true;
 	}
 	st.stop_requested.store(false, std::memory_order_release);
-	bool posted = work_queue::post_labeled("session_health.watcher_loop", []() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "session_health";
+	sub.label = "session_health.watcher_loop";
+	sub.thread_class = "long_lived_service";
+	sub.domain = aida::infra::executor::domain_t::service;
+	sub.priority = 3;
+	sub.body = []() {
 		watcher_loop();
-	});
+	};
+	const auto submit_result = aida::infra::executor::submit(std::move(sub));
+	bool posted = submit_result.submitted;
 	if (!posted) {
 		st.running.store(false, std::memory_order_release);
-		diag::log_tagged("session_health", "initialize_failed work_queue_post_failed");
+		diag::log_tagged_fmt("session_health",
+			"initialize_failed executor_submit_failed reason=%s",
+			submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str());
 		return false;
 	}
 	diag::log_tagged("session_health", "initialize_ok");

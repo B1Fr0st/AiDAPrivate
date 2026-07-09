@@ -42,8 +42,8 @@
 #include "../network/tcp_stream_tracker.hpp"
 #include "../tools/pre_encrypt_hook.hpp"
 #include "../tools/standalone_tools_fwd.hpp"
-#include "../infra/critical_work_queue.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/standalone_license.hpp"
 #include "../scanner/crypto_scanner.hpp"
@@ -7798,7 +7798,7 @@ namespace {
                                  long long queue_delay_ms,
                                  long long worker_elapsed_ms,
                                  const std::string& worker_phase) {
-        const auto cq = critical_work_queue::stats();
+        const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         const std::string domain = mcp_tool_domain(tool_name);
         log_msg(hf, tag, "INVOKE-%s -- \"%s\" seq=%d domain=%s timeout_ms=%lld waited_ms=%lld host_pid=%lu host_tid=%lu worker_started=%d handler_entered=%d handler_exited=%d done=%d worker_pid=%lu worker_tid=%lu queue_delay_ms=%lld worker_elapsed_ms=%lld worker_phase=%s cq_alive=%d cq_shutdown=%d cq_workers=%zu cq_pending=%zu cq_active=%u cq_posted=%llu cq_started=%llu cq_finished=%llu target_pid=%u attached_pid=%u full_test_running=%d",
             phase ? phase : "<null>",
@@ -7963,7 +7963,7 @@ namespace {
         const uint64_t start = GetTickCount64();
         const uint64_t deadline = start + timeout_ms;
         size_t remaining = prune_completed_timed_out_invocations();
-        auto cq = critical_work_queue::stats();
+        auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         log_msg(hf, "mcp.finalize_drain", "BEGIN -- reason=%s timeout_ms=%lu outstanding=%zu cq_alive=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             reason ? reason : "unspecified",
             static_cast<unsigned long>(timeout_ms),
@@ -7978,7 +7978,7 @@ namespace {
             Sleep(100);
             remaining = prune_completed_timed_out_invocations();
         }
-        cq = critical_work_queue::stats();
+        cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         const uint64_t elapsed = GetTickCount64() - start;
         if (remaining == 0) {
             log_msg(hf, "mcp.finalize_drain", "END -- drained=1 elapsed_ms=%llu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
@@ -8023,7 +8023,7 @@ namespace {
         const char* safe_label = label ? label : "unnamed";
         auto state = std::make_shared<finalizer_bool_state_t>();
         const uint64_t t0 = GetTickCount64();
-        log_msg(hf, "mcp.finalize_task", "BEGIN -- label=%s timeout_ms=%lu caller_pid=%lu caller_tid=%lu queue=work_queue",
+        log_msg(hf, "mcp.finalize_task", "BEGIN -- label=%s timeout_ms=%lu caller_pid=%lu caller_tid=%lu queue=taskflow_executor",
             safe_label,
             static_cast<unsigned long>(timeout_ms),
             static_cast<unsigned long>(GetCurrentProcessId()),
@@ -8031,7 +8031,15 @@ namespace {
         bool started = false;
         DWORD post_gle = ERROR_SUCCESS;
         try {
-            started = work_queue::post([state, fn]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "testlab_mcp";
+            sub.label = safe_label;
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 2;
+            sub.failure_policy = "reject_not_started";
+            sub.shutdown_policy = "drain";
+            sub.body = [state, fn]() {
                 const uint64_t worker_t0 = GetTickCount64();
                 {
                     std::lock_guard<std::mutex> lk(state->mutex);
@@ -8057,7 +8065,8 @@ namespace {
                     state->done = true;
                 }
                 state->cv.notify_all();
-            });
+            };
+            started = aida::infra::executor::submit(std::move(sub)).submitted;
             post_gle = GetLastError();
         } catch (const std::exception& ex) {
             post_gle = GetLastError();
@@ -10147,7 +10156,17 @@ namespace {
                 static_cast<unsigned long>(GetCurrentProcessId()),
                 static_cast<unsigned long>(GetCurrentThreadId()),
                 static_cast<unsigned long long>(queued_tick));
-            if (!critical_work_queue::post([state, srv, tool_name, args, queued_at, queued_tick, seq, timeout_ms, external_visible_only]() {
+            std::string invoke_label = "testlab.mcp.invoke.";
+            invoke_label += tool_name;
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "testlab_mcp";
+            sub.label = invoke_label.c_str();
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::critical;
+            sub.priority = 1;
+            sub.failure_policy = "reject_not_started";
+            sub.shutdown_policy = "drain";
+            sub.body = [state, srv, tool_name, args, queued_at, queued_tick, seq, timeout_ms, external_visible_only]() {
                 mcp_standalone::scoped_call_cancel_t cancel_scope(state->cancel_token);
                 auto t0 = std::chrono::steady_clock::now();
                 const DWORD worker_pid = GetCurrentProcessId();
@@ -10253,25 +10272,26 @@ namespace {
                     log_text_len,
                     log_data_type.c_str(),
                     log_exception_len);
-            })) {
+            };
+            if (!aida::infra::executor::submit(std::move(sub)).submitted) {
                 if (full_log) {
                     log_mcp_invoke_snapshot(hf, tag, "QUEUE-REJECTED", seq, tool_name, timeout_ms, 0,
                         false, false, false, false, 0, 0, 0, 0, "post_failed");
                 }
-                return fail_dispatch("dispatch queue rejected task");
+                return fail_dispatch("dispatch taskflow executor rejected task");
             }
         } catch (const std::exception& ex) {
             if (full_log) {
                 log_mcp_invoke_snapshot(hf, tag, "QUEUE-EXCEPTION", seq, tool_name, timeout_ms, 0,
                     false, false, false, false, 0, 0, 0, 0, "post_exception");
             }
-            return fail_dispatch(std::string("dispatch queue post failed: ") + ex.what());
+            return fail_dispatch(std::string("dispatch taskflow executor submit failed: ") + ex.what());
         } catch (...) {
             if (full_log) {
                 log_mcp_invoke_snapshot(hf, tag, "QUEUE-EXCEPTION", seq, tool_name, timeout_ms, 0,
                     false, false, false, false, 0, 0, 0, 0, "post_unknown_exception");
             }
-            return fail_dispatch("dispatch queue post failed: unknown exception");
+            return fail_dispatch("dispatch taskflow executor submit failed: unknown exception");
         }
 
         const auto wait_start = std::chrono::steady_clock::now();
@@ -10987,9 +11007,9 @@ namespace {
             }
         }
         } catch (const std::exception& ex) {
-            const auto wq = work_queue::stats();
-            const auto sq = work_queue::service_stats();
-            const auto cq = critical_work_queue::stats();
+            const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+            const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_msg(hf, tag, "FAIL -- outer MCP test exception tool=%s seq=%d phase=test_tool_call domain=%s err=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
                 tool_name ? tool_name : "<null>",
                 guarded_seq,
@@ -11008,9 +11028,9 @@ namespace {
             failed.fetch_add(1);
             return mcp_tool_call_status_t::failed;
         } catch (...) {
-            const auto wq = work_queue::stats();
-            const auto sq = work_queue::service_stats();
-            const auto cq = critical_work_queue::stats();
+            const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+            const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_msg(hf, tag, "FAIL -- outer MCP test exception tool=%s seq=%d phase=test_tool_call domain=%s err=<unknown> work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
                 tool_name ? tool_name : "<null>",
                 guarded_seq,
@@ -11592,12 +11612,21 @@ namespace {
                     static_cast<unsigned long>(owner_tid));
             }
             };
-            const bool posted_to_queue = work_queue::post_service_labeled(emitter_label.c_str(), std::move(emitter_fn));
+            aida::infra::executor::submission_t emitter_sub;
+            emitter_sub.owner_subsystem = "testlab_mcp";
+            emitter_sub.label = emitter_label.c_str();
+            emitter_sub.thread_class = "service_loop";
+            emitter_sub.domain = aida::infra::executor::domain_t::service;
+            emitter_sub.priority = 2;
+            emitter_sub.failure_policy = "reject_not_started";
+            emitter_sub.shutdown_policy = "drain";
+            emitter_sub.body = std::move(emitter_fn);
+            const bool posted_to_queue = aida::infra::executor::submit(std::move(emitter_sub)).submitted;
             if (posted_to_queue) {
                 state.posted = true;
-                const auto wq_stats_after_post = work_queue::stats();
+                const auto wq_stats_after_post = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
                 log_msg(hf, tag ? tag : "mcp.coverage.protocol_re",
-                    "PROTOCOL-STIMULUS-EMITTER -- posted phase=%s queue=work_queue label=%s pool_size=%d workers=%zu pending=%zu active=%u posted=%llu started=%llu finished=%llu rejected=%llu",
+                    "PROTOCOL-STIMULUS-EMITTER -- posted phase=%s queue=taskflow_service label=%s pool_size=%d workers=%zu pending=%zu active=%u posted=%llu started=%llu finished=%llu rejected=%llu",
                     phase ? phase : "<empty>",
                     emitter_label.c_str(),
                     wq_stats_after_post.pool_size,
@@ -11610,14 +11639,14 @@ namespace {
                     static_cast<unsigned long long>(wq_stats_after_post.rejected));
             } else {
                 state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
-                const auto wq_stats_rejected = work_queue::stats();
+                const auto wq_stats_rejected = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
                 const DWORD process_handle_count_value = []() -> DWORD {
                     DWORD count = 0;
                     GetProcessHandleCount(GetCurrentProcess(), &count);
                     return count;
                 }();
                 log_msg(hf, tag ? tag : "mcp.coverage.protocol_re",
-                    "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=work_queue_post_rejected pool_size=%d workers=%zu pending=%zu active=%u posted=%llu rejected=%llu shutting_down=%d alive=%d process_handle_count=%lu",
+                    "PROTOCOL-STIMULUS-EMITTER -- start_failed phase=%s exception=taskflow_executor_rejected pool_size=%d workers=%zu pending=%zu active=%u posted=%llu rejected=%llu shutting_down=%d alive=%d process_handle_count=%lu",
                     phase ? phase : "<empty>",
                     wq_stats_rejected.pool_size,
                     wq_stats_rejected.workers,
@@ -11632,7 +11661,7 @@ namespace {
             }
         } catch (const std::exception& e) {
             state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
-            const auto wq_stats_exc = work_queue::stats();
+            const auto wq_stats_exc = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
             const DWORD process_handle_count_value = []() -> DWORD {
                 DWORD count = 0;
                 GetProcessHandleCount(GetCurrentProcess(), &count);
@@ -11652,7 +11681,7 @@ namespace {
             state.done->store(true, std::memory_order_release);
         } catch (...) {
             state.completion_owner_tid->store(GetCurrentThreadId(), std::memory_order_release);
-            const auto wq_stats_unk = work_queue::stats();
+            const auto wq_stats_unk = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
             const DWORD process_handle_count_value = []() -> DWORD {
                 DWORD count = 0;
                 GetProcessHandleCount(GetCurrentProcess(), &count);
@@ -15481,7 +15510,15 @@ namespace {
             const std::string stim_case = case_name ? case_name : "";
             bool stim_posted = false;
             try {
-                stim_posted = work_queue::post([pid, fn = desc.mutate_struct_fn_va, index, delta, stim_case, stim_done, stim_calls, stim_failures]() {
+                aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "testlab_mcp";
+                sub.label = "testlab.struct_observe.stimulus";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::feature_worker;
+                sub.priority = 3;
+                sub.failure_policy = "reject_not_started";
+                sub.shutdown_policy = "drain";
+                sub.body = [pid, fn = desc.mutate_struct_fn_va, index, delta, stim_case, stim_done, stim_calls, stim_failures]() {
                     try {
                         for (std::uint32_t i = 0; i < 5; ++i) {
                             Sleep(100);
@@ -15500,7 +15537,8 @@ namespace {
                         diag::log_tagged_fmt("test_all_mcp", "struct_observe stimulus exception case=%s err=<unknown>", stim_case.c_str());
                     }
                     stim_done->store(true, std::memory_order_release);
-                });
+                };
+                stim_posted = aida::infra::executor::submit(std::move(sub)).submitted;
             } catch (const std::exception& ex) {
                 log_msg(hf, tag, "FAIL -- struct_observe stimulus post threw case=%s err=%s", case_name ? case_name : "", ex.what());
             } catch (...) {
@@ -17090,7 +17128,7 @@ namespace {
 
         auto cleanup = [&](bool force_sidecar, const char* reason) {
             const uint64_t cleanup_start = GetTickCount64();
-            const auto cq_begin = critical_work_queue::stats();
+            const auto cq_begin = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_msg(hf, tag, "CLEANUP-BEGIN -- reason=%s force_sidecar=%d launched=%d signaled_go=%d page_guard_session=%u pid=%lu previous_pid=%u active_pid=%u cq_alive=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
                 reason ? reason : "unspecified",
                 force_sidecar ? 1 : 0,
@@ -17148,7 +17186,7 @@ namespace {
                 close_network_hook_sidecar(hf, tag, proc, force_sidecar);
                 launched = false;
             }
-            const auto cq_end = critical_work_queue::stats();
+            const auto cq_end = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_timed_out_invocations(hf, tag, "sidecar_cleanup_end");
             log_msg(hf, tag, "CLEANUP-END -- reason=%s elapsed_ms=%llu cq_alive=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
                 reason ? reason : "unspecified",
@@ -18694,7 +18732,7 @@ namespace {
             accept_count.store(0, std::memory_order_release);
             request_count.store(0, std::memory_order_release);
             DWORD thread_start_tick = GetTickCount();
-            log_msg(hf, tag, "Burp HTTP fixture work_queue post requested port=%u listener=%llu target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
+            log_msg(hf, tag, "Burp HTTP fixture taskflow executor submit requested port=%u listener=%llu target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                 static_cast<unsigned>(port),
                 static_cast<unsigned long long>(listener),
                 g_mcp_target_pid,
@@ -18705,15 +18743,24 @@ namespace {
             bool posted = false;
             DWORD post_gle = ERROR_SUCCESS;
             try {
-                posted = work_queue::post([this]() {
-                    run_worker("work_queue");
-                });
+                aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "testlab_mcp";
+                sub.label = "testlab.burp_http_fixture";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::feature_worker;
+                sub.priority = 2;
+                sub.failure_policy = "reject_not_started";
+                sub.shutdown_policy = "drain";
+                sub.body = [this]() {
+                    run_worker("taskflow_executor");
+                };
+                posted = aida::infra::executor::submit(std::move(sub)).submitted;
                 post_gle = GetLastError();
             } catch (const std::exception& ex) {
                 post_gle = GetLastError();
                 if (post_gle == ERROR_SUCCESS)
                     post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=%s gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
+                log_msg(hf, tag, "WARN -- fixture taskflow executor submit exception err=%s gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                     compact_text(ex.what(), 700).c_str(),
                     static_cast<unsigned long>(post_gle),
                     static_cast<unsigned>(port),
@@ -18729,7 +18776,7 @@ namespace {
                 post_gle = GetLastError();
                 if (post_gle == ERROR_SUCCESS)
                     post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                log_msg(hf, tag, "WARN -- fixture work_queue post exception err=unknown gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
+                log_msg(hf, tag, "WARN -- fixture taskflow executor submit exception err=unknown gle=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                     static_cast<unsigned long>(post_gle),
                     static_cast<unsigned>(port),
                     static_cast<unsigned long long>(listener),
@@ -18746,7 +18793,7 @@ namespace {
                     post_gle = ERROR_NOT_READY;
                 DWORD elapsed = GetTickCount() - thread_start_tick;
                 worker_done.store(true, std::memory_order_release);
-                log_msg(hf, tag, "FAIL -- fixture work_queue post failed gle=%lu text=%s elapsed_ms=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
+                log_msg(hf, tag, "FAIL -- fixture taskflow executor submit failed gle=%lu text=%s elapsed_ms=%lu port=%u listener=%llu worker_entered=%d worker_done=%d target_pid=%u attached_pid=%u target_unavailable=%d driver_bridge_status=\"%s\" driver_last_error=\"%s\"",
                     static_cast<unsigned long>(post_gle),
                     format_win32_error(post_gle).c_str(),
                     static_cast<unsigned long>(elapsed),
@@ -20731,7 +20778,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             return;
         }
 
-        const auto cq_begin = critical_work_queue::stats();
+        const auto cq_begin = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         log_msg(hf, tag, "BEGIN -- tool_status_records=%zu explicit_invocations=%zu timed_out_records=%zu cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             g_tool_attempt_stats.size(),
             g_invoked_tools.size(),
@@ -21387,7 +21434,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 registered_total, registered_external, registered_internal, registered_ide_chat, skipped_ai, non_ai_audited, destructive_schema_exemptions, k_expected_destructive_schema_only_exemptions, destructive_schema_accounting_ok ? 1 : 0);
             failed.fetch_add(1);
         }
-        const auto cq_end = critical_work_queue::stats();
+        const auto cq_end = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         log_msg(hf, tag, "END -- missing=%d stale=%d no_functional_pass=%d functional_passed_tools=%d destructive_safe_contract_covered=%d security_guard_covered=%d failed_tools=%d mixed_fail_tools=%d dependency_blocked_tools=%d cascade_blocked_tools=%d empty_result_suspect_tools=%d unexpected_zero_pass_tools=%d expected_empty_nonfunctional_tools=%d diagnostic_fallback_tools=%d diagnostic_fallback_functional_tools=%d timed_out_tools=%d outstanding_timed_out_workers=%zu schema_pass_tools=%d contract_pass_tools=%d cleanup_contract_pass_tools=%d state_contract_pass_tools=%d accepted_pending_tools=%d guard_pass_tools=%d security_guard_pass_tools=%d negative_pass_tools=%d strict_safe_contract_proof=1 pass=%d fail=%d skip=%d cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             missing,
             stale,
@@ -21904,9 +21951,9 @@ void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<
         record_tool_status("web_search", mcp_tool_call_status_t::passed);
         passed.fetch_add(1);
         } catch (const std::exception& ex) {
-            const auto wq = work_queue::stats();
-            const auto sq = work_queue::service_stats();
-            const auto cq = critical_work_queue::stats();
+            const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+            const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_msg(hf, tag, "FAIL -- outer MCP test exception tool=web_search seq=%d phase=web_search err=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
                 guarded_seq,
                 ex.what(),
@@ -21922,9 +21969,9 @@ void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<
             record_tool_status("web_search", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
         } catch (...) {
-            const auto wq = work_queue::stats();
-            const auto sq = work_queue::service_stats();
-            const auto cq = critical_work_queue::stats();
+            const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+            const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_msg(hf, tag, "FAIL -- outer MCP test exception tool=web_search seq=%d phase=web_search err=<unknown> work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
                 guarded_seq,
                 wq.pending,
@@ -21963,9 +22010,9 @@ void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<
         }
         test_tool_call(hf, tag, get_server(), "webfetch", args, passed, failed, skipped);
         } catch (const std::exception& ex) {
-            const auto wq = work_queue::stats();
-            const auto sq = work_queue::service_stats();
-            const auto cq = critical_work_queue::stats();
+            const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+            const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_msg(hf, tag, "FAIL -- outer MCP test exception tool=webfetch phase=webfetch err=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
                 ex.what(),
                 wq.pending,
@@ -21980,9 +22027,9 @@ void test_tool_sandbox_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<
             record_tool_status("webfetch", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
         } catch (...) {
-            const auto wq = work_queue::stats();
-            const auto sq = work_queue::service_stats();
-            const auto cq = critical_work_queue::stats();
+            const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+            const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
             log_msg(hf, tag, "FAIL -- outer MCP test exception tool=webfetch phase=webfetch err=<unknown> work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
                 wq.pending,
                 wq.active,
@@ -23334,7 +23381,17 @@ void test_tool_driver_find_references(HANDLE hf, std::atomic<int>& passed, std::
         holder_args["__aida_test_policy_hold_target_resolve_ms"] = 6500;
         const std::uint64_t holder_deadline = GetTickCount64() + 750;
 
-        const bool posted = critical_work_queue::post_labeled("testlab.mcp.stale_owner.thread_classify", [srv, holder_args, holder_state, holder_cancel, holder_diag, holder_deadline]() mutable {
+        aida::infra::executor::submission_t holder_sub;
+        holder_sub.owner_subsystem = "testlab_mcp";
+        holder_sub.label = "testlab.mcp.stale_owner.thread_classify";
+        holder_sub.thread_class = "bounded_task";
+        holder_sub.domain = aida::infra::executor::domain_t::critical;
+        holder_sub.priority = 1;
+        holder_sub.deadline_ms = holder_deadline;
+        holder_sub.diagnostic_id = holder_diag.c_str();
+        holder_sub.failure_policy = "reject_not_started";
+        holder_sub.shutdown_policy = "drain";
+        holder_sub.body = [srv, holder_args, holder_state, holder_cancel, holder_diag, holder_deadline]() mutable {
             mcp_standalone::scoped_call_cancel_t cancel_scope(holder_cancel);
             mcp_standalone::scoped_call_metadata_t metadata_scope(holder_diag, "external-stale-owner-holder", "thread_classify", holder_deadline);
             const auto started = std::chrono::steady_clock::now();
@@ -23377,7 +23434,8 @@ void test_tool_driver_find_references(HANDLE hf, std::atomic<int>& passed, std::
                 holder_state->done = true;
             }
             holder_state->cv.notify_all();
-        });
+        };
+        const bool posted = aida::infra::executor::submit(std::move(holder_sub)).submitted;
         if (!posted) {
             log_msg(hf, tag, "FAIL -- unable to post thread_classify stale-owner holder");
             record_tool_status("dbg_find_strings", mcp_tool_call_status_t::failed);
@@ -24166,22 +24224,32 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             static_cast<unsigned long long>(writer_ctx.deadline_ms > writer_post_start ? writer_ctx.deadline_ms - writer_post_start : 0),
             static_cast<unsigned long>(writer_ctx.remote_timeout_cap_ms));
         try {
-            writer_posted = work_queue::post([writer_ctx]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "testlab_mcp";
+            sub.label = "testlab.find_what_accesses.writer";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::feature_worker;
+            sub.priority = 2;
+            sub.deadline_ms = writer_ctx.deadline_ms;
+            sub.failure_policy = "reject_not_started";
+            sub.shutdown_policy = "drain";
+            sub.body = [writer_ctx]() {
                 run_find_what_accesses_writer(writer_ctx);
-            });
+            };
+            writer_posted = aida::infra::executor::submit(std::move(sub)).submitted;
             writer_post_gle = GetLastError();
         } catch (const std::exception& ex) {
             writer_post_gle = GetLastError();
             if (writer_post_gle == ERROR_SUCCESS)
                 writer_post_gle = ERROR_NOT_ENOUGH_MEMORY;
-            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger work_queue post exception gle=%lu err=%s",
+            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger taskflow executor submit exception gle=%lu err=%s",
                 static_cast<unsigned long>(writer_post_gle),
                 compact_text(ex.what(), 700).c_str());
         } catch (...) {
             writer_post_gle = GetLastError();
             if (writer_post_gle == ERROR_SUCCESS)
                 writer_post_gle = ERROR_NOT_ENOUGH_MEMORY;
-            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger work_queue post exception gle=%lu err=unknown",
+            log_msg(hf, "mcp.find_what_accesses", "WARN -- access trigger taskflow executor submit exception gle=%lu err=unknown",
                 static_cast<unsigned long>(writer_post_gle));
         }
         log_msg(hf, "mcp.find_what_accesses", "WRITER-POST-END -- posted=%d gle=%lu elapsed_ms=%llu target_pid=%u attached_pid=%u",
@@ -24194,14 +24262,14 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             if (writer_post_gle == ERROR_SUCCESS)
                 writer_post_gle = ERROR_NOT_READY;
             writer_done->store(true, std::memory_order_release);
-            log_msg(hf, "mcp.find_what_accesses", "FAIL -- access trigger work_queue post failed gle=%lu text=%s; fixture resource guard fired before tool dispatch",
+                log_msg(hf, "mcp.find_what_accesses", "FAIL -- access trigger taskflow executor submit failed gle=%lu text=%s; fixture resource guard fired before tool dispatch",
                 static_cast<unsigned long>(writer_post_gle),
                 format_win32_error(writer_post_gle).c_str());
             record_tool_status("find_what_accesses", mcp_tool_call_status_t::failed);
             failed.fetch_add(1);
             return;
         }
-        log_msg(hf, "mcp.find_what_accesses", "trigger work_queue posted watched_addr=0x%016llX attached_pid=%u",
+        log_msg(hf, "mcp.find_what_accesses", "trigger taskflow executor submitted watched_addr=0x%016llX attached_pid=%u",
             static_cast<unsigned long long>(watched_addr),
             driver_bridge::attached_pid());
         mcp_standalone::tool_result_t result;
@@ -24759,11 +24827,20 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             }
             stimulus->done.store(true, std::memory_order_release);
         };
-        const bool stimulus_posted = work_queue::post(run_hunt_stimulus);
+        aida::infra::executor::submission_t stimulus_sub;
+        stimulus_sub.owner_subsystem = "testlab_mcp";
+        stimulus_sub.label = "testlab.hunt_integrity_checkers.stimulus";
+        stimulus_sub.thread_class = "bounded_task";
+        stimulus_sub.domain = aida::infra::executor::domain_t::feature_worker;
+        stimulus_sub.priority = 2;
+        stimulus_sub.failure_policy = "reject_not_started";
+        stimulus_sub.shutdown_policy = "drain";
+        stimulus_sub.body = std::move(run_hunt_stimulus);
+        const bool stimulus_posted = aida::infra::executor::submit(std::move(stimulus_sub)).submitted;
         if (!stimulus_posted) {
-            const auto cq = critical_work_queue::stats();
-            const auto wq = work_queue::stats();
-            const auto sq = work_queue::service_stats();
+            const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
+            const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
             log_msg(hf, tag, "STIMULUS-QUEUE-FAILED -- cq_alive=%d cq_pending=%llu cq_active=%u cq_rejected=%llu wq_alive=%d wq_pending=%llu wq_active=%u wq_rejected=%llu svc_alive=%d svc_pending=%llu svc_active=%u svc_rejected=%llu",
                 cq.alive ? 1 : 0,
                 static_cast<unsigned long long>(cq.pending),
@@ -35268,7 +35345,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
         cleanup_mcp_network_state(hf, "before MCP coverage audit");
     }
     if (!cancelled()) {
-        const auto cq_before_coverage = critical_work_queue::stats();
+        const auto cq_before_coverage = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         set_progress_step("mcp finalization: coverage audit");
         g_mcp_coverage_audit_started.store(true, std::memory_order_release);
         log_msg(hf, "mcp.cleanup", "coverage_audit_begin cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
@@ -35278,7 +35355,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
             static_cast<unsigned long long>(cq_before_coverage.finished));
         test_mcp_coverage_audit(hf, passed, failed, skipped);
         g_mcp_coverage_audit_completed.store(true, std::memory_order_release);
-        const auto cq_after_coverage = critical_work_queue::stats();
+        const auto cq_after_coverage = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         log_msg(hf, "mcp.cleanup", "coverage_audit_end cq_pending=%zu cq_active=%u cq_started=%llu cq_finished=%llu",
             cq_after_coverage.pending,
             static_cast<unsigned>(cq_after_coverage.active),

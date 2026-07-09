@@ -16,7 +16,8 @@
 #include "tls_exporter.hpp"
 #include "vbs_enforcement.hpp"
 #include "obfuscation.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../crypto/keys.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../diagnostics/metadata_ring.hpp"
@@ -28,7 +29,6 @@
 #include "customer_capsule.hpp"
 #include "hardware_id/hardware_id_v2.hpp"
 #include "plaintext_window.hpp"
-#include "../infra/critical_work_queue.hpp"
 #include "../testlab/test_all_features.hpp"
 #include "../../../../../src/shared/telemetry/telemetry_client.hpp"
 
@@ -1634,12 +1634,19 @@ static void schedule_async_network_diagnosis(const std::string& url)
         diag_host = diag_host.substr(0, colon);
     }
 
-    if (work_queue::post_labeled("license.network_diagnostics", [diag_host, diag_port]() {
+    aida::infra::executor::submission_t diag_sub;
+    diag_sub.owner_subsystem = "runtime_license";
+    diag_sub.label = "license.network_diagnostics";
+    diag_sub.thread_class = "diagnostic_task";
+    diag_sub.domain = aida::infra::executor::domain_t::diagnostics;
+    diag_sub.priority = 3;
+    diag_sub.body = [diag_host, diag_port]() {
             __try {
                 diagnose_network(diag_host.c_str(), diag_port);
             } __except(EXCEPTION_EXECUTE_HANDLER) {
             }
-        }))
+        };
+    if (aida::infra::executor::submit(std::move(diag_sub)).submitted)
     {
         lic_log("transport_diag_thread_dispatched");
     }
@@ -3660,7 +3667,13 @@ namespace
         {
             std::string reason_copy = reason ? std::string(reason) : std::string("silent_kill_pending");
             lic_log((std::string("silent_kill_scheduled reason=") + reason_copy).c_str());
-            work_queue::post_labeled("license.silent_kill", [reason_copy]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "runtime_license";
+            sub.label = "license.silent_kill";
+            sub.thread_class = "fatal_timer";
+            sub.domain = aida::infra::executor::domain_t::critical;
+            sub.priority = 0;
+            sub.body = [reason_copy]() {
                 int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
                 while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
                 {
@@ -3671,7 +3684,11 @@ namespace
                 {
                     license_failfast("license_silent_kill", reason_copy);
                 }
-            });
+            };
+            if (!aida::infra::executor::submit(std::move(sub)).submitted)
+            {
+                license_failfast("license_silent_kill_post_failed", reason_copy);
+            }
         }
     }
 
@@ -6541,7 +6558,13 @@ namespace
                     std::string reason_copy = response.value("kill_reason", std::string("server_kill_directive"));
                     lic_log((std::string("server_kill_at_epoch_scheduled in_seconds=") +
                         std::to_string(kill_epoch - now_epoch) + " reason=" + reason_copy).c_str());
-                    work_queue::post_labeled("license.server_kill_directive", [reason_copy]() {
+                    aida::infra::executor::submission_t sub;
+                    sub.owner_subsystem = "runtime_license";
+                    sub.label = "license.server_kill_directive";
+                    sub.thread_class = "fatal_timer";
+                    sub.domain = aida::infra::executor::domain_t::critical;
+                    sub.priority = 0;
+                    sub.body = [reason_copy]() {
                         int64_t deadline_local = s_silent_kill_after_ms.load(std::memory_order_acquire);
                         while (deadline_local > 0 && silent_kill_now_ms() < deadline_local)
                         {
@@ -6552,7 +6575,11 @@ namespace
                         {
                             license_failfast("server_kill_directive", reason_copy);
                         }
-                    });
+                    };
+                    if (!aida::infra::executor::submit(std::move(sub)).submitted)
+                    {
+                        license_failfast("server_kill_directive_post_failed", reason_copy);
+                    }
                 }
             }
         }
@@ -8356,18 +8383,58 @@ namespace
         }
     }
 
+    void log_arc_taskflow_runtime_snapshot_for_unload(const char* reason, bool executor_quiescent, bool runtime_quiescent)
+    {
+        const auto snap = aida::infra::taskflow_runtime::active_snapshot(64);
+        lic_log_fmt("arc_unload_taskflow_gate_snapshot reason=%.128s executor_quiescent=%d runtime_quiescent=%d runtime_active=%u runtime_oldest_active_ms=%llu runtime_work_pending=%llu runtime_work_active=%u runtime_service_pending=%llu runtime_service_active=%u runtime_critical_pending=%llu runtime_critical_active=%u runtime_accepting=%d runtime_shutting_down=%d runtime_labels=%.360s",
+            reason && *reason ? reason : "unload_arc",
+            executor_quiescent ? 1 : 0,
+            runtime_quiescent ? 1 : 0,
+            static_cast<unsigned>(snap.total_active),
+            static_cast<unsigned long long>(snap.oldest_active_ms),
+            static_cast<unsigned long long>(snap.work_queue_pending),
+            static_cast<unsigned>(snap.work_queue_active),
+            static_cast<unsigned long long>(snap.service_queue_pending),
+            static_cast<unsigned>(snap.service_queue_active),
+            static_cast<unsigned long long>(snap.critical_queue_pending),
+            static_cast<unsigned>(snap.critical_queue_active),
+            snap.accepting ? 1 : 0,
+            snap.shutting_down ? 1 : 0,
+            snap.labels_under_pressure.empty() ? "<none>" : snap.labels_under_pressure.c_str());
+
+        const std::string snapshot_json = aida::infra::taskflow_runtime::snapshot_json_string();
+        if (snapshot_json.empty()) {
+            lic_log_fmt("arc_unload_taskflow_snapshot_json reason=%.128s part=0 offset=0 total=0 json=<empty>",
+                reason && *reason ? reason : "unload_arc");
+            return;
+        }
+
+        constexpr std::size_t chunk_size = 560;
+        std::size_t part = 0;
+        for (std::size_t offset = 0; offset < snapshot_json.size(); offset += chunk_size, ++part) {
+            const std::size_t count = std::min(chunk_size, snapshot_json.size() - offset);
+            const std::string chunk = snapshot_json.substr(offset, count);
+            lic_log_fmt("arc_unload_taskflow_snapshot_json reason=%.80s part=%llu offset=%llu total=%llu json=%.640s",
+                reason && *reason ? reason : "unload_arc",
+                static_cast<unsigned long long>(part),
+                static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(snapshot_json.size()),
+                chunk.c_str());
+        }
+    }
+
     bool arc_worker_queues_quiescent_for_unload(const char* reason)
     {
-        auto wq = work_queue::stats();
-        auto svc = work_queue::service_stats();
-        auto cq = critical_work_queue::stats();
-        const bool quiescent =
-            wq.pending == 0 && wq.active == 0 &&
-            svc.pending == 0 && svc.active == 0 &&
-            cq.pending == 0 && cq.active == 0;
+        auto exec = aida::infra::executor::active_snapshot();
+        const bool executor_quiescent =
+            exec.work_queue_pending == 0 && exec.work_queue_active == 0 &&
+            exec.service_queue_pending == 0 && exec.service_queue_active == 0 &&
+            exec.critical_queue_pending == 0 && exec.critical_queue_active == 0;
+        const bool runtime_quiescent = aida::infra::taskflow_runtime::all_pools_quiescent();
+        const bool quiescent = executor_quiescent && runtime_quiescent;
         const uintptr_t arc_base = reinterpret_cast<uintptr_t>(s_arc_module.base);
         const uintptr_t arc_end = arc_base + static_cast<uintptr_t>(s_arc_module.image_size);
-        lic_log_fmt("arc_unload_worker_gate reason=%.128s quiescent=%d loaded=%d unloading=%d inflight=%lld base=0x%llX end=0x%llX size=0x%llX wq_alive=%d wq_shutdown=%d wq_pending=%zu wq_active=%u wq_oldest_ms=%llu wq_labels=%.360s svc_alive=%d svc_shutdown=%d svc_pending=%zu svc_active=%u svc_oldest_ms=%llu svc_labels=%.360s cq_alive=%d cq_shutdown=%d cq_pending=%zu cq_active=%u cq_oldest_ms=%llu cq_labels=%.360s",
+        lic_log_fmt("arc_unload_worker_gate reason=%.128s quiescent=%d loaded=%d unloading=%d inflight=%lld base=0x%llX end=0x%llX size=0x%llX executor_quiescent=%d runtime_quiescent=%d executor_total_active=%u executor_work_pending=%llu executor_work_active=%u executor_service_pending=%llu executor_service_active=%u executor_critical_pending=%llu executor_critical_active=%u executor_oldest_ms=%llu executor_labels=%.360s",
             reason && *reason ? reason : "unload_arc",
             quiescent ? 1 : 0,
             s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
@@ -8376,24 +8443,19 @@ namespace
             static_cast<unsigned long long>(arc_base),
             static_cast<unsigned long long>(arc_end),
             static_cast<unsigned long long>(s_arc_module.image_size),
-            wq.alive ? 1 : 0,
-            wq.shutting_down ? 1 : 0,
-            wq.pending,
-            static_cast<unsigned>(wq.active),
-            static_cast<unsigned long long>(wq.oldest_active_ms),
-            wq.active_labels.empty() ? "<none>" : wq.active_labels.c_str(),
-            svc.alive ? 1 : 0,
-            svc.shutting_down ? 1 : 0,
-            svc.pending,
-            static_cast<unsigned>(svc.active),
-            static_cast<unsigned long long>(svc.oldest_active_ms),
-            svc.active_labels.empty() ? "<none>" : svc.active_labels.c_str(),
-            cq.alive ? 1 : 0,
-            cq.shutting_down ? 1 : 0,
-            cq.pending,
-            static_cast<unsigned>(cq.active),
-            static_cast<unsigned long long>(cq.oldest_active_ms),
-            cq.active_labels.empty() ? "<none>" : cq.active_labels.c_str());
+            executor_quiescent ? 1 : 0,
+            runtime_quiescent ? 1 : 0,
+            static_cast<unsigned>(exec.total_active),
+            static_cast<unsigned long long>(exec.work_queue_pending),
+            static_cast<unsigned>(exec.work_queue_active),
+            static_cast<unsigned long long>(exec.service_queue_pending),
+            static_cast<unsigned>(exec.service_queue_active),
+            static_cast<unsigned long long>(exec.critical_queue_pending),
+            static_cast<unsigned>(exec.critical_queue_active),
+            static_cast<unsigned long long>(exec.oldest_active_ms),
+            exec.labels_under_pressure.empty() ? "<none>" : exec.labels_under_pressure.c_str());
+        if (!quiescent)
+            log_arc_taskflow_runtime_snapshot_for_unload(reason, executor_quiescent, runtime_quiescent);
         return quiescent;
     }
 
@@ -8737,7 +8799,13 @@ namespace
         const std::string effective_reason = reason.empty() ? std::string("License reactivation required.") : reason;
         lic_log((std::string("enter_pending_activation: ") + effective_reason).c_str());
         anti_tamper::state::get().license_pending_activation.store(true, std::memory_order_release);
-        unload_arc("enter_pending_activation", false);
+        const bool arc_released = unload_arc("enter_pending_activation", true);
+        lic_log_fmt("enter_pending_activation_arc_unload_result released=%d loaded=%d unloading=%d inflight=%lld reason=%.128s",
+            arc_released ? 1 : 0,
+            s_arc_loaded.load(std::memory_order_acquire) ? 1 : 0,
+            s_arc_unloading.load(std::memory_order_acquire) ? 1 : 0,
+            static_cast<long long>(s_arc_call_inflight.load(std::memory_order_acquire)),
+            effective_reason.c_str());
         reset_arc_fetch_state();
         reset_activation_completed_at();
         settings.license_plan.clear();
@@ -9293,11 +9361,19 @@ namespace
         bool heartbeat_posted = false;
         try
         {
-            heartbeat_posted = work_queue::post_service_labeled("license.heartbeat_worker", [settings_ptr, worker_epoch]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "runtime_license";
+            sub.label = "license.heartbeat_worker";
+            sub.thread_class = "service_loop";
+            sub.domain = aida::infra::executor::domain_t::security_liveness;
+            sub.priority = 0;
+            sub.generation = worker_epoch;
+            sub.body = [settings_ptr, worker_epoch]() {
                 heartbeat_worker(settings_ptr, worker_epoch);
                 if (s_heartbeat_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_heartbeat_done.store(true, std::memory_order_release);
-            });
+            };
+            heartbeat_posted = aida::infra::executor::submit(std::move(sub)).submitted;
         }
         catch (const std::exception& ex)
         {
@@ -9309,12 +9385,13 @@ namespace
         }
         if (heartbeat_posted)
         {
-            auto svc = work_queue::service_stats();
-            lic_log_fmt("heartbeat_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
-                svc.pool_size,
-                svc.workers,
-                svc.pending,
-                svc.active);
+            auto snap = aida::infra::executor::active_snapshot();
+            lic_log_fmt("heartbeat_thread_started executor_total_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u",
+                static_cast<unsigned>(snap.total_active),
+                static_cast<unsigned long long>(snap.service_queue_pending),
+                static_cast<unsigned>(snap.service_queue_active),
+                static_cast<unsigned long long>(snap.critical_queue_pending),
+                static_cast<unsigned>(snap.critical_queue_active));
         }
         else
         {
@@ -9329,11 +9406,19 @@ namespace
         bool srv_refresh_posted = false;
         try
         {
-            srv_refresh_posted = work_queue::post_service_labeled("license.server_refresh_worker", [settings_ptr, worker_epoch]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "runtime_license";
+            sub.label = "license.server_refresh_worker";
+            sub.thread_class = "service_loop";
+            sub.domain = aida::infra::executor::domain_t::security_liveness;
+            sub.priority = 0;
+            sub.generation = worker_epoch;
+            sub.body = [settings_ptr, worker_epoch]() {
                 srv_refresh_worker(settings_ptr, worker_epoch);
                 if (s_srv_refresh_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_srv_refresh_done.store(true, std::memory_order_release);
-            });
+            };
+            srv_refresh_posted = aida::infra::executor::submit(std::move(sub)).submitted;
         }
         catch (const std::exception& ex)
         {
@@ -9345,12 +9430,13 @@ namespace
         }
         if (srv_refresh_posted)
         {
-            auto svc = work_queue::service_stats();
-            lic_log_fmt("srv_refresh_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
-                svc.pool_size,
-                svc.workers,
-                svc.pending,
-                svc.active);
+            auto snap = aida::infra::executor::active_snapshot();
+            lic_log_fmt("srv_refresh_thread_started executor_total_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u",
+                static_cast<unsigned>(snap.total_active),
+                static_cast<unsigned long long>(snap.service_queue_pending),
+                static_cast<unsigned>(snap.service_queue_active),
+                static_cast<unsigned long long>(snap.critical_queue_pending),
+                static_cast<unsigned>(snap.critical_queue_active));
         }
         else
         {
@@ -9364,11 +9450,19 @@ namespace
         bool kernel_session_recovery_posted = false;
         try
         {
-            kernel_session_recovery_posted = work_queue::post_service_labeled("license.kernel_session_recovery", [settings_ptr, worker_epoch]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "runtime_license";
+            sub.label = "license.kernel_session_recovery";
+            sub.thread_class = "service_loop";
+            sub.domain = aida::infra::executor::domain_t::security_liveness;
+            sub.priority = 0;
+            sub.generation = worker_epoch;
+            sub.body = [settings_ptr, worker_epoch]() {
                 kernel_session_recovery_watchdog_worker(settings_ptr, worker_epoch);
                 if (s_kernel_session_recovery_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_kernel_session_recovery_done.store(true, std::memory_order_release);
-            });
+            };
+            kernel_session_recovery_posted = aida::infra::executor::submit(std::move(sub)).submitted;
         }
         catch (const std::exception& ex)
         {
@@ -9380,12 +9474,13 @@ namespace
         }
         if (kernel_session_recovery_posted)
         {
-            auto svc = work_queue::service_stats();
-            lic_log_fmt("kernel_session_recovery_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
-                svc.pool_size,
-                svc.workers,
-                svc.pending,
-                svc.active);
+            auto snap = aida::infra::executor::active_snapshot();
+            lic_log_fmt("kernel_session_recovery_thread_started executor_total_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u",
+                static_cast<unsigned>(snap.total_active),
+                static_cast<unsigned long long>(snap.service_queue_pending),
+                static_cast<unsigned>(snap.service_queue_active),
+                static_cast<unsigned long long>(snap.critical_queue_pending),
+                static_cast<unsigned>(snap.critical_queue_active));
         }
         else
         {
@@ -9399,11 +9494,19 @@ namespace
         bool seed_rotation_proactive_posted = false;
         try
         {
-            seed_rotation_proactive_posted = work_queue::post_service_labeled("license.seed_rotation_proactive", [settings_ptr, worker_epoch]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "runtime_license";
+            sub.label = "license.seed_rotation_proactive";
+            sub.thread_class = "service_loop";
+            sub.domain = aida::infra::executor::domain_t::security_liveness;
+            sub.priority = 0;
+            sub.generation = worker_epoch;
+            sub.body = [settings_ptr, worker_epoch]() {
                 seed_rotation_proactive_watchdog_worker(settings_ptr, worker_epoch);
                 if (s_seed_rotation_proactive_running_epoch.load(std::memory_order_acquire) == worker_epoch)
                     s_seed_rotation_proactive_done.store(true, std::memory_order_release);
-            });
+            };
+            seed_rotation_proactive_posted = aida::infra::executor::submit(std::move(sub)).submitted;
         }
         catch (const std::exception& ex)
         {
@@ -9415,12 +9518,13 @@ namespace
         }
         if (seed_rotation_proactive_posted)
         {
-            auto svc = work_queue::service_stats();
-            lic_log_fmt("seed_rotation_proactive_thread_started service_pool=%d service_workers=%zu service_pending=%zu service_active=%u",
-                svc.pool_size,
-                svc.workers,
-                svc.pending,
-                svc.active);
+            auto snap = aida::infra::executor::active_snapshot();
+            lic_log_fmt("seed_rotation_proactive_thread_started executor_total_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u",
+                static_cast<unsigned>(snap.total_active),
+                static_cast<unsigned long long>(snap.service_queue_pending),
+                static_cast<unsigned>(snap.service_queue_active),
+                static_cast<unsigned long long>(snap.critical_queue_pending),
+                static_cast<unsigned>(snap.critical_queue_active));
         }
         else
         {
@@ -9463,10 +9567,17 @@ namespace
         s_honeypot_tripped.store(true, std::memory_order_release);
         s_honeypot_trip_count.fetch_add(1, std::memory_order_relaxed);
 
-        work_queue::post_labeled("license.honeypot_report", [trap = std::string(trap_name)]() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "runtime_license";
+        sub.label = "license.honeypot_report";
+        sub.thread_class = "security_task";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.body = [trap = std::string(trap_name)]() {
             try { honeypot_report_impl(trap.c_str(), trap.size()); }
             catch (...) {}
-        });
+        };
+        aida::infra::executor::submit(std::move(sub));
     }
 
 
@@ -11040,10 +11151,17 @@ namespace standalone_license
         const std::string reason_copy(reason ? reason : "unknown");
         bool posted = false;
         try {
-            posted = work_queue::post_service_labeled("license.request_immediate_relay", [reason_copy]() {
+            aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "runtime_license";
+            sub.label = "license.request_immediate_relay";
+            sub.thread_class = "security_task";
+            sub.domain = aida::infra::executor::domain_t::security_liveness;
+            sub.priority = 0;
+            sub.body = [reason_copy]() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 kernel_demote_kick_thunk(reason_copy.c_str());
-            });
+            };
+            posted = aida::infra::executor::submit(std::move(sub)).submitted;
         }
         catch (const std::exception& ex) {
             lic_log_fmt("request_immediate_relay_post_exception what=%.160s reason=%s",

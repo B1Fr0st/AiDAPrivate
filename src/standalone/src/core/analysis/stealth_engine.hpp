@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include "work_queue.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -10,10 +9,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace stealth_engine {
@@ -814,7 +815,14 @@ inline void run_protection_scan()
 	uint32_t pid_at_start = driver_bridge::attached_pid();
 	diag::log_tagged_fmt("stealth", "scan_begin pid=%u", pid_at_start);
 
-	work_queue::post([] {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "analysis";
+	sub.label = "analysis.stealth.scan";
+	sub.thread_class = "bounded_task";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 2;
+	sub.target_pid = pid_at_start;
+	sub.body = [] {
 		auto t0 = std::chrono::steady_clock::now();
 		{
 			std::lock_guard<std::mutex> lk(g_scan.mutex);
@@ -891,7 +899,13 @@ inline void run_protection_scan()
 
 		g_scan.progress.store(1.f);
 		g_scan.scanning.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		g_scan.scanning.store(false);
+		diag::log_tagged_fmt("stealth",
+			"scan_post_failed pid=%u",
+			pid_at_start);
+	}
 }
 
 inline void stop_protection_scan()

@@ -17,8 +17,7 @@
 #include "arc/arc.h"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
-#include "../infra/critical_work_queue.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../network/burp/audit_trail.hpp"
 #include "../network/burp/camoufox_bridge.hpp"
 #include "../runtime/manual_map_tls.hpp"
@@ -926,12 +925,109 @@ namespace
         };
     }
 
-    static void log_work_queue_stats(const char* context)
+    struct runtime_queue_stats_t
     {
-        const auto general = work_queue::stats();
+        bool alive = false;
+        bool shutting_down = false;
+        int pool_size = 0;
+        std::size_t workers = 0;
+        std::size_t pending = 0;
+        std::uint32_t active = 0;
+        std::uint64_t post_attempts = 0;
+        std::uint64_t posted = 0;
+        std::uint64_t rejected = 0;
+        std::uint64_t started = 0;
+        std::uint64_t finished = 0;
+        std::uint64_t oldest_active_ms = 0;
+        std::uint32_t active_label_count = 0;
+        std::uint32_t healthy_long_lived = 0;
+        std::uint32_t hot_workers = 0;
+        std::uint32_t not_queryable_workers = 0;
+        std::string active_labels;
+        std::string top_cpu_labels;
+    };
+
+    enum class runtime_queue_family_t
+    {
+        general,
+        service,
+        critical
+    };
+
+    static void append_limited_runtime_text(std::string& dst, const std::string& src, std::size_t limit)
+    {
+        if (src.empty() || dst.size() >= limit)
+            return;
+        if (!dst.empty() && dst.size() + 1 < limit)
+            dst.push_back(';');
+        const std::size_t remaining = dst.size() < limit ? limit - dst.size() : 0;
+        if (remaining != 0)
+            dst.append(src, 0, remaining);
+    }
+
+    static void accumulate_runtime_domain_stats(runtime_queue_stats_t& out,
+                                                aida::infra::taskflow_runtime::executor_domain_t domain)
+    {
+        auto& pool = aida::infra::taskflow_runtime::domain_pool(domain);
+        const auto stats = aida::infra::taskflow_runtime::stats_for(
+            pool,
+            pool.configured_pool_size,
+            aida::infra::taskflow_runtime::domain_name(domain));
+        out.alive = out.alive || stats.alive;
+        out.shutting_down = out.shutting_down || stats.shutting_down;
+        out.pool_size += stats.pool_size;
+        out.workers += stats.workers;
+        out.pending += stats.pending;
+        out.active += stats.active;
+        out.post_attempts += stats.post_attempts;
+        out.posted += stats.posted;
+        out.rejected += stats.rejected;
+        out.started += stats.started;
+        out.finished += stats.finished;
+        if (stats.oldest_active_ms > out.oldest_active_ms)
+            out.oldest_active_ms = stats.oldest_active_ms;
+        out.active_label_count += stats.active_label_count;
+        out.healthy_long_lived += stats.healthy_long_lived;
+        out.hot_workers += stats.hot_workers;
+        out.not_queryable_workers += stats.not_queryable_workers;
+        append_limited_runtime_text(out.active_labels, stats.active_labels, 900);
+        append_limited_runtime_text(out.top_cpu_labels, stats.top_cpu_labels, 900);
+    }
+
+    static runtime_queue_stats_t runtime_queue_stats(runtime_queue_family_t family)
+    {
+        using domain_t = aida::infra::taskflow_runtime::executor_domain_t;
+        runtime_queue_stats_t out;
+        switch (family) {
+        case runtime_queue_family_t::service:
+            accumulate_runtime_domain_stats(out, domain_t::service);
+            accumulate_runtime_domain_stats(out, domain_t::long_running);
+            break;
+        case runtime_queue_family_t::critical:
+            accumulate_runtime_domain_stats(out, domain_t::critical);
+            accumulate_runtime_domain_stats(out, domain_t::security_liveness);
+            break;
+        case runtime_queue_family_t::general:
+        default:
+            accumulate_runtime_domain_stats(out, domain_t::general);
+            accumulate_runtime_domain_stats(out, domain_t::ui_dispatch);
+            accumulate_runtime_domain_stats(out, domain_t::external_tool);
+            accumulate_runtime_domain_stats(out, domain_t::feature_worker);
+            accumulate_runtime_domain_stats(out, domain_t::diagnostics);
+            break;
+        }
+        return out;
+    }
+
+    static void log_runtime_executor_stats(const char* context)
+    {
+        const auto general = runtime_queue_stats(runtime_queue_family_t::general);
+        const auto critical = runtime_queue_stats(runtime_queue_family_t::critical);
+        const auto service = runtime_queue_stats(runtime_queue_family_t::service);
+        const auto exec = aida::infra::executor::active_snapshot();
         diag::log_tagged_fmt("mcp_srv",
-            "%s work_queue alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu",
-            context ? context : "work_queue",
+            "%s runtime_general alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu oldest_ms=%llu labels=%.420s exec_total_active=%u exec_oldest_ms=%llu",
+            context ? context : "runtime_general",
             general.alive ? 1 : 0,
             general.shutting_down ? 1 : 0,
             general.pool_size,
@@ -942,37 +1038,43 @@ namespace
             static_cast<unsigned long long>(general.posted),
             static_cast<unsigned long long>(general.rejected),
             static_cast<unsigned long long>(general.started),
-            static_cast<unsigned long long>(general.finished));
-        const auto st = critical_work_queue::stats();
+            static_cast<unsigned long long>(general.finished),
+            static_cast<unsigned long long>(general.oldest_active_ms),
+            general.active_labels.empty() ? "<none>" : general.active_labels.c_str(),
+            static_cast<unsigned>(exec.total_active),
+            static_cast<unsigned long long>(exec.oldest_active_ms));
         diag::log_tagged_fmt("mcp_srv",
-            "%s critical_queue alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu",
-            context ? context : "critical_queue",
-            st.alive ? 1 : 0,
-            st.shutting_down ? 1 : 0,
-            st.pool_size,
-            st.workers,
-            st.pending,
-            static_cast<unsigned>(st.active),
-            static_cast<unsigned long long>(st.post_attempts),
-            static_cast<unsigned long long>(st.posted),
-            static_cast<unsigned long long>(st.rejected),
-            static_cast<unsigned long long>(st.started),
-            static_cast<unsigned long long>(st.finished));
-        const auto svc = work_queue::service_stats();
+            "%s runtime_critical alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu oldest_ms=%llu labels=%.420s",
+            context ? context : "runtime_critical",
+            critical.alive ? 1 : 0,
+            critical.shutting_down ? 1 : 0,
+            critical.pool_size,
+            critical.workers,
+            critical.pending,
+            static_cast<unsigned>(critical.active),
+            static_cast<unsigned long long>(critical.post_attempts),
+            static_cast<unsigned long long>(critical.posted),
+            static_cast<unsigned long long>(critical.rejected),
+            static_cast<unsigned long long>(critical.started),
+            static_cast<unsigned long long>(critical.finished),
+            static_cast<unsigned long long>(critical.oldest_active_ms),
+            critical.active_labels.empty() ? "<none>" : critical.active_labels.c_str());
         diag::log_tagged_fmt("mcp_srv",
-            "%s service_queue alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu",
-            context ? context : "service_queue",
-            svc.alive ? 1 : 0,
-            svc.shutting_down ? 1 : 0,
-            svc.pool_size,
-            svc.workers,
-            svc.pending,
-            static_cast<unsigned>(svc.active),
-            static_cast<unsigned long long>(svc.post_attempts),
-            static_cast<unsigned long long>(svc.posted),
-            static_cast<unsigned long long>(svc.rejected),
-            static_cast<unsigned long long>(svc.started),
-            static_cast<unsigned long long>(svc.finished));
+            "%s runtime_service alive=%d shutting_down=%d pool_size=%d workers=%zu pending=%zu active=%u post_attempts=%llu posted=%llu rejected=%llu started=%llu finished=%llu oldest_ms=%llu labels=%.420s",
+            context ? context : "runtime_service",
+            service.alive ? 1 : 0,
+            service.shutting_down ? 1 : 0,
+            service.pool_size,
+            service.workers,
+            service.pending,
+            static_cast<unsigned>(service.active),
+            static_cast<unsigned long long>(service.post_attempts),
+            static_cast<unsigned long long>(service.posted),
+            static_cast<unsigned long long>(service.rejected),
+            static_cast<unsigned long long>(service.started),
+            static_cast<unsigned long long>(service.finished),
+            static_cast<unsigned long long>(service.oldest_active_ms),
+            service.active_labels.empty() ? "<none>" : service.active_labels.c_str());
     }
 
     struct mcp_executor_task_meta_t
@@ -1569,17 +1671,15 @@ namespace
     {
     public:
         mcp_owned_executor_t(const char* name, std::size_t worker_count, std::size_t max_queued_requests)
-            : _name(name ? name : "mcp_executor")
-            , _worker_count(worker_count)
-            , _max_queued_requests(max_queued_requests)
+            : _state(std::make_shared<state_t>(name, worker_count, max_queued_requests))
         {
             register_mcp_executor(this);
             diag::log_tagged_fmt("mcp_srv",
                 "mcp_executor_config name=%s workers=%zu max_queue=%zu",
-                _name.c_str(),
-                _worker_count,
-                _max_queued_requests);
-            start_workers();
+                _state->name.c_str(),
+                _state->worker_count,
+                _state->max_queued_requests);
+            start_runtime_executor();
         }
 
         mcp_owned_executor_t(const mcp_owned_executor_t&) = delete;
@@ -1593,123 +1693,215 @@ namespace
 
         bool enqueue(std::function<void()> fn, std::shared_ptr<mcp_executor_task_meta_t> meta = nullptr)
         {
+            auto state = _state;
             if (!fn) {
-                _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                if (state)
+                    state->rejected.fetch_add(1u, std::memory_order_acq_rel);
                 return false;
             }
+            if (!state)
+                return false;
 
-            task_t task;
-            task.fn = std::move(fn);
-            task.meta = meta ? std::move(meta) : make_executor_task_meta();
+            auto task = std::make_shared<task_t>();
+            task->fn = std::move(fn);
+            task->meta = meta ? std::move(meta) : make_executor_task_meta();
             const std::uint64_t queued_at = mcp_now_ms();
-            const std::uint64_t seq = _enqueued.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+            const std::uint64_t seq = state->enqueued.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+            task->seq = seq;
             {
-                std::lock_guard<std::mutex> meta_lk(task.meta->mtx);
-                task.meta->queued_at = queued_at;
-                task.meta->executor_seq = seq;
+                std::lock_guard<std::mutex> meta_lk(task->meta->mtx);
+                task->meta->queued_at = queued_at;
+                task->meta->executor_seq = seq;
             }
             {
-                std::lock_guard<std::mutex> meta_lk(task.meta->mtx);
-                task.long_running = is_long_running_tool_diagnostic(
-                    task.meta->tool,
-                    task.meta->domain,
-                    task.meta->lane,
-                    task.meta->queued_at,
-                    task.meta->deadline_ms);
+                std::lock_guard<std::mutex> meta_lk(task->meta->mtx);
+                task->long_running = is_long_running_tool_diagnostic(
+                    task->meta->tool,
+                    task->meta->domain,
+                    task->meta->lane,
+                    task->meta->queued_at,
+                    task->meta->deadline_ms);
             }
-            task.pressure = make_pressure_record(_name, task.meta, task.long_running);
-            const mcp_pressure_record_t pressure_record = task.pressure;
-            const bool pressure_long_running = task.long_running;
+            task->pressure = make_pressure_record(state->name, task->meta, task->long_running);
+            const mcp_pressure_record_t pressure_record = task->pressure;
+            const bool pressure_long_running = task->long_running;
 
+            std::string request_id;
+            std::string session_id;
+            std::string target_id;
+            std::string diagnostic_id;
+            std::string label = state->name + "#" + std::to_string(seq);
+            std::uint64_t deadline_ms = 0;
+            std::uint32_t target_pid = 0;
             {
-                std::lock_guard<std::mutex> lk(_mtx);
-                if (_shutdown.load(std::memory_order_acquire) || _workers.empty()) {
-                    _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                std::lock_guard<std::mutex> meta_lk(task->meta->mtx);
+                request_id = task->meta->request_id;
+                session_id = task->meta->session_hash;
+                target_id = task->meta->target_id;
+                diagnostic_id = task->meta->action;
+                deadline_ms = task->meta->deadline_ms;
+                target_pid = task->meta->target_pid;
+            }
+
+            aida::infra::taskflow_runtime::task_descriptor_t desc;
+            desc.owner_subsystem = state->name.c_str();
+            desc.label = label.c_str();
+            desc.thread_class = "mcp_runtime";
+            desc.domain = runtime_domain_for_executor_name(state->name);
+            desc.priority = task->long_running ? 2 : 3;
+            desc.deadline_ms = deadline_ms;
+            desc.session_id = session_id.empty() ? nullptr : session_id.c_str();
+            desc.target_id = target_id.empty() ? nullptr : target_id.c_str();
+            desc.target_pid = target_pid;
+            desc.diagnostic_id = diagnostic_id.empty() ? nullptr : diagnostic_id.c_str();
+            desc.request_id = request_id.empty() ? nullptr : request_id.c_str();
+            desc.failure_policy = "reject_not_started";
+            desc.shutdown_policy = "cancel_or_drain";
+            desc.no_capacity_reason = "mcp_executor_runtime_rejected";
+            desc.cancel_hook = [state, task]() {
+                cancel_queued_task(state, task, "runtime_cancel_hook");
+            };
+            desc.cancellable_body = [state, task](const aida::infra::taskflow_runtime::cancellation_token_t& token) {
+                execute_task(state, task, token);
+            };
+
+            bool pressure_recorded = false;
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                const std::size_t workers = state->worker_count_snapshot.load(std::memory_order_acquire);
+                if (state->shutdown.load(std::memory_order_acquire) || workers == 0) {
+                    state->rejected.fetch_add(1u, std::memory_order_acq_rel);
                     diag::log_tagged_fmt("mcp_srv",
                         "mcp_executor_enqueue_rejected name=%s reason=%s workers=%zu queued=%zu active=%u",
-                        _name.c_str(),
-                        _shutdown.load(std::memory_order_acquire) ? "shutdown" : "no_workers",
-                        _workers.size(),
-                        _jobs.size(),
-                        static_cast<unsigned>(_active.load(std::memory_order_acquire)));
+                        state->name.c_str(),
+                        state->shutdown.load(std::memory_order_acquire) ? "shutdown" : "no_workers",
+                        workers,
+                        state->queued_tasks.size(),
+                        static_cast<unsigned>(state->active.load(std::memory_order_acquire)));
                     return false;
                 }
-                if (_max_queued_requests > 0 && _jobs.size() >= _max_queued_requests) {
-                    _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                if (state->max_queued_requests > 0 && state->queued_tasks.size() >= state->max_queued_requests) {
+                    state->rejected.fetch_add(1u, std::memory_order_acq_rel);
                     diag::log_tagged_fmt("mcp_srv",
                         "mcp_executor_enqueue_rejected name=%s reason=full queued=%zu max=%zu active=%u",
-                        _name.c_str(),
-                        _jobs.size(),
-                        _max_queued_requests,
-                        static_cast<unsigned>(_active.load(std::memory_order_acquire)));
+                        state->name.c_str(),
+                        state->queued_tasks.size(),
+                        state->max_queued_requests,
+                        static_cast<unsigned>(state->active.load(std::memory_order_acquire)));
                     return false;
                 }
                 try {
-                    _jobs.push_back(std::move(task));
+                    state->queued_tasks.push_back(task);
                     if (pressure_long_running)
-                        _queued_long_running.fetch_add(1u, std::memory_order_acq_rel);
+                        state->queued_long_running.fetch_add(1u, std::memory_order_acq_rel);
                 } catch (...) {
-                    _rejected.fetch_add(1u, std::memory_order_acq_rel);
+                    state->rejected.fetch_add(1u, std::memory_order_acq_rel);
                     diag::log_tagged_fmt("mcp_srv",
                         "mcp_executor_enqueue_rejected name=%s reason=exception queued=%zu active=%u",
-                        _name.c_str(),
-                        _jobs.size(),
-                        static_cast<unsigned>(_active.load(std::memory_order_acquire)));
+                        state->name.c_str(),
+                        state->queued_tasks.size(),
+                        static_cast<unsigned>(state->active.load(std::memory_order_acquire)));
+                    return false;
+                }
+                try {
+                    record_pressure_enqueue(pressure_record);
+                    pressure_recorded = true;
+                } catch (const std::exception& ex) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_pressure_record_failed phase=enqueue executor=%s err='%s'",
+                        state->name.c_str(),
+                        ex.what());
+                } catch (...) {
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_pressure_record_failed phase=enqueue executor=%s err='<unknown>'",
+                        state->name.c_str());
+                }
+                try {
+                    auto submit_result = aida::infra::taskflow_runtime::submit(std::move(desc));
+                    if (!submit_result.submitted) {
+                        remove_queued_task_locked(*state, task);
+                        state->rejected.fetch_add(1u, std::memory_order_acq_rel);
+                        diag::log_tagged_fmt("mcp_srv",
+                            "mcp_executor_enqueue_rejected name=%s reason=runtime_submit_rejected runtime_reason='%s' queued=%zu active=%u",
+                            state->name.c_str(),
+                            submit_result.reject_reason.empty() ? "<none>" : submit_result.reject_reason.c_str(),
+                            state->queued_tasks.size(),
+                            static_cast<unsigned>(state->active.load(std::memory_order_acquire)));
+                        if (pressure_recorded)
+                            balance_rejected_pressure(pressure_record);
+                        return false;
+                    }
+                    task->runtime_job_id.store(submit_result.handle.id, std::memory_order_release);
+                    state->outstanding_tasks[seq] = task;
+                } catch (const std::exception& ex) {
+                    remove_queued_task_locked(*state, task);
+                    state->rejected.fetch_add(1u, std::memory_order_acq_rel);
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_enqueue_rejected name=%s reason=runtime_submit_exception queued=%zu active=%u err='%s'",
+                        state->name.c_str(),
+                        state->queued_tasks.size(),
+                        static_cast<unsigned>(state->active.load(std::memory_order_acquire)),
+                        ex.what());
+                    if (pressure_recorded)
+                        balance_rejected_pressure(pressure_record);
+                    return false;
+                } catch (...) {
+                    remove_queued_task_locked(*state, task);
+                    state->rejected.fetch_add(1u, std::memory_order_acq_rel);
+                    diag::log_tagged_fmt("mcp_srv",
+                        "mcp_executor_enqueue_rejected name=%s reason=runtime_submit_exception queued=%zu active=%u err='<unknown>'",
+                        state->name.c_str(),
+                        state->queued_tasks.size(),
+                        static_cast<unsigned>(state->active.load(std::memory_order_acquire)));
+                    if (pressure_recorded)
+                        balance_rejected_pressure(pressure_record);
                     return false;
                 }
             }
-            try {
-                record_pressure_enqueue(pressure_record);
-            } catch (const std::exception& ex) {
-                diag::log_tagged_fmt("mcp_srv",
-                    "mcp_pressure_record_failed phase=enqueue executor=%s err='%s'",
-                    _name.c_str(),
-                    ex.what());
-            } catch (...) {
-                diag::log_tagged_fmt("mcp_srv",
-                    "mcp_pressure_record_failed phase=enqueue executor=%s err='<unknown>'",
-                    _name.c_str());
-            }
-            _cv.notify_one();
             return true;
         }
 
         bool try_snapshot_json(json& out, mcp_capacity_snapshot_state_t* capacity)
         {
+            auto state = _state;
+            if (!state)
+                return false;
             const std::uint64_t now = mcp_now_ms();
-            std::vector<std::shared_ptr<mcp_executor_task_meta_t>> active_tasks;
-            std::vector<std::shared_ptr<mcp_executor_task_meta_t>> queued_tasks;
+            std::vector<std::shared_ptr<task_t>> active_tasks;
+            std::vector<std::shared_ptr<task_t>> queued_tasks;
             std::size_t queued = 0;
             std::size_t workers = 0;
             {
-                std::unique_lock<std::mutex> lk(_mtx, std::try_to_lock);
+                std::unique_lock<std::mutex> lk(state->mtx, std::try_to_lock);
                 if (!lk.owns_lock()) {
                     out = json::object();
-                    out["name"] = _name;
+                    out["name"] = state->name;
                     out["snapshot_lock_busy"] = true;
-                    out["workers"] = 0;
-                    out["max_queue"] = _max_queued_requests;
+                    out["workers"] = state->worker_count_snapshot.load(std::memory_order_acquire);
+                    out["max_queue"] = state->max_queued_requests;
                     out["queued"] = 0;
-                    out["active"] = _active.load(std::memory_order_acquire);
-                    out["enqueued"] = _enqueued.load(std::memory_order_acquire);
-                    out["started"] = _started.load(std::memory_order_acquire);
-                    out["finished"] = _finished.load(std::memory_order_acquire);
-                    out["rejected"] = _rejected.load(std::memory_order_acquire);
-                    out["worker_failures"] = _worker_failures.load(std::memory_order_acquire);
-                    out["tls_failures"] = _tls_failures.load(std::memory_order_acquire);
+                    out["active"] = state->active.load(std::memory_order_acquire);
+                    out["queued_long_running"] = state->queued_long_running.load(std::memory_order_acquire);
+                    out["active_long_running"] = state->active_long_running.load(std::memory_order_acquire);
+                    out["enqueued"] = state->enqueued.load(std::memory_order_acquire);
+                    out["started"] = state->started.load(std::memory_order_acquire);
+                    out["finished"] = state->finished.load(std::memory_order_acquire);
+                    out["rejected"] = state->rejected.load(std::memory_order_acquire);
+                    out["worker_failures"] = state->worker_failures.load(std::memory_order_acquire);
+                    out["tls_failures"] = state->tls_failures.load(std::memory_order_acquire);
                     if (capacity)
                         ++capacity->executor_snapshot_busy;
                     return false;
                 }
-                queued = _jobs.size();
-                workers = _workers.size();
-                active_tasks = _active_tasks;
+                queued = state->queued_tasks.size();
+                workers = state->worker_count_snapshot.load(std::memory_order_acquire);
+                active_tasks = state->active_tasks;
                 queued_tasks.reserve(std::min<std::size_t>(queued, kMcpCapacityMaxQueuedSamples));
                 std::size_t sampled = 0;
-                for (const auto& job : _jobs) {
+                for (const auto& job : state->queued_tasks) {
                     if (sampled >= kMcpCapacityMaxQueuedSamples)
                         break;
-                    queued_tasks.push_back(job.meta);
+                    queued_tasks.push_back(job);
                     ++sampled;
                 }
                 if (capacity && queued > sampled)
@@ -1718,7 +1910,8 @@ namespace
 
             json active = json::array();
             std::size_t active_sampled = 0;
-            for (const auto& meta : active_tasks) {
+            for (const auto& active_task : active_tasks) {
+                const auto meta = active_task ? active_task->meta : nullptr;
                 if (!meta)
                     continue;
                 if (active_sampled >= kMcpCapacityMaxActiveSamples) {
@@ -1774,7 +1967,7 @@ namespace
                     if (capacity && meta->external_tool) {
                         ++capacity->active_samples;
                         record_capacity_item(*capacity,
-                            _name,
+                            state->name,
                             "active",
                             meta->principal_id,
                             meta->session_hash,
@@ -1799,7 +1992,8 @@ namespace
             }
 
             json queued_items = json::array();
-            for (const auto& meta : queued_tasks) {
+            for (const auto& queued_task : queued_tasks) {
+                const auto meta = queued_task ? queued_task->meta : nullptr;
                 if (!meta)
                     continue;
                 json item;
@@ -1845,7 +2039,7 @@ namespace
                 if (capacity && meta->external_tool) {
                     ++capacity->queued_samples;
                     record_capacity_item(*capacity,
-                        _name,
+                        state->name,
                         "queued",
                         meta->principal_id,
                         meta->session_hash,
@@ -1869,20 +2063,20 @@ namespace
             }
 
             out = json::object();
-            out["name"] = _name;
+            out["name"] = state->name;
             out["snapshot_lock_busy"] = false;
             out["workers"] = workers;
-            out["max_queue"] = _max_queued_requests;
+            out["max_queue"] = state->max_queued_requests;
             out["queued"] = queued;
-            out["active"] = _active.load(std::memory_order_acquire);
-            out["queued_long_running"] = _queued_long_running.load(std::memory_order_acquire);
-            out["active_long_running"] = _active_long_running.load(std::memory_order_acquire);
-            out["enqueued"] = _enqueued.load(std::memory_order_acquire);
-            out["started"] = _started.load(std::memory_order_acquire);
-            out["finished"] = _finished.load(std::memory_order_acquire);
-            out["rejected"] = _rejected.load(std::memory_order_acquire);
-            out["worker_failures"] = _worker_failures.load(std::memory_order_acquire);
-            out["tls_failures"] = _tls_failures.load(std::memory_order_acquire);
+            out["active"] = state->active.load(std::memory_order_acquire);
+            out["queued_long_running"] = state->queued_long_running.load(std::memory_order_acquire);
+            out["active_long_running"] = state->active_long_running.load(std::memory_order_acquire);
+            out["enqueued"] = state->enqueued.load(std::memory_order_acquire);
+            out["started"] = state->started.load(std::memory_order_acquire);
+            out["finished"] = state->finished.load(std::memory_order_acquire);
+            out["rejected"] = state->rejected.load(std::memory_order_acquire);
+            out["worker_failures"] = state->worker_failures.load(std::memory_order_acquire);
+            out["tls_failures"] = state->tls_failures.load(std::memory_order_acquire);
             out["active_tasks"] = std::move(active);
             out["queued_tasks_sampled"] = std::move(queued_items);
             return true;
@@ -1897,46 +2091,50 @@ namespace
 
         bool try_snapshot_counts(mcp_executor_counts_t& out)
         {
+            auto state = _state;
+            if (!state)
+                return false;
             const std::uint64_t now = mcp_now_ms();
-            std::vector<std::shared_ptr<mcp_executor_task_meta_t>> active_tasks;
+            std::vector<std::shared_ptr<task_t>> active_tasks;
             std::size_t queued = 0;
             std::size_t workers = 0;
             {
-                std::unique_lock<std::mutex> lk(_mtx, std::try_to_lock);
+                std::unique_lock<std::mutex> lk(state->mtx, std::try_to_lock);
                 if (!lk.owns_lock())
                     return false;
-                queued = _jobs.size();
-                workers = _workers.size();
-                active_tasks = _active_tasks;
+                queued = state->queued_tasks.size();
+                workers = state->worker_count_snapshot.load(std::memory_order_acquire);
+                active_tasks = state->active_tasks;
             }
 
             ++out.snapshotted;
             out.workers += workers;
             out.queued += queued;
-            out.active += _active.load(std::memory_order_acquire);
-            out.enqueued += _enqueued.load(std::memory_order_acquire);
-            out.started += _started.load(std::memory_order_acquire);
-            out.finished += _finished.load(std::memory_order_acquire);
-            out.rejected += _rejected.load(std::memory_order_acquire);
-            out.worker_failures += _worker_failures.load(std::memory_order_acquire);
-            out.tls_failures += _tls_failures.load(std::memory_order_acquire);
-            out.queued_long_running += _queued_long_running.load(std::memory_order_acquire);
-            out.active_long_running += _active_long_running.load(std::memory_order_acquire);
+            out.active += state->active.load(std::memory_order_acquire);
+            out.enqueued += state->enqueued.load(std::memory_order_acquire);
+            out.started += state->started.load(std::memory_order_acquire);
+            out.finished += state->finished.load(std::memory_order_acquire);
+            out.rejected += state->rejected.load(std::memory_order_acquire);
+            out.worker_failures += state->worker_failures.load(std::memory_order_acquire);
+            out.tls_failures += state->tls_failures.load(std::memory_order_acquire);
+            out.queued_long_running += state->queued_long_running.load(std::memory_order_acquire);
+            out.active_long_running += state->active_long_running.load(std::memory_order_acquire);
             if (out.queue_summary.size() < 900) {
                 char item[260] = {};
                 _snprintf_s(item, sizeof(item), _TRUNCATE,
                     "%s%s:workers=%zu:queued=%zu:active=%u:long_queued=%llu:long_active=%llu",
                     out.queue_summary.empty() ? "" : ";",
-                    _name.c_str(),
+                    state->name.c_str(),
                     workers,
                     queued,
-                    static_cast<unsigned>(_active.load(std::memory_order_acquire)),
-                    static_cast<unsigned long long>(_queued_long_running.load(std::memory_order_acquire)),
-                    static_cast<unsigned long long>(_active_long_running.load(std::memory_order_acquire)));
+                    static_cast<unsigned>(state->active.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(state->queued_long_running.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(state->active_long_running.load(std::memory_order_acquire)));
                 out.queue_summary += item;
             }
 
-            for (const auto& meta : active_tasks) {
+            for (const auto& active_task : active_tasks) {
+                const auto meta = active_task ? active_task->meta : nullptr;
                 if (!meta)
                     continue;
                 std::unique_lock<std::mutex> meta_lk(meta->mtx, std::try_to_lock);
@@ -1953,7 +2151,7 @@ namespace
                     _snprintf_s(item, sizeof(item), _TRUNCATE,
                         "%s%s#%llu:transport=%s:principal=%s:session=%s:tool=%s:lane=%s:tid=%lu:queued_age_ms=%llu:active_age_ms=%llu:deadline_ms=%llu:cancelled=%d",
                         out.active_summary.empty() ? "" : ";",
-                        _name.c_str(),
+                        state->name.c_str(),
                         static_cast<unsigned long long>(meta->executor_seq),
                         meta->transport.empty() ? "<none>" : meta->transport.c_str(),
                         meta->principal_id.empty() ? "<none>" : meta->principal_id.c_str(),
@@ -1973,280 +2171,552 @@ namespace
 
         void shutdown()
         {
+            auto state = _state;
+            if (!state)
+                return;
             bool expected = false;
-            if (!_shutdown.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+            if (!state->shutdown.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
                 return;
 
             const std::uint64_t begin = mcp_now_ms();
-            std::vector<aida::infra::win_thread::joinable_thread_t> workers;
-            std::vector<unsigned> worker_ids;
             std::size_t queued = 0;
+            std::size_t workers = 0;
+            std::vector<std::shared_ptr<task_t>> outstanding;
+            std::uint64_t current_seq = 0;
+            if (tls_executor_task_meta)
+                current_seq = tls_executor_task_meta->executor_seq;
             {
-                std::lock_guard<std::mutex> lk(_mtx);
-                queued = _jobs.size();
-                worker_ids.reserve(_workers.size());
-                for (const auto& worker : _workers)
-                    worker_ids.push_back(worker.id());
-                workers = std::move(_workers);
-                _workers.clear();
+                std::lock_guard<std::mutex> lk(state->mtx);
+                queued = state->queued_tasks.size();
+                workers = state->worker_count_snapshot.load(std::memory_order_acquire);
+                outstanding.reserve(state->outstanding_tasks.size());
+                for (const auto& kv : state->outstanding_tasks) {
+                    if (kv.second)
+                        outstanding.push_back(kv.second);
+                }
             }
             diag::log_tagged_fmt("mcp_srv",
-                "mcp_executor_shutdown_begin name=%s workers=%zu queued=%zu active=%u enqueued=%llu finished=%llu rejected=%llu",
-                _name.c_str(),
-                workers.size(),
+                "mcp_executor_shutdown_begin name=%s workers=%zu queued=%zu active=%u outstanding=%zu enqueued=%llu finished=%llu rejected=%llu",
+                state->name.c_str(),
+                workers,
                 queued,
-                static_cast<unsigned>(_active.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(_enqueued.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(_rejected.load(std::memory_order_acquire)));
-            _cv.notify_all();
+                static_cast<unsigned>(state->active.load(std::memory_order_acquire)),
+                outstanding.size(),
+                static_cast<unsigned long long>(state->enqueued.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state->finished.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state->rejected.load(std::memory_order_acquire)));
 
-            const DWORD current_tid = GetCurrentThreadId();
-            for (std::size_t i = 0; i < workers.size(); ++i) {
-                auto& worker = workers[i];
-                const unsigned tid = i < worker_ids.size() ? worker_ids[i] : worker.id();
-                if (!worker.joinable())
+            if (outstanding.empty()) {
+                log_shutdown_done(*state, begin);
+                return;
+            }
+
+            for (const auto& task : outstanding) {
+                if (!task)
                     continue;
-                if (tid == current_tid) {
+                request_task_cancel(task);
+                const std::uint64_t job_id = task->runtime_job_id.load(std::memory_order_acquire);
+                if (job_id != 0)
+                    (void)aida::infra::taskflow_runtime::cancel(aida::infra::taskflow_runtime::job_handle_t{job_id});
+            }
+
+            const std::uint64_t deadline = begin + 10000ULL;
+            bool skipped_current_task = false;
+            bool wait_timed_out = false;
+            for (const auto& task : outstanding) {
+                if (!task)
+                    continue;
+                if (task->seq == current_seq && current_seq != 0) {
+                    skipped_current_task = true;
                     diag::log_tagged_fmt("mcp_srv",
-                        "mcp_executor_shutdown_self_join_skipped name=%s worker_index=%zu tid=%u",
-                        _name.c_str(),
-                        i,
-                        tid);
-                    worker.detach();
+                        "mcp_executor_shutdown_self_wait_skipped name=%s seq=%llu job_id=%llu tid=%u",
+                        state->name.c_str(),
+                        static_cast<unsigned long long>(task->seq),
+                        static_cast<unsigned long long>(task->runtime_job_id.load(std::memory_order_acquire)),
+                        static_cast<unsigned>(GetCurrentThreadId()));
                     continue;
                 }
-                if (!worker.join_for(10000)) {
-                    std::size_t remaining_queued = 0;
-                    {
-                        std::lock_guard<std::mutex> lk(_mtx);
-                        remaining_queued = _jobs.size();
-                    }
-                    diag::log_tagged_fmt("mcp_srv",
-                        "mcp_executor_shutdown_join_timeout name=%s worker_index=%zu tid=%u elapsed_ms=%llu queued=%zu active=%u finished=%llu",
-                        _name.c_str(),
-                        i,
-                        tid,
-                        static_cast<unsigned long long>(mcp_now_ms() - begin),
-                        remaining_queued,
-                        static_cast<unsigned>(_active.load(std::memory_order_acquire)),
-                        static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)));
-                    worker.detach();
+                const std::uint64_t job_id = task->runtime_job_id.load(std::memory_order_acquire);
+                if (job_id == 0)
+                    continue;
+                const std::uint64_t now = mcp_now_ms();
+                if (now >= deadline)
+                    break;
+                const std::uint32_t wait_ms = static_cast<std::uint32_t>((std::min<std::uint64_t>)(deadline - now, 250ULL));
+                auto wait_result = aida::infra::taskflow_runtime::wait_for(aida::infra::taskflow_runtime::job_handle_t{job_id}, wait_ms);
+                if (wait_result.timed_out) {
+                    wait_timed_out = true;
+                    break;
                 }
             }
 
-            diag::log_tagged_fmt("mcp_srv",
-                "mcp_executor_shutdown_done name=%s elapsed_ms=%llu enqueued=%llu started=%llu finished=%llu rejected=%llu tls_failures=%llu",
-                _name.c_str(),
-                static_cast<unsigned long long>(mcp_now_ms() - begin),
-                static_cast<unsigned long long>(_enqueued.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(_started.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(_rejected.load(std::memory_order_acquire)),
-                static_cast<unsigned long long>(_tls_failures.load(std::memory_order_acquire)));
+            if (wait_timed_out || !executor_drained(state)) {
+                std::size_t remaining_queued = 0;
+                std::size_t remaining_outstanding = 0;
+                std::string live_summary;
+                {
+                    std::lock_guard<std::mutex> lk(state->mtx);
+                    remaining_queued = state->queued_tasks.size();
+                    remaining_outstanding = state->outstanding_tasks.size();
+                    live_summary = live_task_summary_locked(*state, 16);
+                }
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_shutdown_wait_timeout name=%s elapsed_ms=%llu queued=%zu active=%u outstanding=%zu finished=%llu skipped_current=%d wait_timed_out=%d live='%s'",
+                    state->name.c_str(),
+                    static_cast<unsigned long long>(mcp_now_ms() - begin),
+                    remaining_queued,
+                    static_cast<unsigned>(state->active.load(std::memory_order_acquire)),
+                    remaining_outstanding,
+                    static_cast<unsigned long long>(state->finished.load(std::memory_order_acquire)),
+                    skipped_current_task ? 1 : 0,
+                    wait_timed_out ? 1 : 0,
+                    live_summary.c_str());
+                log_shutdown_done(*state, begin);
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                state->queued_tasks.clear();
+                state->active_tasks.clear();
+                state->outstanding_tasks.clear();
+            }
+
+            log_shutdown_done(*state, begin);
         }
 
     private:
         struct task_t {
+            std::uint64_t seq = 0;
             std::function<void()> fn;
             std::shared_ptr<mcp_executor_task_meta_t> meta;
             mcp_pressure_record_t pressure;
             bool long_running = false;
+            std::atomic<std::uint64_t> runtime_job_id{0};
+            std::atomic<bool> queued_cancel_finalized{false};
         };
 
-        void start_workers()
-        {
-            std::lock_guard<std::mutex> lk(_mtx);
-            _workers.reserve(_worker_count);
-            _active_tasks.resize(_worker_count);
-            for (std::size_t i = 0; i < _worker_count; ++i) {
-                aida::infra::win_thread::joinable_thread_t worker;
-                std::string err;
-                const bool started = worker.start([this, i]() {
-                    worker_loop(i);
-                }, &err, aida::infra::win_thread::default_stack_reserve, _name.c_str());
-                if (started) {
-                    _workers.emplace_back(std::move(worker));
-                    continue;
-                }
-                _worker_failures.fetch_add(1u, std::memory_order_acq_rel);
-                diag::log_tagged_fmt("mcp_srv",
-                    "mcp_executor_worker_start_failed name=%s worker_index=%zu err='%s'",
-                    _name.c_str(),
-                    i,
-                    err.empty() ? "<none>" : err.c_str());
+        struct state_t {
+            const std::string name;
+            const std::size_t worker_count;
+            const std::size_t max_queued_requests;
+            std::deque<std::shared_ptr<task_t>> queued_tasks;
+            std::vector<std::shared_ptr<task_t>> active_tasks;
+            std::map<std::uint64_t, std::shared_ptr<task_t>> outstanding_tasks;
+            std::mutex mtx;
+            std::atomic<bool> shutdown{false};
+            std::atomic<std::uint32_t> active{0};
+            std::atomic<std::uint64_t> enqueued{0};
+            std::atomic<std::uint64_t> rejected{0};
+            std::atomic<std::uint64_t> started{0};
+            std::atomic<std::uint64_t> finished{0};
+            std::atomic<std::uint64_t> worker_failures{0};
+            std::atomic<std::uint64_t> tls_failures{0};
+            std::atomic<std::uint64_t> queued_long_running{0};
+            std::atomic<std::uint64_t> active_long_running{0};
+            std::atomic<std::size_t> worker_count_snapshot{0};
+
+            state_t(const char* name_in, std::size_t worker_count_in, std::size_t max_queued_requests_in)
+                : name(name_in && *name_in ? name_in : "mcp_executor")
+                , worker_count(worker_count_in)
+                , max_queued_requests(max_queued_requests_in)
+            {
             }
-            diag::log_tagged_fmt("mcp_srv",
-                "mcp_executor_workers_ready name=%s requested=%zu active_workers=%zu failures=%llu",
-                _name.c_str(),
-                _worker_count,
-                _workers.size(),
-                static_cast<unsigned long long>(_worker_failures.load(std::memory_order_acquire)));
+        };
+
+        static aida::infra::taskflow_runtime::executor_domain_t runtime_domain_for_executor_name(const std::string& name)
+        {
+            using domain_t = aida::infra::taskflow_runtime::executor_domain_t;
+            if (name.rfind("mcp_http", 0) == 0)
+                return domain_t::service;
+            if (name.rfind("mcp_jsonrpc_batch", 0) == 0 || name.rfind("mcp_tool", 0) == 0 || name.rfind("mcp_domain_", 0) == 0)
+                return domain_t::external_tool;
+            return domain_t::external_tool;
         }
 
-        void worker_loop(std::size_t worker_index)
+        void start_runtime_executor()
         {
-            bool thread_tls_ready = aida::manual_map_tls::ensure_current_thread();
-            if (!thread_tls_ready) {
-                _tls_failures.fetch_add(1u, std::memory_order_acq_rel);
+            auto state = _state;
+            if (!state)
+                return;
+            std::lock_guard<std::mutex> lk(state->mtx);
+            if (state->worker_count == 0) {
                 diag::log_tagged_fmt("mcp_srv",
-                    "mcp_executor_tls_unavailable name=%s phase=worker_start worker_index=%zu tid=%lu",
-                    _name.c_str(),
+                    "mcp_executor_workers_ready name=%s requested=%zu active_workers=%zu failures=%llu runtime=central_taskflow",
+                    state->name.c_str(),
+                    state->worker_count,
+                    static_cast<std::size_t>(0),
+                    static_cast<unsigned long long>(state->worker_failures.load(std::memory_order_acquire)));
+                return;
+            }
+            state->active_tasks.reserve(state->worker_count);
+            state->worker_count_snapshot.store(state->worker_count, std::memory_order_release);
+            diag::log_tagged_fmt("mcp_srv",
+                "mcp_executor_workers_ready name=%s requested=%zu active_workers=%zu failures=%llu runtime=central_taskflow",
+                state->name.c_str(),
+                state->worker_count,
+                state->worker_count_snapshot.load(std::memory_order_acquire),
+                static_cast<unsigned long long>(state->worker_failures.load(std::memory_order_acquire)));
+        }
+
+        static void decrement_counter_if_nonzero(std::atomic<std::uint64_t>& value)
+        {
+            std::uint64_t current = value.load(std::memory_order_acquire);
+            while (current != 0 &&
+                   !value.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            }
+        }
+
+        static bool remove_queued_task_locked(state_t& state, const std::shared_ptr<task_t>& task)
+        {
+            if (!task)
+                return false;
+            auto it = std::find_if(state.queued_tasks.begin(), state.queued_tasks.end(),
+                [&task](const std::shared_ptr<task_t>& item) {
+                    return item && item->seq == task->seq;
+                });
+            if (it == state.queued_tasks.end())
+                return false;
+            state.queued_tasks.erase(it);
+            if (task->long_running)
+                decrement_counter_if_nonzero(state.queued_long_running);
+            return true;
+        }
+
+        static void remove_active_task_locked(state_t& state, const std::shared_ptr<task_t>& task)
+        {
+            if (!task)
+                return;
+            state.active_tasks.erase(
+                std::remove_if(state.active_tasks.begin(), state.active_tasks.end(),
+                    [&task](const std::shared_ptr<task_t>& item) {
+                        return item && item->seq == task->seq;
+                    }),
+                state.active_tasks.end());
+        }
+
+        static void remove_outstanding_task_locked(state_t& state, const std::shared_ptr<task_t>& task)
+        {
+            if (task)
+                state.outstanding_tasks.erase(task->seq);
+        }
+
+        static void balance_rejected_pressure(const mcp_pressure_record_t& pressure_record)
+        {
+            record_pressure_start(pressure_record);
+            record_pressure_finish(pressure_record);
+        }
+
+        static void request_task_cancel(const std::shared_ptr<task_t>& task)
+        {
+            if (!task || !task->meta)
+                return;
+            std::shared_ptr<std::atomic<bool>> token;
+            {
+                std::lock_guard<std::mutex> meta_lk(task->meta->mtx);
+                token = task->meta->cancel_token;
+            }
+            if (token)
+                token->store(true, std::memory_order_release);
+        }
+
+        static bool cancel_queued_task(const std::shared_ptr<state_t>& state, const std::shared_ptr<task_t>& task, const char* reason)
+        {
+            if (!state || !task)
+                return false;
+            request_task_cancel(task);
+            bool removed = false;
+            std::size_t queued_after = 0;
+            {
+                std::lock_guard<std::mutex> lk(state->mtx);
+                removed = remove_queued_task_locked(*state, task);
+                if (removed)
+                    remove_outstanding_task_locked(*state, task);
+                queued_after = state->queued_tasks.size();
+            }
+            if (!removed)
+                return false;
+            if (!task->queued_cancel_finalized.exchange(true, std::memory_order_acq_rel)) {
+                task->fn = {};
+                state->finished.fetch_add(1u, std::memory_order_acq_rel);
+                balance_rejected_pressure(task->pressure);
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_queued_task_cancelled name=%s seq=%llu job_id=%llu reason=%s queued=%zu active=%u finished=%llu",
+                    state->name.c_str(),
+                    static_cast<unsigned long long>(task->seq),
+                    static_cast<unsigned long long>(task->runtime_job_id.load(std::memory_order_acquire)),
+                    reason ? reason : "cancelled",
+                    queued_after,
+                    static_cast<unsigned>(state->active.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(state->finished.load(std::memory_order_acquire)));
+            }
+            return true;
+        }
+
+        static bool executor_drained(const std::shared_ptr<state_t>& state)
+        {
+            if (!state)
+                return true;
+            std::lock_guard<std::mutex> lk(state->mtx);
+            return state->queued_tasks.empty() &&
+                   state->active.load(std::memory_order_acquire) == 0 &&
+                   state->outstanding_tasks.empty();
+        }
+
+        static std::string live_task_summary_locked(const state_t& state, std::size_t max_items)
+        {
+            std::string out;
+            std::size_t emitted = 0;
+            auto append_task = [&](const char* phase, const std::shared_ptr<task_t>& task) {
+                if (!task || emitted >= max_items || out.size() >= 900)
+                    return;
+                std::string tool;
+                std::string lane;
+                std::uint64_t queued_at = 0;
+                std::uint64_t active_at = 0;
+                DWORD tid = 0;
+                if (task->meta) {
+                    std::unique_lock<std::mutex> meta_lk(task->meta->mtx, std::try_to_lock);
+                    if (meta_lk.owns_lock()) {
+                        tool = task->meta->tool;
+                        lane = task->meta->lane;
+                        queued_at = task->meta->queued_at;
+                        active_at = task->meta->active_at;
+                        tid = task->meta->worker_tid;
+                    }
+                }
+                char item[360] = {};
+                const std::uint64_t now = mcp_now_ms();
+                _snprintf_s(item, sizeof(item), _TRUNCATE,
+                    "%s%s#%llu:job=%llu:tool=%s:lane=%s:queued_age=%llu:active_age=%llu:tid=%lu",
+                    out.empty() ? "" : ";",
+                    phase ? phase : "task",
+                    static_cast<unsigned long long>(task->seq),
+                    static_cast<unsigned long long>(task->runtime_job_id.load(std::memory_order_acquire)),
+                    tool.empty() ? "<none>" : tool.c_str(),
+                    lane.empty() ? "<none>" : lane.c_str(),
+                    static_cast<unsigned long long>(queued_at != 0 && now >= queued_at ? now - queued_at : 0),
+                    static_cast<unsigned long long>(active_at != 0 && now >= active_at ? now - active_at : 0),
+                    static_cast<unsigned long>(tid));
+                out += item;
+                ++emitted;
+            };
+            for (const auto& task : state.active_tasks)
+                append_task("active", task);
+            for (const auto& task : state.queued_tasks)
+                append_task("queued", task);
+            return out;
+        }
+
+        static void log_shutdown_done(state_t& state, std::uint64_t begin)
+        {
+            std::size_t queued = 0;
+            std::size_t active_entries = 0;
+            std::size_t outstanding = 0;
+            {
+                std::lock_guard<std::mutex> lk(state.mtx);
+                queued = state.queued_tasks.size();
+                active_entries = state.active_tasks.size();
+                outstanding = state.outstanding_tasks.size();
+            }
+            diag::log_tagged_fmt("mcp_srv",
+                "mcp_executor_shutdown_done name=%s elapsed_ms=%llu queued=%zu active_entries=%zu outstanding=%zu enqueued=%llu started=%llu finished=%llu rejected=%llu tls_failures=%llu",
+                state.name.c_str(),
+                static_cast<unsigned long long>(mcp_now_ms() - begin),
+                queued,
+                active_entries,
+                outstanding,
+                static_cast<unsigned long long>(state.enqueued.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.started.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.finished.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.rejected.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(state.tls_failures.load(std::memory_order_acquire)));
+        }
+
+        static bool begin_task_execution(const std::shared_ptr<state_t>& state,
+                                         const std::shared_ptr<task_t>& task,
+                                         std::size_t& active_slot,
+                                         std::size_t& queued_after_pop)
+        {
+            if (!state || !task)
+                return false;
+            std::lock_guard<std::mutex> lk(state->mtx);
+            if (task->queued_cancel_finalized.load(std::memory_order_acquire))
+                return false;
+            const bool removed = remove_queued_task_locked(*state, task);
+            queued_after_pop = state->queued_tasks.size();
+            if (!removed) {
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_start_missing_queued_record name=%s seq=%llu job_id=%llu queued=%zu active=%u",
+                    state->name.c_str(),
+                    static_cast<unsigned long long>(task->seq),
+                    static_cast<unsigned long long>(task->runtime_job_id.load(std::memory_order_acquire)),
+                    state->queued_tasks.size(),
+                    static_cast<unsigned>(state->active.load(std::memory_order_acquire)));
+            }
+            state->active_tasks.push_back(task);
+            active_slot = state->active_tasks.size() - 1u;
+            return true;
+        }
+
+        static void execute_task(std::shared_ptr<state_t> state,
+                                 std::shared_ptr<task_t> task,
+                                 const aida::infra::taskflow_runtime::cancellation_token_t& runtime_token)
+        {
+            if (!state || !task)
+                return;
+            if (!task->meta)
+                task->meta = make_executor_task_meta();
+
+            if (runtime_token.requested.load(std::memory_order_acquire) || task->queued_cancel_finalized.load(std::memory_order_acquire)) {
+                if (cancel_queued_task(state, task, "cancelled_before_start"))
+                    return;
+                if (task->queued_cancel_finalized.load(std::memory_order_acquire))
+                    return;
+            }
+
+            std::size_t worker_index = (std::numeric_limits<std::size_t>::max)();
+            std::size_t queued_after_pop = 0;
+            if (!begin_task_execution(state, task, worker_index, queued_after_pop))
+                return;
+            state->active.fetch_add(1u, std::memory_order_acq_rel);
+            if (task->long_running)
+                state->active_long_running.fetch_add(1u, std::memory_order_acq_rel);
+            record_pressure_start(task->pressure);
+            state->started.fetch_add(1u, std::memory_order_acq_rel);
+
+            struct finish_guard_t {
+                std::shared_ptr<state_t> state;
+                std::shared_ptr<task_t> task;
+                std::size_t worker_index = (std::numeric_limits<std::size_t>::max)();
+                mcp_executor_task_meta_t* previous_tls = nullptr;
+                ~finish_guard_t()
+                {
+                    tls_executor_task_meta = previous_tls;
+                    if (!state)
+                        return;
+                    {
+                        std::lock_guard<std::mutex> lk(state->mtx);
+                        remove_active_task_locked(*state, task);
+                        remove_outstanding_task_locked(*state, task);
+                    }
+                    state->finished.fetch_add(1u, std::memory_order_acq_rel);
+                    if (task)
+                        record_pressure_finish(task->pressure);
+                    if (task && task->long_running)
+                        decrement_counter_if_nonzero(state->active_long_running);
+                    if (task)
+                        task->fn = {};
+                    state->active.fetch_sub(1u, std::memory_order_acq_rel);
+                }
+            } finish_guard{state, task, worker_index, tls_executor_task_meta};
+
+            const std::uint64_t now = mcp_now_ms();
+            std::uint64_t wait_ms = 0;
+            std::string method;
+            std::string tool;
+            std::string lane;
+            bool meta_cancelled = false;
+            {
+                std::lock_guard<std::mutex> meta_lk(task->meta->mtx);
+                wait_ms = task->meta->queued_at != 0 && now >= task->meta->queued_at ? now - task->meta->queued_at : 0;
+                task->meta->queue_wait_ms = wait_ms;
+                task->meta->active_at = now;
+                task->meta->worker_tid = GetCurrentThreadId();
+                method = task->meta->method;
+                tool = task->meta->tool;
+                lane = task->meta->lane;
+                meta_cancelled = task->meta->cancel_token && task->meta->cancel_token->load(std::memory_order_acquire);
+            }
+            if (wait_ms > 100) {
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_dispatch_delay name=%s runtime_slot=%zu seq=%llu job_id=%llu wait_ms=%llu queued=%zu active=%u method='%s' tool='%s' lane='%s'",
+                    state->name.c_str(),
                     worker_index,
+                    static_cast<unsigned long long>(task->seq),
+                    static_cast<unsigned long long>(task->runtime_job_id.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(wait_ms),
+                    queued_after_pop,
+                    static_cast<unsigned>(state->active.load(std::memory_order_acquire)),
+                    method.c_str(),
+                    tool.c_str(),
+                    lane.c_str());
+            }
+
+            const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
+            if (!task_tls_ready) {
+                state->tls_failures.fetch_add(1u, std::memory_order_acq_rel);
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_tls_unavailable name=%s phase=task_start runtime_slot=%zu seq=%llu tid=%lu",
+                    state->name.c_str(),
+                    worker_index,
+                    static_cast<unsigned long long>(task->seq),
                     static_cast<unsigned long>(GetCurrentThreadId()));
             }
 
-            for (;;) {
-                task_t task;
-                std::size_t queued_after_pop = 0;
-                {
-                    std::unique_lock<std::mutex> lk(_mtx);
-                    _cv.wait(lk, [this]() {
-                        return _shutdown.load(std::memory_order_acquire) || !_jobs.empty();
-                    });
-                    if (_shutdown.load(std::memory_order_acquire) && _jobs.empty())
-                        break;
-                    task = std::move(_jobs.front());
-                    _jobs.pop_front();
-                    if (task.long_running)
-                        _queued_long_running.fetch_sub(1u, std::memory_order_acq_rel);
-                    queued_after_pop = _jobs.size();
-                }
-
-                if (!task.meta)
-                    task.meta = make_executor_task_meta();
-                _active.fetch_add(1u, std::memory_order_acq_rel);
-                if (task.long_running)
-                    _active_long_running.fetch_add(1u, std::memory_order_acq_rel);
-                record_pressure_start(task.pressure);
-                _started.fetch_add(1u, std::memory_order_acq_rel);
-                const std::uint64_t now = mcp_now_ms();
-                std::uint64_t wait_ms = 0;
-                std::uint64_t seq = 0;
-                std::string method;
-                std::string tool;
-                std::string lane;
-                {
-                    std::lock_guard<std::mutex> meta_lk(task.meta->mtx);
-                    wait_ms = task.meta->queued_at != 0 && now >= task.meta->queued_at ? now - task.meta->queued_at : 0;
-                    task.meta->queue_wait_ms = wait_ms;
-                    task.meta->active_at = now;
-                    task.meta->worker_tid = GetCurrentThreadId();
-                    seq = task.meta->executor_seq;
-                    method = task.meta->method;
-                    tool = task.meta->tool;
-                    lane = task.meta->lane;
-                }
-                {
-                    std::lock_guard<std::mutex> lk(_mtx);
-                    if (worker_index < _active_tasks.size())
-                        _active_tasks[worker_index] = task.meta;
-                }
-                if (wait_ms > 100) {
-                    diag::log_tagged_fmt("mcp_srv",
-                        "mcp_executor_dispatch_delay name=%s worker_index=%zu seq=%llu wait_ms=%llu queued=%zu active=%u method='%s' tool='%s' lane='%s'",
-                        _name.c_str(),
-                        worker_index,
-                        static_cast<unsigned long long>(seq),
-                        static_cast<unsigned long long>(wait_ms),
-                        queued_after_pop,
-                        static_cast<unsigned>(_active.load(std::memory_order_acquire)),
-                        method.c_str(),
-                        tool.c_str(),
-                        lane.c_str());
-                }
-
-                const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
-                if (!task_tls_ready) {
-                    _tls_failures.fetch_add(1u, std::memory_order_acq_rel);
-                    diag::log_tagged_fmt("mcp_srv",
-                        "mcp_executor_tls_unavailable name=%s phase=task_start worker_index=%zu seq=%llu tid=%lu",
-                        _name.c_str(),
-                        worker_index,
-                        static_cast<unsigned long long>(seq),
-                        static_cast<unsigned long>(GetCurrentThreadId()));
-                }
-
-                tls_executor_task_meta = task.meta.get();
-                DWORD task_seh = 0;
+            tls_executor_task_meta = task->meta.get();
+            DWORD task_seh = 0;
+            if (runtime_token.requested.load(std::memory_order_acquire) || meta_cancelled) {
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_task_cancelled_before_invoke name=%s runtime_slot=%zu seq=%llu job_id=%llu method='%s' tool='%s' lane='%s'",
+                    state->name.c_str(),
+                    worker_index,
+                    static_cast<unsigned long long>(task->seq),
+                    static_cast<unsigned long long>(task->runtime_job_id.load(std::memory_order_acquire)),
+                    method.c_str(),
+                    tool.c_str(),
+                    lane.c_str());
+            } else {
                 try {
-                    task_seh = aida::infra::win_thread::run_function_seh_guarded(task.fn);
+                    task_seh = aida::infra::win_thread::run_function_seh_guarded(task->fn);
                 } catch (const std::exception& ex) {
                     diag::log_tagged_fmt("mcp_srv",
-                        "mcp_executor_task_exception name=%s worker_index=%zu seq=%llu err='%s'",
-                        _name.c_str(),
+                        "mcp_executor_task_exception name=%s runtime_slot=%zu seq=%llu err='%s'",
+                        state->name.c_str(),
                         worker_index,
-                        static_cast<unsigned long long>(seq),
+                        static_cast<unsigned long long>(task->seq),
                         ex.what());
                 } catch (...) {
                     diag::log_tagged_fmt("mcp_srv",
-                        "mcp_executor_task_exception name=%s worker_index=%zu seq=%llu err='<unknown>'",
-                        _name.c_str(),
+                        "mcp_executor_task_exception name=%s runtime_slot=%zu seq=%llu err='<unknown>'",
+                        state->name.c_str(),
                         worker_index,
-                        static_cast<unsigned long long>(seq));
+                        static_cast<unsigned long long>(task->seq));
                 }
-                if (task_seh != 0) {
-                    const std::uint64_t task_now = mcp_now_ms();
-                    std::uint64_t active_age_ms = 0;
-                    std::uint64_t deadline_snapshot = 0;
-                    {
-                        std::lock_guard<std::mutex> meta_lk(task.meta->mtx);
-                        active_age_ms = task.meta->active_at != 0 && task_now >= task.meta->active_at ? task_now - task.meta->active_at : 0;
-                        deadline_snapshot = task.meta->deadline_ms;
-                        method = task.meta->method;
-                        tool = task.meta->tool;
-                        lane = task.meta->lane;
-                    }
-                    diag::log_tagged_fmt("mcp_srv",
-                        "mcp_executor_task_seh name=%s worker_index=%zu seq=%llu tid=%lu code=0x%08lX active_age_ms=%llu queued_after_pop=%zu active=%u started=%llu finished=%llu method='%s' tool='%s' lane='%s' deadline_ms=%llu shutdown=%d",
-                        _name.c_str(),
-                        worker_index,
-                        static_cast<unsigned long long>(seq),
-                        static_cast<unsigned long>(GetCurrentThreadId()),
-                        static_cast<unsigned long>(task_seh),
-                        static_cast<unsigned long long>(active_age_ms),
-                        queued_after_pop,
-                        static_cast<unsigned>(_active.load(std::memory_order_acquire)),
-                        static_cast<unsigned long long>(_started.load(std::memory_order_acquire)),
-                        static_cast<unsigned long long>(_finished.load(std::memory_order_acquire)),
-                        method.c_str(),
-                        tool.c_str(),
-                        lane.c_str(),
-                        static_cast<unsigned long long>(deadline_snapshot),
-                        _shutdown.load(std::memory_order_acquire) ? 1 : 0);
-                }
-                tls_executor_task_meta = nullptr;
+            }
+            if (task_seh != 0) {
+                const std::uint64_t task_now = mcp_now_ms();
+                std::uint64_t active_age_ms = 0;
+                std::uint64_t deadline_snapshot = 0;
                 {
-                    std::lock_guard<std::mutex> lk(_mtx);
-                    if (worker_index < _active_tasks.size())
-                        _active_tasks[worker_index].reset();
+                    std::lock_guard<std::mutex> meta_lk(task->meta->mtx);
+                    active_age_ms = task->meta->active_at != 0 && task_now >= task->meta->active_at ? task_now - task->meta->active_at : 0;
+                    deadline_snapshot = task->meta->deadline_ms;
+                    method = task->meta->method;
+                    tool = task->meta->tool;
+                    lane = task->meta->lane;
                 }
-                _finished.fetch_add(1u, std::memory_order_acq_rel);
-                record_pressure_finish(task.pressure);
-                if (task.long_running)
-                    _active_long_running.fetch_sub(1u, std::memory_order_acq_rel);
-                _active.fetch_sub(1u, std::memory_order_acq_rel);
+                diag::log_tagged_fmt("mcp_srv",
+                    "mcp_executor_task_seh name=%s runtime_slot=%zu seq=%llu tid=%lu code=0x%08lX active_age_ms=%llu queued_after_pop=%zu active=%u started=%llu finished=%llu method='%s' tool='%s' lane='%s' deadline_ms=%llu shutdown=%d",
+                    state->name.c_str(),
+                    worker_index,
+                    static_cast<unsigned long long>(task->seq),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long>(task_seh),
+                    static_cast<unsigned long long>(active_age_ms),
+                    queued_after_pop,
+                    static_cast<unsigned>(state->active.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(state->started.load(std::memory_order_acquire)),
+                    static_cast<unsigned long long>(state->finished.load(std::memory_order_acquire)),
+                    method.c_str(),
+                    tool.c_str(),
+                    lane.c_str(),
+                    static_cast<unsigned long long>(deadline_snapshot),
+                    state->shutdown.load(std::memory_order_acquire) ? 1 : 0);
             }
         }
 
-        const std::string _name;
-        const std::size_t _worker_count;
-        const std::size_t _max_queued_requests;
-        std::vector<aida::infra::win_thread::joinable_thread_t> _workers;
-        std::deque<task_t> _jobs;
-        std::vector<std::shared_ptr<mcp_executor_task_meta_t>> _active_tasks;
-        std::mutex _mtx;
-        std::condition_variable _cv;
-        std::atomic<bool> _shutdown{false};
-        std::atomic<std::uint32_t> _active{0};
-        std::atomic<std::uint64_t> _enqueued{0};
-        std::atomic<std::uint64_t> _rejected{0};
-        std::atomic<std::uint64_t> _started{0};
-        std::atomic<std::uint64_t> _finished{0};
-        std::atomic<std::uint64_t> _worker_failures{0};
-        std::atomic<std::uint64_t> _tls_failures{0};
-        std::atomic<std::uint64_t> _queued_long_running{0};
-        std::atomic<std::uint64_t> _active_long_running{0};
+        std::shared_ptr<state_t> _state;
     };
 
     static json mcp_executor_health_snapshot(mcp_capacity_snapshot_state_t* capacity = nullptr)
@@ -5100,12 +5570,12 @@ bounded_diag_snapshot_t bounded_diagnostic_snapshot() noexcept
 
     try {
         const auto exec_snap = aida::infra::executor::active_snapshot();
-        const auto wq = work_queue::stats();
-        const auto sq = work_queue::service_stats();
-        const auto cq = critical_work_queue::stats();
+        const auto general = runtime_queue_stats(runtime_queue_family_t::general);
+        const auto service = runtime_queue_stats(runtime_queue_family_t::service);
+        const auto critical = runtime_queue_stats(runtime_queue_family_t::critical);
         _snprintf_s(snap.capacity_snapshot, sizeof(snap.capacity_snapshot), _TRUNCATE,
             "exec{total_active=%u wq=%u svc=%u crit=%u wq_pending=%llu svc_pending=%llu crit_pending=%llu oldest_ms=%llu labels=%.360s} "
-            "queues{wq_alive=%d wq_active=%u wq_pending=%zu svc_alive=%d svc_active=%u svc_pending=%zu crit_alive=%d crit_active=%u crit_pending=%zu}",
+            "runtime{general_alive=%d general_active=%u general_pending=%zu service_alive=%d service_active=%u service_pending=%zu critical_alive=%d critical_active=%u critical_pending=%zu}",
             static_cast<unsigned>(exec_snap.total_active),
             static_cast<unsigned>(exec_snap.work_queue_active),
             static_cast<unsigned>(exec_snap.service_queue_active),
@@ -5115,9 +5585,9 @@ bounded_diag_snapshot_t bounded_diagnostic_snapshot() noexcept
             static_cast<unsigned long long>(exec_snap.critical_queue_pending),
             static_cast<unsigned long long>(exec_snap.oldest_active_ms),
             exec_snap.labels_under_pressure.empty() ? "<none>" : exec_snap.labels_under_pressure.c_str(),
-            wq.alive ? 1 : 0, static_cast<unsigned>(wq.active), wq.pending,
-            sq.alive ? 1 : 0, static_cast<unsigned>(sq.active), sq.pending,
-            cq.alive ? 1 : 0, static_cast<unsigned>(cq.active), cq.pending);
+            general.alive ? 1 : 0, static_cast<unsigned>(general.active), general.pending,
+            service.alive ? 1 : 0, static_cast<unsigned>(service.active), service.pending,
+            critical.alive ? 1 : 0, static_cast<unsigned>(critical.active), critical.pending);
     } catch (...) {
         _snprintf_s(snap.capacity_snapshot, sizeof(snap.capacity_snapshot), _TRUNCATE,
             "exec{snapshot_exception=1}");
@@ -8754,15 +9224,13 @@ static capacity_diag::pressure_snapshot_t capacity_pressure_snapshot(const capac
     pressure.background_command_sessions_reader_active = command_stats.reader_active;
     pressure.background_command_sessions_timed_out = command_stats.timed_out;
     pressure.background_command_oldest_running_ms = command_stats.oldest_running_ms;
-    const auto general = work_queue::stats();
-    const auto service = work_queue::service_stats();
-    const auto critical = critical_work_queue::stats();
-    pressure.downstream_general_pending = general.pending;
-    pressure.downstream_general_active = static_cast<std::size_t>(general.active);
-    pressure.downstream_service_pending = service.pending;
-    pressure.downstream_service_active = static_cast<std::size_t>(service.active);
-    pressure.downstream_critical_pending = critical.pending;
-    pressure.downstream_critical_active = static_cast<std::size_t>(critical.active);
+    const auto executor_snapshot = aida::infra::executor::active_snapshot();
+    pressure.downstream_general_pending = static_cast<std::size_t>(executor_snapshot.work_queue_pending);
+    pressure.downstream_general_active = static_cast<std::size_t>(executor_snapshot.work_queue_active);
+    pressure.downstream_service_pending = static_cast<std::size_t>(executor_snapshot.service_queue_pending);
+    pressure.downstream_service_active = static_cast<std::size_t>(executor_snapshot.service_queue_active);
+    pressure.downstream_critical_pending = static_cast<std::size_t>(executor_snapshot.critical_queue_pending);
+    pressure.downstream_critical_active = static_cast<std::size_t>(executor_snapshot.critical_queue_active);
     return pressure;
 }
 
@@ -8893,9 +9361,9 @@ static void log_capacity_snapshot_events(const char* phase, const capacity_diag:
     bool executor_registry_busy = false;
     const mcp_executor_counts_t executor_counts = snapshot_mcp_executor_counts(&executor_count, &executor_registry_busy);
     const auto command_stats = command_sessions::stats();
-    const auto general = work_queue::stats();
-    const auto service = work_queue::service_stats();
-    const auto critical = critical_work_queue::stats();
+    const auto general = runtime_queue_stats(runtime_queue_family_t::general);
+    const auto service = runtime_queue_stats(runtime_queue_family_t::service);
+    const auto critical = runtime_queue_stats(runtime_queue_family_t::critical);
     const mcp_pressure_snapshot_t pressure_registry = mcp_pressure_snapshot();
     char owner_snapshot[900] = {};
     format_active_session_owner_diagnostic_snapshot(owner_snapshot, sizeof(owner_snapshot));
@@ -11096,9 +11564,9 @@ static json capacity_health_snapshot(const std::string& principal_id,
     log_capacity_snapshot_events("health_capacity_snapshot", prediction);
     const std::uint64_t now = executor_capacity.timestamp_ms != 0 ? executor_capacity.timestamp_ms : mcp_now_ms();
     const auto command_stats = command_sessions::stats();
-    const auto general = work_queue::stats();
-    const auto service = work_queue::service_stats();
-    const auto critical = critical_work_queue::stats();
+    const auto general = runtime_queue_stats(runtime_queue_family_t::general);
+    const auto service = runtime_queue_stats(runtime_queue_family_t::service);
+    const auto critical = runtime_queue_stats(runtime_queue_family_t::critical);
     const mcp_pressure_snapshot_t pressure_registry = mcp_pressure_snapshot();
     const json activity = capacity_diag::activity_snapshot_json(now);
     const bool downstream_pressure =
@@ -14714,7 +15182,7 @@ bool server_t::start(int port)
 
     if (!_server_done.load(std::memory_order_acquire)) {
         diag::log_tagged_fmt("mcp_srv", "start rejected server worker already starting port=%d", port);
-        log_work_queue_stats("start rejected");
+        log_runtime_executor_stats("start rejected");
         return false;
     }
 
@@ -14730,7 +15198,7 @@ bool server_t::start(int port)
         const DWORD tid = GetCurrentThreadId();
         _server_worker_tid.store(static_cast<std::uint32_t>(tid), std::memory_order_release);
         diag::log_tagged_fmt("mcp_srv", "server_worker starting port=%d tid=%lu", port, static_cast<unsigned long>(tid));
-        log_work_queue_stats("server_worker entry");
+        log_runtime_executor_stats("server_worker entry");
         if (_stop_requested.load(std::memory_order_acquire)) {
             diag::log_tagged_fmt("mcp_srv", "server_worker cancelled before listen port=%d tid=%lu", port, static_cast<unsigned long>(tid));
             _server_worker_tid.store(0, std::memory_order_release);
@@ -14752,12 +15220,19 @@ bool server_t::start(int port)
     };
     auto post_service_worker = [&](const char* source) -> bool {
         worker_lifetime->queued_worker.store(true, std::memory_order_release);
-        const bool posted = work_queue::post_service(worker_body);
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "mcp_server";
+        sub.label = "mcp_server.worker";
+        sub.thread_class = "service_loop";
+        sub.domain = aida::infra::executor::domain_t::service;
+        sub.priority = 4;
+        sub.body = worker_body;
+        const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
         if (posted) {
             diag::log_tagged_fmt("mcp_srv", "start server worker service queue posted port=%d source=%s", port, source ? source : "unknown");
         } else {
             diag::log_tagged_fmt("mcp_srv", "start server worker service queue failed port=%d source=%s", port, source ? source : "unknown");
-            log_work_queue_stats("start service_queue_fallback_failed");
+            log_runtime_executor_stats("start service_queue_fallback_failed");
         }
         return posted;
     };
@@ -14766,7 +15241,7 @@ bool server_t::start(int port)
     bool started = worker_lifetime->thread.start(worker_body, &worker_err, aida::infra::win_thread::default_stack_reserve, "mcp_server_worker");
     if (!started) {
         diag::log_tagged_fmt("mcp_srv", "start server worker native start failed err='%s'", worker_err.empty() ? "<none>" : worker_err.c_str());
-        log_work_queue_stats("start native_worker_failed");
+        log_runtime_executor_stats("start native_worker_failed");
         started = post_service_worker("native_fallback");
     }
     if (!started) {
@@ -14830,7 +15305,7 @@ void server_t::stop()
                     static_cast<unsigned long long>(elapsed),
                     static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
                     _running.load(std::memory_order_acquire) ? 1 : 0);
-                log_work_queue_stats("stop waiting_no_worker");
+                log_runtime_executor_stats("stop waiting_no_worker");
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -14852,7 +15327,7 @@ void server_t::stop()
                     static_cast<unsigned long long>(elapsed),
                     static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
                     _running.load(std::memory_order_acquire) ? 1 : 0);
-                log_work_queue_stats("stop queued_worker waiting");
+                log_runtime_executor_stats("stop queued_worker waiting");
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -14862,7 +15337,7 @@ void server_t::stop()
             diag::log_tagged_fmt("mcp_srv", "stop join timeout worker_tid=%u running=%d",
                 static_cast<unsigned>(_server_worker_tid.load(std::memory_order_acquire)),
                 _running.load(std::memory_order_acquire) ? 1 : 0);
-            log_work_queue_stats("stop join timeout");
+            log_runtime_executor_stats("stop join timeout");
             worker_lifetime->thread.join();
         }
         erase_server_worker_lifetime(this, worker_lifetime);
@@ -15577,7 +16052,7 @@ void server_t::server_thread_func(int port)
                 char general_buf[1024] = {};
                 char service_buf[1024] = {};
                 char critical_buf[1024] = {};
-                const auto wq_stats = work_queue::stats();
+                const auto wq_stats = runtime_queue_stats(runtime_queue_family_t::general);
                 _snprintf_s(general_buf, sizeof(general_buf), _TRUNCATE,
                     "alive=%d active=%u pending=%zu started=%llu finished=%llu rejected=%llu oldest_ms=%llu",
                     wq_stats.alive ? 1 : 0, wq_stats.active, wq_stats.pending,
@@ -15585,7 +16060,7 @@ void server_t::server_thread_func(int port)
                     static_cast<unsigned long long>(wq_stats.finished),
                     static_cast<unsigned long long>(wq_stats.rejected),
                     static_cast<unsigned long long>(wq_stats.oldest_active_ms));
-                const auto svc_stats = work_queue::service_stats();
+                const auto svc_stats = runtime_queue_stats(runtime_queue_family_t::service);
                 _snprintf_s(service_buf, sizeof(service_buf), _TRUNCATE,
                     "alive=%d active=%u pending=%zu started=%llu finished=%llu rejected=%llu oldest_ms=%llu",
                     svc_stats.alive ? 1 : 0, svc_stats.active, svc_stats.pending,
@@ -15593,7 +16068,7 @@ void server_t::server_thread_func(int port)
                     static_cast<unsigned long long>(svc_stats.finished),
                     static_cast<unsigned long long>(svc_stats.rejected),
                     static_cast<unsigned long long>(svc_stats.oldest_active_ms));
-                const auto crit_stats = critical_work_queue::stats();
+                const auto crit_stats = runtime_queue_stats(runtime_queue_family_t::critical);
                 _snprintf_s(critical_buf, sizeof(critical_buf), _TRUNCATE,
                     "alive=%d active=%u pending=%zu started=%llu finished=%llu rejected=%llu oldest_ms=%llu",
                     crit_stats.alive ? 1 : 0, crit_stats.active, crit_stats.pending,

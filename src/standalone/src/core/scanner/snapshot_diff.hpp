@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -27,6 +26,7 @@
 #include "../helpers/helpers.h"
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
+#include "../infra/executor.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -346,7 +346,14 @@ inline void take_snapshot(const std::string& name = "")
 	diag::log_tagged_fmt("snapshot_diff", "take_snapshot start name='%s' pid=%u",
 		snap_name.c_str(), driver_bridge::attached_pid());
 
-	work_queue::post([snap_name]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.snapshot_take";
+	sub.thread_class = "scanner_snapshot";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = [snap_name]() {
 		auto t_start = std::chrono::steady_clock::now();
 		snapshot_t snap;
 		snap.id = g_state.next_snap_id.fetch_add(1);
@@ -416,7 +423,13 @@ inline void take_snapshot(const std::string& name = "")
 
 		g_state.progress.store(1.f);
 		g_state.capturing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("snapshot_diff", "take_snapshot worker_queue_rejected");
+		g_state.last_error = "take_snapshot: worker queue rejected the task";
+		g_state.progress.store(1.f);
+		g_state.capturing.store(false);
+	}
 }
 
 inline void load_from_disk(const std::string& path)
@@ -443,7 +456,13 @@ inline void load_from_disk(const std::string& path)
 	diag::log_tagged_fmt("snapshot_diff", "load_from_disk start path='%s'", path.c_str());
 
 	std::string path_copy = path;
-	work_queue::post([path_copy, fallback_name]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.snapshot_load";
+	sub.thread_class = "scanner_snapshot";
+	sub.domain = aida::infra::executor::domain_t::feature_worker;
+	sub.priority = 3;
+	sub.body = [path_copy, fallback_name]() {
 		auto t_start = std::chrono::steady_clock::now();
 		snapshot_t snap;
 		if (!detail::load_snapshot(path_copy, snap)) {
@@ -484,7 +503,13 @@ inline void load_from_disk(const std::string& path)
 
 		g_state.progress.store(1.f);
 		g_state.loading.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		diag::log_tagged("snapshot_diff", "load_from_disk worker_queue_rejected");
+		g_state.last_error = "load_from_disk: worker queue rejected the task";
+		g_state.progress.store(1.f);
+		g_state.loading.store(false);
+	}
 }
 
 inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
@@ -510,7 +535,14 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 	g_state.compare_cursor_active = true;
 	g_state.compare_cursor_t = 0.f;
 
-	if (!work_queue::post([id_a, id_b]() {
+	aida::infra::executor::submission_t sub;
+	sub.owner_subsystem = "scanner";
+	sub.label = "scanner.snapshot_compare";
+	sub.thread_class = "scanner_snapshot_compare";
+	sub.domain = aida::infra::executor::domain_t::long_running;
+	sub.priority = 2;
+	sub.target_pid = driver_bridge::attached_pid();
+	sub.body = [id_a, id_b]() {
 		try {
 		auto t_start = std::chrono::steady_clock::now();
 		diff_result_t result;
@@ -634,7 +666,8 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 			g_state.comparing.store(false);
 			g_state.compare_cursor_active = false;
 		}
-	})) {
+	};
+	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 		diag::log_tagged("snapshot_diff", "compare_snapshots worker_queue_rejected");
 		g_state.last_error = "compare_snapshots: worker queue rejected the task";
 		g_state.progress.store(1.f);
@@ -911,9 +944,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					path_buf, sizeof(path_buf),
 					"snapshot_diff::load")) {
 				std::string picked(path_buf);
-				work_queue::post([picked]() {
-					load_from_disk(picked);
-				});
+				load_from_disk(picked);
 			}
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;

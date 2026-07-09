@@ -20,7 +20,7 @@
 #include "../disasm/comment_store.hpp"
 #include "../disasm/rename_store.hpp"
 #include "../editor/expression_eval.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Windows.h>
@@ -3525,7 +3525,7 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
         if (source_reconstructor::is_running()) {
             float progress = source_reconstructor::get_progress();
             std::string status = source_reconstructor::get_status();
-            auto stats = work_queue::stats();
+            auto stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
             log_msg(hf, "srcrecon_lr", "FAIL -- previous reconstruction still running progress=%.2f status=\"%s\" queue_alive=%d queue_pending=%zu queue_active=%u elapsed=%lld ms",
                 progress, status.c_str(), stats.alive ? 1 : 0, stats.pending, stats.active, (long long)ms);
@@ -3588,7 +3588,7 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
     while (source_reconstructor::is_running()) {
         ULONGLONG now = GetTickCount64();
         if (now >= next_log) {
-            auto stats = work_queue::stats();
+            auto stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
             log_msg(hf, "srcrecon_lr", "WAIT -- elapsed_ms=%llu progress=%.2f stage=%d status=\"%s\" queue_pending=%zu queue_active=%u",
                 static_cast<unsigned long long>(now - run_start),
                 source_reconstructor::get_progress(),
@@ -3618,9 +3618,9 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
             std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
             result = source_reconstructor::g_state.last_result;
         }
-        auto stats = work_queue::stats();
-        auto svc_stats = work_queue::service_stats();
-        auto critical_stats = critical_work_queue::stats();
+        auto stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+        auto svc_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+        auto critical_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
         ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction timeout cancel_wait_ms=%llu running=%d progress=%.2f stage=%d status=\"%s\" success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu preload_read=%zu work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu elapsed=%lld ms",
             static_cast<unsigned long long>(cancel_elapsed),

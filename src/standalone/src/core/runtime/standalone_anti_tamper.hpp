@@ -1,7 +1,7 @@
 #pragma once
 
 #include <windows.h>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <bcrypt.h>
@@ -744,7 +744,13 @@ inline void start_monitors()
     bool posted = false;
     try
     {
-        posted = work_queue::post_service_labeled("anti_tamper.monitor_loop", []() {
+        aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "runtime_anti_tamper";
+        sub.label = "anti_tamper.monitor_loop";
+        sub.thread_class = "security_loop";
+        sub.domain = aida::infra::executor::domain_t::security_liveness;
+        sub.priority = 0;
+        sub.body = []() {
             Sleep(5000);
 
             auto& rt = state::get();
@@ -753,7 +759,8 @@ inline void start_monitors()
                 run_verification_cycle();
                 Sleep(3000);
             }
-        });
+        };
+        posted = aida::infra::executor::submit(std::move(sub)).submitted;
     }
     catch (const std::exception& ex)
     {

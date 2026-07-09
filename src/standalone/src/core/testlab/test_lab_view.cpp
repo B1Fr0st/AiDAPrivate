@@ -6,7 +6,7 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/ui_anim.hpp"
 #include "../ui/empty_state.hpp"
@@ -874,7 +874,14 @@ namespace test_lab_view {
 
 			bool posted = false;
 			try {
-				posted = critical_work_queue::post([]() {
+				aida::infra::executor::submission_t submission;
+				submission.owner_subsystem = "test_lab_view";
+				submission.label = "test_lab_view.run_all_safe";
+				submission.thread_class = "testlab_view_run_all";
+				submission.domain = aida::infra::executor::domain_t::long_running;
+				submission.priority = 2;
+				submission.failure_policy = "reject_not_started";
+				submission.body = []() {
 				full_test_scope_t full_test_scope("test_lab_view_run_all");
 				const auto& features = test_lab::all_features();
 				g_run_all_total.store(static_cast<int>(features.size()));
@@ -973,24 +980,25 @@ namespace test_lab_view {
 					g_run_all_current_name.clear();
 				}
 				g_run_all_active.store(false);
-				});
+				};
+				posted = aida::infra::executor::submit(std::move(submission)).submitted;
 			} catch (const std::exception& ex) {
-				diag::log_tagged_fmt("test_lab", "run_all_safe critical_queue post exception: %s", ex.what());
+				diag::log_tagged_fmt("test_lab", "run_all_safe executor submit exception: %s", ex.what());
 			} catch (...) {
-				diag::log_tagged("test_lab", "run_all_safe critical_queue post unknown exception");
+				diag::log_tagged("test_lab", "run_all_safe executor submit unknown exception");
 			}
 			if (!posted) {
 				g_run_all_active.store(false, std::memory_order_release);
 				{
 					std::unique_lock<std::mutex> lk(g_run_all_status_mtx, std::try_to_lock);
 					if (lk.owns_lock()) {
-						g_run_all_status_line = "start failed: critical queue unavailable";
+						g_run_all_status_line = "start failed: executor unavailable";
 						g_run_all_current_name.clear();
 					} else {
 						log_render_lock_busy("start_run_all_safe_post_failed_status", "g_run_all_status_mtx");
 					}
 				}
-				diag::log_tagged("test_lab", "run_all_safe critical_queue post failed");
+				diag::log_tagged("test_lab", "run_all_safe executor submit failed");
 			}
 		}
 
@@ -1288,7 +1296,15 @@ namespace test_lab_view {
 			if (feature_idx >= 0)
 				update_feature_summary_start(static_cast<std::size_t>(feature_idx), 0);
 			test_lab::feature_t feature_copy = f;
-			if (!critical_work_queue::post([feature_copy, snapshot, new_result, feature_idx]() mutable {
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "test_lab_view";
+			submission.label = "test_lab_view.single_feature";
+			submission.thread_class = "testlab_feature";
+			submission.domain = aida::infra::executor::domain_t::feature_worker;
+			submission.priority = 2;
+			submission.diagnostic_id = feature_copy.name ? feature_copy.name : "unnamed";
+			submission.failure_policy = "reject_not_started";
+			submission.body = [feature_copy, snapshot, new_result, feature_idx]() mutable {
 				full_test_scope_t full_test_scope("test_lab_view_single_feature");
 				if (feature_copy.run == nullptr) {
 					new_result->ok = false;
@@ -1323,13 +1339,14 @@ namespace test_lab_view {
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
 				if (feature_idx >= 0)
 					update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
-			})) {
+			};
+			if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 				new_result->ok = false;
-				new_result->error = "critical queue unavailable";
+				new_result->error = "executor unavailable";
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
 				if (feature_idx >= 0)
 					update_feature_summary_result(static_cast<std::size_t>(feature_idx), *new_result, 0);
-				diag::log_tagged_fmt("test_lab", "single_feature critical_queue post failed name=%s",
+				diag::log_tagged_fmt("test_lab", "single_feature executor submit failed name=%s",
 					feature_copy.name ? feature_copy.name : "?");
 			}
 		}

@@ -1,6 +1,6 @@
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../../../../driver/comm.h"
 #include "imgui/imgui.h"
 
@@ -1329,7 +1329,15 @@ namespace {
 		auto stopped = std::make_shared<std::atomic<bool>>(false);
 		auto ok = std::make_shared<std::atomic<bool>>(false);
 		auto bytes = std::make_shared<std::atomic<std::uint32_t>>(0u);
-		const bool posted = critical_work_queue::post([stopped, ok, bytes]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "testlab_feature_verify";
+		sub.label = "testlab.dns.stop_capture";
+		sub.thread_class = "bounded_task";
+		sub.domain = aida::infra::executor::domain_t::critical;
+		sub.priority = 1;
+		sub.failure_policy = "reject_not_started";
+		sub.shutdown_policy = "drain";
+		sub.body = [stopped, ok, bytes]() {
 			voyager::detail::net_cap_ctrl_request stop_req{};
 			stop_req.operation = 1u;
 			std::uint32_t br = 0;
@@ -1339,10 +1347,11 @@ namespace {
 			bytes->store(br, std::memory_order_release);
 			ok->store(stop_ok, std::memory_order_release);
 			stopped->store(true, std::memory_order_release);
-		});
+		};
+		const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 		if (!posted) {
 			r.parsed.push_back({ "dns_capture_timeout_stop_ok", "0" });
-			r.parsed.push_back({ "dns_capture_timeout_stop_error", "critical_queue_post_failed" });
+			r.parsed.push_back({ "dns_capture_timeout_stop_error", "taskflow_executor_post_failed" });
 			return false;
 		}
 		const DWORD start = GetTickCount();
@@ -2144,7 +2153,15 @@ namespace {
 		const DWORD cancel_grace_ms = 3000;
 		auto ctx = std::make_shared<dns_log_ctx_t>();
 		dns_mark_stage(ctx, dns_log_stage_e::not_started);
-		const bool posted = critical_work_queue::post([ctx]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "testlab_feature_verify";
+		sub.label = "testlab.dns.verify_log";
+		sub.thread_class = "bounded_task";
+		sub.domain = aida::infra::executor::domain_t::critical;
+		sub.priority = 1;
+		sub.failure_policy = "reject_not_started";
+		sub.shutdown_policy = "drain";
+		sub.body = [ctx]() {
 			try {
 				dns_log_thread_proc(ctx);
 			} catch (const std::exception& e) {
@@ -2163,11 +2180,12 @@ namespace {
 				ctx->result.ntstatus = static_cast<std::int32_t>(0xC0000001u);
 			}
 			ctx->done.store(true, std::memory_order_release);
-		});
+		};
+		const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 		if (!posted) {
 			r.ok = false;
 			r.ntstatus = static_cast<std::int32_t>(0xC000009Au);
-			r.error = "DNS verifier critical_queue post failed";
+			r.error = "DNS verifier taskflow executor post failed";
 			return;
 		}
 

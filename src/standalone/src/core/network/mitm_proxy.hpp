@@ -202,7 +202,7 @@ struct state_t {
 
 
     std::atomic<uint32_t>         active_worker_count{0};
-    std::queue<work_item>         work_queue;
+    std::queue<work_item>         pending_work;
     std::mutex                    work_mutex;
     std::condition_variable       work_cv;
 

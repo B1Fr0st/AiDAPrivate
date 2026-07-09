@@ -12,7 +12,7 @@
 #include "../../ui/components.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -93,13 +94,22 @@ void render(float pos_x, float pos_y, float width, float height,
         ::diag::log_tagged_fmt("logger_v", "export_csv path='%s' method='%s' host='%s' url='%s' status=%d-%d",
             path.c_str(), f.method.c_str(), f.host_regex.c_str(), f.url_regex.c_str(),
             f.status_min, f.status_max);
-        work_queue::post([path, f]() {
+        {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.logger_view";
+            sub.label = "logger.export_csv";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::diagnostics;
+            sub.priority = 3;
+            sub.body = [path, f]() {
             bool ok = logger::export_csv(path, f);
             ::diag::log_tagged_fmt("logger_v", "export_csv_result ok=%d path='%s'", ok ? 1 : 0, path.c_str());
             std::lock_guard<std::mutex> lk(s_state.lock);
             s_state.last_action_kind = ok ? "ok" : "error";
             s_state.last_action      = ok ? std::string("Exported ") + path : logger::last_error();
-        });
+        };
+            (void)::aida::infra::executor::submit(std::move(sub));
+        }
     }
     ImGui::SameLine(0.f, 12.f);
     {

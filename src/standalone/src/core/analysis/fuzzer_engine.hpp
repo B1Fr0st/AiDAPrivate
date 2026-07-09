@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include "work_queue.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -20,7 +19,7 @@
 #include "standalone_ai_client.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_settings.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../runtime/diagnostic_exception_scope.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -924,7 +923,16 @@ inline bool start_fuzzing()
 		worker();
 		return true;
 	}
-	const bool posted = critical_work_queue::post(worker) || work_queue::post(worker);
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "fuzzer";
+	submission.label = "fuzzer.worker";
+	submission.thread_class = "fuzzer_worker";
+	submission.domain = aida::infra::executor::domain_t::long_running;
+	submission.priority = 1;
+	submission.target_pid = cfg_snapshot.pid;
+	submission.failure_policy = "reject_not_started";
+	submission.body = std::move(worker);
+	const bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 	if (!posted) {
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -1024,7 +1032,14 @@ inline void ai_analyze_crash(int crash_index)
 
 	g_state.analyzing_crash.store(true);
 
-	work_queue::post([target_crash, crash_index]() {
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "fuzzer";
+	submission.label = "fuzzer.ai_analyze_crash";
+	submission.thread_class = "external_ai";
+	submission.domain = aida::infra::executor::domain_t::external_tool;
+	submission.priority = 3;
+	submission.failure_policy = "reject_not_started";
+	submission.body = [target_crash, crash_index]() {
 		std::string prompt = "You are a vulnerability researcher analyzing a crash found by a fuzzer.\n\n";
 		prompt += "CRASH DETAILS:\n";
 		prompt += "Type: " + std::string(crash_type_name(target_crash.type)) + "\n";
@@ -1116,7 +1131,11 @@ inline void ai_analyze_crash(int crash_index)
 			static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(t_ai1 - t_ai0).count()));
 
 		g_state.analyzing_crash.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+		diag::log_tagged_fmt("fuzzer", "ai_analyze_post_failed crash_index=%d", crash_index);
+		g_state.analyzing_crash.store(false);
+	}
 #else
 	(void)crash_index;
 #endif
@@ -1138,7 +1157,14 @@ inline void minimize_crash(int crash_index)
 
 	g_state.minimizing.store(true);
 
-	work_queue::post([target_crash, crash_index]() {
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "fuzzer";
+	submission.label = "fuzzer.minimize_crash";
+	submission.thread_class = "fuzzer_minimize";
+	submission.domain = aida::infra::executor::domain_t::long_running;
+	submission.priority = 3;
+	submission.failure_policy = "reject_not_started";
+	submission.body = [target_crash, crash_index]() {
 		auto& cfg = g_state.config;
 
 		emulation::process_snapshot_t snapshot;
@@ -1222,7 +1248,11 @@ inline void minimize_crash(int crash_index)
 			g_state.cancel.load() ? 1 : 0);
 
 		g_state.minimizing.store(false);
-	});
+	};
+	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+		diag::log_tagged_fmt("fuzzer", "minimize_post_failed crash_index=%d", crash_index);
+		g_state.minimizing.store(false);
+	}
 #else
 	(void)crash_index;
 #endif

@@ -13,8 +13,8 @@
 #include "../editor/expression_eval.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../runtime/standalone_driver.hpp"
-#include "../infra/work_queue.hpp"
 #include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../ui/ui_thread_dispatcher.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
@@ -2390,11 +2390,11 @@ namespace {
             (void)_exec_result;
         }
         if (!watchdog_posted) {
-            const work_queue::stats_t work_stats = work_queue::stats();
-            const work_queue::stats_t service_stats = work_queue::service_stats();
+            const aida::infra::taskflow_runtime::stats_t work_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+            const aida::infra::taskflow_runtime::stats_t service_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
             g_xref_live_after_warm_stage.store(14, std::memory_order_release);
             log_msg(hf, tag,
-                "OUTPUT -- ok=0 error=\"watchdog_post_failed\" reason=work_queue_post_returned_false "
+                "OUTPUT -- ok=0 error=\"watchdog_post_failed\" reason=taskflow_executor_submit_returned_false "
                 "work_alive=%d work_shutting_down=%d work_pool_size=%d work_workers=%zu work_pending=%zu work_active=%u work_posted=%llu work_rejected=%llu work_started=%llu work_finished=%llu work_oldest_active_ms=%llu work_active_label_count=%u "
                 "service_alive=%d service_shutting_down=%d service_pool_size=%d service_workers=%zu service_pending=%zu service_active=%u service_rejected=%llu "
                 "pid=%u module=\"%s\" elapsed_us=%lld",

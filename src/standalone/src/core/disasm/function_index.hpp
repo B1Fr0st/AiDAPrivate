@@ -16,6 +16,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "functions_panel.hpp"
@@ -24,11 +25,11 @@
 #include "standalone_driver.hpp"
 #include "symbol_classifier.hpp"
 #include "symbol_store.hpp"
-#include "work_queue.hpp"
 #include "zydis_disasm.hpp"
 
 #include "../../helpers/diag_log.hpp"
 #include "../anti-tamper/webhook.hpp"
+#include "../infra/executor.hpp"
 
 namespace function_index {
 
@@ -2940,7 +2941,13 @@ namespace function_index {
 				return;
 			}
 
-			work_queue::post([func_start, status, mod_name]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "disasm";
+			sub.label = "disasm.function_index.build_function";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::feature_worker;
+			sub.priority = 2;
+			sub.body = [func_start, status, mod_name]() {
 				bool live = (driver_bridge::attached_pid() != 0);
 				bool static_loaded = static_pe_active();
 				if (!live && !static_loaded) {
@@ -3035,7 +3042,21 @@ namespace function_index {
 					c.static_bulk_last_progress_ns.store(now_ns_v,
 						std::memory_order_release);
 				}
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+				status->state.store(static_cast<uint32_t>(func_state_t::failed),
+					std::memory_order_release);
+				cache_t& c = cache();
+				uint32_t prev_pending = c.static_bulk_pending.load(std::memory_order_acquire);
+				if (prev_pending > 0u) {
+					c.static_bulk_pending.fetch_sub(1u, std::memory_order_acq_rel);
+					uint64_t now_ns_v = static_cast<uint64_t>(
+						std::chrono::duration_cast<std::chrono::nanoseconds>(
+							std::chrono::steady_clock::now().time_since_epoch()).count());
+					c.static_bulk_last_progress_ns.store(now_ns_v,
+						std::memory_order_release);
+				}
+			}
 		}
 
 		struct bulk_dispatch_state_t {
@@ -3062,16 +3083,38 @@ namespace function_index {
 				auto status = kv.second;
 				uint64_t func_start = kv.first;
 				auto state_ref = state;
-				work_queue::post([func_start, status, state_ref]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "disasm";
+				sub.label = "disasm.function_index.bulk_schedule_function";
+				sub.thread_class = "bounded_task";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 2;
+				sub.body = [func_start, status, state_ref]() {
 					schedule_function_build(func_start, status, *state_ref->mod_name);
 					size_t left = state_ref->in_flight.fetch_sub(1u,
 						std::memory_order_acq_rel) - 1u;
 					if (left == 0) {
-						work_queue::post([state_ref]() {
+						aida::infra::executor::submission_t next_sub;
+						next_sub.owner_subsystem = "disasm";
+						next_sub.label = "disasm.function_index.bulk_next_chunk";
+						next_sub.thread_class = "bounded_task";
+						next_sub.domain = aida::infra::executor::domain_t::feature_worker;
+						next_sub.priority = 2;
+						next_sub.body = [state_ref]() {
 							post_bulk_chunk(state_ref);
-						});
+						};
+						if (!aida::infra::executor::submit(std::move(next_sub)).submitted)
+							post_bulk_chunk(state_ref);
 					}
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+					status->state.store(static_cast<uint32_t>(func_state_t::failed),
+						std::memory_order_release);
+					size_t left = state_ref->in_flight.fetch_sub(1u,
+						std::memory_order_acq_rel) - 1u;
+					if (left == 0)
+						post_bulk_chunk(state_ref);
+				}
 			}
 		}
 
@@ -3088,7 +3131,13 @@ namespace function_index {
 				return;
 			}
 
-			work_queue::post([]() {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "disasm";
+			sub.label = "disasm.function_index.bounds_rebuild";
+			sub.thread_class = "bounded_task";
+			sub.domain = aida::infra::executor::domain_t::feature_worker;
+			sub.priority = 2;
+			sub.body = []() {
 				cache_t& c2 = cache();
 				bool live = (driver_bridge::attached_pid() != 0);
 				bool static_loaded = static_pe_active();
@@ -3218,7 +3267,10 @@ namespace function_index {
 					diag::log_tagged("function_index", log_extra);
 					anti_tamper::webhook::write_log("function_index", log_extra);
 				}
-			});
+			};
+			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+				c.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
+					std::memory_order_release);
 		}
 
 		inline void reset_all() {

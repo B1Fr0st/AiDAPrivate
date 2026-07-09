@@ -6,8 +6,6 @@
 #include "ghidra_decompiler.hpp"
 #include "function_index.hpp"
 #include "rename_store.hpp"
-#include "work_queue.hpp"
-#include "../infra/critical_work_queue.hpp"
 #include "../infra/executor.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
@@ -20,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using json = nlohmann::json;
@@ -126,14 +125,14 @@ static tool_result_t handle_decompile_function(const json& params)
         aida::infra::executor::submission_t _exec_sub;
         _exec_sub.owner_subsystem = "standalone.decompiler.tools";
         _exec_sub.label = "decompile_tools.post";
-        _exec_sub.thread_class = "queued_task";
-        _exec_sub.domain = aida::infra::executor::domain_t::general;
+        _exec_sub.thread_class = "external_tool";
+        _exec_sub.domain = aida::infra::executor::domain_t::external_tool;
         _exec_sub.priority = 3;
         _exec_sub.body = run_decompile;
         _exec_sub.failure_policy = "reject_not_started";
         _exec_sub.ui_access_policy = "none";
         _exec_sub.shutdown_policy = "drain";
-        _exec_sub.no_capacity_reason = "no_capacity_needed_general_queue";
+        _exec_sub.no_capacity_reason = "decompile_tool_external_capacity";
         auto _exec_result = aida::infra::executor::submit(std::move(_exec_sub));
         posted = _exec_result.submitted;
         (void)_exec_result;

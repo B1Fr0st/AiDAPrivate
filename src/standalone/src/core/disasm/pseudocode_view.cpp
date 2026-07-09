@@ -13,7 +13,6 @@
 #include "../analysis/symbol_store.hpp"
 #include "rename_store.hpp"
 #include "../infra/event_bus.hpp"
-#include "../infra/work_queue.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
@@ -35,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32

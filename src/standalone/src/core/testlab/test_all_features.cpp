@@ -29,8 +29,8 @@
 #include "../disasm/decompiler_engine.hpp"
 #include "../disasm/pseudocode_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
-#include "../infra/critical_work_queue.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../analysis/pdb_default_skip.hpp"
 #include "../analysis/symbol_store.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -625,9 +625,9 @@ namespace test_all_features {
 			const std::uint64_t run_age = (run_start != 0 && now >= run_start) ? (now - run_start) : 0;
 			const std::uint64_t phase_age = (phase_start != 0 && now >= phase_start) ? (now - phase_start) : 0;
 			const std::uint64_t step_age = (step_start != 0 && now >= step_start) ? (now - step_start) : 0;
-			const auto cq = critical_work_queue::stats();
-			const auto wq = work_queue::stats();
-			const auto sq = work_queue::service_stats();
+			const auto cq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
+			const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+			const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
 			char ui_phase[900] = {};
 			format_ui_phase_snapshot(ui_phase, sizeof(ui_phase));
 			const int global_completed = current_completed_count();
@@ -798,15 +798,15 @@ namespace test_all_features {
 				snap);
 		}
 
-		void log_work_queue_snapshot(HANDLE hf, const char* tag, const char* prefix) {
-			const auto st = critical_work_queue::stats();
-			const auto wq = work_queue::stats();
-			const auto sq = work_queue::service_stats();
-			log_msg(hf, tag ? tag : "critical_queue",
+		void log_taskflow_runtime_snapshot(HANDLE hf, const char* tag, const char* prefix) {
+			const auto st = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
+			const auto wq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
+			const auto sq = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
+			log_msg(hf, tag ? tag : "taskflow_runtime",
 				"%s%scritical_alive=%d critical_shutting_down=%d critical_pool_size=%d critical_workers=%zu critical_pending=%zu critical_active=%u critical_post_attempts=%llu critical_posted=%llu critical_rejected=%llu critical_started=%llu critical_finished=%llu "
 				"work_alive=%d work_shutting_down=%d work_pool_size=%d work_workers=%zu work_pending=%zu work_active=%u work_post_attempts=%llu work_posted=%llu work_rejected=%llu work_started=%llu work_finished=%llu "
 				"service_alive=%d service_shutting_down=%d service_pool_size=%d service_workers=%zu service_pending=%zu service_active=%u service_post_attempts=%llu service_posted=%llu service_rejected=%llu service_started=%llu service_finished=%llu",
-				prefix ? prefix : "critical_queue snapshot",
+				prefix ? prefix : "taskflow runtime snapshot",
 				(prefix && *prefix) ? " | " : "",
 				st.alive ? 1 : 0,
 				st.shutting_down ? 1 : 0,
@@ -1394,7 +1394,7 @@ namespace test_all_features {
 				}
 				pkt_ctx.downstream_summary = downstream_buf;
 				pkt_ctx.ui_dispatcher_backlog = aida::ui_thread::pending_count();
-				auto wq_stats = work_queue::stats();
+				auto wq_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
 				char wq_buf[512] = {};
 				_snprintf_s(wq_buf, sizeof(wq_buf), _TRUNCATE,
 					"alive=%d active=%u pending=%zu started=%llu finished=%llu rejected=%llu oldest_ms=%llu",
@@ -1404,7 +1404,7 @@ namespace test_all_features {
 					static_cast<unsigned long long>(wq_stats.rejected),
 					static_cast<unsigned long long>(wq_stats.oldest_active_ms));
 				pkt_ctx.work_queue_snapshot = wq_buf;
-				auto cq_stats = critical_work_queue::stats();
+				auto cq_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
 				char cq_buf[512] = {};
 				_snprintf_s(cq_buf, sizeof(cq_buf), _TRUNCATE,
 					"alive=%d active=%u pending=%zu started=%llu finished=%llu rejected=%llu oldest_ms=%llu",
@@ -3824,7 +3824,16 @@ namespace test_all_features {
 				try {
 					auto stop_token = std::make_shared<std::atomic<bool>>(false);
 					stop = stop_token;
-					const bool posted = critical_work_queue::post_labeled("full_test.heartbeat", [stop_token]() {
+					aida::infra::executor::submission_t submission;
+					submission.owner_subsystem = "test_all_features";
+					submission.label = "full_test.heartbeat";
+					submission.thread_class = "testlab_heartbeat";
+					submission.domain = aida::infra::executor::domain_t::security_liveness;
+					submission.priority = 0;
+					submission.cancel_hook = [stop_token]() { stop_token->store(true, std::memory_order_release); };
+					submission.failure_policy = "reject_not_started";
+					submission.shutdown_policy = "abandon_on_shutdown";
+					submission.body = [stop_token]() {
 						while (!stop_token->load(std::memory_order_acquire)) {
 							for (int i = 0; i < 50; ++i) {
 								if (stop_token->load(std::memory_order_acquire)) return;
@@ -3835,11 +3844,12 @@ namespace test_all_features {
 							log_hung_heartbeat_if_needed(hh);
 							if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
 						}
-					});
+					};
+					const bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 					if (!posted) {
 						DWORD err = GetLastError();
-						log_msg(hf, "heartbeat", "disabled live heartbeat worker: critical_queue post failed");
-						log_resource_snapshot(hf, "heartbeat", "critical_queue post failed", err);
+						log_msg(hf, "heartbeat", "disabled live heartbeat worker: executor submit failed");
+						log_resource_snapshot(hf, "heartbeat", "executor submit failed", err);
 						stop_token->store(true, std::memory_order_release);
 					}
 				} catch (const std::exception& ex) {
@@ -4232,36 +4242,125 @@ namespace test_all_features {
 
 		bool start_full_test_worker(HANDLE hf) {
 			const std::uint64_t queued_at = now_ms_tick();
-			log_work_queue_snapshot(hf, "start", "BEFORE full-test critical_queue post");
-			const bool posted = critical_work_queue::post_labeled("full_test.run_all", [queued_at]() {
+			const std::uint64_t session_run_id = g_run_id.load(std::memory_order_acquire) + 1;
+			char session_id[64] = {};
+			_snprintf_s(session_id, sizeof(session_id), _TRUNCATE, "testlab.run.%llu",
+				static_cast<unsigned long long>(session_run_id));
+
+			log_taskflow_runtime_snapshot(hf, "start", "BEFORE full-test taskflow graph submit");
+
+			constexpr std::uint64_t kDispatchSetupNode = 1;
+			constexpr std::uint64_t kRunBodyNode = 2;
+			constexpr std::uint64_t kFinishEvidenceNode = 3;
+
+			aida::infra::taskflow_runtime::graph_descriptor_t graph;
+			graph.owner_subsystem = "testlab";
+			graph.label = "full_test.run_all";
+			graph.phase = "full_run";
+			graph.session_id = session_id;
+			graph.diagnostic_id = "full_test.run_all";
+			graph.domain = aida::infra::taskflow_runtime::executor_domain_t::critical;
+			graph.priority = 1;
+			graph.generation = session_run_id;
+			graph.nodes.reserve(3);
+
+			aida::infra::taskflow_runtime::graph_node_descriptor_t dispatch_setup;
+			dispatch_setup.node_id = kDispatchSetupNode;
+			dispatch_setup.label = "full_test.dispatch_setup";
+			dispatch_setup.body = [queued_at]() {
 				const std::uint64_t entered_at = now_ms_tick();
 				const std::uint64_t queue_delay = entered_at >= queued_at ? (entered_at - queued_at) : 0;
 				HANDLE entry_hf = open_log_file();
-				log_msg(entry_hf, "start", "full-test critical_queue worker entry tid=%lu queue_delay_ms=%llu",
+				log_msg(entry_hf, "start", "full-test taskflow graph setup entry tid=%lu queue_delay_ms=%llu",
 					static_cast<unsigned long>(GetCurrentThreadId()),
 					static_cast<unsigned long long>(queue_delay));
-				log_work_queue_snapshot(entry_hf, "start", "full-test critical_queue worker entry");
+				log_taskflow_runtime_snapshot(entry_hf, "start", "full-test taskflow graph setup entry");
 				if (entry_hf != INVALID_HANDLE_VALUE) {
 					flush_full_test_log(entry_hf);
 					CloseHandle(entry_hf);
 				}
-				diag::log_tagged_fmt("test_all", "full-test critical_queue worker entry tid=%lu queue_delay_ms=%llu",
+				diag::log_tagged_fmt("test_all", "full-test taskflow graph setup entry tid=%lu queue_delay_ms=%llu",
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(queue_delay));
+			};
+			graph.nodes.emplace_back(std::move(dispatch_setup));
+
+			aida::infra::taskflow_runtime::graph_node_descriptor_t run_body;
+			run_body.node_id = kRunBodyNode;
+			run_body.label = "full_test.run_body";
+			run_body.depends_on.push_back(kDispatchSetupNode);
+			run_body.body = [queued_at]() {
+				const std::uint64_t entered_at = now_ms_tick();
+				const std::uint64_t queue_delay = entered_at >= queued_at ? (entered_at - queued_at) : 0;
+				HANDLE entry_hf = open_log_file();
+				log_msg(entry_hf, "start", "full-test taskflow graph run entry tid=%lu queue_delay_ms=%llu",
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(queue_delay));
+				log_taskflow_runtime_snapshot(entry_hf, "start", "full-test taskflow graph run entry");
+				if (entry_hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(entry_hf);
+					CloseHandle(entry_hf);
+				}
+				diag::log_tagged_fmt("test_all", "full-test taskflow graph run entry tid=%lu queue_delay_ms=%llu",
 					static_cast<unsigned long>(GetCurrentThreadId()),
 					static_cast<unsigned long long>(queue_delay));
 				(void)run_all_seh_guarded();
-			});
+			};
+			graph.nodes.emplace_back(std::move(run_body));
+
+			aida::infra::taskflow_runtime::graph_node_descriptor_t finish_evidence;
+			finish_evidence.node_id = kFinishEvidenceNode;
+			finish_evidence.label = "full_test.finish_evidence";
+			finish_evidence.depends_on.push_back(kRunBodyNode);
+			finish_evidence.body = [queued_at]() {
+				const std::uint64_t finished_at = now_ms_tick();
+				const std::uint64_t elapsed = finished_at >= queued_at ? (finished_at - queued_at) : 0;
+				HANDLE finish_hf = open_log_file();
+				log_msg(finish_hf, "summary", "full-test taskflow graph finish evidence tid=%lu elapsed_ms=%llu running=%d cancel=%d target_unavailable=%d total=%d current=%d passed=%d failed=%d skipped=%d suspect=%d",
+					static_cast<unsigned long>(GetCurrentThreadId()),
+					static_cast<unsigned long long>(elapsed),
+					g_running.load(std::memory_order_acquire) ? 1 : 0,
+					g_cancel_requested.load(std::memory_order_acquire) ? 1 : 0,
+					g_target_unavailable.load(std::memory_order_acquire) ? 1 : 0,
+					g_total.load(std::memory_order_acquire),
+					current_completed_count(),
+					g_passed.load(std::memory_order_acquire),
+					g_failed.load(std::memory_order_acquire),
+					g_skipped.load(std::memory_order_acquire),
+					g_suspect.load(std::memory_order_acquire));
+				log_taskflow_runtime_snapshot(finish_hf, "summary", "full-test taskflow graph finish evidence");
+				if (finish_hf != INVALID_HANDLE_VALUE) {
+					flush_full_test_log(finish_hf);
+					CloseHandle(finish_hf);
+				}
+				diag::log_tagged_fmt("test_all", "full-test taskflow graph finish evidence elapsed_ms=%llu",
+					static_cast<unsigned long long>(elapsed));
+			};
+			graph.nodes.emplace_back(std::move(finish_evidence));
+
+			auto result = aida::infra::taskflow_runtime::submit_graph(std::move(graph));
+			const bool posted = result.submitted;
 			if (!posted) {
 				DWORD err = GetLastError();
-				log_msg(hf, "start", "FAIL -- full-test critical_queue post failed err=%lu",
-					static_cast<unsigned long>(err));
-				log_work_queue_snapshot(hf, "start", "full-test critical_queue post failed");
-				log_resource_snapshot(hf, "start", "full-test critical_queue post failed", err);
-				diag::log_tagged_fmt("test_all", "full-test critical_queue post failed err=%lu",
-					static_cast<unsigned long>(err));
+				const char* reason = result.reject_reason.empty() ? "<none>" : result.reject_reason.c_str();
+				log_msg(hf, "start", "FAIL -- full-test taskflow graph submit failed err=%lu reason=%s",
+					static_cast<unsigned long>(err),
+					reason);
+				log_taskflow_runtime_snapshot(hf, "start", "full-test taskflow graph submit failed");
+				log_resource_snapshot(hf, "start", "full-test taskflow graph submit failed", err);
+				diag::log_tagged_fmt("test_all", "full-test taskflow graph submit failed err=%lu reason=%s",
+					static_cast<unsigned long>(err),
+					reason);
 				return false;
 			}
-			log_work_queue_snapshot(hf, "start", "full-test critical_queue post ok");
-			diag::log_tagged("test_all", "full-test critical_queue worker posted");
+			log_msg(hf, "start", "full-test taskflow graph submitted job_id=%llu session_id=%s nodes=3 domain=critical queued_at_ms=%llu",
+				static_cast<unsigned long long>(result.handle.id),
+				session_id,
+				static_cast<unsigned long long>(queued_at));
+			log_taskflow_runtime_snapshot(hf, "start", "full-test taskflow graph submit ok");
+			diag::log_tagged_fmt("test_all", "full-test taskflow graph submitted job_id=%llu session_id=%s",
+				static_cast<unsigned long long>(result.handle.id),
+				session_id);
 			return true;
 		}
 
@@ -4350,10 +4449,10 @@ namespace test_all_features {
 					HANDLE hf = open_log_file();
 					g_failed.fetch_add(1);
 					g_running.store(false, std::memory_order_release);
-					set_full_test_env(hf, false, "critical_queue post failed");
+					set_full_test_env(hf, false, "taskflow graph submit failed");
 					anti_tamper::state::get().full_test_running.store(false, std::memory_order_release);
 					set_phase("Idle");
-					set_step("critical_queue post failed");
+					set_step("taskflow graph submit failed");
 					if (hf != INVALID_HANDLE_VALUE) {
 						flush_full_test_log(hf);
 						CloseHandle(hf);
@@ -4395,7 +4494,7 @@ namespace test_all_features {
 				diag::log_tagged_fmt("test_all", "full-test worker start failed: unknown exception err=%lu", static_cast<unsigned long>(err));
 				return false;
 			}
-			diag::log_tagged("test_all", "full test critical_queue worker posted");
+			diag::log_tagged("test_all", "full test taskflow graph submitted");
 			return true;
 		}
 
@@ -4430,12 +4529,12 @@ namespace test_all_features {
 			aida::ui_thread::post([]() { globals::ui::test_all_visible = true; },
 				"testlab", "queue_set_visible", "queue_start_tests");
 			set_phase("Initializing...");
-			set_step("start_tests queued");
+			set_step("start_tests submitted");
 			const std::uint64_t queued_at = now_ms_tick();
 			std::string tag_copy = tag;
 			HANDLE hf = open_log_file();
 			log_msg(hf, "start", "QUEUED -- full-test startup source=%s tid=%lu", tag, static_cast<unsigned long>(GetCurrentThreadId()));
-			log_work_queue_snapshot(hf, "start", "BEFORE full-test startup queue post");
+			log_taskflow_runtime_snapshot(hf, "start", "BEFORE full-test startup executor submit");
 			if (hf != INVALID_HANDLE_VALUE) {
 				flush_full_test_log(hf);
 				CloseHandle(hf);
@@ -4444,11 +4543,11 @@ namespace test_all_features {
 			auto task = [tag_copy, queued_at]() {
 				const std::uint64_t entered_at = now_ms_tick();
 				HANDLE entry_hf = open_log_file();
-				log_msg(entry_hf, "start", "full-test startup queue worker entry source=%s tid=%lu queue_delay_ms=%llu",
+				log_msg(entry_hf, "start", "full-test startup executor worker entry source=%s tid=%lu queue_delay_ms=%llu",
 					tag_copy.c_str(),
 					static_cast<unsigned long>(GetCurrentThreadId()),
 					static_cast<unsigned long long>(entered_at >= queued_at ? entered_at - queued_at : 0));
-				log_work_queue_snapshot(entry_hf, "start", "full-test startup queue worker entry");
+				log_taskflow_runtime_snapshot(entry_hf, "start", "full-test startup executor worker entry");
 				if (entry_hf != INVALID_HANDLE_VALUE) {
 					flush_full_test_log(entry_hf);
 					CloseHandle(entry_hf);
@@ -4456,39 +4555,44 @@ namespace test_all_features {
 				const bool started = start_tests_impl();
 				g_start_queued.store(false, std::memory_order_release);
 				HANDLE exit_hf = open_log_file();
-				log_msg(exit_hf, "start", "full-test startup queue worker exit source=%s started=%d elapsed_ms=%llu",
+				log_msg(exit_hf, "start", "full-test startup executor worker exit source=%s started=%d elapsed_ms=%llu",
 					tag_copy.c_str(),
 					started ? 1 : 0,
 					static_cast<unsigned long long>(now_ms_tick() - entered_at));
-				log_debug_snapshot(exit_hf, "start", "full-test startup queue worker exit");
+				log_debug_snapshot(exit_hf, "start", "full-test startup executor worker exit");
 				if (exit_hf != INVALID_HANDLE_VALUE) {
 					flush_full_test_log(exit_hf);
 					CloseHandle(exit_hf);
 				}
 			};
 
-			bool posted = work_queue::post_service_labeled("full_test.start_service", task);
-			if (!posted)
-				posted = work_queue::post_labeled("full_test.start_worker", task);
-			if (!posted)
-				posted = critical_work_queue::post_labeled("full_test.startup_fallback", std::move(task));
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "test_all_features";
+			submission.label = "full_test.start_service";
+			submission.thread_class = "testlab_startup";
+			submission.domain = aida::infra::executor::domain_t::service;
+			submission.priority = 1;
+			submission.diagnostic_id = tag;
+			submission.failure_policy = "reject_not_started";
+			submission.body = std::move(task);
+			bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 			if (!posted) {
 				DWORD err = GetLastError();
 				g_start_queued.store(false, std::memory_order_release);
 				set_phase("Idle");
-				set_step("startup queue post failed");
+				set_step("startup executor submit failed");
 				HANDLE fail_hf = open_log_file();
-				log_msg(fail_hf, "start", "FAIL -- full-test startup queue post failed source=%s err=%lu", tag, static_cast<unsigned long>(err));
-				log_work_queue_snapshot(fail_hf, "start", "full-test startup queue post failed");
-				log_resource_snapshot(fail_hf, "start", "startup queue post failed", err);
+				log_msg(fail_hf, "start", "FAIL -- full-test startup executor submit failed source=%s err=%lu", tag, static_cast<unsigned long>(err));
+				log_taskflow_runtime_snapshot(fail_hf, "start", "full-test startup executor submit failed");
+				log_resource_snapshot(fail_hf, "start", "startup executor submit failed", err);
 				if (fail_hf != INVALID_HANDLE_VALUE) {
 					flush_full_test_log(fail_hf);
 					CloseHandle(fail_hf);
 				}
-				diag::log_tagged_fmt("test_all", "full-test startup queue post failed source=%s err=%lu", tag, static_cast<unsigned long>(err));
+				diag::log_tagged_fmt("test_all", "full-test startup executor submit failed source=%s err=%lu", tag, static_cast<unsigned long>(err));
 				return false;
 			}
-			diag::log_tagged_fmt("test_all", "full-test startup queued source=%s", tag);
+			diag::log_tagged_fmt("test_all", "full-test startup submitted source=%s", tag);
 			return true;
 		}
 
@@ -4527,11 +4631,16 @@ namespace test_all_features {
 				std::function<void()> task = []() {
 					run_interactive_cancel_cleanup_worker();
 				};
-				posted = work_queue::post_service_labeled("full_test.cancel_cleanup", task);
-				if (!posted)
-					posted = work_queue::post_labeled("full_test.cancel_cleanup", task);
-				if (!posted)
-					posted = critical_work_queue::post_labeled("full_test.cancel_cleanup", std::move(task));
+				aida::infra::executor::submission_t submission;
+				submission.owner_subsystem = "test_all_features";
+				submission.label = "full_test.cancel_cleanup";
+				submission.thread_class = "testlab_cancel_cleanup";
+				submission.domain = aida::infra::executor::domain_t::service;
+				submission.priority = 1;
+				submission.failure_policy = "reject_not_started";
+				submission.shutdown_policy = "drain";
+				submission.body = std::move(task);
+				posted = aida::infra::executor::submit(std::move(submission)).submitted;
 			} catch (...) {
 				posted = false;
 			}
@@ -4605,11 +4714,16 @@ namespace test_all_features {
 			}
 			s_hotkey_task_inflight.store(false, std::memory_order_release);
 		};
-		bool posted = work_queue::post_service_labeled("full_test.hotkey", task);
-		if (!posted)
-			posted = work_queue::post_labeled("full_test.hotkey", task);
-		if (!posted)
-			posted = critical_work_queue::post_labeled("full_test.hotkey", std::move(task));
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "test_all_features";
+		submission.label = "full_test.hotkey";
+		submission.thread_class = "testlab_hotkey";
+		submission.domain = aida::infra::executor::domain_t::service;
+		submission.priority = 1;
+		submission.diagnostic_id = tag_ptr;
+		submission.failure_policy = "reject_not_started";
+		submission.body = std::move(task);
+		bool posted = aida::infra::executor::submit(std::move(submission)).submitted;
 		if (!posted) {
 			s_hotkey_task_inflight.store(false, std::memory_order_release);
 			diag::log_tagged_critical_fmt("ui", "test_all_hotkey_post_failed source=%s", tag_ptr);
@@ -4630,11 +4744,16 @@ namespace test_all_features {
 		auto proof_task = [] {
 			run_parser_proof_smoke();
 		};
-		bool proof_posted = work_queue::post_service_labeled("parser_proof.hotkey", proof_task);
-		if (!proof_posted)
-			proof_posted = work_queue::post_labeled("parser_proof.hotkey", proof_task);
-		if (!proof_posted)
-			proof_posted = critical_work_queue::post_labeled("parser_proof.hotkey", std::move(proof_task));
+		aida::infra::executor::submission_t proof_submission;
+		proof_submission.owner_subsystem = "test_all_features";
+		proof_submission.label = "parser_proof.hotkey";
+		proof_submission.thread_class = "parser_proof";
+		proof_submission.domain = aida::infra::executor::domain_t::diagnostics;
+		proof_submission.priority = 4;
+		proof_submission.diagnostic_id = tag;
+		proof_submission.failure_policy = "reject_not_started";
+		proof_submission.body = std::move(proof_task);
+		bool proof_posted = aida::infra::executor::submit(std::move(proof_submission)).submitted;
 		if (!proof_posted)
 			diag::log_tagged("parser_proof", "hotkey parser proof smoke post failed");
 		bool accepted = queue_start_tests_impl(tag);

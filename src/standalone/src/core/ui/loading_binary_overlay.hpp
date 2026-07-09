@@ -20,7 +20,8 @@
 #include "../disasm/function_index.hpp"
 #include "../disasm/xref_index.hpp"
 #include "../editor/hex_view.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../infra/event_bus.hpp"
 #include "../analysis/initial_analysis.hpp"
 #include "../analysis/symbol_store.hpp"
@@ -723,7 +724,13 @@ inline void begin_load(const std::string& path, completion_action_t action = com
 	completion_action_t captured_action = action;
 	bool queued = false;
 	try {
-		queued = work_queue::post([captured_path, captured_action, generation]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "loading_binary_overlay";
+		sub.label = "loading_binary_overlay.begin_load";
+		sub.thread_class = "bounded_task";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.body = [captured_path, captured_action, generation]() {
 			const DWORD tid = GetCurrentThreadId();
 			const ULONGLONG start_ms = GetTickCount64();
 			diag::log_tagged_fmt("loading_binary_overlay",
@@ -739,21 +746,22 @@ inline void begin_load(const std::string& path, completion_action_t action = com
 				static_cast<unsigned long long>(generation),
 				static_cast<unsigned long>(tid),
 				static_cast<unsigned long long>(GetTickCount64() - start_ms));
-		});
+		};
+		queued = aida::infra::executor::submit(std::move(sub)).submitted;
 	} catch (...) {
 		queued = false;
 	}
 	if (!queued) {
-		const auto qs = work_queue::stats();
+		const auto qs = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("loading_binary_overlay",
-			"begin_load worker_post_failed path=%s queue_alive=%d queue_shutdown=%d queue_pending=%llu queue_active=%u queue_posted=%llu queue_rejected=%llu",
+			"begin_load worker_post_failed path=%s runtime_accepting=%d runtime_shutdown=%d work_pending=%llu work_active=%u total_submitted=%llu total_rejected=%llu",
 			path.c_str(),
-			qs.alive ? 1 : 0,
+			qs.accepting ? 1 : 0,
 			qs.shutting_down ? 1 : 0,
-			static_cast<unsigned long long>(qs.pending),
-			qs.active,
-			static_cast<unsigned long long>(qs.posted),
-			static_cast<unsigned long long>(qs.rejected));
+			static_cast<unsigned long long>(qs.work_queue_pending),
+			static_cast<unsigned>(qs.work_queue_active),
+			static_cast<unsigned long long>(qs.total_submitted),
+			static_cast<unsigned long long>(qs.total_rejected));
 	}
 	diag::log_tagged_fmt("loading_binary_overlay",
 		"begin_load accepted path=%s action=%u queued=%d generation=%llu",

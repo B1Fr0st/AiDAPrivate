@@ -12,7 +12,7 @@
 #include "../../ui/components.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "helpers/diag_log.hpp"
 
 #include "imgui/imgui.h"
@@ -22,6 +22,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -90,7 +91,14 @@ void render(float pos_x, float pos_y, float width, float height,
         std::map<std::string, std::string> hdrs = parse_kv(s_state.headers_buf);
         ::diag::log_tagged_fmt("graphql_v", "introspect ep='%s'", ep.c_str());
         s_state.introspecting.store(true);
-        work_queue::post([ep, hdrs]() {
+        {
+            ::aida::infra::executor::submission_t sub;
+            sub.owner_subsystem = "burp.graphql_view";
+            sub.label = "graphql.introspect";
+            sub.thread_class = "bounded_task";
+            sub.domain = aida::infra::executor::domain_t::external_tool;
+            sub.priority = 3;
+            sub.body = [ep, hdrs]() {
             graphql::gql_schema_t schema;
             std::string raw;
             bool ok = graphql::introspect(ep, hdrs, schema, raw);
@@ -103,7 +111,9 @@ void render(float pos_x, float pos_y, float width, float height,
             ::diag::log_tagged_fmt("graphql_v", "introspect_result ok=%d types=%zu err='%s'",
                 ok ? 1 : 0, schema.types.size(), ok ? "" : graphql::last_error().c_str());
             s_state.introspecting.store(false);
-        });
+        };
+            (void)::aida::infra::executor::submit(std::move(sub));
+        }
     }
     if (intro) ImGui::EndDisabled();
 
@@ -258,7 +268,14 @@ void render(float pos_x, float pos_y, float width, float height,
             }
             ::diag::log_tagged_fmt("graphql_v", "send_query ep='%s' query_len=%zu", ep.c_str(), q.size());
             s_state.sending.store(true);
-            work_queue::post([ep, hdrs, q, v]() {
+            {
+                ::aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "burp.graphql_view";
+                sub.label = "graphql.send_query";
+                sub.thread_class = "bounded_task";
+                sub.domain = aida::infra::executor::domain_t::external_tool;
+                sub.priority = 3;
+                sub.body = [ep, hdrs, q, v]() {
                 nlohmann::json variables = nlohmann::json::object();
                 if (!v.empty()) {
                     auto parsed = nlohmann::json::parse(v, nullptr, false);
@@ -291,7 +308,9 @@ void render(float pos_x, float pos_y, float width, float height,
                     while (s_state.history.size() > s_state.history_max) s_state.history.pop_front();
                 }
                 s_state.sending.store(false);
-            });
+            };
+                (void)::aida::infra::executor::submit(std::move(sub));
+            }
         }
         if (sending) ImGui::EndDisabled();
         ImGui::SameLine();

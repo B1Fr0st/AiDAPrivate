@@ -4,7 +4,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <regex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace workspace_search
@@ -382,11 +384,17 @@ inline void start_search(const std::string& root_dir)
     auto includes       = parse_globs(st.include_buf);
     auto excludes       = parse_globs(st.exclude_buf);
 
-    work_queue::post([root_dir_copy = std::move(root_dir_copy),
-                      query = std::move(query),
-                      case_sensitive, whole_word, use_regex,
-                      includes = std::move(includes),
-                      excludes = std::move(excludes)]() mutable {
+    aida::infra::executor::submission_t sub;
+    sub.owner_subsystem = "analysis";
+    sub.label = "analysis.workspace_search";
+    sub.thread_class = "bounded_task";
+    sub.domain = aida::infra::executor::domain_t::feature_worker;
+    sub.priority = 3;
+    sub.body = [root_dir_copy = std::move(root_dir_copy),
+                query = std::move(query),
+                case_sensitive, whole_word, use_regex,
+                includes = std::move(includes),
+                excludes = std::move(excludes)]() mutable {
         auto& s = g_search;
         for (int i = 0; i < 500 && s.searching.load(std::memory_order_acquire); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -398,7 +406,11 @@ inline void start_search(const std::string& root_dir)
         search_worker(std::move(root_dir_copy), std::move(query),
                       case_sensitive, whole_word, use_regex,
                       std::move(includes), std::move(excludes));
-    });
+    };
+    if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+        st.launch_pending.store(false, std::memory_order_release);
+        diag::log_tagged("workspace_search", "start_search_post_failed");
+    }
 }
 
 

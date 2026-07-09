@@ -11,7 +11,7 @@
 #include "test_all_burp.h"
 #include "test_all_features.hpp"
 #include "../infra/event_bus.hpp"
-#include "../infra/work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "../network/burp/scope.hpp"
 #include "../network/burp/cookie_jar.hpp"
 #include "../network/burp/match_replace.hpp"
@@ -759,8 +759,8 @@ namespace {
             st->last_wsa_error.store(0, std::memory_order_release);
             st->last_win32_error.store(0, std::memory_order_release);
             const ULONGLONG start_tick = GetTickCount64();
-            const auto q_before = work_queue::stats();
-            log_msg(hf, tag, "fixture_start INFO -- listener work_queue post requested port=%u listener=%llu host_pid=%lu host_tid=%lu wq_alive=%d wq_shutting=%d wq_pending=%zu wq_active=%u wq_posted=%llu wq_finished=%llu",
+            const auto q_before = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::feature_worker);
+            log_msg(hf, tag, "fixture_start INFO -- listener taskflow executor post requested port=%u listener=%llu host_pid=%lu host_tid=%lu executor_alive=%d executor_shutting=%d executor_pending=%zu executor_active=%u executor_posted=%llu executor_finished=%llu",
                 static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(listener),
                 static_cast<unsigned long>(GetCurrentProcessId()),
@@ -775,15 +775,24 @@ namespace {
             bool posted = false;
             DWORD post_gle = ERROR_SUCCESS;
             try {
-                posted = work_queue::post([st]() {
-                    burp_loopback_fixture_t::worker_entry(st, "work_queue");
-                });
+                aida::infra::executor::submission_t sub;
+                sub.owner_subsystem = "testlab_burp";
+                sub.label = "testlab.burp.loopback_fixture";
+                sub.thread_class = "service_loop";
+                sub.domain = aida::infra::executor::domain_t::feature_worker;
+                sub.priority = 2;
+                sub.failure_policy = "reject_not_started";
+                sub.shutdown_policy = "drain";
+                sub.body = [st]() {
+                    burp_loopback_fixture_t::worker_entry(st, "taskflow_executor");
+                };
+                posted = aida::infra::executor::submit(std::move(sub)).submitted;
                 post_gle = GetLastError();
             } catch (const std::exception& ex) {
                 post_gle = GetLastError();
                 if (post_gle == ERROR_SUCCESS)
                     post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_post_exception port=%u listener=%llu err=%s gle=%lu state=%p",
+                diag::log_tagged_fmt("testlab_burp", "loopback_taskflow_executor_post_exception port=%u listener=%llu err=%s gle=%lu state=%p",
                     static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                     static_cast<unsigned long long>(listener),
                     ex.what(),
@@ -793,15 +802,15 @@ namespace {
                 post_gle = GetLastError();
                 if (post_gle == ERROR_SUCCESS)
                     post_gle = ERROR_NOT_ENOUGH_MEMORY;
-                diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_post_exception port=%u listener=%llu err=unknown gle=%lu state=%p",
+                diag::log_tagged_fmt("testlab_burp", "loopback_taskflow_executor_post_exception port=%u listener=%llu err=unknown gle=%lu state=%p",
                     static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                     static_cast<unsigned long long>(listener),
                     static_cast<unsigned long>(post_gle),
                     st.get());
             }
-            const auto q_after = work_queue::stats();
+            const auto q_after = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::feature_worker);
             st->worker_posted.store(posted, std::memory_order_release);
-            diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_post_result posted=%d gle=%lu state=%p port=%u listener=%llu wq_alive=%d wq_shutting=%d wq_pending=%zu wq_active=%u wq_posted=%llu wq_rejected=%llu wq_started=%llu wq_finished=%llu elapsed_ms=%llu",
+            diag::log_tagged_fmt("testlab_burp", "loopback_taskflow_executor_post_result posted=%d gle=%lu state=%p port=%u listener=%llu executor_alive=%d executor_shutting=%d executor_pending=%zu executor_active=%u executor_posted=%llu executor_rejected=%llu executor_started=%llu executor_finished=%llu elapsed_ms=%llu",
                 posted ? 1 : 0,
                 static_cast<unsigned long>(post_gle),
                 st.get(),
@@ -829,7 +838,7 @@ namespace {
                     closesocket(s);
                 }
                 st->port.store(0, std::memory_order_release);
-                log_msg(hf, tag, "fixture_start FAIL -- listener work_queue post failed gle=%lu elapsed_ms=%llu host_pid=%lu host_tid=%lu wq_alive=%d wq_shutting=%d wq_pending=%zu wq_active=%u wq_rejected=%llu",
+                log_msg(hf, tag, "fixture_start FAIL -- listener taskflow executor post failed gle=%lu elapsed_ms=%llu host_pid=%lu host_tid=%lu executor_alive=%d executor_shutting=%d executor_pending=%zu executor_active=%u executor_rejected=%llu",
                     static_cast<unsigned long>(post_gle),
                     static_cast<unsigned long long>(GetTickCount64() - start_tick),
                     static_cast<unsigned long>(GetCurrentProcessId()),
@@ -868,8 +877,8 @@ namespace {
                         return st->worker_exited.load(std::memory_order_acquire);
                     });
                 }
-                const auto q_late = work_queue::stats();
-                log_msg(hf, tag, "fixture_start FAIL -- listener work_queue worker did not enter port=%u entered=%d exited=%d drained=%d worker_tid=%lu accept_count=%llu request_count=%llu response_count=%llu last_wsa=%d last_gle=%lu elapsed_ms=%llu wq_pending=%zu wq_active=%u wq_started=%llu wq_finished=%llu",
+                const auto q_late = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::feature_worker);
+                log_msg(hf, tag, "fixture_start FAIL -- listener taskflow executor worker did not enter port=%u entered=%d exited=%d drained=%d worker_tid=%lu accept_count=%llu request_count=%llu response_count=%llu last_wsa=%d last_gle=%lu elapsed_ms=%llu executor_pending=%zu executor_active=%u executor_started=%llu executor_finished=%llu",
                     static_cast<unsigned>(ntohs(bound.sin_port)),
                     entered ? 1 : 0,
                     exited ? 1 : 0,
@@ -885,7 +894,7 @@ namespace {
                     static_cast<unsigned>(q_late.active),
                     static_cast<unsigned long long>(q_late.started),
                     static_cast<unsigned long long>(q_late.finished));
-                diag::log_tagged_fmt("testlab_burp", "loopback_work_queue_start_not_ready port=%u entered=%d exited=%d drained=%d worker_tid=%lu state=%p elapsed_ms=%llu wq_pending=%zu wq_active=%u",
+                diag::log_tagged_fmt("testlab_burp", "loopback_taskflow_executor_start_not_ready port=%u entered=%d exited=%d drained=%d worker_tid=%lu state=%p elapsed_ms=%llu executor_pending=%zu executor_active=%u",
                     static_cast<unsigned>(ntohs(bound.sin_port)),
                     entered ? 1 : 0,
                     exited ? 1 : 0,

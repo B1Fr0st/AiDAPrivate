@@ -1806,6 +1806,10 @@ if(WIN32)
             "${DEPS_DIR}/sqlite-amalgamation-3530000"
         )
 
+        target_include_directories(AiDAStandalone SYSTEM PRIVATE
+            "${DEPS_DIR}/taskflow"
+        )
+
         target_compile_definitions(AiDAStandalone PRIVATE
             __NT__
             _CRT_SECURE_NO_WARNINGS

@@ -7,12 +7,12 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
-#include "work_queue.hpp"
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "pdb_default_skip.hpp"
@@ -23,7 +23,8 @@
 #include "standalone_settings.hpp"
 #include "../testlab/test_all_features.hpp"
 #include "../anti-tamper/state.hpp"
-#include "../infra/critical_work_queue.hpp"
+#include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../infra/win_thread.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -201,44 +202,36 @@ inline void apply_loading_timeout(const load_timeout_context_t& ctx) noexcept
 			dbghelp_quarantined_after ? 0 : 1,
 			dbghelp_quarantined_after ? 1 : 0);
 	} catch (const std::exception& ex) {
-		auto wq = work_queue::stats();
-		auto sq = work_queue::service_stats();
-		auto cq = critical_work_queue::stats();
+		auto rt = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("symbol_store",
-			"pdb_timeout_task_exception module=%s generation=%llu phase=%s timeout_ms=%u err=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+			"pdb_timeout_task_exception module=%s generation=%llu phase=%s timeout_ms=%u err=%s work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 			ctx.module_name.c_str(),
 			static_cast<unsigned long long>(ctx.generation),
 			ctx.phase.c_str(),
 			ctx.timeout_ms,
 			ex.what(),
-			wq.pending,
-			wq.active,
-			static_cast<unsigned long long>(wq.rejected),
-			sq.pending,
-			sq.active,
-			static_cast<unsigned long long>(sq.rejected),
-			cq.pending,
-			cq.active,
-			static_cast<unsigned long long>(cq.rejected));
+			static_cast<unsigned long long>(rt.work_queue_pending),
+			rt.work_queue_active,
+			static_cast<unsigned long long>(rt.service_queue_pending),
+			rt.service_queue_active,
+			static_cast<unsigned long long>(rt.critical_queue_pending),
+			rt.critical_queue_active,
+			static_cast<unsigned long long>(rt.total_rejected));
 	} catch (...) {
-		auto wq = work_queue::stats();
-		auto sq = work_queue::service_stats();
-		auto cq = critical_work_queue::stats();
+		auto rt = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("symbol_store",
-			"pdb_timeout_task_exception module=%s generation=%llu phase=%s timeout_ms=%u err=<unknown> work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+			"pdb_timeout_task_exception module=%s generation=%llu phase=%s timeout_ms=%u err=<unknown> work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 			ctx.module_name.c_str(),
 			static_cast<unsigned long long>(ctx.generation),
 			ctx.phase.c_str(),
 			ctx.timeout_ms,
-			wq.pending,
-			wq.active,
-			static_cast<unsigned long long>(wq.rejected),
-			sq.pending,
-			sq.active,
-			static_cast<unsigned long long>(sq.rejected),
-			cq.pending,
-			cq.active,
-			static_cast<unsigned long long>(cq.rejected));
+			static_cast<unsigned long long>(rt.work_queue_pending),
+			rt.work_queue_active,
+			static_cast<unsigned long long>(rt.service_queue_pending),
+			rt.service_queue_active,
+			static_cast<unsigned long long>(rt.critical_queue_pending),
+			rt.critical_queue_active,
+			static_cast<unsigned long long>(rt.total_rejected));
 	}
 }
 
@@ -276,89 +269,73 @@ inline bool schedule_loading_timeout(const std::string& module_name, uint64_t ge
 		HANDLE timer = nullptr;
 		if (!CreateTimerQueueTimer(&timer, nullptr, load_timeout_timer_cb, ctx.get(), timeout_ms, 0, WT_EXECUTEDEFAULT)) {
 			DWORD gle = GetLastError();
-			auto wq = work_queue::stats();
-			auto sq = work_queue::service_stats();
-			auto cq = critical_work_queue::stats();
+			auto rt = aida::infra::taskflow_runtime::active_snapshot();
 			diag::log_tagged_fmt("symbol_store",
-				"pdb_timeout_schedule_failed module=%s generation=%llu phase=%s timeout_ms=%u gle=%lu work_alive=%d work_pending=%zu work_active=%u work_rejected=%llu service_alive=%d service_pending=%zu service_active=%u service_rejected=%llu critical_alive=%d critical_pending=%zu critical_active=%u critical_rejected=%llu",
+				"pdb_timeout_schedule_failed module=%s generation=%llu phase=%s timeout_ms=%u gle=%lu accepting=%d work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 				module_name.c_str(),
 				static_cast<unsigned long long>(generation),
 				phase.c_str(),
 				timeout_ms,
 				static_cast<unsigned long>(gle),
-				wq.alive ? 1 : 0,
-				wq.pending,
-				wq.active,
-				static_cast<unsigned long long>(wq.rejected),
-				sq.alive ? 1 : 0,
-				sq.pending,
-				sq.active,
-				static_cast<unsigned long long>(sq.rejected),
-				cq.alive ? 1 : 0,
-				cq.pending,
-				cq.active,
-				static_cast<unsigned long long>(cq.rejected));
+				rt.accepting ? 1 : 0,
+				static_cast<unsigned long long>(rt.work_queue_pending),
+				rt.work_queue_active,
+				static_cast<unsigned long long>(rt.service_queue_pending),
+				rt.service_queue_active,
+				static_cast<unsigned long long>(rt.critical_queue_pending),
+				rt.critical_queue_active,
+				static_cast<unsigned long long>(rt.total_rejected));
 			return false;
 		}
 
 		ctx->timer = timer;
 		ctx.release();
-		auto wq = work_queue::stats();
-		auto sq = work_queue::service_stats();
-		auto cq = critical_work_queue::stats();
+		auto rt = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("symbol_store",
-			"pdb_timeout_schedule_ok module=%s generation=%llu phase=%s timeout_ms=%u work_pending=%zu work_active=%u service_pending=%zu service_active=%u critical_pending=%zu critical_active=%u",
+			"pdb_timeout_schedule_ok module=%s generation=%llu phase=%s timeout_ms=%u work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u",
 			module_name.c_str(),
 			static_cast<unsigned long long>(generation),
 			phase.c_str(),
 			timeout_ms,
-			wq.pending,
-			wq.active,
-			sq.pending,
-			sq.active,
-			cq.pending,
-			cq.active);
+			static_cast<unsigned long long>(rt.work_queue_pending),
+			rt.work_queue_active,
+			static_cast<unsigned long long>(rt.service_queue_pending),
+			rt.service_queue_active,
+			static_cast<unsigned long long>(rt.critical_queue_pending),
+			rt.critical_queue_active);
 		return true;
 	} catch (const std::exception& ex) {
-		auto wq = work_queue::stats();
-		auto sq = work_queue::service_stats();
-		auto cq = critical_work_queue::stats();
+		auto rt = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("symbol_store",
-			"pdb_timeout_schedule_outer_exception module=%s generation=%llu phase=%s timeout_ms=%u err=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+			"pdb_timeout_schedule_outer_exception module=%s generation=%llu phase=%s timeout_ms=%u err=%s work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 			module_name.c_str(),
 			static_cast<unsigned long long>(generation),
 			phase.c_str(),
 			timeout_ms,
 			ex.what(),
-			wq.pending,
-			wq.active,
-			static_cast<unsigned long long>(wq.rejected),
-			sq.pending,
-			sq.active,
-			static_cast<unsigned long long>(sq.rejected),
-			cq.pending,
-			cq.active,
-			static_cast<unsigned long long>(cq.rejected));
+			static_cast<unsigned long long>(rt.work_queue_pending),
+			rt.work_queue_active,
+			static_cast<unsigned long long>(rt.service_queue_pending),
+			rt.service_queue_active,
+			static_cast<unsigned long long>(rt.critical_queue_pending),
+			rt.critical_queue_active,
+			static_cast<unsigned long long>(rt.total_rejected));
 		return false;
 	} catch (...) {
-		auto wq = work_queue::stats();
-		auto sq = work_queue::service_stats();
-		auto cq = critical_work_queue::stats();
+		auto rt = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("symbol_store",
-			"pdb_timeout_schedule_outer_exception module=%s generation=%llu phase=%s timeout_ms=%u err=<unknown> work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+			"pdb_timeout_schedule_outer_exception module=%s generation=%llu phase=%s timeout_ms=%u err=<unknown> work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 			module_name.c_str(),
 			static_cast<unsigned long long>(generation),
 			phase.c_str(),
 			timeout_ms,
-			wq.pending,
-			wq.active,
-			static_cast<unsigned long long>(wq.rejected),
-			sq.pending,
-			sq.active,
-			static_cast<unsigned long long>(sq.rejected),
-			cq.pending,
-			cq.active,
-			static_cast<unsigned long long>(cq.rejected));
+			static_cast<unsigned long long>(rt.work_queue_pending),
+			rt.work_queue_active,
+			static_cast<unsigned long long>(rt.service_queue_pending),
+			rt.service_queue_active,
+			static_cast<unsigned long long>(rt.critical_queue_pending),
+			rt.critical_queue_active,
+			static_cast<unsigned long long>(rt.total_rejected));
 		return false;
 	}
 }
@@ -764,7 +741,16 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 		ms.status_text = "Searching for PDB...";
 	}
 
-	const bool posted = work_queue::post([module_name, generation]() {
+	aida::infra::executor::submission_t load_sub;
+	load_sub.owner_subsystem = "symbol_store";
+	load_sub.label = "symbol_store.load_pdb_for_module";
+	load_sub.thread_class = "external_tool";
+	load_sub.domain = aida::infra::executor::domain_t::external_tool;
+	load_sub.priority = 2;
+	load_sub.generation = generation;
+	load_sub.target_id = module_name.c_str();
+	load_sub.failure_policy = "reject_not_started";
+	load_sub.body = [module_name, generation]() {
 		std::string pdb_path = detail::find_pdb_local(module_name);
 
 		if (pdb_path.empty()) {
@@ -868,7 +854,8 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 		if (publish_event) {
 			aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
 		}
-	});
+	};
+	const bool posted = aida::infra::executor::submit(std::move(load_sub)).submitted;
 	if (!posted) {
 		aida::events::event_pdb_loaded ev_payload;
 		{
@@ -974,7 +961,16 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 	std::string pdb_guid_copy = pdb_guid;
 	std::string server_copy = symbol_server_base;
 
-	const bool posted = work_queue::post([mod_copy, pdb_name_copy, pdb_guid_copy, pdb_age, server_copy, generation]() {
+	aida::infra::executor::submission_t hint_sub;
+	hint_sub.owner_subsystem = "symbol_store";
+	hint_sub.label = "symbol_store.load_pdb_with_hint";
+	hint_sub.thread_class = "external_tool";
+	hint_sub.domain = aida::infra::executor::domain_t::external_tool;
+	hint_sub.priority = 2;
+	hint_sub.generation = generation;
+	hint_sub.target_id = mod_copy.c_str();
+	hint_sub.failure_policy = "reject_not_started";
+	hint_sub.body = [mod_copy, pdb_name_copy, pdb_guid_copy, pdb_age, server_copy, generation]() {
 		std::string cache_root = detail::get_cache_dir().string();
 
 		pdb_downloader::download_request_t req;
@@ -1117,7 +1113,8 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 			}
 		}
 		aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
-	});
+	};
+	const bool posted = aida::infra::executor::submit(std::move(hint_sub)).submitted;
 	if (!posted) {
 		aida::events::event_pdb_loaded ev_payload;
 		{
@@ -1275,46 +1272,38 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				snprintf(status, sizeof(status), "Parsing user-supplied PDB: progress=0.0%% elapsed=0 ms; %s", ms.parse_diagnostic.c_str());
 				ms.status_text = status;
 			}
-			auto wq_before_timeout = work_queue::stats();
-			auto sq_before_timeout = work_queue::service_stats();
-			auto cq_before_timeout = critical_work_queue::stats();
+			auto rt_before_timeout = aida::infra::taskflow_runtime::active_snapshot();
 			diag::log_tagged_fmt("symbol_store",
-				"explicit_pdb_timeout_schedule_begin module=%s path='%s' file_size=%llu generation=%llu phase=parse timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+				"explicit_pdb_timeout_schedule_begin module=%s path='%s' file_size=%llu generation=%llu phase=parse timeout_ms=%u work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 				mod_copy.c_str(),
 				path_copy.c_str(),
 				static_cast<unsigned long long>(file_size_copy),
 				static_cast<unsigned long long>(generation),
 				k_explicit_pdb_load_timeout_ms,
-				wq_before_timeout.pending,
-				wq_before_timeout.active,
-				static_cast<unsigned long long>(wq_before_timeout.rejected),
-				sq_before_timeout.pending,
-				sq_before_timeout.active,
-				static_cast<unsigned long long>(sq_before_timeout.rejected),
-				cq_before_timeout.pending,
-				cq_before_timeout.active,
-				static_cast<unsigned long long>(cq_before_timeout.rejected));
+				static_cast<unsigned long long>(rt_before_timeout.work_queue_pending),
+				rt_before_timeout.work_queue_active,
+				static_cast<unsigned long long>(rt_before_timeout.service_queue_pending),
+				rt_before_timeout.service_queue_active,
+				static_cast<unsigned long long>(rt_before_timeout.critical_queue_pending),
+				rt_before_timeout.critical_queue_active,
+				static_cast<unsigned long long>(rt_before_timeout.total_rejected));
 			const bool parse_timeout_scheduled = schedule_loading_timeout(mod_copy, generation, k_explicit_pdb_load_timeout_ms, "parse");
-			auto wq_after_timeout = work_queue::stats();
-			auto sq_after_timeout = work_queue::service_stats();
-			auto cq_after_timeout = critical_work_queue::stats();
+			auto rt_after_timeout = aida::infra::taskflow_runtime::active_snapshot();
 			diag::log_tagged_fmt("symbol_store",
-				"explicit_pdb_timeout_schedule_end module=%s path='%s' file_size=%llu generation=%llu phase=parse scheduled=%d timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+				"explicit_pdb_timeout_schedule_end module=%s path='%s' file_size=%llu generation=%llu phase=parse scheduled=%d timeout_ms=%u work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 				mod_copy.c_str(),
 				path_copy.c_str(),
 				static_cast<unsigned long long>(file_size_copy),
 				static_cast<unsigned long long>(generation),
 				parse_timeout_scheduled ? 1 : 0,
 				k_explicit_pdb_load_timeout_ms,
-				wq_after_timeout.pending,
-				wq_after_timeout.active,
-				static_cast<unsigned long long>(wq_after_timeout.rejected),
-				sq_after_timeout.pending,
-				sq_after_timeout.active,
-				static_cast<unsigned long long>(sq_after_timeout.rejected),
-				cq_after_timeout.pending,
-				cq_after_timeout.active,
-				static_cast<unsigned long long>(cq_after_timeout.rejected));
+				static_cast<unsigned long long>(rt_after_timeout.work_queue_pending),
+				rt_after_timeout.work_queue_active,
+				static_cast<unsigned long long>(rt_after_timeout.service_queue_pending),
+				rt_after_timeout.service_queue_active,
+				static_cast<unsigned long long>(rt_after_timeout.critical_queue_pending),
+				rt_after_timeout.critical_queue_active,
+				static_cast<unsigned long long>(rt_after_timeout.total_rejected));
 			pdb_parser::pdb_info_t info;
 			std::atomic<float> parse_progress{0.f};
 			std::string search_path = std::filesystem::path(path_copy).parent_path().string();
@@ -1386,9 +1375,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					continue;
 				}
 				const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
-				auto wq = work_queue::stats();
-				auto sq = work_queue::service_stats();
-				auto cq = critical_work_queue::stats();
+				auto rt = aida::infra::taskflow_runtime::active_snapshot();
 				{
 					std::lock_guard<std::mutex> lk(g_state.mutex);
 					auto it = g_state.modules.find(mod_copy);
@@ -1399,7 +1386,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					}
 				}
 				diag::log_tagged_critical_fmt("symbol_store",
-					"explicit_pdb_parse_monitor_giveup module=%s generation=%llu path='%s' file_size=%llu attempts=%d err='%s' parser_diag=\"%s\" work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu",
+					"explicit_pdb_parse_monitor_giveup module=%s generation=%llu path='%s' file_size=%llu attempts=%d err='%s' parser_diag=\"%s\" work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu",
 					mod_copy.c_str(),
 					static_cast<unsigned long long>(generation),
 					path_copy.c_str(),
@@ -1407,15 +1394,13 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					k_parse_monitor_max_attempts,
 					mon_err.c_str(),
 					parser_diag.c_str(),
-					wq.pending,
-					wq.active,
-					static_cast<unsigned long long>(wq.rejected),
-					sq.pending,
-					sq.active,
-					static_cast<unsigned long long>(sq.rejected),
-					cq.pending,
-					cq.active,
-					static_cast<unsigned long long>(cq.rejected));
+					static_cast<unsigned long long>(rt.work_queue_pending),
+					rt.work_queue_active,
+					static_cast<unsigned long long>(rt.service_queue_pending),
+					rt.service_queue_active,
+					static_cast<unsigned long long>(rt.critical_queue_pending),
+					rt.critical_queue_active,
+					static_cast<unsigned long long>(rt.total_rejected));
 			}
 			auto stop_parse_monitor = [&]() {
 				parse_monitor_done.store(true, std::memory_order_release);
@@ -1586,71 +1571,60 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				detail.c_str(), GetTickCount64() - job_start);
 		}
 	};
-	auto wq_before_post = work_queue::stats();
-	auto sq_before_post = work_queue::service_stats();
-	auto cq_before_post = critical_work_queue::stats();
+	auto rt_before_post = aida::infra::taskflow_runtime::active_snapshot();
 	diag::log_tagged_fmt("symbol_store",
-		"explicit_pdb_parse_queue_begin module=%s path='%s' file_size=%llu generation=%llu work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
+		"explicit_pdb_parse_queue_begin module=%s path='%s' file_size=%llu generation=%llu work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu parser_diag=\"%s\"",
 		mod_copy.c_str(),
 		path_copy.c_str(),
 		static_cast<unsigned long long>(file_size_copy),
 		static_cast<unsigned long long>(generation),
-		wq_before_post.pending,
-		wq_before_post.active,
-		static_cast<unsigned long long>(wq_before_post.rejected),
-		sq_before_post.pending,
-		sq_before_post.active,
-		static_cast<unsigned long long>(sq_before_post.rejected),
-		cq_before_post.pending,
-		cq_before_post.active,
-		static_cast<unsigned long long>(cq_before_post.rejected),
+		static_cast<unsigned long long>(rt_before_post.work_queue_pending),
+		rt_before_post.work_queue_active,
+		static_cast<unsigned long long>(rt_before_post.service_queue_pending),
+		rt_before_post.service_queue_active,
+		static_cast<unsigned long long>(rt_before_post.critical_queue_pending),
+		rt_before_post.critical_queue_active,
+		static_cast<unsigned long long>(rt_before_post.total_rejected),
 		pdb_parser::dbghelp_load_diagnostic().c_str());
 	bool posted = false;
 	const char* posted_queue = "none";
 	try {
-		posted = critical_work_queue::post(parse_job);
+		aida::infra::executor::submission_t parse_sub;
+		parse_sub.owner_subsystem = "symbol_store";
+		parse_sub.label = "symbol_store.explicit_pdb_parse";
+		parse_sub.thread_class = "external_tool";
+		parse_sub.domain = aida::infra::executor::domain_t::external_tool;
+		parse_sub.priority = 1;
+		parse_sub.generation = generation;
+		parse_sub.target_id = mod_copy.c_str();
+		parse_sub.failure_policy = "reject_not_started";
+		parse_sub.body = std::move(parse_job);
+		posted = aida::infra::executor::submit(std::move(parse_sub)).submitted;
 		if (posted)
-			posted_queue = "critical";
+			posted_queue = "external_tool";
 	} catch (const std::exception& ex) {
-		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=critical module=%s path='%s' file_size=%llu generation=%llu err=%s",
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=external_tool module=%s path='%s' file_size=%llu generation=%llu err=%s",
 			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation), ex.what());
 	} catch (...) {
-		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=critical module=%s path='%s' file_size=%llu generation=%llu err=<unknown>",
+		diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=external_tool module=%s path='%s' file_size=%llu generation=%llu err=<unknown>",
 			mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation));
 	}
-	if (!posted) {
-		try {
-			posted = work_queue::post(parse_job);
-			if (posted)
-				posted_queue = "work";
-		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=work module=%s path='%s' file_size=%llu generation=%llu err=%s",
-				mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation), ex.what());
-		} catch (...) {
-			diag::log_tagged_fmt("symbol_store", "explicit_pdb_parse_queue_exception queue=work module=%s path='%s' file_size=%llu generation=%llu err=<unknown>",
-				mod_copy.c_str(), path_copy.c_str(), static_cast<unsigned long long>(file_size_copy), static_cast<unsigned long long>(generation));
-		}
-	}
-	auto wq_after_post = work_queue::stats();
-	auto sq_after_post = work_queue::service_stats();
-	auto cq_after_post = critical_work_queue::stats();
+	auto rt_after_post = aida::infra::taskflow_runtime::active_snapshot();
 	diag::log_tagged_fmt("symbol_store",
-		"explicit_pdb_parse_queue_end module=%s path='%s' file_size=%llu generation=%llu posted=%d queue=%s work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
+		"explicit_pdb_parse_queue_end module=%s path='%s' file_size=%llu generation=%llu posted=%d queue=%s work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu parser_diag=\"%s\"",
 		mod_copy.c_str(),
 		path_copy.c_str(),
 		static_cast<unsigned long long>(file_size_copy),
 		static_cast<unsigned long long>(generation),
 		posted ? 1 : 0,
 		posted_queue,
-		wq_after_post.pending,
-		wq_after_post.active,
-		static_cast<unsigned long long>(wq_after_post.rejected),
-		sq_after_post.pending,
-		sq_after_post.active,
-		static_cast<unsigned long long>(sq_after_post.rejected),
-		cq_after_post.pending,
-		cq_after_post.active,
-		static_cast<unsigned long long>(cq_after_post.rejected),
+		static_cast<unsigned long long>(rt_after_post.work_queue_pending),
+		rt_after_post.work_queue_active,
+		static_cast<unsigned long long>(rt_after_post.service_queue_pending),
+		rt_after_post.service_queue_active,
+		static_cast<unsigned long long>(rt_after_post.critical_queue_pending),
+		rt_after_post.critical_queue_active,
+		static_cast<unsigned long long>(rt_after_post.total_rejected),
 		pdb_parser::dbghelp_load_diagnostic().c_str());
 	if (!posted) {
 		const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
@@ -1678,47 +1652,39 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 		}
 		aida::events::publish(aida::events::event_pdb_loaded_def, ev_payload);
 	} else {
-		auto wq_before_timeout = work_queue::stats();
-		auto sq_before_timeout = work_queue::service_stats();
-		auto cq_before_timeout = critical_work_queue::stats();
+		auto rt_before_timeout = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("symbol_store",
-			"explicit_pdb_timeout_schedule_begin module=%s path='%s' file_size=%llu generation=%llu phase=queue timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
+			"explicit_pdb_timeout_schedule_begin module=%s path='%s' file_size=%llu generation=%llu phase=queue timeout_ms=%u work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu parser_diag=\"%s\"",
 			module_name.c_str(),
 			path_copy.c_str(),
 			static_cast<unsigned long long>(file_size_copy),
 			static_cast<unsigned long long>(generation),
 			k_explicit_pdb_load_timeout_ms,
-			wq_before_timeout.pending,
-			wq_before_timeout.active,
-			static_cast<unsigned long long>(wq_before_timeout.rejected),
-			sq_before_timeout.pending,
-			sq_before_timeout.active,
-			static_cast<unsigned long long>(sq_before_timeout.rejected),
-			cq_before_timeout.pending,
-			cq_before_timeout.active,
-			static_cast<unsigned long long>(cq_before_timeout.rejected),
+			static_cast<unsigned long long>(rt_before_timeout.work_queue_pending),
+			rt_before_timeout.work_queue_active,
+			static_cast<unsigned long long>(rt_before_timeout.service_queue_pending),
+			rt_before_timeout.service_queue_active,
+			static_cast<unsigned long long>(rt_before_timeout.critical_queue_pending),
+			rt_before_timeout.critical_queue_active,
+			static_cast<unsigned long long>(rt_before_timeout.total_rejected),
 			pdb_parser::dbghelp_load_diagnostic().c_str());
 		const bool queue_timeout_scheduled = schedule_loading_timeout(module_name, generation, k_explicit_pdb_load_timeout_ms, "queue");
-		auto wq_after_timeout = work_queue::stats();
-		auto sq_after_timeout = work_queue::service_stats();
-		auto cq_after_timeout = critical_work_queue::stats();
+		auto rt_after_timeout = aida::infra::taskflow_runtime::active_snapshot();
 		diag::log_tagged_fmt("symbol_store",
-			"explicit_pdb_timeout_schedule_end module=%s path='%s' file_size=%llu generation=%llu phase=queue scheduled=%d timeout_ms=%u work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu parser_diag=\"%s\"",
+			"explicit_pdb_timeout_schedule_end module=%s path='%s' file_size=%llu generation=%llu phase=queue scheduled=%d timeout_ms=%u work_pending=%llu work_active=%u service_pending=%llu service_active=%u critical_pending=%llu critical_active=%u total_rejected=%llu parser_diag=\"%s\"",
 			module_name.c_str(),
 			path_copy.c_str(),
 			static_cast<unsigned long long>(file_size_copy),
 			static_cast<unsigned long long>(generation),
 			queue_timeout_scheduled ? 1 : 0,
 			k_explicit_pdb_load_timeout_ms,
-			wq_after_timeout.pending,
-			wq_after_timeout.active,
-			static_cast<unsigned long long>(wq_after_timeout.rejected),
-			sq_after_timeout.pending,
-			sq_after_timeout.active,
-			static_cast<unsigned long long>(sq_after_timeout.rejected),
-			cq_after_timeout.pending,
-			cq_after_timeout.active,
-			static_cast<unsigned long long>(cq_after_timeout.rejected),
+			static_cast<unsigned long long>(rt_after_timeout.work_queue_pending),
+			rt_after_timeout.work_queue_active,
+			static_cast<unsigned long long>(rt_after_timeout.service_queue_pending),
+			rt_after_timeout.service_queue_active,
+			static_cast<unsigned long long>(rt_after_timeout.critical_queue_pending),
+			rt_after_timeout.critical_queue_active,
+			static_cast<unsigned long long>(rt_after_timeout.total_rejected),
 			pdb_parser::dbghelp_load_diagnostic().c_str());
 	}
 }

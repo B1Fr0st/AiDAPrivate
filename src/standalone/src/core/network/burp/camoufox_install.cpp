@@ -8,7 +8,7 @@
 #include "camoufox_install.hpp"
 #include "camoufox_bridge.hpp"
 
-#include "../../infra/work_queue.hpp"
+#include "../../infra/executor.hpp"
 #include "../../ui/embedded_resources.hpp"
 #include "../../../helpers/diag_log.hpp"
 
@@ -36,6 +36,7 @@
 #include <vector>
 
 #include <zlib.h>
+#include <utility>
 
 namespace aida {
 namespace burp {
@@ -3458,11 +3459,20 @@ bool pip_install_async()
         sg().last_error = "install task already running";
         return false;
     }
-    bool posted = work_queue::post([]() {
+    bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.camoufox_install";
+        sub.label = "camoufox.pip_install";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         std::string log;
         try { pip_install_module(log); } catch (...) {}
         sg().busy.store(false, std::memory_order_release);
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
     if (!posted) sg().busy.store(false, std::memory_order_release);
     return posted;
 }
@@ -3476,11 +3486,20 @@ bool repair_runtime_dependencies_async()
         sg().last_error = "install task already running";
         return false;
     }
-    bool posted = work_queue::post([]() {
+    bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.camoufox_install";
+        sub.label = "camoufox.repair_runtime";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         std::string log;
         try { repair_runtime_dependencies(log); } catch (...) {}
         sg().busy.store(false, std::memory_order_release);
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
     if (!posted) sg().busy.store(false, std::memory_order_release);
     return posted;
 }
@@ -3494,11 +3513,20 @@ bool fetch_browser_async()
         sg().last_error = "install task already running";
         return false;
     }
-    bool posted = work_queue::post([]() {
+    bool posted = [&]() {
+        ::aida::infra::executor::submission_t sub;
+        sub.owner_subsystem = "burp.camoufox_install";
+        sub.label = "camoufox.fetch_browser";
+        sub.thread_class = "bounded_task";
+        sub.domain = aida::infra::executor::domain_t::external_tool;
+        sub.priority = 3;
+        sub.body = []() {
         std::string log;
         try { fetch_browser(log); } catch (...) {}
         sg().busy.store(false, std::memory_order_release);
-    });
+    };
+        return ::aida::infra::executor::submit(std::move(sub)).submitted;
+    }();
     if (!posted) sg().busy.store(false, std::memory_order_release);
     return posted;
 }

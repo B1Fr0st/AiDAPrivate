@@ -33,7 +33,7 @@
 #include "skeleton.hpp"
 #include "fonts.hpp"
 #include "hex_view.hpp"
-#include "work_queue.hpp"
+#include "../infra/executor.hpp"
 #include "toast_notification.hpp"
 #include "../session/analysis_session.hpp"
 #include "../analysis/stealth_engine.hpp"
@@ -2134,7 +2134,14 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 					uint64_t size_copy = dump_target.size;
 					std::string path_copy = path_buf;
 					std::string name_copy = dump_target.name;
-					work_queue::post([base_copy, size_copy, path_copy, name_copy]() {
+					aida::infra::executor::submission_t sub;
+					sub.owner_subsystem = "debugger";
+					sub.label = "debugger.module_dump";
+					sub.thread_class = "debugger_dump";
+					sub.domain = aida::infra::executor::domain_t::feature_worker;
+					sub.priority = 2;
+					sub.target_pid = driver_bridge::attached_pid();
+					sub.body = [base_copy, size_copy, path_copy, name_copy]() {
 						std::vector<uint8_t> buf;
 						bool read_ok = driver_bridge::read_memory(base_copy,
 							static_cast<size_t>(size_copy), buf);
@@ -2172,7 +2179,17 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 							toast_notification::push("Module dump failed.",
 								toast_notification::toast_type_t::error);
 						}
-					});
+					};
+					if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+						diag::log_tagged_critical_fmt("modules",
+							"modules_dump_post_failed name='%s' base=0x%llx size=%llu path='%s'",
+							name_copy.c_str(),
+							static_cast<unsigned long long>(base_copy),
+							static_cast<unsigned long long>(size_copy),
+							path_copy.c_str());
+						toast_notification::push("Module dump queue rejected the task.",
+							toast_notification::toast_type_t::error);
+					}
 				}
 			}
 		}
@@ -2720,11 +2737,22 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 		if (!busy && now_ms - last > 500) {
 			bool expected = false;
 			if (s_in_flight.compare_exchange_strong(expected, true)) {
-				work_queue::post([now_ms]() {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "debugger";
+				sub.label = "debugger.call_stack_refresh";
+				sub.thread_class = "debugger_refresh";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 3;
+				sub.target_pid = driver_bridge::attached_pid();
+				sub.body = [now_ms]() {
 					debugger_engine::get_call_stack();
 					s_last_refresh_ms.store(now_ms, std::memory_order_release);
 					s_in_flight.store(false, std::memory_order_release);
-				});
+				};
+				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+					diag::log_tagged("debugger", "call_stack_refresh_post_failed");
+					s_in_flight.store(false, std::memory_order_release);
+				}
 			}
 		}
 	}
@@ -3928,7 +3956,14 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 			static_cast<unsigned>(driver_bridge::attached_pid()));
 		anti_tamper::webhook::write_log("dbg_audit",
 			"[dbg_audit] handles enumerate ok=1");
-		work_queue::post([]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "debugger";
+		sub.label = "debugger.handles_enumerate";
+		sub.thread_class = "debugger_refresh";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.target_pid = driver_bridge::attached_pid();
+		sub.body = []() {
 			debugger_engine::enumerate_handles();
 			size_t n = 0;
 			{
@@ -3938,7 +3973,9 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 			}
 			diag::log_tagged_fmt("handles",
 				"handles_enumerate_done count=%zu", n);
-		});
+		};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted)
+			diag::log_tagged("handles", "handles_enumerate_post_failed");
 	}
 	ImGui::PopID();
 
@@ -4102,7 +4139,16 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 			if (ok) {
 				toast_notification::push("Handle closed in target.",
 					toast_notification::toast_type_t::info);
-				work_queue::post([]() { debugger_engine::enumerate_handles(); });
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "debugger";
+				sub.label = "debugger.handles_refresh_after_close";
+				sub.thread_class = "debugger_refresh";
+				sub.domain = aida::infra::executor::domain_t::feature_worker;
+				sub.priority = 3;
+				sub.target_pid = target_pid;
+				sub.body = []() { debugger_engine::enumerate_handles(); };
+				if (!aida::infra::executor::submit(std::move(sub)).submitted)
+					diag::log_tagged("handles", "handles_refresh_after_close_post_failed");
 			} else {
 				toast_notification::push("Kernel handle close failed.",
 					toast_notification::toast_type_t::error);
@@ -4726,7 +4772,13 @@ void render(float pos_x, float pos_y, float width, float height,
 		opts.exe_path    = std::move(spawn_result.exe_path);
 		opts.args        = std::move(spawn_result.args);
 		opts.working_dir = std::move(spawn_result.working_dir);
-		work_queue::post([opts]() {
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "debugger";
+		sub.label = "debugger.spawn_attach";
+		sub.thread_class = "debugger_launch";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 2;
+		sub.body = [opts]() {
 			uint32_t new_pid = 0;
 			run_target::launch_result_t lr{};
 			bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, &lr);
@@ -4759,7 +4811,10 @@ void render(float pos_x, float pos_y, float width, float height,
 				toast_notification::push(ok_msg,
 					toast_notification::toast_type_t::success);
 			}
-		});
+		};
+		if (!aida::infra::executor::submit(std::move(sub)).submitted)
+			toast_notification::push("Launch queue rejected the task.",
+				toast_notification::toast_type_t::error);
 	}
 }
 
