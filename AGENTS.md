@@ -16,9 +16,11 @@ AiDA uses CMake 3.25+ with Ninja generator and MSVC (Visual Studio 2022 Professi
 
 ## Subagent Policy
 
-**For very massive tasks (large refactors, multi-file redesigns, UI overhauls, cross-module implementations), the host AI MUST dispatch GPT-5.5 implementer/designer subagents.** Solo inline-editing on big jobs is wrong; parallel implementer/designer subagents with surgical briefs is the default.
+**Every subagent must use exactly `gpt-5.6-sol max`, regardless of role or task size.** This applies to planners, implementers, designers, investigators, auditors, fixers, reviewers, and verifiers. Never spawn a subagent with `gpt-5.6-sol ultra`, `gpt-5.5xhigh`, any GPT-5.5 variant, an automatic/default model, or any other model or reasoning tier. The root orchestrator is already configured as `gpt-5.6-sol ultra`; that tier is reserved for the root and must not be inherited by subagents. If `gpt-5.6-sol max` is unavailable, report the blocker instead of substituting another model.
 
-For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tamper, or driver-backed debugging tasks, use a dedicated GPT-5.5 xhigh subagent when the investigation spans multiple files or needs heavy instrumentation. The most valuable subagent pattern for this repo is a tightly scoped logging/instrumentation implementer: give it the exact evidence window from logs, tell it to add comprehensive breadcrumbs across that path, and forbid it from diagnosing beyond evidence or building.
+**For very massive tasks (large refactors, multi-file redesigns, UI overhauls, cross-module implementations), the host AI MUST dispatch `gpt-5.6-sol max` implementer/designer subagents.** Solo inline-editing on big jobs is wrong; parallel implementer/designer subagents with surgical briefs is the default.
+
+For serious crash, hang, Test Lab, MCP startup, Runtime Integrity Lock, anti-tamper, or driver-backed debugging tasks, use a dedicated `gpt-5.6-sol max` subagent when the investigation spans multiple files or needs heavy instrumentation. The most valuable subagent pattern for this repo is a tightly scoped logging/instrumentation implementer: give it the exact evidence window from logs, tell it to add comprehensive breadcrumbs across that path, and forbid it from diagnosing beyond evidence or building.
 
 **SUBAGENTS ARE FORBIDDEN FROM BUILDING. NEVER. UNDER ANY CIRCUMSTANCE.**
 
@@ -81,7 +83,7 @@ The rules from `RULES.MD` apply to AiDA's real architecture: C++ clients, Node/E
 
 - The user strongly prefers evidence-driven work over theories. Do not speculate, even with symbols/PDBs, when logs can be made better.
 - Do not add only a few debug logs, build, ask for a run, then repeat the same cycle. For confirmed crash/hang windows, instrument the whole narrow subsystem deeply enough to identify entry, exit, state, timing, and failing call in one reproduction whenever possible.
-- When the problem is broad or high-stakes, dispatch a GPT-5.5 xhigh subagent specifically for comprehensive debug logging or implementation, then the host reviews, patches if needed, and builds.
+- When the problem is broad or high-stakes, dispatch a `gpt-5.6-sol max` subagent specifically for comprehensive debug logging or implementation, then the host reviews, patches if needed, and builds.
 - Creating small local test apps, focused repro harnesses, or API-behavior probes is encouraged when it can safely validate a low-level change before touching the protected app. Keep these tests focused, do not weaken protections, and do not run driver/anti-tamper paths casually.
 - The user wants AiDA to be extremely stable and secure at the same time. Never trade anti-tamper, license, ARC, driver, or protector strength for convenience or to make tests pass.
 - Debug logs are intentionally retained during pre-release development. They are evidence, not a vulnerability category. When adding debug logs, prefer complete diagnostic capture over cosmetic sanitization; do not remove or weaken logs merely because they include sensitive state or payload context needed to prove a failure. Keep raw credentials, private keys, signing keys, KMS/HSM material, OAuth bearer tokens, and API keys out of logs unless the user explicitly directs a controlled local diagnostic capture.
