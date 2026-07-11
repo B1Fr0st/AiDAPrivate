@@ -24,6 +24,7 @@
 #include "toast_notification.hpp"
 #include "standalone_anti_dump.hpp"
 #include "anti-tamper/state.hpp"
+#include "anti-tamper/syscall.hpp"
 #include "anti-tamper/virtualizer.hpp"
 #include "anti-tamper/vm_compiler.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -40,6 +41,7 @@
 #pragma comment(lib, "bcrypt.lib")
 
 #include "anti-tamper/webhook.hpp"
+#include "anti-tamper/orchestrator.hpp"
 
 namespace standalone_anti_tamper
 {
@@ -120,15 +122,28 @@ namespace detect
 
     inline bool check_debug_port()
     {
-        using NtQueryInfoProc_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-        auto pNtQuery = reinterpret_cast<NtQueryInfoProc_t>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+        if (!anti_tamper::syscall::is_initialized()) return false;
+
+        auto pNtQuery = anti_tamper::syscall::NtQueryInformationProcess();
         if (!pNtQuery) return false;
 
         ULONG_PTR debug_port = 0;
         NTSTATUS st = pNtQuery(GetCurrentProcess(), 7, &debug_port,
             sizeof(debug_port), nullptr);
-        if (st >= 0 && debug_port != 0) return true;
+        if (st >= 0 && debug_port != 0)
+        {
+            if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+            {
+                diag::log_tagged_critical_fmt("runtime_enforce",
+                    "trigger_kernel_bsod reason=debug_port text_hash=0x%016llX",
+                    static_cast<unsigned long long>(state::get().code_snap.text_hash));
+                driver_bridge::trigger_kernel_bsod(
+                    0x0002u,
+                    state::get().code_snap.text_hash
+                );
+            }
+            return true;
+        }
 
         HANDLE debug_obj = nullptr;
         st = pNtQuery(GetCurrentProcess(), 0x1E, &debug_obj,
@@ -182,29 +197,16 @@ namespace detect
         return false;
     }
 
-    inline bool check_timing_anomaly()
-    {
-        volatile uint64_t t0 = __rdtsc();
-
-        volatile uint64_t acc = 0;
-        for (volatile int i = 0; i < 100; ++i)
-            acc += i * i;
-
-        volatile uint64_t t1 = __rdtsc();
-        uint64_t delta = t1 - t0;
-
-        return delta > 10000000ULL;
-    }
-
     inline bool check_kernel_debugger()
     {
+        if (!anti_tamper::syscall::is_initialized()) return false;
+
         struct kernel_debugger_information_t {
             BOOLEAN KernelDebuggerEnabled;
             BOOLEAN KernelDebuggerNotPresent;
         } kd_info{};
-        using NtQuerySystemInformation_t = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
-        auto pQuery = reinterpret_cast<NtQuerySystemInformation_t>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+
+        auto pQuery = anti_tamper::syscall::NtQuerySystemInformation();
         if (!pQuery) return false;
 
         NTSTATUS st = pQuery(0x23, &kd_info, sizeof(kd_info), nullptr);
@@ -216,9 +218,9 @@ namespace detect
 
     inline bool check_thread_hiding()
     {
-        using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-        auto pQuery = reinterpret_cast<NtQueryInformationThread_t>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+        if (!anti_tamper::syscall::is_initialized()) return false;
+
+        auto pQuery = anti_tamper::syscall::NtQueryInformationThread();
         if (!pQuery) return false;
 
         ULONG hidden = 0;
@@ -703,11 +705,6 @@ inline bool run_verification_cycle()
             enforce_violation("re_tool_loaded_binary");
             return false;
         }
-
-        if (detect::check_timing_anomaly())
-        {
-            webhook::send_debug_log("timing", "rdtsc_anomaly (informational)", false);
-        }
     }
 
 
@@ -853,6 +850,16 @@ inline bool initialize()
         return false;
     }
     diag::log_tagged("anti_tamper", "initialize_anti_dump_done");
+
+    diag::log_tagged("dma_preflight", "tier1_preflight_check_begin");
+    bool dma_refused = anti_tamper::check_dma_preflight();
+    if (dma_refused)
+    {
+        diag::log_tagged_critical("dma_preflight", "tier1_preflight_refused_exiting");
+        rt.initialized.store(false);
+        return false;
+    }
+    diag::log_tagged("dma_preflight", "tier1_preflight_check_passed");
 
     rt.initialized.store(true);
 

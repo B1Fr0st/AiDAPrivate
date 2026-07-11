@@ -21,6 +21,7 @@
 #include "standalone_settings.hpp"
 #include "session_store.hpp"
 #include "binary_map.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "standalone_chat.hpp"
 #include "mcp_standalone.hpp"
 #include "cost_calculator.hpp"
@@ -129,13 +130,15 @@ namespace task {
 			       cancel_flag->load(std::memory_order_acquire);
 		};
 
+		auto ws = aida::analysis::workspace_registry().selected_for_ui();
+
 		aida::infra::executor::submission_t sub;
 		sub.owner_subsystem = "ai_agent_task";
 		sub.label = "agent_task.execute";
 		sub.thread_class = "bounded_task";
 		sub.domain = aida::infra::executor::domain_t::external_tool;
 		sub.priority = 3;
-		sub.body = [&]() {
+		sub.body = [&, ws]() {
 			std::unique_ptr<standalone_ai_client_t> local_client;
 			try {
 				local_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
@@ -176,7 +179,7 @@ namespace task {
 
 				std::string system_prompt = agent.system_prompt;
 				{
-					std::string injected = aida::binary_map::auto_inject_text(4096);
+					std::string injected = ws ? aida::binary_map::auto_inject_text(ws, 4096) : std::string{};
 					if (!injected.empty()) {
 						system_prompt += "\n\n# Binary Map (auto-generated)\n";
 						system_prompt += injected;

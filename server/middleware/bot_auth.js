@@ -88,9 +88,81 @@ function authenticate(req, res, next) {
     return next();
 }
 
+let s_adminKey = null;
+
+function getAdminKey() {
+    if (s_adminKey) return s_adminKey;
+    const direct = String(process.env.ADMIN_HMAC_SECRET_B64 || '').trim();
+    if (direct) {
+        const buf = Buffer.from(direct, 'base64');
+        if (buf.length >= 32) {
+            s_adminKey = buf;
+            return s_adminKey;
+        }
+    }
+    const master = String(process.env.SERVER_MASTER_KEY_B64 || '').trim();
+    if (master) {
+        const buf = Buffer.from(master, 'base64');
+        if (buf.length !== 32) throw new Error('admin_hmac_master_key_invalid');
+        s_adminKey = crypto.createHmac('sha256', buf).update('aida/admin-hmac/v1', 'utf8').digest();
+        return s_adminKey;
+    }
+    throw new Error('admin_hmac_key_unavailable');
+}
+
+function canonicalizeAdmin(payload) {
+    const filtered = Object.keys(payload || {})
+        .filter(k => !k.startsWith('__') && k !== 'signature')
+        .sort();
+    return JSON.stringify(filtered.reduce((acc, k) => {
+        acc[k] = payload[k];
+        return acc;
+    }, {}));
+}
+
+function verifyAdminRequest(req) {
+    try {
+        const sigHex = String(req.headers['x-admin-signature'] || '').trim().toLowerCase();
+        if (!sigHex || !/^[0-9a-f]{64}$/.test(sigHex)) {
+            return { ok: false, reason: 'admin_signature_missing' };
+        }
+        const body = req.body;
+        if (!body || typeof body !== 'object') {
+            return { ok: false, reason: 'admin_body_missing' };
+        }
+        const ts = Number(body.ts);
+        if (!Number.isFinite(ts)) {
+            return { ok: false, reason: 'admin_timestamp_missing' };
+        }
+        const now = Math.floor(Date.now() / 1000);
+        if (Math.abs(now - ts) > MAX_TIMESTAMP_DRIFT_SECONDS) {
+            return { ok: false, reason: 'admin_timestamp_drift' };
+        }
+        const nonce = String(body.nonce || '').trim().toLowerCase();
+        if (!nonce || !/^[0-9a-f]{32,128}$/.test(nonce)) {
+            return { ok: false, reason: 'admin_nonce_invalid' };
+        }
+        const canonical = canonicalizeAdmin(body);
+        const expected = crypto.createHmac('sha256', getAdminKey()).update(canonical, 'utf8').digest();
+        const providedBuf = Buffer.from(sigHex, 'hex');
+        if (providedBuf.length !== expected.length) {
+            return { ok: false, reason: 'admin_signature_invalid' };
+        }
+        if (!crypto.timingSafeEqual(expected, providedBuf)) {
+            return { ok: false, reason: 'admin_signature_invalid' };
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, reason: 'admin_key_error' };
+    }
+}
+
 module.exports = {
     authenticate,
     verifyBotRequest,
     canonicalize,
     getBotPublicKey,
+    verifyAdminRequest,
+    getAdminKey,
+    canonicalizeAdmin,
 };

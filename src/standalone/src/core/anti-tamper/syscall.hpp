@@ -27,7 +27,7 @@ namespace syscall {
 
 namespace detail {
 
-    constexpr uint32_t kSlotCount = 16;
+    constexpr uint32_t kSlotCount = 32;
     constexpr uint32_t kEntryNtQueryInformationProcess = 0;
     constexpr uint32_t kEntryNtQuerySystemInformation  = 1;
     constexpr uint32_t kEntryNtQueryVirtualMemory      = 2;
@@ -38,6 +38,16 @@ namespace detail {
     constexpr uint32_t kEntryNtOpenProcessToken        = 7;
     constexpr uint32_t kEntryNtOpenThreadToken         = 8;
     constexpr uint32_t kEntryNtAdjustPrivilegesToken   = 9;
+    constexpr uint32_t kEntryNtSuspendProcess          = 10;
+    constexpr uint32_t kEntryNtResumeProcess           = 11;
+    constexpr uint32_t kEntryNtProtectVirtualMemory    = 12;
+    constexpr uint32_t kEntryNtGetContextThread        = 13;
+    constexpr uint32_t kEntryNtReadVirtualMemory       = 14;
+    constexpr uint32_t kEntryNtWriteVirtualMemory      = 15;
+    constexpr uint32_t kEntryNtAllocateVirtualMemory   = 16;
+    constexpr uint32_t kEntryNtFreeVirtualMemory       = 17;
+    constexpr uint32_t kEntryNtOpenProcess             = 18;
+    constexpr uint32_t kEntryNtCreateFile              = 19;
 
     struct slot_t
     {
@@ -361,6 +371,46 @@ using NtAdjustPrivilegesToken_t = NTSTATUS(NTAPI*)(
 using RtlAdjustPrivilege_t = NTSTATUS(NTAPI*)(
     ULONG Privilege, BOOLEAN Enable, BOOLEAN Client, PBOOLEAN WasEnabled);
 
+using NtSuspendProcess_t = NTSTATUS(NTAPI*)(HANDLE ProcessHandle);
+
+using NtResumeProcess_t = NTSTATUS(NTAPI*)(HANDLE ProcessHandle);
+
+using NtProtectVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    PSIZE_T RegionSize, ULONG NewProtect,
+    PULONG OldProtect);
+
+using NtGetContextThread_t = NTSTATUS(NTAPI*)(
+    HANDLE ThreadHandle, CONTEXT* Context);
+
+using NtReadVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID BaseAddress,
+    PVOID Buffer, SIZE_T Size, PSIZE_T BytesRead);
+
+using NtWriteVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID BaseAddress,
+    PVOID Buffer, SIZE_T Size, PSIZE_T BytesWritten);
+
+using NtAllocateVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    ULONG_PTR ZeroBits, PSIZE_T RegionSize,
+    ULONG AllocationType, ULONG Protect);
+
+using NtFreeVirtualMemory_t = NTSTATUS(NTAPI*)(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    PSIZE_T RegionSize, ULONG FreeType);
+
+using NtOpenProcess_t = NTSTATUS(NTAPI*)(
+    PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, PVOID ClientId);
+
+using NtCreateFile_t = NTSTATUS(NTAPI*)(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, PVOID IoStatusBlock,
+    LARGE_INTEGER* AllocationSize, ULONG FileAttributes,
+    ULONG ShareAccess, ULONG CreateDisposition,
+    ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength);
+
 namespace detail {
 
     template <typename Fn>
@@ -424,6 +474,16 @@ inline bool initialize()
     ok &= detail::resolve_slot(detail::kEntryNtOpenProcessToken,        "NtOpenProcessToken");
     ok &= detail::resolve_slot(detail::kEntryNtOpenThreadToken,         "NtOpenThreadToken");
     ok &= detail::resolve_slot(detail::kEntryNtAdjustPrivilegesToken,   "NtAdjustPrivilegesToken");
+    ok &= detail::resolve_slot(detail::kEntryNtSuspendProcess,          "NtSuspendProcess");
+    ok &= detail::resolve_slot(detail::kEntryNtResumeProcess,           "NtResumeProcess");
+    ok &= detail::resolve_slot(detail::kEntryNtProtectVirtualMemory,    "NtProtectVirtualMemory");
+    ok &= detail::resolve_slot(detail::kEntryNtGetContextThread,        "NtGetContextThread");
+    ok &= detail::resolve_slot(detail::kEntryNtReadVirtualMemory,       "NtReadVirtualMemory");
+    ok &= detail::resolve_slot(detail::kEntryNtWriteVirtualMemory,      "NtWriteVirtualMemory");
+    ok &= detail::resolve_slot(detail::kEntryNtAllocateVirtualMemory,   "NtAllocateVirtualMemory");
+    ok &= detail::resolve_slot(detail::kEntryNtFreeVirtualMemory,       "NtFreeVirtualMemory");
+    ok &= detail::resolve_slot(detail::kEntryNtOpenProcess,             "NtOpenProcess");
+    ok &= detail::resolve_slot(detail::kEntryNtCreateFile,              "NtCreateFile");
 
     t.initialized.store(ok, std::memory_order_release);
     return ok;
@@ -596,6 +656,122 @@ inline NTSTATUS call_RtlAdjustPrivilege(
     return status;
 }
 
+inline NTSTATUS call_NtSuspendProcess(HANDLE ProcessHandle)
+{
+    return detail::run_call(detail::kEntryNtSuspendProcess,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtSuspendProcess_t>(code);
+            return fn(ProcessHandle);
+        });
+}
+
+inline NTSTATUS call_NtResumeProcess(HANDLE ProcessHandle)
+{
+    return detail::run_call(detail::kEntryNtResumeProcess,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtResumeProcess_t>(code);
+            return fn(ProcessHandle);
+        });
+}
+
+inline NTSTATUS call_NtProtectVirtualMemory(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    PSIZE_T RegionSize, ULONG NewProtect,
+    PULONG OldProtect)
+{
+    return detail::run_call(detail::kEntryNtProtectVirtualMemory,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtProtectVirtualMemory_t>(code);
+            return fn(ProcessHandle, BaseAddress, RegionSize,
+                      NewProtect, OldProtect);
+        });
+}
+
+inline NTSTATUS call_NtGetContextThread(
+    HANDLE ThreadHandle, CONTEXT* Context)
+{
+    return detail::run_call(detail::kEntryNtGetContextThread,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtGetContextThread_t>(code);
+            return fn(ThreadHandle, Context);
+        });
+}
+
+inline NTSTATUS call_NtReadVirtualMemory(
+    HANDLE ProcessHandle, PVOID BaseAddress,
+    PVOID Buffer, SIZE_T Size, PSIZE_T BytesRead)
+{
+    return detail::run_call(detail::kEntryNtReadVirtualMemory,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtReadVirtualMemory_t>(code);
+            return fn(ProcessHandle, BaseAddress, Buffer, Size, BytesRead);
+        });
+}
+
+inline NTSTATUS call_NtWriteVirtualMemory(
+    HANDLE ProcessHandle, PVOID BaseAddress,
+    PVOID Buffer, SIZE_T Size, PSIZE_T BytesWritten)
+{
+    return detail::run_call(detail::kEntryNtWriteVirtualMemory,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtWriteVirtualMemory_t>(code);
+            return fn(ProcessHandle, BaseAddress, Buffer, Size, BytesWritten);
+        });
+}
+
+inline NTSTATUS call_NtAllocateVirtualMemory(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    ULONG_PTR ZeroBits, PSIZE_T RegionSize,
+    ULONG AllocationType, ULONG Protect)
+{
+    return detail::run_call(detail::kEntryNtAllocateVirtualMemory,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtAllocateVirtualMemory_t>(code);
+            return fn(ProcessHandle, BaseAddress, ZeroBits,
+                      RegionSize, AllocationType, Protect);
+        });
+}
+
+inline NTSTATUS call_NtFreeVirtualMemory(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    PSIZE_T RegionSize, ULONG FreeType)
+{
+    return detail::run_call(detail::kEntryNtFreeVirtualMemory,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtFreeVirtualMemory_t>(code);
+            return fn(ProcessHandle, BaseAddress, RegionSize, FreeType);
+        });
+}
+
+inline NTSTATUS call_NtOpenProcess(
+    PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, PVOID ClientId)
+{
+    return detail::run_call(detail::kEntryNtOpenProcess,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtOpenProcess_t>(code);
+            return fn(ProcessHandle, DesiredAccess,
+                      ObjectAttributes, ClientId);
+        });
+}
+
+inline NTSTATUS call_NtCreateFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, PVOID IoStatusBlock,
+    LARGE_INTEGER* AllocationSize, ULONG FileAttributes,
+    ULONG ShareAccess, ULONG CreateDisposition,
+    ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength)
+{
+    return detail::run_call(detail::kEntryNtCreateFile,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtCreateFile_t>(code);
+            return fn(FileHandle, DesiredAccess, ObjectAttributes,
+                      IoStatusBlock, AllocationSize, FileAttributes,
+                      ShareAccess, CreateDisposition,
+                      CreateOptions, EaBuffer, EaLength);
+        });
+}
+
 namespace adapters {
 
     inline NTSTATUS NTAPI adapter_NtQueryInformationProcess(
@@ -645,6 +821,67 @@ namespace adapters {
         return call_RtlAdjustPrivilege(p, e, c, w);
     }
 
+    inline NTSTATUS NTAPI adapter_NtSuspendProcess(HANDLE h)
+    {
+        return call_NtSuspendProcess(h);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtResumeProcess(HANDLE h)
+    {
+        return call_NtResumeProcess(h);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtProtectVirtualMemory(
+        HANDLE h, PVOID* ba, PSIZE_T rs, ULONG np, PULONG op)
+    {
+        return call_NtProtectVirtualMemory(h, ba, rs, np, op);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtGetContextThread(
+        HANDLE h, CONTEXT* c)
+    {
+        return call_NtGetContextThread(h, c);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtReadVirtualMemory(
+        HANDLE h, PVOID ba, PVOID buf, SIZE_T sz, PSIZE_T br)
+    {
+        return call_NtReadVirtualMemory(h, ba, buf, sz, br);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtWriteVirtualMemory(
+        HANDLE h, PVOID ba, PVOID buf, SIZE_T sz, PSIZE_T bw)
+    {
+        return call_NtWriteVirtualMemory(h, ba, buf, sz, bw);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtAllocateVirtualMemory(
+        HANDLE h, PVOID* ba, ULONG_PTR z, PSIZE_T rs,
+        ULONG at, ULONG p)
+    {
+        return call_NtAllocateVirtualMemory(h, ba, z, rs, at, p);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtFreeVirtualMemory(
+        HANDLE h, PVOID* ba, PSIZE_T rs, ULONG ft)
+    {
+        return call_NtFreeVirtualMemory(h, ba, rs, ft);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtOpenProcess(
+        PHANDLE h, ACCESS_MASK da, PVOID oa, PVOID ci)
+    {
+        return call_NtOpenProcess(h, da, oa, ci);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtCreateFile(
+        PHANDLE h, ACCESS_MASK da, PVOID oa, PVOID iosb,
+        LARGE_INTEGER* as, ULONG fa, ULONG sa, ULONG cd,
+        ULONG co, PVOID ea, ULONG eal)
+    {
+        return call_NtCreateFile(h, da, oa, iosb, as, fa, sa, cd, co, ea, eal);
+    }
+
 }
 
 inline NtQueryInformationProcess_t NtQueryInformationProcess()
@@ -685,6 +922,56 @@ inline NtRaiseHardError_t NtRaiseHardError()
 inline RtlAdjustPrivilege_t RtlAdjustPrivilege()
 {
     return &adapters::adapter_RtlAdjustPrivilege;
+}
+
+inline NtSuspendProcess_t NtSuspendProcess()
+{
+    return &adapters::adapter_NtSuspendProcess;
+}
+
+inline NtResumeProcess_t NtResumeProcess()
+{
+    return &adapters::adapter_NtResumeProcess;
+}
+
+inline NtProtectVirtualMemory_t NtProtectVirtualMemory()
+{
+    return &adapters::adapter_NtProtectVirtualMemory;
+}
+
+inline NtGetContextThread_t NtGetContextThread()
+{
+    return &adapters::adapter_NtGetContextThread;
+}
+
+inline NtReadVirtualMemory_t NtReadVirtualMemory()
+{
+    return &adapters::adapter_NtReadVirtualMemory;
+}
+
+inline NtWriteVirtualMemory_t NtWriteVirtualMemory()
+{
+    return &adapters::adapter_NtWriteVirtualMemory;
+}
+
+inline NtAllocateVirtualMemory_t NtAllocateVirtualMemory()
+{
+    return &adapters::adapter_NtAllocateVirtualMemory;
+}
+
+inline NtFreeVirtualMemory_t NtFreeVirtualMemory()
+{
+    return &adapters::adapter_NtFreeVirtualMemory;
+}
+
+inline NtOpenProcess_t NtOpenProcess()
+{
+    return &adapters::adapter_NtOpenProcess;
+}
+
+inline NtCreateFile_t NtCreateFile()
+{
+    return &adapters::adapter_NtCreateFile;
 }
 
 namespace detail {

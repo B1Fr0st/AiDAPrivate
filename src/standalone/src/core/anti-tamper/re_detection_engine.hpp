@@ -17,9 +17,11 @@
 #include "state.hpp"
 #include "enforcement.hpp"
 #include "anti_debug.hpp"
+#include "dr_check.hpp"
 #include "kernel_adbg_classifier.hpp"
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
+#include "self_guard.hpp"
 #include "../infra/win_thread.hpp"
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
@@ -42,6 +44,11 @@ constexpr uint32_t SIGNAL_THREAD_SUSPENDED  = 1u << 17;
 constexpr uint32_t SIGNAL_VEH_TAMPERED      = 1u << 18;
 constexpr uint32_t SIGNAL_DEBUG_REATTACH    = 1u << 19;
 constexpr uint32_t SIGNAL_KD_TARGETING_US   = 1u << 22;
+constexpr uint32_t SIGNAL_INT3_BREAKPOINT  = 1u << 20;
+constexpr uint32_t SIGNAL_VTABLE_HOOKED         = 1u << 23;
+constexpr uint32_t SIGNAL_KERNEL_CALLBACK_HOOKED = 1u << 24;
+constexpr uint32_t SIGNAL_SELF_HOOK_DETECTED     = 1u << 25;
+constexpr uint32_t SIGNAL_PROLOGUE_SERVER_MISMATCH = 1u << 26;
 
 constexpr uint32_t FAMILY_TARGET    = 0x01;
 constexpr uint32_t FAMILY_HANDLE    = 0x02;
@@ -98,6 +105,7 @@ inline const signal_desc_t& signals(uint32_t bit)
         { SIGNAL_THREAD_SUSPENDED, FAMILY_TARGET, "thread_suspended" },
         { SIGNAL_VEH_TAMPERED, FAMILY_INJECTION, "veh_tampered" },
         { SIGNAL_DEBUG_REATTACH, FAMILY_ATTACH, "debug_reattach" },
+        { SIGNAL_INT3_BREAKPOINT, FAMILY_MEMORY, "int3_breakpoint" },
         { SIGNAL_KD_TARGETING_US, FAMILY_KDEBUG, "kernel_debug_targeting_us" },
     };
     static const signal_desc_t zero = { 0, 0, "unknown" };
@@ -567,6 +575,89 @@ namespace detail {
         }
 
         return writable;
+    }
+
+    inline bool detect_int3_breakpoints()
+    {
+        auto& rt = state::get();
+        if (rt.code_snap.text_base == 0 || rt.code_snap.text_size == 0)
+            return false;
+        if (rt.code_snap.module_base == 0)
+            return false;
+
+        const UINT8* module_base = reinterpret_cast<const UINT8*>(rt.code_snap.module_base);
+
+        const DWORD e_lfanew = *reinterpret_cast<const DWORD*>(module_base + 0x3C);
+        if (e_lfanew <= 0 || e_lfanew > 0x100000)
+            return false;
+
+        const auto* nt_hdrs = reinterpret_cast<const IMAGE_NT_HEADERS64*>(module_base + e_lfanew);
+        if (nt_hdrs->Signature != IMAGE_NT_SIGNATURE)
+            return false;
+        if (nt_hdrs->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            return false;
+        if (nt_hdrs->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+            return false;
+
+        const auto& exc_dir = nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (exc_dir.VirtualAddress == 0 || exc_dir.Size == 0)
+            return false;
+
+        const UINT32 func_count = exc_dir.Size / 12;
+        if (func_count == 0)
+            return false;
+
+        static std::atomic<uint32_t> scan_rotation{0};
+        const uint32_t batch_idx = scan_rotation.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t per_tick = (func_count + 7) / 8;
+        const uint32_t start = (batch_idx * per_tick) % func_count;
+
+        const RUNTIME_FUNCTION* rf_base = reinterpret_cast<const RUNTIME_FUNCTION*>(
+            module_base + exc_dir.VirtualAddress);
+
+        for (uint32_t i = 0; i < per_tick; ++i)
+        {
+            const uint32_t idx = (start + i) % func_count;
+            const RUNTIME_FUNCTION* rf = rf_base + idx;
+            const UINT8* entry_ptr = module_base + rf->BeginAddress;
+
+            if (reinterpret_cast<uint64_t>(entry_ptr) < rt.code_snap.module_base ||
+                reinterpret_cast<uint64_t>(entry_ptr) >= rt.code_snap.module_end)
+                continue;
+
+            const UINT8 current_byte = *entry_ptr;
+            if (current_byte == 0xCC)
+            {
+                uint8_t orig_byte = 0;
+                const uint64_t rva = rf->BeginAddress;
+                if (rva < rt.code_snap.text_size)
+                {
+                    const UINT8* text_base_ptr = reinterpret_cast<const UINT8*>(rt.code_snap.text_base);
+                    const uint64_t text_rva = rva - (rt.code_snap.text_base - rt.code_snap.module_base);
+                    if (text_rva < rt.code_snap.text_size)
+                        orig_byte = text_base_ptr[text_rva];
+                }
+
+                if (orig_byte != 0xCC)
+                {
+                    char buf[192];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "int3_breakpoint_detected rva=0x%X module_base=0x%llX orig_byte=0x%02X current_byte=0xCC",
+                        rf->BeginAddress,
+                        static_cast<unsigned long long>(rt.code_snap.module_base),
+                        orig_byte);
+                    webhook::write_log("re_int3", buf);
+
+                    if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+                    {
+                        driver_bridge::trigger_kernel_bsod(0xA1DA0002,
+                            (uint64_t)rf->BeginAddress | (0xCCULL << 32));
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     inline bool detect_process_debug_handle()
@@ -1145,6 +1236,9 @@ namespace detail {
         if (detect_kd_targeting_us())
             mask |= SIGNAL_KD_TARGETING_US;
 
+        if (detect_int3_breakpoints())
+            mask |= SIGNAL_INT3_BREAKPOINT;
+
         return mask;
     }
 
@@ -1312,12 +1406,44 @@ inline void tick();
 
 inline void tick()
 {
+    dr_check::on_gate_call_random_check(0xA1DA0001u);
+
     auto& s = state_ref();
     s.verify_counter.fetch_add(1);
     s.last_tick_tsc.store(__rdtsc());
 
+    self_guard::verify_self_guard_integrity();
+
     uint32_t mask = detail::collect_signals();
     s.last_mask.store(mask);
+
+    if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
+        driver_bridge::kernel_anti_debug_clear_dr();
+
+        auto& rt = state::get();
+        if (rt.code_snap.module_base != 0) {
+            __try {
+                const UINT8* mod_base = reinterpret_cast<const UINT8*>(rt.code_snap.module_base);
+                const DWORD e_lfanew = *reinterpret_cast<const DWORD*>(mod_base + 0x3C);
+                if (e_lfanew > 0 && e_lfanew < 0x100000) {
+                    const auto* nt_hdrs = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mod_base + e_lfanew);
+                    if (nt_hdrs->Signature == IMAGE_NT_SIGNATURE &&
+                        nt_hdrs->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                        nt_hdrs->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+                        const auto& exc_dir = nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+                        if (exc_dir.VirtualAddress != 0 && exc_dir.Size != 0) {
+                            uint64_t kernel_hit_rva = 0;
+                            driver_bridge::kernel_anti_debug_scan_text(
+                                rt.code_snap.module_base,
+                                exc_dir.VirtualAddress,
+                                exc_dir.Size,
+                                &kernel_hit_rva);
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
 
     static std::atomic<uint32_t> s_tick_num{0};
     s_tick_num.fetch_add(1);
@@ -1384,6 +1510,7 @@ inline void tick()
             else if (mask & SIGNAL_PROC_DEBUG_HANDLE) reason = 0x0000DBDBu;
             else if (mask & SIGNAL_TEXT_WRITABLE)     reason = 0x0000D7ECu;
             else if (mask & SIGNAL_KD_TARGETING_US)   reason = 0x00007A63u;
+            else if (mask & SIGNAL_INT3_BREAKPOINT)    reason = 0xA1DA0002u;
             driver_bridge::latch_targeting_from_usermode(reason);
             driver_bridge::trigger_kernel_bsod(reason, evidence);
         }
@@ -1391,6 +1518,32 @@ inline void tick()
         s.persist_count.store(0);
         s.persist_mask.store(0);
         return;
+    }
+    if ((s_tick_num.load(std::memory_order_relaxed) & 3u) == 0)
+    {
+        auto& rt = state::get();
+        auto dbg = anti_debug::full_scan(rt.code_snap.module_base, rt.code_snap.module_end);
+        if (dbg.any_detected())
+        {
+            uint32_t bug_check = dbg.get_bug_check_code_or(0xA1DA0005u);
+            uint64_t evidence = detail::hash_evidence(mask | 0x80000000u);
+            std::string detail_str = "periodic_full_scan " + dbg.summary;
+            webhook::write_log_critical_fmt("re_tick",
+                "periodic_full_scan_detected bug_check=0x%08X summary=%s",
+                static_cast<unsigned long>(bug_check),
+                dbg.summary.c_str());
+            standalone_license::fold_integrity_token(evidence);
+            webhook::send_debug_log("re_detect", detail_str, true);
+            webhook::post_critical_then_enforce("re_detected_periodic_scan", detail_str, mask);
+            if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+            {
+                driver_bridge::trigger_kernel_bsod(bug_check, evidence);
+            }
+            enforce_violation("re_detected_periodic_scan", detail_str);
+            s.persist_count.store(0);
+            s.persist_mask.store(0);
+            return;
+        }
     }
     s.persist_mask.store(mask);
 }

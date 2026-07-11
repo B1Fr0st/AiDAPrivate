@@ -3,12 +3,20 @@
 
 #include "mcp_standalone.hpp"
 #include "standalone_tools_fwd.hpp"
+#include "calculator_tool.hpp"
+#include "ida_compat_mut.hpp"
+#include "ida_compat_read.hpp"
+#include "schema_validator.hpp"
 #include "sandbox.hpp"
 #include "standalone_driver.hpp"
 #include "vm_guest_bridge.hpp"
 #include "standalone_settings.hpp"
 #include "zydis_disasm.hpp"
+#include "../anti-tamper/self_guard.hpp"
 #include "../analysis/stealth_engine.hpp"
+#include "../infra/taskflow_runtime.hpp"
+#include "../session/analysis_session.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../network/burp/camoufox_bridge.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/globals.h"
@@ -18,6 +26,7 @@
 #include <cwctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -30,6 +39,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -975,6 +985,18 @@ tool_result_t ensure_attached()
         if (!address)
             return error("Missing or invalid address.");
 
+        {
+            self_guard::self_guard_context_t sg_ctx;
+            sg_ctx.tool_name = "read_memory";
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = driver_bridge::attached_pid();
+            sg_ctx.has_address = true;
+            sg_ctx.target_address = *address;
+            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+            if (guard_result != self_guard::self_guard_result_t::allow)
+                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+        }
+
         const std::string value_type = params.value("value_type", std::string());
         size_t requested_size = static_cast<size_t>(params.value("size", 0));
         const auto size = value_type.empty() ? (requested_size == 0 ? 256 : requested_size) : typed_read_size(value_type, requested_size);
@@ -1017,6 +1039,18 @@ tool_result_t ensure_attached()
         if (!address)
             return error("Missing or invalid address.");
 
+        {
+            self_guard::self_guard_context_t sg_ctx;
+            sg_ctx.tool_name = "read_string";
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = driver_bridge::attached_pid();
+            sg_ctx.has_address = true;
+            sg_ctx.target_address = *address;
+            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+            if (guard_result != self_guard::self_guard_result_t::allow)
+                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+        }
+
         std::string text;
         if (!driver_bridge::read_string(*address, static_cast<size_t>(params.value("max_length", 256)), text))
             return error("Could not read a string at the requested address.");
@@ -1037,6 +1071,18 @@ tool_result_t ensure_attached()
         if (!address)
             return error("Missing or invalid address.");
 
+        {
+            self_guard::self_guard_context_t sg_ctx;
+            sg_ctx.tool_name = "query_memory";
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = driver_bridge::attached_pid();
+            sg_ctx.has_address = true;
+            sg_ctx.target_address = *address;
+            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+            if (guard_result != self_guard::self_guard_result_t::allow)
+                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+        }
+
         driver_bridge::memory_region_t region;
         if (!driver_bridge::query_memory(*address, region))
             return error("Memory query failed. Ensure the kernel driver is loaded and attached.");
@@ -1050,66 +1096,301 @@ tool_result_t ensure_attached()
         return tool_result_t::ok("Queried memory region.", out);
     }
 
+    class workspace_call_cancel_bridge_t
+    {
+    public:
+        explicit workspace_call_cancel_bridge_t(
+            std::optional<std::chrono::steady_clock::time_point> deadline)
+            : source_(deadline), external_(mcp_standalone::current_cancel_token())
+        {
+            if (external_) {
+                worker_ = std::thread([this]() {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    while (!stopping_) {
+                        if (external_->load(std::memory_order_acquire)) {
+                            source_.request_cancel();
+                            break;
+                        }
+                        cv_.wait_for(lock, std::chrono::milliseconds(10), [this]() {
+                            return stopping_;
+                        });
+                    }
+                });
+            }
+        }
 
+        ~workspace_call_cancel_bridge_t()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            cv_.notify_all();
+            if (worker_.joinable())
+                worker_.join();
+        }
 
+        workspace_call_cancel_bridge_t(const workspace_call_cancel_bridge_t&) = delete;
+        workspace_call_cancel_bridge_t& operator=(const workspace_call_cancel_bridge_t&) = delete;
+
+        aida::analysis::cancellation_token_t token() const noexcept
+        {
+            return source_.token();
+        }
+
+    private:
+        aida::analysis::cancellation_source_t source_;
+        std::atomic<bool>* external_ = nullptr;
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool stopping_ = false;
+        std::thread worker_;
+    };
+
+    std::optional<std::chrono::steady_clock::time_point> current_workspace_deadline()
+    {
+        const std::uint64_t deadline_ms = mcp_standalone::current_call_deadline_ms();
+        if (deadline_ms == 0)
+            return std::nullopt;
+        const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+        if (deadline_ms <= now_ms)
+            return std::chrono::steady_clock::now();
+        return std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(deadline_ms - now_ms);
+    }
+
+    tool_result_t workspace_tool_error(const aida::analysis::workspace_error_t& value)
+    {
+        json details{{"phase", value.phase}, {"cancellation", value.cancellation},
+            {"deadline", value.deadline}};
+        if (value.offset)
+            details["offset"] = std::to_string(*value.offset);
+        if (value.size)
+            details["size"] = std::to_string(*value.size);
+        if (value.win32_status)
+            details["win32_status"] = *value.win32_status;
+        if (value.sqlite_status)
+            details["sqlite_status"] = *value.sqlite_status;
+        if (!value.details.empty()) {
+            details["details"] = json::object();
+            for (const auto& entry : value.details)
+                details["details"][entry.first] = entry.second;
+        }
+        return tool_result_t::error(value.message, value.stable_code(), details);
+    }
 
     tool_result_t handle_disassemble_file(const json& params)
     {
         diag::log_tagged_fmt("mcp_tools", "handle_disassemble_file entry");
         if (!params.contains("path") || !params["path"].is_string())
             return error("Missing required parameter: path");
-
-        DisasmFile file;
         const auto path = params["path"].get<std::string>();
-        const size_t limit = static_cast<size_t>(params.value("count", 64));
-        diag::log_tagged_fmt("mcp_tools",
-            "handle_disassemble_file load_start path='%s' count=%zu",
-            path.c_str(), limit);
-        if (!disasm::load_pe(path, file))
-            return error(file.err.empty() ? "Unable to load PE file." : file.err);
-        size_t exec_sections = 0;
-        size_t exec_bytes = 0;
-        for (const auto& section : file.sections) {
-            if (section.is_executable) {
-                ++exec_sections;
-                exec_bytes += section.bytes.size();
+        if (path.empty() || path.size() > 32768)
+            return tool_result_t::error("Path must contain between 1 and 32768 bytes.",
+                std::string("INVALID_ARGUMENT"), json::object());
+        std::uint64_t requested = 64;
+        if (params.contains("count")) {
+            if (params["count"].is_number_unsigned())
+                requested = params["count"].get<std::uint64_t>();
+            else if (params["count"].is_number_integer()) {
+                const auto signed_count = params["count"].get<std::int64_t>();
+                if (signed_count < 0)
+                    return tool_result_t::error("count must be non-negative",
+                        std::string("INVALID_ARGUMENT"), json::object());
+                requested = static_cast<std::uint64_t>(signed_count);
+            } else {
+                return tool_result_t::error("count must be an integer",
+                    std::string("INVALID_ARGUMENT"), json::object());
             }
         }
-        diag::log_tagged_fmt("mcp_tools",
-            "handle_disassemble_file load_done path='%s' image=0x%llX sections=%zu exec_sections=%zu exec_bytes=%zu",
-            path.c_str(),
-            static_cast<unsigned long long>(file.image_base),
-            file.sections.size(),
-            exec_sections,
-            exec_bytes);
-
-        diag::log_tagged_fmt("mcp_tools",
-            "handle_disassemble_file decode_start path='%s' max_instrs=%zu",
-            path.c_str(), limit);
-        disasm::decode_section_limited(file, limit);
-        diag::log_tagged_fmt("mcp_tools",
-            "handle_disassemble_file decode_done path='%s' instrs=%zu",
-            path.c_str(), file.instrs.size());
-        json instructions = json::array();
-        for (size_t i = 0; i < file.instrs.size() && i < limit; ++i) {
-            const auto& insn = file.instrs[i];
-            instructions.push_back({
-                {"address", hex_addr(insn.addr)},
-                {"mnemonic", insn.mnem},
-                {"operands", insn.ops},
-                {"length", insn.len}
-            });
+        if (requested > 50000)
+            return tool_result_t::error("count exceeds the 50000-instruction limit",
+                std::string("LIMIT_EXCEEDED"), json::object());
+        const size_t limit = static_cast<size_t>(requested);
+        const auto deadline = current_workspace_deadline();
+        workspace_call_cancel_bridge_t cancellation(deadline);
+        auto acquired = analysis_session::acquire_static_workspace(path, cancellation.token());
+        std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+        bool joined_existing = false;
+        std::optional<aida::infra::taskflow_runtime::job_handle_t> analysis_job;
+        bool analysis_started = false;
+        if (!acquired) {
+            if (acquired.error().stable_code() == "SERVICE_CONFLICT") {
+                auto candidates = aida::analysis::workspace_registry().find_by_exact_name_or_path(path);
+                if (!candidates.empty()) {
+                    workspace = candidates.front();
+                    joined_existing = true;
+                    const bool has_database = workspace->database() != nullptr;
+                    const bool has_overlay = workspace->overlay() != nullptr;
+                    const bool has_decompiler = workspace->decompiler() != nullptr;
+                    const bool has_search_index = workspace->search_index() != nullptr;
+                    diag::log_tagged_fmt("mcp_tools",
+                        "handle_disassemble_file SERVICE_CONFLICT resolved_by_existing path='%s' binary_id='%s' "
+                        "has_database=%d has_overlay=%d has_decompiler=%d has_search_index=%d readiness=%u",
+                        path.c_str(),
+                        workspace->identity().binary_id().to_hex().c_str(),
+                        has_database ? 1 : 0, has_overlay ? 1 : 0,
+                        has_decompiler ? 1 : 0, has_search_index ? 1 : 0,
+                        static_cast<unsigned>(workspace->progress().readiness));
+                    if (!has_database) {
+                        diag::log_tagged_fmt("mcp_tools",
+                            "handle_disassemble_file SERVICE_CONFLICT partial_installation path='%s' binary_id='%s' "
+                            "database_missing=1 attempting_close_and_retry",
+                            path.c_str(),
+                            workspace->identity().binary_id().to_hex().c_str());
+                        const auto close_deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(5);
+                        auto closed = workspace->close(close_deadline);
+                        if (closed) {
+                            auto retry = analysis_session::acquire_static_workspace(path, cancellation.token());
+                            if (retry) {
+                                auto retry_acquisition = retry.take_value();
+                                workspace = retry_acquisition.workspace;
+                                joined_existing = retry_acquisition.joined_existing;
+                                analysis_job = std::move(retry_acquisition.analysis_job);
+                                analysis_started = retry_acquisition.analysis_started;
+                                diag::log_tagged_fmt("mcp_tools",
+                                    "handle_disassemble_file SERVICE_CONFLICT retry_succeeded path='%s' binary_id='%s'",
+                                    path.c_str(),
+                                    workspace->identity().binary_id().to_hex().c_str());
+                            } else {
+                                diag::log_tagged_fmt("mcp_tools",
+                                    "handle_disassemble_file SERVICE_CONFLICT retry_failed path='%s' code='%s' message='%.160s'",
+                                    path.c_str(),
+                                    retry.error().stable_code().c_str(),
+                                    retry.error().message.c_str());
+                                workspace.reset();
+                            }
+                        } else {
+                            diag::log_tagged_fmt("mcp_tools",
+                                "handle_disassemble_file SERVICE_CONFLICT close_failed path='%s' code='%s'",
+                                path.c_str(),
+                                closed.error().stable_code().c_str());
+                            workspace.reset();
+                        }
+                    }
+                }
+            }
+            if (!workspace)
+                return workspace_tool_error(acquired.error());
+        } else {
+            auto acquisition = acquired.take_value();
+            workspace = acquisition.workspace;
+            joined_existing = acquisition.joined_existing;
+            analysis_job = std::move(acquisition.analysis_job);
+            analysis_started = acquisition.analysis_started;
         }
-
+        if (!workspace)
+            return workspace_tool_error(aida::analysis::make_workspace_error(
+                aida::analysis::workspace_error_code_t::integrity_failure,
+                "Static workspace acquisition returned no workspace",
+                "disassemble_file.acquire"));
+        for (;;) {
+            const auto progress = workspace->progress();
+            if ((progress.readiness == aida::analysis::workspace_readiness_t::baseline_ready ||
+                 progress.readiness == aida::analysis::workspace_readiness_t::partial) &&
+                workspace->snapshot())
+                break;
+            if (progress.error)
+                return workspace_tool_error(*progress.error);
+            if (cancellation.token().stop_requested()) {
+                auto failure = aida::analysis::make_workspace_error(
+                    cancellation.token().deadline_exceeded()
+                        ? aida::analysis::workspace_error_code_t::deadline_exceeded
+                        : aida::analysis::workspace_error_code_t::cancelled,
+                    "Disassembly request stopped waiting for the shared analysis",
+                    "disassemble_file.wait");
+                failure.cancellation = !cancellation.token().deadline_exceeded();
+                failure.deadline = cancellation.token().deadline_exceeded();
+                return workspace_tool_error(failure);
+            }
+            if (analysis_job) {
+                const auto waited = aida::infra::taskflow_runtime::wait_for(
+                    *analysis_job, 25);
+                if (waited.failed || waited.cancelled) {
+                    const auto final_progress = workspace->progress();
+                    if (final_progress.error)
+                        return workspace_tool_error(*final_progress.error);
+                    return workspace_tool_error(aida::analysis::make_workspace_error(
+                        waited.cancelled ? aida::analysis::workspace_error_code_t::cancelled
+                            : aida::analysis::workspace_error_code_t::integrity_failure,
+                        waited.cancelled ? "Shared disassembly analysis was cancelled" :
+                            "Shared disassembly analysis task graph failed",
+                        "disassemble_file.wait"));
+                }
+                if (waited.completed) {
+                    const auto final_progress = workspace->progress();
+                    if ((final_progress.readiness == aida::analysis::workspace_readiness_t::baseline_ready ||
+                         final_progress.readiness == aida::analysis::workspace_readiness_t::partial) &&
+                        workspace->snapshot())
+                        break;
+                    return workspace_tool_error(aida::analysis::make_workspace_error(
+                        aida::analysis::workspace_error_code_t::integrity_failure,
+                        "Shared disassembly analysis completed without a publication",
+                        "disassemble_file.wait"));
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+        const auto publication = workspace->analysis_publication();
+        const auto image = workspace->image();
+        if (!publication || !publication->snapshot || !image) {
+            return workspace_tool_error(aida::analysis::make_workspace_error(
+                aida::analysis::workspace_error_code_t::integrity_failure,
+                "Disassembly workspace has no immutable baseline publication",
+                "disassemble_file.publish"));
+        }
+        std::vector<AsmInstr> formatted;
+        formatted.reserve((std::min)(limit, publication->snapshot->instructions.size()));
+        size_t offset = 0;
+        while (offset < limit && offset < publication->snapshot->instructions.size()) {
+            const size_t page_count = (std::min)({static_cast<size_t>(64), limit - offset,
+                publication->snapshot->instructions.size() - offset});
+            auto page = disasm::format_page(workspace, offset, page_count, cancellation.token());
+            if (!page)
+                return workspace_tool_error(page.error());
+            auto values = page.take_value();
+            formatted.insert(formatted.end(), values.begin(), values.end());
+            offset += page_count;
+        }
+        std::uint64_t exec_sections = 0;
+        std::uint64_t exec_bytes = 0;
+        for (const auto& section : image->sections()) {
+            if (section.executable) {
+                ++exec_sections;
+                exec_bytes += section.raw_size;
+            }
+        }
+        json instructions = json::array();
+        for (const auto& insn : formatted) {
+            instructions.push_back({{"address", hex_addr(insn.addr)},
+                {"mnemonic", insn.mnem}, {"operands", insn.ops}, {"length", insn.len}});
+        }
+        auto entry = image->rva_to_va(image->entry_rva());
+        if (!entry)
+            return workspace_tool_error(entry.error());
         json out;
         out["path"] = path;
-        out["image_base"] = hex_addr(file.image_base);
-        out["entry_point"] = hex_addr(file.entry_point);
-        out["instruction_count"] = file.instrs.size();
+        out["image_base"] = hex_addr(image->image_base());
+        out["entry_point"] = hex_addr(entry.value());
+        out["instruction_count"] = formatted.size();
         out["exec_section_count"] = exec_sections;
         out["exec_byte_count"] = exec_bytes;
         out["decode_limited"] = true;
-        out["instructions"] = instructions;
+        out["analysis_started"] = analysis_started;
+        out["joined_existing"] = joined_existing;
+        out["baseline_complete"] = publication->snapshot->baseline_complete;
+        out["instructions"] = std::move(instructions);
+        out["_meta"]["aida"] = json{{"binary_id", workspace->identity().binary_id().to_hex()},
+            {"bin_name", workspace->identity().bin_name()}, {"kind", "static"},
+            {"analysis_revision", workspace->analysis_revision()},
+            {"overlay_revision", workspace->overlay_revision()}};
+        diag::log_tagged_fmt("mcp_tools",
+            "handle_disassemble_file complete path='%s' binary_id=%s instructions=%zu exec_sections=%llu exec_bytes=%llu",
+            path.c_str(), workspace->identity().binary_id().to_hex().c_str(), formatted.size(),
+            static_cast<unsigned long long>(exec_sections),
+            static_cast<unsigned long long>(exec_bytes));
         return tool_result_t::ok("Disassembled PE file.", out);
     }
 
@@ -3112,9 +3393,159 @@ return {
 
 namespace mcp_standalone
 {
+    namespace
+    {
+        workspace_request_context_t targetless_ida_compat_context()
+        {
+            workspace_request_context_t context;
+            context.cancellation = current_cancel_token();
+            context.deadline_ms = current_call_deadline_ms();
+            context.diagnostic_id = current_call_diag_id();
+            context.request_id = current_call_request_id();
+            context.tool_name = current_call_tool_name();
+            return context;
+        }
+
+        bool configure_ida_compat_tool(tool_def_t& tool, const char* name, const char* description)
+        {
+            const json* schema = ida_compat::find_schema(name);
+            if (!schema) {
+                diag::log_tagged_fmt("mcp_tools",
+                    "ida_compat registration blocked file='ida_compat_schemas.hpp' symbol='find_schema(%s)'",
+                    name);
+                return false;
+            }
+            const json metadata = ida_compat::tool_metadata(name);
+            const bool read_only = metadata.value("read_only", false);
+            const bool mutating = metadata.value("mutating", false);
+            if (read_only == mutating) {
+                diag::log_tagged_fmt("mcp_tools",
+                    "ida_compat registration blocked file='ida_compat_schemas.hpp' symbol='tool_metadata(%s)'",
+                    name);
+                return false;
+            }
+            tool.name = name;
+            tool.description = description;
+            tool.read_only = read_only;
+            tool.visibility = tool_visibility_t::external_visible;
+            tool.input_schema = *schema;
+            return true;
+        }
+
+        void install_ida_compat_schema_validation()
+        {
+            ida_compat::register_schema_validator();
+            set_pre_dispatch_validation_hook([](const tool_def_t& tool, const json& arguments) {
+                const auto validation = ida_compat::validate_tool_args(
+                    tool.name, arguments, tool.input_schema);
+                if (validation.valid)
+                    return tool_result_t::ok("");
+                json errors = json::array();
+                for (const auto& error : validation.errors) {
+                    errors.push_back({
+                        {"path", error.path},
+                        {"message", error.message},
+                        {"schema_fragment", error.schema_fragment}
+                    });
+                }
+                return tool_result_t::error(validation.summary(),
+                    "MCP_TOOL_INPUT_SCHEMA_INVALID", {{"errors", std::move(errors)}});
+            });
+        }
+
+        bool register_ida_compatibility_tools(server_t& server)
+        {
+            for (const auto& definition : ida_compat::get_read_tool_defs()) {
+                tool_def_t tool;
+                const std::string description = std::string("ida-pro-mcp compatible: ") + definition.name;
+                if (!configure_ida_compat_tool(tool, definition.name, description.c_str()) || !tool.read_only) {
+                    diag::log_tagged_fmt("mcp_tools",
+                        "ida_compat registration blocked file='ida_compat_read.cpp' symbol='%s'",
+                        definition.name);
+                    return false;
+                }
+                if (ida_compat::is_target_dependent_tool(definition.name)) {
+                    tool.workspace_handler = definition.handler;
+                } else {
+                    tool.handler = [handler = definition.handler](const json& params) {
+                        return handler(params, targetless_ida_compat_context());
+                    };
+                }
+                if (!server.register_tool(std::move(tool))) {
+                    diag::log_tagged_fmt("mcp_tools",
+                        "ida_compat registration blocked file='ida_compat_read.cpp' symbol='%s' reason='register_tool_failed'",
+                        definition.name);
+                    return false;
+                }
+            }
+
+            for (const auto& definition : ida_compat::get_mutation_tool_defs()) {
+                tool_def_t tool;
+                const std::string description = std::string("ida-pro-mcp compatible mutation: ") + definition.name;
+                if (!configure_ida_compat_tool(tool, definition.name, description.c_str()) || tool.read_only ||
+                    !ida_compat::is_target_dependent_tool(definition.name)) {
+                    diag::log_tagged_fmt("mcp_tools",
+                        "ida_compat registration blocked file='ida_compat_mut.cpp' symbol='%s'",
+                        definition.name);
+                    return false;
+                }
+                tool.workspace_handler = definition.handler;
+                if (!server.register_tool(std::move(tool))) {
+                    diag::log_tagged_fmt("mcp_tools",
+                        "ida_compat registration blocked file='ida_compat_mut.cpp' symbol='%s' reason='register_tool_failed'",
+                        definition.name);
+                    return false;
+                }
+            }
+
+            tool_def_t instances;
+            if (!configure_ida_compat_tool(instances, "list_instances", "List open AiDA analysis workspaces.") ||
+                !instances.read_only || ida_compat::is_target_dependent_tool(instances.name)) {
+                diag::log_tagged_fmt("mcp_tools",
+                    "ida_compat registration blocked file='ida_compat_read.cpp' symbol='tool_list_instances'");
+                return false;
+            }
+            instances.handler = [](const json& params) {
+                return ida_compat::tool_list_instances(params, targetless_ida_compat_context());
+            };
+            if (!server.register_tool(std::move(instances))) {
+                diag::log_tagged_fmt("mcp_tools",
+                    "ida_compat registration blocked file='ida_compat_read.cpp' symbol='tool_list_instances' reason='register_tool_failed'");
+                return false;
+            }
+
+            for (const char* name : {"calculator", "calculate"}) {
+                tool_def_t tool;
+                const char* description = std::strcmp(name, "calculator") == 0
+                    ? "ida-pro-mcp compatible calculator."
+                    : "Safe target-independent integer, bytes, hash, floating-point, and address mapping calculator";
+                if (!configure_ida_compat_tool(tool, name, description) || !tool.read_only ||
+                    ida_compat::is_target_dependent_tool(tool.name)) {
+                    diag::log_tagged_fmt("mcp_tools",
+                        "ida_compat registration blocked file='calculator_tool.cpp' symbol='tool_calculate' name='%s'",
+                        name);
+                    return false;
+                }
+                tool.handler = [](const json& params) {
+                    return ida_compat::tool_calculate(params, targetless_ida_compat_context());
+                };
+                if (!server.register_tool(std::move(tool))) {
+                    diag::log_tagged_fmt("mcp_tools",
+                        "ida_compat registration blocked file='calculator_tool.cpp' symbol='tool_calculate' name='%s' reason='register_tool_failed'",
+                        name);
+                    return false;
+                }
+            }
+
+            return true;
+        }
+    }
+
     void register_standalone_tools(server_t& srv)
     {
         diag::log_tagged_fmt("mcp_tools", "register_standalone_tools entry");
+
+        install_ida_compat_schema_validation();
 
         srv.register_tool({"get_tool_descriptions",
             "Return full descriptions and parameter schemas for selected MCP tool names or grouped packs such as browser, network, and burp.",
@@ -3226,6 +3657,8 @@ namespace mcp_standalone
         disasm_tools::register_disasm_tools(srv);
         decompile_tools::register_decompile_tools(srv);
         session_tools_ext::register_tools(srv);
+        if (!register_ida_compatibility_tools(srv))
+            diag::log_tagged_fmt("mcp_tools", "ida_compat registration incomplete");
 
         diag::log_tagged_fmt("mcp_tools", "register_standalone_tools done");
     }

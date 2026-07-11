@@ -1,9 +1,21 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "imgui.h"
 #include "crypto_scanner.hpp"
@@ -22,8 +34,6 @@
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
 
-extern DisasmState g_disasm;
-
 namespace crypto_scanner_view {
 
 struct state_t {
@@ -38,9 +48,52 @@ struct state_t {
 	int    ctx_hit_idx = -1;
 	float  sort_arrow_anim = 0.f;
 	int    last_sort_column = -1;
+	std::mutex mutex;
+	std::string last_error;
+	std::atomic<bool> scanning{false};
+	std::atomic<bool> cancellation_requested{false};
+	std::atomic<float> progress{0.0f};
+	std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t> snapshot;
+	std::shared_ptr<const std::vector<crypto_scanner::crypto_hit_t>> filtered_results;
+	std::string requested_filter;
+	int requested_category = -2;
+	int requested_sort_column = -2;
+	bool requested_sort_ascending = true;
+	const crypto_scanner::workspace_scan_snapshot_t* requested_snapshot = nullptr;
+	std::atomic<std::uint64_t> filter_serial{0};
+	std::atomic<bool> filtering{false};
+	std::atomic<std::size_t> total_hits{0};
+	std::atomic<std::size_t> cipher_hits{0};
+	std::atomic<std::size_t> hash_hits{0};
+	std::atomic<std::size_t> referenced_hits{0};
 };
 
 inline state_t g_state;
+
+inline std::mutex& workspace_states_mutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
+
+inline std::unordered_map<std::string, std::shared_ptr<state_t>>& workspace_view_states()
+{
+	static std::unordered_map<std::string, std::shared_ptr<state_t>> states;
+	return states;
+}
+
+inline std::shared_ptr<state_t> state_for(const disasm_view::workspace_context_t& context)
+{
+	if (!context.workspace) return {};
+	const std::string key = context.workspace->identity().binary_id().to_hex();
+	std::lock_guard<std::mutex> lock(workspace_states_mutex());
+	auto view = workspace_view_states()[key];
+	if (!view) {
+		view = std::make_shared<state_t>();
+		workspace_view_states()[key] = view;
+	}
+	return view;
+}
 
 namespace detail {
 
@@ -252,19 +305,412 @@ inline void render_glyph(ImDrawList* dl, ImVec2 center, float radius,
 	}
 }
 
+struct scan_region_t {
+	std::uint64_t provider_offset = 0;
+	std::uint64_t size = 0;
+	std::uint64_t runtime_address = 0;
+};
+
+inline std::vector<scan_region_t> scan_regions(
+	const disasm_view::workspace_context_t& context)
+{
+	std::vector<scan_region_t> regions;
+	if (!context.workspace) return regions;
+	const std::uint64_t provider_size = context.workspace->provider().size();
+	if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
+		const auto& module = context.workspace->identity().module();
+		if (module && provider_size != 0) regions.push_back({0, provider_size, module->base});
+		return regions;
+	}
+	if (!context.image) return regions;
+	for (const auto& section : context.image->sections()) {
+		if (section.raw_size == 0 || section.raw_offset >= provider_size) continue;
+		const std::uint64_t size = (std::min)(provider_size - section.raw_offset,
+			static_cast<std::uint64_t>(section.raw_size));
+		if (size != 0) regions.push_back({section.raw_offset, size,
+			context.image->image_base() + section.virtual_address});
+	}
+	return regions;
+}
+
+inline void set_scan_error(const std::shared_ptr<state_t>& state, std::string error)
+{
+	if (!state) return;
+	std::lock_guard<std::mutex> lock(state->mutex);
+	state->last_error = std::move(error);
+}
+
+inline void start_workspace_scan(
+	const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& view_state,
+	bool entropy_only)
+{
+	if (!context.workspace || !view_state) return;
+	bool expected = false;
+	if (!view_state->scanning.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel, std::memory_order_acquire)) return;
+	view_state->cancellation_requested.store(false, std::memory_order_release);
+	view_state->progress.store(0.0f, std::memory_order_release);
+	std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t> previous;
+	{
+		std::lock_guard<std::mutex> lock(view_state->mutex);
+		previous = view_state->snapshot;
+	}
+	set_scan_error(view_state, {});
+	aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+	descriptor.owner_subsystem = "scanner";
+	descriptor.label = entropy_only ? "scanner.crypto.entropy.workspace" :
+		"scanner.crypto.signatures.workspace";
+	descriptor.thread_class = "bounded_task";
+	descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+	descriptor.priority = 2;
+	const std::string target_id = context.workspace->identity().binary_id().to_hex();
+	descriptor.target_id = target_id.c_str();
+	descriptor.generation = context.workspace->generation();
+	descriptor.cancellable_body = [context, view_state, previous, entropy_only](
+		const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) {
+		constexpr std::uint64_t chunk_size = 4ULL * 1024ULL * 1024ULL;
+		constexpr std::size_t max_hits = 100000;
+		constexpr std::size_t max_entropy_regions = 100000;
+		auto regions = scan_regions(context);
+		if (regions.empty()) {
+			set_scan_error(view_state, "The selected workspace has no bounded scan ranges.");
+			view_state->scanning.store(false, std::memory_order_release);
+			return;
+		}
+		auto signatures = crypto_scanner::get_signatures();
+		if (previous) {
+			for (const auto& custom : previous->custom_signatures) {
+				if (custom.pattern.empty()) continue;
+				signatures.push_back({custom.name.c_str(), custom.algorithm.c_str(),
+					custom.description.c_str(), custom.category, custom.pattern.data(),
+					custom.pattern.size(), custom.pattern.size()});
+			}
+		}
+		std::size_t overlap = 0;
+		for (const auto& signature : signatures)
+			overlap = (std::max)(overlap, signature.min_match > 0 ? signature.min_match - 1 : 0);
+		std::uint64_t total = 0;
+		for (const auto& region : regions) {
+			if (total > UINT64_MAX - region.size) {
+				set_scan_error(view_state, "Workspace scan range total overflowed.");
+				view_state->scanning.store(false, std::memory_order_release);
+				return;
+			}
+			total += region.size;
+		}
+		std::uint64_t processed = 0;
+		std::vector<crypto_scanner::workspace_crypto_hit_t> hits =
+			entropy_only && previous ? previous->results :
+			std::vector<crypto_scanner::workspace_crypto_hit_t>{};
+		std::vector<crypto_scanner::workspace_entropy_region_t> entropy;
+		for (const auto& region : regions) {
+			for (std::uint64_t cursor = 0; cursor < region.size;) {
+				if (runtime_cancel.requested.load(std::memory_order_acquire) ||
+					view_state->cancellation_requested.load(std::memory_order_acquire) ||
+					context.workspace->cancellation_token().stop_requested()) {
+					view_state->scanning.store(false, std::memory_order_release);
+					return;
+				}
+				const std::uint64_t logical = (std::min)(chunk_size, region.size - cursor);
+				const std::uint64_t tail = (std::min)(static_cast<std::uint64_t>(overlap),
+					region.size - cursor - logical);
+				auto lease = context.workspace->provider().lease(region.provider_offset + cursor,
+					logical + tail, context.workspace->cancellation_token());
+				if (!lease) {
+					set_scan_error(view_state, lease.error().message);
+					view_state->scanning.store(false, std::memory_order_release);
+					return;
+				}
+				const auto& bytes = lease.value();
+				if (!entropy_only) {
+					for (const auto& signature : signatures) {
+						if (!signature.pattern || signature.min_match == 0 ||
+							signature.min_match > bytes.size()) continue;
+						const std::size_t limit = bytes.size() - signature.min_match;
+						for (std::size_t offset = 0; offset <= limit; ++offset) {
+							if (offset >= logical || hits.size() >= max_hits) break;
+							if (std::memcmp(bytes.data() + offset, signature.pattern,
+								signature.min_match) != 0) continue;
+							const std::uint64_t runtime = region.runtime_address + cursor + offset;
+							const auto address = disasm_view::typed_address(context, runtime);
+							if (!address) continue;
+							crypto_scanner::workspace_crypto_hit_t hit;
+							hit.signature_name = signature.name;
+							hit.algorithm = signature.algorithm;
+							hit.category = signature.category;
+							hit.address = *address;
+							hit.module_name = context.workspace->identity().bin_name();
+							const auto& module = context.workspace->identity().module();
+							const std::uint64_t module_base = module ? module->base :
+								context.workspace->identity().image_base();
+							hit.module_offset = runtime >= module_base ? runtime - module_base : offset;
+							hits.push_back(std::move(hit));
+						}
+						if (hits.size() >= max_hits) break;
+					}
+				} else {
+					for (std::size_t offset = 0; offset + 256 <= logical &&
+						entropy.size() < max_entropy_regions; offset += 256) {
+						const float value = crypto_scanner::detail::compute_shannon_entropy(
+							bytes.data() + offset, 256);
+						if (value < 7.0f) continue;
+						const auto address = disasm_view::typed_address(context,
+							region.runtime_address + cursor + offset);
+						if (address) entropy.push_back({*address, value, 256,
+							context.workspace->identity().bin_name()});
+					}
+				}
+				cursor += logical;
+				processed += logical;
+				view_state->progress.store(total == 0 ? 1.0f : static_cast<float>(
+					static_cast<double>(processed) / static_cast<double>(total)));
+			}
+		}
+		if (!entropy_only && context.publication && context.publication->snapshot) {
+			std::map<aida::analysis::address_t,
+				std::vector<aida::analysis::address_t>> references;
+			for (const auto& xref : context.publication->snapshot->xrefs)
+				references[xref.target].push_back(xref.source);
+			for (auto& hit : hits) {
+				auto found = references.find(hit.address);
+				if (found != references.end()) hit.referencing_functions = std::move(found->second);
+			}
+		}
+		std::size_t cipher_count = 0;
+		std::size_t hash_count = 0;
+		std::size_t referenced_count = 0;
+		for (const auto& hit : hits) {
+			const int category = static_cast<int>(hit.category);
+			if (category == 0 || category == 3 || category == 4) ++cipher_count;
+			else if (category == 1) ++hash_count;
+			if (!hit.referencing_functions.empty()) ++referenced_count;
+		}
+		view_state->total_hits.store(hits.size(), std::memory_order_release);
+		view_state->cipher_hits.store(cipher_count, std::memory_order_release);
+		view_state->hash_hits.store(hash_count, std::memory_order_release);
+		view_state->referenced_hits.store(referenced_count, std::memory_order_release);
+		auto publication = std::make_shared<crypto_scanner::workspace_scan_snapshot_t>();
+		publication->results = std::move(hits);
+		publication->entropy_map = std::move(entropy);
+		if (previous) publication->custom_signatures = previous->custom_signatures;
+		publication->progress = 1.0f;
+		publication->scanning = false;
+		publication->cancellation_requested = false;
+		{
+			std::lock_guard<std::mutex> lock(view_state->mutex);
+			view_state->snapshot = std::move(publication);
+			view_state->filtered_results.reset();
+			view_state->requested_snapshot = nullptr;
+			view_state->filter_serial.fetch_add(1, std::memory_order_acq_rel);
+		}
+		view_state->progress.store(1.0f, std::memory_order_release);
+		view_state->scanning.store(false, std::memory_order_release);
+	};
+	const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
+	if (!submitted.submitted) {
+		set_scan_error(view_state, submitted.reject_reason);
+		view_state->scanning.store(false, std::memory_order_release);
+	}
+}
+
+inline void open_hit_in_hex(const disasm_view::workspace_context_t& context,
+	std::uint64_t address)
+{
+	if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
+		hex_view::read_from_process(context, address, 256);
+		return;
+	}
+	const auto typed = disasm_view::typed_address(context, address);
+	if (!typed) return;
+	auto bytes = disasm_view::read_bytes(context, *typed, 256);
+	if (bytes) hex_view::set_data(context, bytes.value(), address,
+		context.workspace->identity().bin_name());
+}
+
+inline std::string lowercase(std::string value)
+{
+	for (char& character : value)
+		character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+	return value;
+}
+
+inline void request_filtered_results(
+	const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state,
+	const std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t>& snapshot,
+	std::string filter,
+	int category,
+	int sort_column,
+	bool sort_ascending)
+{
+	if (!context.workspace || !state || !snapshot) return;
+	filter = lowercase(std::move(filter));
+	std::uint64_t serial = 0;
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		if (state->requested_snapshot == snapshot.get() &&
+			state->requested_filter == filter && state->requested_category == category &&
+			state->requested_sort_column == sort_column &&
+			state->requested_sort_ascending == sort_ascending) return;
+		state->requested_snapshot = snapshot.get();
+		state->requested_filter = filter;
+		state->requested_category = category;
+		state->requested_sort_column = sort_column;
+		state->requested_sort_ascending = sort_ascending;
+		serial = state->filter_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+		state->filtering.store(true, std::memory_order_release);
+	}
+	aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+	descriptor.owner_subsystem = "scanner";
+	descriptor.label = "scanner.crypto.filter.workspace";
+	descriptor.thread_class = "bounded_task";
+	descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+	descriptor.priority = 3;
+	const std::string target_id = context.workspace->identity().binary_id().to_hex();
+	descriptor.target_id = target_id.c_str();
+	descriptor.generation = context.workspace->generation();
+	descriptor.body = [context, state, snapshot, filter = std::move(filter), category,
+		sort_column, sort_ascending, serial, generation = context.workspace->generation()]() {
+		auto filtered = std::make_shared<std::vector<crypto_scanner::crypto_hit_t>>();
+		filtered->reserve(snapshot->results.size());
+		for (const auto& workspace_hit : snapshot->results) {
+			if (state->filter_serial.load(std::memory_order_acquire) != serial) return;
+			if (context.workspace->cancellation_token().stop_requested()) {
+				state->filtering.store(false, std::memory_order_release);
+				return;
+			}
+			if (category >= 0 && static_cast<int>(workspace_hit.category) != category) continue;
+			if (!filter.empty() && lowercase(workspace_hit.signature_name).find(filter) == std::string::npos &&
+				lowercase(workspace_hit.algorithm).find(filter) == std::string::npos &&
+				lowercase(workspace_hit.module_name).find(filter) == std::string::npos) continue;
+			crypto_scanner::crypto_hit_t hit;
+			hit.signature_name = workspace_hit.signature_name;
+			hit.algorithm = workspace_hit.algorithm;
+			hit.category = workspace_hit.category;
+			const auto runtime = disasm_view::runtime_address(context, workspace_hit.address);
+			if (!runtime) continue;
+			hit.address = *runtime;
+			hit.module_name = workspace_hit.module_name;
+			hit.module_offset = workspace_hit.module_offset;
+			for (const auto& reference : workspace_hit.referencing_functions) {
+				const auto address = disasm_view::runtime_address(context, reference);
+				if (address) hit.referencing_functions.push_back(*address);
+			}
+			filtered->push_back(std::move(hit));
+		}
+		if (sort_column >= 0) {
+			std::sort(filtered->begin(), filtered->end(),
+				[sort_column, sort_ascending](const auto& left, const auto& right) {
+					int comparison = 0;
+					switch (sort_column) {
+					case 0: comparison = left.algorithm.compare(right.algorithm); break;
+					case 1: comparison = left.signature_name.compare(right.signature_name); break;
+					case 2: comparison = left.address < right.address ? -1 :
+						(left.address > right.address ? 1 : 0); break;
+					case 3: comparison = left.module_name.compare(right.module_name); break;
+					default: break;
+					}
+					return sort_ascending ? comparison < 0 : comparison > 0;
+				});
+		}
+		if (context.workspace->generation() != generation ||
+			state->filter_serial.load(std::memory_order_acquire) != serial) return;
+		{
+			std::lock_guard<std::mutex> lock(state->mutex);
+			state->filtered_results = std::move(filtered);
+		}
+		state->filtering.store(false, std::memory_order_release);
+	};
+	const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
+	if (!submitted.submitted) {
+		set_scan_error(state, submitted.reject_reason);
+		state->filtering.store(false, std::memory_order_release);
+	}
+}
+
+inline void export_results(const disasm_view::workspace_context_t& context,
+	std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t> snapshot,
+	std::string path,
+	bool csv)
+{
+	aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+	descriptor.owner_subsystem = "scanner";
+	descriptor.label = csv ? "scanner.crypto.export.csv" : "scanner.crypto.export.json";
+	descriptor.thread_class = "bounded_task";
+	descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+	descriptor.priority = 2;
+	const std::string target_id = context.workspace->identity().binary_id().to_hex();
+	descriptor.target_id = target_id.c_str();
+	descriptor.generation = context.workspace->generation();
+	descriptor.body = [context, snapshot = std::move(snapshot), path = std::move(path), csv]() {
+		if (!snapshot) return;
+		std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+		if (!stream.is_open()) return;
+		if (csv) {
+			stream << "algorithm,signature,address,module,module_offset,references\n";
+			for (const auto& hit : snapshot->results) {
+				const auto address = disasm_view::runtime_address(context, hit.address);
+				if (!address) continue;
+				stream << '"' << hit.algorithm << "\",\"" << hit.signature_name << "\",0x"
+					<< std::hex << *address << std::dec << ",\"" << hit.module_name << "\",0x"
+					<< std::hex << hit.module_offset << std::dec << ','
+					<< hit.referencing_functions.size() << '\n';
+			}
+			return;
+		}
+		nlohmann::json output;
+		output["binary_id"] = context.workspace->identity().binary_id().to_hex();
+		output["bin_name"] = context.workspace->identity().bin_name();
+		output["results"] = nlohmann::json::array();
+		for (const auto& hit : snapshot->results) {
+			const auto address = disasm_view::runtime_address(context, hit.address);
+			if (!address) continue;
+			nlohmann::json item;
+			item["algorithm"] = hit.algorithm;
+			item["signature"] = hit.signature_name;
+			item["address"] = *address;
+			item["module"] = hit.module_name;
+			item["module_offset"] = hit.module_offset;
+			item["references"] = hit.referencing_functions.size();
+			output["results"].push_back(std::move(item));
+		}
+		stream << output.dump(2);
+	};
+	aida::infra::taskflow_runtime::submit(std::move(descriptor));
+}
+
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
-                   float alpha, float, float, float)
+                   float alpha, float, float, float,
+				   const disasm_view::workspace_context_t& context)
 {
 	ImGui::BeginChild("##crypto_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	const auto view_state = state_for(context);
+	if (!view_state) {
+		aida::ui::empty_state::config_t config;
+		config.glyph = aida::ui::empty_state::glyph_t::shield;
+		config.title = "No analysis target";
+		config.body = "Open a binary or attach a live target before scanning.";
+		aida::ui::empty_state::render(ImGui::GetWindowPos(), ImGui::GetWindowSize(), config);
+		ImGui::EndChild();
+		return;
+	}
+	std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t> scan_snapshot;
+	{
+		std::lock_guard<std::mutex> lock(view_state->mutex);
+		scan_snapshot = view_state->snapshot;
+	}
+	static const auto empty_snapshot =
+		std::make_shared<const crypto_scanner::workspace_scan_snapshot_t>();
+	if (!scan_snapshot) scan_snapshot = empty_snapshot;
 	ImVec2 wp = ImGui::GetWindowPos();
 	float ox = wp.x;
 	float oy = wp.y;
 	auto* dl = ImGui::GetWindowDrawList();
-	auto& st = g_state;
-	auto& cs = crypto_scanner::g_state;
+	auto& st = *view_state;
 	const auto& t = aida::ui::resolved();
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
@@ -284,9 +730,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::with_alpha(t.text_primary, alpha), "Crypto Scanner");
 	cx += 140.f;
 
-	bool scanning = cs.scanning.load();
-	bool attached_now = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
-	bool pe_loaded = g_disasm.file.loaded;
+	const bool scanning = view_state->scanning.load(std::memory_order_acquire);
+	const bool attached_now = context.workspace->target_kind() ==
+		aida::analysis::target_kind_t::live_snapshot;
+	const bool pe_loaded = context.workspace->target_kind() ==
+		aida::analysis::target_kind_t::static_file && static_cast<bool>(context.image);
 
 	const float btn_gap = 14.f;
 	{
@@ -296,11 +744,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				scanning ? aida::ui::button_kind_t::destructive : aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !scanning && !attached_now, nullptr, false)) {
 			if (scanning) {
-				crypto_scanner::cancel();
+				view_state->cancellation_requested.store(true, std::memory_order_release);
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] crypto_scanner cancel");
 			} else {
-				crypto_scanner::scan_process();
+				detail::start_workspace_scan(context, view_state, false);
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] crypto_scanner scan_process");
 			}
@@ -312,7 +760,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool fl = !pe_loaded;
 		if (aida::ui::button("Scan File", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning || fl)) {
-			crypto_scanner::scan_file(g_disasm.file);
+			detail::start_workspace_scan(context, view_state, false);
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] crypto_scanner scan_file");
 		}
@@ -322,7 +770,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Entropy", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), scanning || !attached_now)) {
-			crypto_scanner::scan_entropy();
+			detail::start_workspace_scan(context, view_state, true);
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] crypto_scanner scan_entropy");
 		}
@@ -336,9 +784,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			size_t len = 0;
 			_dupenv_s(&appdata, &len, "APPDATA");
 			if (appdata) {
-				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export.json";
+				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export_" +
+					context.workspace->identity().binary_id().to_hex().substr(0, 16) + ".json";
 				free(appdata);
-				crypto_scanner::export_results_json(path);
+				detail::export_results(context, scan_snapshot, path, false);
 			}
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
@@ -351,15 +800,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			size_t len = 0;
 			_dupenv_s(&appdata, &len, "APPDATA");
 			if (appdata) {
-				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export.csv";
+				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export_" +
+					context.workspace->identity().binary_id().to_hex().substr(0, 16) + ".csv";
 				free(appdata);
-				crypto_scanner::export_results_csv(path);
+				detail::export_results(context, scan_snapshot, path, true);
 			}
 		}
 	}
 
 	if (scanning) {
-		float prog = cs.progress.load();
+		float prog = view_state->progress.load(std::memory_order_acquire);
 		float bar_w = 160.f;
 		float bar_x = ox + width - bar_w - 16.f;
 		float bar_y = oy + (toolbar_h - 6.f) * 0.5f;
@@ -367,6 +817,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	cy = oy + toolbar_h + 6.f;
+	std::string scan_error;
+	{
+		std::lock_guard<std::mutex> lock(view_state->mutex);
+		scan_error = view_state->last_error;
+	}
+	if (!scan_error.empty()) {
+		ui_anim::render_inline_callout(dl, ox + 16.f, cy, width - 32.f, 22.f,
+			scan_error.c_str(), ui_anim::callout_kind_t::error,
+			0.9f, 0.25f, 0.25f, alpha);
+		cy += 28.f;
+	}
 	if (!attached_now && !pe_loaded) {
 		ui_anim::render_inline_callout(dl, ox + 16.f, cy, width - 32.f, 22.f,
 			"Scan needs either a live attach or a loaded PE.",
@@ -397,17 +858,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleColor(4);
 		ImGui::PopItemWidth();
 
-		int total = 0, sym = 0, hash = 0, referenced = 0;
-		{
-			std::lock_guard<std::mutex> lk(cs.mutex);
-			total = static_cast<int>(cs.results.size());
-			for (auto& h : cs.results) {
-				int cat = static_cast<int>(h.category);
-				if (cat == 0 || cat == 3 || cat == 4) sym++;
-				else if (cat == 1) hash++;
-				if (!h.referencing_functions.empty()) referenced++;
-			}
-		}
+		const int total = static_cast<int>(view_state->total_hits.load(std::memory_order_acquire));
+		const int sym = static_cast<int>(view_state->cipher_hits.load(std::memory_order_acquire));
+		const int hash = static_cast<int>(view_state->hash_hits.load(std::memory_order_acquire));
+		const int referenced = static_cast<int>(
+			view_state->referenced_hits.load(std::memory_order_acquire));
 
 		float pill_x = ox + 16.f + 290.f + 170.f + 20.f;
 		float pill_y = cy + 6.f;
@@ -426,44 +881,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	cy += 44.f;
 
-	std::vector<crypto_scanner::crypto_hit_t> filtered;
+	detail::request_filtered_results(context, view_state, scan_snapshot,
+		st.search_filter, st.category_filter, st.sort_column, st.sort_ascending);
+	std::shared_ptr<const std::vector<crypto_scanner::crypto_hit_t>> filtered_snapshot;
 	{
-		std::lock_guard<std::mutex> lk(cs.mutex);
-		for (auto& hit : cs.results) {
-			if (st.category_filter >= 0 && static_cast<int>(hit.category) != st.category_filter)
-				continue;
-			if (st.search_filter[0]) {
-				std::string lower_name = hit.signature_name;
-				std::string lower_algo = hit.algorithm;
-				std::string lower_mod = hit.module_name;
-				std::string lower_filter = st.search_filter;
-				for (auto& c : lower_name) c = static_cast<char>(std::tolower(c));
-				for (auto& c : lower_algo) c = static_cast<char>(std::tolower(c));
-				for (auto& c : lower_mod) c = static_cast<char>(std::tolower(c));
-				for (auto& c : lower_filter) c = static_cast<char>(std::tolower(c));
-				if (lower_name.find(lower_filter) == std::string::npos &&
-				    lower_algo.find(lower_filter) == std::string::npos &&
-				    lower_mod.find(lower_filter) == std::string::npos)
-					continue;
-			}
-			filtered.push_back(hit);
-		}
+		std::lock_guard<std::mutex> lock(view_state->mutex);
+		filtered_snapshot = view_state->filtered_results;
 	}
-
-	if (st.sort_column >= 0) {
-		std::sort(filtered.begin(), filtered.end(),
-			[&](const crypto_scanner::crypto_hit_t& a, const crypto_scanner::crypto_hit_t& b) {
-				int cmp = 0;
-				switch (st.sort_column) {
-				case 0: cmp = a.algorithm.compare(b.algorithm); break;
-				case 1: cmp = a.signature_name.compare(b.signature_name); break;
-				case 2: cmp = (a.address < b.address) ? -1 : (a.address > b.address ? 1 : 0); break;
-				case 3: cmp = a.module_name.compare(b.module_name); break;
-				default: break;
-				}
-				return st.sort_ascending ? (cmp < 0) : (cmp > 0);
-			});
-	}
+	static const auto empty_results =
+		std::make_shared<const std::vector<crypto_scanner::crypto_hit_t>>();
+	if (!filtered_snapshot) filtered_snapshot = empty_results;
+	const auto& filtered = *filtered_snapshot;
 
 	const float row_h = 30.f;
 	const float table_top = cy;
@@ -574,7 +1002,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(hit.address, g_disasm);
+			disasm_view::goto_address(hit.address, context);
 		}
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
@@ -661,13 +1089,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			if (ImGui::MenuItem("Go to Disassembly")) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(ctx_hit.address, g_disasm);
+				disasm_view::goto_address(ctx_hit.address, context);
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] crypto_scanner ctx open_disasm");
 			}
 
 			if (ImGui::MenuItem("Open in Hex")) {
-				hex_view::read_from_process(ctx_hit.address, 256);
+				detail::open_hit_in_hex(context, ctx_hit.address);
 				globals::ui::active_center_view = center_view_t::hex_view;
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] crypto_scanner ctx open_hex");
@@ -678,12 +1106,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					for (auto ref_addr : ctx_hit.referencing_functions) {
 						char ref_label[64];
 						std::snprintf(ref_label, sizeof(ref_label), "0x%llX", static_cast<unsigned long long>(ref_addr));
-						auto lbl = crypto_scanner::get_function_label(ref_addr);
+						std::string lbl;
+						if (const auto typed = disasm_view::typed_address(context, ref_addr))
+							lbl = disasm_view::resolve_name(context, *typed);
 						std::string menu_text = ref_label;
 						if (!lbl.empty()) menu_text += " (" + lbl + ")";
 						if (ImGui::MenuItem(menu_text.c_str())) {
 							globals::ui::active_center_view = center_view_t::disassembly;
-							disasm_view::goto_address(ref_addr, g_disasm);
+							disasm_view::goto_address(ref_addr, context);
 							anti_tamper::webhook::write_log("scan_audit",
 								"[scan_audit] crypto_scanner ctx show_ref");
 						}
@@ -717,8 +1147,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddRectFilled(ImVec2(ox + 8.f, fy), ImVec2(ox + width - 8.f, fy + footer_h),
 			aida::ui::with_alpha(t.panel_bg, alpha * 0.6f), 6.f);
 		char count_buf[160];
-		std::lock_guard<std::mutex> lk(cs.mutex);
-		size_t entropy_count = cs.entropy_map.size();
+		const size_t entropy_count = scan_snapshot->entropy_map.size();
 		if (entropy_count > 0) {
 			std::snprintf(count_buf, sizeof(count_buf), "%zu results  ·  %zu entropy regions", filtered.size(), entropy_count);
 		} else {
@@ -736,6 +1165,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		                                  alpha, st.scrollbar_dragging, st.scrollbar_drag_offset);
 	}
 	ImGui::EndChild();
+}
+
+inline void render(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b)
+{
+	render(pos_x, pos_y, width, height, alpha, accent_r, accent_g, accent_b,
+		disasm_view::capture_selected_workspace());
 }
 
 }

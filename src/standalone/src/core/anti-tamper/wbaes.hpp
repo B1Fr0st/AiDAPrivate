@@ -9,23 +9,22 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <bcrypt.h>
 
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
 #include <string>
+
+#include "blake3.hpp"
+#include "arc_build_seed.hpp"
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace anti_tamper {
 namespace wbaes {
-
-struct white_box_table_t {
-    uint8_t  t_boxes[10][16][256];
-    uint32_t mb_tables[9][16][256];
-    uint8_t  ext_in[16];
-    uint8_t  ext_out[16];
-    uint8_t  table_id[16];
-};
 
 namespace detail_wb {
 
@@ -41,43 +40,93 @@ inline void set_last_error(const char* m)
     else s_last_error_storage().clear();
 }
 
-static constexpr uint8_t k_sbox[256] = {
-    0x63,0x7C,0x77,0x7B,0xF2,0x6B,0x6F,0xC5,0x30,0x01,0x67,0x2B,0xFE,0xD7,0xAB,0x76,
-    0xCA,0x82,0xC9,0x7D,0xFA,0x59,0x47,0xF0,0xAD,0xD4,0xA2,0xAF,0x9C,0xA4,0x72,0xC0,
-    0xB7,0xFD,0x93,0x26,0x36,0x3F,0xF7,0xCC,0x34,0xA5,0xE5,0xF1,0x71,0xD8,0x31,0x15,
-    0x04,0xC7,0x23,0xC3,0x18,0x96,0x05,0x9A,0x07,0x12,0x80,0xE2,0xEB,0x27,0xB2,0x75,
-    0x09,0x83,0x2C,0x1A,0x1B,0x6E,0x5A,0xA0,0x52,0x3B,0xD6,0xB3,0x29,0xE3,0x2F,0x84,
-    0x53,0xD1,0x00,0xED,0x20,0xFC,0xB1,0x5B,0x6A,0xCB,0xBE,0x39,0x4A,0x4C,0x58,0xCF,
-    0xD0,0xEF,0xAA,0xFB,0x43,0x4D,0x33,0x85,0x45,0xF9,0x02,0x7F,0x50,0x3C,0x9F,0xA8,
-    0x51,0xA3,0x40,0x8F,0x92,0x9D,0x38,0xF5,0xBC,0xB6,0xDA,0x21,0x10,0xFF,0xF3,0xD2,
-    0xCD,0x0C,0x13,0xEC,0x5F,0x97,0x44,0x17,0xC4,0xA7,0x7E,0x3D,0x64,0x5D,0x19,0x73,
-    0x60,0x81,0x4F,0xDC,0x22,0x2A,0x90,0x88,0x46,0xEE,0xB8,0x14,0xDE,0x5E,0x0B,0xDB,
-    0xE0,0x32,0x3A,0x0A,0x49,0x06,0x24,0x5C,0xC2,0xD3,0xAC,0x62,0x91,0x95,0xE4,0x79,
-    0xE7,0xC8,0x37,0x6D,0x8D,0xD5,0x4E,0xA9,0x6C,0x56,0xF4,0xEA,0x65,0x7A,0xAE,0x08,
-    0xBA,0x78,0x25,0x2E,0x1C,0xA6,0xB4,0xC6,0xE8,0xDD,0x74,0x1F,0x4B,0xBD,0x8B,0x8A,
-    0x70,0x3E,0xB5,0x66,0x48,0x03,0xF6,0x0E,0x61,0x35,0x57,0xB9,0x86,0xC1,0x1D,0x9E,
-    0xE1,0xF8,0x98,0x11,0x69,0xD9,0x8E,0x94,0x9B,0x1E,0x87,0xE9,0xCE,0x55,0x28,0xDF,
-    0x8C,0xA1,0x89,0x0D,0xBF,0xE6,0x42,0x68,0x41,0x99,0x2D,0x0F,0xB0,0x54,0xBB,0x16
-};
+constexpr uint8_t kGhashHalfA = 0xC0;
+constexpr uint8_t kGhashHalfB = 0x21;
 
-static constexpr uint8_t k_rcon[11] = {
-    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36
-};
-
-inline uint32_t sub_word(uint32_t w)
+__forceinline uint8_t gf_mul(uint8_t a, uint8_t b)
 {
-    return (static_cast<uint32_t>(k_sbox[(w >> 24) & 0xFFu]) << 24) |
-           (static_cast<uint32_t>(k_sbox[(w >> 16) & 0xFFu]) << 16) |
-           (static_cast<uint32_t>(k_sbox[(w >> 8) & 0xFFu]) << 8) |
-            static_cast<uint32_t>(k_sbox[w & 0xFFu]);
+    uint8_t p = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        if (b & 1u) p ^= a;
+        uint8_t hi = a & 0x80u;
+        a = static_cast<uint8_t>(a << 1);
+        if (hi) a ^= 0x1Bu;
+        b >>= 1;
+    }
+    return p;
 }
 
-inline uint32_t rot_word(uint32_t w)
+__forceinline uint8_t gf_inv(uint8_t a)
+{
+    if (a == 0) return 0;
+    for (int b = 1; b < 256; ++b)
+    {
+        if (gf_mul(static_cast<uint8_t>(a), static_cast<uint8_t>(b)) == 1)
+            return static_cast<uint8_t>(b);
+    }
+    return 0;
+}
+
+__forceinline uint8_t sbox_entry(uint8_t input)
+{
+    uint8_t inv = gf_inv(input);
+    uint8_t result = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        uint8_t bit = static_cast<uint8_t>(
+            ((inv >> i) & 1u) ^
+            ((inv >> ((i + 4) % 8)) & 1u) ^
+            ((inv >> ((i + 5) % 8)) & 1u) ^
+            ((inv >> ((i + 6) % 8)) & 1u) ^
+            ((inv >> ((i + 7) % 8)) & 1u) ^
+            ((0x63u >> i) & 1u));
+        result |= static_cast<uint8_t>(bit << i);
+    }
+    return result;
+}
+
+__forceinline uint8_t compute_rcon(int i)
+{
+    if (i == 0) return 0;
+    uint8_t r = 1;
+    for (int j = 1; j < i; ++j)
+    {
+        uint8_t hi = r & 0x80u;
+        r = static_cast<uint8_t>(r << 1);
+        if (hi) r ^= 0x1Bu;
+    }
+    return r;
+}
+
+__forceinline void compute_sbox(uint8_t out[256])
+{
+    for (int i = 0; i < 256; ++i)
+        out[i] = sbox_entry(static_cast<uint8_t>(i));
+}
+
+__forceinline void compute_rcon_table(uint8_t out[11])
+{
+    for (int i = 0; i < 11; ++i)
+        out[i] = compute_rcon(i);
+}
+
+__forceinline uint32_t sub_word_runtime(uint32_t w, const uint8_t sbox[256])
+{
+    return (static_cast<uint32_t>(sbox[(w >> 24) & 0xFFu]) << 24) |
+           (static_cast<uint32_t>(sbox[(w >> 16) & 0xFFu]) << 16) |
+           (static_cast<uint32_t>(sbox[(w >> 8) & 0xFFu]) << 8) |
+            static_cast<uint32_t>(sbox[w & 0xFFu]);
+}
+
+__forceinline uint32_t rot_word(uint32_t w)
 {
     return (w << 8) | (w >> 24);
 }
 
-inline void key_expansion_128(const uint8_t key[16], uint32_t rk[44])
+__forceinline void key_expansion_128_runtime(
+    const uint8_t key[16], uint32_t rk[44],
+    const uint8_t sbox[256], const uint8_t rcon[11])
 {
     for (int i = 0; i < 4; ++i)
     {
@@ -90,22 +139,23 @@ inline void key_expansion_128(const uint8_t key[16], uint32_t rk[44])
     {
         uint32_t t = rk[i - 1];
         if ((i % 4) == 0)
-            t = sub_word(rot_word(t)) ^ (static_cast<uint32_t>(k_rcon[i / 4]) << 24);
+            t = sub_word_runtime(rot_word(t), sbox) ^
+                (static_cast<uint32_t>(rcon[i / 4]) << 24);
         rk[i] = rk[i - 4] ^ t;
     }
 }
 
-inline uint8_t gf_mul2(uint8_t a)
+__forceinline uint8_t gf_mul2(uint8_t a)
 {
     return static_cast<uint8_t>((a << 1) ^ (((a >> 7) & 1u) * 0x1Bu));
 }
 
-inline uint8_t gf_mul3(uint8_t a)
+__forceinline uint8_t gf_mul3(uint8_t a)
 {
     return static_cast<uint8_t>(gf_mul2(a) ^ a);
 }
 
-inline uint32_t mc_word_for_row(uint8_t v, int row)
+__forceinline uint32_t mc_word_for_row(uint8_t v, int row)
 {
     uint8_t b2 = gf_mul2(v);
     uint8_t b3 = gf_mul3(v);
@@ -120,162 +170,31 @@ inline uint32_t mc_word_for_row(uint8_t v, int row)
             static_cast<uint32_t>(r3);
 }
 
-inline uint32_t rotr32(uint32_t x, unsigned n)
+__forceinline int sr_source_col(int target_col, int row)
 {
-    return (x >> n) | (x << (32 - n));
+    return (target_col + row) & 3;
 }
 
-inline void sha256_compress(uint32_t H[8], const uint8_t block[64])
+__forceinline int sr_source_index(int target_col, int row)
 {
-    static constexpr uint32_t K[64] = {
-        0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
-        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
-        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
-        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
-        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
-        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
-        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
-        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
-    };
-    uint32_t W[64];
-    for (int i = 0; i < 16; ++i)
-    {
-        W[i] = (static_cast<uint32_t>(block[4 * i]) << 24) |
-               (static_cast<uint32_t>(block[4 * i + 1]) << 16) |
-               (static_cast<uint32_t>(block[4 * i + 2]) << 8) |
-                static_cast<uint32_t>(block[4 * i + 3]);
-    }
-    for (int i = 16; i < 64; ++i)
-    {
-        uint32_t s0 = rotr32(W[i - 15], 7) ^ rotr32(W[i - 15], 18) ^ (W[i - 15] >> 3);
-        uint32_t s1 = rotr32(W[i - 2], 17) ^ rotr32(W[i - 2], 19) ^ (W[i - 2] >> 10);
-        W[i] = W[i - 16] + s0 + W[i - 7] + s1;
-    }
-    uint32_t a = H[0], b = H[1], c = H[2], d = H[3];
-    uint32_t e = H[4], f = H[5], g = H[6], h = H[7];
-    for (int i = 0; i < 64; ++i)
-    {
-        uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
-        uint32_t ch = (e & f) ^ (~e & g);
-        uint32_t t1 = h + S1 + ch + K[i] + W[i];
-        uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
-        uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
-        uint32_t t2 = S0 + mj;
-        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
-    }
-    H[0] += a; H[1] += b; H[2] += c; H[3] += d;
-    H[4] += e; H[5] += f; H[6] += g; H[7] += h;
-}
-
-inline void sha256(const uint8_t* data, size_t len, uint8_t out[32])
-{
-    uint32_t H[8] = {
-        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
-        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
-    };
-    uint64_t bitlen = static_cast<uint64_t>(len) * 8ull;
-    size_t off = 0;
-    while (len - off >= 64)
-    {
-        sha256_compress(H, data + off);
-        off += 64;
-    }
-    uint8_t block[64];
-    size_t rem = len - off;
-    if (rem > 0) std::memcpy(block, data + off, rem);
-    block[rem] = 0x80;
-    if (rem + 1 > 56)
-    {
-        std::memset(block + rem + 1, 0, 64 - rem - 1);
-        sha256_compress(H, block);
-        std::memset(block, 0, 56);
-    }
-    else
-    {
-        std::memset(block + rem + 1, 0, 56 - rem - 1);
-    }
-    for (int i = 0; i < 8; ++i)
-        block[56 + i] = static_cast<uint8_t>((bitlen >> (56 - 8 * i)) & 0xFFull);
-    sha256_compress(H, block);
-    for (int i = 0; i < 8; ++i)
-    {
-        out[4 * i]     = static_cast<uint8_t>((H[i] >> 24) & 0xFFu);
-        out[4 * i + 1] = static_cast<uint8_t>((H[i] >> 16) & 0xFFu);
-        out[4 * i + 2] = static_cast<uint8_t>((H[i] >> 8) & 0xFFu);
-        out[4 * i + 3] = static_cast<uint8_t>(H[i] & 0xFFu);
-    }
-}
-
-inline void hmac_sha256(const uint8_t* key, size_t key_len,
-                         const uint8_t* data, size_t data_len,
-                         uint8_t out[32])
-{
-    uint8_t k[64];
-    if (key_len > 64)
-    {
-        sha256(key, key_len, k);
-        std::memset(k + 32, 0, 32);
-    }
-    else
-    {
-        if (key_len > 0) std::memcpy(k, key, key_len);
-        std::memset(k + key_len, 0, 64 - key_len);
-    }
-    uint8_t ipad[64];
-    uint8_t opad[64];
-    for (int i = 0; i < 64; ++i)
-    {
-        ipad[i] = static_cast<uint8_t>(k[i] ^ 0x36u);
-        opad[i] = static_cast<uint8_t>(k[i] ^ 0x5Cu);
-    }
-    uint8_t* inner_buf = static_cast<uint8_t*>(HeapAlloc(GetProcessHeap(), 0, 64 + data_len));
-    if (!inner_buf)
-    {
-        std::memset(out, 0, 32);
-        SecureZeroMemory(k, 64);
-        SecureZeroMemory(ipad, 64);
-        SecureZeroMemory(opad, 64);
-        return;
-    }
-    std::memcpy(inner_buf, ipad, 64);
-    if (data_len > 0) std::memcpy(inner_buf + 64, data, data_len);
-    uint8_t inner_hash[32];
-    sha256(inner_buf, 64 + data_len, inner_hash);
-    SecureZeroMemory(inner_buf, 64 + data_len);
-    HeapFree(GetProcessHeap(), 0, inner_buf);
-
-    uint8_t outer[96];
-    std::memcpy(outer, opad, 64);
-    std::memcpy(outer + 64, inner_hash, 32);
-    sha256(outer, 96, out);
-
-    SecureZeroMemory(k, 64);
-    SecureZeroMemory(ipad, 64);
-    SecureZeroMemory(opad, 64);
-    SecureZeroMemory(inner_hash, 32);
-    SecureZeroMemory(outer, 96);
+    return sr_source_col(target_col, row) * 4 + row;
 }
 
 struct prng_t {
-    uint8_t state[32];
+    uint8_t key[32];
     uint64_t counter;
 
-    void init(const uint8_t key[16], uint64_t seed)
+    void init(const uint8_t seed[32])
     {
-        uint8_t ikm[24];
-        std::memcpy(ikm, key, 16);
-        ikm[16] = static_cast<uint8_t>(seed & 0xFFu);
-        ikm[17] = static_cast<uint8_t>((seed >> 8) & 0xFFu);
-        ikm[18] = static_cast<uint8_t>((seed >> 16) & 0xFFu);
-        ikm[19] = static_cast<uint8_t>((seed >> 24) & 0xFFu);
-        ikm[20] = static_cast<uint8_t>((seed >> 32) & 0xFFu);
-        ikm[21] = static_cast<uint8_t>((seed >> 40) & 0xFFu);
-        ikm[22] = static_cast<uint8_t>((seed >> 48) & 0xFFu);
-        ikm[23] = static_cast<uint8_t>((seed >> 56) & 0xFFu);
-        static const uint8_t label[18] = { 'A','i','D','A','-','W','B','A','E','S','-','S','E','E','D','-','V','1' };
-        hmac_sha256(label, sizeof(label), ikm, sizeof(ikm), state);
+        uint8_t input[48];
+        std::memcpy(input, seed, 32);
+        static const uint8_t label[16] = {
+            'W','B','A','E','S','-','P','R','N','G','-','K','E','Y','V','2'
+        };
+        std::memcpy(input + 32, label, 16);
+        blake3::hash(input, 48, key);
         counter = 0;
-        SecureZeroMemory(ikm, sizeof(ikm));
+        SecureZeroMemory(input, sizeof(input));
     }
 
     void emit(uint8_t* out, size_t n)
@@ -284,18 +203,10 @@ struct prng_t {
         while (produced < n)
         {
             uint8_t blk[40];
-            std::memcpy(blk, state, 32);
-            blk[32] = static_cast<uint8_t>(counter & 0xFFu);
-            blk[33] = static_cast<uint8_t>((counter >> 8) & 0xFFu);
-            blk[34] = static_cast<uint8_t>((counter >> 16) & 0xFFu);
-            blk[35] = static_cast<uint8_t>((counter >> 24) & 0xFFu);
-            blk[36] = static_cast<uint8_t>((counter >> 32) & 0xFFu);
-            blk[37] = static_cast<uint8_t>((counter >> 40) & 0xFFu);
-            blk[38] = static_cast<uint8_t>((counter >> 48) & 0xFFu);
-            blk[39] = static_cast<uint8_t>((counter >> 56) & 0xFFu);
+            std::memcpy(blk, key, 32);
+            std::memcpy(blk + 32, &counter, 8);
             uint8_t hash[32];
-            static const uint8_t label[14] = { 'A','i','D','A','-','W','B','A','E','S','-','G','E','N' };
-            hmac_sha256(label, sizeof(label), blk, sizeof(blk), hash);
+            blake3::hash(blk, 40, hash);
             size_t take = (n - produced > 32) ? 32 : (n - produced);
             std::memcpy(out + produced, hash, take);
             produced += take;
@@ -311,37 +222,275 @@ struct prng_t {
         emit(&b, 1);
         return b;
     }
-};
 
-inline int sr_source_col(int target_col, int row)
-{
-    return (target_col + row) & 3;
-}
-
-inline int sr_source_index(int target_col, int row)
-{
-    return sr_source_col(target_col, row) * 4 + row;
-}
-
-}
-
-inline const char* last_error()
-{
-    return detail_wb::s_last_error_storage().c_str();
-}
-
-inline bool generate_tables(const uint8_t key[16], uint64_t entropy_seed, white_box_table_t& out)
-{
-    if (!key)
+    void next_bytes(uint8_t* out, size_t n)
     {
-        detail_wb::set_last_error("generate_tables_invalid_key");
-        return false;
+        emit(out, n);
     }
 
+    void wipe()
+    {
+        SecureZeroMemory(key, sizeof(key));
+        SecureZeroMemory(&counter, sizeof(counter));
+    }
+};
+
+__forceinline void blake3_compress_custom(
+    uint32_t out[16],
+    const uint32_t chaining[8],
+    const uint32_t block_words[16],
+    uint32_t counter,
+    uint32_t block_len,
+    uint32_t flags,
+    const uint32_t iv[8])
+{
+    uint32_t state[16];
+    std::memcpy(state, chaining, 32);
+    std::memcpy(state + 8, iv, 32);
+    state[12] ^= counter;
+    state[13] ^= 0;
+    state[14] ^= block_len;
+    state[15] ^= flags;
+
+    uint32_t m[16];
+    std::memcpy(m, block_words, 64);
+
+    for (int round = 0; round < 7; ++round)
+    {
+        const uint8_t* s = blake3::kMsgSchedule[round];
+        blake3::g_round(state[0], state[4], state[8],  state[12], m[s[0]],  m[s[1]]);
+        blake3::g_round(state[1], state[5], state[9],  state[13], m[s[2]],  m[s[3]]);
+        blake3::g_round(state[2], state[6], state[10], state[14], m[s[4]],  m[s[5]]);
+        blake3::g_round(state[3], state[7], state[11], state[15], m[s[6]],  m[s[7]]);
+        blake3::g_round(state[0], state[5], state[10], state[15], m[s[8]],  m[s[9]]);
+        blake3::g_round(state[1], state[6], state[11], state[12], m[s[10]], m[s[11]]);
+        blake3::g_round(state[2], state[7], state[8],  state[13], m[s[12]], m[s[13]]);
+        blake3::g_round(state[3], state[4], state[9],  state[14], m[s[14]], m[s[15]]);
+    }
+
+    for (int i = 0; i < 8; ++i)
+    {
+        out[i]     = state[i]     ^ state[i + 8];
+        out[i + 8] = chaining[i]  ^ state[i + 8];
+    }
+}
+
+__forceinline void blake3_hash_custom(
+    const void* data, size_t len,
+    const uint32_t iv[8],
+    uint8_t out[32])
+{
+    const auto* input = static_cast<const uint8_t*>(data);
+    const uint32_t flags = 0;
+
+    if (len <= static_cast<size_t>(blake3::kChunkSize))
+    {
+        blake3::chunk_state_t cs;
+        blake3::chunk_state_init(cs, iv, flags);
+        blake3::chunk_state_update(cs, input, len);
+        uint32_t cv[8];
+        blake3::chunk_state_finalize(cs, cv);
+
+        uint8_t block[blake3::kBlockSize];
+        std::memcpy(block, cs.block, cs.block_len);
+        std::memset(block + cs.block_len, 0, blake3::kBlockSize - cs.block_len);
+
+        uint32_t words[16];
+        for (int i = 0; i < 16; ++i)
+            std::memcpy(&words[i], block + i * 4, 4);
+
+        uint32_t out16[16];
+        uint32_t chunk_flags = cs.flags | blake3::chunk_start_flag(cs) |
+                               blake3::kFlags_ChunkEnd | blake3::kFlags_Root;
+        blake3_compress_custom(out16, cv, words,
+            static_cast<uint32_t>(cs.chunk_counter),
+            static_cast<uint32_t>(cs.block_len), chunk_flags, iv);
+
+        for (int i = 0; i < 8; ++i)
+        {
+            out[i * 4]     = static_cast<uint8_t>((out16[i] >> 24) & 0xFFu);
+            out[i * 4 + 1] = static_cast<uint8_t>((out16[i] >> 16) & 0xFFu);
+            out[i * 4 + 2] = static_cast<uint8_t>((out16[i] >> 8) & 0xFFu);
+            out[i * 4 + 3] = static_cast<uint8_t>(out16[i] & 0xFFu);
+        }
+        return;
+    }
+
+    size_t chunks_remaining = (len + blake3::kChunkSize - 1) / blake3::kChunkSize;
+    blake3::chunk_state_t cs;
+    blake3::chunk_state_init(cs, iv, flags);
+    size_t pos = 0;
+
+    while (chunks_remaining > 1)
+    {
+        size_t take = blake3::kChunkSize - blake3::chunk_state_len(cs);
+        if (take > len - pos) take = len - pos;
+
+        blake3::chunk_state_update(cs, input + pos, take);
+        pos += take;
+
+        if (blake3::chunk_state_len(cs) == static_cast<size_t>(blake3::kChunkSize))
+        {
+            uint32_t cv[8];
+            blake3::chunk_state_finalize(cs, cv);
+            blake3::chunk_state_init(cs, iv, flags);
+            std::memcpy(cs.cv, cv, 32);
+            cs.chunk_counter += 1;
+            chunks_remaining -= 1;
+        }
+    }
+
+    blake3::chunk_state_update(cs, input + pos, len - pos);
+    uint32_t final_cv[8];
+    blake3::chunk_state_finalize(cs, final_cv);
+
+    uint8_t block[blake3::kBlockSize];
+    std::memcpy(block, cs.block, cs.block_len);
+    std::memset(block + cs.block_len, 0, blake3::kBlockSize - cs.block_len);
+
+    uint32_t words[16];
+    for (int i = 0; i < 16; ++i)
+        std::memcpy(&words[i], block + i * 4, 4);
+
+    uint32_t out16[16];
+    uint32_t chunk_flags = cs.flags | blake3::chunk_start_flag(cs) |
+                           blake3::kFlags_ChunkEnd | blake3::kFlags_Root;
+    blake3_compress_custom(out16, final_cv, words,
+        static_cast<uint32_t>(cs.chunk_counter),
+        static_cast<uint32_t>(cs.block_len), chunk_flags, iv);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        out[i * 4]     = static_cast<uint8_t>((out16[i] >> 24) & 0xFFu);
+        out[i * 4 + 1] = static_cast<uint8_t>((out16[i] >> 16) & 0xFFu);
+        out[i * 4 + 2] = static_cast<uint8_t>((out16[i] >> 8) & 0xFFu);
+        out[i * 4 + 3] = static_cast<uint8_t>(out16[i] & 0xFFu);
+    }
+}
+
+__forceinline void derive_blake3_iv(const uint8_t seed[32], uint32_t iv[8])
+{
+    std::memcpy(iv, seed, 32);
+    for (int i = 0; i < 8; ++i)
+    {
+        iv[i] ^= 0x9E3779B9u;
+        iv[i] = (iv[i] << 13) | (iv[i] >> 19);
+        iv[i] *= 0x85EBCA6Bu;
+        iv[i] ^= iv[(i + 3) & 7];
+        iv[i] = (iv[i] << 17) | (iv[i] >> 15);
+        iv[i] *= 0xC2B2AE35u;
+    }
+}
+
+__forceinline void derive_wbaes_key(const uint8_t seed[32], uint8_t key[16])
+{
+    uint8_t okm[64];
+    uint8_t input[40];
+    std::memcpy(input, seed, 32);
+    static const uint8_t label[8] = {'W','B','K','E','Y','V','2','\0'};
+    std::memcpy(input + 32, label, 8);
+    blake3::hash(input, 40, okm);
+    std::memcpy(key, okm, 16);
+    SecureZeroMemory(okm, sizeof(okm));
+    SecureZeroMemory(input, sizeof(input));
+}
+
+__forceinline void derive_verification_key(const uint8_t seed[32], uint8_t key[16])
+{
+    uint8_t okm[64];
+    uint8_t input[40];
+    std::memcpy(input, seed, 32);
+    static const uint8_t label[8] = {'W','B','V','K','E','Y','V','2'};
+    std::memcpy(input + 32, label, 8);
+    blake3::hash(input, 40, okm);
+    std::memcpy(key, okm, 16);
+    SecureZeroMemory(okm, sizeof(okm));
+    SecureZeroMemory(input, sizeof(input));
+}
+
+}
+
+struct white_box_table_masked_t {
+    uint8_t  t_boxes_s1[10][16][256];
+    uint8_t  t_boxes_s2[10][16][256];
+    uint32_t mb_tables_s1[9][16][256];
+    uint32_t mb_tables_s2[9][16][256];
+    uint8_t  ext_in[16];
+    uint8_t  ext_out[16];
+    uint8_t  table_id[16];
+    uint8_t  input_masks[10][16];
+    uint8_t  output_masks[10][16];
+    uint8_t  t_xor_keys_s1[10][16][32];
+    uint8_t  t_xor_keys_s2[10][16][32];
+    uint8_t  mb_xor_keys_s1[9][16][32];
+    uint8_t  mb_xor_keys_s2[9][16][32];
+    int      col_order[9][4];
+    uint8_t  ghash_half_a;
+    uint8_t  ghash_half_b;
+    uint32_t blake3_iv[8];
+    uint8_t  expected_hash[32];
+    uint8_t  test_plaintext[16];
+    uint8_t  test_ciphertext[16];
+    uint8_t  build_id[16];
+    uint8_t  verification_key_obf[16];
+    uint8_t  verification_key_xor[16];
+    bool     initialized;
+};
+
+using white_box_table_t = white_box_table_masked_t;
+
+namespace detail_wb {
+
+__forceinline uint8_t t_box_lookup_s1(
+    const white_box_table_masked_t& tbl,
+    int round, int pos, uint8_t input)
+{
+    uint8_t encoded = tbl.t_boxes_s1[round][pos][input];
+    return static_cast<uint8_t>(encoded ^ tbl.t_xor_keys_s1[round][pos][0]);
+}
+
+__forceinline uint8_t t_box_lookup_s2(
+    const white_box_table_masked_t& tbl,
+    int round, int pos, uint8_t input)
+{
+    uint8_t encoded = tbl.t_boxes_s2[round][pos][input];
+    return static_cast<uint8_t>(encoded ^ tbl.t_xor_keys_s2[round][pos][0]);
+}
+
+__forceinline uint32_t mb_table_lookup_s1(
+    const white_box_table_masked_t& tbl,
+    int round, int pos, uint8_t input)
+{
+    uint32_t encoded = tbl.mb_tables_s1[round][pos][input];
+    uint32_t key;
+    std::memcpy(&key, tbl.mb_xor_keys_s1[round][pos], 4);
+    return encoded ^ key;
+}
+
+__forceinline uint32_t mb_table_lookup_s2(
+    const white_box_table_masked_t& tbl,
+    int round, int pos, uint8_t input)
+{
+    uint32_t encoded = tbl.mb_tables_s2[round][pos][input];
+    uint32_t key;
+    std::memcpy(&key, tbl.mb_xor_keys_s2[round][pos], 4);
+    return encoded ^ key;
+}
+
+__forceinline void generate_tables_masked(
+    const uint8_t key[16],
+    const uint8_t seed[32],
+    white_box_table_masked_t& out)
+{
     SecureZeroMemory(&out, sizeof(out));
 
+    uint8_t sbox[256];
+    uint8_t rcon[11];
+    compute_sbox(sbox);
+    compute_rcon_table(rcon);
+
     uint32_t round_keys[44];
-    detail_wb::key_expansion_128(key, round_keys);
+    key_expansion_128_runtime(key, round_keys, sbox, rcon);
 
     uint8_t key_bytes[16 * 11];
     for (int r = 0; r < 11; ++r)
@@ -355,20 +504,46 @@ inline bool generate_tables(const uint8_t key[16], uint64_t entropy_seed, white_
         }
     }
 
-    detail_wb::prng_t rng;
-    rng.init(key, entropy_seed);
+    prng_t rng;
+    rng.init(seed);
 
     rng.emit(out.ext_in, 16);
     rng.emit(out.ext_out, 16);
     rng.emit(out.table_id, 16);
 
+    for (int r = 0; r < 10; ++r)
+        for (int c = 0; c < 4; ++c)
+        {
+            uint8_t mask = rng.next_byte();
+            out.input_masks[r][c * 4 + 0] = mask;
+            out.input_masks[r][c * 4 + 1] = mask;
+            out.input_masks[r][c * 4 + 2] = mask;
+            out.input_masks[r][c * 4 + 3] = mask;
+
+            out.output_masks[r][c * 4 + 0] = rng.next_byte();
+            out.output_masks[r][c * 4 + 1] = rng.next_byte();
+            out.output_masks[r][c * 4 + 2] = rng.next_byte();
+            out.output_masks[r][c * 4 + 3] = rng.next_byte();
+        }
+
     uint8_t mb_masks[9][4][4];
     for (int r = 0; r < 9; ++r)
-    {
         for (int c = 0; c < 4; ++c)
             for (int i = 0; i < 4; ++i)
                 mb_masks[r][c][i] = rng.next_byte();
-    }
+
+    for (int r = 0; r < 10; ++r)
+        for (int pos = 0; pos < 16; ++pos)
+        {
+            rng.emit(out.t_xor_keys_s1[r][pos], 32);
+            rng.emit(out.t_xor_keys_s2[r][pos], 32);
+        }
+    for (int r = 0; r < 9; ++r)
+        for (int pos = 0; pos < 16; ++pos)
+        {
+            rng.emit(out.mb_xor_keys_s1[r][pos], 32);
+            rng.emit(out.mb_xor_keys_s2[r][pos], 32);
+        }
 
     for (int r = 0; r < 10; ++r)
     {
@@ -378,7 +553,8 @@ inline bool generate_tables(const uint8_t key[16], uint64_t entropy_seed, white_
             {
                 int target_col = c;
                 int row = i;
-                int src_idx = detail_wb::sr_source_index(target_col, row);
+                int src_idx = sr_source_index(target_col, row);
+                int pos = c * 4 + i;
 
                 uint8_t input_decode = 0;
                 if (r == 0)
@@ -387,7 +563,7 @@ inline bool generate_tables(const uint8_t key[16], uint64_t entropy_seed, white_
                 }
                 else
                 {
-                    int src_col = detail_wb::sr_source_col(target_col, row);
+                    int src_col = sr_source_col(target_col, row);
                     input_decode = mb_masks[r - 1][src_col][row];
                 }
 
@@ -395,17 +571,65 @@ inline bool generate_tables(const uint8_t key[16], uint64_t entropy_seed, white_
                 uint8_t out_decode = 0;
                 if (r == 9)
                 {
-                    out_decode = static_cast<uint8_t>(key_bytes[10 * 16 + c * 4 + i] ^ out.ext_out[c * 4 + i]);
+                    out_decode = static_cast<uint8_t>(
+                        key_bytes[10 * 16 + c * 4 + i] ^ out.ext_out[c * 4 + i]);
                 }
+
+                uint8_t m_in = out.input_masks[r][pos];
+                uint8_t m_out = out.output_masks[r][pos];
 
                 for (int b = 0; b < 256; ++b)
                 {
-                    uint8_t input_byte = static_cast<uint8_t>(b);
-                    uint8_t after_decode = static_cast<uint8_t>(input_byte ^ input_decode);
+                    uint8_t actual = static_cast<uint8_t>(b ^ m_in);
+                    uint8_t after_decode = static_cast<uint8_t>(actual ^ input_decode);
                     uint8_t after_key = static_cast<uint8_t>(after_decode ^ kbyte);
-                    uint8_t after_sbox = detail_wb::k_sbox[after_key];
-                    uint8_t final_byte = static_cast<uint8_t>(after_sbox ^ out_decode);
-                    out.t_boxes[r][c * 4 + i][b] = final_byte;
+                    uint8_t after_sbox = sbox[after_key];
+                    uint8_t t_val = static_cast<uint8_t>(after_sbox ^ out_decode);
+
+                    uint8_t o1 = rng.next_byte();
+                    uint8_t o2 = static_cast<uint8_t>(t_val ^ o1);
+
+                    out.t_boxes_s1[r][pos][b] = static_cast<uint8_t>(o1 ^ out.t_xor_keys_s1[r][pos][0]);
+                    out.t_boxes_s2[r][pos][b] = static_cast<uint8_t>(o2 ^ out.t_xor_keys_s2[r][pos][0]);
+                }
+
+                if (r < 9)
+                {
+                    for (int b = 0; b < 256; ++b)
+                    {
+                        uint8_t actual = static_cast<uint8_t>(b ^ m_in);
+                        uint8_t t_val = static_cast<uint8_t>(
+                            sbox[static_cast<uint8_t>(actual ^ input_decode ^ kbyte)] ^ out_decode);
+                        uint32_t mc_word = mc_word_for_row(t_val, i);
+
+                        uint32_t col_mask = 0;
+                        if (i == 0)
+                        {
+                            col_mask =
+                                (static_cast<uint32_t>(mb_masks[r][c][0]) << 24) |
+                                (static_cast<uint32_t>(mb_masks[r][c][1]) << 16) |
+                                (static_cast<uint32_t>(mb_masks[r][c][2]) << 8) |
+                                 static_cast<uint32_t>(mb_masks[r][c][3]);
+                            mc_word ^= col_mask;
+                        }
+
+                        uint32_t mb_mask_out =
+                            (static_cast<uint32_t>(out.output_masks[r][c * 4 + 0]) << 24) |
+                            (static_cast<uint32_t>(out.output_masks[r][c * 4 + 1]) << 16) |
+                            (static_cast<uint32_t>(out.output_masks[r][c * 4 + 2]) << 8) |
+                             static_cast<uint32_t>(out.output_masks[r][c * 4 + 3]);
+
+                        uint32_t share1_val = mc_word ^ mb_mask_out;
+                        uint32_t share2_val = mb_mask_out;
+
+                        uint32_t xor_key1;
+                        std::memcpy(&xor_key1, out.mb_xor_keys_s1[r][pos], 4);
+                        uint32_t xor_key2;
+                        std::memcpy(&xor_key2, out.mb_xor_keys_s2[r][pos], 4);
+
+                        out.mb_tables_s1[r][pos][b] = share1_val ^ xor_key1;
+                        out.mb_tables_s2[r][pos][b] = share2_val ^ xor_key2;
+                    }
                 }
             }
         }
@@ -413,88 +637,140 @@ inline bool generate_tables(const uint8_t key[16], uint64_t entropy_seed, white_
 
     for (int r = 0; r < 9; ++r)
     {
-        for (int c = 0; c < 4; ++c)
+        int order[4] = {0, 1, 2, 3};
+        for (int i = 3; i > 0; --i)
         {
-            for (int i = 0; i < 4; ++i)
-            {
-                for (int b = 0; b < 256; ++b)
-                {
-                    uint8_t sbox_out = out.t_boxes[r][c * 4 + i][b];
-                    uint32_t mc_word = detail_wb::mc_word_for_row(sbox_out, i);
-                    if (i == 0)
-                    {
-                        uint32_t mask_word =
-                            (static_cast<uint32_t>(mb_masks[r][c][0]) << 24) |
-                            (static_cast<uint32_t>(mb_masks[r][c][1]) << 16) |
-                            (static_cast<uint32_t>(mb_masks[r][c][2]) << 8) |
-                             static_cast<uint32_t>(mb_masks[r][c][3]);
-                        mc_word ^= mask_word;
-                    }
-                    out.mb_tables[r][c * 4 + i][b] = mc_word;
-                }
-            }
+            int j = rng.next_byte() % (i + 1);
+            int tmp = order[i];
+            order[i] = order[j];
+            order[j] = tmp;
         }
+        for (int c = 0; c < 4; ++c)
+            out.col_order[r][c] = order[c];
     }
+
+    derive_blake3_iv(seed, out.blake3_iv);
+
+    out.ghash_half_a = kGhashHalfA;
+    out.ghash_half_b = kGhashHalfB;
+
+    uint8_t ver_key[16];
+    derive_verification_key(seed, ver_key);
+
+    for (int i = 0; i < 16; ++i)
+    {
+        out.verification_key_xor[i] = rng.next_byte();
+        out.verification_key_obf[i] = static_cast<uint8_t>(ver_key[i] ^ out.verification_key_xor[i]);
+    }
+    SecureZeroMemory(ver_key, sizeof(ver_key));
+
+    uint8_t build_id_input[48];
+    std::memcpy(build_id_input, seed, 32);
+    static const uint8_t bid_label[16] = {
+        'W','B','B','U','I','L','D','I','D','V','2','\0','\0','\0','\0','\0'
+    };
+    std::memcpy(build_id_input + 32, bid_label, 16);
+    blake3::hash(build_id_input, 48, out.build_id);
+    SecureZeroMemory(build_id_input, sizeof(build_id_input));
+
+    static const uint8_t test_pt[16] = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+    };
+    std::memcpy(out.test_plaintext, test_pt, 16);
 
     SecureZeroMemory(round_keys, sizeof(round_keys));
     SecureZeroMemory(key_bytes, sizeof(key_bytes));
     SecureZeroMemory(mb_masks, sizeof(mb_masks));
-    SecureZeroMemory(&rng, sizeof(rng));
-
-    detail_wb::set_last_error(nullptr);
-    return true;
+    SecureZeroMemory(sbox, sizeof(sbox));
+    SecureZeroMemory(rcon, sizeof(rcon));
+    rng.wipe();
 }
 
-inline void encrypt_block(const white_box_table_t& tbl, const uint8_t in[16], uint8_t out[16])
+}
+
+inline const char* last_error()
 {
-    uint8_t state[16];
+    return detail_wb::s_last_error_storage().c_str();
+}
+
+inline void encrypt_block_masked(
+    const white_box_table_masked_t& tbl,
+    const uint8_t in[16], uint8_t out[16])
+{
+    uint8_t state1[16], state2[16];
     for (int i = 0; i < 16; ++i)
-        state[i] = static_cast<uint8_t>(in[i] ^ tbl.ext_in[i]);
+    {
+        state1[i] = static_cast<uint8_t>(in[i] ^ tbl.ext_in[i]);
+        state2[i] = tbl.input_masks[0][i];
+        state1[i] = static_cast<uint8_t>(state1[i] ^ state2[i]);
+    }
 
     for (int r = 0; r < 9; ++r)
     {
-        uint8_t next_state[16];
-        for (int c = 0; c < 4; ++c)
+        uint8_t next1[16], next2[16];
+        for (int co = 0; co < 4; ++co)
         {
-            uint32_t col_word = 0;
+            int c = tbl.col_order[r][co];
+            uint32_t col1 = 0, col2 = 0;
             for (int i = 0; i < 4; ++i)
             {
                 int src_idx = detail_wb::sr_source_index(c, i);
-                uint8_t b = state[src_idx];
-                col_word ^= tbl.mb_tables[r][c * 4 + i][b];
+                int pos = c * 4 + i;
+
+                col1 ^= detail_wb::mb_table_lookup_s1(tbl, r, pos, state1[src_idx]);
+                col2 ^= detail_wb::mb_table_lookup_s2(tbl, r, pos, state2[src_idx]);
+
+                volatile uint8_t dummy1 = tbl.t_boxes_s1[r][pos ^ 0x05][state1[src_idx ^ 0x0A]];
+                volatile uint8_t dummy2 = tbl.t_boxes_s2[r][pos ^ 0x0A][state2[src_idx ^ 0x05]];
+                (void)dummy1;
+                (void)dummy2;
             }
-            next_state[c * 4 + 0] = static_cast<uint8_t>((col_word >> 24) & 0xFFu);
-            next_state[c * 4 + 1] = static_cast<uint8_t>((col_word >> 16) & 0xFFu);
-            next_state[c * 4 + 2] = static_cast<uint8_t>((col_word >> 8) & 0xFFu);
-            next_state[c * 4 + 3] = static_cast<uint8_t>(col_word & 0xFFu);
+
+            uint32_t combined = col1 ^ col2;
+            uint8_t new_mask = tbl.input_masks[r + 1][c * 4];
+            next1[c * 4 + 0] = static_cast<uint8_t>((combined >> 24) & 0xFFu) ^ new_mask;
+            next1[c * 4 + 1] = static_cast<uint8_t>((combined >> 16) & 0xFFu) ^ new_mask;
+            next1[c * 4 + 2] = static_cast<uint8_t>((combined >> 8) & 0xFFu) ^ new_mask;
+            next1[c * 4 + 3] = static_cast<uint8_t>(combined & 0xFFu) ^ new_mask;
+            next2[c * 4 + 0] = new_mask;
+            next2[c * 4 + 1] = new_mask;
+            next2[c * 4 + 2] = new_mask;
+            next2[c * 4 + 3] = new_mask;
         }
-        std::memcpy(state, next_state, 16);
-        SecureZeroMemory(next_state, sizeof(next_state));
+        std::memcpy(state1, next1, 16);
+        std::memcpy(state2, next2, 16);
+        SecureZeroMemory(next1, sizeof(next1));
+        SecureZeroMemory(next2, sizeof(next2));
     }
 
+    uint8_t final_state[16];
+    for (int c = 0; c < 4; ++c)
     {
-        uint8_t final_state[16];
-        for (int c = 0; c < 4; ++c)
+        for (int i = 0; i < 4; ++i)
         {
-            for (int i = 0; i < 4; ++i)
-            {
-                int src_idx = detail_wb::sr_source_index(c, i);
-                uint8_t b = state[src_idx];
-                final_state[c * 4 + i] = tbl.t_boxes[9][c * 4 + i][b];
-            }
+            int src_idx = detail_wb::sr_source_index(c, i);
+            int pos = c * 4 + i;
+
+            uint8_t v1 = detail_wb::t_box_lookup_s1(tbl, 9, pos, state1[src_idx]);
+            uint8_t v2 = detail_wb::t_box_lookup_s2(tbl, 9, pos, state2[src_idx]);
+
+            volatile uint8_t dummy = tbl.t_boxes_s1[9][pos ^ 0x05][state2[src_idx ^ 0x0A]];
+            (void)dummy;
+
+            final_state[pos] = static_cast<uint8_t>((v1 ^ v2) ^ tbl.ext_out[pos]);
         }
-        std::memcpy(state, final_state, 16);
-        SecureZeroMemory(final_state, sizeof(final_state));
     }
-
-    for (int i = 0; i < 16; ++i)
-        out[i] = static_cast<uint8_t>(state[i] ^ tbl.ext_out[i]);
-
-    SecureZeroMemory(state, sizeof(state));
+    std::memcpy(out, final_state, 16);
+    SecureZeroMemory(state1, sizeof(state1));
+    SecureZeroMemory(state2, sizeof(state2));
+    SecureZeroMemory(final_state, sizeof(final_state));
 }
 
-inline bool encrypt_ctr(const white_box_table_t& tbl, const uint8_t iv[16],
-                         const uint8_t* in, uint8_t* out, size_t len)
+inline bool encrypt_ctr_masked(
+    const white_box_table_masked_t& tbl,
+    const uint8_t iv[16],
+    const uint8_t* in, uint8_t* out, size_t len)
 {
     if (len > 0 && (!in || !out))
     {
@@ -506,13 +782,14 @@ inline bool encrypt_ctr(const white_box_table_t& tbl, const uint8_t iv[16],
         detail_wb::set_last_error("encrypt_ctr_invalid_iv");
         return false;
     }
+
     uint8_t counter[16];
     std::memcpy(counter, iv, 16);
     uint8_t ks[16];
     size_t off = 0;
     while (off < len)
     {
-        encrypt_block(tbl, counter, ks);
+        encrypt_block_masked(tbl, counter, ks);
         for (int i = 15; i >= 0; --i)
         {
             if (++counter[i] != 0) break;
@@ -526,6 +803,696 @@ inline bool encrypt_ctr(const white_box_table_t& tbl, const uint8_t iv[16],
     SecureZeroMemory(ks, sizeof(ks));
     detail_wb::set_last_error(nullptr);
     return true;
+}
+
+inline const white_box_table_masked_t& get_tables();
+inline bool initialize_tables();
+inline bool is_fallback_mode();
+inline void get_verification_key(uint8_t key[16]);
+
+namespace detail_wb {
+
+__forceinline void gcm_gf_mul_wb(
+    const uint8_t x[16], const uint8_t y[16], uint8_t z_out[16],
+    uint8_t half_a, uint8_t half_b)
+{
+    uint8_t z[16] = {0};
+    uint8_t v[16];
+    std::memcpy(v, y, 16);
+    uint8_t reduction = static_cast<uint8_t>(half_a | half_b);
+
+    for (int i = 0; i < 128; ++i)
+    {
+        uint8_t bit = static_cast<uint8_t>((x[i >> 3] >> (7 - (i & 7))) & 1);
+        if (bit)
+        {
+            for (int j = 0; j < 16; ++j)
+                z[j] ^= v[j];
+        }
+        uint8_t lsb = static_cast<uint8_t>(v[15] & 1);
+        for (int j = 15; j > 0; --j)
+        {
+            v[j] = static_cast<uint8_t>((v[j] >> 1) | ((v[j - 1] & 1) << 7));
+        }
+        v[0] >>= 1;
+        if (lsb) v[0] ^= reduction;
+    }
+    std::memcpy(z_out, z, 16);
+    SecureZeroMemory(z, sizeof(z));
+    SecureZeroMemory(v, sizeof(v));
+}
+
+__forceinline void ghash_update_wb(
+    const uint8_t H[16], const uint8_t* data, size_t len,
+    uint8_t y[16], uint8_t half_a, uint8_t half_b)
+{
+    size_t full = len / 16;
+    for (size_t i = 0; i < full; ++i)
+    {
+        for (int j = 0; j < 16; ++j)
+            y[j] ^= data[i * 16 + j];
+        uint8_t t[16];
+        gcm_gf_mul_wb(y, H, t, half_a, half_b);
+        std::memcpy(y, t, 16);
+        SecureZeroMemory(t, sizeof(t));
+    }
+    size_t rem = len % 16;
+    if (rem)
+    {
+        uint8_t last[16] = {0};
+        for (size_t j = 0; j < rem; ++j)
+            last[j] = data[full * 16 + j];
+        for (int j = 0; j < 16; ++j)
+            y[j] ^= last[j];
+        uint8_t t[16];
+        gcm_gf_mul_wb(y, H, t, half_a, half_b);
+        std::memcpy(y, t, 16);
+        SecureZeroMemory(t, sizeof(t));
+        SecureZeroMemory(last, sizeof(last));
+    }
+}
+
+__forceinline void gcm_inc32_wb(uint8_t ctr[16])
+{
+    uint32_t c = (static_cast<uint32_t>(ctr[12]) << 24) |
+                 (static_cast<uint32_t>(ctr[13]) << 16) |
+                 (static_cast<uint32_t>(ctr[14]) << 8)  |
+                 (static_cast<uint32_t>(ctr[15]));
+    c += 1;
+    ctr[12] = static_cast<uint8_t>(c >> 24);
+    ctr[13] = static_cast<uint8_t>(c >> 16);
+    ctr[14] = static_cast<uint8_t>(c >> 8);
+    ctr[15] = static_cast<uint8_t>(c);
+}
+
+}
+
+inline bool gcm_encrypt(
+    const uint8_t* plaintext, size_t pt_len,
+    const uint8_t* aad, size_t aad_len,
+    const uint8_t nonce[12],
+    uint8_t* ciphertext,
+    uint8_t tag[16])
+{
+    if (!nonce) return false;
+    if (pt_len > 0 && (!plaintext || !ciphertext)) return false;
+
+    const auto& tbl = get_tables();
+
+    uint8_t H[16] = {0};
+    uint8_t zero[16] = {0};
+    encrypt_block_masked(tbl, zero, H);
+
+    uint8_t j0[16] = {0};
+    std::memcpy(j0, nonce, 12);
+    j0[15] = 1;
+
+    uint8_t ctr[16];
+    std::memcpy(ctr, j0, 16);
+    detail_wb::gcm_inc32_wb(ctr);
+
+    size_t full = pt_len / 16;
+    size_t rem = pt_len % 16;
+    for (size_t i = 0; i < full; ++i)
+    {
+        uint8_t ks[16];
+        encrypt_block_masked(tbl, ctr, ks);
+        for (int j = 0; j < 16; ++j)
+            ciphertext[i * 16 + j] = static_cast<uint8_t>(plaintext[i * 16 + j] ^ ks[j]);
+        detail_wb::gcm_inc32_wb(ctr);
+        SecureZeroMemory(ks, sizeof(ks));
+    }
+    if (rem)
+    {
+        uint8_t ks[16];
+        encrypt_block_masked(tbl, ctr, ks);
+        for (size_t j = 0; j < rem; ++j)
+            ciphertext[full * 16 + j] = static_cast<uint8_t>(plaintext[full * 16 + j] ^ ks[j]);
+        SecureZeroMemory(ks, sizeof(ks));
+    }
+
+    uint8_t y[16] = {0};
+    if (aad && aad_len > 0)
+        detail_wb::ghash_update_wb(H, aad, aad_len, y, tbl.ghash_half_a, tbl.ghash_half_b);
+    if (pt_len > 0)
+        detail_wb::ghash_update_wb(H, ciphertext, pt_len, y, tbl.ghash_half_a, tbl.ghash_half_b);
+
+    uint8_t len_blk[16] = {0};
+    uint64_t aad_bits = static_cast<uint64_t>(aad_len) * 8;
+    uint64_t ct_bits  = static_cast<uint64_t>(pt_len) * 8;
+    for (int i = 7; i >= 0; --i)
+        len_blk[7 - i] = static_cast<uint8_t>(aad_bits >> (i * 8));
+    for (int i = 7; i >= 0; --i)
+        len_blk[15 - i] = static_cast<uint8_t>(ct_bits >> (i * 8));
+    for (int j = 0; j < 16; ++j)
+        y[j] ^= len_blk[j];
+
+    uint8_t ghash_tag[16];
+    detail_wb::gcm_gf_mul_wb(y, H, ghash_tag, tbl.ghash_half_a, tbl.ghash_half_b);
+
+    uint8_t ej0[16];
+    encrypt_block_masked(tbl, j0, ej0);
+    for (int j = 0; j < 16; ++j)
+        tag[j] = static_cast<uint8_t>(ghash_tag[j] ^ ej0[j]);
+
+    SecureZeroMemory(H, sizeof(H));
+    SecureZeroMemory(j0, sizeof(j0));
+    SecureZeroMemory(ctr, sizeof(ctr));
+    SecureZeroMemory(y, sizeof(y));
+    SecureZeroMemory(ghash_tag, sizeof(ghash_tag));
+    SecureZeroMemory(ej0, sizeof(ej0));
+    SecureZeroMemory(len_blk, sizeof(len_blk));
+    return true;
+}
+
+inline bool gcm_decrypt(
+    const uint8_t* ciphertext, size_t ct_len,
+    const uint8_t* aad, size_t aad_len,
+    const uint8_t nonce[12],
+    const uint8_t tag[16],
+    uint8_t* plaintext)
+{
+    if (!nonce || !tag) return false;
+    if (ct_len > 0 && (!ciphertext || !plaintext)) return false;
+
+    const auto& tbl = get_tables();
+
+    uint8_t H[16] = {0};
+    uint8_t zero[16] = {0};
+    encrypt_block_masked(tbl, zero, H);
+
+    uint8_t j0[16] = {0};
+    std::memcpy(j0, nonce, 12);
+    j0[15] = 1;
+
+    uint8_t y[16] = {0};
+    if (aad && aad_len > 0)
+        detail_wb::ghash_update_wb(H, aad, aad_len, y, tbl.ghash_half_a, tbl.ghash_half_b);
+    if (ct_len > 0)
+        detail_wb::ghash_update_wb(H, ciphertext, ct_len, y, tbl.ghash_half_a, tbl.ghash_half_b);
+
+    uint8_t len_blk[16] = {0};
+    uint64_t aad_bits = static_cast<uint64_t>(aad_len) * 8;
+    uint64_t ct_bits  = static_cast<uint64_t>(ct_len) * 8;
+    for (int i = 7; i >= 0; --i)
+        len_blk[7 - i] = static_cast<uint8_t>(aad_bits >> (i * 8));
+    for (int i = 7; i >= 0; --i)
+        len_blk[15 - i] = static_cast<uint8_t>(ct_bits >> (i * 8));
+    for (int j = 0; j < 16; ++j)
+        y[j] ^= len_blk[j];
+
+    uint8_t ghash_tag[16];
+    detail_wb::gcm_gf_mul_wb(y, H, ghash_tag, tbl.ghash_half_a, tbl.ghash_half_b);
+
+    uint8_t ej0[16];
+    encrypt_block_masked(tbl, j0, ej0);
+    uint8_t expected_tag[16];
+    for (int j = 0; j < 16; ++j)
+        expected_tag[j] = static_cast<uint8_t>(ghash_tag[j] ^ ej0[j]);
+
+    volatile uint8_t diff = 0;
+    for (int j = 0; j < 16; ++j)
+        diff |= static_cast<uint8_t>(expected_tag[j] ^ tag[j]);
+
+    if (diff != 0)
+    {
+        SecureZeroMemory(H, sizeof(H));
+        SecureZeroMemory(j0, sizeof(j0));
+        SecureZeroMemory(y, sizeof(y));
+        SecureZeroMemory(ghash_tag, sizeof(ghash_tag));
+        SecureZeroMemory(ej0, sizeof(ej0));
+        SecureZeroMemory(expected_tag, sizeof(expected_tag));
+        SecureZeroMemory(len_blk, sizeof(len_blk));
+        detail_wb::set_last_error("gcm_decrypt_tag_mismatch");
+        return false;
+    }
+
+    uint8_t ctr[16];
+    std::memcpy(ctr, j0, 16);
+    detail_wb::gcm_inc32_wb(ctr);
+
+    size_t full = ct_len / 16;
+    size_t rem = ct_len % 16;
+    for (size_t i = 0; i < full; ++i)
+    {
+        uint8_t ks[16];
+        encrypt_block_masked(tbl, ctr, ks);
+        for (int j = 0; j < 16; ++j)
+            plaintext[i * 16 + j] = static_cast<uint8_t>(ciphertext[i * 16 + j] ^ ks[j]);
+        detail_wb::gcm_inc32_wb(ctr);
+        SecureZeroMemory(ks, sizeof(ks));
+    }
+    if (rem)
+    {
+        uint8_t ks[16];
+        encrypt_block_masked(tbl, ctr, ks);
+        for (size_t j = 0; j < rem; ++j)
+            plaintext[full * 16 + j] = static_cast<uint8_t>(ciphertext[full * 16 + j] ^ ks[j]);
+        SecureZeroMemory(ks, sizeof(ks));
+    }
+
+    SecureZeroMemory(H, sizeof(H));
+    SecureZeroMemory(j0, sizeof(j0));
+    SecureZeroMemory(ctr, sizeof(ctr));
+    SecureZeroMemory(y, sizeof(y));
+    SecureZeroMemory(ghash_tag, sizeof(ghash_tag));
+    SecureZeroMemory(ej0, sizeof(ej0));
+    SecureZeroMemory(expected_tag, sizeof(expected_tag));
+    SecureZeroMemory(len_blk, sizeof(len_blk));
+    return true;
+}
+
+inline void compute_table_hash(const white_box_table_masked_t& tbl, uint8_t out[32])
+{
+    constexpr size_t kTableDataSize = offsetof(white_box_table_masked_t, blake3_iv);
+    detail_wb::blake3_hash_custom(&tbl, kTableDataSize, tbl.blake3_iv, out);
+}
+
+namespace detail_wb {
+
+inline std::atomic<bool>& s_fallback_mode()
+{
+    static std::atomic<bool> v{false};
+    return v;
+}
+
+inline uint8_t (&s_fallback_token())[64]
+{
+    static uint8_t t[64] = {};
+    return t;
+}
+
+inline std::mutex& s_fallback_mtx()
+{
+    static std::mutex m;
+    return m;
+}
+
+inline uint8_t (&s_table_hash())[32]
+{
+    static uint8_t h[32] = {};
+    return h;
+}
+
+inline std::atomic<bool>& s_tables_ready()
+{
+    static std::atomic<bool> v{false};
+    return v;
+}
+
+inline std::once_flag& s_init_once()
+{
+    static std::once_flag f;
+    return f;
+}
+
+inline white_box_table_masked_t*& s_global_tables()
+{
+    static white_box_table_masked_t* p = nullptr;
+    return p;
+}
+
+}
+
+inline bool is_fallback_mode()
+{
+    return detail_wb::s_fallback_mode().load(std::memory_order_acquire);
+}
+
+inline void set_fallback_mode(bool mode)
+{
+    detail_wb::s_fallback_mode().store(mode, std::memory_order_release);
+}
+
+inline void set_fallback_token(const uint8_t token[64])
+{
+    std::lock_guard<std::mutex> lk(detail_wb::s_fallback_mtx());
+    std::memcpy(detail_wb::s_fallback_token(), token, 64);
+}
+
+inline void get_fallback_token(uint8_t token[64])
+{
+    std::lock_guard<std::mutex> lk(detail_wb::s_fallback_mtx());
+    std::memcpy(token, detail_wb::s_fallback_token(), 64);
+}
+
+inline void get_table_hash(uint8_t out[32])
+{
+    std::memcpy(out, detail_wb::s_table_hash(), 32);
+}
+
+inline bool bcrypt_aes128_ecb(
+    const uint8_t in[16], const uint8_t key[16], uint8_t out[16])
+{
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(st) || !hAlg) return false;
+
+    st = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+        reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_ECB)),
+        static_cast<ULONG>(wcslen(BCRYPT_CHAIN_MODE_ECB) * sizeof(wchar_t) + sizeof(wchar_t)), 0);
+    if (!BCRYPT_SUCCESS(st))
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    st = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+        const_cast<PUCHAR>(key), 16, 0);
+    if (!BCRYPT_SUCCESS(st) || !hKey)
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    ULONG bytes_done = 0;
+    st = BCryptEncrypt(hKey,
+        const_cast<PUCHAR>(in), 16,
+        nullptr, nullptr, 0,
+        out, 16, &bytes_done, 0);
+
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    return BCRYPT_SUCCESS(st) && bytes_done == 16;
+}
+
+inline bool bcrypt_aes128_ctr(
+    const uint8_t* in, uint8_t* out, size_t len,
+    const uint8_t key[16], const uint8_t iv[16])
+{
+    if (len == 0) return true;
+    if (!in || !out || !key || !iv) return false;
+
+    uint8_t counter[16];
+    std::memcpy(counter, iv, 16);
+
+    size_t off = 0;
+    while (off < len)
+    {
+        uint8_t ks[16];
+        if (!bcrypt_aes128_ecb(counter, key, ks))
+        {
+            SecureZeroMemory(counter, sizeof(counter));
+            return false;
+        }
+        for (int i = 15; i >= 0; --i)
+        {
+            if (++counter[i] != 0) break;
+        }
+        size_t bl = (len - off > 16) ? 16 : (len - off);
+        for (size_t i = 0; i < bl; ++i)
+            out[off + i] = static_cast<uint8_t>(in[off + i] ^ ks[i]);
+        off += bl;
+        SecureZeroMemory(ks, sizeof(ks));
+    }
+    SecureZeroMemory(counter, sizeof(counter));
+    return true;
+}
+
+inline bool bcrypt_aes128_gcm_encrypt(
+    const uint8_t* plaintext, size_t pt_len,
+    const uint8_t* aad, size_t aad_len,
+    const uint8_t key[16], const uint8_t nonce[12],
+    uint8_t* ciphertext, uint8_t tag[16])
+{
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(st)) return false;
+
+    st = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+        reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+        static_cast<ULONG>(wcslen(BCRYPT_CHAIN_MODE_GCM) * sizeof(wchar_t) + sizeof(wchar_t)), 0);
+    if (!BCRYPT_SUCCESS(st))
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    st = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+        const_cast<PUCHAR>(key), 16, 0);
+    if (!BCRYPT_SUCCESS(st) || !hKey)
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = const_cast<PUCHAR>(nonce);
+    info.cbNonce = 12;
+    info.pbAuthData = aad ? const_cast<PUCHAR>(aad) : nullptr;
+    info.cbAuthData = static_cast<ULONG>(aad_len);
+    info.pbTag = tag;
+    info.cbTag = 16;
+
+    ULONG bytes_done = 0;
+    st = BCryptEncrypt(hKey,
+        const_cast<PUCHAR>(plaintext), static_cast<ULONG>(pt_len),
+        &info, nullptr, 0,
+        ciphertext, static_cast<ULONG>(pt_len), &bytes_done, 0);
+
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return BCRYPT_SUCCESS(st);
+}
+
+inline bool bcrypt_aes128_gcm_decrypt(
+    const uint8_t* ciphertext, size_t ct_len,
+    const uint8_t* aad, size_t aad_len,
+    const uint8_t key[16], const uint8_t nonce[12],
+    const uint8_t tag[16], uint8_t* plaintext)
+{
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_KEY_HANDLE hKey = nullptr;
+
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(st)) return false;
+
+    st = BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE,
+        reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+        static_cast<ULONG>(wcslen(BCRYPT_CHAIN_MODE_GCM) * sizeof(wchar_t) + sizeof(wchar_t)), 0);
+    if (!BCRYPT_SUCCESS(st))
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    st = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0,
+        const_cast<PUCHAR>(key), 16, 0);
+    if (!BCRYPT_SUCCESS(st) || !hKey)
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = const_cast<PUCHAR>(nonce);
+    info.cbNonce = 12;
+    info.pbAuthData = aad ? const_cast<PUCHAR>(aad) : nullptr;
+    info.cbAuthData = static_cast<ULONG>(aad_len);
+    info.pbTag = const_cast<PUCHAR>(tag);
+    info.cbTag = 16;
+
+    ULONG bytes_done = 0;
+    st = BCryptDecrypt(hKey,
+        const_cast<PUCHAR>(ciphertext), static_cast<ULONG>(ct_len),
+        &info, nullptr, 0,
+        plaintext, static_cast<ULONG>(ct_len), &bytes_done, 0);
+
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return BCRYPT_SUCCESS(st);
+}
+
+inline void get_verification_key(uint8_t key[16])
+{
+    const auto& tbl = *detail_wb::s_global_tables();
+    for (int i = 0; i < 16; ++i)
+        key[i] = static_cast<uint8_t>(tbl.verification_key_obf[i] ^ tbl.verification_key_xor[i]);
+}
+
+inline bool initialize_tables()
+{
+    if (detail_wb::s_tables_ready().load(std::memory_order_acquire))
+        return true;
+
+    bool success = false;
+    std::call_once(detail_wb::s_init_once(), [&]() {
+        auto* tbl = static_cast<white_box_table_masked_t*>(
+            HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                      sizeof(white_box_table_masked_t)));
+        if (!tbl)
+        {
+            detail_wb::set_last_error("init_tables_alloc_failed");
+            return;
+        }
+
+        uint8_t seed[32];
+        arc_internal::arc_build_seed_bytes(seed);
+
+        uint8_t wbaes_key[16];
+        detail_wb::derive_wbaes_key(seed, wbaes_key);
+
+        detail_wb::generate_tables_masked(wbaes_key, seed, *tbl);
+
+        SecureZeroMemory(wbaes_key, sizeof(wbaes_key));
+
+        encrypt_block_masked(*tbl, tbl->test_plaintext, tbl->test_ciphertext);
+
+        compute_table_hash(*tbl, tbl->expected_hash);
+
+        std::memcpy(detail_wb::s_table_hash(), tbl->expected_hash, 32);
+
+        tbl->initialized = true;
+        detail_wb::s_global_tables() = tbl;
+        detail_wb::s_tables_ready().store(true, std::memory_order_release);
+        success = true;
+
+        SecureZeroMemory(seed, sizeof(seed));
+    });
+
+    return success;
+}
+
+inline const white_box_table_masked_t& get_tables()
+{
+    if (!detail_wb::s_tables_ready().load(std::memory_order_acquire))
+        initialize_tables();
+    return *detail_wb::s_global_tables();
+}
+
+inline bool verify_test_vector()
+{
+    const auto& tbl = get_tables();
+
+    uint8_t result[16];
+    encrypt_block_masked(tbl, tbl.test_plaintext, result);
+
+    volatile uint8_t diff = 0;
+    for (int i = 0; i < 16; ++i)
+        diff |= static_cast<uint8_t>(result[i] ^ tbl.test_ciphertext[i]);
+
+    SecureZeroMemory(result, sizeof(result));
+
+    if (diff != 0)
+    {
+        detail_wb::set_last_error("test_vector_mismatch");
+        return false;
+    }
+    return true;
+}
+
+inline bool verify_table_hash()
+{
+    const auto& tbl = get_tables();
+
+    uint8_t computed[32];
+    compute_table_hash(tbl, computed);
+
+    volatile uint8_t diff = 0;
+    for (int i = 0; i < 32; ++i)
+        diff |= static_cast<uint8_t>(computed[i] ^ tbl.expected_hash[i]);
+
+    SecureZeroMemory(computed, sizeof(computed));
+
+    if (diff != 0)
+    {
+        detail_wb::set_last_error("table_hash_mismatch");
+        set_fallback_mode(true);
+        return false;
+    }
+    return true;
+}
+
+inline bool ctr_crypt(
+    const uint8_t* in, uint8_t* out, size_t len,
+    const uint8_t iv[16])
+{
+    if (!iv) return false;
+    if (len > 0 && (!in || !out)) return false;
+
+    if (is_fallback_mode())
+    {
+        uint8_t ver_key[16];
+        get_verification_key(ver_key);
+        bool ok = bcrypt_aes128_ctr(in, out, len, ver_key, iv);
+        SecureZeroMemory(ver_key, sizeof(ver_key));
+        return ok;
+    }
+
+    const auto& tbl = get_tables();
+    return encrypt_ctr_masked(tbl, iv, in, out, len);
+}
+
+struct wbaes_challenge_t {
+    uint8_t challenge_plaintext[16];
+    uint8_t expected_ciphertext[16];
+    uint8_t build_id[16];
+    uint8_t fallback_mode;
+    uint8_t fallback_token[64];
+    uint8_t reserved[15];
+};
+
+inline bool compute_challenge_response(
+    const uint8_t challenge[16],
+    uint8_t response[16],
+    bool& used_fallback)
+{
+    if (!challenge || !response) return false;
+
+    if (is_fallback_mode())
+    {
+        used_fallback = true;
+        uint8_t ver_key[16];
+        get_verification_key(ver_key);
+        bool ok = bcrypt_aes128_ecb(challenge, ver_key, response);
+        SecureZeroMemory(ver_key, sizeof(ver_key));
+        return ok;
+    }
+
+    used_fallback = false;
+    const auto& tbl = get_tables();
+    encrypt_block_masked(tbl, challenge, response);
+    return true;
+}
+
+inline void build_challenge_packet(
+    const uint8_t challenge[16],
+    wbaes_challenge_t& out_pkt)
+{
+    std::memcpy(out_pkt.challenge_plaintext, challenge, 16);
+
+    bool used_fallback = false;
+    compute_challenge_response(challenge, out_pkt.expected_ciphertext, used_fallback);
+
+    out_pkt.fallback_mode = used_fallback ? 1 : 0;
+
+    if (used_fallback)
+        get_fallback_token(out_pkt.fallback_token);
+    else
+        std::memset(out_pkt.fallback_token, 0, 64);
+
+    const auto& tbl = get_tables();
+    std::memcpy(out_pkt.build_id, tbl.build_id, 16);
+    std::memset(out_pkt.reserved, 0, sizeof(out_pkt.reserved));
+}
+
+inline void shutdown_tables()
+{
+    auto* tbl = detail_wb::s_global_tables();
+    if (tbl)
+    {
+        SecureZeroMemory(tbl, sizeof(white_box_table_masked_t));
+        HeapFree(GetProcessHeap(), 0, tbl);
+        detail_wb::s_global_tables() = nullptr;
+    }
+    detail_wb::s_tables_ready().store(false, std::memory_order_release);
+    set_fallback_mode(false);
 }
 
 }

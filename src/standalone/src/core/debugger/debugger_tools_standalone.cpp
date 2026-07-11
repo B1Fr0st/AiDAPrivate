@@ -22,6 +22,7 @@
 #include "../../helpers/diag_log.hpp"
 #include "../diagnostics/metadata_ring.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
+#include "../anti-tamper/self_guard.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -296,6 +297,17 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         }
     }
     diag::log_tagged_fmt("dbg_tools", "ensure_attached: ok pid=%u", driver_bridge::attached_pid());
+
+    {
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "debugger_tools";
+        sg_ctx.has_pid = true;
+        sg_ctx.target_pid = driver_bridge::attached_pid();
+        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+        if (sg_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+    }
+
     return std::nullopt;
 }
 
@@ -2587,6 +2599,18 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
     }
     const std::uint64_t addr = *addr_opt;
 
+    {
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "dbg_detect_vm_handler";
+        sg_ctx.has_pid = true;
+        sg_ctx.target_pid = driver_bridge::attached_pid();
+        sg_ctx.has_address = true;
+        sg_ctx.target_address = addr;
+        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+        if (sg_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+    }
+
     int scan_size = 512;
     if (params.contains("size") && params["size"].is_number())
         scan_size = std::clamp(params["size"].get<int>(), 64, 16384);
@@ -3009,6 +3033,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+
+            {
+                self_guard::self_guard_context_t sg_ctx;
+                sg_ctx.tool_name = "dbg_run_to_address";
+                sg_ctx.has_pid = true;
+                sg_ctx.target_pid = driver_bridge::attached_pid();
+                sg_ctx.has_address = true;
+                sg_ctx.target_address = *addr;
+                auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+                if (sg_result != self_guard::self_guard_result_t::allow)
+                    self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+            }
+
             bool wait = false;
             if (params.contains("wait_for_completion") && params["wait_for_completion"].is_boolean())
                 wait = params["wait_for_completion"].get<bool>();
@@ -3622,6 +3659,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             } else {
                 return tool_result_t::error("'address' is required.");
             }
+
+            {
+                self_guard::self_guard_context_t sg_ctx;
+                sg_ctx.tool_name = "debugger_set_breakpoint";
+                sg_ctx.has_pid = true;
+                sg_ctx.target_pid = driver_bridge::attached_pid();
+                sg_ctx.has_address = true;
+                sg_ctx.target_address = addr;
+                auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+                if (sg_result != self_guard::self_guard_result_t::allow)
+                    self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+            }
+
             std::string type_str = "exec";
             if (params.contains("type") && params["type"].is_string())
                 type_str = params["type"].get<std::string>();
@@ -3993,6 +4043,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'address' required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+
+            {
+                self_guard::self_guard_context_t sg_ctx;
+                sg_ctx.tool_name = "dbg_add_hw_breakpoint";
+                sg_ctx.has_pid = true;
+                sg_ctx.target_pid = driver_bridge::attached_pid();
+                sg_ctx.has_address = true;
+                sg_ctx.target_address = *addr;
+                auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+                if (sg_result != self_guard::self_guard_result_t::allow)
+                    self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+            }
+
             std::string type_str = params.value("type", "execute");
             debugger_engine::bp_type_t bpt = debugger_engine::bp_type_t::hardware_execute;
             if (type_str == "write") bpt = debugger_engine::bp_type_t::hardware_write;
@@ -4898,6 +4961,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             auto patched = code_patcher::parse_bytes(params["bytes"].get<std::string>());
+
+            {
+                self_guard::self_guard_context_t sg_ctx;
+                sg_ctx.tool_name = "dbg_add_patch";
+                sg_ctx.has_pid = true;
+                sg_ctx.target_pid = driver_bridge::attached_pid();
+                sg_ctx.has_address = true;
+                sg_ctx.target_address = *addr;
+                auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+                if (sg_result != self_guard::self_guard_result_t::allow)
+                    self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+            }
+
             if (patched.empty()) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: invalid hex bytes");
                 return tool_result_t::error(OBFSTR("Invalid hex bytes."));
@@ -5065,6 +5141,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             int size = params["size"].get<int>();
             if (size <= 0 || size > 4096)
                 return tool_result_t::error(OBFSTR("Size must be between 1 and 4096."));
+
+            {
+                self_guard::self_guard_context_t sg_ctx;
+                sg_ctx.tool_name = "dbg_nop_fill";
+                sg_ctx.has_pid = true;
+                sg_ctx.target_pid = driver_bridge::attached_pid();
+                sg_ctx.has_address = true;
+                sg_ctx.target_address = *addr;
+                auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+                if (sg_result != self_guard::self_guard_result_t::allow)
+                    self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+            }
+
             if (auto reject = reject_full_test_system_mutation(*addr, static_cast<std::uint64_t>(size), "dbg_nop_fill"))
                 return *reject;
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: addr=0x%llX size=%d", (unsigned long long)*addr, size);
@@ -5183,6 +5272,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
             std::string cond = params["condition"].get<std::string>();
+
+            {
+                self_guard::self_guard_context_t sg_ctx;
+                sg_ctx.tool_name = "dbg_conditional_breakpoint";
+                sg_ctx.has_pid = true;
+                sg_ctx.target_pid = driver_bridge::attached_pid();
+                sg_ctx.has_address = true;
+                sg_ctx.target_address = *addr;
+                auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+                if (sg_result != self_guard::self_guard_result_t::allow)
+                    self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+            }
+
             diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: addr=0x%llX cond=%s", (unsigned long long)*addr, cond.c_str());
             const std::size_t before_count = breakpoint_count();
             int bp_idx = debugger_engine::add_breakpoint(*addr, debugger_engine::bp_type_t::software, "", cond);

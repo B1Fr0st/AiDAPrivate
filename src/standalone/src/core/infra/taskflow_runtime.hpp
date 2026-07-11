@@ -19,7 +19,20 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER) && defined(_MSVC_LANG) && _MSVC_LANG == 201703L
+#pragma push_macro("__has_include")
+#undef __has_include
+#define __has_include(...) 0
+#define AIDA_TASKFLOW_RESTORE_HAS_INCLUDE 1
+#endif
 #include <taskflow/taskflow.hpp>
+#if defined(AIDA_TASKFLOW_RESTORE_HAS_INCLUDE)
+#undef AIDA_TASKFLOW_RESTORE_HAS_INCLUDE
+#pragma pop_macro("__has_include")
+#endif
+#if !defined(TF_VERSION) || TF_VERSION != 301100
+#error Taskflow_version_mismatch
+#endif
 
 #include "../diagnostics/metadata_ring.hpp"
 #include "../runtime/manual_map_tls.hpp"
@@ -209,9 +222,15 @@ struct active_job_snapshot_t {
     std::string label;
     std::string owner_subsystem;
     std::string exception_text;
+    std::string target_id;
+    int priority = 3;
     std::uint64_t queued_ms = 0;
     std::uint64_t started_ms = 0;
     std::uint64_t finished_ms = 0;
+    std::uint64_t queued_ns = 0;
+    std::uint64_t started_ns = 0;
+    std::uint64_t fairness_wait_ns = 0;
+    std::uint64_t service_units = 0;
     std::uint64_t deadline_ms = 0;
     std::uint64_t capacity_lease = 0;
     std::uint64_t active_ms = 0;
@@ -242,6 +261,7 @@ struct runtime_snapshot_t {
 };
 
 struct pool_t;
+struct job_record_t;
 
 class worker_interface_t final : public tf::WorkerInterface {
 public:
@@ -278,6 +298,15 @@ struct pool_t {
     std::atomic<std::uint64_t> timed_out_tasks{0};
     std::atomic<std::uint64_t> next_task_id{0};
     std::atomic<std::size_t> worker_count{0};
+    std::vector<std::shared_ptr<job_record_t>> admission_queue;
+    std::unordered_map<std::string, std::size_t> admitted_targets;
+    std::unordered_map<std::string, std::uint64_t> target_pending_nodes;
+    std::uint64_t admission_sequence = 0;
+    std::uint64_t deferred_nodes = 0;
+    std::size_t admitted_jobs = 0;
+    std::size_t pending_capacity = 0;
+    std::size_t per_target_pending_capacity = 0;
+    std::size_t admission_capacity = 0;
 
     pool_t(const char* pool_name_in, const char* log_tag_in, const char* default_label_in, pool_family_t family_in, int configured_pool_size_in) noexcept
         : pool_name(pool_name_in),
@@ -325,13 +354,22 @@ struct job_record_t {
     std::uint64_t queued_ms = 0;
     std::uint64_t started_ms = 0;
     std::uint64_t finished_ms = 0;
+    std::uint64_t queued_ns = 0;
+    std::uint64_t started_ns = 0;
+    std::uint64_t fairness_wait_ns = 0;
+    std::uint64_t service_units = 0;
+    std::uint64_t admission_sequence = 0;
     std::function<void()> body;
     std::function<void(const cancellation_token_t&)> cancellable_body;
     std::function<void()> cancel_hook;
     std::shared_ptr<cancellation_token_t> cancel_token;
+    std::shared_ptr<tf::Taskflow> pending_flow;
+    std::shared_ptr<tf::Semaphore> target_semaphore;
     tf::Future<void> future;
     bool has_future = false;
     bool graph = false;
+    bool admission_pending = false;
+    bool admitted = false;
     bool active = true;
     bool deadline_reported = false;
     job_state_t state = job_state_t::queued;
@@ -400,6 +438,25 @@ inline bool terminal_state(job_state_t s) {
 
 inline std::uint64_t now_ms() {
     return static_cast<std::uint64_t>(GetTickCount64());
+}
+
+inline std::uint64_t now_ns() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+inline int normalized_priority(int priority) {
+    return (std::max)(0, (std::min)(7, priority));
+}
+
+inline std::string admission_target_key(const job_record_t& record) {
+    if (!record.target_id.empty())
+        return "target:" + record.target_id;
+    if (record.target_pid != 0)
+        return "pid:" + std::to_string(record.target_pid);
+    if (!record.session_id.empty())
+        return "session:" + record.session_id;
+    return "owner:" + record.owner_subsystem;
 }
 
 inline int clamp_pool_size(unsigned value, unsigned low, unsigned high) {
@@ -661,6 +718,16 @@ inline void initialize_pool(pool_t& p, int pool_size) {
     }
     try {
         p.configured_pool_size = pool_size;
+        const auto workers = static_cast<std::size_t>(pool_size);
+        p.pending_capacity = (std::max<std::size_t>)(4096, workers * 4096);
+        p.per_target_pending_capacity =
+            (std::max<std::size_t>)(1024, p.pending_capacity / 2);
+        p.admission_capacity = (std::max<std::size_t>)(1, workers);
+        p.admission_queue.clear();
+        p.admitted_targets.clear();
+        p.target_pending_nodes.clear();
+        p.deferred_nodes = 0;
+        p.admitted_jobs = 0;
         p.active_snapshots.assign(static_cast<std::size_t>(pool_size), {});
         p.executor.reset(new tf::Executor(static_cast<std::size_t>(pool_size), std::unique_ptr<tf::WorkerInterface>(new worker_interface_t(&p))));
         p.worker_count.store(p.executor ? p.executor->num_workers() : 0, std::memory_order_release);
@@ -756,10 +823,15 @@ inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint6
     p->started_tasks.fetch_add(1u, std::memory_order_acq_rel);
     decrement_atomic_if_nonzero(p->pending_tasks);
     const std::uint64_t start = now_ms();
+    const std::uint64_t start_ns = now_ns();
     {
         std::lock_guard<std::mutex> lk(record->mtx);
-        if (record->started_ms == 0)
+        if (record->started_ms == 0) {
             record->started_ms = start;
+            record->started_ns = start_ns;
+            record->fairness_wait_ns = start_ns >= record->queued_ns
+                ? start_ns - record->queued_ns : 0;
+        }
         if (record->state == job_state_t::queued || record->state == job_state_t::not_started)
             record->state = job_state_t::running;
     }
@@ -809,6 +881,10 @@ inline void finish_started_record(const std::shared_ptr<job_record_t>& record, s
         p->failed_tasks.fetch_add(1u, std::memory_order_acq_rel);
     if (final_state == job_state_t::timed_out)
         p->timed_out_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    if (final_state == job_state_t::completed) {
+        std::lock_guard<std::mutex> lk(record->mtx);
+        ++record->service_units;
+    }
     mark_record_inactive(record, final_state, exception_text);
 }
 
@@ -923,6 +999,8 @@ inline void execute_graph_node(const std::shared_ptr<job_record_t>& record, std:
         } else if (node_state == job_state_t::cancelled && record->state != job_state_t::failed && record->state != job_state_t::timed_out) {
             record->state = job_state_t::cancelled;
         }
+        if (node_state == job_state_t::completed)
+            ++record->service_units;
     }
     if (node_state == job_state_t::failed) {
         g_total_failed.fetch_add(1u, std::memory_order_acq_rel);
@@ -942,6 +1020,9 @@ inline void execute_graph_node(const std::shared_ptr<job_record_t>& record, std:
         exception_text.empty() ? "<none>" : exception_text.c_str(),
         static_cast<unsigned long>(GetCurrentThreadId()));
 }
+
+inline void try_admit_deferred(pool_t& p);
+inline void release_target_nodes(pool_t& p, const job_record_t& record);
 
 inline void complete_graph_record(const std::shared_ptr<job_record_t>& record) {
     if (!record)
@@ -995,6 +1076,10 @@ inline void complete_graph_record(const std::shared_ptr<job_record_t>& record) {
         record->nodes.size(),
         exception_text.empty() ? "<none>" : exception_text.c_str(),
         static_cast<unsigned long>(GetCurrentThreadId()));
+    if (p && !record->admission_pending) {
+        release_target_nodes(*p, *record);
+        try_admit_deferred(*p);
+    }
 }
 
 inline void prune_completed_jobs_locked() {
@@ -1040,13 +1125,14 @@ inline std::shared_ptr<job_record_t> make_record_from_descriptor(task_descriptor
     record->failure_policy = copy_or_default(desc.failure_policy, "reject_not_started");
     record->shutdown_policy = copy_or_default(desc.shutdown_policy, "drain");
     record->no_capacity_reason = copy_or_default(desc.no_capacity_reason, "");
-    record->priority = desc.priority;
+    record->priority = normalized_priority(desc.priority);
     record->target_pid = desc.target_pid;
     record->deadline_ms = desc.deadline_ms;
     record->capacity_lease = desc.capacity_lease;
     record->lease_token = desc.lease_token;
     record->generation = desc.generation;
     record->queued_ms = now_ms();
+    record->queued_ns = now_ns();
     record->body = std::move(desc.body);
     record->cancellable_body = std::move(desc.cancellable_body);
     record->cancel_hook = std::move(desc.cancel_hook);
@@ -1150,6 +1236,85 @@ inline submit_result_t submit(task_descriptor_t&& desc) {
     return submit_to_pool(p, p.configured_pool_size, std::move(desc));
 }
 
+inline void try_admit_deferred(pool_t& p) {
+    if (!p.executor || !p.alive.load(std::memory_order_acquire) ||
+        p.shutting_down.load(std::memory_order_acquire) ||
+        p.stop_accepting.load(std::memory_order_acquire))
+        return;
+    std::vector<std::shared_ptr<job_record_t>> admitted;
+    std::vector<std::shared_ptr<job_record_t>> still_deferred;
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        if (p.admission_queue.empty())
+            return;
+        still_deferred.reserve(p.admission_queue.size());
+        for (auto& record : p.admission_queue) {
+            if (!record || !record->pending_flow || !record->active)
+                continue;
+            const auto key = admission_target_key(*record);
+            const auto node_count = record->nodes.size();
+            const auto current = p.target_pending_nodes[key];
+            if (current + node_count <= p.per_target_pending_capacity) {
+                p.target_pending_nodes[key] = current + node_count;
+                p.admitted_targets[key] = 1;
+                admitted.push_back(std::move(record));
+            } else {
+                still_deferred.push_back(std::move(record));
+            }
+        }
+        p.admission_queue = std::move(still_deferred);
+        p.deferred_nodes = 0;
+        for (const auto& record : p.admission_queue)
+            p.deferred_nodes += record ? record->nodes.size() : 0;
+    }
+    for (auto& record : admitted) {
+        try {
+            auto flow = std::move(*record->pending_flow);
+            record->pending_flow.reset();
+            record->admission_pending = false;
+            std::lock_guard<std::mutex> plk(p.mtx);
+            p.pending_tasks.fetch_add(static_cast<std::uint64_t>(record->nodes.size()), std::memory_order_acq_rel);
+            auto future = p.executor->run(std::move(flow), [record]() { complete_graph_record(record); });
+            {
+                std::lock_guard<std::mutex> record_lk(record->mtx);
+                record->future = std::move(future);
+                record->has_future = true;
+                if (record->state == job_state_t::queued)
+                    record->state = job_state_t::not_started;
+            }
+            p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
+            g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
+        } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> record_lk(record->mtx);
+            record->state = job_state_t::failed;
+            record->exception_text = ex.what();
+            record->active = false;
+            record->cv.notify_all();
+        } catch (...) {
+            std::lock_guard<std::mutex> record_lk(record->mtx);
+            record->state = job_state_t::failed;
+            record->exception_text = "admission_exception";
+            record->active = false;
+            record->cv.notify_all();
+        }
+    }
+}
+
+inline void release_target_nodes(pool_t& p, const job_record_t& record) {
+    const auto key = admission_target_key(record);
+    const auto node_count = record.nodes.size();
+    std::lock_guard<std::mutex> lk(p.mtx);
+    auto it = p.target_pending_nodes.find(key);
+    if (it != p.target_pending_nodes.end()) {
+        if (it->second > node_count)
+            it->second -= node_count;
+        else
+            it->second = 0;
+        if (it->second == 0)
+            p.admitted_targets.erase(key);
+    }
+}
+
 inline submit_result_t submit_graph(graph_descriptor_t&& graph) {
     submit_result_t result;
     if (!graph.owner_subsystem || !*graph.owner_subsystem) {
@@ -1181,11 +1346,12 @@ inline submit_result_t submit_graph(graph_descriptor_t&& graph) {
     record->target_id = copy_or_default(graph.target_id, "");
     record->diagnostic_id = copy_or_default(graph.diagnostic_id, "");
     record->request_id = copy_or_default(graph.request_id, "");
-    record->priority = graph.priority;
+    record->priority = normalized_priority(graph.priority);
     record->target_pid = graph.target_pid;
     record->deadline_ms = graph.deadline_ms;
     record->generation = graph.generation;
     record->queued_ms = now_ms();
+    record->queued_ns = now_ns();
     record->cancel_hook = std::move(graph.cancel_hook);
     record->cancel_token = std::make_shared<cancellation_token_t>();
     record->graph = true;
@@ -1235,25 +1401,47 @@ inline submit_result_t submit_graph(graph_descriptor_t&& graph) {
         g_jobs[record->id] = record;
     }
     bool pending_incremented = false;
+    bool deferred = false;
     try {
         std::lock_guard<std::mutex> lk(p.mtx);
         if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire) || p.stop_accepting.load(std::memory_order_acquire) || !p.executor) {
             result.reject_reason = "pool_not_accepting";
         } else {
-            p.pending_tasks.fetch_add(static_cast<std::uint64_t>(record->nodes.size()), std::memory_order_acq_rel);
-            pending_incremented = true;
-            auto future = p.executor->run(std::move(flow), [record]() { complete_graph_record(record); });
-            {
-                std::lock_guard<std::mutex> record_lk(record->mtx);
-                record->future = std::move(future);
-                record->has_future = true;
-                if (record->state == job_state_t::queued)
-                    record->state = job_state_t::not_started;
+            const auto target_key = admission_target_key(*record);
+            const auto node_count = record->nodes.size();
+            const auto current_pending = p.target_pending_nodes[target_key];
+            const bool other_targets_waiting = !p.admission_queue.empty() ||
+                (p.admitted_targets.size() > 1) ||
+                (p.admitted_targets.size() == 1 &&
+                 p.admitted_targets.find(target_key) == p.admitted_targets.end());
+            if (other_targets_waiting &&
+                current_pending + node_count > p.per_target_pending_capacity &&
+                p.admission_queue.size() < p.admission_capacity) {
+                record->pending_flow = std::make_shared<tf::Taskflow>(std::move(flow));
+                record->admission_pending = true;
+                p.admission_queue.push_back(record);
+                p.deferred_nodes += node_count;
+                result.submitted = true;
+                result.handle.id = record->id;
+                deferred = true;
+            } else {
+                p.target_pending_nodes[target_key] = current_pending + node_count;
+                p.admitted_targets[target_key] = 1;
+                p.pending_tasks.fetch_add(static_cast<std::uint64_t>(record->nodes.size()), std::memory_order_acq_rel);
+                pending_incremented = true;
+                auto future = p.executor->run(std::move(flow), [record]() { complete_graph_record(record); });
+                {
+                    std::lock_guard<std::mutex> record_lk(record->mtx);
+                    record->future = std::move(future);
+                    record->has_future = true;
+                    if (record->state == job_state_t::queued)
+                        record->state = job_state_t::not_started;
+                }
+                p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
+                g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
+                result.submitted = true;
+                result.handle.id = record->id;
             }
-            p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
-            g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
-            result.submitted = true;
-            result.handle.id = record->id;
         }
     } catch (const std::exception& ex) {
         result.reject_reason = ex.what();
@@ -1268,7 +1456,7 @@ inline submit_result_t submit_graph(graph_descriptor_t&& graph) {
         p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
         g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
         mark_record_inactive(record, job_state_t::failed, result.reject_reason);
-    } else {
+    } else if (!deferred) {
         diag::log_tagged_fmt(safe_log_tag(p),
             "taskflow_graph_submit job_id=%llu pool=%s owner=%s label=%s phase=%s domain=%s nodes=%zu deadline_ms=%llu tid=%lu",
             static_cast<unsigned long long>(record->id),
@@ -1835,9 +2023,15 @@ inline runtime_snapshot_t active_snapshot(std::size_t max_jobs = 64) {
                 item.label = record->label;
                 item.owner_subsystem = record->owner_subsystem;
                 item.exception_text = record->exception_text;
+                item.target_id = record->target_id;
+                item.priority = record->priority;
                 item.queued_ms = record->queued_ms;
                 item.started_ms = record->started_ms;
                 item.finished_ms = record->finished_ms;
+                item.queued_ns = record->queued_ns;
+                item.started_ns = record->started_ns;
+                item.fairness_wait_ns = record->fairness_wait_ns;
+                item.service_units = record->service_units;
                 item.deadline_ms = record->deadline_ms;
                 item.capacity_lease = record->capacity_lease;
                 item.active_ms = age;

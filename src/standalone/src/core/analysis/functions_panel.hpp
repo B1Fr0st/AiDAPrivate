@@ -5,9 +5,7 @@
 #include "../helpers/globals.h"
 #include "zydis_disasm.hpp"
 #include "disasm_view.hpp"
-#include "pe_parser.hpp"
 #include "symbol_store.hpp"
-#include "rename_store.hpp"
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "ui/theme.hpp"
@@ -17,6 +15,9 @@
 #include "ui/empty_state.hpp"
 #include "ui/fonts.hpp"
 #include "ui/ui_anim.hpp"
+#include "workspace/overlay_journal.hpp"
+#include "workspace/workspace_registry.hpp"
+#include "../session/analysis_session.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -25,21 +26,19 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <string>
-#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <Windows.h>
 
-extern DisasmState g_disasm;
-
 namespace cfg_view {
-	void build_cfg(uint64_t entry_address);
+	void build_cfg(const disasm_view::workspace_context_t& context,
+		uint64_t entry_address);
 }
 
 namespace functions_panel {
@@ -64,6 +63,10 @@ namespace functions_panel {
 		uint32_t                       cached_module_size = 0;
 		std::string                    cached_module_name;
 		uint64_t                       cached_pid_token = 0;
+		uint64_t                       cached_generation = 0;
+		uint64_t                       cached_analysis_revision = 0;
+		uint64_t                       cached_overlay_revision = 0;
+		uint64_t                       cached_symbol_revision = 0;
 
 		char                           filter_buf[160] = {};
 		std::string                    last_filter_lower;
@@ -82,9 +85,42 @@ namespace functions_panel {
 		std::vector<int>               sorted_indices;
 	};
 
+	inline std::mutex& workspace_states_mutex() {
+		static std::mutex mutex;
+		return mutex;
+	}
+
+	inline std::unordered_map<std::string, std::shared_ptr<view_state_t>>&
+	workspace_states() {
+		static std::unordered_map<std::string, std::shared_ptr<view_state_t>> states;
+		return states;
+	}
+
+	inline std::shared_ptr<aida::analysis::analysis_workspace_t>& render_workspace() {
+		thread_local std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+		return workspace;
+	}
+
+	inline std::shared_ptr<view_state_t> state_handle_for(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+		if (!workspace) {
+			static auto empty = std::make_shared<view_state_t>();
+			return empty;
+		}
+		const std::string id = workspace->identity().binary_id().to_hex();
+		std::lock_guard<std::mutex> lock(workspace_states_mutex());
+		auto& slot = workspace_states()[id];
+		if (!slot) slot = std::make_shared<view_state_t>();
+		return slot;
+	}
+
+	inline view_state_t& state_for(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+		return *state_handle_for(workspace);
+	}
+
 	inline view_state_t& state() {
-		static view_state_t s;
-		return s;
+		return state_for(render_workspace());
 	}
 
 	namespace detail {
@@ -96,15 +132,6 @@ namespace functions_panel {
 				out[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
 			}
 			return out;
-		}
-
-		inline std::string section_name_for_rva(const pe_parser::pe_info_t& pe, uint32_t rva) {
-			for (const auto& s : pe.sections) {
-				if (rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size) {
-					return s.name;
-				}
-			}
-			return std::string();
 		}
 
 		inline std::string make_synthetic_name(uint64_t addr) {
@@ -120,929 +147,237 @@ namespace functions_panel {
 			return s.substr(pos + 1);
 		}
 
-		inline std::string resolve_function_name(uint64_t va, uint64_t module_base,
-			const std::unordered_map<uint64_t, std::string>& export_lookup,
-			bool& out_synthetic)
+		inline void refresh_from_workspace(
+			const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
 		{
-			out_synthetic = false;
-
-			std::string rn = rename_store::get(va);
-			if (!rn.empty()) {
-				return rn;
-			}
-
-			std::string sym = symbol_store::resolve_symbol_exact(va);
-			if (!sym.empty()) {
-				return sym;
-			}
-
-			auto it = export_lookup.find(va);
-			if (it != export_lookup.end() && !it->second.empty()) {
-				return it->second;
-			}
-
-			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-			for (auto& [mod_name, ms] : symbol_store::g_state.modules) {
-				if (!ms.pdb.loaded) continue;
-				if (va < ms.base || va >= ms.base + ms.size) continue;
-				uint64_t rva = va - ms.base;
-				auto rit = ms.pdb.symbol_by_rva.find(rva);
-				if (rit != ms.pdb.symbol_by_rva.end()) {
-					return ms.pdb.symbols[rit->second].name;
-				}
-			}
-
-			(void)module_base;
-			out_synthetic = true;
-			return make_synthetic_name(va);
-		}
-
-		inline bool read_runtime_function_table(uint64_t module_base,
-			const pe_parser::pe_info_t& pe,
-			std::vector<uint64_t>& out_starts,
-			std::vector<uint32_t>& out_sizes)
-		{
-			out_starts.clear();
-			out_sizes.clear();
-
-			uint16_t dos_magic = 0;
-			if (!pe_parser::detail::read_mem(module_base, &dos_magic, 2)) return false;
-			if (dos_magic != 0x5A4D) return false;
-
-			uint32_t e_lfanew = 0;
-			if (!pe_parser::detail::read_mem(module_base + 0x3C, &e_lfanew, 4)) return false;
-			if (e_lfanew == 0 || e_lfanew > 0x1000) return false;
-
-			uint64_t opt_addr = module_base + e_lfanew + 24;
-
-			uint16_t opt_magic = 0;
-			if (!pe_parser::detail::read_mem(opt_addr, &opt_magic, 2)) return false;
-			if (opt_magic != 0x020B) return true;
-
-			uint32_t exception_dir_rva = 0;
-			uint32_t exception_dir_size = 0;
-			if (!pe_parser::detail::read_mem(opt_addr + 144, &exception_dir_rva, 4)) return false;
-			if (!pe_parser::detail::read_mem(opt_addr + 148, &exception_dir_size, 4)) return false;
-			if (exception_dir_rva == 0 || exception_dir_size < 12) return true;
-
-			const uint32_t entry_size = 12;
-			uint32_t count = exception_dir_size / entry_size;
-			if (count == 0 || count > 0x100000) return true;
-
-			std::vector<uint8_t> table;
-			size_t total_bytes = static_cast<size_t>(count) * entry_size;
-			table.reserve(total_bytes);
-			const size_t chunk_bytes = 0x10000;
-			size_t fetched = 0;
-			bool any_chunk_ok = false;
-			while (fetched < total_bytes) {
-				size_t to_read = total_bytes - fetched;
-				if (to_read > chunk_bytes) to_read = chunk_bytes;
-				std::vector<uint8_t> piece;
-				if (driver_bridge::read_memory(module_base + exception_dir_rva + fetched,
-					to_read, piece) && !piece.empty())
-				{
-					any_chunk_ok = true;
-					table.insert(table.end(), piece.begin(), piece.end());
-					fetched += piece.size();
-					if (piece.size() < to_read) break;
-				} else {
-					break;
-				}
-			}
-			if (!any_chunk_ok) return false;
-			if (table.size() < total_bytes) {
-				count = static_cast<uint32_t>(table.size() / entry_size);
-			}
-
-			out_starts.reserve(count);
-			out_sizes.reserve(count);
-			for (uint32_t i = 0; i < count; ++i) {
-				uint32_t begin_rva = 0;
-				uint32_t end_rva = 0;
-				std::memcpy(&begin_rva, table.data() + i * entry_size + 0, 4);
-				std::memcpy(&end_rva, table.data() + i * entry_size + 4, 4);
-				if (begin_rva == 0 || end_rva <= begin_rva) continue;
-				if (begin_rva >= pe.size_of_image) continue;
-				out_starts.push_back(module_base + begin_rva);
-				uint32_t fsz = end_rva - begin_rva;
-				if (fsz > 0x4000000u) fsz = 0x4000000u;
-				out_sizes.push_back(fsz);
-			}
-
-			(void)pe;
-			return true;
-		}
-
-		inline const driver_bridge::module_info_t* select_target_module(
-			const std::vector<driver_bridge::module_info_t>& modules,
-			const std::string& process_name)
-		{
-			if (modules.empty()) return nullptr;
-
-			if (!process_name.empty()) {
-				for (const auto& m : modules) {
-					if (_stricmp(m.name.c_str(), process_name.c_str()) == 0) {
-						return &m;
-					}
-				}
-			}
-
-			const driver_bridge::module_info_t* best = &modules.front();
-			for (const auto& m : modules) {
-				if (m.base != 0 && (best->base == 0 || m.base < best->base)) {
-					best = &m;
-				}
-			}
-			return best;
-		}
-
-		inline void build_locked(view_state_t& s, uint64_t module_base, uint32_t module_size,
-			const std::string& module_name)
-		{
-			pe_parser::pe_info_t pe;
-			if (!pe_parser::parse(module_base, pe)) {
-				std::lock_guard<std::mutex> lk(s.mtx);
-				s.entries.clear();
-				s.cached_module_base = module_base;
-				s.cached_module_size = module_size;
-				s.cached_module_name = module_name;
-				s.filter_dirty = true;
-				s.sort_dirty = true;
-				return;
-			}
-
-			std::vector<uint64_t> rf_starts;
-			std::vector<uint32_t> rf_sizes;
-			read_runtime_function_table(module_base, pe, rf_starts, rf_sizes);
-
-			std::unordered_map<uint64_t, uint32_t> size_lookup;
-			size_lookup.reserve(rf_starts.size());
-			for (size_t i = 0; i < rf_starts.size(); ++i) {
-				auto it = size_lookup.find(rf_starts[i]);
-				if (it == size_lookup.end()) {
-					size_lookup.emplace(rf_starts[i], rf_sizes[i]);
-				}
-				else {
-					if (rf_sizes[i] > it->second) it->second = rf_sizes[i];
-				}
-			}
-
-			std::unordered_map<uint64_t, std::string> export_lookup;
-			export_lookup.reserve(pe.exports.size());
-			for (const auto& exp : pe.exports) {
-				if (exp.is_forwarded || exp.address == 0 || exp.name.empty()) continue;
-				if (export_lookup.find(exp.address) == export_lookup.end()) {
-					export_lookup.emplace(exp.address, exp.name);
-				}
-			}
-
-			std::vector<uint64_t> candidate_addrs;
-			candidate_addrs.reserve(rf_starts.size() + pe.exports.size() + 64);
-
-			for (uint64_t va : rf_starts) {
-				candidate_addrs.push_back(va);
-			}
-
-			for (const auto& exp : pe.exports) {
-				if (exp.is_forwarded || exp.address == 0) continue;
-				if (exp.address < module_base) continue;
-				if (exp.address >= module_base + module_size) continue;
-				candidate_addrs.push_back(exp.address);
-			}
-
-			{
-				std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-				auto it = symbol_store::g_state.modules.find(module_name);
-				if (it != symbol_store::g_state.modules.end() && it->second.pdb.loaded) {
-					for (const auto& sym : it->second.pdb.symbols) {
-						if (!sym.is_function) continue;
-						if (sym.rva == 0) continue;
-						uint64_t va = it->second.base + sym.rva;
-						if (va < module_base || va >= module_base + module_size) continue;
-						candidate_addrs.push_back(va);
-					}
-				}
-			}
-
-			if (pe.entry_point >= module_base && pe.entry_point < module_base + module_size) {
-				candidate_addrs.push_back(pe.entry_point);
-			}
-
-			std::sort(candidate_addrs.begin(), candidate_addrs.end());
-			candidate_addrs.erase(
-				std::unique(candidate_addrs.begin(), candidate_addrs.end()),
-				candidate_addrs.end());
-
-			std::vector<function_entry_t> built;
-			built.reserve(candidate_addrs.size());
-
-			for (uint64_t va : candidate_addrs) {
-				if (s.cancel.load(std::memory_order_acquire)) return;
-
-				function_entry_t fn;
-				fn.address = va;
-
-				auto sit = size_lookup.find(va);
-				fn.size = (sit != size_lookup.end()) ? sit->second : 0;
-
-				bool synthetic = true;
-				fn.name = resolve_function_name(va, module_base, export_lookup, synthetic);
-				fn.synthetic_name = synthetic;
-
-				if (va >= module_base && va < module_base + module_size) {
-					uint32_t rva = static_cast<uint32_t>(va - module_base);
-					fn.section = section_name_for_rva(pe, rva);
-				}
-
-				built.push_back(std::move(fn));
-			}
-
-			std::sort(built.begin(), built.end(),
-				[](const function_entry_t& a, const function_entry_t& b) {
-					return a.address < b.address;
-				});
-
-			{
-				std::lock_guard<std::mutex> lk(s.mtx);
-				s.entries = std::move(built);
-				s.cached_module_base = module_base;
-				s.cached_module_size = module_size;
-				s.cached_module_name = module_name;
-				s.filter_dirty = true;
-				s.sort_dirty = true;
-				s.selected_row = -1;
-				s.selected_addr = 0;
-			}
-		}
-
-		inline bool disk_read_whole_file(const std::string& path, std::vector<uint8_t>& out)
-		{
-			out.clear();
-			HANDLE h = CreateFileA(path.c_str(), GENERIC_READ,
-				FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-				FILE_ATTRIBUTE_NORMAL, nullptr);
-			if (h == INVALID_HANDLE_VALUE) return false;
-			LARGE_INTEGER sz{};
-			if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (1ll << 31)) {
-				CloseHandle(h);
-				return false;
-			}
-			out.resize(static_cast<size_t>(sz.QuadPart));
-			size_t total = 0;
-			while (total < out.size()) {
-				DWORD chunk = static_cast<DWORD>(std::min<size_t>(out.size() - total, 1u << 20));
-				DWORD got = 0;
-				if (!ReadFile(h, out.data() + total, chunk, &got, nullptr) || got == 0) {
-					CloseHandle(h);
-					out.clear();
-					return false;
-				}
-				total += got;
-			}
-			CloseHandle(h);
-			return true;
-		}
-
-		struct disk_section_t {
-			std::string name;
-			uint32_t    virtual_address = 0;
-			uint32_t    virtual_size = 0;
-			uint32_t    raw_size = 0;
-			uint32_t    raw_offset = 0;
-			uint32_t    characteristics = 0;
-		};
-
-		struct disk_pe_view_t {
-			std::vector<uint8_t>              raw;
-			uint64_t                          image_base = 0;
-			uint32_t                          size_of_image = 0;
-			uint32_t                          entry_rva = 0;
-			std::vector<disk_section_t>       sections;
-			uint32_t                          exception_dir_rva = 0;
-			uint32_t                          exception_dir_size = 0;
-			uint32_t                          export_dir_rva = 0;
-			uint32_t                          export_dir_size = 0;
-			uint32_t                          import_dir_rva = 0;
-			uint32_t                          import_dir_size = 0;
-			uint32_t                          iat_dir_rva = 0;
-			uint32_t                          iat_dir_size = 0;
-			bool                              is_pe32_plus = false;
-		};
-
-		inline bool disk_parse_pe(disk_pe_view_t& v)
-		{
-			if (v.raw.size() < sizeof(IMAGE_DOS_HEADER)) return false;
-			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(v.raw.data());
-			if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-			uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
-			if (pe_off + sizeof(IMAGE_NT_HEADERS32) > v.raw.size()) return false;
-			const auto* nt_common = reinterpret_cast<const IMAGE_NT_HEADERS32*>(v.raw.data() + pe_off);
-			if (nt_common->Signature != IMAGE_NT_SIGNATURE) return false;
-			const IMAGE_FILE_HEADER& fh = nt_common->FileHeader;
-			const uint16_t opt_magic = nt_common->OptionalHeader.Magic;
-			v.is_pe32_plus = (opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
-			const bool is_pe32 = (opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC);
-			if (!v.is_pe32_plus && !is_pe32) return false;
-			IMAGE_DATA_DIRECTORY exc_dir{};
-			IMAGE_DATA_DIRECTORY exp_dir{};
-			IMAGE_DATA_DIRECTORY imp_dir{};
-			IMAGE_DATA_DIRECTORY iat_dir{};
-			if (v.is_pe32_plus) {
-				if (pe_off + sizeof(IMAGE_NT_HEADERS64) > v.raw.size()) return false;
-				const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(v.raw.data() + pe_off);
-				v.image_base = nt64->OptionalHeader.ImageBase;
-				v.size_of_image = nt64->OptionalHeader.SizeOfImage;
-				v.entry_rva = nt64->OptionalHeader.AddressOfEntryPoint;
-				if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION)
-					exc_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-				if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT)
-					exp_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-				if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT)
-					imp_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-				if (nt64->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT)
-					iat_dir = nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
-			} else {
-				v.image_base = nt_common->OptionalHeader.ImageBase;
-				v.size_of_image = nt_common->OptionalHeader.SizeOfImage;
-				v.entry_rva = nt_common->OptionalHeader.AddressOfEntryPoint;
-				if (nt_common->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION)
-					exc_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-				if (nt_common->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT)
-					exp_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-				if (nt_common->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT)
-					imp_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-				if (nt_common->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT)
-					iat_dir = nt_common->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
-			}
-			v.exception_dir_rva = exc_dir.VirtualAddress;
-			v.exception_dir_size = exc_dir.Size;
-			v.export_dir_rva = exp_dir.VirtualAddress;
-			v.export_dir_size = exp_dir.Size;
-			v.import_dir_rva = imp_dir.VirtualAddress;
-			v.import_dir_size = imp_dir.Size;
-			v.iat_dir_rva = iat_dir.VirtualAddress;
-			v.iat_dir_size = iat_dir.Size;
-			uint64_t sec_offset = static_cast<uint64_t>(pe_off)
-				+ offsetof(IMAGE_NT_HEADERS32, OptionalHeader) + fh.SizeOfOptionalHeader;
-			uint32_t nsec = fh.NumberOfSections > 96 ? 96 : fh.NumberOfSections;
-			if (sec_offset + static_cast<uint64_t>(nsec) * sizeof(IMAGE_SECTION_HEADER) > v.raw.size()) return false;
-			const auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(v.raw.data() + sec_offset);
-			for (uint32_t i = 0; i < nsec; ++i) {
-				disk_section_t info;
-				char nm[9] = {};
-				std::memcpy(nm, sec[i].Name, 8);
-				nm[8] = 0;
-				info.name = nm;
-				info.virtual_address = sec[i].VirtualAddress;
-				info.virtual_size = sec[i].Misc.VirtualSize;
-				info.raw_size = sec[i].SizeOfRawData;
-				info.raw_offset = sec[i].PointerToRawData;
-				info.characteristics = sec[i].Characteristics;
-				v.sections.push_back(std::move(info));
-			}
-			return true;
-		}
-
-		inline bool disk_read_at_rva(const disk_pe_view_t& v, uint32_t rva, void* buf, size_t size)
-		{
-			for (const auto& s : v.sections) {
-				uint32_t end = s.virtual_address + std::max<uint32_t>(s.virtual_size, s.raw_size);
-				if (rva >= s.virtual_address && rva < end) {
-					uint32_t delta = rva - s.virtual_address;
-					if (delta >= s.raw_size) return false;
-					if (s.raw_size - delta < size) return false;
-					if (s.raw_offset == 0) return false;
-					if (static_cast<uint64_t>(s.raw_offset) + delta + size > v.raw.size()) return false;
-					std::memcpy(buf, v.raw.data() + s.raw_offset + delta, size);
-					return true;
-				}
-			}
-			return false;
-		}
-
-		inline std::string disk_read_string_at_rva(const disk_pe_view_t& v, uint32_t rva, size_t max_len)
-		{
-			std::string out;
-			out.reserve(max_len);
-			for (size_t i = 0; i < max_len; ++i) {
-				uint8_t b = 0;
-				if (!disk_read_at_rva(v, rva + static_cast<uint32_t>(i), &b, 1)) break;
-				if (b == 0) break;
-				out.push_back(static_cast<char>(b));
-			}
-			return out;
-		}
-
-		inline void disk_parse_exports(const disk_pe_view_t& v,
-			std::unordered_map<uint64_t, std::string>& out_lookup)
-		{
-			out_lookup.clear();
-			if (v.export_dir_rva == 0 || v.export_dir_size < 40) return;
-			uint8_t dir_buf[40] = {};
-			if (!disk_read_at_rva(v, v.export_dir_rva, dir_buf, 40)) return;
-			uint32_t num_functions = 0;
-			uint32_t num_names = 0;
-			uint32_t addr_table_rva = 0;
-			uint32_t name_table_rva = 0;
-			uint32_t ordinal_table_rva = 0;
-			std::memcpy(&num_functions, dir_buf + 20, 4);
-			std::memcpy(&num_names, dir_buf + 24, 4);
-			std::memcpy(&addr_table_rva, dir_buf + 28, 4);
-			std::memcpy(&name_table_rva, dir_buf + 32, 4);
-			std::memcpy(&ordinal_table_rva, dir_buf + 36, 4);
-			if (num_functions == 0 || num_functions > 0x10000) return;
-			if (num_names > num_functions) num_names = num_functions;
-			std::vector<uint32_t> addr_table(num_functions, 0);
-			for (uint32_t i = 0; i < num_functions; ++i) {
-				disk_read_at_rva(v, addr_table_rva + i * 4, &addr_table[i], 4);
-			}
-			std::vector<uint32_t> name_ptrs(num_names, 0);
-			std::vector<uint16_t> ordinals(num_names, 0);
-			for (uint32_t i = 0; i < num_names; ++i) {
-				disk_read_at_rva(v, name_table_rva + i * 4, &name_ptrs[i], 4);
-				disk_read_at_rva(v, ordinal_table_rva + i * 2, &ordinals[i], 2);
-			}
-			uint32_t exp_start = v.export_dir_rva;
-			uint32_t exp_end = v.export_dir_rva + v.export_dir_size;
-			for (uint32_t i = 0; i < num_names; ++i) {
-				uint16_t ord = ordinals[i];
-				if (ord >= num_functions) continue;
-				uint32_t rva = addr_table[ord];
-				if (rva == 0) continue;
-				if (rva >= exp_start && rva < exp_end) continue;
-				std::string fn = disk_read_string_at_rva(v, name_ptrs[i], 512);
-				if (fn.empty()) continue;
-				uint64_t va = v.image_base + rva;
-				if (out_lookup.find(va) == out_lookup.end()) {
-					out_lookup.emplace(va, std::move(fn));
-				}
-			}
-		}
-
-		inline void disk_parse_imports(const disk_pe_view_t& v,
-			std::vector<pe_parser::import_entry_t>& out)
-		{
-			out.clear();
-			if (v.import_dir_rva == 0 || v.import_dir_size == 0) return;
-			const uint32_t desc_stride = 20;
-			uint32_t max_descriptors = v.import_dir_size / desc_stride;
-			if (max_descriptors == 0) max_descriptors = 4096;
-			if (max_descriptors > 4096) max_descriptors = 4096;
-			for (uint32_t i = 0; i < max_descriptors; ++i) {
-				uint8_t desc[20] = {};
-				if (!disk_read_at_rva(v, v.import_dir_rva + i * desc_stride, desc, 20)) break;
-				uint32_t ilt_rva = 0;
-				uint32_t name_rva = 0;
-				uint32_t iat_rva = 0;
-				std::memcpy(&ilt_rva, desc + 0, 4);
-				std::memcpy(&name_rva, desc + 12, 4);
-				std::memcpy(&iat_rva, desc + 16, 4);
-				if (ilt_rva == 0 && iat_rva == 0) break;
-				std::string mod_name = disk_read_string_at_rva(v, name_rva, 256);
-				uint32_t lookup_rva = (ilt_rva != 0) ? ilt_rva : iat_rva;
-				if (lookup_rva == 0) continue;
-				const uint32_t entry_stride = v.is_pe32_plus ? 8u : 4u;
-				for (uint32_t t = 0; t < 0x10000; ++t) {
-					uint64_t thunk_val = 0;
-					if (v.is_pe32_plus) {
-						if (!disk_read_at_rva(v, lookup_rva + t * entry_stride, &thunk_val, 8)) break;
-					} else {
-						uint32_t tmp32 = 0;
-						if (!disk_read_at_rva(v, lookup_rva + t * entry_stride, &tmp32, 4)) break;
-						thunk_val = tmp32;
-					}
-					if (thunk_val == 0) break;
-					pe_parser::import_entry_t entry;
-					entry.module_name = mod_name;
-					entry.iat_address = v.image_base + iat_rva + t * entry_stride;
-					if (v.is_pe32_plus) {
-						uint64_t iat_val = 0;
-						disk_read_at_rva(v, iat_rva + t * entry_stride, &iat_val, 8);
-						entry.bound_address = iat_val;
-					} else {
-						uint32_t iat_val32 = 0;
-						disk_read_at_rva(v, iat_rva + t * entry_stride, &iat_val32, 4);
-						entry.bound_address = iat_val32;
-					}
-					bool is_ordinal = v.is_pe32_plus
-						? (thunk_val & 0x8000000000000000ULL) != 0
-						: (thunk_val & 0x80000000ULL) != 0;
-					if (is_ordinal) {
-						entry.ordinal = static_cast<uint16_t>(thunk_val & 0xFFFF);
-						char ord_buf[32];
-						std::snprintf(ord_buf, sizeof(ord_buf), "Ordinal#%u",
-							static_cast<unsigned>(entry.ordinal));
-						entry.function_name = ord_buf;
-					} else {
-						uint32_t hint_name_rva = static_cast<uint32_t>(thunk_val & 0x7FFFFFFFu);
-						uint16_t hint = 0;
-						disk_read_at_rva(v, hint_name_rva, &hint, 2);
-						entry.hint = hint;
-						entry.function_name = disk_read_string_at_rva(v, hint_name_rva + 2, 512);
-					}
-					out.push_back(std::move(entry));
-				}
-			}
-		}
-
-		inline void disk_parse_pdata(const disk_pe_view_t& v,
-			std::unordered_map<uint64_t, uint32_t>& out_size_lookup,
-			std::vector<uint64_t>& out_starts)
-		{
-			out_size_lookup.clear();
-			out_starts.clear();
-			if (!v.is_pe32_plus) return;
-			if (v.exception_dir_rva == 0 || v.exception_dir_size < 12) return;
-			const uint32_t entry_size = 12;
-			uint32_t count = v.exception_dir_size / entry_size;
-			if (count == 0 || count > 0x100000) return;
-			out_starts.reserve(count);
-			out_size_lookup.reserve(count);
-			for (uint32_t i = 0; i < count; ++i) {
-				uint32_t begin_rva = 0;
-				uint32_t end_rva = 0;
-				if (!disk_read_at_rva(v, v.exception_dir_rva + i * entry_size + 0, &begin_rva, 4)) break;
-				if (!disk_read_at_rva(v, v.exception_dir_rva + i * entry_size + 4, &end_rva, 4)) break;
-				if (begin_rva == 0 || end_rva <= begin_rva) continue;
-				if (begin_rva >= v.size_of_image) continue;
-				uint64_t start_va = v.image_base + begin_rva;
-				uint32_t sz = end_rva - begin_rva;
-				if (sz > 0x4000000u) sz = 0x4000000u;
-				out_starts.push_back(start_va);
-				auto it = out_size_lookup.find(start_va);
-				if (it == out_size_lookup.end()) out_size_lookup.emplace(start_va, sz);
-				else if (sz > it->second) it->second = sz;
-			}
-		}
-
-		inline std::string disk_section_name_for_va(const disk_pe_view_t& v, uint64_t va)
-		{
-			if (va < v.image_base) return std::string();
-			uint64_t rva64 = va - v.image_base;
-			if (rva64 > 0xFFFFFFFFull) return std::string();
-			uint32_t rva = static_cast<uint32_t>(rva64);
-			for (const auto& s : v.sections) {
-				if (rva >= s.virtual_address && rva < s.virtual_address + s.virtual_size)
-					return s.name;
-			}
-			return std::string();
-		}
-
-		inline bool regular_pdb_file_candidate(const std::filesystem::path& candidate, std::string& out)
-		{
-			out.clear();
-			if (candidate.empty()) return false;
-			std::error_code abs_ec;
-			std::filesystem::path check = std::filesystem::absolute(candidate, abs_ec);
-			if (abs_ec) check = candidate;
-			std::error_code type_ec;
-			if (!std::filesystem::is_regular_file(check, type_ec) || type_ec) return false;
-			std::error_code size_ec;
-			const auto size = std::filesystem::file_size(check, size_ec);
-			if (size_ec || size == 0) return false;
-			out = check.string();
-			return true;
-		}
-
-		inline std::string disk_pdb_name_for_module(const std::string& display_name)
-		{
-			std::filesystem::path p(display_name);
-			std::string stem = p.stem().string();
-			if (stem.empty()) stem = display_name;
-			return stem + ".pdb";
-		}
-
-		inline bool resolve_full_test_disk_pdb(const std::string& binary_path,
-			const std::string& display_name, std::string& out)
-		{
-			const std::string pdb_name = disk_pdb_name_for_module(display_name);
-			std::vector<std::filesystem::path> candidates;
-			std::filesystem::path bp(binary_path);
-			std::error_code abs_ec;
-			std::filesystem::path abs_bp = std::filesystem::absolute(bp, abs_ec);
-			if (!abs_ec) bp = abs_bp;
-			std::filesystem::path parent = bp.parent_path();
-			if (!parent.empty()) candidates.push_back(parent / pdb_name);
-			for (const auto& sp : symbol_store::g_state.search_paths) {
-				if (!sp.empty()) candidates.emplace_back(std::filesystem::path(sp) / pdb_name);
-			}
-			for (const auto& candidate : candidates) {
-				if (regular_pdb_file_candidate(candidate, out)) return true;
-			}
-			out.clear();
-			return false;
-		}
-
-		inline void trigger_disk_pdb_auto_load(const std::string& binary_path,
-			const std::string& display_name, uint64_t image_base, uint32_t size_of_image)
-		{
-			if (binary_path.empty() || display_name.empty()) return;
-			std::filesystem::path bp(binary_path);
-			std::error_code ec;
-			std::filesystem::path parent = bp.parent_path();
-			if (!parent.empty()) {
-				std::string parent_str = parent.string();
-				bool already = false;
-				for (const auto& sp : symbol_store::g_state.search_paths) {
-					if (_stricmp(sp.c_str(), parent_str.c_str()) == 0) { already = true; break; }
-				}
-				if (!already) symbol_store::add_search_path(parent_str);
-			}
-			bool already_loaded_or_loading = false;
-			bool already_failed = false;
-			bool already_declined = false;
-			{
-				std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-				auto it = symbol_store::g_state.modules.find(display_name);
-				if (it != symbol_store::g_state.modules.end()) {
-					already_failed = it->second.failed;
-					already_declined = it->second.load_declined;
-					if (it->second.pdb.loaded || it->second.loading || already_failed || already_declined) {
-						already_loaded_or_loading = true;
-					}
-				}
-			}
-			if (already_loaded_or_loading) {
-				const auto automation = symbol_store::pdb_automation_context();
-				if (automation.pdb_skip_active) {
-					const std::string pdb_name = disk_pdb_name_for_module(display_name);
-					diag::log_tagged_fmt("functions_panel",
-						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=<none> cache_path=<none> decision=do_not_load_pdb reason=module_loaded_loading_failed_or_declined prompt_created=0 prompt_suppressed=1 failed=%d declined=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-						display_name.c_str(),
-						static_cast<unsigned long long>(image_base),
-						static_cast<unsigned>(size_of_image),
-						pdb_name.c_str(),
-						already_failed ? 1 : 0,
-						already_declined ? 1 : 0,
-						automation.is_running ? 1 : 0,
-						automation.anti_tamper_full_test_running ? 1 : 0,
-						automation.full_test_env_active ? 1 : 0,
-						automation.unattended_active ? 1 : 0,
-						automation.post_suppression_active ? 1 : 0,
-						static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-						automation.pdb_automation_active ? 1 : 0,
-						automation.user_default_skip_active ? 1 : 0,
-						automation.pdb_skip_active ? 1 : 0);
+			if (!workspace) return;
+			auto state_handle = state_handle_for(workspace);
+			auto publication = workspace->analysis_publication();
+			if (!publication || !publication->snapshot) {
+				if (workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
+					std::lock_guard<std::mutex> lock(state_handle->mtx);
+					state_handle->entries.clear();
+					state_handle->cached_module_base = workspace->identity().image_base();
+					state_handle->cached_module_size = workspace->identity().module()
+						? static_cast<uint32_t>((std::min<std::uint64_t>)(
+							workspace->identity().module()->size, UINT32_MAX)) : 0;
+					state_handle->cached_module_name = workspace->identity().bin_name();
+					state_handle->ready.store(true, std::memory_order_release);
+					state_handle->building.store(false, std::memory_order_release);
 				}
 				return;
 			}
-			if (symbol_store::pdb_skip_active()) {
-				const auto automation = symbol_store::pdb_automation_context();
-				std::string local_candidate;
-				const bool have_local = resolve_full_test_disk_pdb(binary_path, display_name, local_candidate);
-				const std::string pdb_name = disk_pdb_name_for_module(display_name);
-				if (have_local) {
-					diag::log_tagged_fmt("functions_panel",
-						"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=load_local reason=direct_local_pdb_present prompt_created=0 prompt_suppressed=1 failed=0 declined=0 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-						display_name.c_str(),
-						static_cast<unsigned long long>(image_base),
-						static_cast<unsigned>(size_of_image),
-						pdb_name.c_str(),
-						local_candidate.c_str(),
-						automation.is_running ? 1 : 0,
-						automation.anti_tamper_full_test_running ? 1 : 0,
-						automation.full_test_env_active ? 1 : 0,
-						automation.unattended_active ? 1 : 0,
-						automation.post_suppression_active ? 1 : 0,
-						static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-						automation.pdb_automation_active ? 1 : 0,
-						automation.user_default_skip_active ? 1 : 0,
-						automation.pdb_skip_active ? 1 : 0);
-					symbol_store::load_pdb_from_explicit_path(display_name, image_base,
-						static_cast<uint64_t>(size_of_image), local_candidate);
+			{
+				std::lock_guard<std::mutex> lock(state_handle->mtx);
+				const auto current_symbols = analysis_session::symbols_for_workspace(workspace);
+				const uint64_t symbol_revision = current_symbols
+					? current_symbols->revision() : 0;
+				if (state_handle->cached_generation == publication->generation &&
+					state_handle->cached_analysis_revision == publication->analysis_revision &&
+					state_handle->cached_overlay_revision == publication->overlay_revision &&
+					state_handle->cached_symbol_revision == symbol_revision)
 					return;
+			}
+			bool expected = false;
+			if (!state_handle->building.compare_exchange_strong(
+					expected, true, std::memory_order_acq_rel))
+				return;
+			state_handle->ready.store(false, std::memory_order_release);
+			const auto snapshot = publication->snapshot;
+			const auto overlay = workspace->overlay();
+			const auto debug_symbols = analysis_session::symbols_for_workspace(workspace);
+			const uint64_t debug_symbol_revision = debug_symbols
+				? debug_symbols->revision() : 0;
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "analysis";
+			submission.label = "analysis.functions_panel.workspace_projection";
+			submission.thread_class = "bounded_task";
+			submission.domain = aida::infra::executor::domain_t::feature_worker;
+			submission.priority = 2;
+			submission.generation = publication->generation;
+			submission.body = [workspace, state_handle, publication, snapshot, overlay,
+				debug_symbols, debug_symbol_revision]() {
+				std::unordered_map<aida::analysis::entity_id_t, std::string> symbols;
+				symbols.reserve(snapshot->symbols.size());
+				for (const auto& symbol : snapshot->symbols) {
+					if (!symbol.name.empty()) symbols.emplace(symbol.id, symbol.name);
 				}
-				const char* reason = "no_deterministic_local_pdb_decline_remote_symbol_download";
-				diag::log_tagged_fmt("functions_panel",
-					"fulltest_disk_pdb_policy module=%s base=0x%llX size=0x%X pdb=%s local_candidate=%s cache_path=<none> decision=do_not_load_pdb reason=%s prompt_created=0 prompt_suppressed=1 failed=0 declined=1 is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-					display_name.c_str(),
-					static_cast<unsigned long long>(image_base),
-					static_cast<unsigned>(size_of_image),
-					pdb_name.c_str(),
-					"<none>",
-					reason,
-					automation.is_running ? 1 : 0,
-					automation.anti_tamper_full_test_running ? 1 : 0,
-					automation.full_test_env_active ? 1 : 0,
-					automation.unattended_active ? 1 : 0,
-					automation.post_suppression_active ? 1 : 0,
-					static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-					automation.pdb_automation_active ? 1 : 0,
-					automation.user_default_skip_active ? 1 : 0,
-					automation.pdb_skip_active ? 1 : 0);
-				symbol_store::suppress_full_test_pdb_load("functions_panel.trigger_disk_pdb_auto_load",
-					display_name, image_base, static_cast<uint64_t>(size_of_image),
-					pdb_name, {}, 0, local_candidate, {}, {},
-					reason);
-				return;
-			}
-			symbol_store::load_pdb_for_module(display_name, image_base,
-				static_cast<uint64_t>(size_of_image));
-		}
-
-		inline void build_locked_disk(view_state_t& s, const std::string& path,
-			const std::string& display_name)
-		{
-			disk_pe_view_t v;
-			if (!disk_read_whole_file(path, v.raw) || !disk_parse_pe(v)) {
-				std::lock_guard<std::mutex> lk(s.mtx);
-				s.entries.clear();
-				s.cached_module_base = 0;
-				s.cached_module_size = 0;
-				s.cached_module_name = display_name;
-				s.filter_dirty = true;
-				s.sort_dirty = true;
-				return;
-			}
-
-			trigger_disk_pdb_auto_load(path, display_name, v.image_base, v.size_of_image);
-
-			std::unordered_map<uint64_t, uint32_t> size_lookup;
-			std::vector<uint64_t> rf_starts;
-			disk_parse_pdata(v, size_lookup, rf_starts);
-
-			std::unordered_map<uint64_t, std::string> export_lookup;
-			disk_parse_exports(v, export_lookup);
-
-			std::vector<uint64_t> candidate_addrs;
-			candidate_addrs.reserve(rf_starts.size() + export_lookup.size() + 4);
-			for (uint64_t va : rf_starts) candidate_addrs.push_back(va);
-			for (const auto& kv : export_lookup) candidate_addrs.push_back(kv.first);
-			if (v.entry_rva != 0) candidate_addrs.push_back(v.image_base + v.entry_rva);
-
-			std::sort(candidate_addrs.begin(), candidate_addrs.end());
-			candidate_addrs.erase(std::unique(candidate_addrs.begin(), candidate_addrs.end()),
-				candidate_addrs.end());
-
-			std::vector<function_entry_t> built;
-			built.reserve(candidate_addrs.size());
-			for (uint64_t va : candidate_addrs) {
-				if (s.cancel.load(std::memory_order_acquire)) return;
-				function_entry_t fn;
-				fn.address = va;
-				auto sit = size_lookup.find(va);
-				fn.size = (sit != size_lookup.end()) ? sit->second : 0;
-				auto eit = export_lookup.find(va);
-				if (eit != export_lookup.end() && !eit->second.empty()) {
-					fn.name = eit->second;
-					fn.synthetic_name = false;
-				} else {
-					std::string rn = rename_store::get(va);
-					if (!rn.empty()) {
-						fn.name = rn;
-						fn.synthetic_name = false;
-					} else {
-						std::string sym = symbol_store::resolve_symbol_exact(va);
-						if (!sym.empty()) {
-							fn.name = sym;
-							fn.synthetic_name = false;
-						} else {
-							fn.name = make_synthetic_name(va);
-							fn.synthetic_name = true;
+				const auto image = snapshot->image;
+				std::unordered_map<uint64_t, std::string> debug_symbol_names;
+				if (debug_symbols) {
+					const auto mode = image ? image->architecture_mode() :
+						(workspace->identity().architecture() ==
+							aida::analysis::architecture_id_t::x86_64
+							? aida::analysis::architecture_mode_t::x86_64
+							: (workspace->identity().architecture() ==
+								aida::analysis::architecture_id_t::x86
+								? aida::analysis::architecture_mode_t::x86_32
+								: aida::analysis::architecture_mode_t::unknown));
+					auto entries = debug_symbols->function_snapshot(
+						workspace->identity().architecture(), mode);
+					debug_symbol_names.reserve(entries.size());
+					for (auto& entry : entries) {
+						if (!entry.name.empty())
+							debug_symbol_names.emplace(entry.address.value,
+								std::move(entry.name));
+					}
+				}
+				std::unordered_map<uint64_t, std::string> overlay_names;
+				if (overlay) {
+					const auto overlay_snapshot = overlay->snapshot();
+					if (overlay_snapshot.revision == publication->overlay_revision) {
+						for (const auto& item : overlay_snapshot.items) {
+							const auto& operation = item.second;
+							if (operation.kind != aida::analysis::overlay_operation_kind_t::name ||
+								operation.name.empty())
+								continue;
+							uint64_t operation_va = 0;
+							if (operation.address.space ==
+								aida::analysis::address_space_id_t::relative_virtual) {
+								if (!image || operation.address.value >= image->image_size() ||
+									image->image_base() > UINT64_MAX - operation.address.value)
+									continue;
+								operation_va = image->image_base() + operation.address.value;
+							} else if (operation.address.space ==
+								aida::analysis::address_space_id_t::virtual_address ||
+								operation.address.space ==
+								aida::analysis::address_space_id_t::live_virtual) {
+								operation_va = operation.address.value;
+							} else if (image) {
+								auto rva = image->file_offset_to_rva(operation.address.value);
+								if (!rva || image->image_base() > UINT64_MAX - rva.value())
+									continue;
+								operation_va = image->image_base() + rva.value();
+							}
+							if (operation_va != 0)
+								overlay_names.emplace(operation_va, operation.name);
 						}
 					}
 				}
-				fn.section = disk_section_name_for_va(v, va);
-				built.push_back(std::move(fn));
-			}
-
-			std::sort(built.begin(), built.end(),
-				[](const function_entry_t& a, const function_entry_t& b) {
-					return a.address < b.address;
+				std::vector<const aida::analysis::function_record_t*> ordered;
+				ordered.reserve(snapshot->functions.size());
+				for (const auto& function : snapshot->functions)
+					ordered.push_back(&function);
+				std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+					return left->start < right->start;
 				});
-
-			{
-				std::lock_guard<std::mutex> lk(s.mtx);
-				s.entries = std::move(built);
-				s.cached_module_base = v.image_base;
-				s.cached_module_size = v.size_of_image;
-				s.cached_module_name = display_name;
-				s.filter_dirty = true;
-				s.sort_dirty = true;
-				s.selected_row = -1;
-				s.selected_addr = 0;
+				auto enclosing = [&](const aida::analysis::address_t& address)
+					-> const aida::analysis::function_record_t* {
+					auto found = std::upper_bound(ordered.begin(), ordered.end(), address,
+						[](const auto& value, const auto* function) {
+							return value < function->start;
+						});
+					if (found == ordered.begin()) return nullptr;
+					--found;
+					const auto* function = *found;
+					if (address.space != function->start.space ||
+						address.value < function->start.value ||
+						address.value >= function->end.value)
+						return nullptr;
+					return function;
+				};
+				std::unordered_map<aida::analysis::entity_id_t, uint32_t> calls_in;
+				std::unordered_map<aida::analysis::entity_id_t, uint32_t> calls_out;
+				for (const auto& edge : snapshot->edges) {
+					if (workspace->cancellation_token().stop_requested()) {
+						state_handle->building.store(false, std::memory_order_release);
+						return;
+					}
+					if (edge.kind != aida::analysis::edge_kind_t::call &&
+						edge.kind != aida::analysis::edge_kind_t::tail_call)
+						continue;
+					const auto* caller = enclosing(edge.source);
+					const auto* callee = enclosing(edge.target);
+					if (caller && calls_out[caller->id] != UINT32_MAX) ++calls_out[caller->id];
+					if (callee && calls_in[callee->id] != UINT32_MAX) ++calls_in[callee->id];
+				}
+				std::vector<function_entry_t> entries;
+				entries.reserve(ordered.size());
+				for (const auto* function : ordered) {
+					if (workspace->cancellation_token().stop_requested()) {
+						state_handle->building.store(false, std::memory_order_release);
+						return;
+					}
+					function_entry_t entry;
+					uint64_t function_rva = 0;
+					bool have_function_rva = false;
+					if (function->start.space == aida::analysis::address_space_id_t::relative_virtual) {
+						if (!image || function->start.value >= image->image_size() ||
+							image->image_base() > UINT64_MAX - function->start.value)
+							continue;
+						function_rva = function->start.value;
+						have_function_rva = true;
+						entry.address = image->image_base() + function_rva;
+					} else if (function->start.space == aida::analysis::address_space_id_t::virtual_address ||
+						function->start.space == aida::analysis::address_space_id_t::live_virtual) {
+						entry.address = function->start.value;
+						if (image && entry.address >= image->image_base()) {
+							function_rva = entry.address - image->image_base();
+							have_function_rva = true;
+						}
+					} else {
+						continue;
+					}
+					const uint64_t span = function->end.value > function->start.value
+						? function->end.value - function->start.value : 0;
+					entry.size = static_cast<uint32_t>((std::min<std::uint64_t>)(span, UINT32_MAX));
+					const auto overlay_name = overlay_names.find(entry.address);
+					if (overlay_name != overlay_names.end())
+						entry.name = overlay_name->second;
+					if (entry.name.empty()) {
+						const auto debug_name = debug_symbol_names.find(entry.address);
+						if (debug_name != debug_symbol_names.end())
+							entry.name = debug_name->second;
+					}
+					if (entry.name.empty() && function->symbol_id) {
+						const auto found = symbols.find(*function->symbol_id);
+						if (found != symbols.end()) entry.name = found->second;
+					}
+					entry.synthetic_name = entry.name.empty();
+					if (entry.synthetic_name) entry.name = make_synthetic_name(entry.address);
+					if (image && have_function_rva) {
+						const auto* section = image->section_for_rva(function_rva);
+						if (section) entry.section = section->name;
+					}
+					entry.calls_in = calls_in[function->id];
+					entry.calls_out = calls_out[function->id];
+					entries.push_back(std::move(entry));
+				}
+				{
+					std::lock_guard<std::mutex> lock(state_handle->mtx);
+					if (workspace->generation() != publication->generation) {
+						state_handle->building.store(false, std::memory_order_release);
+						return;
+					}
+					state_handle->entries = std::move(entries);
+					state_handle->cached_module_base = workspace->identity().image_base();
+					state_handle->cached_module_size = image ? image->image_size() : 0;
+					state_handle->cached_module_name = workspace->identity().bin_name();
+					state_handle->cached_generation = publication->generation;
+					state_handle->cached_analysis_revision = publication->analysis_revision;
+					state_handle->cached_overlay_revision = publication->overlay_revision;
+					state_handle->cached_symbol_revision = debug_symbol_revision;
+					state_handle->filter_dirty = true;
+					state_handle->sort_dirty = true;
+					state_handle->selected_row = -1;
+					state_handle->selected_addr = 0;
+				}
+				state_handle->ready.store(true, std::memory_order_release);
+				state_handle->building.store(false, std::memory_order_release);
+			};
+			const auto submitted = aida::infra::executor::submit(std::move(submission));
+			if (!submitted.submitted) {
+				state_handle->building.store(false, std::memory_order_release);
+				diag::log_tagged_fmt("functions_panel",
+					"workspace_projection_submit_failed binary_id=%s reason=%s",
+					workspace->identity().binary_id().to_hex().c_str(),
+					submitted.reject_reason.c_str());
 			}
 		}
 
-		inline void launch_build_if_needed(view_state_t& s) {
-			if (s.building.load(std::memory_order_acquire)) return;
-
-			const bool driver_attached = driver_bridge::is_loaded()
-				&& driver_bridge::attached_pid() != 0;
-			if (driver_attached) {
-				auto modules = driver_bridge::enumerate_modules();
-				if (modules.empty()) return;
-
-				const auto process_name = driver_bridge::attached_process_name();
-				const auto* m = select_target_module(modules, process_name);
-				if (m == nullptr || m->base == 0 || m->size == 0) return;
-
-				uint64_t pid_token = static_cast<uint64_t>(driver_bridge::attached_pid())
-					^ (static_cast<uint64_t>(m->size) << 32);
-
-				bool need_build = false;
-				{
-					std::lock_guard<std::mutex> lk(s.mtx);
-					if (!s.ready.load(std::memory_order_acquire) ||
-						s.cached_module_base != m->base ||
-						s.cached_module_size != m->size ||
-						s.cached_pid_token != pid_token)
-					{
-						need_build = true;
-						s.cached_pid_token = pid_token;
-					}
-				}
-				if (!need_build) return;
-
-				bool expected = false;
-				if (!s.building.compare_exchange_strong(expected, true,
-					std::memory_order_acq_rel))
-				{
-					return;
-				}
-				s.cancel.store(false, std::memory_order_release);
-				s.ready.store(false, std::memory_order_release);
-
-				uint64_t base = m->base;
-				uint32_t size = m->size;
-				std::string name = m->name;
-
-				aida::infra::executor::submission_t sub;
-				sub.owner_subsystem = "analysis";
-				sub.label = "analysis.functions_panel.live_build";
-				sub.thread_class = "bounded_task";
-				sub.domain = aida::infra::executor::domain_t::feature_worker;
-				sub.priority = 2;
-				sub.body = [base, size, name]() {
-					auto& s2 = state();
-					build_locked(s2, base, size, name);
-					s2.ready.store(true, std::memory_order_release);
-					s2.building.store(false, std::memory_order_release);
-				};
-				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-					s.building.store(false, std::memory_order_release);
-					diag::log_tagged_fmt("functions_panel",
-						"live_build_post_failed base=0x%llX size=0x%X name='%s'",
-						static_cast<unsigned long long>(base),
-						size,
-						name.c_str());
-				}
-				return;
-			}
-
-			if (!g_disasm.file.loaded) return;
-			if (g_disasm.file.path.empty()) return;
-			if (g_disasm.file.path.compare(0, 7, "live://") == 0) return;
-			if (g_disasm.file.image_base == 0) return;
-
-			const std::string& disk_path = g_disasm.file.path;
-			const std::string& disk_name = g_disasm.file.filename.empty()
-				? disk_path : g_disasm.file.filename;
-			uint64_t disk_token = std::hash<std::string>{}(disk_path);
-
-			bool need_build = false;
-			{
-				std::lock_guard<std::mutex> lk(s.mtx);
-				if (!s.ready.load(std::memory_order_acquire) ||
-					s.cached_module_base != g_disasm.file.image_base ||
-					s.cached_pid_token != disk_token)
-				{
-					need_build = true;
-					s.cached_pid_token = disk_token;
-				}
-			}
-			if (!need_build) return;
-
-			bool expected2 = false;
-			if (!s.building.compare_exchange_strong(expected2, true,
-				std::memory_order_acq_rel))
-			{
-				return;
-			}
-			s.cancel.store(false, std::memory_order_release);
-			s.ready.store(false, std::memory_order_release);
-
-			std::string path_capture = disk_path;
-			std::string name_capture = disk_name;
-			aida::infra::executor::submission_t sub;
-			sub.owner_subsystem = "analysis";
-			sub.label = "analysis.functions_panel.disk_build";
-			sub.thread_class = "bounded_task";
-			sub.domain = aida::infra::executor::domain_t::feature_worker;
-			sub.priority = 2;
-			sub.body = [path_capture, name_capture]() {
-				auto& s2 = state();
-				build_locked_disk(s2, path_capture, name_capture);
-				s2.ready.store(true, std::memory_order_release);
-				s2.building.store(false, std::memory_order_release);
-			};
-			if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-				s.building.store(false, std::memory_order_release);
-				diag::log_tagged_fmt("functions_panel",
-					"disk_build_post_failed path='%s'",
-					path_capture.c_str());
-			}
+		inline void launch_build_if_needed(view_state_t&)
+		{
+			refresh_from_workspace(render_workspace());
 		}
 
 		inline void rebuild_filter(view_state_t& s) {
@@ -1149,40 +484,27 @@ namespace functions_panel {
 
 		inline void jump_to_disasm(uint64_t addr) {
 			if (addr == 0) return;
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
 			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(addr, g_disasm);
+			disasm_view::goto_address(addr, context);
 		}
 
 		inline void open_in_graph(uint64_t addr) {
 			if (addr == 0) return;
-			cfg_view::build_cfg(addr);
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
+			cfg_view::build_cfg(context, addr);
 			globals::ui::active_center_view = center_view_t::graph_view;
 		}
 
 		inline void show_xrefs_to(uint64_t addr) {
 			if (addr == 0) return;
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
 			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(addr, g_disasm);
-			disasm_view::g_state.xref_popup_open = true;
-			disasm_view::g_state.xref_popup_addr = addr;
-			disasm_view::g_state.xref_popup_fade = 0.f;
-			disasm_view::g_state.xref_popup_selected = -1;
-			disasm_view::g_state.xref_popup_filter[0] = '\0';
-			{
-				std::lock_guard<std::mutex> lk(disasm_view::g_state.xref_mutex);
-				disasm_view::g_state.xref_results.clear();
-			}
-			char addr_buf[32];
-			std::snprintf(addr_buf, sizeof(addr_buf), "sub_%llX",
-				static_cast<unsigned long long>(addr));
-			std::string rn = rename_store::get(addr);
-			if (!rn.empty()) {
-				disasm_view::g_state.xref_popup_target_name = rn;
-			} else {
-				std::string sym = symbol_store::resolve_symbol_exact(addr);
-				disasm_view::g_state.xref_popup_target_name = sym.empty()
-					? std::string(addr_buf) : strip_module_prefix(sym);
-			}
+			disasm_view::goto_address(addr, context);
+			disasm_view::open_xrefs(addr, context);
 		}
 
 		inline ImU32 alpha_u32(ImU32 c, float a) {
@@ -1210,7 +532,7 @@ namespace functions_panel {
 
 	}
 
-	inline void render(float x, float y, float w, float h) {
+	inline void render_impl(float x, float y, float w, float h) {
 		auto& s = state();
 		const auto& th = aida::ui::resolved();
 		const float dt = aida::ui::clock::dt();
@@ -1894,6 +1216,27 @@ namespace functions_panel {
 		ImGui::End();
 		ImGui::PopStyleColor();
 		ImGui::PopStyleVar(2);
+	}
+
+	inline void render(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		float x, float y, float w, float h)
+	{
+		auto& slot = render_workspace();
+		auto previous = slot;
+		slot = workspace;
+		struct restore_t {
+			std::shared_ptr<aida::analysis::analysis_workspace_t>& slot;
+			std::shared_ptr<aida::analysis::analysis_workspace_t> previous;
+			~restore_t() { slot = std::move(previous); }
+		} restore{slot, std::move(previous)};
+		detail::refresh_from_workspace(workspace);
+		render_impl(x, y, w, h);
+	}
+
+	inline void render(float x, float y, float w, float h)
+	{
+		render(aida::analysis::workspace_registry().selected_for_ui(), x, y, w, h);
 	}
 
 }

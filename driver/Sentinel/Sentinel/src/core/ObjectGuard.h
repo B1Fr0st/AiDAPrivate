@@ -15,6 +15,69 @@ namespace object_guard {
     inline volatile LONG g_device_hidden = 0;
     inline PDRIVER_OBJECT g_target_driver_object = nullptr;
 
+    struct allowlist_entry_t {
+        const char* name;
+        int         len;
+    };
+
+    constexpr allowlist_entry_t g_allowlist[] = {
+        { "csrss.exe",               10 },
+        { "lsass.exe",                9 },
+        { "svchost.exe",             11 },
+        { "services.exe",            12 },
+        { "wininit.exe",             12 },
+        { "winlogon.exe",            13 },
+        { "smss.exe",                 8 },
+        { "MsMpEng.exe",             12 },
+        { "SecurityHealthService",   23 },
+        { "WerFault.exe",            13 },
+        { "devenv.exe",              11 },
+        { "SearchIndexer.exe",       19 },
+        { "dwm.exe",                  7 },
+        { "fontdrvhost.exe",         15 },
+        { "audiodg.exe",             12 },
+        { "explorer.exe",            13 },
+    };
+    constexpr int g_allowlist_count = sizeof(g_allowlist) / sizeof(g_allowlist[0]);
+
+    constexpr ACCESS_MASK TIER_ALLOW_MASK = PROCESS_QUERY_INFORMATION;
+    constexpr ACCESS_MASK TIER_LOG_MASK   = PROCESS_VM_READ;
+    constexpr ACCESS_MASK TIER_BLOCK_MASK = PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION;
+
+    __forceinline bool is_caller_allowlisted(HANDLE caller_pid) {
+        if (!caller_pid || (ULONG_PTR)caller_pid == 4)
+            return true;
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId(caller_pid, &proc);
+        if (!NT_SUCCESS(st) || !proc)
+            return false;
+
+        bool allowlisted = false;
+        __try {
+            UCHAR* name = PsGetProcessImageFileName(proc);
+            if (name) {
+                for (int i = 0; i < g_allowlist_count; ++i) {
+                    int j = 0;
+                    bool match = true;
+                    while (j < g_allowlist[i].len) {
+                        char a = (char)(name[j] | 0x20);
+                        char b = (char)(g_allowlist[i].name[j] | 0x20);
+                        if (a != b) { match = false; break; }
+                        ++j;
+                    }
+                    if (match && name[j] == 0) {
+                        allowlisted = true;
+                        break;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        _ObfDereferenceObject(proc);
+        return allowlisted;
+    }
+
     __forceinline void set_protected_pid(HANDLE pid) {
         _InterlockedExchange64(
             reinterpret_cast<volatile LONG64*>(&g_protected_pid),
@@ -48,27 +111,69 @@ namespace object_guard {
             else
                 desired = info->Parameters->DuplicateHandleInformation.DesiredAccess;
 
+            bool caller_allowlisted = is_caller_allowlisted(caller_pid);
+
             constexpr ACCESS_MASK HOSTILE_PROC =
                 PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
-                PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION;
+                PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION |
+                PROCESS_DUP_HANDLE;
+            constexpr ACCESS_MASK STRIP_READ = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION;
+            constexpr ACCESS_MASK ALLOWLIST_STRIP =
+                PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION;
 
-            if (desired & HOSTILE_PROC) {
-                if (info->Operation == OB_OPERATION_HANDLE_CREATE)
-                    info->Parameters->CreateHandleInformation.DesiredAccess &= ~HOSTILE_PROC;
-                else
-                    info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~HOSTILE_PROC;
+            if (desired & TIER_BLOCK_MASK) {
+                if (!caller_allowlisted) {
+                    SN_LOG("object_guard: BLOCK TIER non-allowlisted pid=%llu desired=0x%08x -- BSOD",
+                        (UINT64)(ULONG_PTR)caller_pid, (UINT32)desired);
 
-                targeting_latch::latch_targeting(
-                    targeting_latch::RE_REASON_OB_WRITE,
-                    (UINT64)(ULONG_PTR)caller_pid,
-                    (UINT64)desired,
-                    0, 0
-                );
-            } else if (desired & PROCESS_VM_READ) {
-                if (info->Operation == OB_OPERATION_HANDLE_CREATE)
-                    info->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_VM_READ;
-                else
-                    info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~PROCESS_VM_READ;
+                    targeting_latch::latch_targeting(
+                        targeting_latch::RE_REASON_OB_WRITE,
+                        (UINT64)(ULONG_PTR)caller_pid,
+                        (UINT64)desired,
+                        0, 0
+                    );
+
+                    if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                        info->Parameters->CreateHandleInformation.DesiredAccess &= ~(HOSTILE_PROC | STRIP_READ);
+                    else
+                        info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~(HOSTILE_PROC | STRIP_READ);
+
+#ifndef AIDA_DEV_MODE
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xA1DA0001, (ULONG_PTR)caller_pid, (ULONG_PTR)desired, 0, 0);
+                    }
+#endif
+                } else {
+                    if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                        info->Parameters->CreateHandleInformation.DesiredAccess &= ~ALLOWLIST_STRIP;
+                    else
+                        info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~ALLOWLIST_STRIP;
+
+                    SN_LOG("object_guard: BLOCK TIER allowlisted pid=%llu desired=0x%08x -- strip write only",
+                        (UINT64)(ULONG_PTR)caller_pid, (UINT32)desired);
+                }
+            } else if (desired & TIER_LOG_MASK) {
+                if (!caller_allowlisted) {
+                    SN_LOG("object_guard: LOG TIER non-allowlisted VM_READ pid=%llu -- log + strip",
+                        (UINT64)(ULONG_PTR)caller_pid);
+
+                    _InterlockedExchange64(
+                        reinterpret_cast<volatile LONG64*>(&g_last_suspicious_pid),
+                        reinterpret_cast<LONG64>(caller_pid));
+                    _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_suspicious_handle_count));
+
+                    targeting_latch::latch_targeting(
+                        targeting_latch::RE_REASON_OB_WRITE,
+                        (UINT64)(ULONG_PTR)caller_pid,
+                        (UINT64)desired,
+                        0, 0
+                    );
+
+                    if (info->Operation == OB_OPERATION_HANDLE_CREATE)
+                        info->Parameters->CreateHandleInformation.DesiredAccess &= ~STRIP_READ;
+                    else
+                        info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~STRIP_READ;
+                }
             }
         }
         else if (info->ObjectType == *PsThreadType) {

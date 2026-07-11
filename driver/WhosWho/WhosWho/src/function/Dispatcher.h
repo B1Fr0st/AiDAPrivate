@@ -10,6 +10,7 @@
 #include <function/impl/AntiDumpKernel.h>
 #include <function/impl/driver/FileHandleScanner.h>
 #include <function/DmaCanary.h>
+#include <function/DmaDefense.h>
 #include <function/TargetingLatch.h>
 #include <function/DebugEvents.h>
 #include <function/MalwareSafe.h>
@@ -143,6 +144,16 @@ namespace ioctl_codes {
     __forceinline ULONG TQIF() { return make(60); }
     __forceinline ULONG TTERM(){ return make(61); }
     __forceinline ULONG HCLS() { return make(62); }
+    __forceinline ULONG DMAR() { return make(63); }
+    __forceinline ULONG PCIE() { return make(64); }
+    __forceinline ULONG PCWL() { return make(65); }
+    __forceinline ULONG DMCP() { return make(66); }
+    __forceinline ULONG PMPT() { return make(67); }
+    __forceinline ULONG EPTH() { return make(68); }
+    __forceinline ULONG DMST() { return make(69); }
+    __forceinline ULONG DMCT() { return make(70); }
+    __forceinline ULONG TXTS() { return make(71); }
+    __forceinline ULONG RTHS() { return make(72); }
 }
 
 namespace phase3_msg {
@@ -333,12 +344,12 @@ namespace dispatcher {
         out.encoded = (code & 0x0000FFFFu) >> 2;
         if (out.base_previous != 0 && out.encoded >= out.base_previous) {
             ULONG prev_candidate = out.encoded - out.base_previous;
-            if (prev_candidate <= 62u)
+            if (prev_candidate <= 72u)
                 out.offset_via_previous = prev_candidate;
         }
         if (out.encoded >= out.base) {
             ULONG candidate = out.encoded - out.base;
-            if (candidate <= 62u) {
+            if (candidate <= 72u) {
                 out.offset = candidate;
                 out.valid = TRUE;
             }
@@ -440,6 +451,16 @@ namespace dispatcher {
         case 50u: return "CANQ";
         case 52u: return "HVDT";
         case 53u: return "RELA";
+        case 63u: return "DMAR";
+        case 64u: return "PCIE";
+        case 65u: return "PCWL";
+        case 66u: return "DMCP";
+        case 67u: return "PMPT";
+        case 68u: return "EPTH";
+        case 69u: return "DMST";
+        case 70u: return "DMCT";
+        case 71u: return "TXTS";
+        case 72u: return "RTHS";
         default: return "OTHER";
         }
     }
@@ -454,6 +475,16 @@ namespace dispatcher {
         case 50u: return ioctl_codes::CANQ();
         case 52u: return ioctl_codes::HVDT();
         case 53u: return ioctl_codes::RELA();
+        case 63u: return ioctl_codes::DMAR();
+        case 64u: return ioctl_codes::PCIE();
+        case 65u: return ioctl_codes::PCWL();
+        case 66u: return ioctl_codes::DMCP();
+        case 67u: return ioctl_codes::PMPT();
+        case 68u: return ioctl_codes::EPTH();
+        case 69u: return ioctl_codes::DMST();
+        case 70u: return ioctl_codes::DMCT();
+        case 71u: return ioctl_codes::TXTS();
+        case 72u: return ioctl_codes::RTHS();
         default: return 0;
         }
     }
@@ -466,7 +497,17 @@ namespace dispatcher {
                offset == 49u ||
                offset == 50u ||
                offset == 52u ||
-               offset == 53u;
+               offset == 53u ||
+               offset == 63u ||
+               offset == 64u ||
+               offset == 65u ||
+               offset == 66u ||
+               offset == 67u ||
+               offset == 68u ||
+               offset == 69u ||
+               offset == 70u ||
+               offset == 71u ||
+               offset == 72u;
     }
 
     __forceinline BOOLEAN looks_like_startup_ioctl_shape(ULONG input_size, ULONG output_size) {
@@ -479,9 +520,19 @@ namespace dispatcher {
         if (input_size >= sizeof(phase3_msg::tier_a_query_request_k) &&
             output_size >= sizeof(phase3_msg::tier_a_query_request_k))
             return TRUE;
-        if (input_size >= sizeof(phase3_msg::canary_register_request_k) &&
-            output_size >= sizeof(phase3_msg::canary_register_request_k))
-            return TRUE;
+    if (input_size >= sizeof(phase3_msg::canary_register_request_k) &&
+        output_size >= sizeof(phase3_msg::canary_register_request_k))
+        return TRUE;
+    if (input_size >= sizeof(iommu_status_k) && output_size >= sizeof(iommu_status_k))
+        return TRUE;
+    if (input_size >= sizeof(dma_protection_state_k) && output_size >= sizeof(dma_protection_state_k))
+        return TRUE;
+    if (input_size >= sizeof(ept_check_result_k) && output_size >= sizeof(ept_check_result_k))
+        return TRUE;
+    if (input_size >= sizeof(dma_countermeasure_request_k) && output_size >= sizeof(dma_countermeasure_request_k))
+        return TRUE;
+    if (input_size >= sizeof(text_scan_request_k) && output_size >= sizeof(text_scan_request_k))
+        return TRUE;
         return looks_like_hvdt_buffer_shape(input_size, output_size);
     }
 
@@ -495,7 +546,17 @@ namespace dispatcher {
             code == ioctl_codes::CANR() ||
             code == ioctl_codes::CANQ() ||
             code == ioctl_codes::HVDT() ||
-            code == ioctl_codes::RELA())
+            code == ioctl_codes::RELA() ||
+            code == ioctl_codes::DMAR() ||
+            code == ioctl_codes::PCIE() ||
+            code == ioctl_codes::PCWL() ||
+            code == ioctl_codes::DMCP() ||
+            code == ioctl_codes::PMPT() ||
+            code == ioctl_codes::EPTH() ||
+            code == ioctl_codes::DMST() ||
+            code == ioctl_codes::DMCT() ||
+            code == ioctl_codes::TXTS() ||
+            code == ioctl_codes::RTHS())
             return TRUE;
         return looks_like_startup_ioctl_shape(input_size, output_size);
     }
@@ -617,6 +678,11 @@ namespace dispatcher {
         case sentinel_bridge::RE_REASON_HOSTILE_DEVICE:
         case sentinel_bridge::RE_REASON_KD_ENABLED:
         case sentinel_bridge::RE_REASON_DMA_CANARY:
+        case sentinel_bridge::RE_REASON_DMA_IOMMU_BYPASS:
+        case sentinel_bridge::RE_REASON_DMA_UNKNOWN_PCIE:
+        case sentinel_bridge::RE_REASON_DMA_EPT_HOOK:
+        case sentinel_bridge::RE_REASON_DMA_PTE_TAMPER:
+        case sentinel_bridge::RE_REASON_DMA_KEY_SCRUB:
         case sentinel_bridge::RE_REASON_TARGET_FILE_OPENED:
         case sentinel_bridge::RE_REASON_TARGET_SECTION_MAPPED:
         case sentinel_bridge::RE_REASON_DEBUG_BY_RE_TOOL:
@@ -692,6 +758,7 @@ namespace dispatcher {
         anti_dma_canary::stop_timer(reason ? reason : "session_reset",
             static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client)),
             cleanup_client ? TRUE : FALSE);
+        anti_dma::pte_protect::unprotect_all();
 
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_server_seed), 0);
         _InterlockedExchange(reinterpret_cast<volatile LONG*>(&dynamic_key::g_cached_key), 0);
@@ -707,6 +774,7 @@ namespace dispatcher {
         _InterlockedExchange(&dispatcher_rekey::g_session_needs_rekey, 0);
         _InterlockedExchange64(&dispatcher_rekey::g_session_soft_demote_qpc, 0);
         _InterlockedExchange64(&dispatcher_rekey::g_last_rekey_required_log_qpc, 0);
+        process_hide::uninstall();
         caller_validation::unregister_client();
         secure_comm::reset();
 
@@ -715,6 +783,7 @@ namespace dispatcher {
             ULONG cleanup_cleared = anti_dma_canary::cleanup_for_pid(prev_pid);
             ULONG dprt_cleared = dll_protection::cleanup_for_session_reset(prev_pid, reason);
             continuous_anti_debug::stop();
+            context_guard::uninstall();
             continuous_anti_dump::stop();
             WW_LOG("SESSION_RESET: cleanup_done reason=%s prev_pid=%u canaries_cleared=%lu dprt_slots_cleared=%lu",
                 reason ? reason : "unknown",
@@ -1025,6 +1094,7 @@ namespace dispatcher {
                     device_object ? device_object->DriverObject : nullptr);
             }
             _InterlockedExchange(&g_driver_activated, 0);
+            process_hide::uninstall();
             caller_validation::unregister_client();
             irp->IoStatus.Status = STATUS_ACCESS_DENIED;
             irp->IoStatus.Information = 0;
@@ -1165,7 +1235,7 @@ namespace dispatcher {
 
         ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
         if (early_decode.accepted_via_previous && early_decode.valid &&
-            early_decode.offset != 0xffffffffu && early_decode.offset <= 62u) {
+            early_decode.offset != 0xffffffffu && early_decode.offset <= 71u) {
             const ULONG canonical_code = ioctl_codes::make(early_decode.offset);
             if (canonical_code != code) {
                 WW_LOG("ioctl_seed_previous_canonicalize raw_code=0x%08lx canonical_code=0x%08lx offset=%lu base_current=0x%lx base_previous=0x%lx caller_pid=%llu registered_pid=%llu",
@@ -2431,6 +2501,11 @@ namespace dispatcher {
                                 HANDLE caller_pid = PsGetCurrentProcessId();
                                 UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                                 continuous_anti_debug::start(client_pid);
+                                context_guard::install();
+                                {
+                                    NTSTATUS phide_st = process_hide::install();
+                                    WW_LOG("HB: process_hide::install status=0x%08X pid=%u", (ULONG)phide_st, client_pid);
+                                }
                                 file_handle_scanner::start(30, "heartbeat_register", caller_pid, g_heartbeat_counter);
                                 WW_LOG("HB: continuous anti-debug started for pid=%u (anti-dump deferred until user-mode finalize_after_activation)", client_pid);
                             }
@@ -3246,6 +3321,192 @@ namespace dispatcher {
                 bytes = sizeof(debug_events::DRAIN_DEBUG_EVENTS_REQUEST_T);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
+        else if (code == ioctl_codes::DMAR()) {
+            if (input_size >= sizeof(iommu_status_k) && output_size >= sizeof(iommu_status_k)) {
+                auto* req = reinterpret_cast<iommu_status_k*>(buffer);
+                *req = anti_dma::iommu::query_status();
+                status = STATUS_SUCCESS;
+                bytes = sizeof(iommu_status_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::PCIE()) {
+            if (output_size >= sizeof(pcie_enum_result_k)) {
+                auto* req = reinterpret_cast<pcie_enum_result_k*>(buffer);
+                req->device_count = anti_dma::pcie::enumerate_devices(req, MAX_PCIE_DEVICES);
+                req->unknown_count = anti_dma::pcie::count_unknown_dma_capable(req);
+                status = STATUS_SUCCESS;
+                bytes = sizeof(pcie_enum_result_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::PCWL()) {
+            if (input_size >= sizeof(pcie_whitelist_request_k) &&
+                output_size >= sizeof(pcie_whitelist_request_k)) {
+                auto* req = reinterpret_cast<pcie_whitelist_request_k*>(buffer);
+                if (req->operation == 0) {
+                    BOOLEAN ok = anti_dma::pcie::add_to_whitelist(req->vendor_id, req->device_id);
+                    req->result = ok ? 0u : 3u;
+                } else if (req->operation == 1) {
+                    BOOLEAN ok = anti_dma::pcie::remove_from_whitelist(req->vendor_id, req->device_id);
+                    req->result = ok ? 0u : 2u;
+                } else if (req->operation == 2) {
+                    req->result = 0u;
+                } else if (req->operation == 3) {
+                    req->result = 0u;
+                } else {
+                    req->result = 2u;
+                }
+                req->timestamp = static_cast<UINT64>(KeQueryInterruptTime());
+                status = STATUS_SUCCESS;
+                bytes = sizeof(pcie_whitelist_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::DMCP()) {
+            if (input_size >= sizeof(canary_poison_request_k) &&
+                output_size >= sizeof(canary_poison_request_k)) {
+                auto* req = reinterpret_cast<canary_poison_request_k*>(buffer);
+                if (req->active == 1 && req->va) {
+                    UINT64 pa = req->pa;
+                    if (!pa) {
+                        pa = strong::translate_virtual_address(
+                            anti_dma::get_process_dtb(static_cast<UINT32>(
+                                reinterpret_cast<ULONG_PTR>(caller_validation::g_registered_client_pid))),
+                            req->va);
+                    }
+                    if (pa) {
+                        SIZE_T br = 0;
+                        UINT64 orig = 0;
+                        strong::read_physical(pa, &orig, 8, &br);
+                        req->pa = pa;
+                        req->original_value = orig;
+                        req->result = 0u;
+                    } else {
+                        req->result = 1u;
+                    }
+                } else if (req->active == 0 && req->pa) {
+                    SIZE_T bw = 0;
+                    strong::write_physical(reinterpret_cast<PVOID>(req->pa),
+                        &req->original_value, sizeof(req->original_value), &bw);
+                    req->result = 0u;
+                } else {
+                    req->result = 2u;
+                }
+                status = STATUS_SUCCESS;
+                bytes = sizeof(canary_poison_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::PMPT()) {
+            if (input_size >= sizeof(pte_protection_entry_k)) {
+                auto* req = reinterpret_cast<pte_protection_entry_k*>(buffer);
+                if (req->active == 1) {
+                    BOOLEAN ok = anti_dma::pte_protect::protect_page(req->va, req->pa);
+                    req->active = ok ? 1u : 0u;
+                } else {
+                    anti_dma::pte_protect::unprotect_page(req->va);
+                    req->active = 0u;
+                }
+                status = STATUS_SUCCESS;
+                bytes = sizeof(pte_protection_entry_k);
+            } else if (output_size >= sizeof(pte_protection_table_k)) {
+                auto* tbl = reinterpret_cast<pte_protection_table_k*>(buffer);
+                anti_dma::pte_protect::snapshot_protections(tbl);
+                status = STATUS_SUCCESS;
+                bytes = sizeof(pte_protection_table_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::EPTH()) {
+            if (output_size >= sizeof(ept_check_result_k)) {
+                auto* req = reinterpret_cast<ept_check_result_k*>(buffer);
+                *req = anti_dma::ept::check_ept_state();
+                status = STATUS_SUCCESS;
+                bytes = sizeof(ept_check_result_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::DMST()) {
+            if (output_size >= sizeof(dma_protection_state_k)) {
+                auto* req = reinterpret_cast<dma_protection_state_k*>(buffer);
+                *req = anti_dma::state::query_state();
+                status = STATUS_SUCCESS;
+                bytes = sizeof(dma_protection_state_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::DMCT()) {
+            if (input_size >= sizeof(dma_countermeasure_request_k) &&
+                output_size >= sizeof(dma_countermeasure_request_k)) {
+                auto* req = reinterpret_cast<dma_countermeasure_request_k*>(buffer);
+                if (req->action == 0) {
+                    dma_protection_state_k state = anti_dma::state::query_state();
+                    req->result = 0u;
+                    req->timestamp = static_cast<UINT64>(KeQueryInterruptTime());
+                    status = STATUS_SUCCESS;
+                } else if (req->action == 1) {
+                    req->result = 0u;
+                    req->timestamp = static_cast<UINT64>(KeQueryInterruptTime());
+                    anti_dma::countermeasure::trigger_bsod(
+                        req->reason, 0, req->target_pid, req->evidence_hash);
+                    status = STATUS_SUCCESS;
+                } else if (req->action == 2) {
+                    req->result = 0u;
+                    req->timestamp = static_cast<UINT64>(KeQueryInterruptTime());
+                    anti_dma::countermeasure::scrub_keys_then_bsod(
+                        req->reason, 0, req->target_pid, req->evidence_hash);
+                    status = STATUS_SUCCESS;
+                } else {
+                    req->result = 2u;
+                    status = STATUS_INVALID_PARAMETER;
+                }
+                bytes = sizeof(dma_countermeasure_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::TXTS()) {
+            if (input_size >= sizeof(text_scan_request_k) &&
+                output_size >= sizeof(text_scan_request_k)) {
+                auto* req = reinterpret_cast<text_scan_request_k*>(buffer);
+                UINT64 hit_rva = 0;
+                PEPROCESS scan_proc = nullptr;
+                NTSTATUS lookup_st = PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)caller_validation::g_registered_client_pid,
+                    &scan_proc);
+                if (NT_SUCCESS(lookup_st) && scan_proc) {
+                    NTSTATUS scan_st = anti_debug::scan_text_for_int3(
+                        scan_proc, req->module_base,
+                        req->exception_dir_va, req->exception_dir_size,
+                        &hit_rva);
+                    req->hit_rva = hit_rva;
+                    ObDereferenceObject(scan_proc);
+                    if (NT_SUCCESS(scan_st)) {
+                        status = STATUS_SUCCESS;
+                    } else {
+                        status = scan_st;
+                    }
+                } else {
+                    req->hit_rva = 0;
+                    status = STATUS_NOT_FOUND;
+                }
+                bytes = sizeof(text_scan_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::RTHS()) {
+            if (input_size >= sizeof(re_tool_hash_update_request_k) &&
+                output_size >= sizeof(re_tool_hash_update_request_k)) {
+                auto* req = reinterpret_cast<re_tool_hash_update_request_k*>(buffer);
+                ULONG expected_magic = 0x5A4E0B02u ^ g_session_key ^ dynamic_key::get();
+                if (req->magic != expected_magic) {
+                    status = STATUS_ACCESS_DENIED;
+                    bytes = sizeof(re_tool_hash_update_request_k);
+                } else if (req->hash_count > 16) {
+                    status = STATUS_INVALID_PARAMETER;
+                    bytes = sizeof(re_tool_hash_update_request_k);
+                } else {
+                    anti_debug::update_re_tool_hashes(req->hashes, req->hash_count);
+                    req->magic = 0;
+                    status = STATUS_SUCCESS;
+                    bytes = sizeof(re_tool_hash_update_request_k);
+                    WW_LOG("RTHS_IOCTL: updated re_tool_hashes count=%lu caller_pid=%llu",
+                        req->hash_count,
+                        reinterpret_cast<UINT64>(PsGetCurrentProcessId()));
+                }
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
         else {
 
 
@@ -3318,6 +3579,11 @@ namespace dispatcher {
 
                             UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                             continuous_anti_debug::start(client_pid);
+                            context_guard::install();
+                            {
+                                NTSTATUS phide_st = process_hide::install();
+                                WW_LOG("HB-RECONNECT: process_hide::install status=0x%08X pid=%u", (ULONG)phide_st, client_pid);
+                            }
                             file_handle_scanner::start(30, "heartbeat_reconnect", caller_pid, g_heartbeat_counter);
 
                             hb->response = (UINT64)g_heartbeat_counter ^ dynamic_key::get();

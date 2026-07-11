@@ -1,14 +1,89 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "workspace/workspace_types.hpp"
+
 namespace auto_comment_store {
+
+class workspace_store_t {
+public:
+	explicit workspace_store_t(aida::analysis::binary_id_t binary_id)
+		: binary_id_(std::move(binary_id)) {}
+
+	const aida::analysis::binary_id_t& binary_id() const noexcept { return binary_id_; }
+
+	void set(aida::analysis::address_t address, std::string text) {
+		std::unique_lock<std::shared_mutex> lock(mutex_);
+		if (text.empty())
+			values_.erase(address);
+		else
+			values_[address] = std::move(text);
+	}
+
+	std::string get(const aida::analysis::address_t& address) const {
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		auto found = values_.find(address);
+		return found == values_.end() ? std::string() : found->second;
+	}
+
+	bool has(const aida::analysis::address_t& address) const {
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		return values_.find(address) != values_.end();
+	}
+
+	void clear() {
+		std::unique_lock<std::shared_mutex> lock(mutex_);
+		values_.clear();
+	}
+
+	std::size_t clear_in_range(const aida::analysis::address_t& begin,
+		const aida::analysis::address_t& end) {
+		if (begin.space != end.space || begin.architecture != end.architecture ||
+			begin.mode != end.mode || begin.value > end.value)
+			return 0;
+		std::unique_lock<std::shared_mutex> lock(mutex_);
+		std::size_t removed = 0;
+		for (auto item = values_.begin(); item != values_.end();) {
+			const auto& address = item->first;
+			if (address.space == begin.space &&
+				address.architecture == begin.architecture &&
+				address.mode == begin.mode && address.value >= begin.value &&
+				address.value < end.value) {
+				item = values_.erase(item);
+				++removed;
+			} else {
+				++item;
+			}
+		}
+		return removed;
+	}
+
+	std::vector<std::pair<aida::analysis::address_t, std::string>> snapshot() const {
+		std::shared_lock<std::shared_mutex> lock(mutex_);
+		std::vector<std::pair<aida::analysis::address_t, std::string>> output;
+		output.reserve(values_.size());
+		for (const auto& item : values_)
+			output.push_back(item);
+		std::sort(output.begin(), output.end(),
+			[](const auto& left, const auto& right) { return left.first < right.first; });
+		return output;
+	}
+
+private:
+	aida::analysis::binary_id_t binary_id_;
+	mutable std::shared_mutex mutex_;
+	std::unordered_map<aida::analysis::address_t, std::string,
+		aida::analysis::address_hash_t> values_;
+};
 
 namespace detail {
 

@@ -54,8 +54,6 @@
 #include <string>
 #include <vector>
 
-extern DisasmState g_disasm;
-
 namespace debugger_view {
 
 static constexpr float TAB_HEIGHT      = 32.f;
@@ -623,13 +621,15 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 inline bool jump_to_disasm(uint64_t addr) {
 	if (addr == 0) return false;
 	globals::ui::active_center_view = center_view_t::disassembly;
-	disasm_view::goto_address(addr, g_disasm);
+	disasm_view::goto_address(addr, disasm_view::capture_selected_workspace());
 	return true;
 }
 
 inline bool jump_to_hex(uint64_t addr, size_t bytes) {
 	if (addr == 0) return false;
-	hex_view::read_from_process(addr, bytes);
+	const auto context = disasm_view::capture_selected_workspace();
+	if (!hex_view::read_live_memory(context, addr, bytes))
+		return false;
 	globals::ui::active_center_view = center_view_t::hex_view;
 	return true;
 }

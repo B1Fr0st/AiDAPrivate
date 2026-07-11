@@ -1,9 +1,6 @@
 
 #pragma once
 #include <windows.h>
-#include "../infra/executor.hpp"
-#include <commdlg.h>
-
 #include <Zydis/Zydis.h>
 
 #include <vector>
@@ -14,13 +11,11 @@
 #include <atomic>
 #include <thread>
 #include <algorithm>
-#include <mutex>
+#include <memory>
 #include <utility>
 
-#include "standalone_driver.hpp"
-#include "../analysis/pe_parser.hpp"
-#include "../infra/event_bus.hpp"
-#include "../../helpers/diag_log.hpp"
+#include "../analysis/workspace/analysis_workspace.hpp"
+#include "../analysis/workspace/x86_decoder.hpp"
 #include "../../helpers/win32_dialog.hpp"
 
 
@@ -74,11 +69,10 @@ struct DisasmFile
     uint64_t               text_va    = 0;
     uint16_t               machine = IMAGE_FILE_MACHINE_AMD64;
     bool                   is_64bit = true;
-    std::vector<PESection> sections;
-    std::vector<AsmInstr>  instrs;
-    bool                   loaded = false;
-    bool                   decoding = false;
-    std::string            err;
+	std::vector<PESection> sections;
+	bool                   loaded = false;
+	std::string            err;
+    std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
 };
 
 
@@ -114,8 +108,60 @@ struct DisasmState
 
 namespace static_analysis
 {
+    inline bool read_bytes_from_pe(const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+                                   const aida::analysis::address_t& address,
+                                   size_t len,
+                                   std::vector<uint8_t>& out)
+    {
+        out.clear();
+        if (!workspace || workspace->target_kind() !=
+                aida::analysis::target_kind_t::static_file ||
+            len == 0 || len > (64ull << 20)) return false;
+        if (address.architecture != aida::analysis::architecture_id_t::unknown &&
+            address.architecture != workspace->identity().architecture())
+            return false;
+        const auto image = workspace->image();
+        if (!image) return false;
+        uint64_t rva = 0;
+        uint64_t provider_offset = 0;
+        if (address.space == aida::analysis::address_space_id_t::relative_virtual) {
+            rva = address.value;
+        } else if (address.space == aida::analysis::address_space_id_t::virtual_address) {
+            auto mapped = image->va_to_rva(address.value);
+            if (!mapped) return false;
+            rva = mapped.value();
+        } else if (address.space == aida::analysis::address_space_id_t::file_offset) {
+            provider_offset = address.value;
+        } else {
+            return false;
+        }
+        if (address.space != aida::analysis::address_space_id_t::file_offset) {
+            auto file_offset = image->rva_to_file_offset(rva, len);
+            if (!file_offset) return false;
+            provider_offset = file_offset.value();
+        }
+        out.resize(len);
+        auto read = workspace->provider().read_exact(provider_offset, out.data(), len,
+                                                     workspace->cancellation_token());
+        if (!read) {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+
     inline bool read_bytes_from_pe(const DisasmFile& file, uint64_t va, size_t len, std::vector<uint8_t>& out)
     {
+        if (file.workspace) {
+            const auto image = file.workspace->image();
+            if (!image) return false;
+            aida::analysis::address_t address;
+            address.space = aida::analysis::address_space_id_t::virtual_address;
+            address.value = va;
+            address.architecture = image->architecture();
+            address.mode = image->architecture_mode();
+            return read_bytes_from_pe(file.workspace, address, len, out);
+        }
         out.clear();
         if (!file.loaded || file.sections.empty() || len == 0) return false;
 
@@ -136,6 +182,10 @@ namespace static_analysis
 
     inline uint64_t total_image_size(const DisasmFile& file)
     {
+        if (file.workspace) {
+            const auto image = file.workspace->image();
+            return image ? image->image_size() : 0;
+        }
         uint64_t max_end = 0;
         for (auto& sec : file.sections) {
             uint64_t end = sec.va + sec.bytes.size();
@@ -148,37 +198,59 @@ namespace static_analysis
 
 namespace zydis_detail
 {
-    inline ZydisDecoder&   decoder64() { static ZydisDecoder   d; return d; }
-    inline ZydisDecoder&   decoder32() { static ZydisDecoder   d; return d; }
-    inline ZydisDecoder&   decoder()   { return decoder64(); }
-    inline ZydisFormatter& formatter() { static ZydisFormatter f; return f; }
-    inline std::mutex&     mutex()     { static std::mutex     m; return m; }
-    inline bool&           ready()     { static bool r = false; return r; }
-    inline std::once_flag& flag()      { static std::once_flag f; return f; }
+    struct contexts_t {
+        ZydisDecoder decoder64{};
+        ZydisDecoder decoder32{};
+        ZydisFormatter formatter{};
+        bool ready = false;
+    };
+
+    inline contexts_t& contexts()
+    {
+        thread_local contexts_t value;
+        if (!value.ready) {
+            const ZyanStatus decoder64_status = ZydisDecoderInit(
+                &value.decoder64, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+            const ZyanStatus decoder32_status = ZydisDecoderInit(
+                &value.decoder32, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
+            const ZyanStatus formatter_status = ZydisFormatterInit(
+                &value.formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+            const ZyanStatus segment_status = ZydisFormatterSetProperty(
+                &value.formatter, ZYDIS_FORMATTER_PROP_FORCE_SEGMENT, ZYAN_FALSE);
+            const ZyanStatus size_status = ZydisFormatterSetProperty(
+                &value.formatter, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_FALSE);
+            value.ready = ZYAN_SUCCESS(decoder64_status) && ZYAN_SUCCESS(decoder32_status) &&
+                          ZYAN_SUCCESS(formatter_status) && ZYAN_SUCCESS(segment_status) &&
+                          ZYAN_SUCCESS(size_status);
+        }
+        return value;
+    }
 
     inline void ensure_init()
     {
-        std::call_once(flag(), []() {
-            ZydisDecoderInit(&decoder64(), ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-            ZydisDecoderInit(&decoder32(), ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
-            ZydisFormatterInit(&formatter(), ZYDIS_FORMATTER_STYLE_INTEL);
-            ZydisFormatterSetProperty(&formatter(), ZYDIS_FORMATTER_PROP_FORCE_SEGMENT, ZYAN_FALSE);
-            ZydisFormatterSetProperty(&formatter(), ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_FALSE);
-            ready() = true;
-        });
+        (void)contexts();
+    }
+
+    inline ZydisDecoder& decoder()
+    {
+        return contexts().decoder64;
+    }
+
+    inline ZydisFormatter& formatter()
+    {
+        return contexts().formatter;
     }
 }
 
 
 inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bool is_64bit = true)
 {
-    zydis_detail::ensure_init();
-    std::lock_guard<std::mutex> decode_lk(zydis_detail::mutex());
+    auto& contexts = zydis_detail::contexts();
 
     AsmInstr ins;
     ins.addr = va;
 
-    if (!code || avail <= 0) {
+    if (!contexts.ready || !code || avail <= 0) {
         snprintf(ins.mnem, sizeof(ins.mnem), "db");
         snprintf(ins.ops, sizeof(ins.ops), "??");
         return ins;
@@ -188,7 +260,7 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bo
     ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT];
 
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-            is_64bit ? &zydis_detail::decoder64() : &zydis_detail::decoder32(),
+            is_64bit ? &contexts.decoder64 : &contexts.decoder32,
             code,
             avail,
             &instruction,
@@ -208,7 +280,7 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bo
 
     char full[256] = {};
     ZydisFormatterFormatInstruction(
-        &zydis_detail::formatter(), &instruction, operands,
+        &contexts.formatter, &instruction, operands,
         instruction.operand_count_visible,
         full, sizeof(full), va, ZYAN_NULL);
 
@@ -268,7 +340,7 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bo
             ins.mem_op.disp = static_cast<int64_t>(op.mem.disp.value);
             ins.mem_op.size = static_cast<uint16_t>(op.size);
             ins.mem_op.segment = static_cast<uint8_t>(op.mem.segment);
-            ins.mem_op.has_disp = (op.mem.disp.size != 0);
+            ins.mem_op.has_disp = op.mem.disp.has_displacement != ZYAN_FALSE;
         }
         if (ins.has_imm && ins.has_mem_op)
             break;
@@ -280,14 +352,144 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bo
 
 namespace disasm
 {
-    inline size_t zero_run_length(const uint8_t* data, int size, int off)
+    inline bool bind_workspace(const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+                               DisasmFile& out)
     {
-        if (!data || off < 0 || off >= size || data[off] != 0) return 0;
-        int cur = off;
-        while (cur < size && data[cur] == 0)
-            ++cur;
-        return static_cast<size_t>(cur - off);
+        out = {};
+        if (!workspace) {
+            out.err = "Workspace is unavailable";
+            return false;
+        }
+        const auto image = workspace->image();
+        if (!image) {
+            out.err = "Workspace image is unavailable";
+            return false;
+        }
+        out.workspace = workspace;
+        out.path = workspace->identity().normalized_source_path();
+        out.filename = workspace->identity().bin_name();
+        out.image_base = image->image_base();
+        if (image->entry_rva() != 0) {
+            auto entry = image->rva_to_va(image->entry_rva());
+            if (!entry) {
+                out.err = entry.error().stable_code() + ": " + entry.error().message;
+                return false;
+            }
+            out.entry_point = entry.value();
+        }
+        out.machine = image->machine();
+        out.is_64bit = image->architecture() == aida::analysis::architecture_id_t::x86_64;
+        out.text_va = out.entry_point;
+        for (const auto& section : image->sections()) {
+            if (section.executable) {
+                auto section_address = image->rva_to_va(section.virtual_address);
+                if (!section_address) {
+                    out.err = section_address.error().stable_code() + ": " +
+                        section_address.error().message;
+                    return false;
+                }
+                out.text_va = section_address.value();
+                break;
+            }
+        }
+        out.loaded = true;
+        return true;
     }
+
+    inline aida::analysis::workspace_result_t<std::vector<AsmInstr>> format_page(
+        const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+        size_t offset,
+        size_t count,
+        const aida::analysis::cancellation_token_t& cancel = {})
+    {
+        using namespace aida::analysis;
+        if (!workspace || count > 50000) {
+            return workspace_result_t<std::vector<AsmInstr>>::failure(
+                make_workspace_error(workspace_error_code_t::invalid_argument,
+                                     "Workspace and bounded instruction count are required",
+                                     "disasm.format_page"));
+        }
+        const auto publication = workspace->analysis_publication();
+        const auto image = workspace->image();
+        if (!publication || !publication->snapshot || !image ||
+            offset > publication->snapshot->instructions.size()) {
+            return workspace_result_t<std::vector<AsmInstr>>::failure(
+                make_workspace_error(workspace_error_code_t::out_of_range,
+                                     "Instruction page is outside the current publication",
+                                     "disasm.format_page"));
+        }
+        if (publication->binary_id != workspace->identity().binary_id() ||
+            publication->generation != workspace->generation()) {
+            return workspace_result_t<std::vector<AsmInstr>>::failure(
+                make_workspace_error(workspace_error_code_t::stale_generation,
+                                     "Instruction publication does not match the workspace generation",
+                                     "disasm.format_page"));
+        }
+        auto decoder = worker_owned_x86_decoder_t::create(image->architecture_mode());
+        if (!decoder)
+            return workspace_result_t<std::vector<AsmInstr>>::failure(decoder.error());
+        const size_t remaining = publication->snapshot->instructions.size() - offset;
+        const size_t end = offset + (std::min)(remaining, count);
+        std::vector<AsmInstr> result;
+        result.reserve(end - offset);
+        for (size_t index = offset; index < end; ++index) {
+            if (cancel.stop_requested()) {
+                auto error = make_workspace_error(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                    "Instruction formatting was cancelled", "disasm.format_page");
+                error.cancellation = true;
+                error.deadline = cancel.deadline_exceeded();
+                return workspace_result_t<std::vector<AsmInstr>>::failure(std::move(error));
+            }
+            const auto& record = publication->snapshot->instructions[index];
+            auto text = decoder.value()->format_one(workspace->provider(), *image, record, {}, cancel);
+            if (!text)
+                return workspace_result_t<std::vector<AsmInstr>>::failure(text.error());
+            AsmInstr formatted;
+            if (record.address.space == address_space_id_t::relative_virtual) {
+                auto address = image->rva_to_va(record.address.value);
+                if (!address)
+                    return workspace_result_t<std::vector<AsmInstr>>::failure(address.error());
+                formatted.addr = address.value();
+            } else {
+                formatted.addr = record.address.value;
+            }
+            formatted.len = record.length;
+            const auto separator = text.value().find(' ');
+            const auto mnemonic = text.value().substr(0, separator);
+            const auto operands = separator == std::string::npos
+                ? std::string{}
+                : text.value().substr(separator + 1);
+            std::snprintf(formatted.mnem, sizeof(formatted.mnem), "%s", mnemonic.c_str());
+            std::snprintf(formatted.ops, sizeof(formatted.ops), "%s", operands.c_str());
+            formatted.is_call = (record.flow_flags & flow_call) != 0;
+            formatted.is_branch = (record.flow_flags & flow_branch) != 0;
+            formatted.is_ret = (record.flow_flags & flow_return) != 0;
+            formatted.is_priv = (record.flow_flags & flow_privileged) != 0;
+            for (uint16_t target_index = 0; target_index < record.target_fact_count; ++target_index) {
+                const size_t fact_index = static_cast<size_t>(record.target_fact_begin) + target_index;
+                if (fact_index >= publication->snapshot->target_facts.size()) break;
+                const auto& target = publication->snapshot->target_facts[fact_index];
+                if (target.kind == target_kind_record_t::branch ||
+                    target.kind == target_kind_record_t::call) {
+                    if (target.target.space == address_space_id_t::relative_virtual) {
+                        auto target_address = image->rva_to_va(target.target.value);
+                        if (!target_address)
+                            return workspace_result_t<std::vector<AsmInstr>>::failure(
+                                target_address.error());
+                        formatted.branch_target = target_address.value();
+                    } else {
+                        formatted.branch_target = target.target.value;
+                    }
+                    break;
+                }
+            }
+            result.push_back(formatted);
+        }
+        return workspace_result_t<std::vector<AsmInstr>>::success(std::move(result));
+    }
+
 
     inline bool summarize_bytes(const uint8_t* data, size_t size, size_t& zero_count, size_t& longest_zero_run)
     {
@@ -332,562 +534,19 @@ namespace disasm
         return {};
     }
 
-    inline bool load_pe(const std::string& path, DisasmFile& out)
-    {
-        out = {};
-        out.path = path;
-        size_t sl = path.find_last_of("/\\");
-        out.filename = (sl != std::string::npos) ? path.substr(sl + 1) : path;
-
-        HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hf == INVALID_HANDLE_VALUE) { out.err = "Cannot open file"; return false; }
-
-        DWORD fsz = GetFileSize(hf, nullptr);
-        if (fsz == INVALID_FILE_SIZE || fsz < sizeof(IMAGE_DOS_HEADER)) {
-            CloseHandle(hf); out.err = "File too small"; return false;
-        }
-
-        std::vector<uint8_t> raw(fsz);
-        DWORD read = 0;
-        if (!ReadFile(hf, raw.data(), fsz, &read, nullptr) || read != fsz) {
-            CloseHandle(hf); out.err = "Read error"; return false;
-        }
-        CloseHandle(hf);
-
-        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(raw.data());
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) { out.err = "Not a PE file"; return false; }
-        if (dos->e_lfanew < 0) {
-            out.err = "Corrupt PE"; return false;
-        }
-
-        const uint64_t nt_off = static_cast<uint64_t>(dos->e_lfanew);
-        const uint64_t file_header_off = nt_off + sizeof(DWORD);
-        if (file_header_off + sizeof(IMAGE_FILE_HEADER) > fsz) {
-            out.err = "Corrupt PE"; return false;
-        }
-
-        const auto* nt_base = raw.data() + nt_off;
-        DWORD signature = 0;
-        std::memcpy(&signature, nt_base, sizeof(signature));
-        if (signature != IMAGE_NT_SIGNATURE) { out.err = "Not a PE file"; return false; }
-
-        const auto* fh = reinterpret_cast<const IMAGE_FILE_HEADER*>(raw.data() + file_header_off);
-        const uint64_t opt_off = file_header_off + sizeof(IMAGE_FILE_HEADER);
-        if (fh->SizeOfOptionalHeader < sizeof(WORD) ||
-            opt_off + fh->SizeOfOptionalHeader > fsz) {
-            out.err = "Corrupt PE"; return false;
-        }
-
-        WORD opt_magic = 0;
-        std::memcpy(&opt_magic, raw.data() + opt_off, sizeof(opt_magic));
-        const bool is_pe64 = (fh->Machine == IMAGE_FILE_MACHINE_AMD64 &&
-                              opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
-        const bool is_pe32 = (fh->Machine == IMAGE_FILE_MACHINE_I386 &&
-                              opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC);
-        if (!is_pe64 && !is_pe32) {
-            out.err = "Unsupported PE architecture"; return false;
-        }
-
-        out.machine = fh->Machine;
-        out.is_64bit = is_pe64;
-        DWORD entry_rva = 0;
-        if (is_pe64) {
-            if (fh->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) {
-                out.err = "Corrupt PE"; return false;
-            }
-            const auto* opt64 = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(raw.data() + opt_off);
-            out.image_base = opt64->ImageBase;
-            entry_rva = opt64->AddressOfEntryPoint;
-        } else {
-            if (fh->SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32)) {
-                out.err = "Corrupt PE"; return false;
-            }
-            const auto* opt32 = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(raw.data() + opt_off);
-            out.image_base = opt32->ImageBase;
-            entry_rva = opt32->AddressOfEntryPoint;
-        }
-        out.entry_point = out.image_base + entry_rva;
-
-        const auto* sec = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
-            raw.data() + opt_off + fh->SizeOfOptionalHeader);
-        WORD nsec = fh->NumberOfSections;
-        if (nsec == 0 ||
-            opt_off + fh->SizeOfOptionalHeader +
-                static_cast<uint64_t>(nsec) * sizeof(IMAGE_SECTION_HEADER) > fsz) {
-            out.err = "Corrupt PE"; return false;
-        }
-
-        bool any_exec_loaded = false;
-        for (WORD i = 0; i < nsec; i++) {
-            bool is_exec = (sec[i].Characteristics & IMAGE_SCN_CNT_CODE) ||
-                           (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE);
-            if (!is_exec) continue;
-            DWORD off = sec[i].PointerToRawData;
-            DWORD sz  = sec[i].SizeOfRawData;
-            if (sec[i].Misc.VirtualSize && sec[i].Misc.VirtualSize < sz)
-                sz = sec[i].Misc.VirtualSize;
-            if (sz == 0 || static_cast<uint64_t>(off) + sz > fsz) continue;
-            PESection ps;
-            ps.va = out.image_base + sec[i].VirtualAddress;
-            ps.bytes.assign(raw.data() + off, raw.data() + off + sz);
-            ps.is_executable = true;
-            if (!any_exec_loaded) {
-                out.text_va = ps.va;
-                any_exec_loaded = true;
-            }
-            out.sections.push_back(std::move(ps));
-        }
-        if (!any_exec_loaded) { out.err = "No executable section found"; return false; }
-
-        for (WORD i = 0; i < nsec; i++) {
-            bool is_exec = (sec[i].Characteristics & IMAGE_SCN_CNT_CODE) ||
-                           (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE);
-            if (is_exec) continue;
-            bool is_readable = (sec[i].Characteristics & IMAGE_SCN_MEM_READ) != 0;
-            bool has_raw     = (sec[i].Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA) == 0;
-            if (!is_readable || !has_raw) continue;
-            DWORD off = sec[i].PointerToRawData;
-            DWORD sz  = sec[i].SizeOfRawData;
-            if (sec[i].Misc.VirtualSize && sec[i].Misc.VirtualSize < sz)
-                sz = sec[i].Misc.VirtualSize;
-            if (sz == 0 || static_cast<uint64_t>(off) + sz > fsz) continue;
-            PESection ps;
-            ps.va = out.image_base + sec[i].VirtualAddress;
-            ps.bytes.assign(raw.data() + off, raw.data() + off + sz);
-            ps.is_executable = false;
-            out.sections.push_back(std::move(ps));
-        }
-
-        out.loaded  = true;
-        return true;
-    }
 
 
-    inline void decode_section(DisasmFile& file)
-    {
-        file.instrs.clear();
-        if (file.sections.empty()) return;
-
-        size_t total_bytes = 0;
-        for (auto& s : file.sections) {
-            if (!s.is_executable) continue;
-            total_bytes += s.bytes.size();
-        }
-        file.instrs.reserve(total_bytes / 4);
-
-        constexpr size_t kYieldEveryN = 16384;
-        size_t since_yield = 0;
-
-        for (auto& section : file.sections) {
-            if (!section.is_executable) continue;
-            const uint8_t* data = section.bytes.data();
-            int             sz   = static_cast<int>(section.bytes.size());
-            int             off  = 0;
-            uint64_t        va   = section.va;
-
-            while (off < sz) {
-                size_t zr = zero_run_length(data, sz, off);
-                if (zr >= 16) {
-                    off += static_cast<int>(zr);
-                    continue;
-                }
-                const int remaining = sz - off;
-                const int avail = (remaining < 15) ? remaining : 15;
-                AsmInstr ins = zydis_decode_one(data + off, avail, va + off, file.is_64bit);
-                const int raw_len = (ins.len < 15) ? ins.len : 15;
-                memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
-                file.instrs.push_back(ins);
-                off += (ins.len > 0) ? ins.len : 1;
-                if (++since_yield >= kYieldEveryN) {
-                    since_yield = 0;
-                    std::this_thread::yield();
-                }
-            }
-        }
 
 
-        if (file.instrs.size() > 4) {
-            int last_real = static_cast<int>(file.instrs.size()) - 1;
-            while (last_real > 0 && (file.instrs[last_real].is_nop ||
-                   (file.instrs[last_real].is_priv &&
-                    file.instrs[last_real].raw[0] == 0xCC &&
-                    file.instrs[last_real].len == 1))) {
-                --last_real;
-            }
-            const int keep = last_real + 1 + 3;
-            if (keep < static_cast<int>(file.instrs.size()))
-                file.instrs.resize(keep);
-        }
-
-        file.instrs.shrink_to_fit();
-    }
-
-    inline void decode_section_limited(DisasmFile& file, size_t max_instrs)
-    {
-        file.instrs.clear();
-        if (file.sections.empty() || max_instrs == 0) return;
-        file.instrs.reserve((std::min)(max_instrs, static_cast<size_t>(4096)));
-
-        for (auto& section : file.sections) {
-            if (!section.is_executable) continue;
-            const uint8_t* data = section.bytes.data();
-            int             sz   = static_cast<int>(section.bytes.size());
-            int             off  = 0;
-            uint64_t        va   = section.va;
-
-            diag::log_tagged_fmt("disasm",
-                "decode_section_limited section_start va=0x%llX bytes=%d current_instrs=%zu max=%zu",
-                static_cast<unsigned long long>(va), sz, file.instrs.size(), max_instrs);
-
-            while (off < sz && file.instrs.size() < max_instrs) {
-                size_t zr = zero_run_length(data, sz, off);
-                if (zr >= 16) {
-                    off += static_cast<int>(zr);
-                    continue;
-                }
-                const int remaining = sz - off;
-                const int avail = (remaining < 15) ? remaining : 15;
-                AsmInstr ins = zydis_decode_one(data + off, avail, va + off, file.is_64bit);
-                const int raw_len = (ins.len < 15) ? ins.len : 15;
-                memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
-                file.instrs.push_back(ins);
-                off += (ins.len > 0) ? ins.len : 1;
-            }
-
-            diag::log_tagged_fmt("disasm",
-                "decode_section_limited section_end va=0x%llX off=%d emitted=%zu max=%zu",
-                static_cast<unsigned long long>(va), off, file.instrs.size(), max_instrs);
-
-            if (file.instrs.size() >= max_instrs)
-                break;
-        }
-
-        file.instrs.shrink_to_fit();
-    }
 
 
-    inline void decode_section_async(DisasmFile& file)
-    {
-        if (file.decoding) return;
-        file.decoding = true;
-        aida::infra::executor::submission_t sub;
-        sub.owner_subsystem = "disasm";
-        sub.label = "disasm.decode_section";
-        sub.thread_class = "bounded_task";
-        sub.domain = aida::infra::executor::domain_t::feature_worker;
-        sub.priority = 2;
-        sub.body = [&file]() {
-            decode_section(file);
-            file.decoding = false;
-        };
-        if (!aida::infra::executor::submit(std::move(sub)).submitted)
-            file.decoding = false;
-    }
 
 
-    inline void request_live_decode(DisasmState& state)
-    {
-        diag::log_tagged_critical_fmt("disasm", "request_live_decode_enter pid=%u base=0x%llX size=0x%llX view=0x%llX",
-            state.live_pid,
-            static_cast<unsigned long long>(state.live_base),
-            static_cast<unsigned long long>(state.live_size),
-            static_cast<unsigned long long>(state.live_view_addr));
-        bool expected = false;
-        if (!state.live_decoding.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            diag::log_tagged_critical("disasm", "request_live_decode_SKIPPED_already_decoding");
-            static int s_skip_log = 0;
-            if (s_skip_log++ < 5)
-                driver_bridge::debug_log("request_live_decode: SKIPPED (already decoding)\n");
-            return;
-        }
-        if (!state.live_mode || state.live_base == 0 || state.live_size == 0) {
-            diag::log_tagged_critical_fmt("disasm", "request_live_decode_SKIPPED_invalid_state mode=%d base=0x%llX size=0x%llX",
-                state.live_mode ? 1 : 0,
-                static_cast<unsigned long long>(state.live_base),
-                static_cast<unsigned long long>(state.live_size));
-            driver_bridge::debug_log("request_live_decode: SKIPPED (mode=%d base=0x%llX size=0x%llX)\n",
-                state.live_mode ? 1 : 0,
-                static_cast<unsigned long long>(state.live_base),
-                static_cast<unsigned long long>(state.live_size));
-            state.live_decoding.store(false, std::memory_order_release);
-            return;
-        }
-
-        uint64_t half = state.live_window / 2;
-        uint64_t win_start = state.live_view_addr;
-        uint64_t effective_floor = state.live_base;
-        if (state.live_floor_va != 0 &&
-            state.live_floor_va >= state.live_base &&
-            state.live_floor_va < state.live_base + state.live_size &&
-            state.live_view_addr >= state.live_floor_va)
-            effective_floor = state.live_floor_va;
-        if (win_start > half && (win_start - half) >= effective_floor)
-            win_start -= half;
-        else
-            win_start = effective_floor;
-
-        uint64_t mod_end = state.live_base + state.live_size;
-        uint64_t win_end = win_start + state.live_window;
-        if (win_end > mod_end) win_end = mod_end;
-        uint64_t read_sz = win_end - win_start;
-        if (read_sz == 0) {
-            driver_bridge::debug_log("request_live_decode: read_sz == 0, aborting\n");
-            state.live_decoding.store(false, std::memory_order_release);
-            return;
-        }
-
-        driver_bridge::debug_log("request_live_decode: win_start=0x%llX read_sz=%llu pid=%u\n",
-            static_cast<unsigned long long>(win_start),
-            static_cast<unsigned long long>(read_sz),
-            state.live_pid);
-        diag::log_tagged_critical_fmt("disasm",
-            "request_live_decode_posting_to_executor domain=feature_worker win_start=0x%llX read_sz=%llu pid=%u",
-            static_cast<unsigned long long>(win_start),
-            static_cast<unsigned long long>(read_sz),
-            state.live_pid);
-
-        uint32_t pid = state.live_pid;
-        DisasmState* state_ptr = &state;
-        bool decode_is_64bit = state.file.is_64bit;
-
-        aida::infra::executor::submission_t sub;
-        sub.owner_subsystem = "disasm";
-        sub.label = "disasm.live_decode";
-        sub.thread_class = "bounded_task";
-        sub.domain = aida::infra::executor::domain_t::feature_worker;
-        sub.priority = 2;
-        sub.target_pid = pid;
-        sub.body = [state_ptr, pid, win_start, read_sz, decode_is_64bit]() {
-            diag::log_tagged_critical_fmt("disasm",
-                "live_decode_worker_enter pid=%u win_start=0x%llX read_sz=%llu tid=%lu",
-                pid,
-                static_cast<unsigned long long>(win_start),
-                static_cast<unsigned long long>(read_sz),
-                GetCurrentThreadId());
-            std::vector<uint8_t> mem;
-            if (driver_bridge::is_loaded()) {
-                diag::log_tagged_critical("disasm", "live_decode_worker_pre_read_memory");
-                bool read_ok = driver_bridge::read_memory_for(pid, win_start, static_cast<size_t>(read_sz), mem);
-                diag::log_tagged_critical_fmt("disasm",
-                    "live_decode_worker_post_read_memory ok=%d bytes=%llu active_pid=%u",
-                    read_ok ? 1 : 0,
-                    (unsigned long long)mem.size(),
-                    driver_bridge::attached_pid());
-            }
-
-            std::vector<AsmInstr> instrs;
-            if (!mem.empty()) {
-                size_t zero_count = 0;
-                size_t longest_zero_run = 0;
-                summarize_bytes(mem.data(), mem.size(), zero_count, longest_zero_run);
-                diag::log_tagged_fmt("disasm",
-                    "live_decode_worker_memory_profile bytes=%llu zero=%llu longest_zero_run=%llu mostly_zero=%d",
-                    static_cast<unsigned long long>(mem.size()),
-                    static_cast<unsigned long long>(zero_count),
-                    static_cast<unsigned long long>(longest_zero_run),
-                    buffer_is_zero_padding(mem) ? 1 : 0);
-                instrs.reserve(mem.size() / 4);
-                const uint8_t* data = mem.data();
-                int sz = static_cast<int>(mem.size());
-                int off = 0;
-                size_t since_yield = 0;
-                while (off < sz) {
-                    size_t zr = zero_run_length(data, sz, off);
-                    if (zr >= 16) {
-                        off += static_cast<int>(zr);
-                        continue;
-                    }
-                    int remaining = sz - off;
-                    int avail = (remaining < 15) ? remaining : 15;
-                    AsmInstr ins = zydis_decode_one(data + off, avail, win_start + off, decode_is_64bit);
-                    int raw_len = (ins.len < 15) ? ins.len : 15;
-                    memcpy(ins.raw, data + off, static_cast<size_t>(raw_len));
-                    instrs.push_back(ins);
-                    off += (ins.len > 0) ? ins.len : 1;
-                    if (++since_yield >= 16384) {
-                        since_yield = 0;
-                        std::this_thread::yield();
-                    }
-                }
-            }
-
-            if (instrs.empty()) {
-                state_ptr->live_decode_failed.store(true, std::memory_order_release);
-                state_ptr->live_fail_count.fetch_add(1, std::memory_order_acq_rel);
-            } else {
-                state_ptr->live_decode_failed.store(false, std::memory_order_release);
-                state_ptr->live_fail_count.store(0, std::memory_order_release);
-            }
-
-            state_ptr->live_pending_instrs = std::move(instrs);
-            state_ptr->live_pending_va = win_start;
-            state_ptr->live_pending_ready.store(true, std::memory_order_release);
-            state_ptr->live_decoding.store(false, std::memory_order_release);
-            diag::log_tagged_critical_fmt("disasm",
-                "live_decode_worker_exit pid=%u win_start=0x%llX",
-                pid,
-                static_cast<unsigned long long>(win_start));
-        };
-        if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-            state_ptr->live_decode_failed.store(true, std::memory_order_release);
-            state_ptr->live_fail_count.fetch_add(1, std::memory_order_acq_rel);
-            state_ptr->live_decoding.store(false, std::memory_order_release);
-            diag::log_tagged_critical_fmt("disasm",
-                "live_decode_post_failed pid=%u win_start=0x%llX read_sz=%llu",
-                pid,
-                static_cast<unsigned long long>(win_start),
-                static_cast<unsigned long long>(read_sz));
-        }
-    }
 
 
-    inline bool start_live(DisasmState& state, uint32_t pid,
-                           uint64_t base, uint64_t size,
-                           const std::string& module_name)
-    {
-        diag::log_tagged_critical_fmt("disasm", "start_live_enter pid=%u base=0x%llX size=0x%llX module=%s tid=%lu",
-            pid,
-            static_cast<unsigned long long>(base),
-            static_cast<unsigned long long>(size),
-            module_name.c_str(),
-            GetCurrentThreadId());
-        driver_bridge::debug_log("start_live: pid=%u base=0x%llX size=0x%llX module=%s\n",
-            pid,
-            static_cast<unsigned long long>(base),
-            static_cast<unsigned long long>(size),
-            module_name.c_str());
-
-        state.live_mode   = true;
-        state.live_pid    = pid;
-        state.live_base   = base;
-        state.live_size   = size;
-        state.live_floor_va = 0;
-        state.live_view_addr = base;
-
-        std::vector<PESection> snapshot_sections;
-        bool live_is_64bit = true;
-        uint16_t live_machine = IMAGE_FILE_MACHINE_AMD64;
-        {
-            diag::log_tagged_critical("disasm", "start_live_pre_pe_parse_sections_only");
-            pe_parser::pe_info_t pe;
-            if (pe_parser::parse(base, pe, false)) {
-                live_is_64bit = pe.is_64bit;
-                live_machine = pe.is_64bit ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
-                diag::log_tagged_critical_fmt("disasm",
-                    "start_live_post_pe_parse sections=%llu is64=%d",
-                    (unsigned long long)pe.sections.size(),
-                    pe.is_64bit ? 1 : 0);
-                constexpr uint32_t kCntCode = 0x00000020u;
-                constexpr uint32_t kMemExec = 0x20000000u;
-                constexpr uint32_t kMemRead = 0x40000000u;
-                constexpr uint32_t kCntUData = 0x00000080u;
-                constexpr size_t kMaxSnapshotBytes = 64ull * 1024ull * 1024ull;
-                uint64_t first_exec_va = 0;
-                size_t snapshot_total = 0;
-                for (const auto& s : pe.sections) {
-                    bool is_exec = (s.characteristics & kCntCode) || (s.characteristics & kMemExec);
-                    if (!is_exec) continue;
-                    if (first_exec_va == 0)
-                        first_exec_va = base + static_cast<uint64_t>(s.virtual_address);
-                    uint32_t sec_size = (s.virtual_size > 0) ? s.virtual_size : s.raw_size;
-                    if (sec_size == 0) continue;
-                    if (snapshot_total >= kMaxSnapshotBytes) continue;
-                    size_t remaining_budget = kMaxSnapshotBytes - snapshot_total;
-                    size_t read_size = (sec_size <= remaining_budget) ? sec_size : remaining_budget;
-                    uint64_t sec_va = base + static_cast<uint64_t>(s.virtual_address);
-                    std::vector<uint8_t> sec_bytes;
-                    if (driver_bridge::read_memory_for(pid, sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
-                        PESection ps;
-                        ps.va = sec_va;
-                        ps.bytes = std::move(sec_bytes);
-                        ps.is_executable = true;
-                        snapshot_total += ps.bytes.size();
-                        snapshot_sections.push_back(std::move(ps));
-                    }
-                }
-                for (const auto& s : pe.sections) {
-                    bool is_exec = (s.characteristics & kCntCode) || (s.characteristics & kMemExec);
-                    if (is_exec) continue;
-                    bool is_readable = (s.characteristics & kMemRead) != 0;
-                    bool has_raw     = (s.characteristics & kCntUData) == 0;
-                    if (!is_readable || !has_raw) continue;
-                    uint32_t sec_size = (s.virtual_size > 0) ? s.virtual_size : s.raw_size;
-                    if (sec_size == 0) continue;
-                    if (snapshot_total >= kMaxSnapshotBytes) continue;
-                    size_t remaining_budget = kMaxSnapshotBytes - snapshot_total;
-                    size_t read_size = (sec_size <= remaining_budget) ? sec_size : remaining_budget;
-                    uint64_t sec_va = base + static_cast<uint64_t>(s.virtual_address);
-                    std::vector<uint8_t> sec_bytes;
-                    if (driver_bridge::read_memory_for(pid, sec_va, read_size, sec_bytes) && !sec_bytes.empty()) {
-                        PESection ps;
-                        ps.va = sec_va;
-                        ps.bytes = std::move(sec_bytes);
-                        ps.is_executable = false;
-                        snapshot_total += ps.bytes.size();
-                        snapshot_sections.push_back(std::move(ps));
-                    }
-                }
-                if (first_exec_va != 0 && first_exec_va >= base && first_exec_va < base + size) {
-                    state.live_view_addr = first_exec_va;
-                    state.live_floor_va  = first_exec_va;
-                }
-                diag::log_tagged_critical_fmt("disasm",
-                    "start_live_snapshot sections=%llu bytes=%llu",
-                    (unsigned long long)snapshot_sections.size(),
-                    (unsigned long long)snapshot_total);
-            } else {
-                diag::log_tagged_critical("disasm", "start_live_pe_parse_FAILED");
-            }
-        }
-        state.live_module = module_name;
-        state.live_paused = false;
-        state.live_decoding.store(false, std::memory_order_release);
-        state.live_decode_failed.store(false, std::memory_order_release);
-        state.live_fail_count.store(0, std::memory_order_release);
-        state.live_pending_ready.store(false);
-        state.live_refresh_timer = 0.f;
-        state.live_needs_refresh = true;
-
-        state.file = DisasmFile{};
-        state.file.filename = module_name + " [LIVE]";
-        state.file.path     = "live://" + std::to_string(pid) + "/" + module_name;
-        state.file.image_base = base;
-        state.file.text_va    = state.live_view_addr;
-        state.file.machine    = live_machine;
-        state.file.is_64bit   = live_is_64bit;
-        state.file.sections   = std::move(snapshot_sections);
-        state.file.loaded     = true;
-
-        {
-            aida::events::binary_loaded_t payload;
-            payload.binary_path = state.file.path;
-            payload.image_base = base;
-            payload.image_size = (size > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(size);
-            aida::events::publish(aida::events::event_binary_loaded, payload);
-        }
-
-        diag::log_tagged_critical("disasm", "start_live_pre_request_live_decode");
-        request_live_decode(state);
-        diag::log_tagged_critical("disasm", "start_live_exit");
-        return true;
-    }
 
 
-    inline void stop_live(DisasmState& state)
-    {
-        state.live_mode   = false;
-        state.live_pid    = 0;
-        state.live_base   = 0;
-        state.live_size   = 0;
-        state.live_floor_va = 0;
-        state.live_view_addr = 0;
-        state.live_module.clear();
-        state.live_paused = false;
-        state.live_decoding.store(false, std::memory_order_release);
-        state.live_decode_failed.store(false, std::memory_order_release);
-        state.live_fail_count.store(0, std::memory_order_release);
-        state.live_pending_ready.store(false);
-        state.live_pending_instrs.clear();
-    }
+
+
+
 }

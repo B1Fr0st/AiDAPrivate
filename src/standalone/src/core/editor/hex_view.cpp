@@ -1,1112 +1,913 @@
 #include "hex_view.hpp"
-#include "../helpers/globals.h"
+
+#include "../analysis/workspace/overlay_journal.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
+#include "../infra/taskflow_runtime.hpp"
+#include "../ui/theme.hpp"
+#include "../../helpers/globals.h"
 #include "standalone_driver.hpp"
+
 #include "imgui/imgui.h"
-#include "imgui/imgui_internal.h"
-#include <Windows.h>
+
 #include <algorithm>
+#include <atomic>
+#include <charconv>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
-#include "ui_anim.hpp"
-#include "theme.hpp"
-#include "motion.hpp"
-#include "clock.hpp"
-#include "transition.hpp"
-#include "components.hpp"
-#include "blur_layer.hpp"
-#include "empty_state.hpp"
-#include "fonts.hpp"
-#include "../helpers/diag_log.hpp"
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace hex_view {
 
 namespace {
 
-std::string s_last_error;
+struct patch_span_t {
+    std::uint64_t offset = 0;
+    std::vector<std::uint8_t> bytes;
+};
 
-bool parse_hex_pattern(const char* in, std::vector<uint8_t>& out) {
-    out.clear();
-    int nibble = -1;
-    for (const char* p = in; *p; ++p) {
-        char c = *p;
-        if (c == ' ' || c == '\t' || c == ',' || c == '-' || c == '_') {
-            if (nibble >= 0) return false;
+struct state_t {
+    std::uint64_t base_addr = 0;
+    std::string source_name;
+    bool active = false;
+    std::int64_t sel_start = -1;
+    std::int64_t sel_end = -1;
+    bool selecting = false;
+    float scroll_y = 0.0f;
+    float target_scroll_y = 0.0f;
+    bool goto_visible = false;
+    char goto_buf[32] = {};
+    bool search_visible = false;
+    char search_buf[256] = {};
+    bool search_hex = true;
+    std::int64_t search_match = -1;
+    std::uint64_t search_match_len = 0;
+    std::int64_t search_match_idx = -1;
+    std::vector<std::uint64_t> search_matches;
+    std::string search_last_query;
+    bool search_last_hex = true;
+};
+
+enum class source_kind_t : std::uint8_t {
+    workspace_provider,
+    live_memory
+};
+
+struct workspace_hex_state_t final : aida::analysis::workspace_lifecycle_participant_t {
+    std::mutex mutex;
+    state_t ui;
+    std::weak_ptr<aida::analysis::analysis_workspace_t> owner;
+    aida::analysis::binary_id_t owner_id;
+    source_kind_t source_kind = source_kind_t::workspace_provider;
+    std::vector<std::uint8_t> live_bytes;
+    std::uint64_t live_base = 0;
+    aida::analysis::byte_view_t window;
+    std::uint64_t window_offset = 0;
+    std::uint64_t window_size = 0;
+    std::uint64_t patch_revision = (std::numeric_limits<std::uint64_t>::max)();
+    std::vector<patch_span_t> patches;
+    std::atomic<bool> patch_refreshing{false};
+    std::shared_ptr<aida::analysis::cancellation_source_t> search_cancellation;
+    std::atomic<std::uint64_t> search_serial{1};
+    std::atomic<bool> searching{false};
+    std::atomic<bool> cancelled{false};
+    std::atomic<std::uint32_t> pending_jobs{0};
+    std::mutex drain_mutex;
+    std::condition_variable drain_cv;
+    aida::infra::taskflow_runtime::job_handle_t patch_job;
+    aida::infra::taskflow_runtime::job_handle_t search_job;
+    std::uint64_t scroll_to_offset = (std::numeric_limits<std::uint64_t>::max)();
+    std::string error;
+
+    void request_cancel() noexcept override;
+    aida::analysis::workspace_result_t<void> drain(
+        std::chrono::steady_clock::time_point deadline) override;
+};
+
+struct pending_job_t final {
+    explicit pending_job_t(std::shared_ptr<workspace_hex_state_t> state_value)
+        : state(std::move(state_value)) {
+        state->pending_jobs.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    ~pending_job_t() {
+        state->pending_jobs.fetch_sub(1, std::memory_order_acq_rel);
+        state->drain_cv.notify_all();
+    }
+
+    std::shared_ptr<workspace_hex_state_t> state;
+};
+
+std::mutex& registry_mutex() {
+    static std::mutex value;
+    return value;
+}
+
+std::unordered_map<aida::analysis::binary_id_t, std::shared_ptr<workspace_hex_state_t>,
+    aida::analysis::binary_id_hash_t>& registry() {
+    static std::unordered_map<aida::analysis::binary_id_t,
+        std::shared_ptr<workspace_hex_state_t>, aida::analysis::binary_id_hash_t> value;
+    return value;
+}
+
+void unregister_state(const aida::analysis::binary_id_t& id,
+                      const workspace_hex_state_t* state) {
+    std::lock_guard<std::mutex> lock(registry_mutex());
+    auto& values = registry();
+    const auto found = values.find(id);
+    if (found != values.end() && found->second.get() == state)
+        values.erase(found);
+}
+
+void workspace_hex_state_t::request_cancel() noexcept {
+    cancelled.store(true, std::memory_order_release);
+    std::shared_ptr<aida::analysis::cancellation_source_t> search;
+    aida::infra::taskflow_runtime::job_handle_t patch;
+    aida::infra::taskflow_runtime::job_handle_t search_task;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        search = search_cancellation;
+        search_cancellation.reset();
+        patch = patch_job;
+        search_task = search_job;
+        patch_job = {};
+        search_job = {};
+        window = {};
+        window_size = 0;
+        live_bytes.clear();
+    }
+    if (search)
+        search->request_cancel();
+    if (patch.valid())
+        aida::infra::taskflow_runtime::cancel(patch);
+    if (search_task.valid())
+        aida::infra::taskflow_runtime::cancel(search_task);
+    unregister_state(owner_id, this);
+}
+
+aida::analysis::workspace_result_t<void> workspace_hex_state_t::drain(
+    std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(drain_mutex);
+    if (!drain_cv.wait_until(lock, deadline, [this] {
+        return pending_jobs.load(std::memory_order_acquire) == 0;
+    }))
+        return aida::analysis::workspace_result_t<void>::failure(
+            aida::analysis::make_workspace_error(
+                aida::analysis::workspace_error_code_t::deadline_exceeded,
+                "hex view cancellation reached its workspace close deadline", "hex_view"));
+    return aida::analysis::workspace_result_t<void>::success();
+}
+
+bool state_matches(const disasm_view::workspace_context_t& context,
+                   const std::shared_ptr<workspace_hex_state_t>& state) {
+    if (!context.workspace || !state || state->cancelled.load(std::memory_order_acquire))
+        return false;
+    const auto owner = state->owner.lock();
+    return owner && owner == context.workspace && !owner->closing() && !owner->closed();
+}
+
+std::shared_ptr<workspace_hex_state_t> state_for(
+    const disasm_view::workspace_context_t& context) {
+    if (!context.workspace || context.workspace->closing() || context.workspace->closed())
+        return {};
+    const auto id = context.workspace->identity().binary_id();
+    auto created = std::make_shared<workspace_hex_state_t>();
+    created->owner = context.workspace;
+    created->owner_id = id;
+    created->ui.active = true;
+    created->ui.base_addr = context.workspace->identity().image_base();
+    created->ui.source_name = context.workspace->identity().bin_name();
+    {
+        std::lock_guard<std::mutex> lock(registry_mutex());
+        auto& values = registry();
+        auto found = values.find(id);
+        if (found != values.end() && state_matches(context, found->second))
+            return found->second;
+        if (found != values.end())
+            values.erase(found);
+        values.emplace(id, created);
+    }
+    auto registered = context.workspace->register_lifecycle_participant(created);
+    if (!registered) {
+        created->request_cancel();
+        return {};
+    }
+    return created;
+}
+
+std::optional<std::vector<std::uint8_t>> parse_hex(std::string text) {
+    std::vector<std::uint8_t> output;
+    int high = -1;
+    for (char character : text) {
+        if (std::isspace(static_cast<unsigned char>(character)))
             continue;
-        }
-        int v;
-        if (c >= '0' && c <= '9') v = c - '0';
-        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
-        else return false;
-        if (nibble < 0) {
-            nibble = v;
-        } else {
-            out.push_back(static_cast<uint8_t>((nibble << 4) | v));
-            nibble = -1;
+        int value = -1;
+        if (character >= '0' && character <= '9')
+            value = character - '0';
+        else if (character >= 'a' && character <= 'f')
+            value = character - 'a' + 10;
+        else if (character >= 'A' && character <= 'F')
+            value = character - 'A' + 10;
+        else
+            return {};
+        if (high < 0)
+            high = value;
+        else {
+            output.push_back(static_cast<std::uint8_t>((high << 4) | value));
+            high = -1;
         }
     }
-    return nibble < 0 && !out.empty();
+    if (high >= 0 || output.empty())
+        return {};
+    return output;
 }
 
-void recompute_search_matches(state_t& st) {
-    diag::log_tagged_fmt("hex", "search_recompute enter query='%s' hex=%d data_size=%zu",
-        st.search_buf, static_cast<int>(st.search_hex), st.data.size());
-    st.search_matches.clear();
-    st.search_match     = -1;
-    st.search_match_idx = -1;
-    st.search_match_len = 0;
-    st.search_last_query.assign(st.search_buf);
-    st.search_last_hex = st.search_hex;
+std::vector<std::uint8_t> search_pattern(const state_t& state) {
+    if (state.search_hex) {
+        auto parsed = parse_hex(state.search_buf);
+        return parsed ? std::move(*parsed) : std::vector<std::uint8_t>();
+    }
+    const auto* begin = reinterpret_cast<const std::uint8_t*>(state.search_buf);
+    return std::vector<std::uint8_t>(begin, begin + std::strlen(state.search_buf));
+}
 
-    if (st.data.empty() || st.search_buf[0] == '\0') return;
-
-    std::vector<uint8_t> pat;
-    if (st.search_hex) {
-        if (!parse_hex_pattern(st.search_buf, pat)) return;
+void request_patch_refresh(const disasm_view::workspace_context_t& context,
+                           const std::shared_ptr<workspace_hex_state_t>& state) {
+    if (!state_matches(context, state))
+        return;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->source_kind != source_kind_t::workspace_provider ||
+            state->patch_revision == context.workspace->overlay_revision())
+            return;
+    }
+    if (state->patch_refreshing.exchange(true, std::memory_order_acq_rel))
+        return;
+    const std::string target_id = context.workspace->identity().binary_id().to_hex();
+    auto pending = std::make_shared<pending_job_t>(state);
+    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+    descriptor.owner_subsystem = "hex_view";
+    descriptor.label = "refresh_workspace_patches";
+    descriptor.target_id = target_id.c_str();
+    descriptor.generation = context.publication->generation;
+    descriptor.cancellable_body = [context, state, pending](
+        const aida::infra::taskflow_runtime::cancellation_token_t& cancel) {
+        std::vector<patch_span_t> patches;
+        if (!cancel.requested.load(std::memory_order_acquire) && state_matches(context, state)) {
+            if (auto overlay = context.workspace->overlay()) {
+                const auto operations = overlay->patch_operations();
+                patches.reserve(operations.size());
+                for (const auto& operation : operations) {
+                    if (cancel.requested.load(std::memory_order_acquire))
+                        break;
+                    const auto offset = disasm_view::provider_offset(context, operation.address);
+                    if (!offset || operation.bytes.empty())
+                        continue;
+                    patches.push_back({*offset, operation.bytes});
+                }
+                std::sort(patches.begin(), patches.end(), [](const auto& left, const auto& right) {
+                    return left.offset < right.offset;
+                });
+            }
+        }
+        if (state_matches(context, state)) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->patches = std::move(patches);
+            state->patch_revision = context.workspace->overlay_revision();
+        }
+        state->patch_refreshing.store(false, std::memory_order_release);
+    };
+    const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
+    if (!submitted.submitted) {
+        state->patch_refreshing.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = submitted.reject_reason;
     } else {
-        size_t len = std::strlen(st.search_buf);
-        pat.assign(reinterpret_cast<const uint8_t*>(st.search_buf),
-                   reinterpret_cast<const uint8_t*>(st.search_buf) + len);
-    }
-    if (pat.empty() || pat.size() > st.data.size()) return;
-
-    const size_t n = st.data.size();
-    const size_t m = pat.size();
-    const uint8_t  first = pat[0];
-    const uint8_t* dp    = st.data.data();
-    for (size_t i = 0; i + m <= n; ++i) {
-        if (dp[i] != first) continue;
-        if (std::memcmp(dp + i, pat.data(), m) == 0) {
-            st.search_matches.push_back(static_cast<int>(i));
-            if (st.search_matches.size() >= 65536u) break;
+        bool cancel_submitted = false;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            cancel_submitted = state->cancelled.load(std::memory_order_acquire);
+            if (!cancel_submitted)
+                state->patch_job = submitted.handle;
         }
+        if (cancel_submitted)
+            aida::infra::taskflow_runtime::cancel(submitted.handle);
     }
-    st.search_match_len = static_cast<int>(m);
-    if (!st.search_matches.empty()) {
-        st.search_match_idx = 0;
-        st.search_match     = st.search_matches[0];
+}
+
+bool ensure_window(const disasm_view::workspace_context_t& context,
+                   const std::shared_ptr<workspace_hex_state_t>& state,
+                   std::uint64_t begin, std::uint64_t end) {
+    if (!state_matches(context, state) || begin >= end)
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->source_kind == source_kind_t::live_memory)
+            return end <= state->live_bytes.size();
+        if (end > context.workspace->provider().size())
+            return false;
+        if (!state->window.empty() && begin >= state->window_offset &&
+            end <= state->window_offset + state->window_size)
+            return true;
     }
-    diag::log_tagged_fmt("hex", "search_recompute done matches=%zu pat_len=%zu",
-        st.search_matches.size(), m);
-}
-
-void goto_search_match(state_t& st, int idx, float line_h, int bytes_per_row, float view_h) {
-    if (idx < 0 || idx >= static_cast<int>(st.search_matches.size())) return;
-    st.search_match_idx = idx;
-    st.search_match     = st.search_matches[idx];
-    int len = st.search_match_len > 0 ? st.search_match_len : 1;
-    st.sel_start = st.search_match;
-    st.sel_end   = st.search_match + len - 1;
-    int row = st.search_match / bytes_per_row;
-    float row_y = row * line_h;
-    float center = row_y - (view_h * 0.5f) + (line_h * 0.5f);
-    if (center < 0.f) center = 0.f;
-    st.target_scroll_y = center;
-}
-
-void step_search(state_t& st, int dir, float line_h, int bytes_per_row, float view_h) {
-    if (st.search_matches.empty()) return;
-    int n = static_cast<int>(st.search_matches.size());
-    int idx = st.search_match_idx + dir;
-    if (idx < 0) idx = n - 1;
-    if (idx >= n) idx = 0;
-    goto_search_match(st, idx, line_h, bytes_per_row, view_h);
-}
-
-bool match_range_contains(const std::vector<int>& matches, int len, int byte_idx, int& which) {
-    if (matches.empty() || len <= 0) return false;
-    auto it = std::upper_bound(matches.begin(), matches.end(), byte_idx);
-    if (it == matches.begin()) return false;
-    --it;
-    int start = *it;
-    if (byte_idx >= start && byte_idx < start + len) {
-        which = static_cast<int>(it - matches.begin());
-        return true;
-    }
-    return false;
-}
-
-void clipboard_copy_string(const std::string& text) {
-    if (text.empty() || !OpenClipboard(nullptr)) return;
-    EmptyClipboard();
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-    if (wlen <= 0) { CloseClipboard(); return; }
-    size_t bytes = (static_cast<size_t>(wlen) + 1) * sizeof(wchar_t);
-    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (!hg) { CloseClipboard(); return; }
-    wchar_t* dst = static_cast<wchar_t*>(GlobalLock(hg));
-    if (!dst) { GlobalFree(hg); CloseClipboard(); return; }
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), dst, wlen);
-    dst[wlen] = L'\0';
-    GlobalUnlock(hg);
-    if (!SetClipboardData(CF_UNICODETEXT, hg)) {
-        GlobalFree(hg);
-    }
-    CloseClipboard();
-}
-
-}
-
-void set_data(const std::vector<uint8_t>& bytes, uint64_t base_addr,
-              const std::string& name) {
-    diag::log_tagged_fmt("hex", "set_data enter size=%zu base=0x%llX name='%s'",
-        bytes.size(), static_cast<unsigned long long>(base_addr), name.c_str());
-    g_state.data       = bytes;
-    g_state.base_addr  = base_addr;
-    g_state.source_name = name;
-    g_state.active     = true;
-    g_state.sel_start  = -1;
-    g_state.sel_end    = -1;
-    g_state.scroll_y   = 0.f;
-    g_state.target_scroll_y = 0.f;
-    g_state.search_match     = -1;
-    g_state.search_match_len = 0;
-    g_state.search_match_idx = -1;
-    g_state.search_matches.clear();
-    g_state.search_last_query.clear();
-    diag::log_tagged_fmt("hex", "set_data complete buffer_active=true");
-}
-
-void load_from_file(const std::string& path, size_t offset, size_t size) {
-    diag::log_tagged_fmt("hex", "load_from_file enter path='%s' offset=%zu size=%zu",
-        path.c_str(), offset, size);
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) {
-        s_last_error = "hex_view::load_from_file: failed to open " + path;
-        diag::log_tagged_fmt("hex", "load_from_file FAILED open path='%s'", path.c_str());
-        return;
-    }
-    std::streampos tp = f.tellg();
-    if (tp < 0) {
-        s_last_error = "hex_view::load_from_file: failed to read size of " + path;
-        return;
-    }
-    size_t fsize = static_cast<size_t>(tp);
-    if (offset >= fsize) {
-        s_last_error = "hex_view::load_from_file: offset past end of " + path;
-        return;
-    }
-    f.seekg(static_cast<std::streamoff>(offset));
-    if (!f.good()) {
-        s_last_error = "hex_view::load_from_file: failed to seek " + path;
-        return;
-    }
-    size_t read_sz = (size > 0 && offset + size <= fsize) ? size : (fsize - offset);
-    std::vector<uint8_t> buf(read_sz);
-    f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(read_sz));
-    auto pos = path.find_last_of("/\\");
-    std::string name = (pos != std::string::npos) ? path.substr(pos + 1) : path;
-    set_data(buf, static_cast<uint64_t>(offset), name);
-    s_last_error.clear();
-    diag::log_tagged_fmt("hex", "load_from_file SUCCESS read_sz=%zu name='%s'", read_sz, name.c_str());
-}
-
-std::string last_error() {
-    return s_last_error;
-}
-
-bool read_from_process(uint64_t address, size_t size) {
-    diag::log_tagged_fmt("hex", "read_from_process enter addr=0x%llX size=%zu pid=%u",
-        static_cast<unsigned long long>(address), size, driver_bridge::attached_pid());
-    if (!driver_bridge::is_loaded() || !driver_bridge::can_read_memory()) {
-        diag::log_tagged_fmt("hex", "read_from_process FAILED driver_loaded=%d can_read=%d",
-            static_cast<int>(driver_bridge::is_loaded()),
-            static_cast<int>(driver_bridge::can_read_memory()));
+    constexpr std::uint64_t window_capacity = 4ULL << 20;
+    const std::uint64_t aligned = begin & ~static_cast<std::uint64_t>(0xFFFF);
+    const std::uint64_t required = end - aligned;
+    const std::uint64_t available = context.workspace->provider().size() - aligned;
+    const std::uint64_t length = (std::min)(available,
+        (std::max)(required, window_capacity));
+    auto lease = context.workspace->provider().lease(aligned, length,
+        context.workspace->cancellation_token());
+    if (!lease) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = lease.error().stable_code() + ": " + lease.error().message;
+        state->window = {};
+        state->window_size = 0;
         return false;
     }
-    if (driver_bridge::attached_pid() == 0) {
-        diag::log_tagged("hex", "read_from_process FAILED no_attached_pid");
-        return false;
-    }
-    if (size == 0 || size > 1 * 1024 * 1024) {
-        diag::log_tagged_fmt("hex", "read_from_process FAILED invalid_size=%zu", size);
-        return false;
-    }
-
-    std::vector<uint8_t> buf;
-    if (!driver_bridge::read_memory(address, size, buf)) {
-        diag::log_tagged_fmt("hex", "read_from_process FAILED read_memory addr=0x%llX size=%zu",
-            static_cast<unsigned long long>(address), size);
-        return false;
-    }
-    if (buf.empty()) {
-        diag::log_tagged("hex", "read_from_process FAILED empty_buffer");
-        return false;
-    }
-
-    char label[64];
-    snprintf(label, sizeof(label), "PID %u @ %016llX",
-             driver_bridge::attached_pid(),
-             static_cast<unsigned long long>(address));
-    set_data(buf, address, label);
-    diag::log_tagged_fmt("hex", "read_from_process SUCCESS read=%zu bytes", buf.size());
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->window = lease.take_value();
+    state->window_offset = aligned;
+    state->window_size = length;
+    state->error.clear();
     return true;
 }
 
-void render(float pos_x, float pos_y, float width, float height,
-            float alpha, float accent_r, float accent_g, float accent_b) {
-    (void)accent_r; (void)accent_g; (void)accent_b;
-    static bool s_render_first_log = false;
-    if (!s_render_first_log) {
-        s_render_first_log = true;
-        diag::log_tagged_fmt("hex", "render first_call width=%.0f height=%.0f", width, height);
-    }
+std::uint8_t patched_byte(const workspace_hex_state_t& state,
+                          std::uint64_t offset, std::uint8_t original,
+                          bool* patched) {
+    if (patched)
+        *patched = false;
+    auto found = std::upper_bound(state.patches.begin(), state.patches.end(), offset,
+        [](std::uint64_t value, const patch_span_t& span) {
+            return value < span.offset;
+        });
+    if (found == state.patches.begin())
+        return original;
+    --found;
+    if (offset < found->offset || offset - found->offset >= found->bytes.size())
+        return original;
+    if (patched)
+        *patched = true;
+    return found->bytes[static_cast<std::size_t>(offset - found->offset)];
+}
 
-    auto& st = g_state;
-    const float a   = alpha;
-    const float dt  = aida::ui::clock::dt();
-
-    const auto& t = aida::ui::resolved();
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 wpos = ImGui::GetWindowPos();
-    float ox = wpos.x + pos_x;
-    float oy = wpos.y + pos_y;
-
-    dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
-        aida::ui::with_alpha(t.bg_base, a));
-
-    static aida::ui::transition_t s_empty_intro;
-    static bool                   s_empty_intro_armed = false;
-    static aida::ui::transition_t s_inspector_anim;
-    static bool                   s_inspector_was_visible = false;
-    static float                  s_insp_x_smooth = 0.f;
-    static aida::ui::transition_t s_heat_xfade;
-    static bool                   s_heat_mode = false;
-    static aida::ui::flash_t      s_copy_flash;
-    static double                 s_copy_flash_until = 0.0;
-    static std::string            s_copy_toast_text;
-    static aida::ui::transition_t s_overlay_intro;
-    static aida::ui::hover_state_t s_heat_btn_hover;
-    static float                  s_zoom_scale = 1.f;
-    static float                  s_zoom_target = 1.f;
-
-    if (!st.active || st.data.empty()) {
-        if (!s_empty_intro_armed) { s_empty_intro.start(aida::motion::dur::lg, aida::motion::ease::out_quint); s_empty_intro_armed = true; }
-        s_empty_intro.tick(dt);
-        float ev = s_empty_intro.eased();
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * ev);
-        aida::ui::empty_state::config_t cfg;
-        cfg.glyph = aida::ui::empty_state::glyph_t::memory;
-        cfg.title = "No buffer attached";
-        cfg.body  = "Open a file or attach a process to inspect bytes.";
-        cfg.hints = { {"Ctrl+O"}, {"Ctrl+P"} };
-        cfg.max_width = 360.f;
-        aida::ui::empty_state::render(ImVec2(ox, oy), ImVec2(width, height), cfg);
-        ImGui::PopStyleVar();
-        return;
-    } else {
-        s_empty_intro.reset();
-        s_empty_intro_armed = false;
-    }
-
-    static float s_overlay_armed_for = -1.f;
-    bool overlay_visible = st.goto_visible || st.search_visible;
-    if (overlay_visible && s_overlay_armed_for < 0.f) {
-        s_overlay_intro.start(aida::motion::dur::md, aida::motion::ease::out_quint);
-        s_overlay_armed_for = 1.f;
-    } else if (!overlay_visible) {
-        s_overlay_armed_for = -1.f;
-    }
-    s_overlay_intro.tick(dt);
-
-    bool ctrl_held = ImGui::GetIO().KeyCtrl;
-    bool wheel_zoom_consumed = false;
-    if (ctrl_held) {
-        float w_in = ImGui::GetIO().MouseWheel;
-        if (w_in != 0.f) {
-            ImVec2 mp_z = ImGui::GetIO().MousePos;
-            if (mp_z.x >= ox && mp_z.x <= ox + width && mp_z.y >= oy && mp_z.y <= oy + height) {
-                s_zoom_target += w_in * 0.06f;
-                if (s_zoom_target < 0.78f) s_zoom_target = 0.78f;
-                if (s_zoom_target > 1.30f) s_zoom_target = 1.30f;
-                wheel_zoom_consumed = true;
-            }
-        }
-    }
-    s_zoom_scale = aida::motion::smooth_lerp(s_zoom_scale, s_zoom_target, 14.f, dt);
-
-    ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
-    const float font_base = ImGui::GetFontSize();
-    const float font_size = font_base * s_zoom_scale;
-    const float line_h = font_size + 4.f;
-    const float char_w = code_font->CalcTextSizeA(font_size, FLT_MAX, 0.f, "0").x;
-    const int   bytes_per_row = 16;
-    const int   total_rows = ((int)st.data.size() + bytes_per_row - 1) / bytes_per_row;
-
-    const float addr_w = char_w * 17.f;
-    const float hex_w  = char_w * 50.f;
-    const float asc_x  = addr_w + hex_w + char_w * 2.f;
-
-    static std::vector<uint8_t> prev_bytes;
-    static std::vector<float> byte_flash;
-    static std::vector<aida::ui::transition_t> byte_heat_anim;
-    if (prev_bytes.size() != st.data.size()) {
-        prev_bytes = st.data;
-        byte_flash.assign(st.data.size(), 0.f);
-        byte_heat_anim.clear();
-        byte_heat_anim.resize(st.data.size());
-    }
-
-    const float strip_h = 46.f;
+void start_search(const disasm_view::workspace_context_t& context,
+                  const std::shared_ptr<workspace_hex_state_t>& state) {
+    std::vector<std::uint8_t> pattern;
+    std::vector<std::uint8_t> live_source;
+    std::uint64_t serial = 0;
+    std::shared_ptr<aida::analysis::cancellation_source_t> cancellation;
     {
-        char bytes_buf[32];
-        char sel_buf[32];
-        char base_buf[24];
-        char src_buf[48];
-
-        std::snprintf(bytes_buf, sizeof(bytes_buf), "%zu", st.data.size());
-        int sel_count = 0;
-        if (st.sel_start >= 0 && st.sel_end >= 0)
-            sel_count = std::abs(st.sel_end - st.sel_start) + 1;
-        if (sel_count > 0)
-            std::snprintf(sel_buf, sizeof(sel_buf), "%d", sel_count);
-        else
-            std::snprintf(sel_buf, sizeof(sel_buf), "none");
-        std::snprintf(base_buf, sizeof(base_buf), "0x%016llX",
-            static_cast<unsigned long long>(st.base_addr));
-        if (st.source_name.empty())
-            std::snprintf(src_buf, sizeof(src_buf), "in-memory");
-        else
-            std::snprintf(src_buf, sizeof(src_buf), "%.44s", st.source_name.c_str());
-
-        ui_anim::stat_strip_item_t items[4];
-        items[0] = { "Bytes",    bytes_buf, nullptr, 0, nullptr, 0, t.text_primary };
-        items[1] = { "Selected", sel_buf,   nullptr, 0, nullptr, 0, sel_count > 0 ? t.accent_u32 : t.text_dim };
-        items[2] = { "Base",     base_buf,  nullptr, 0, nullptr, 0, t.text_address };
-        items[3] = { "Source",   src_buf,   nullptr, 0, nullptr, 0, t.text_secondary };
-        ui_anim::render_stat_strip(dl, ox + 6.f, oy + 6.f, width - 12.f, strip_h - 10.f,
-            items, 4,
-            ((float)((t.accent_u32 >> IM_COL32_R_SHIFT) & 0xFF)) / 255.f,
-            ((float)((t.accent_u32 >> IM_COL32_G_SHIFT) & 0xFF)) / 255.f,
-            ((float)((t.accent_u32 >> IM_COL32_B_SHIFT) & 0xFF)) / 255.f, a);
-    }
-    oy += strip_h;
-    height -= strip_h;
-
-    float col_hdr_h = line_h + 4.f;
-    {
-        dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + col_hdr_h),
-            aida::ui::with_alpha(t.panel_header, a));
-        dl->AddRectFilledMultiColor(ImVec2(ox, oy), ImVec2(ox + width, oy + col_hdr_h),
-            aida::ui::with_alpha(t.accent_glow, a * 0.7f),
-            aida::ui::with_alpha(t.accent_glow, 0),
-            aida::ui::with_alpha(t.accent_glow, 0),
-            aida::ui::with_alpha(t.accent_glow, a * 0.7f));
-        float hx = ox + addr_w;
-        for (int c = 0; c < bytes_per_row; ++c) {
-            float bx = hx + c * char_w * 3.f;
-            if (c >= 8) bx += char_w;
-            char hdr[4];
-            snprintf(hdr, sizeof(hdr), "%02X", c);
-            dl->AddText(code_font, font_size, ImVec2(bx, oy + 3.f),
-                aida::ui::with_alpha(t.text_dim, a), hdr);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        pattern = search_pattern(state->ui);
+        if (pattern.empty()) {
+            state->error = "Search pattern is empty or malformed.";
+            return;
         }
-        dl->AddText(aida::ui::fonts::caption(), 13.f,
-            ImVec2(ox + asc_x, oy + (col_hdr_h - 11.f) * 0.5f),
-            aida::ui::with_alpha(t.text_dim, a), "DECODED TEXT");
-        dl->AddLine(ImVec2(ox, oy + col_hdr_h - 1.f),
-                    ImVec2(ox + width, oy + col_hdr_h - 1.f),
-                    aida::ui::with_alpha(t.border_subtle, a), 1.f);
+        if (state->search_cancellation)
+            state->search_cancellation->request_cancel();
+        cancellation = std::make_shared<aida::analysis::cancellation_source_t>();
+        state->search_cancellation = cancellation;
+        serial = state->search_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+        state->ui.search_matches.clear();
+        state->ui.search_match = -1;
+        state->ui.search_match_idx = -1;
+        state->ui.search_match_len = pattern.size();
+        state->error.clear();
+        if (state->source_kind == source_kind_t::live_memory)
+            live_source = state->live_bytes;
     }
-    oy += col_hdr_h;
-    height -= col_hdr_h;
-
-    st.scroll_y = aida::motion::smooth_lerp(st.scroll_y, st.target_scroll_y, 20.f, dt);
-    if (std::abs(st.target_scroll_y - st.scroll_y) < 0.5f)
-        st.scroll_y = st.target_scroll_y;
-    float max_scroll = std::max(0.f, total_rows * line_h - height + line_h);
-    st.target_scroll_y = std::max(0.f, std::min(st.target_scroll_y, max_scroll));
-    st.scroll_y = std::max(0.f, std::min(st.scroll_y, max_scroll));
-
-    bool hovered = ImGui::IsMouseHoveringRect(ImVec2(ox, oy), ImVec2(ox + width, oy + height));
-    if (hovered && !wheel_zoom_consumed) {
-        float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.f && !ctrl_held)
-            st.target_scroll_y -= wheel * line_h * 3.f;
-    }
-
-    int first_row = std::max(0, (int)(st.scroll_y / line_h) - 1);
-    int last_row  = std::min(total_rows - 1, (int)((st.scroll_y + height) / line_h) + 1);
-
-    dl->AddLine(ImVec2(ox + addr_w - char_w, oy),
-                ImVec2(ox + addr_w - char_w, oy + height),
-                aida::ui::with_alpha(t.border_subtle, a * 1.2f), 1.f);
-    dl->AddLine(ImVec2(ox + addr_w + hex_w, oy),
-                ImVec2(ox + addr_w + hex_w, oy + height),
-                aida::ui::with_alpha(t.border_subtle, a * 1.2f), 1.f);
-
-    {
-        ImVec2 ht_min = ImVec2(ox + width - 110.f, oy + 4.f);
-        ImVec2 ht_max = ImVec2(ox + width - 10.f, oy + 4.f + 22.f);
-        bool ht_hov = ImGui::IsMouseHoveringRect(ht_min, ht_max);
-        float hov_v = s_heat_btn_hover.tick(ht_hov, dt, aida::motion::spring::balanced);
-
-        if (ht_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            s_heat_mode = !s_heat_mode;
-            s_heat_xfade.start(aida::motion::dur::md, aida::motion::ease::out_quint);
-        }
-        s_heat_xfade.tick(dt);
-
-        ImU32 fill_off = aida::ui::with_alpha(t.panel_header, (0.55f + hov_v * 0.25f) * a);
-        ImU32 fill_on  = aida::ui::with_alpha(t.accent_dim, (0.6f + hov_v * 0.30f) * a);
-        ImU32 fill = s_heat_mode ? fill_on : fill_off;
-        dl->AddRectFilled(ht_min, ht_max, fill, 11.f);
-        ImU32 border_col = aida::ui::with_alpha(s_heat_mode ? t.accent_u32 : t.border_subtle, a);
-        dl->AddRect(ht_min, ht_max, border_col, 11.f, 0, 1.f);
-
-        const char* lbl = s_heat_mode ? "Heat: ON" : "Heat";
-        ImVec2 ts = ImGui::CalcTextSize(lbl);
-        ImU32 txt_col = s_heat_mode ? aida::ui::with_alpha(t.accent_u32, a)
-                                    : aida::ui::with_alpha(t.text_secondary, (0.85f + hov_v * 0.15f) * a);
-        dl->AddText(ImVec2(ht_min.x + (ht_max.x - ht_min.x - ts.x) * 0.5f,
-                           ht_min.y + ((ht_max.y - ht_min.y) - ts.y) * 0.5f),
-                    txt_col, lbl);
-    }
-
-    int sel_lo = -1, sel_hi = -1;
-    if (st.sel_start >= 0 && st.sel_end >= 0) {
-        sel_lo = std::min(st.sel_start, st.sel_end);
-        sel_hi = std::max(st.sel_start, st.sel_end);
-    }
-
-    static float s_sel_lo_anim = -1.f;
-    static float s_sel_hi_anim = -1.f;
-    static float s_sel_lo_vel = 0.f;
-    static float s_sel_hi_vel = 0.f;
-    if (sel_lo < 0) {
-        s_sel_lo_anim = -1.f;
-        s_sel_hi_anim = -1.f;
-        s_sel_lo_vel = 0.f;
-        s_sel_hi_vel = 0.f;
-    } else {
-        if (s_sel_lo_anim < 0.f) {
-            s_sel_lo_anim = (float)sel_lo;
-            s_sel_hi_anim = (float)sel_hi;
-        } else {
-            s_sel_lo_anim = aida::motion::spring_step(s_sel_lo_anim, (float)sel_lo, s_sel_lo_vel, aida::motion::spring::snappy, dt);
-            s_sel_hi_anim = aida::motion::spring_step(s_sel_hi_anim, (float)sel_hi, s_sel_hi_vel, aida::motion::spring::snappy, dt);
-        }
-    }
-
-    ImU32 sel_col_fill = aida::ui::with_alpha(t.selection, a);
-    ImU32 sel_glow     = aida::ui::with_alpha(t.accent_glow, a);
-
-    for (int row = first_row; row <= last_row; row++) {
-        float y = oy + row * line_h - st.scroll_y;
-        int row_off = row * bytes_per_row;
-
-        if (row & 1) {
-            dl->AddRectFilled(ImVec2(ox, y), ImVec2(ox + width, y + line_h - 1.f),
-                              aida::ui::with_alpha(t.text_primary, 0.012f * a));
-        }
-
-        char addr_buf[20];
-        snprintf(addr_buf, sizeof(addr_buf), "%016llX",
-                 (unsigned long long)(st.base_addr + row_off));
-        dl->AddText(code_font, font_size, ImVec2(ox + 4.f, y + 1.f),
-                    aida::ui::with_alpha(t.text_address, 0.85f * a), addr_buf);
-
-        for (int col = 0; col < bytes_per_row; col++) {
-            int byte_idx = row_off + col;
-            if (byte_idx >= (int)st.data.size()) break;
-
-            uint8_t byte_val = st.data[byte_idx];
-            float bx = ox + addr_w + col * char_w * 3.f;
-            if (col >= 8) bx += char_w;
-
-            float heat_alpha = 0.f;
-            if (byte_idx < (int)byte_heat_anim.size()) {
-                auto& xa = byte_heat_anim[byte_idx];
-                if (s_heat_mode && !xa.active && xa.progress < 0.999f) {
-                    xa.start(aida::motion::dur::md, aida::motion::ease::out_quint);
-                } else if (!s_heat_mode && !xa.active && xa.progress > 0.001f) {
-                    xa.start_reverse(aida::motion::dur::md, aida::motion::ease::out_quint);
-                }
-                xa.tick(dt);
-                heat_alpha = xa.eased();
+    state->searching.store(true, std::memory_order_release);
+    const std::string target_id = context.workspace->identity().binary_id().to_hex();
+    auto pending = std::make_shared<pending_job_t>(state);
+    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+    descriptor.owner_subsystem = "hex_view";
+    descriptor.label = "search_workspace_bytes";
+    descriptor.target_id = target_id.c_str();
+    descriptor.generation = context.publication->generation;
+    descriptor.cancellable_body = [context, state, pending, pattern = std::move(pattern),
+                                   live_source = std::move(live_source), cancellation, serial](
+        const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) {
+        constexpr std::uint64_t chunk_size = 4ULL << 20;
+        constexpr std::size_t maximum_matches = 100000;
+        std::vector<std::uint64_t> matches;
+        std::uint64_t cursor = 0;
+        if (!live_source.empty() && state_matches(context, state) &&
+            !runtime_cancel.requested.load(std::memory_order_acquire) &&
+            !cancellation->token().stop_requested()) {
+            auto found = std::search(live_source.begin(), live_source.end(),
+                pattern.begin(), pattern.end());
+            while (found != live_source.end() && matches.size() < maximum_matches &&
+                   !runtime_cancel.requested.load(std::memory_order_acquire) &&
+                   !cancellation->token().stop_requested()) {
+                matches.push_back(static_cast<std::uint64_t>(
+                    std::distance(live_source.begin(), found)));
+                found = std::search(found + 1, live_source.end(), pattern.begin(), pattern.end());
             }
-            if (heat_alpha > 0.001f) {
-                ImU32 hc = ui_anim::byte_heat_color(byte_val, a * 0.32f * heat_alpha);
-                dl->AddRectFilled(ImVec2(bx - 1.f, y),
-                                  ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                  hc);
-            } else if (byte_val == 0) {
-                dl->AddRectFilled(ImVec2(bx - 1.f, y),
-                                  ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                  IM_COL32(0, 0, 0, static_cast<int>(30 * a)));
-            }
-
-            bool sel_animated_in = false;
-            if (s_sel_lo_anim >= 0.f) {
-                float lo_a = s_sel_lo_anim;
-                float hi_a = s_sel_hi_anim;
-                if (lo_a > hi_a) { float tmp = lo_a; lo_a = hi_a; hi_a = tmp; }
-                if (byte_idx >= (int)floorf(lo_a) && byte_idx <= (int)ceilf(hi_a)) {
-                    float intensity = 1.f;
-                    if (byte_idx < (int)floorf(lo_a) + 1) {
-                        intensity = 1.f - (lo_a - floorf(lo_a));
-                    }
-                    if (byte_idx > (int)ceilf(hi_a) - 1) {
-                        intensity = std::min(intensity, 1.f - (ceilf(hi_a) - hi_a));
-                    }
-                    if (intensity < 0.f) intensity = 0.f;
-                    dl->AddRectFilled(ImVec2(bx - 1.f, y),
-                                      ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                      aida::ui::with_alpha(sel_col_fill, intensity));
-                    sel_animated_in = true;
+        }
+        while (live_source.empty() && cursor < context.workspace->provider().size() &&
+               matches.size() < maximum_matches &&
+               state_matches(context, state) &&
+               !runtime_cancel.requested.load(std::memory_order_acquire) &&
+               !cancellation->token().stop_requested()) {
+            const std::uint64_t remaining = context.workspace->provider().size() - cursor;
+            const std::uint64_t length = (std::min)(remaining, chunk_size);
+            auto lease = context.workspace->provider().lease(cursor, length,
+                cancellation->token());
+            if (!lease)
+                break;
+            const auto& view = lease.value();
+            if (view.size() >= pattern.size()) {
+                auto found = std::search(view.begin(), view.end(), pattern.begin(), pattern.end());
+                while (found != view.end() && matches.size() < maximum_matches) {
+                    matches.push_back(cursor + static_cast<std::uint64_t>(
+                        std::distance(view.begin(), found)));
+                    found = std::search(found + 1, view.end(), pattern.begin(), pattern.end());
                 }
             }
-
-            if (sel_animated_in && sel_lo >= 0 && byte_idx >= sel_lo && byte_idx <= sel_hi) {
-                if (byte_idx == sel_lo || byte_idx == sel_hi) {
-                    dl->AddRect(ImVec2(bx - 1.f, y),
-                                ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                aida::ui::with_alpha(t.accent_u32, 0.55f * a),
-                                0.f, 0, 1.f);
+            if (length == remaining)
+                break;
+            const std::uint64_t overlap = pattern.size() > 1 ? pattern.size() - 1 : 0;
+            cursor += length - (std::min)(length - 1, overlap);
+        }
+        if (state_matches(context, state)) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->search_serial.load(std::memory_order_acquire) == serial) {
+                state->ui.search_matches = std::move(matches);
+                state->ui.search_match_idx = state->ui.search_matches.empty() ? -1 : 0;
+                state->ui.search_match = state->ui.search_matches.empty() ? -1 :
+                    static_cast<std::int64_t>(state->ui.search_matches.front());
+                if (!state->ui.search_matches.empty()) {
+                    state->scroll_to_offset = state->ui.search_matches.front();
                 }
             }
-
-            if (byte_idx < static_cast<int>(prev_bytes.size()) &&
-                st.data[byte_idx] != prev_bytes[byte_idx]) {
-                byte_flash[byte_idx] = 1.f;
-                prev_bytes[byte_idx] = st.data[byte_idx];
-            }
-
-            if (byte_idx < static_cast<int>(byte_flash.size()) && byte_flash[byte_idx] > 0.f) {
-                ui_anim::decay_flash(byte_flash[byte_idx], 3.f, dt);
-                dl->AddRectFilled(ImVec2(bx - 1.f, y),
-                                  ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                  aida::ui::with_alpha(t.error, byte_flash[byte_idx] * 0.46f * a));
-            }
-
-            ImU32 bc = (byte_val == 0)
-                        ? aida::ui::with_alpha(t.text_dim, a)
-                        : aida::ui::with_alpha(t.text_primary, a);
-
-            int match_which = -1;
-            if (match_range_contains(st.search_matches, st.search_match_len, byte_idx, match_which)) {
-                bool is_current = (match_which == st.search_match_idx);
-                float pulse = aida::ui::clock::pulse(1.5f, 0.55f, 1.f);
-                float intensity = is_current ? pulse : 0.34f;
-                ImU32 match_fill = aida::ui::with_alpha(t.accent_u32, 0.42f * intensity * a);
-                dl->AddRectFilled(ImVec2(bx - 1.f, y),
-                                  ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                  match_fill);
-                if (is_current) {
-                    dl->AddRect(ImVec2(bx - 1.f, y),
-                                ImVec2(bx + char_w * 2.f + 1.f, y + line_h),
-                                aida::ui::with_alpha(t.accent_u32, 0.85f * pulse * a),
-                                0.f, 0, 1.2f);
-                    aida::ui::blur::render_inner_glow(dl,
-                        ImVec2(bx - 2.f, y - 1.f),
-                        ImVec2(bx + char_w * 2.f + 2.f, y + line_h + 1.f),
-                        2.f, sel_glow, 2);
-                }
-            }
-
-            char hex[4];
-            snprintf(hex, sizeof(hex), "%02X", byte_val);
-            dl->AddText(code_font, font_size, ImVec2(bx, y + 1.f), bc, hex);
-
-            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                ImVec2 mp = ImGui::GetIO().MousePos;
-                if (mp.x >= bx - 1.f && mp.x <= bx + char_w * 2.f + 1.f &&
-                    mp.y >= y && mp.y <= y + line_h) {
-                    if (ImGui::GetIO().KeyShift && st.sel_start >= 0)
-                        st.sel_end = byte_idx;
-                    else {
-                        st.sel_start = byte_idx;
-                        st.sel_end   = byte_idx;
-                    }
-                    st.selecting = true;
-                }
-            }
-            if (st.selecting && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                ImVec2 mp = ImGui::GetIO().MousePos;
-                if (mp.x >= bx - 1.f && mp.x <= bx + char_w * 2.f + 1.f &&
-                    mp.y >= y && mp.y <= y + line_h)
-                    st.sel_end = byte_idx;
-            }
         }
-        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
-            st.selecting = false;
-
-        float ax = ox + asc_x;
-        for (int col = 0; col < bytes_per_row; col++) {
-            int byte_idx = row_off + col;
-            if (byte_idx >= (int)st.data.size()) break;
-
-            uint8_t byte_val = st.data[byte_idx];
-            char ch[2] = { '.', 0 };
-            ImU32 ac;
-
-            if (byte_val >= 0x20 && byte_val <= 0x7E) {
-                ch[0] = (char)byte_val;
-                ac = aida::ui::with_alpha(t.text_secondary, a);
-            } else if (byte_val == 0) {
-                ch[0] = '.';
-                ac = aida::ui::with_alpha(t.text_dim, 0.55f * a);
-            } else {
-                ch[0] = '.';
-                ac = aida::ui::with_alpha(t.warning, 0.62f * a);
-            }
-
-            if (sel_lo >= 0 && byte_idx >= sel_lo && byte_idx <= sel_hi)
-                dl->AddRectFilled(ImVec2(ax, y), ImVec2(ax + char_w, y + line_h), sel_col_fill);
-
-            int ascii_match_which = -1;
-            if (match_range_contains(st.search_matches, st.search_match_len, byte_idx, ascii_match_which)) {
-                bool is_current = (ascii_match_which == st.search_match_idx);
-                float pulse = aida::ui::clock::pulse(1.5f, 0.55f, 1.f);
-                float intensity = is_current ? pulse : 0.30f;
-                dl->AddRectFilled(ImVec2(ax, y), ImVec2(ax + char_w, y + line_h),
-                    aida::ui::with_alpha(t.accent_u32, 0.36f * intensity * a));
-            }
-
-            dl->AddText(code_font, font_size, ImVec2(ax, y + 1.f), ac, ch);
-            ax += char_w;
-        }
-    }
-
-    if (sel_lo >= 0 && sel_lo < (int)st.data.size()) {
-        float insp_w = 280.f;
-        float insp_h = 0.f;
-        float insp_target_x = ox + width - insp_w - 8.f;
-        float insp_y = oy + 8.f;
-
-        if (!s_inspector_was_visible) {
-            s_inspector_anim.start(aida::motion::dur::lg, aida::motion::ease::out_back);
-            s_inspector_was_visible = true;
-            s_insp_x_smooth = ox + width;
-        }
-        s_inspector_anim.tick(dt);
-        float intro = s_inspector_anim.eased();
-        float anim_x = aida::motion::remap(intro, 0.f, 1.f, ox + width, insp_target_x);
-        s_insp_x_smooth = aida::motion::smooth_lerp(s_insp_x_smooth, anim_x, 16.f, dt);
-        float insp_x = s_insp_x_smooth;
-
-        ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        int remaining = (int)st.data.size() - sel_lo;
-        const uint8_t* p = st.data.data() + sel_lo;
-        char vbuf[64];
-
-        struct InspRow { const char* label; std::string value; };
-        std::vector<InspRow> rows;
-
-        if (remaining >= 1) {
-            snprintf(vbuf, sizeof(vbuf), "%d", (int8_t)p[0]);
-            rows.push_back({"int8", vbuf});
-            snprintf(vbuf, sizeof(vbuf), "%u (0x%02X)", p[0], p[0]);
-            rows.push_back({"uint8", vbuf});
-        }
-        if (remaining >= 2) {
-            int16_t v; memcpy(&v, p, 2);
-            uint16_t uv; memcpy(&uv, p, 2);
-            snprintf(vbuf, sizeof(vbuf), "%d", v);
-            rows.push_back({"int16", vbuf});
-            snprintf(vbuf, sizeof(vbuf), "%u (0x%04X)", uv, uv);
-            rows.push_back({"uint16", vbuf});
-        }
-        if (remaining >= 4) {
-            int32_t v; memcpy(&v, p, 4);
-            uint32_t uv; memcpy(&uv, p, 4);
-            snprintf(vbuf, sizeof(vbuf), "%d (0x%08X)", v, uv);
-            rows.push_back({"int32", vbuf});
-            snprintf(vbuf, sizeof(vbuf), "%u", uv);
-            rows.push_back({"uint32", vbuf});
-        }
-        if (remaining >= 8) {
-            int64_t v; memcpy(&v, p, 8);
-            uint64_t uv; memcpy(&uv, p, 8);
-            snprintf(vbuf, sizeof(vbuf), "%lld", (long long)v);
-            rows.push_back({"int64", vbuf});
-            snprintf(vbuf, sizeof(vbuf), "%llu", (unsigned long long)uv);
-            rows.push_back({"uint64", vbuf});
-        }
-        if (remaining >= 4) {
-            float v; memcpy(&v, p, 4);
-            snprintf(vbuf, sizeof(vbuf), "%.6g", v);
-            rows.push_back({"float", vbuf});
-        }
-        if (remaining >= 8) {
-            double v; memcpy(&v, p, 8);
-            snprintf(vbuf, sizeof(vbuf), "%.10g", v);
-            rows.push_back({"double", vbuf});
-        }
-        if (remaining >= 8) {
-            uint64_t v; memcpy(&v, p, 8);
-            snprintf(vbuf, sizeof(vbuf), "0x%016llX", (unsigned long long)v);
-            rows.push_back({"ptr64", vbuf});
-        }
-        {
-            std::string s;
-            for (int i = 0; i < std::min(remaining, 32); i++) {
-                if (p[i] >= 0x20 && p[i] <= 0x7E) s += (char)p[i];
-                else break;
-            }
-            if (!s.empty()) rows.push_back({"ASCII", std::move(s)});
-        }
-
-        const float row_h = 22.f;
-        const float header_h = 36.f;
-        const float pad = 12.f;
-        insp_h = header_h + static_cast<float>(rows.size()) * row_h + pad + 8.f;
-
-        ImVec2 imin(insp_x, insp_y);
-        ImVec2 imax(insp_x + insp_w, insp_y + insp_h);
-
-        aida::ui::blur::render_drop_shadow(fdl, imin, imax, 14.f, 5, 0.42f, ImVec2(0.f, 6.f));
-        aida::ui::blur::render_glass_fill(fdl, imin, imax, 14.f, a);
-        aida::ui::blur::render_glass_border(fdl, imin, imax, 14.f, a, 1.f);
-
-        fdl->AddRectFilledMultiColor(
-            ImVec2(imin.x, imin.y),
-            ImVec2(imax.x, imin.y + 4.f),
-            aida::ui::with_alpha(t.accent_grad_top, a),
-            aida::ui::with_alpha(t.accent_grad_top, a),
-            aida::ui::with_alpha(t.accent_grad_bot, a),
-            aida::ui::with_alpha(t.accent_grad_bot, a));
-
-        fdl->AddRectFilledMultiColor(
-            ImVec2(imin.x + 1.f, imin.y + 4.f),
-            ImVec2(imax.x - 1.f, imin.y + header_h),
-            aida::ui::with_alpha(t.accent_glow, a * 0.45f),
-            aida::ui::with_alpha(t.accent_glow, a * 0.10f),
-            aida::ui::with_alpha(t.accent_glow, 0),
-            aida::ui::with_alpha(t.accent_glow, a * 0.20f));
-
-        fdl->AddText(aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont(),
-                     14.f, ImVec2(imin.x + pad, imin.y + (header_h - 14.f) * 0.5f + 2.f),
-                     aida::ui::with_alpha(t.text_primary, a), "Data Inspector");
-
-        snprintf(vbuf, sizeof(vbuf), "@ 0x%X", sel_lo);
-        ImVec2 offs_ts = ImGui::CalcTextSize(vbuf);
-        ImVec2 chip_min(imax.x - offs_ts.x - 18.f, imin.y + (header_h - 18.f) * 0.5f + 2.f);
-        ImVec2 chip_max(imax.x - 8.f, chip_min.y + 18.f);
-        fdl->AddRectFilled(chip_min, chip_max,
-            aida::ui::with_alpha(t.panel_header, 0.85f * a), 9.f);
-        fdl->AddRect(chip_min, chip_max,
-            aida::ui::with_alpha(t.border_subtle, a), 9.f, 0, 1.f);
-        fdl->AddText(aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont(),
-                     11.f, ImVec2(chip_min.x + 8.f, chip_min.y + 3.f),
-                     aida::ui::with_alpha(t.text_secondary, a), vbuf);
-
-        float iy = insp_y + header_h + 4.f;
-        float label_x = insp_x + pad;
-        float val_x   = insp_x + 86.f;
-        ImU32 label_c = aida::ui::with_alpha(t.text_dim, a);
-        ImU32 val_c   = aida::ui::with_alpha(t.text_primary, a);
-
-        for (int ri = 0; ri < (int)rows.size(); ri++) {
-            ImVec2 rmin(insp_x + 4.f, iy);
-            ImVec2 rmax(insp_x + insp_w - 4.f, iy + row_h);
-            bool row_hov = ImGui::IsMouseHoveringRect(rmin, rmax);
-
-            float row_lift = 0.f;
-            ImGuiID row_id = ImGui::GetID(rows[ri].label);
-            ImGuiStorage* store = ImGui::GetStateStorage();
-            float prev_hov = store->GetFloat(row_id, 0.f);
-            float new_hov = aida::motion::smooth_lerp(prev_hov, row_hov ? 1.f : 0.f, 16.f, dt);
-            store->SetFloat(row_id, new_hov);
-            row_lift = new_hov;
-
-            if (row_lift > 0.001f) {
-                fdl->AddRectFilled(rmin, rmax,
-                    aida::ui::with_alpha(t.hover_wash, row_lift * 0.9f * a), 6.f);
-                fdl->AddLine(ImVec2(rmin.x + 2.f, rmin.y),
-                             ImVec2(rmin.x + 2.f, rmax.y),
-                             aida::ui::with_alpha(t.accent_u32, row_lift * 0.55f * a), 1.5f);
-            }
-
-            ImFont* code_f = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
-            fdl->AddText(aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont(),
-                         11.f, ImVec2(label_x, iy + 4.f),
-                         label_c, rows[ri].label);
-            fdl->AddText(code_f, 13.f, ImVec2(val_x, iy + 3.f),
-                         val_c, rows[ri].value.c_str());
-
-            if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                clipboard_copy_string(rows[ri].value);
-                s_copy_flash.trigger();
-                s_copy_toast_text = "Copied " + rows[ri].value;
-                s_copy_flash_until = ImGui::GetTime() + 1.4;
-            }
-
-            if (s_copy_flash.v > 0.f && row_hov) {
-                fdl->AddRect(rmin, rmax,
-                    aida::ui::with_alpha(t.success, s_copy_flash.v * a), 6.f, 0, 1.5f);
-                float check_x = rmax.x - 16.f;
-                float check_y = rmin.y + (rmax.y - rmin.y) * 0.5f;
-                ImU32 check_col = aida::ui::with_alpha(t.success, s_copy_flash.v * a);
-                fdl->AddLine(ImVec2(check_x - 4.f, check_y),
-                             ImVec2(check_x - 1.f, check_y + 3.f),
-                             check_col, 1.5f);
-                fdl->AddLine(ImVec2(check_x - 1.f, check_y + 3.f),
-                             ImVec2(check_x + 4.f, check_y - 3.f),
-                             check_col, 1.5f);
-            }
-
-            iy += row_h;
-        }
-
-        s_copy_flash.tick(dt, 2.0f);
-
-        if (ImGui::GetTime() < s_copy_flash_until && !s_copy_toast_text.empty()) {
-            float toast_w = ImGui::CalcTextSize(s_copy_toast_text.c_str()).x + 28.f;
-            float toast_x = insp_x + (insp_w - toast_w) * 0.5f;
-            float toast_y = insp_y + insp_h + 8.f;
-            ImVec2 tmin(toast_x, toast_y);
-            ImVec2 tmax(toast_x + toast_w, toast_y + 26.f);
-            float remaining = (float)(s_copy_flash_until - ImGui::GetTime());
-            float fade = std::min(1.f, remaining * 2.f);
-            aida::ui::blur::render_drop_shadow(fdl, tmin, tmax, 13.f, 3, 0.30f, ImVec2(0.f, 4.f));
-            fdl->AddRectFilled(tmin, tmax, aida::ui::with_alpha(t.bg_overlay, fade * 0.95f), 13.f);
-            fdl->AddRect(tmin, tmax, aida::ui::with_alpha(t.success, fade * 0.7f), 13.f, 0, 1.f);
-            float check_cx = tmin.x + 12.f;
-            float check_cy = tmin.y + 13.f;
-            fdl->AddLine(ImVec2(check_cx - 3.f, check_cy),
-                         ImVec2(check_cx - 0.5f, check_cy + 2.5f),
-                         aida::ui::with_alpha(t.success, fade), 1.6f);
-            fdl->AddLine(ImVec2(check_cx - 0.5f, check_cy + 2.5f),
-                         ImVec2(check_cx + 3.5f, check_cy - 2.5f),
-                         aida::ui::with_alpha(t.success, fade), 1.6f);
-            fdl->AddText(ImVec2(tmin.x + 22.f, tmin.y + 6.f),
-                         aida::ui::with_alpha(t.text_primary, fade),
-                         s_copy_toast_text.c_str());
-        }
-    } else if (s_inspector_was_visible && s_inspector_anim.progress > 0.001f) {
-        if (s_inspector_anim.is_finished()) {
-            s_inspector_anim.start_reverse(aida::motion::dur::md, aida::motion::ease::in_quint);
-        }
-        s_inspector_anim.tick(dt);
-        float intro = s_inspector_anim.eased();
-        float insp_w = 280.f;
-        float insp_target_x = ox + width - insp_w - 8.f;
-        float anim_x = aida::motion::remap(intro, 0.f, 1.f, ox + width, insp_target_x);
-        s_insp_x_smooth = aida::motion::smooth_lerp(s_insp_x_smooth, anim_x, 16.f, dt);
-        float insp_x = s_insp_x_smooth;
-        float insp_y = oy + 8.f;
-        float insp_h = 60.f;
-        ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        ImVec2 imin(insp_x, insp_y);
-        ImVec2 imax(insp_x + insp_w, insp_y + insp_h);
-        aida::ui::blur::render_drop_shadow(fdl, imin, imax, 14.f, 5, 0.42f * intro, ImVec2(0.f, 6.f));
-        aida::ui::blur::render_glass_fill(fdl, imin, imax, 14.f, intro);
-        if (s_inspector_anim.progress < 0.001f && !s_inspector_anim.active) {
-            s_inspector_was_visible = false;
-            s_insp_x_smooth = ox + width;
-        }
-    } else {
-        s_inspector_anim.tick(dt);
-    }
-
-    if (hovered || st.goto_visible || st.search_visible) {
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) {
-            st.goto_visible = !st.goto_visible;
-            if (st.goto_visible) st.search_visible = false;
-        }
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
-            st.search_visible = !st.search_visible;
-            if (st.search_visible) st.goto_visible = false;
-        }
-        if (st.search_visible && ImGui::IsKeyPressed(ImGuiKey_F3, false)) {
-            int dir = ImGui::GetIO().KeyShift ? -1 : 1;
-            step_search(st, dir, line_h, bytes_per_row, height);
-        }
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-            st.goto_visible = false;
-            st.search_visible = false;
-        }
-
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false) &&
-            sel_lo >= 0 && sel_hi >= sel_lo) {
-            std::string hex_str;
-            for (int i = sel_lo; i <= sel_hi && i < (int)st.data.size(); i++) {
-                char h[4];
-                snprintf(h, sizeof(h), "%02X ", st.data[i]);
-                hex_str += h;
-            }
-            if (!hex_str.empty()) clipboard_copy_string(hex_str);
-        }
-    }
-
-    auto render_overlay_panel = [&](float panel_x, float panel_y, float panel_w, float panel_h) {
-        float intro = s_overlay_intro.eased();
-        float ease_y = aida::motion::remap(intro, 0.f, 1.f, panel_y - 12.f, panel_y);
-        float ease_a = intro;
-        ImDrawList* fdl = ImGui::GetForegroundDrawList();
-        ImVec2 a_min(panel_x, ease_y);
-        ImVec2 a_max(panel_x + panel_w, ease_y + panel_h);
-        aida::ui::blur::render_drop_shadow(fdl, a_min, a_max, 12.f, 4, 0.35f * ease_a, ImVec2(0.f, 4.f));
-        aida::ui::blur::render_glass_fill(fdl, a_min, a_max, 12.f, ease_a);
-        aida::ui::blur::render_glass_border(fdl, a_min, a_max, 12.f, ease_a, 1.f);
-        return ease_y;
+        state->searching.store(false, std::memory_order_release);
     };
-
-    if (st.goto_visible) {
-        float panel_w = 270.f;
-        float panel_h = 40.f;
-        float panel_x = ox + 12.f;
-        float panel_y = oy + 6.f;
-        float ey = render_overlay_panel(panel_x, panel_y, panel_w, panel_h);
-
-        ImGui::SetCursorScreenPos(ImVec2(panel_x + 12.f, ey + (panel_h - 26.f) * 0.5f));
-        ImGui::PushID("hex_goto_overlay");
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(t.bg_base, 0.65f)));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(t.text_primary));
-        ImGui::SetNextItemWidth(160.f);
-        bool go = ImGui::InputTextWithHint("##hex_goto_input", "0x...", st.goto_buf, sizeof(st.goto_buf),
-            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
-        ImGui::SameLine();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2.f);
-        bool clicked_go = aida::ui::components::button("Go", aida::ui::components::button_kind_t::primary,
-            aida::ui::components::size_t_::sm);
-        ImGui::PopID();
-
-        if (clicked_go || go) {
-            uint64_t addr = 0;
-            if (st.goto_buf[0] != '\0' && sscanf_s(st.goto_buf, "%llx", &addr) == 1 &&
-                addr >= st.base_addr) {
-                uint64_t off64 = addr - st.base_addr;
-                if (off64 < static_cast<uint64_t>(st.data.size())) {
-                    int off = static_cast<int>(off64);
-                    int row = off / bytes_per_row;
-                    st.target_scroll_y = row * line_h;
-                    st.sel_start = st.sel_end = off;
-                    st.goto_visible = false;
-                    diag::log_tagged_fmt("hex", "goto_address addr=0x%llX offset=%d row=%d",
-                        static_cast<unsigned long long>(addr), off, row);
-                }
-            } else {
-                diag::log_tagged_fmt("hex", "goto_address parse_failed input='%s'", st.goto_buf);
-            }
+    const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
+    if (!submitted.submitted) {
+        state->searching.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = submitted.reject_reason;
+    } else {
+        bool cancel_submitted = false;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            cancel_submitted = state->cancelled.load(std::memory_order_acquire);
+            if (!cancel_submitted)
+                state->search_job = submitted.handle;
         }
+        if (cancel_submitted)
+            aida::infra::taskflow_runtime::cancel(submitted.handle);
     }
+}
 
-    if (st.search_visible) {
-        float panel_w = 540.f;
-        float panel_h = 40.f;
-        float panel_x = ox + 12.f;
-        float panel_y = oy + 6.f;
-        float ey = render_overlay_panel(panel_x, panel_y, panel_w, panel_h);
+void step_search_result(const std::shared_ptr<workspace_hex_state_t>& state, int direction) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->ui.search_matches.empty())
+        return;
+    const std::int64_t count = static_cast<std::int64_t>((std::min)(
+        state->ui.search_matches.size(),
+        static_cast<std::size_t>((std::numeric_limits<std::int64_t>::max)())));
+    std::int64_t index = state->ui.search_match_idx;
+    if (index < 0 || index >= count)
+        index = direction < 0 ? count - 1 : 0;
+    else
+        index = (index + (direction < 0 ? -1 : 1) + count) % count;
+    state->ui.search_match_idx = index;
+    state->ui.search_match = static_cast<std::int64_t>(
+        state->ui.search_matches[static_cast<std::size_t>(index)]);
+    state->scroll_to_offset = state->ui.search_matches[static_cast<std::size_t>(index)];
+}
 
-        ImGui::SetCursorScreenPos(ImVec2(panel_x + 12.f, ey + (panel_h - 26.f) * 0.5f));
-        ImGui::PushID("hex_search_overlay");
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.f, 4.f));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(t.bg_base, 0.65f)));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(t.text_primary));
-        ImGui::SetNextItemWidth(220.f);
-        const char* hint = st.search_hex ? "DE AD BE EF..." : "text";
-        bool submit = ImGui::InputTextWithHint("##hex_search_input", hint, st.search_buf, sizeof(st.search_buf),
-            ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(2);
+std::optional<std::uint64_t> parse_u64(std::string text) {
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+        text.erase(0, 2);
+    std::uint64_t value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+    return result.ec == std::errc() && result.ptr == text.data() + text.size()
+        ? std::optional<std::uint64_t>(value) : std::nullopt;
+}
 
-        bool query_changed = (st.search_last_query != st.search_buf) ||
-                             (st.search_last_hex != st.search_hex);
-        if (query_changed) {
-            recompute_search_matches(st);
-            if (!st.search_matches.empty()) {
-                goto_search_match(st, 0, line_h, bytes_per_row, height);
-            }
-        }
-
-        ImGui::SameLine();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2.f);
-        const char* mode_label = st.search_hex ? "Hex" : "Txt";
-        if (aida::ui::components::button(mode_label, aida::ui::components::button_kind_t::secondary,
-                                          aida::ui::components::size_t_::sm)) {
-            st.search_hex = !st.search_hex;
-        }
-
-        ImGui::SameLine();
-        if (aida::ui::components::button("<", aida::ui::components::button_kind_t::ghost,
-                                          aida::ui::components::size_t_::sm)) {
-            step_search(st, -1, line_h, bytes_per_row, height);
-        }
-        ImGui::SameLine();
-        if (aida::ui::components::button(">", aida::ui::components::button_kind_t::ghost,
-                                          aida::ui::components::size_t_::sm)) {
-            step_search(st, +1, line_h, bytes_per_row, height);
-        }
-
-        ImGui::SameLine();
-        char count_buf[32];
-        if (st.search_buf[0] == '\0') {
-            std::snprintf(count_buf, sizeof(count_buf), " ");
-        } else if (st.search_matches.empty()) {
-            std::snprintf(count_buf, sizeof(count_buf), "0 matches");
-        } else {
-            std::snprintf(count_buf, sizeof(count_buf), "%d/%d",
-                st.search_match_idx + 1, static_cast<int>(st.search_matches.size()));
-        }
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.f);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-            st.search_matches.empty() && st.search_buf[0] != '\0' ? t.error : t.text_secondary));
-        ImGui::TextUnformatted(count_buf);
-        ImGui::PopStyleColor();
-
-        ImGui::SameLine();
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 4.f);
-        if (aida::ui::components::button("Close", aida::ui::components::button_kind_t::ghost,
-                                          aida::ui::components::size_t_::sm)) {
-            st.search_visible = false;
-        }
-
-        if (submit) {
-            int dir = ImGui::GetIO().KeyShift ? -1 : 1;
-            step_search(st, dir, line_h, bytes_per_row, height);
-        }
-        ImGui::PopID();
-    }
-
+void copy_selection(const disasm_view::workspace_context_t& context,
+                    const std::shared_ptr<workspace_hex_state_t>& state) {
+    std::int64_t begin = -1;
+    std::int64_t end = -1;
+    std::vector<std::uint8_t> live_bytes;
     {
-        float total_content = total_rows * line_h;
-        if (total_content > height) {
-            const float sb_w = 10.f;
-            const float sb_pad = 2.f;
-            float track_x = ox + width - sb_w - sb_pad;
-            float track_y0 = oy + sb_pad;
-            float track_h  = height - sb_pad * 2.f;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        begin = state->ui.sel_start;
+        end = state->ui.sel_end;
+        if (state->source_kind == source_kind_t::live_memory)
+            live_bytes = state->live_bytes;
+    }
+    if (begin < 0 || end < 0)
+        return;
+    if (begin > end)
+        std::swap(begin, end);
+    const std::uint64_t count = static_cast<std::uint64_t>(end - begin + 1);
+    if (count > (1ULL << 20))
+        return;
+    std::vector<std::uint8_t> selected;
+    if (!live_bytes.empty()) {
+        if (static_cast<std::uint64_t>(end) >= live_bytes.size())
+            return;
+        selected.assign(live_bytes.begin() + static_cast<std::size_t>(begin),
+            live_bytes.begin() + static_cast<std::size_t>(end + 1));
+    } else {
+        auto bytes = context.workspace->provider().read_vector(static_cast<std::uint64_t>(begin),
+            count, 1ULL << 20, context.workspace->cancellation_token());
+        if (!bytes)
+            return;
+        selected = bytes.take_value();
+    }
+    std::string text;
+    text.reserve(selected.size() * 3);
+    char encoded[4]{};
+    for (std::uint8_t byte : selected) {
+        if (!text.empty())
+            text.push_back(' ');
+        std::snprintf(encoded, sizeof(encoded), "%02X", byte);
+        text.append(encoded);
+    }
+    ImGui::SetClipboardText(text.c_str());
+}
 
-            ui_anim::render_custom_scrollbar(dl, track_x, track_y0, sb_w, track_h,
-                st.scroll_y, total_content, height, a,
-                st.sb_dragging, st.sb_drag_offset);
+}
 
-            float ratio = height / total_content;
-            float thumb_h = std::max(track_h * ratio, 20.f);
-            float track_range = std::max(0.f, track_h - thumb_h);
-            float scroll_ratio = max_scroll > 0.f ? st.scroll_y / max_scroll : 0.f;
-            scroll_ratio = std::max(0.f, std::min(scroll_ratio, 1.f));
-            float thumb_y = track_y0 + track_range * scroll_ratio;
-            ImVec2 track_min(track_x, track_y0);
-            ImVec2 track_max(track_x + sb_w, track_y0 + track_h);
-            ImVec2 thumb_min(track_x, thumb_y);
-            ImVec2 thumb_max(track_x + sb_w, thumb_y + thumb_h);
-            bool track_hovered = ImGui::IsMouseHoveringRect(track_min, track_max, false);
-            bool thumb_hovered = ImGui::IsMouseHoveringRect(thumb_min, thumb_max, false);
-            if (track_hovered && !thumb_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                float page = std::max(line_h, height - line_h);
-                st.target_scroll_y += ImGui::GetMousePos().y < thumb_y ? -page : page;
-                st.target_scroll_y = std::max(0.f, std::min(st.target_scroll_y, max_scroll));
+void activate(const disasm_view::workspace_context_t& context) {
+    auto state = state_for(context);
+    if (!state)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->source_kind = source_kind_t::workspace_provider;
+    state->live_bytes.clear();
+    state->live_base = 0;
+    state->ui.base_addr = context.workspace->identity().image_base();
+    state->ui.source_name = context.workspace->identity().bin_name();
+    if (const auto& member = context.workspace->identity().normalized_member_path())
+        state->ui.source_name.append("::").append(*member);
+    state->ui.active = true;
+    state->window = {};
+    state->window_size = 0;
+    state->patch_revision = (std::numeric_limits<std::uint64_t>::max)();
+    state->patches.clear();
+    state->error.clear();
+}
+
+bool read_live_memory(const disasm_view::workspace_context_t& context,
+                      std::uint64_t address, std::size_t size) {
+    auto state = state_for(context);
+    if (!state)
+        return false;
+    if (!context.workspace->identity().process() || address == 0 || size == 0 ||
+        size > (64ULL << 20) || address > (std::numeric_limits<std::uint64_t>::max)() -
+            static_cast<std::uint64_t>(size - 1)) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = "INVALID_ARGUMENT: live-memory preview requires a bound process, address, and bounded size";
+        return false;
+    }
+    const std::uint32_t pid = context.workspace->identity().process()->pid;
+    std::vector<std::uint8_t> bytes;
+    if (!driver_bridge::read_memory_for(pid, address, size, bytes) || bytes.size() != size) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = "IO_FAILURE: bounded live-memory read failed";
+        return false;
+    }
+    if (!state_matches(context, state))
+        return false;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->source_kind = source_kind_t::live_memory;
+    state->live_bytes = std::move(bytes);
+    state->live_base = address;
+    state->ui.base_addr = address;
+    state->ui.source_name = context.workspace->identity().bin_name() + " memory";
+    state->ui.active = true;
+    state->ui.sel_start = -1;
+    state->ui.sel_end = -1;
+    state->window = {};
+    state->window_size = 0;
+    state->patches.clear();
+    state->error.clear();
+    return true;
+}
+
+void close(const disasm_view::workspace_context_t& context) {
+    auto state = state_for(context);
+    if (!state)
+        return;
+    state->request_cancel();
+}
+
+bool active(const disasm_view::workspace_context_t& context) {
+    auto state = state_for(context);
+    if (!state)
+        return false;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->ui.active && (state->source_kind == source_kind_t::live_memory
+        ? !state->live_bytes.empty() : context.workspace->provider().size() != 0);
+}
+
+std::string source_name(const disasm_view::workspace_context_t& context) {
+    auto state = state_for(context);
+    if (!state)
+        return {};
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->ui.source_name.empty() ? context.workspace->identity().bin_name() :
+        state->ui.source_name;
+}
+
+std::string last_error(const disasm_view::workspace_context_t& context) {
+    auto state = state_for(context);
+    if (!state)
+        return "TARGET_NOT_FOUND: workspace is unavailable";
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->error;
+}
+
+void render(float, float, float width, float height,
+            float alpha, float, float, float,
+            const disasm_view::workspace_context_t& context) {
+    if (!context) {
+        ImGui::BeginChild("##workspace_hex_empty", ImVec2(width, height), false);
+        ImGui::TextUnformatted("No analysis workspace is selected.");
+        ImGui::EndChild();
+        return;
+    }
+    auto state = state_for(context);
+    if (!state)
+        return;
+    bool provider_source = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        provider_source = state->source_kind == source_kind_t::workspace_provider;
+    }
+    if (provider_source)
+        request_patch_refresh(context, state);
+    const std::string id = context.workspace->identity().binary_id().to_hex();
+    ImGui::PushID(id.c_str());
+    ImGui::BeginChild("##workspace_hex", ImVec2(width, height), false);
+    const auto& theme = aida::ui::resolved();
+    ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(theme.text_primary, alpha));
+    if (ImGui::Button("Go to")) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->ui.goto_visible = true;
+        state->ui.goto_buf[0] = '\0';
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Search")) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->ui.search_visible = !state->ui.search_visible;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Copy selection"))
+        copy_selection(context, state);
+    bool goto_visible = false;
+    bool search_visible = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        goto_visible = state->ui.goto_visible;
+        search_visible = state->ui.search_visible;
+    }
+    if (goto_visible) {
+        ImGui::SetNextItemWidth(220.0f);
+        const bool enter = ImGui::InputTextWithHint("##hex_goto", "File offset or VA",
+            state->ui.goto_buf, sizeof(state->ui.goto_buf),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if (enter || ImGui::Button("Go")) {
+            if (auto value = parse_u64(state->ui.goto_buf)) {
+                std::uint64_t offset = *value;
+                bool live_source = false;
+                std::uint64_t live_base = 0;
+                std::uint64_t source_size = context.workspace->provider().size();
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    live_source = state->source_kind == source_kind_t::live_memory;
+                    live_base = state->live_base;
+                    if (live_source)
+                        source_size = static_cast<std::uint64_t>(state->live_bytes.size());
+                }
+                if (live_source && *value >= live_base)
+                    offset = *value - live_base;
+                else if (!live_source) {
+                    if (auto typed = disasm_view::typed_address(context, *value))
+                        offset = disasm_view::provider_offset(context, *typed).value_or(offset);
+                }
+                if (offset < source_size) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->ui.target_scroll_y = static_cast<float>(offset / 16) *
+                        ImGui::GetTextLineHeightWithSpacing();
+                }
             }
-            if (st.sb_dragging && ImGui::IsMouseDown(ImGuiMouseButton_Left) && track_range > 0.f) {
-                float new_thumb_y = ImGui::GetMousePos().y - st.sb_drag_offset;
-                float new_ratio = (new_thumb_y - track_y0) / track_range;
-                new_ratio = std::max(0.f, std::min(new_ratio, 1.f));
-                st.target_scroll_y = new_ratio * max_scroll;
-                st.scroll_y = st.target_scroll_y;
-            }
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->ui.goto_visible = false;
         }
     }
-
+    if (search_visible) {
+        ImGui::SetNextItemWidth(300.0f);
+        const bool enter = ImGui::InputTextWithHint("##hex_search", "Bytes or text",
+            state->ui.search_buf, sizeof(state->ui.search_buf),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            ImGui::Checkbox("Hex", &state->ui.search_hex);
+        }
+        ImGui::SameLine();
+        if (enter || ImGui::Button("Find"))
+            start_search(context, state);
+        ImGui::SameLine();
+        if (state->searching.load(std::memory_order_acquire)) {
+            ImGui::TextUnformatted("Searching...");
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel search")) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->search_cancellation)
+                    state->search_cancellation->request_cancel();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("<"))
+            step_search_result(state, -1);
+        ImGui::SameLine();
+        if (ImGui::Button(">"))
+            step_search_result(state, 1);
+        std::int64_t match_index = -1;
+        std::size_t match_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            match_index = state->ui.search_match_idx;
+            match_count = state->ui.search_matches.size();
+        }
+        ImGui::SameLine();
+        if (match_count == 0)
+            ImGui::TextUnformatted("0 matches");
+        else
+            ImGui::Text("%lld/%zu", static_cast<long long>(match_index + 1), match_count);
+        ImGui::SameLine();
+        if (ImGui::Button("Close")) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->ui.search_visible = false;
+        }
+    }
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        error = state->error;
+    }
+    if (!error.empty())
+        ImGui::TextWrapped("%s", error.c_str());
+    ImGui::Separator();
+    ImGui::BeginChild("##hex_rows", ImVec2(0.0f, 0.0f), false,
+        ImGuiWindowFlags_HorizontalScrollbar);
+    std::uint64_t byte_count = 0;
+    bool live_source = false;
+    std::uint64_t live_base = 0;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        live_source = state->source_kind == source_kind_t::live_memory;
+        live_base = state->live_base;
+        byte_count = live_source ? static_cast<std::uint64_t>(state->live_bytes.size()) :
+            context.workspace->provider().size();
+    }
+    const std::uint64_t row_count64 = (byte_count + 15) / 16;
+    const int row_count = row_count64 > static_cast<std::uint64_t>((std::numeric_limits<int>::max)())
+        ? (std::numeric_limits<int>::max)() : static_cast<int>(row_count64);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->scroll_to_offset != (std::numeric_limits<std::uint64_t>::max)()) {
+            state->ui.target_scroll_y = static_cast<float>(state->scroll_to_offset / 16) *
+                ImGui::GetTextLineHeightWithSpacing();
+            state->scroll_to_offset = (std::numeric_limits<std::uint64_t>::max)();
+        }
+        if (state->ui.target_scroll_y > 0.0f) {
+            ImGui::SetScrollY(state->ui.target_scroll_y);
+            state->ui.target_scroll_y = 0.0f;
+        }
+    }
+    ImGuiListClipper clipper;
+    const float row_height = ImGui::GetTextLineHeightWithSpacing();
+    clipper.Begin(row_count, row_height);
+    while (clipper.Step()) {
+        const std::uint64_t begin = static_cast<std::uint64_t>(clipper.DisplayStart) * 16;
+        const std::uint64_t end = (std::min)(byte_count,
+            static_cast<std::uint64_t>(clipper.DisplayEnd) * 16);
+        if (!ensure_window(context, state, begin, end))
+            continue;
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const std::uint64_t row_offset = static_cast<std::uint64_t>(row) * 16;
+            if (row_offset >= byte_count)
+                break;
+            char address[32]{};
+            std::uint64_t display_address = live_source ? live_base + row_offset : row_offset;
+            if (!live_source && context.image) {
+                auto rva = context.image->file_offset_to_rva(row_offset);
+                if (rva) {
+                    auto va = context.image->rva_to_va(rva.value());
+                    if (va)
+                        display_address = va.value();
+                }
+            }
+            std::snprintf(address, sizeof(address), "%016llX",
+                static_cast<unsigned long long>(display_address));
+            ImGui::TextUnformatted(address);
+            std::string ascii;
+            ascii.reserve(16);
+            for (std::uint64_t column = 0; column < 16; ++column) {
+                const std::uint64_t offset = row_offset + column;
+                if (offset >= byte_count)
+                    break;
+                std::uint8_t value = 0;
+                bool patched = false;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (live_source) {
+                        if (offset >= state->live_bytes.size())
+                            continue;
+                        value = state->live_bytes[static_cast<std::size_t>(offset)];
+                    } else {
+                        const auto relative = offset - state->window_offset;
+                        if (relative >= state->window.size())
+                            continue;
+                        value = patched_byte(*state, offset,
+                            state->window[static_cast<std::size_t>(relative)], &patched);
+                    }
+                }
+                ImGui::SameLine(170.0f + static_cast<float>(column) * 29.0f);
+                ImGui::PushID(static_cast<int>((offset ^ (offset >> 32)) & 0x7FFFFFFF));
+                char encoded[4]{};
+                std::snprintf(encoded, sizeof(encoded), "%02X", value);
+                std::int64_t selection_begin = -1;
+                std::int64_t selection_end = -1;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    selection_begin = state->ui.sel_start;
+                    selection_end = state->ui.sel_end;
+                }
+                const auto low = (std::min)(selection_begin, selection_end);
+                const auto high = (std::max)(selection_begin, selection_end);
+                const bool selected = selection_begin >= 0 &&
+                    static_cast<std::int64_t>(offset) >= low &&
+                    static_cast<std::int64_t>(offset) <= high;
+                if (patched)
+                    ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(theme.warning, alpha));
+                if (ImGui::Selectable(encoded, selected,
+                        ImGuiSelectableFlags_AllowDoubleClick, ImVec2(27.0f, row_height))) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (ImGui::GetIO().KeyShift && state->ui.sel_start >= 0)
+                        state->ui.sel_end = static_cast<std::int64_t>(offset);
+                    else
+                        state->ui.sel_start = state->ui.sel_end =
+                            static_cast<std::int64_t>(offset);
+                    if (!live_source && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && context.image) {
+                        auto rva = context.image->file_offset_to_rva(offset);
+                        if (rva) {
+                            auto va = context.image->rva_to_va(rva.value());
+                            if (va) {
+                                disasm_view::goto_address(va.value(), context);
+                                globals::ui::active_center_view = center_view_t::disassembly;
+                            }
+                        }
+                    }
+                }
+                if (patched)
+                    ImGui::PopStyleColor();
+                if (ImGui::BeginPopupContextItem("##hex_actions")) {
+                    if (ImGui::MenuItem("Copy byte"))
+                        ImGui::SetClipboardText(encoded);
+                    if (!live_source && ImGui::MenuItem("Patch to 00")) {
+                        if (auto typed = context.image
+                                ? disasm_view::typed_address(context, display_address + column)
+                                : std::nullopt)
+                            disasm_view::queue_patch(context, *typed, {0});
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+                ascii.push_back(value >= 0x20 && value <= 0x7E ? static_cast<char>(value) : '.');
+            }
+            ImGui::SameLine(650.0f);
+            ImGui::TextUnformatted(ascii.c_str());
+        }
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImGui::PopID();
 }
 
 }

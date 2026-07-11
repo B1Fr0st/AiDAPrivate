@@ -20,6 +20,8 @@
 #include "symbol_store.hpp"
 #include "xref_db.hpp"
 #include "binary_map.hpp"
+#include "workspace/analysis_workspace.hpp"
+#include "workspace/search_index.hpp"
 #include "standalone_driver.hpp"
 #include "../debugger/page_guard_engine.hpp"
 #include "../disasm/function_index.hpp"
@@ -40,8 +42,6 @@
 
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
-
-extern DisasmState g_disasm;
 
 namespace analysis_tools {
 
@@ -99,6 +99,26 @@ static std::string analysis_hex_u64(uint64_t value)
 	char buf[32] = {};
 	_snprintf_s(buf, sizeof(buf), _TRUNCATE, "0x%llX", static_cast<unsigned long long>(value));
 	return std::string(buf);
+}
+
+static bool mcp_call_deadline_expired() noexcept
+{
+	const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+	return deadline != 0 && static_cast<std::uint64_t>(GetTickCount64()) >= deadline;
+}
+
+static bool mcp_call_interrupted() noexcept
+{
+	return mcp_standalone::current_call_cancelled() || mcp_call_deadline_expired();
+}
+
+static tool_result_t mcp_call_interrupted_result(const char* operation)
+{
+	const bool deadline = mcp_call_deadline_expired();
+	return tool_result_t::error(
+		std::string(operation) + (deadline ? " deadline expired" : " cancelled"),
+		deadline ? "DEADLINE_EXCEEDED" : "CANCELLED",
+		json{{"disposition", "cancel_requested"}});
 }
 
 static json page_guard_install_failure_json()
@@ -240,530 +260,6 @@ static std::vector<driver_bridge::module_info_t> enumerate_modules_toolhelp(uint
 		return a.base < b.base;
 	});
 	return result;
-}
-
-static bool fast_section_executable(uint32_t characteristics)
-{
-	return (characteristics & 0x20000000u) != 0;
-}
-
-static bool fast_section_readable(uint32_t characteristics)
-{
-	return (characteristics & 0x40000000u) != 0;
-}
-
-static bool fast_section_writable(uint32_t characteristics)
-{
-	return (characteristics & 0x80000000u) != 0;
-}
-
-static json fast_import_lines_json(const std::vector<pe_parser::import_entry_t>& imports)
-{
-	std::map<std::string, std::vector<std::string>> by_module;
-	for (const auto& imp : imports) {
-		if (!imp.module_name.empty())
-			by_module[imp.module_name].push_back(imp.function_name.empty() ? ("#" + std::to_string(imp.ordinal)) : imp.function_name);
-	}
-	json out = json::array();
-	for (auto& kv : by_module) {
-		std::sort(kv.second.begin(), kv.second.end());
-		kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
-		std::string line = kv.first + ": ";
-		for (size_t i = 0; i < kv.second.size(); ++i) {
-			if (i != 0)
-				line += ", ";
-			line += kv.second[i];
-		}
-		out.push_back(std::move(line));
-	}
-	return out;
-}
-
-static json fast_export_names_json(const std::vector<pe_parser::export_entry_t>& exports)
-{
-	std::vector<std::string> names;
-	names.reserve(exports.size());
-	for (const auto& exp : exports) {
-		if (!exp.is_forwarded && !exp.name.empty())
-			names.push_back(exp.name);
-	}
-	std::sort(names.begin(), names.end());
-	names.erase(std::unique(names.begin(), names.end()), names.end());
-	json out = json::array();
-	for (auto& name : names)
-		out.push_back(std::move(name));
-	return out;
-}
-
-static tool_result_t analysis_query_binary_map_fast_summary(const json& params)
-{
-	mcp_standalone::downstream::producer_identity_t be_id;
-	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
-	be_id.tool_name = "binary_map_fast_summary";
-	mcp_standalone::downstream::scoped_admission_t be_admission =
-		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
-	if (!be_admission.active()) {
-		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-REJECT binary_map_fast_summary reason=%s quota=%s observed=%zu limit=%zu",
-			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
-		return tool_result_t::error(
-			"Broad enumeration capacity exhausted; work was not started.",
-			"MCP_DOWNSTREAM_CAPACITY_REJECT",
-			mcp_standalone::downstream::rejection_json(rej, be_id));
-	}
-	diag::log_tagged_fmt("analysis",
-		"FEATURE-WORKER-GROUP-ADMIT binary_map_fast_summary token=%llu",
-		static_cast<unsigned long long>(be_admission.token()));
-
-	const uint64_t start_ms = GetTickCount64();
-	json phases = json::object();
-	json phase_details = json::object();
-	auto mark_phase = [&](const char* name, uint64_t phase_start) {
-		const uint64_t elapsed = GetTickCount64() - phase_start;
-		phases[name] = elapsed;
-		diag::log_tagged_fmt("analysis", "binary_map_fast_summary_phase phase=%s elapsed_ms=%llu total_ms=%llu",
-			name,
-			static_cast<unsigned long long>(elapsed),
-			static_cast<unsigned long long>(GetTickCount64() - start_ms));
-	};
-	auto cancelled_result = [&](const char* phase) {
-		json out;
-		out["cancelled"] = true;
-		out["cancel_phase"] = phase;
-		out["phase_timings_ms"] = phases;
-		out["phase_details"] = phase_details;
-		out["elapsed_ms"] = GetTickCount64() - start_ms;
-		diag::log_tagged_fmt("analysis",
-			"binary_map_fast_summary_cancelled phase=%s elapsed_ms=%llu",
-			phase,
-			static_cast<unsigned long long>(GetTickCount64() - start_ms));
-		return tool_result_t::error("analysis_query binary_map_overview fast_summary cancelled", out);
-	};
-	const size_t max_functions = bounded_size_param(params, "max_functions", 24, 1, 256);
-	const size_t max_imports = bounded_size_param(params, "max_imports", 512, 1, 4096);
-	const size_t max_exports = bounded_size_param(params, "max_exports", 512, 1, 4096);
-	const uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-	const std::string requested_module = params.value("module_name", std::string());
-	const bool include_imports = params.value("include_imports", false);
-	const bool include_exports = params.value("include_exports", false);
-	char buf[32];
-
-	diag::log_tagged_fmt("analysis",
-		"binary_map_fast_summary_enter static_loaded=%d attached_pid=%u module_filter=%s max_functions=%zu include_imports=%d include_exports=%d timeout_ms=%u",
-		g_disasm.file.loaded ? 1 : 0,
-		driver_bridge::attached_pid(),
-		requested_module.c_str(),
-		max_functions,
-		include_imports ? 1 : 0,
-		include_exports ? 1 : 0,
-		static_cast<unsigned>(timeout_ms));
-
-	if (g_disasm.file.loaded) {
-		uint64_t phase_start = GetTickCount64();
-		json sections = json::array();
-		for (size_t i = 0; i < g_disasm.file.sections.size(); ++i) {
-			const auto& s = g_disasm.file.sections[i];
-			json o;
-			o["name"] = ".section" + std::to_string(i);
-			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s.va));
-			o["va"] = buf;
-			o["size"] = s.bytes.size();
-			o["executable"] = s.is_executable;
-			o["readable"] = true;
-			o["writable"] = false;
-			sections.push_back(std::move(o));
-		}
-		mark_phase("static_sections", phase_start);
-		if (mcp_standalone::current_call_cancelled()) {
-			if (be_admission.active()) {
-				diag::log_tagged_fmt("analysis",
-					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-					static_cast<unsigned long long>(be_admission.token()));
-				be_admission.release("completed");
-			}
-			return cancelled_result("static_sections");
-		}
-
-		phase_start = GetTickCount64();
-		json functions = json::array();
-		uint64_t last_va = 0;
-		for (const auto& ins : g_disasm.file.instrs) {
-			if (functions.size() >= max_functions)
-				break;
-			if (ins.addr == 0 || ins.addr == last_va)
-				continue;
-			last_va = ins.addr;
-			json o;
-			std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(ins.addr));
-			o["va"] = buf;
-			o["name"] = std::string("sub_") + buf + "_" + ins.mnem;
-			o["xref_count"] = 0;
-			o["callee_count"] = 0;
-			o["source"] = "static_disasm";
-			functions.push_back(std::move(o));
-		}
-		mark_phase("static_functions", phase_start);
-		if (mcp_standalone::current_call_cancelled()) {
-			if (be_admission.active()) {
-				diag::log_tagged_fmt("analysis",
-					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-					static_cast<unsigned long long>(be_admission.token()));
-				be_admission.release("completed");
-			}
-			return cancelled_result("static_functions");
-		}
-
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g_disasm.file.image_base));
-		json result;
-		result["module_name"] = g_disasm.file.filename;
-		result["module_path"] = g_disasm.file.path;
-		result["architecture"] = "x86_64";
-		result["format"] = "PE";
-		result["image_base"] = buf;
-		result["image_size"] = static_analysis::total_image_size(g_disasm.file);
-		result["sections"] = std::move(sections);
-		result["functions"] = std::move(functions);
-		result["globals"] = json::array();
-		result["imports"] = json::array();
-		result["exports"] = json::array();
-		result["imports_parse_complete"] = !include_imports;
-		result["exports_parse_complete"] = !include_exports;
-		result["imports_exports_source"] = include_imports || include_exports ? "static_loaded_sections_no_pe_directory_cache" : "not_requested";
-		result["fast_summary"] = true;
-		result["phase_timings_ms"] = phases;
-		result["phase_details"] = phase_details;
-		result["elapsed_ms"] = GetTickCount64() - start_ms;
-		diag::log_tagged_fmt("analysis",
-			"binary_map_fast_summary_exit ok=1 source=static sections=%zu functions=%zu elapsed_ms=%llu",
-			result["sections"].size(),
-			result["functions"].size(),
-			static_cast<unsigned long long>(GetTickCount64() - start_ms));
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::ok(result);
-	}
-
-	uint64_t phase_start = GetTickCount64();
-	const uint32_t attached_pid = driver_bridge::attached_pid();
-	if (attached_pid == 0) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("No process is attached and no static binary is loaded.");
-	}
-	mark_phase("attached_pid", phase_start);
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("attached_pid");
-	}
-
-	phase_start = GetTickCount64();
-	auto modules = driver_bridge::enumerate_modules();
-	const size_t driver_module_count = modules.size();
-	if (modules.empty())
-		modules = enumerate_modules_toolhelp(attached_pid);
-	mark_phase("module_enumeration", phase_start);
-	diag::log_tagged_fmt("analysis",
-		"binary_map_fast_summary_modules pid=%u driver_count=%zu final_count=%zu",
-		attached_pid,
-		driver_module_count,
-		modules.size());
-	if (modules.empty()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("Module enumeration returned no entries.");
-	}
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("module_enumeration");
-	}
-
-	phase_start = GetTickCount64();
-	const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
-	mark_phase("module_select", phase_start);
-	if (!selected) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("Requested module was not found in the attached process.");
-	}
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("module_select");
-	}
-
-	phase_start = GetTickCount64();
-	pe_parser::pe_info_t pe;
-	const bool pe_ok = pe_parser::parse(selected->base, pe, false);
-	mark_phase("pe_parse_headers", phase_start);
-	if (!pe_ok) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("pe_parser::parse failed on the selected module.");
-	}
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("pe_parse_headers");
-	}
-
-	phase_start = GetTickCount64();
-	json sections = json::array();
-	for (const auto& s : pe.sections) {
-		json o;
-		o["name"] = s.name;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base + s.virtual_address));
-		o["va"] = buf;
-		o["size"] = s.virtual_size;
-		o["executable"] = fast_section_executable(s.characteristics);
-		o["readable"] = fast_section_readable(s.characteristics);
-		o["writable"] = fast_section_writable(s.characteristics);
-		sections.push_back(std::move(o));
-	}
-	mark_phase("sections", phase_start);
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("sections");
-	}
-
-	phase_start = GetTickCount64();
-	json functions = json::array();
-	std::vector<uint64_t> emitted;
-	auto emitted_index = [&](uint64_t va) -> size_t {
-		for (size_t i = 0; i < emitted.size(); ++i) {
-			if (emitted[i] == va)
-				return i;
-		}
-		return static_cast<size_t>(-1);
-	};
-	auto emit_function = [&](uint64_t va, const std::string& name, const char* source, uint32_t rva = 0, bool prefer_existing_name = false) -> bool {
-		if (va == 0)
-			return false;
-		const size_t existing_index = emitted_index(va);
-		if (existing_index != static_cast<size_t>(-1)) {
-			if (prefer_existing_name && !name.empty()) {
-				functions[existing_index]["name"] = name;
-				functions[existing_index]["source"] = source;
-				if (rva != 0) {
-					char rva_buf[32];
-					std::snprintf(rva_buf, sizeof(rva_buf), "0x%X", rva);
-					functions[existing_index]["rva"] = rva_buf;
-				}
-				return true;
-			}
-			return false;
-		}
-		if (functions.size() >= max_functions)
-			return false;
-		emitted.push_back(va);
-		json o;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(va));
-		o["va"] = buf;
-		if (rva != 0) {
-			char rva_buf[32];
-			std::snprintf(rva_buf, sizeof(rva_buf), "0x%X", rva);
-			o["rva"] = rva_buf;
-		}
-		o["name"] = name;
-		o["xref_count"] = 0;
-		o["callee_count"] = 0;
-		o["source"] = source;
-		functions.push_back(std::move(o));
-		return true;
-	};
-	auto export_address_executable = [&](uint64_t va) -> bool {
-		for (const auto& s : pe.sections) {
-			if (!fast_section_executable(s.characteristics))
-				continue;
-			const uint64_t start = selected->base + s.virtual_address;
-			if (start < selected->base)
-				continue;
-			const uint64_t section_size = s.virtual_size != 0 ? s.virtual_size : s.raw_size;
-			if (section_size == 0)
-				continue;
-			uint64_t end = start + section_size;
-			if (end < start)
-				end = UINT64_MAX;
-			if (va >= start && va < end)
-				return true;
-		}
-		return false;
-	};
-	if (pe.entry_point != 0)
-		emit_function(pe.entry_point, "entry_point", "pe_entry_point");
-	for (const auto& s : pe.sections) {
-		if (functions.size() >= max_functions)
-			break;
-		if (!fast_section_executable(s.characteristics))
-			continue;
-		std::string name = s.name.empty() ? "executable_section_start" : ("section_start_" + s.name);
-		emit_function(selected->base + s.virtual_address, name, "executable_section");
-	}
-	mark_phase("functions", phase_start);
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("functions");
-	}
-
-	json imports = json::array();
-	json exports = json::array();
-	bool imports_truncated = false;
-	bool exports_truncated = false;
-	bool imports_parse_complete = !include_imports;
-	bool exports_parse_complete = !include_exports;
-	if (include_exports) {
-		phase_start = GetTickCount64();
-		std::vector<pe_parser::export_entry_t> parsed_exports;
-		const bool parsed = pe_parser::parse_exports(selected->base, pe, parsed_exports, max_exports, &deadline, &exports_truncated);
-		exports = fast_export_names_json(parsed_exports);
-		size_t export_functions_promoted = 0;
-		size_t export_functions_non_executable = 0;
-		bool export_function_promotion_timed_out = false;
-		for (const auto& exp : parsed_exports) {
-			if (std::chrono::steady_clock::now() >= deadline) {
-				export_function_promotion_timed_out = true;
-				exports_truncated = true;
-				break;
-			}
-			if (exp.is_forwarded || exp.address == 0 || exp.name.empty())
-				continue;
-			if (!export_address_executable(exp.address)) {
-				++export_functions_non_executable;
-				continue;
-			}
-			if (emit_function(exp.address, exp.name, "pe_export", exp.rva, true))
-				++export_functions_promoted;
-		}
-		exports_parse_complete = parsed && !exports_truncated;
-		phase_details["exports_requested"] = true;
-		phase_details["exports_truncated"] = exports_truncated;
-		phase_details["exports_returned"] = exports.size();
-		phase_details["export_functions_promoted"] = export_functions_promoted;
-		phase_details["export_functions_non_executable"] = export_functions_non_executable;
-		phase_details["export_function_promotion_timed_out"] = export_function_promotion_timed_out;
-		phase_details["functions_after_export_promotion"] = functions.size();
-		mark_phase("exports", phase_start);
-		if (mcp_standalone::current_call_cancelled()) {
-			if (be_admission.active()) {
-				diag::log_tagged_fmt("analysis",
-					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-					static_cast<unsigned long long>(be_admission.token()));
-				be_admission.release("completed");
-			}
-			return cancelled_result("exports");
-		}
-	}
-	if (include_imports) {
-		phase_start = GetTickCount64();
-		std::vector<pe_parser::import_entry_t> parsed_imports;
-		const bool parsed = pe_parser::parse_imports(selected->base, pe, parsed_imports, max_imports, &deadline, &imports_truncated);
-		imports_parse_complete = parsed && !imports_truncated;
-		imports = fast_import_lines_json(parsed_imports);
-		phase_details["imports_requested"] = true;
-		phase_details["imports_truncated"] = imports_truncated;
-		phase_details["imports_returned"] = imports.size();
-		mark_phase("imports", phase_start);
-		if (mcp_standalone::current_call_cancelled()) {
-			if (be_admission.active()) {
-				diag::log_tagged_fmt("analysis",
-					"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-					static_cast<unsigned long long>(be_admission.token()));
-				be_admission.release("completed");
-			}
-			return cancelled_result("imports");
-		}
-	}
-
-	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
-	json result;
-	result["module_name"] = selected->name;
-	result["module_path"] = selected->path;
-	result["architecture"] = pe.is_64bit ? "x86_64" : "x86";
-	result["format"] = "PE";
-	result["image_base"] = buf;
-	result["image_size"] = pe.size_of_image != 0 ? pe.size_of_image : selected->size;
-	result["sections"] = std::move(sections);
-	result["functions"] = std::move(functions);
-	result["globals"] = json::array();
-	result["imports"] = std::move(imports);
-	result["exports"] = std::move(exports);
-	result["imports_parse_complete"] = imports_parse_complete;
-	result["exports_parse_complete"] = exports_parse_complete;
-	result["imports_truncated"] = imports_truncated;
-	result["exports_truncated"] = exports_truncated;
-	result["imports_exports_source"] = include_imports || include_exports ? "live_pe_directory_parse" : "not_requested";
-	result["max_imports"] = max_imports;
-	result["max_exports"] = max_exports;
-	result["timeout_ms"] = timeout_ms;
-	result["fast_summary"] = true;
-	result["phase_timings_ms"] = phases;
-	result["phase_details"] = phase_details;
-	result["elapsed_ms"] = GetTickCount64() - start_ms;
-	diag::log_tagged_fmt("analysis",
-		"binary_map_fast_summary_exit ok=1 source=live pid=%u module=%s sections=%zu functions=%zu imports=%zu exports=%zu elapsed_ms=%llu cheap_path=1",
-		attached_pid,
-		selected->name.c_str(),
-		result["sections"].size(),
-		result["functions"].size(),
-		result["imports"].size(),
-		result["exports"].size(),
-		static_cast<unsigned long long>(GetTickCount64() - start_ms));
-	if (be_admission.active()) {
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-RELEASE binary_map_fast_summary token=%llu reason=completed",
-			static_cast<unsigned long long>(be_admission.token()));
-		be_admission.release("completed");
-	}
-	return tool_result_t::ok(result);
 }
 
 static tool_result_t fuzzer_manage_start(const json& params)
@@ -1006,6 +502,12 @@ static tool_result_t live_monitor_manage_start(const json& params)
 	struct_monitor::start(addr, size, name, backend);
 	int max_wait = static_cast<int>((timeout_ms + 49) / 50);
 	for (int wait = 0; wait < max_wait; ++wait) {
+		if (mcp_call_interrupted()) {
+			struct_monitor::stop();
+			for (int stop_wait = 0; stop_wait < 10 && struct_monitor::g_state.active.load(); ++stop_wait)
+				Sleep(50);
+			return mcp_call_interrupted_result("Live monitor startup");
+		}
 		if (!struct_monitor::g_state.active.load())
 			break;
 		if (struct_monitor::g_state.session.using_page_guard ||
@@ -1085,6 +587,8 @@ static tool_result_t live_monitor_manage_stop(const json& params)
 	struct_monitor::stop();
 	for (int wait = 0; struct_monitor::g_state.active.load() && wait < 10; ++wait)
 		Sleep(50);
+	if (mcp_call_interrupted())
+		return mcp_call_interrupted_result("Live monitor shutdown");
 	return live_monitor_snapshot(params.value("require_captures", false));
 }
 
@@ -1209,688 +713,213 @@ static tool_result_t symbolic_manage_solve_path(const json& params)
 	return tool_result_t::ok(out);
 }
 
-static tool_result_t analysis_query_imports(const json& params)
-{
-	mcp_standalone::downstream::producer_identity_t be_id;
-	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
-	be_id.tool_name = "analysis_query_imports";
-	mcp_standalone::downstream::scoped_admission_t be_admission =
-		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
-	if (!be_admission.active()) {
-		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-REJECT analysis_query_imports reason=%s quota=%s observed=%zu limit=%zu",
-			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
-		return tool_result_t::error(
-			"Broad enumeration capacity exhausted; work was not started.",
-			"MCP_DOWNSTREAM_CAPACITY_REJECT",
-			mcp_standalone::downstream::rejection_json(rej, be_id));
-	}
-	diag::log_tagged_fmt("analysis",
-		"FEATURE-WORKER-GROUP-ADMIT analysis_query_imports token=%llu",
-		static_cast<unsigned long long>(be_admission.token()));
+using workspace_ptr_t = std::shared_ptr<aida::analysis::analysis_workspace_t>;
 
-	if (driver_bridge::attached_pid() == 0) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("No process is attached; use sessions_manage action=attach_pid first.");
-	}
-	auto modules = driver_bridge::enumerate_modules();
-	if (modules.empty()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("Module enumeration returned no entries.");
-	}
-	pe_parser::pe_info_t pe;
-	if (!pe_parser::parse(modules.front().base, pe, false)) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("pe_parser::parse failed on the main module.");
-	}
-	size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
-	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-	bool truncated = false;
-	bool parsed = pe_parser::parse_imports(modules.front().base, pe, pe.imports, max_entries, &deadline, &truncated);
-	if (!parsed)
-		truncated = true;
-	json arr = json::array();
-	char buf[32];
-	for (const auto& imp : pe.imports) {
-		json o;
-		o["module"] = imp.module_name;
-		o["function"] = imp.function_name;
-		o["ordinal"] = imp.ordinal;
-		o["hint"] = imp.hint;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(imp.iat_address));
-		o["iat_address"] = buf;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(imp.bound_address));
-		o["bound_address"] = buf;
-		arr.push_back(std::move(o));
-	}
-	json result;
-	result["module"] = modules.front().name;
-	result["count"] = arr.size();
-	result["truncated"] = truncated;
-	result["parse_complete"] = parsed && !truncated;
-	result["max_entries"] = max_entries;
-	result["timeout_ms"] = timeout_ms;
-	result["imports"] = std::move(arr);
-	if (be_admission.active()) {
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-RELEASE analysis_query_imports token=%llu reason=completed",
-			static_cast<unsigned long long>(be_admission.token()));
-		be_admission.release("completed");
-	}
-	return tool_result_t::ok(result);
+static uint64_t query_workspace_va(const aida::analysis::address_t& address,
+                                   const aida::analysis::pe_image_t& image)
+{
+	return address.space == aida::analysis::address_space_id_t::relative_virtual
+		? image.image_base() + address.value : address.value;
 }
 
-static tool_result_t analysis_query_exports(const json& params)
+static std::string query_hex(uint64_t value)
 {
-	mcp_standalone::downstream::producer_identity_t be_id;
-	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
-	be_id.tool_name = "analysis_query_exports";
-	mcp_standalone::downstream::scoped_admission_t be_admission =
-		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
-	if (!be_admission.active()) {
-		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-REJECT analysis_query_exports reason=%s quota=%s observed=%zu limit=%zu",
-			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
-		return tool_result_t::error(
-			"Broad enumeration capacity exhausted; work was not started.",
-			"MCP_DOWNSTREAM_CAPACITY_REJECT",
-			mcp_standalone::downstream::rejection_json(rej, be_id));
-	}
-	diag::log_tagged_fmt("analysis",
-		"FEATURE-WORKER-GROUP-ADMIT analysis_query_exports token=%llu",
-		static_cast<unsigned long long>(be_admission.token()));
-
-	if (driver_bridge::attached_pid() == 0) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("No process is attached; use sessions_manage action=attach_pid first.");
-	}
-	auto modules = driver_bridge::enumerate_modules();
-	if (modules.empty()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("Module enumeration returned no entries.");
-	}
-	const std::string requested_module = params.value("module_name", std::string());
-	const driver_bridge::module_info_t* selected = select_module_by_name(modules, requested_module);
-	if (!selected) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("Requested module was not found in the attached process.");
-	}
-	pe_parser::pe_info_t pe;
-	if (!pe_parser::parse(selected->base, pe, false)) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error("pe_parser::parse failed on the selected module.");
-	}
-	size_t max_entries = bounded_size_param(params, "max_entries", 512, 1, 4096);
-	uint32_t timeout_ms = bounded_u32_param(params, "timeout_ms", 2500, 100, 10000);
-	const std::string selected_name_lc = lower_ascii(selected->name);
-	const std::string selected_path_lc = lower_ascii(selected->path);
-	const bool is_testtarget_fixture =
-		selected_name_lc.find("aida_testtarget") != std::string::npos ||
-		selected_name_lc.find("aida_test_target") != std::string::npos ||
-		selected_path_lc.find("aida_testtarget") != std::string::npos ||
-		selected_path_lc.find("aida_test_target") != std::string::npos;
-	size_t effective_max_entries = max_entries;
-	uint32_t effective_timeout_ms = timeout_ms;
-	const ULONGLONG analysis_exports_t0 = GetTickCount64();
-	const DWORD analysis_exports_pid = GetCurrentProcessId();
-	const DWORD analysis_exports_tid = GetCurrentThreadId();
-	if (is_testtarget_fixture) {
-		const size_t fixture_floor = 64;
-		const size_t fixture_ceiling = 4096;
-		size_t lifted = effective_max_entries < fixture_floor ? fixture_floor : effective_max_entries;
-		if (lifted > fixture_ceiling)
-			lifted = fixture_ceiling;
-		if (lifted != effective_max_entries) {
-			diag::log_tagged_fmt("analysis",
-				"analysis_exports_fixture_cap_lift module=%s pid=%lu tid=%lu requested=%zu effective=%zu floor=%zu ceiling=%zu elapsed_ms=%llu",
-				selected->name.c_str(),
-				static_cast<unsigned long>(analysis_exports_pid),
-				static_cast<unsigned long>(analysis_exports_tid),
-				max_entries,
-				lifted,
-				fixture_floor,
-				fixture_ceiling,
-				static_cast<unsigned long long>(GetTickCount64() - analysis_exports_t0));
-		}
-		effective_max_entries = lifted;
-		const uint32_t fixture_timeout_floor = 8000;
-		if (effective_timeout_ms < fixture_timeout_floor) {
-			diag::log_tagged_fmt("analysis",
-				"analysis_exports_fixture_timeout_lift module=%s pid=%lu tid=%lu requested_ms=%u effective_ms=%u elapsed_ms=%llu",
-				selected->name.c_str(),
-				static_cast<unsigned long>(analysis_exports_pid),
-				static_cast<unsigned long>(analysis_exports_tid),
-				timeout_ms,
-				fixture_timeout_floor,
-				static_cast<unsigned long long>(GetTickCount64() - analysis_exports_t0));
-			effective_timeout_ms = fixture_timeout_floor;
-		}
-	}
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms);
-	bool truncated = false;
-	const ULONGLONG analysis_exports_parse_t0 = GetTickCount64();
-	SetLastError(0);
-	bool parsed = pe_parser::parse_exports(selected->base, pe, pe.exports, effective_max_entries, &deadline, &truncated);
-	const DWORD analysis_exports_parse_gle = parsed ? 0 : GetLastError();
-	const ULONGLONG analysis_exports_parse_elapsed_ms = GetTickCount64() - analysis_exports_parse_t0;
-	if (!parsed)
-		truncated = true;
-	json arr = json::array();
-	char buf[32];
-	for (const auto& exp : pe.exports) {
-		json o;
-		o["ordinal"] = exp.ordinal;
-		o["name"] = exp.name;
-		std::snprintf(buf, sizeof(buf), "0x%X", exp.rva);
-		o["rva"] = buf;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(exp.address));
-		o["address"] = buf;
-		if (exp.is_forwarded) {
-			o["forwarded"] = true;
-			o["forward_to"] = exp.forward_name;
-		}
-		arr.push_back(std::move(o));
-	}
-	json result;
-	result["module"] = selected->name;
-	result["module_path"] = selected->path;
-	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(selected->base));
-	result["module_base"] = buf;
-	result["count"] = arr.size();
-	result["truncated"] = truncated;
-	result["parse_complete"] = parsed && !truncated;
-	result["max_entries"] = effective_max_entries;
-	result["requested_max_entries"] = max_entries;
-	result["timeout_ms"] = effective_timeout_ms;
-	result["requested_timeout_ms"] = timeout_ms;
-	result["is_testtarget_fixture"] = is_testtarget_fixture;
-	diag::log_tagged_fmt("analysis",
-		"analysis_exports_truncated pid=%lu tid=%lu cap=%zu requested_cap=%zu count=%zu truncated=%d parse_complete=%d module=%s module_path=%s is_testtarget_fixture=%d parse_elapsed_ms=%llu parse_gle=%lu total_elapsed_ms=%llu timeout_ms=%u",
-		static_cast<unsigned long>(analysis_exports_pid),
-		static_cast<unsigned long>(analysis_exports_tid),
-		effective_max_entries,
-		max_entries,
-		arr.size(),
-		truncated ? 1 : 0,
-		(parsed && !truncated) ? 1 : 0,
-		selected->name.c_str(),
-		selected->path.c_str(),
-		is_testtarget_fixture ? 1 : 0,
-		static_cast<unsigned long long>(analysis_exports_parse_elapsed_ms),
-		static_cast<unsigned long>(analysis_exports_parse_gle),
-		static_cast<unsigned long long>(GetTickCount64() - analysis_exports_t0),
-		effective_timeout_ms);
-	result["exports"] = std::move(arr);
-	if (be_admission.active()) {
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-RELEASE analysis_query_exports token=%llu reason=completed",
-			static_cast<unsigned long long>(be_admission.token()));
-		be_admission.release("completed");
-	}
-	return tool_result_t::ok(result);
+	char buffer[32];
+	std::snprintf(buffer, sizeof(buffer), "0x%llX", static_cast<unsigned long long>(value));
+	return buffer;
 }
 
-static tool_result_t analysis_query_types(const json& params)
+static tool_result_t workspace_query_error(std::string message, std::string code)
 {
-	mcp_standalone::downstream::producer_identity_t be_id;
-	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
-	be_id.tool_name = "analysis_query_types";
-	mcp_standalone::downstream::scoped_admission_t be_admission =
-		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
-	if (!be_admission.active()) {
-		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-REJECT analysis_query_types reason=%s quota=%s observed=%zu limit=%zu",
-			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
-		return tool_result_t::error(
-			"Broad enumeration capacity exhausted; work was not started.",
-			"MCP_DOWNSTREAM_CAPACITY_REJECT",
-			mcp_standalone::downstream::rejection_json(rej, be_id));
-	}
-	diag::log_tagged_fmt("analysis",
-		"FEATURE-WORKER-GROUP-ADMIT analysis_query_types token=%llu",
-		static_cast<unsigned long long>(be_admission.token()));
+	return tool_result_t::error(message, code, json::object());
+}
 
-	std::string filter;
-	if (params.contains("filter") && params["filter"].is_string()) {
-		filter = params["filter"].get<std::string>();
-		std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char c) {
-			return static_cast<char>(std::tolower(c));
-		});
+static tool_result_t workspace_analysis_query(const json& params, const workspace_ptr_t& workspace)
+{
+	const std::string action = compat_action_name(params);
+	const json payload = compat_action_payload(params);
+	auto image = workspace->image();
+	if (!image)
+		return workspace_query_error("Workspace image metadata is unavailable", "WORKSPACE_NOT_READY");
+	const bool live = workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot;
+	const size_t limit = bounded_size_param(payload, "limit", 512, 1, 4096);
+
+	if (action == "imports") {
+		const size_t max_entries = bounded_size_param(payload, "max_entries", 512, 1, 4096);
+		json imports = json::array();
+		const size_t returned = (std::min)(max_entries, image->imports().size());
+		for (size_t index = 0; index < returned; ++index) {
+			const auto& value = image->imports()[index];
+			imports.push_back(json{{"module", value.library},
+				{"function", value.name ? *value.name : std::string()},
+				{"ordinal", value.ordinal ? json(*value.ordinal) : json(nullptr)},
+				{"hint", value.hint ? json(*value.hint) : json(nullptr)},
+				{"iat_address", query_hex(image->image_base() + value.iat_rva)},
+				{"bound_address", query_hex(0)}, {"delayed", value.delayed}});
+		}
+		return tool_result_t::ok(json{{"module", workspace->identity().bin_name()},
+			{"count", imports.size()}, {"truncated", returned < image->imports().size()},
+			{"parse_complete", true}, {"max_entries", max_entries},
+			{"timeout_ms", bounded_u32_param(payload, "timeout_ms", 2500, 100, 10000)},
+			{"imports", std::move(imports)}});
 	}
-	size_t limit = bounded_size_param(params, "limit", 200, 1, 5000);
-	json arr = json::array();
-	size_t total = 0;
-	{
-		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-		for (const auto& kv : symbol_store::g_state.modules) {
-			const auto& mod = kv.second;
-			for (const auto& s : mod.pdb.structs) {
-				std::string lname = lower_ascii(s.name);
-				if (!filter.empty() && lname.find(filter) == std::string::npos)
-					continue;
-				++total;
-				if (arr.size() >= limit) continue;
-				arr.push_back({{"module", mod.module_name}, {"name", s.name}, {"kind", s.is_union ? "union" : "struct"}, {"size", s.size}, {"member_count", s.members.size()}});
+
+	if (action == "exports") {
+		const size_t max_entries = bounded_size_param(payload, "max_entries", 512, 1, 4096);
+		json exports = json::array();
+		const size_t returned = (std::min)(max_entries, image->exports().size());
+		for (size_t index = 0; index < returned; ++index) {
+			const auto& value = image->exports()[index];
+			json entry{{"ordinal", value.ordinal},
+				{"name", value.name ? *value.name : std::string()},
+				{"rva", query_hex(value.rva)},
+				{"address", query_hex(image->image_base() + value.rva)}};
+			if (value.forwarder) {
+				entry["forwarded"] = true;
+				entry["forward_to"] = *value.forwarder;
 			}
-			for (const auto& e : mod.pdb.enums) {
-				std::string lname = lower_ascii(e.name);
-				if (!filter.empty() && lname.find(filter) == std::string::npos)
-					continue;
-				++total;
-				if (arr.size() >= limit) continue;
-				arr.push_back({{"module", mod.module_name}, {"name", e.name}, {"kind", "enum"}, {"member_count", e.members.size()}});
+			exports.push_back(std::move(entry));
+		}
+		return tool_result_t::ok(json{{"module", workspace->identity().bin_name()},
+			{"module_path", workspace->identity().normalized_source_path()},
+			{"module_base", query_hex(image->image_base())}, {"count", exports.size()},
+			{"truncated", returned < image->exports().size()}, {"parse_complete", true},
+			{"max_entries", max_entries}, {"requested_max_entries", max_entries},
+			{"timeout_ms", bounded_u32_param(payload, "timeout_ms", 2500, 100, 10000)},
+			{"requested_timeout_ms", bounded_u32_param(payload, "timeout_ms", 2500, 100, 10000)},
+			{"is_testtarget_fixture", false}, {"exports", std::move(exports)}});
+	}
+
+	if (live)
+		return workspace_query_error("This query requires a complete static workspace index",
+			"LIVE_TARGET_BULK_ANALYSIS_UNSUPPORTED");
+	auto snapshot = workspace->snapshot();
+	if (!snapshot)
+		return workspace_query_error("Workspace analysis is not ready", "WORKSPACE_NOT_READY");
+	auto search = workspace->search_index();
+
+	if (action == "types" || action == "type_definition") {
+		if (!search)
+			return workspace_query_error("Workspace type index is not ready", "WORKSPACE_NOT_READY");
+		const std::string filter = lower_ascii(payload.value("filter", payload.value("name", std::string())));
+		json types = json::array();
+		size_t visited = 0;
+		for (const auto& type : search->types()) {
+			if ((visited++ & 0x3FFu) == 0) {
+				if (workspace->cancellation_token().stop_requested())
+					return workspace_query_error("Workspace type query was cancelled", "CANCELLED");
+				if (mcp_call_interrupted())
+					return mcp_call_interrupted_result("Workspace type query");
 			}
+			if (!filter.empty() && lower_ascii(type.display_name).find(filter) == std::string::npos)
+				continue;
+			json entry{{"name", type.display_name}, {"definition", type.canonical_type},
+				{"address", query_hex(query_workspace_va(type.address, *image))},
+				{"kind", static_cast<unsigned>(type.kind)}, {"confidence", type.confidence},
+				{"provenance", static_cast<unsigned>(type.provenance)},
+				{"explicitly_unknown", type.explicitly_unknown}};
+			if (action == "type_definition")
+				return tool_result_t::ok(entry);
+			if (types.size() < limit) types.push_back(std::move(entry));
 		}
+		if (action == "type_definition")
+			return workspace_query_error("Type definition was not found", "TYPE_NOT_FOUND");
+		return tool_result_t::ok(json{{"count", types.size()}, {"limit", limit},
+			{"types", std::move(types)}});
 	}
-	if (be_admission.active()) {
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-RELEASE analysis_query_types token=%llu reason=completed",
-			static_cast<unsigned long long>(be_admission.token()));
-		be_admission.release("completed");
-	}
-	return tool_result_t::ok(json{{"total", total}, {"returned", arr.size()}, {"types", arr}});
-}
 
-static tool_result_t analysis_query_type_definition(const json& params)
-{
-	if (!params.contains("name") || !params["name"].is_string())
-		return tool_result_t::error("'name' is required.");
-	std::string want = params["name"].get<std::string>();
-	std::string want_module = params.value("module", std::string());
-	std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-	for (const auto& kv : symbol_store::g_state.modules) {
-		const auto& mod = kv.second;
-		if (!want_module.empty() && mod.module_name != want_module) continue;
-		for (const auto& s : mod.pdb.structs) {
-			if (s.name != want) continue;
-			json members = json::array();
-			for (const auto& m : s.members) {
-				json mj;
-				mj["name"] = m.name;
-				mj["type"] = m.type_name;
-				mj["offset"] = m.offset;
-				mj["size"] = m.size;
-				if (m.is_pointer) {
-					mj["pointer"] = true;
-					mj["pointer_depth"] = m.pointer_depth;
-				}
-				if (m.is_array) {
-					mj["array"] = true;
-					mj["array_count"] = m.array_count;
-				}
-				if (m.bit_offset >= 0) mj["bit_offset"] = m.bit_offset;
-				if (m.bit_size >= 0) mj["bit_size"] = m.bit_size;
-				members.push_back(std::move(mj));
+	if (action == "pdb_symbols") {
+		const std::string filter = lower_ascii(payload.value("filter", std::string()));
+		const bool functions_only = payload.value("functions_only", false);
+		json symbols = json::array();
+		size_t total = 0;
+		size_t visited = 0;
+		for (const auto& symbol : snapshot->symbols) {
+			if ((visited++ & 0x3FFu) == 0) {
+				if (workspace->cancellation_token().stop_requested())
+					return workspace_query_error("Workspace symbol query was cancelled", "CANCELLED");
+				if (mcp_call_interrupted())
+					return mcp_call_interrupted_result("Workspace symbol query");
 			}
-			return tool_result_t::ok(json{{"module", mod.module_name}, {"name", s.name}, {"kind", s.is_union ? "union" : "struct"}, {"size", s.size}, {"members", members}});
+			if ((functions_only && symbol.kind != aida::analysis::symbol_kind_t::function) ||
+				(!functions_only && symbol.kind != aida::analysis::symbol_kind_t::debug_symbol &&
+				 symbol.kind != aida::analysis::symbol_kind_t::function) ||
+				(!filter.empty() && lower_ascii(symbol.name).find(filter) == std::string::npos))
+				continue;
+			++total;
+			if (symbols.size() < limit)
+				symbols.push_back(json{{"name", symbol.name},
+					{"address", query_hex(query_workspace_va(symbol.address, *image))},
+					{"kind", static_cast<unsigned>(symbol.kind)}, {"confidence", symbol.confidence}});
 		}
-		for (const auto& e : mod.pdb.enums) {
-			if (e.name != want) continue;
-			json members = json::array();
-			for (const auto& em : e.members)
-				members.push_back({{"name", em.name}, {"value", em.value}});
-			return tool_result_t::ok(json{{"module", mod.module_name}, {"name", e.name}, {"kind", "enum"}, {"members", members}});
-		}
-	}
-	if (want == "HANDLE")
-		return tool_result_t::ok(json{{"module", "builtin"}, {"name", "HANDLE"}, {"kind", "typedef"}, {"type", "void*"}, {"size", sizeof(void*)}, {"members", json::array()}});
-	return tool_result_t::error("Type not found in any loaded module's PDB.");
-}
-
-static tool_result_t analysis_query_pdb_symbols(const json& params)
-{
-	mcp_standalone::downstream::producer_identity_t be_id;
-	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
-	be_id.tool_name = "analysis_query_pdb_symbols";
-	mcp_standalone::downstream::scoped_admission_t be_admission =
-		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
-	if (!be_admission.active()) {
-		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-REJECT analysis_query_pdb_symbols reason=%s quota=%s observed=%zu limit=%zu",
-			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
-		return tool_result_t::error(
-			"Broad enumeration capacity exhausted; work was not started.",
-			"MCP_DOWNSTREAM_CAPACITY_REJECT",
-			mcp_standalone::downstream::rejection_json(rej, be_id));
-	}
-	diag::log_tagged_fmt("analysis",
-		"FEATURE-WORKER-GROUP-ADMIT analysis_query_pdb_symbols token=%llu",
-		static_cast<unsigned long long>(be_admission.token()));
-
-	std::string filter;
-	if (params.contains("filter") && params["filter"].is_string())
-		filter = lower_ascii(params["filter"].get<std::string>());
-	std::string want_module = params.value("module", std::string());
-	bool funcs_only = params.value("functions_only", false);
-	size_t limit = bounded_size_param(params, "limit", 500, 1, 10000);
-	json arr = json::array();
-	size_t total = 0;
-	char buf[32];
-	{
-		std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-		for (const auto& kv : symbol_store::g_state.modules) {
-			const auto& mod = kv.second;
-			if (!want_module.empty() && mod.module_name != want_module) continue;
-			for (const auto& sym : mod.pdb.symbols) {
-				if (funcs_only && !sym.is_function) continue;
-				if (!filter.empty() && lower_ascii(sym.name).find(filter) == std::string::npos) continue;
-				++total;
-				if (arr.size() >= limit) continue;
-				json o;
-				o["module"] = mod.module_name;
-				o["name"] = sym.name;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(mod.base + sym.rva));
-				o["address"] = buf;
-				std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(sym.rva));
-				o["rva"] = buf;
-				o["size"] = sym.size;
-				o["is_function"] = sym.is_function;
-				arr.push_back(std::move(o));
-			}
-		}
-	}
-	if (be_admission.active()) {
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-RELEASE analysis_query_pdb_symbols token=%llu reason=completed",
-			static_cast<unsigned long long>(be_admission.token()));
-		be_admission.release("completed");
-	}
-	return tool_result_t::ok(json{{"total", total}, {"returned", arr.size()}, {"symbols", arr}});
-}
-
-static tool_result_t analysis_query_binary_map_overview(const json& params)
-{
-	mcp_standalone::downstream::producer_identity_t be_id;
-	be_id.kind = mcp_standalone::downstream::producer_kind_t::broad_enumeration;
-	be_id.tool_name = "binary_map_overview";
-	mcp_standalone::downstream::scoped_admission_t be_admission =
-		mcp_standalone::downstream::scoped_admission_t::acquire(be_id);
-	if (!be_admission.active()) {
-		auto rej = mcp_standalone::downstream::governor_t::instance().try_admit(be_id);
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-REJECT binary_map_overview reason=%s quota=%s observed=%zu limit=%zu",
-			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
-		return tool_result_t::error(
-			"Broad enumeration capacity exhausted; work was not started.",
-			"MCP_DOWNSTREAM_CAPACITY_REJECT",
-			mcp_standalone::downstream::rejection_json(rej, be_id));
-	}
-	diag::log_tagged_fmt("analysis",
-		"FEATURE-WORKER-GROUP-ADMIT binary_map_overview token=%llu",
-		static_cast<unsigned long long>(be_admission.token()));
-
-	const uint64_t start_ms = GetTickCount64();
-	json phases = json::object();
-	json phase_details = json::object();
-	auto mark_phase = [&](const char* name, uint64_t phase_start) {
-		const uint64_t elapsed = GetTickCount64() - phase_start;
-		phases[name] = elapsed;
-		diag::log_tagged_fmt("analysis",
-			"binary_map_overview_phase phase=%s elapsed_ms=%llu total_ms=%llu",
-			name,
-			static_cast<unsigned long long>(elapsed),
-			static_cast<unsigned long long>(GetTickCount64() - start_ms));
-	};
-	auto cancelled_result = [&](const char* phase) {
-		json out;
-		out["cancelled"] = true;
-		out["cancel_phase"] = phase;
-		out["phase_timings_ms"] = phases;
-		out["phase_details"] = phase_details;
-		out["elapsed_ms"] = GetTickCount64() - start_ms;
-		diag::log_tagged_fmt("analysis",
-			"binary_map_overview_cancelled phase=%s elapsed_ms=%llu",
-			phase,
-			static_cast<unsigned long long>(GetTickCount64() - start_ms));
-		return tool_result_t::error("analysis_query binary_map_overview cancelled", out);
-	};
-	if (params.value("fast_summary", false) &&
-		!params.value("include_xrefs", false)) {
-		diag::log_tagged("analysis", "binary_map_overview_delegate_fast_summary");
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return analysis_query_binary_map_fast_summary(params);
-	}
-	uint64_t phase_start = GetTickCount64();
-	aida::binary_map::map_options_t opts;
-	opts.max_functions = static_cast<int>(bounded_size_param(params, "max_functions", 24, 1, 256));
-	opts.max_globals = static_cast<int>(bounded_size_param(params, "max_globals", 12, 1, 256));
-	opts.max_callees_per_function = 2;
-	opts.include_imports = params.value("include_imports", false);
-	opts.include_exports = params.value("include_exports", false);
-	opts.include_xrefs = params.value("include_xrefs", false);
-	opts.include_entropy = !params.value("fast_summary", false);
-	phase_details["request_options"] = json{{"max_functions", opts.max_functions},
-		{"max_globals", opts.max_globals},
-		{"max_callees_per_function", opts.max_callees_per_function},
-		{"include_imports", opts.include_imports},
-		{"include_exports", opts.include_exports},
-		{"include_xrefs", opts.include_xrefs},
-		{"include_entropy", opts.include_entropy}};
-	mark_phase("request_options", phase_start);
-	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("pre_generate");
-	}
-	mark_phase("cancellation_check_pre_generate", phase_start);
-
-	for (const char* delegated : { "module_resolution", "pe_parse", "sections", "entropy", "exports_imports", "function_discovery", "xref_callee_work" }) {
-		phase_details[delegated] = json{{"status", "delegated_to_binary_map_generate"}, {"timed_by", "binary_map_generate_total"}};
-		diag::log_tagged_fmt("analysis",
-			"binary_map_overview_phase phase=%s status=delegated_to_binary_map_generate",
-			delegated);
+		return tool_result_t::ok(json{{"count", symbols.size()}, {"total", total},
+			{"truncated", symbols.size() < total}, {"symbols", std::move(symbols)}});
 	}
 
-	phase_start = GetTickCount64();
-	aida::binary_map::map_t m;
-	if (!aida::binary_map::generate(opts, m)) {
-		mark_phase("binary_map_generate_total", phase_start);
-		json out;
-		out["phase_timings_ms"] = phases;
-		out["phase_details"] = phase_details;
-		out["elapsed_ms"] = GetTickCount64() - start_ms;
-		out["binary_map_error"] = aida::binary_map::last_error();
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return tool_result_t::error(aida::binary_map::last_error(), out);
+	if (action == "xref_db_stats") {
+		return tool_result_t::ok(json{{"module_count", 1}, {"modules_built", 1},
+			{"total_xrefs", snapshot->xrefs.size()}, {"building", false}, {"progress", 1.0},
+			{"modules", json::array({json{{"module", workspace->identity().bin_name()},
+				{"base", image->image_base()}, {"size", image->image_size()},
+				{"total_xrefs", snapshot->xrefs.size()}, {"built", true}}})}});
 	}
-	mark_phase("binary_map_generate_total", phase_start);
-	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("post_generate");
-	}
-	mark_phase("cancellation_check_post_generate", phase_start);
-	char buf[32];
-	phase_start = GetTickCount64();
-	json sections = json::array();
-	for (const auto& s : m.sections) {
-		json o;
-		o["name"] = s.name;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(s.va));
-		o["va"] = buf;
-		o["size"] = s.size;
-		o["executable"] = s.executable;
-		o["readable"] = s.readable;
-		o["writable"] = s.writable;
-		if (opts.include_entropy) {
-			o["entropy"] = s.entropy;
-			o["sampled_bytes"] = s.sampled_bytes;
-		}
-		sections.push_back(std::move(o));
-	}
-	phase_details["sections_serialized"] = sections.size();
-	mark_phase("serialization_sections", phase_start);
-	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("post_sections_serialization");
-	}
-	mark_phase("cancellation_check_post_sections", phase_start);
-	phase_start = GetTickCount64();
-	json functions = json::array();
-	for (const auto& f : m.functions) {
-		json o;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(f.va));
-		o["va"] = buf;
-		o["name"] = f.name;
-		o["xref_count"] = f.xref_count;
-		o["callee_count"] = f.callee_count;
-		if (!f.section_name.empty()) o["section"] = f.section_name;
-		if (!f.top_callees.empty()) o["top_callees"] = f.top_callees;
-		if (f.pinned) o["pinned"] = true;
-		functions.push_back(std::move(o));
-	}
-	phase_details["functions_serialized"] = functions.size();
-	mark_phase("serialization_functions", phase_start);
-	phase_start = GetTickCount64();
-	if (mcp_standalone::current_call_cancelled()) {
-		if (be_admission.active()) {
-			diag::log_tagged_fmt("analysis",
-				"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
-				static_cast<unsigned long long>(be_admission.token()));
-			be_admission.release("completed");
-		}
-		return cancelled_result("post_functions_serialization");
-	}
-	mark_phase("cancellation_check_post_functions", phase_start);
-	phase_start = GetTickCount64();
-	json globals = json::array();
-	for (const auto& g : m.globals) {
-		json o;
-		std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(g.va));
-		o["va"] = buf;
-		o["name"] = g.name;
-		o["xref_count"] = g.xref_count;
-		o["writable"] = g.writable;
-		if (!g.section_name.empty()) o["section"] = g.section_name;
-		globals.push_back(std::move(o));
-	}
-	phase_details["globals_serialized"] = globals.size();
-	mark_phase("serialization_globals", phase_start);
-	phase_start = GetTickCount64();
-	phase_details["imports_serialized"] = m.imports.size();
-	phase_details["exports_serialized"] = m.exports.size();
-	mark_phase("serialization_imports_exports", phase_start);
-	phase_start = GetTickCount64();
-	std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(m.image_base));
-	json result;
-	result["module_name"] = m.module_name;
-	result["module_path"] = m.module_path;
-	result["architecture"] = m.architecture;
-	result["format"] = m.format;
-	result["image_base"] = buf;
-	result["image_size"] = m.image_size;
-	result["sections"] = std::move(sections);
-	result["functions"] = std::move(functions);
-	result["globals"] = std::move(globals);
-	result["imports"] = m.imports;
-	result["exports"] = m.exports;
-	result["fast_summary"] = params.value("fast_summary", false);
-	result["phase_timings_ms"] = phases;
-	result["phase_details"] = phase_details;
-	result["elapsed_ms"] = GetTickCount64() - start_ms;
-	result["cancelled"] = false;
-	mark_phase("serialization_result", phase_start);
-	result["phase_timings_ms"] = phases;
-	result["elapsed_ms"] = GetTickCount64() - start_ms;
-	diag::log_tagged_fmt("analysis",
-		"binary_map_overview_exit ok=1 module=%s sections=%zu functions=%zu globals=%zu imports=%zu exports=%zu elapsed_ms=%llu",
-		m.module_name.c_str(),
-		result["sections"].size(),
-		result["functions"].size(),
-		result["globals"].size(),
-		m.imports.size(),
-		m.exports.size(),
-		static_cast<unsigned long long>(GetTickCount64() - start_ms));
-	if (be_admission.active()) {
-		diag::log_tagged_fmt("analysis",
-			"FEATURE-WORKER-GROUP-RELEASE binary_map_overview token=%llu reason=completed",
-			static_cast<unsigned long long>(be_admission.token()));
-		be_admission.release("completed");
-	}
-	return tool_result_t::ok(result);
-}
 
-static tool_result_t analysis_query_xref_db_stats(const json&)
-{
-	std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-	json arr = json::array();
-	size_t total = 0;
-	size_t built = 0;
-	for (const auto& kv : xref_db::g_state.modules) {
-		const auto& mod = kv.second;
-		arr.push_back({{"module", mod.name}, {"base", mod.base}, {"size", mod.size}, {"total_xrefs", mod.total_xrefs}, {"built", mod.built}});
-		if (mod.built) {
-			++built;
-			total += mod.total_xrefs;
+	if (action == "binary_map_overview") {
+		aida::binary_map::map_options_t options;
+		options.max_functions = static_cast<int>(bounded_size_param(payload, "max_functions", 24, 1, 256));
+		options.max_globals = static_cast<int>(bounded_size_param(payload, "max_globals", 12, 1, 256));
+		options.max_callees_per_function = static_cast<int>(
+			bounded_size_param(payload, "max_callees_per_function", 5, 1, 256));
+		options.max_chars = bounded_size_param(payload, "max_chars", 4096, 256, 1u << 20);
+		options.include_imports = payload.value("include_imports", false);
+		options.include_exports = payload.value("include_exports", false);
+		options.include_xrefs = payload.value("include_xrefs", true);
+		options.include_entropy = payload.value("include_entropy", true);
+		aida::binary_map::map_t map;
+		const auto started = std::chrono::steady_clock::now();
+		if (!aida::binary_map::generate(workspace, options, map)) {
+			if (workspace->cancellation_token().stop_requested())
+				return workspace_query_error("Workspace binary-map generation was cancelled", "CANCELLED");
+			if (mcp_call_interrupted())
+				return mcp_call_interrupted_result("Workspace binary-map generation");
+			return workspace_query_error("Workspace binary-map generation failed", "BINARY_MAP_FAILED");
 		}
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - started).count();
+		json sections = json::array();
+		for (const auto& section : map.sections)
+			sections.push_back(json{{"name", section.name},
+				{"va", query_hex(section.va)}, {"size", section.size},
+				{"executable", section.executable}, {"readable", section.readable},
+				{"writable", section.writable}, {"entropy", section.entropy},
+				{"entropy_sampled_bytes", section.sampled_bytes}});
+		json functions = json::array();
+		for (const auto& function : map.functions) {
+			functions.push_back(json{{"va", query_hex(function.va)}, {"name", function.name},
+				{"xref_count", function.xref_count}, {"callee_count", function.callee_count},
+				{"top_callees", function.top_callees}, {"section", function.section_name},
+				{"pinned", function.pinned}, {"score", function.score}});
+		}
+		json globals = json::array();
+		for (const auto& global : map.globals) {
+			globals.push_back(json{{"va", query_hex(global.va)}, {"name", global.name},
+				{"xref_count", global.xref_count}, {"writable", global.writable},
+				{"section", global.section_name}});
+		}
+		json result{{"module_name", map.module_name}, {"module_path", map.module_path},
+			{"architecture", map.architecture}, {"format", map.format},
+			{"image_base", query_hex(map.image_base)}, {"image_size", map.image_size},
+			{"sections", std::move(sections)}, {"functions", std::move(functions)},
+			{"globals", std::move(globals)}, {"fast_summary", payload.value("fast_summary", false)},
+			{"phase_timings_ms", json{{"generate", elapsed}}},
+			{"phase_details", json{{"sections", map.sections.size()}, {"functions", map.functions.size()},
+				{"globals", map.globals.size()}, {"imports", map.imports.size()}, {"exports", map.exports.size()}}},
+			{"elapsed_ms", elapsed}, {"generated_unix", map.generated_unix}, {"cancelled", false},
+			{"imports", std::move(map.imports)}, {"exports", std::move(map.exports)}};
+		return tool_result_t::ok(result);
 	}
-	return tool_result_t::ok(json{{"module_count", xref_db::g_state.modules.size()}, {"modules_built", built}, {"total_xrefs", total}, {"building", xref_db::g_state.building.load()}, {"progress", xref_db::g_state.progress.load()}, {"modules", arr}});
+
+	return compat_unknown_action("analysis_query", action);
 }
 
 void register_analysis_tools(mcp_standalone::server_t& srv)
@@ -1941,8 +970,10 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			int wait = 0;
 			int max_wait = static_cast<int>((cfg.timeout_ms + 49) / 50);
+			bool interrupted = false;
 			while (crypto_scanner::g_state.scanning.load() && wait < max_wait) {
-				if (mcp_standalone::current_call_cancelled()) {
+				if (mcp_call_interrupted()) {
+					interrupted = true;
 					crypto_scanner::cancel();
 					break;
 				}
@@ -1982,6 +1013,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["results"] = arr;
 			result["status"] = crypto_scanner::g_state.scanning.load() ? "cancel_requested" : (timed_out ? "cancelled_by_timeout" : "complete");
 			result["timed_out"] = timed_out;
+			if (interrupted)
+				return mcp_call_interrupted_result("Crypto scan");
 			if (timed_out)
 				return tool_result_t{false, "Crypto scan did not complete within the timeout.", result};
 			return tool_result_t::ok(result);
@@ -1996,7 +1029,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			{"instruction_count", "integer", "Number of instructions to include (default: 16)", false}
 		},
 		true,
-		[](const json& params) -> tool_result_t {
+		{}},
+		[](const json& params, const workspace_ptr_t& workspace) -> tool_result_t {
 			std::string addr_str = params.value("address", "");
 			int count = params.value("instruction_count", 16);
 			diag::log_tagged_fmt("analysis", "generate_aob_signature entry addr=%s count=%d",
@@ -2015,12 +1049,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			diag::log_tagged_fmt("analysis", "generate_aob_signature generating addr=0x%llX count=%d",
 				static_cast<unsigned long long>(addr), count);
-			aob_generator::generate_from_address(addr, count, true);
+			auto context = disasm_view::capture_workspace(workspace);
+			auto state = aob_generator::state_for(context);
+			if (!context || !state)
+				return workspace_query_error("Workspace disassembly context is unavailable", "WORKSPACE_NOT_READY");
+			aob_generator::generate_from_address(context, addr, count, true);
 
 			int wait = 0;
-			while (aob_generator::g_state.generating.load() && wait < 100) {
-				if (mcp_standalone::current_call_cancelled())
-					return tool_result_t::error("AOB signature generation cancelled.");
+			while (state->generating.load() && wait < 100) {
+				if (mcp_call_interrupted())
+					return mcp_call_interrupted_result("AOB signature generation");
 				Sleep(100);
 				++wait;
 			}
@@ -2028,9 +1066,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			aob_generator::signature_t sig;
 			std::string tool_last_error;
 			{
-				std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
-				sig = aob_generator::g_state.current;
-				tool_last_error = aob_generator::g_state.last_error;
+				std::lock_guard<std::mutex> lk(state->mutex);
+				sig = state->current;
+				tool_last_error = state->last_error;
 			}
 
 			if (sig.bytes.empty() || sig.address != addr) {
@@ -2059,8 +1097,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			result["wildcard_bytes"] = wc;
 
 			return tool_result_t::ok(result);
-		}
-	});
+		});
 
 	srv.register_tool({
 		"reconstruct_struct",
@@ -2098,7 +1135,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			int wait = 0;
 			int max_wait = static_cast<int>((timeout_ms + 49) / 50);
 			while (struct_recon::g_state.monitoring.load() && wait < max_wait) {
-				if (mcp_standalone::current_call_cancelled()) {
+				if (mcp_call_interrupted()) {
 					struct_recon::cancel();
 					break;
 				}
@@ -2197,7 +1234,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			int wait = 0;
 			int max_wait = static_cast<int>((timeout_ms + 99) / 100);
 			while (decrypt_oracle::g_state.scanning.load() && wait < max_wait) {
-				if (mcp_standalone::current_call_cancelled()) {
+				if (mcp_call_interrupted()) {
 					decrypt_oracle::g_state.cancel.store(true, std::memory_order_release);
 					xref_engine::cancel_scan();
 					break;
@@ -2334,7 +1371,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 			const auto install_start = std::chrono::steady_clock::now();
 			while (!integrity_hunter::install_complete_for_generation(generation) &&
 			       (integrity_hunter::g_state.hunting.load() || integrity_hunter::g_state.worker_active.load())) {
-				if (mcp_standalone::current_call_cancelled()) {
+				if (mcp_call_interrupted()) {
 					integrity_hunter::stop_hunt();
 					const auto idle_state = integrity_hunter::wait_until_idle_result(12000);
 					auto result = make_failure_payload("cancelled", generation, idle_state);
@@ -2428,7 +1465,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 			const auto monitor_start = std::chrono::steady_clock::now();
 			while (integrity_hunter::g_state.hunting.load()) {
-				if (mcp_standalone::current_call_cancelled())
+				if (mcp_call_interrupted())
 					break;
 				const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 					std::chrono::steady_clock::now() - monitor_start).count();
@@ -2773,19 +1810,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"include_exports", "boolean", "Include exports in binary-map overview", false},
 		 {"include_xrefs", "boolean", "Include xref summaries in binary-map overview", false}},
 		true,
-		[](const json& params) -> tool_result_t {
-			const std::string action = compat_action_name(params);
-			const json p = compat_action_payload(params);
-			if (action == "imports") return analysis_query_imports(p);
-			if (action == "exports") return analysis_query_exports(p);
-			if (action == "types") return analysis_query_types(p);
-			if (action == "type_definition") return analysis_query_type_definition(p);
-			if (action == "pdb_symbols") return analysis_query_pdb_symbols(p);
-			if (action == "binary_map_overview") return analysis_query_binary_map_overview(p);
-			if (action == "xref_db_stats") return analysis_query_xref_db_stats(p);
-			return compat_unknown_action("analysis_query", action);
-		}
-	});
+		{}},
+		workspace_analysis_query);
 }
 
 }

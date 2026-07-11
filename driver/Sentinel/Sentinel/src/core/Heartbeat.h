@@ -57,6 +57,10 @@ namespace heartbeat {
     constexpr ULONG BRIDGE_CMD_CANARY_FOREIGN_PT     = BRIDGE_CMD_DMA_CANARY_HIT;
     constexpr ULONG BRIDGE_CMD_DEVICE_OBJECT_HIT     = BRIDGE_CMD_HOSTILE_DEVICE;
 
+    constexpr ULONG BRIDGE_CMD_DMA_KEY_SCRUB        = 0x0000B001u;
+    constexpr ULONG BRIDGE_CMD_DMA_BSOD             = 0x0000B003u;
+    constexpr ULONG BRIDGE_CMD_DMA_ATTACK_REPORT    = 0x0000B004u;
+
     constexpr ULONG BUGCHECK_RE_USERMODE_CONFIRMED = 0xDEAD0002u;
     constexpr ULONG BUGCHECK_HOSTILE_DRIVER_LOAD   = 0xDEAD5E40u;
     constexpr ULONG BUGCHECK_HOSTILE_DEVICE_OBJECT = 0xDEAD5E41u;
@@ -69,6 +73,8 @@ namespace heartbeat {
     constexpr ULONG BUGCHECK_TIER_A_DRIVER_LOADED  = BUGCHECK_HOSTILE_DRIVER_LOAD;
     constexpr ULONG BUGCHECK_CANARY_FOREIGN_PT     = BUGCHECK_DMA_CANARY_HIT;
     constexpr ULONG BUGCHECK_KDBG_ENABLED_POSTINIT = BUGCHECK_KD_ENABLED_POST_INIT;
+
+    constexpr ULONG BUGCHECK_DMA_ATTACK             = 0xA1DA0008u;
 
     constexpr UINT32 EVIDENCE_FAMILY_SIDECHANNEL = 0x01;
     constexpr UINT32 EVIDENCE_FAMILY_DEBUG       = 0x02;
@@ -265,6 +271,13 @@ namespace heartbeat {
     inline volatile LONG               g_first_heartbeat_seen = 0;
     inline volatile ULONG              g_quorum_fail_mask = 0;
     inline volatile UINT64             g_quorum_fail_tsc = 0;
+
+    inline volatile LONG               g_dma_tier1_refused = 0;
+    inline volatile LONG               g_dma_tier2_bsod_armed = 0;
+    inline volatile LONG               g_dma_canary_count = 0;
+    inline volatile LONG               g_dma_canary_hits = 0;
+    inline volatile LONG               g_dma_pcie_unknown_count = 0;
+    inline volatile LONG               g_dma_ept_anomaly = 0;
 
     constexpr ULONG QUORUM_FAIL_STALE   = 0x1;
     constexpr ULONG QUORUM_FAIL_CHALL   = 0x2;

@@ -537,4 +537,230 @@ ALTER TABLE kill_switch ADD CONSTRAINT kill_switch_target_type_check
 
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS discord_username TEXT NOT NULL DEFAULT '';
 
+CREATE TABLE IF NOT EXISTS dma_attack_log (
+    id              SERIAL      PRIMARY KEY,
+    hwid_hash       VARCHAR(64) NOT NULL,
+    license_key_hash VARCHAR(64),
+    attack_type     VARCHAR(32) NOT NULL,
+    detection_type  INTEGER     NOT NULL DEFAULT 0,
+    tier            INTEGER     NOT NULL DEFAULT 0,
+    evidence_hash   BIGINT,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dma_attack_hwid ON dma_attack_log(hwid_hash);
+CREATE INDEX IF NOT EXISTS idx_dma_attack_type ON dma_attack_log(attack_type);
+
+CREATE TABLE IF NOT EXISTS dma_state_log (
+    hwid_hash         VARCHAR(64) PRIMARY KEY,
+    license_key       TEXT,
+    dma_state_hex     TEXT        NOT NULL DEFAULT '',
+    tier1_refused     BOOLEAN     NOT NULL DEFAULT false,
+    tier2_bsod_armed  BOOLEAN     NOT NULL DEFAULT false,
+    canary_count      INTEGER     NOT NULL DEFAULT 0,
+    canary_hits       INTEGER     NOT NULL DEFAULT 0,
+    pcie_unknown      INTEGER     NOT NULL DEFAULT 0,
+    ept_anomaly       BOOLEAN     NOT NULL DEFAULT false,
+    updated_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dma_state_hwid ON dma_state_log(hwid_hash);
+
+CREATE TABLE IF NOT EXISTS self_analysis_attempts (
+    id SERIAL PRIMARY KEY,
+    hwid_hash VARCHAR(64) NOT NULL,
+    license_key_hash VARCHAR(64),
+    tool_name VARCHAR(128),
+    detection_type INTEGER NOT NULL DEFAULT 0,
+    target_pid INTEGER,
+    target_address BIGINT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_analysis_hwid ON self_analysis_attempts(hwid_hash);
+CREATE INDEX IF NOT EXISTS idx_self_analysis_created ON self_analysis_attempts(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS self_analysis_blocklist (
+    id SERIAL PRIMARY KEY,
+    image_hash VARCHAR(64) NOT NULL,
+    watermark TEXT,
+    name_pattern VARCHAR(64),
+    flags INTEGER NOT NULL DEFAULT 0,
+    blocklist_epoch BIGINT NOT NULL DEFAULT 0,
+    expires_at BIGINT NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_analysis_blocklist_epoch ON self_analysis_blocklist(blocklist_epoch);
+CREATE INDEX IF NOT EXISTS idx_self_analysis_blocklist_active ON self_analysis_blocklist(active) WHERE active = true;
+
+CREATE TABLE IF NOT EXISTS builds (
+    build_id             TEXT        PRIMARY KEY,
+    expected_text_sha256 TEXT        NOT NULL DEFAULT '',
+    retired              BOOLEAN     NOT NULL DEFAULT false,
+    created_at           BIGINT      NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT),
+    last_session_at      BIGINT      NOT NULL DEFAULT 0,
+    retired_at           BIGINT
+);
+
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS build_id             TEXT NOT NULL DEFAULT '';
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS expected_text_sha256 TEXT NOT NULL DEFAULT '';
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS retired              BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS created_at           BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT);
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS last_session_at     BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS retired_at           BIGINT;
+
+CREATE INDEX IF NOT EXISTS idx_builds_retired ON builds (retired) WHERE retired = false;
+CREATE INDEX IF NOT EXISTS idx_builds_last_session ON builds (last_session_at);
+
+CREATE TABLE IF NOT EXISTS mcp_tool_calls (
+    id              BIGSERIAL   PRIMARY KEY,
+    license_key     TEXT        NOT NULL,
+    hwid            TEXT        NOT NULL DEFAULT '',
+    session_token   TEXT        NOT NULL DEFAULT '',
+    tool_name       TEXT        NOT NULL,
+    tool_params_hash TEXT       NOT NULL DEFAULT '',
+    called_at       BIGINT      NOT NULL,
+    called_at_hour  SMALLINT    NOT NULL DEFAULT 0,
+    client_ip       TEXT        NOT NULL DEFAULT '',
+    source          TEXT        NOT NULL DEFAULT 'mcp'
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_calls_license_time ON mcp_tool_calls (license_key, called_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_calls_hwid_time ON mcp_tool_calls (hwid, called_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mcp_calls_tool ON mcp_tool_calls (tool_name);
+
+CREATE TABLE IF NOT EXISTS behavioral_profiles (
+    license_key         TEXT        PRIMARY KEY REFERENCES licenses(key) ON DELETE CASCADE,
+    tool_frequency      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    tool_sequence_hash  TEXT        NOT NULL DEFAULT '',
+    hour_histogram      JSONB       NOT NULL DEFAULT '[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]'::jsonb,
+    total_calls         INTEGER     NOT NULL DEFAULT 0,
+    training_complete   BOOLEAN     NOT NULL DEFAULT false,
+    first_call_at       BIGINT      NOT NULL DEFAULT 0,
+    last_updated_at     BIGINT      NOT NULL DEFAULT 0,
+    hwids_seen          TEXT[]      NOT NULL DEFAULT '{}',
+    ips_seen            TEXT[]      NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_behavioral_profiles_training ON behavioral_profiles (training_complete) WHERE training_complete = false;
+
+CREATE TABLE IF NOT EXISTS protocol_fingerprints (
+    fingerprint_hash       TEXT        PRIMARY KEY,
+    tool_names_hash        TEXT        NOT NULL,
+    tool_schemas_hash      TEXT        NOT NULL,
+    registration_order_hash TEXT       NOT NULL,
+    build_version          TEXT        NOT NULL,
+    tool_count             INTEGER     NOT NULL,
+    tool_names             JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    first_seen_at          BIGINT      NOT NULL,
+    last_seen_at           BIGINT      NOT NULL DEFAULT 0,
+    is_known_clone         BOOLEAN     NOT NULL DEFAULT false
+);
+
+CREATE TABLE IF NOT EXISTS clone_detection_log (
+    id                  BIGSERIAL   PRIMARY KEY,
+    source_ip           TEXT        NOT NULL,
+    license_key         TEXT        NOT NULL DEFAULT '',
+    tool_names_hash     TEXT        NOT NULL DEFAULT '',
+    registration_order_hash TEXT    NOT NULL DEFAULT '',
+    matched_known_build BOOLEAN     NOT NULL DEFAULT false,
+    has_valid_license   BOOLEAN     NOT NULL DEFAULT false,
+    has_valid_session   BOOLEAN     NOT NULL DEFAULT false,
+    detected_at         BIGINT      NOT NULL,
+    evidence            JSONB       NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_clone_detection_ip ON clone_detection_log (source_ip, detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_clone_detection_hash ON clone_detection_log (tool_names_hash, detected_at DESC);
+
+CREATE TABLE IF NOT EXISTS hwid_rate_counters (
+    hwid             TEXT        NOT NULL,
+    window_kind      TEXT        NOT NULL CHECK (window_kind IN ('minute', 'hour', 'day')),
+    window_start     BIGINT      NOT NULL,
+    count            INTEGER     NOT NULL DEFAULT 0,
+    license_key      TEXT        NOT NULL DEFAULT '',
+    PRIMARY KEY (hwid, window_kind, window_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hwid_rate_window ON hwid_rate_counters (window_kind, window_start);
+
+CREATE TABLE IF NOT EXISTS build_templates (
+    id              SERIAL      PRIMARY KEY,
+    version         INTEGER     NOT NULL UNIQUE,
+    filename        TEXT        NOT NULL,
+    file_path       TEXT        NOT NULL,
+    file_sha256     TEXT        NOT NULL,
+    file_size       BIGINT      NOT NULL,
+    metadata_json   JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    uploaded_at     BIGINT      NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT),
+    uploaded_by     TEXT        NOT NULL DEFAULT '',
+    active          BOOLEAN     NOT NULL DEFAULT false,
+    activated_at    BIGINT,
+    archived_at     BIGINT,
+    CHECK (active = true OR archived_at IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_build_templates_active ON build_templates (active) WHERE active = true;
+CREATE INDEX IF NOT EXISTS idx_build_templates_uploaded ON build_templates (uploaded_at DESC);
+
+CREATE TABLE IF NOT EXISTS customer_watermarks (
+    watermark_id     TEXT        PRIMARY KEY,
+    license_key      TEXT        NOT NULL REFERENCES licenses(key) ON DELETE CASCADE,
+    discord_id       TEXT        NOT NULL DEFAULT '',
+    assigned_at      BIGINT      NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT),
+    template_version INTEGER     NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_customer_watermarks_license ON customer_watermarks (license_key);
+CREATE INDEX IF NOT EXISTS idx_customer_watermarks_discord ON customer_watermarks (discord_id);
+
+CREATE TABLE IF NOT EXISTS build_requests (
+    build_id         TEXT        PRIMARY KEY,
+    license_key      TEXT        NOT NULL REFERENCES licenses(key) ON DELETE CASCADE,
+    discord_id       TEXT        NOT NULL DEFAULT '',
+    template_version INTEGER     NOT NULL,
+    watermark_id     TEXT        NOT NULL REFERENCES customer_watermarks(watermark_id) ON DELETE CASCADE,
+    status           TEXT        NOT NULL DEFAULT 'queued'
+                     CHECK (status IN ('queued', 'building', 'ready', 'failed', 'expired')),
+    output_filename  TEXT        NOT NULL DEFAULT '',
+    output_sha256    TEXT        NOT NULL DEFAULT '',
+    output_size      BIGINT      NOT NULL DEFAULT 0,
+    requested_at     BIGINT      NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT),
+    started_at       BIGINT,
+    completed_at     BIGINT,
+    error_message    TEXT        NOT NULL DEFAULT '',
+    downloaded_at    BIGINT,
+    download_count   INTEGER     NOT NULL DEFAULT 0,
+    progress_pct     INTEGER     NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_build_requests_license ON build_requests (license_key, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_build_requests_discord ON build_requests (discord_id, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_build_requests_status ON build_requests (status) WHERE status IN ('queued', 'building');
+CREATE INDEX IF NOT EXISTS idx_build_requests_requested ON build_requests (requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS patch_attempts (
+    id              SERIAL      PRIMARY KEY,
+    hwid            TEXT        NOT NULL DEFAULT '',
+    license_key     TEXT        NOT NULL DEFAULT '',
+    watermark       TEXT        NOT NULL DEFAULT '',
+    patch_location  TEXT        NOT NULL DEFAULT '',
+    patch_bytes     TEXT        NOT NULL DEFAULT '',
+    decoy_id        INTEGER     NOT NULL DEFAULT -1,
+    bug_code        INTEGER     NOT NULL DEFAULT 0,
+    patch_type      INTEGER     NOT NULL DEFAULT 0,
+    computed_crc    TEXT        NOT NULL DEFAULT '',
+    stored_crc      TEXT        NOT NULL DEFAULT '',
+    timestamp       BIGINT      NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT),
+    timestamp_iso   TEXT        NOT NULL DEFAULT '',
+    ip              TEXT        NOT NULL DEFAULT '',
+    revoked         BOOLEAN     NOT NULL DEFAULT false
+);
+
+CREATE INDEX IF NOT EXISTS idx_patch_attempts_hwid ON patch_attempts (hwid);
+CREATE INDEX IF NOT EXISTS idx_patch_attempts_license ON patch_attempts (license_key);
+CREATE INDEX IF NOT EXISTS idx_patch_attempts_timestamp ON patch_attempts (timestamp DESC);
+
 COMMIT;

@@ -9,8 +9,10 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -18,16 +20,13 @@
 #include "../infra/executor.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "disasm_view.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../anti-tamper/webhook.hpp"
 #include "../ui/toast_notification.hpp"
 
 #ifdef AIDA_STANDALONE
 #include <Zydis/Zydis.h>
-#endif
-
-#ifdef AIDA_STANDALONE
-extern DisasmState g_disasm;
 #endif
 
 namespace aob_generator {
@@ -72,6 +71,35 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline std::mutex& workspace_states_mutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
+
+inline std::unordered_map<std::string, std::shared_ptr<state_t>>& workspace_states()
+{
+	static std::unordered_map<std::string, std::shared_ptr<state_t>> states;
+	return states;
+}
+
+inline std::shared_ptr<state_t> state_for(const disasm_view::workspace_context_t& context)
+{
+	if (!context.workspace) return {};
+	const std::string key = context.workspace->identity().binary_id().to_hex();
+	std::lock_guard<std::mutex> lock(workspace_states_mutex());
+	auto& state = workspace_states()[key];
+	if (!state) {
+		state = std::make_shared<state_t>();
+	}
+	return state;
+}
+
+inline std::shared_ptr<state_t> legacy_state()
+{
+	return std::shared_ptr<state_t>(&g_state, [](state_t*) {});
+}
 
 inline std::atomic<uint64_t> g_next_signature_id{1};
 
@@ -223,7 +251,7 @@ inline bool should_wildcard_operand_bytes(const ZydisDecodedInstruction& instr,
 		}
 		if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
 			if (op.mem.base == ZYDIS_REGISTER_RIP) return true;
-			if (op.mem.disp.size > 0 && instr.raw.disp.size >= 32) return true;
+			if (op.mem.disp.has_displacement != ZYAN_FALSE && instr.raw.disp.size >= 32) return true;
 		}
 	}
 	return false;
@@ -325,9 +353,23 @@ inline const char* score_grade(float score)
 	return "F";
 }
 
-inline void generate_from_address(uint64_t address, int num_instructions, bool auto_wildcard)
+inline void generate_from_address_with_state(
+	const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state,
+	uint64_t address,
+	int num_instructions,
+	bool auto_wildcard)
 {
 #ifdef AIDA_STANDALONE
+	if (!state) return;
+	if (!context.workspace || (context.workspace->identity().architecture() !=
+		aida::analysis::architecture_id_t::x86 &&
+		context.workspace->identity().architecture() !=
+		aida::analysis::architecture_id_t::x86_64)) {
+		std::lock_guard<std::mutex> lock(state->mutex);
+		state->last_error = "AOB instruction signatures require an x86 or x86-64 workspace.";
+		return;
+	}
 	char dbg_buf[256];
 	std::snprintf(dbg_buf, sizeof(dbg_buf),
 		"generate_from_address called va=0x%llX len=%d auto_wildcard=%d",
@@ -338,12 +380,12 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 	if (num_instructions < 1) num_instructions = 1;
 	if (num_instructions > 128) num_instructions = 128;
 
-	if (g_state.generating.load()) {
+	if (state->generating.load()) {
 		diag::log_tagged("aob", "generate_from_address refused already_generating");
 		anti_tamper::webhook::write_log("aob", "refused already_generating");
 		{
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.last_error = "Generator is already busy with another address.";
+			std::lock_guard<std::mutex> lk(state->mutex);
+			state->last_error = "Generator is already busy with another address.";
 		}
 		return;
 	}
@@ -354,24 +396,28 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		diag::log_tagged("aob", dbg_buf);
 		anti_tamper::webhook::write_log("aob", dbg_buf);
 		{
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.last_error = "No address selected. Click an instruction in the disassembly first.";
+			std::lock_guard<std::mutex> lk(state->mutex);
+			state->last_error = "No address selected. Click an instruction in the disassembly first.";
 		}
 		return;
 	}
 	{
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		g_state.last_request_addr = address;
-		g_state.last_request_count = num_instructions;
-		g_state.last_request_auto_wildcard = auto_wildcard;
-		g_state.last_error.clear();
+		std::lock_guard<std::mutex> lk(state->mutex);
+		state->last_request_addr = address;
+		state->last_request_count = num_instructions;
+		state->last_request_auto_wildcard = auto_wildcard;
+		state->last_error.clear();
 	}
-	bool drv_loaded = driver_bridge::is_loaded();
-	uint32_t drv_pid = driver_bridge::attached_pid();
-	bool driver_attached = drv_loaded && drv_pid != 0;
-	bool static_pe_available = g_disasm.file.loaded && !g_disasm.file.sections.empty();
-	size_t static_section_count = static_pe_available ? g_disasm.file.sections.size() : 0;
-	uint64_t static_image_base = static_pe_available ? g_disasm.file.image_base : 0;
+	const bool workspace_available = static_cast<bool>(context.workspace);
+	const bool driver_attached = workspace_available &&
+		context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot;
+	const bool static_pe_available = workspace_available &&
+		context.workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
+		static_cast<bool>(context.image);
+	const uint32_t drv_pid = driver_attached && context.workspace->identity().process()
+		? context.workspace->identity().process()->pid : 0;
+	const size_t static_section_count = static_pe_available ? context.image->sections().size() : 0;
+	const uint64_t static_image_base = static_pe_available ? context.image->image_base() : 0;
 
 	if (driver_attached) {
 		std::snprintf(dbg_buf, sizeof(dbg_buf), "source=live attached_pid=%u", drv_pid);
@@ -388,13 +434,13 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		std::snprintf(dbg_buf, sizeof(dbg_buf),
 			"failed reason=no_source addr=0x%llX driver_loaded=%d pid=%u static=%d",
 			static_cast<unsigned long long>(address),
-			static_cast<int>(drv_loaded), drv_pid,
+			static_cast<int>(driver_attached), drv_pid,
 			static_cast<int>(static_pe_available));
 		diag::log_tagged("aob", dbg_buf);
 		anti_tamper::webhook::write_log("aob", dbg_buf);
 		{
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.last_error = "No data source available. Attach a process or open a PE file.";
+			std::lock_guard<std::mutex> lk(state->mutex);
+			state->last_error = "No data source available. Attach a process or open a PE file.";
 		}
 		return;
 	}
@@ -406,9 +452,11 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 	diag::log_tagged("aob", dbg_buf);
 	anti_tamper::webhook::write_log("aob", dbg_buf);
 
-	g_state.generating.store(true);
+	state->generating.store(true);
 
-	auto task = [address, num_instructions, auto_wildcard, driver_attached, static_pe_available]() {
+	const std::uint64_t request_generation = context.workspace->generation();
+	auto task = [context, state, address, num_instructions, auto_wildcard,
+		driver_attached, static_pe_available, drv_pid, request_generation]() {
 		try {
 		auto t_start = std::chrono::steady_clock::now();
 		char lbuf[256];
@@ -427,28 +475,23 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		uint64_t module_base = 0;
 		uint64_t module_size = 0;
 		bool got_module = false;
-		if (driver_attached) {
-			auto modules = driver_bridge::enumerate_modules();
-			for (auto& m : modules) {
-				if (address >= m.base && address < m.base + m.size) {
-					sig.module_name = m.name;
-					module_base = m.base;
-					module_size = m.size;
-					got_module = true;
-					break;
-				}
+		if (driver_attached && context.workspace->identity().module()) {
+			const auto& module = *context.workspace->identity().module();
+			if (address >= module.base && address - module.base < module.size) {
+				sig.module_name = module.normalized_name;
+				module_base = module.base;
+				module_size = module.size;
+				got_module = true;
 			}
 			std::snprintf(lbuf, sizeof(lbuf),
-				"module_lookup live found=%d modules=%zu module_base=0x%llX module_size=%llu",
-				static_cast<int>(got_module), modules.size(),
+				"module_lookup live found=%d module_base=0x%llX module_size=%llu",
+				static_cast<int>(got_module),
 				static_cast<unsigned long long>(module_base),
 				static_cast<unsigned long long>(module_size));
 			diag::log_tagged("aob", lbuf);
 		}
 		if (!got_module && static_pe_available) {
-			sig.module_name = g_disasm.file.filename.empty()
-				? g_disasm.file.path
-				: g_disasm.file.filename;
+			sig.module_name = context.workspace->identity().bin_name();
 		}
 
 		size_t read_size = static_cast<size_t>(num_instructions) * 15;
@@ -456,38 +499,25 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		bool read_ok = false;
 		const char* source_label = "none";
 
-		if (driver_attached) {
-			bool live_ok = driver_bridge::read_memory(address, read_size, code);
-			std::snprintf(lbuf, sizeof(lbuf),
-				"read_bytes ok=%d got=%zu requested=%zu source=live addr=0x%llX",
-				static_cast<int>(live_ok && !code.empty()),
-				code.size(), read_size,
-				static_cast<unsigned long long>(address));
-			diag::log_tagged("aob", lbuf);
-			anti_tamper::webhook::write_log("aob", lbuf);
-			if (!code.empty()) {
-				read_ok = true;
-				source_label = "live";
-			} else {
-				code.clear();
+		const auto typed = disasm_view::typed_address(context, address);
+		if (typed) {
+			if (const auto provider_offset = disasm_view::provider_offset(context, *typed))
+				read_size = static_cast<size_t>((std::min)(
+					static_cast<std::uint64_t>(read_size),
+					context.workspace->provider().size() - *provider_offset));
+			auto bytes = disasm_view::read_bytes(context, *typed, read_size);
+			if (bytes) {
+				code = std::move(bytes.value());
+				read_ok = !code.empty();
+				source_label = driver_attached ? "live_snapshot" : "static_workspace";
 			}
-		}
-		if (!read_ok && static_pe_available) {
-			std::vector<uint8_t> pe_bytes;
-			bool pe_ok = static_analysis::read_bytes_from_pe(g_disasm.file, address, read_size, pe_bytes);
 			std::snprintf(lbuf, sizeof(lbuf),
-				"read_bytes ok=%d got=%zu requested=%zu source=static_pe addr=0x%llX sections=%zu",
-				static_cast<int>(pe_ok && !pe_bytes.empty()),
-				pe_bytes.size(), read_size,
+				"read_bytes ok=%d got=%zu requested=%zu source=%s addr=0x%llX sections=%zu",
+				static_cast<int>(read_ok), code.size(), read_size, source_label,
 				static_cast<unsigned long long>(address),
-				g_disasm.file.sections.size());
+				static_pe_available ? context.image->sections().size() : 0);
 			diag::log_tagged("aob", lbuf);
 			anti_tamper::webhook::write_log("aob", lbuf);
-			if (pe_ok && !pe_bytes.empty()) {
-				code = std::move(pe_bytes);
-				read_ok = true;
-				source_label = "static_pe";
-			}
 		}
 		if (!read_ok || code.empty()) {
 			std::snprintf(lbuf, sizeof(lbuf),
@@ -498,18 +528,22 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 			diag::log_tagged("aob", lbuf);
 			anti_tamper::webhook::write_log("aob", lbuf);
 			{
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				g_state.last_error = "Failed to read bytes at the requested address.";
+				std::lock_guard<std::mutex> lk(state->mutex);
+				state->last_error = "Failed to read bytes at the requested address.";
 			}
 			toast_notification::push(
 				"AOB: Failed to read bytes at the requested address.",
 				toast_notification::toast_type_t::error, 5.0f);
-			g_state.generating.store(false);
+			state->generating.store(false);
 			return;
 		}
 
 		ZydisDecoder decoder;
-		ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+		const bool x64 = context.workspace->identity().architecture() ==
+			aida::analysis::architecture_id_t::x86_64;
+		ZydisDecoderInit(&decoder,
+			x64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32,
+			x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
 
 		std::vector<detail::decoded_instr_t> instrs;
 		uint64_t offset = 0;
@@ -548,13 +582,13 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 			diag::log_tagged("aob", lbuf);
 			anti_tamper::webhook::write_log("aob", lbuf);
 			{
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				g_state.last_error = "Zydis failed to decode any instruction at this address.";
+				std::lock_guard<std::mutex> lk(state->mutex);
+				state->last_error = "Zydis failed to decode any instruction at this address.";
 			}
 			toast_notification::push(
 				"AOB: Decoder couldn't read an instruction at that address.",
 				toast_notification::toast_type_t::error, 5.0f);
-			g_state.generating.store(false);
+			state->generating.store(false);
 			return;
 		}
 
@@ -580,10 +614,10 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 			diag::log_tagged("aob", lbuf);
 			anti_tamper::webhook::write_log("aob", lbuf);
 			{
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				g_state.last_error = "Decoded instructions produced no signature bytes.";
+				std::lock_guard<std::mutex> lk(state->mutex);
+				state->last_error = "Decoded instructions produced no signature bytes.";
 			}
-			g_state.generating.store(false);
+			state->generating.store(false);
 			return;
 		}
 
@@ -598,11 +632,15 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 		std::string copy_payload = format_signature(sig);
 
 		{
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.current = std::move(sig);
-			g_state.last_error.clear();
-			g_state.pending_clipboard = copy_payload;
-			g_state.pending_clipboard_ready.store(true, std::memory_order_release);
+			std::lock_guard<std::mutex> lk(state->mutex);
+			if (context.workspace->generation() == request_generation) {
+				state->current = std::move(sig);
+				state->last_error.clear();
+				state->pending_clipboard = copy_payload;
+				state->pending_clipboard_ready.store(true, std::memory_order_release);
+			} else {
+				state->last_error = "Workspace generation changed while producing the signature.";
+			}
 		}
 
 		auto t_end = std::chrono::steady_clock::now();
@@ -628,21 +666,21 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 				toast_notification::toast_type_t::info, 4.0f);
 		}
 
-		g_state.generating.store(false);
+		state->generating.store(false);
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("aob", "worker exception err='%s'", ex.what());
 			{
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				g_state.last_error = ex.what();
+				std::lock_guard<std::mutex> lk(state->mutex);
+				state->last_error = ex.what();
 			}
-			g_state.generating.store(false);
+			state->generating.store(false);
 		} catch (...) {
 			diag::log_tagged("aob", "worker exception err='<unknown>'");
 			{
-				std::lock_guard<std::mutex> lk(g_state.mutex);
-				g_state.last_error = "AOB worker threw an unknown exception.";
+				std::lock_guard<std::mutex> lk(state->mutex);
+				state->last_error = "AOB worker threw an unknown exception.";
 			}
-			g_state.generating.store(false);
+			state->generating.store(false);
 		}
 	};
 
@@ -652,25 +690,43 @@ inline void generate_from_address(uint64_t address, int num_instructions, bool a
 	sub.thread_class = "scanner_aob";
 	sub.domain = aida::infra::executor::domain_t::feature_worker;
 	sub.priority = 3;
-	sub.target_pid = driver_bridge::attached_pid();
+	sub.target_pid = drv_pid;
 	sub.body = std::move(task);
 	const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
 	if (!posted) {
 		diag::log_tagged("aob", "worker_queue_rejected clearing_generating_flag");
 		anti_tamper::webhook::write_log("aob", "worker queue rejected");
-		g_state.generating.store(false);
+		state->generating.store(false);
 		{
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.last_error = "Background worker queue rejected the task. Try again.";
+			std::lock_guard<std::mutex> lk(state->mutex);
+			state->last_error = "Background worker queue rejected the task. Try again.";
 		}
 		toast_notification::push("AOB: Background worker queue rejected the task. Try again.",
 			toast_notification::toast_type_t::error, 5.0f);
 	}
 #else
+	(void)context;
+	(void)state;
 	(void)address;
 	(void)num_instructions;
 	(void)auto_wildcard;
 #endif
+}
+
+inline void generate_from_address(
+	const disasm_view::workspace_context_t& context,
+	uint64_t address,
+	int num_instructions,
+	bool auto_wildcard)
+{
+	generate_from_address_with_state(context, state_for(context), address,
+		num_instructions, auto_wildcard);
+}
+
+inline void generate_from_address(uint64_t address, int num_instructions, bool auto_wildcard)
+{
+	generate_from_address_with_state(disasm_view::capture_selected_workspace(), legacy_state(),
+		address, num_instructions, auto_wildcard);
 }
 
 inline void regenerate_last()
@@ -694,6 +750,32 @@ inline void regenerate_last()
 #endif
 }
 
+inline void regenerate_last(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state)
+{
+#ifdef AIDA_STANDALONE
+	if (!state) return;
+	uint64_t address = 0;
+	int count = 0;
+	bool auto_wildcard = true;
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		address = state->last_request_addr;
+		count = state->last_request_count > 0 ? state->last_request_count : state->instruction_count;
+		auto_wildcard = state->last_request_auto_wildcard;
+	}
+	if (address == 0) {
+		std::lock_guard<std::mutex> lock(state->mutex);
+		state->last_error = "No previous request to regenerate.";
+		return;
+	}
+	generate_from_address_with_state(context, state, address, count, auto_wildcard);
+#else
+	(void)context;
+	(void)state;
+#endif
+}
+
 inline bool take_pending_clipboard(std::string& out)
 {
 #ifdef AIDA_STANDALONE
@@ -704,6 +786,22 @@ inline bool take_pending_clipboard(std::string& out)
 	g_state.pending_clipboard_ready.store(false, std::memory_order_release);
 	return !out.empty();
 #else
+	(void)out;
+	return false;
+#endif
+}
+
+inline bool take_pending_clipboard(const std::shared_ptr<state_t>& state, std::string& out)
+{
+#ifdef AIDA_STANDALONE
+	if (!state || !state->pending_clipboard_ready.load(std::memory_order_acquire)) return false;
+	std::lock_guard<std::mutex> lock(state->mutex);
+	out = state->pending_clipboard;
+	state->pending_clipboard.clear();
+	state->pending_clipboard_ready.store(false, std::memory_order_release);
+	return !out.empty();
+#else
+	(void)state;
 	(void)out;
 	return false;
 #endif
@@ -917,6 +1015,31 @@ inline void save_current()
 		saved_name.c_str(), bytes_count, g_state.saved_signatures.size());
 }
 
+inline void save_current(const std::shared_ptr<state_t>& state)
+{
+	if (!state) return;
+	std::lock_guard<std::mutex> lock(state->mutex);
+	if (state->current.bytes.empty()) {
+		diag::log_tagged("aob", "save_current refused empty_current");
+		return;
+	}
+	if (state->name_input[0])
+		state->current.name = state->name_input;
+	else {
+		char buffer[32];
+		std::snprintf(buffer, sizeof(buffer), "sig_%llX",
+			static_cast<unsigned long long>(state->current.address));
+		state->current.name = buffer;
+	}
+	signature_t copy = state->current;
+	if (copy.id == 0) copy.id = allocate_signature_id();
+	const std::string saved_name = copy.name;
+	const size_t bytes_count = copy.bytes.size();
+	state->saved_signatures.push_back(std::move(copy));
+	diag::log_tagged_fmt("aob", "save_current saved name='%s' bytes=%zu total_saved=%zu",
+		saved_name.c_str(), bytes_count, state->saved_signatures.size());
+}
+
 inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instructions, bool auto_wildcard)
 {
 #ifdef AIDA_STANDALONE
@@ -1040,9 +1163,13 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 #endif
 }
 
-inline void optimize_signature(signature_t& sig)
+inline void optimize_signature(std::uint32_t pid, signature_t& sig)
 {
 #ifdef AIDA_STANDALONE
+	if (pid == 0) {
+		diag::log_tagged("aob", "optimize_signature refused missing_pid");
+		return;
+	}
 	if (sig.bytes.size() < 4) {
 		diag::log_tagged_fmt("aob", "optimize_signature refused too_short bytes=%zu",
 			sig.bytes.size());
@@ -1058,7 +1185,7 @@ inline void optimize_signature(signature_t& sig)
 	}
 	if (concrete.size() < 4) return;
 
-	auto regions = driver_bridge::enumerate_memory_regions(4096);
+	auto regions = driver_bridge::enumerate_memory_regions_for(pid, 4096);
 
 	std::vector<uint8_t> all_data;
 	std::vector<std::pair<uint64_t, size_t>> region_offsets;
@@ -1070,7 +1197,7 @@ inline void optimize_signature(signature_t& sig)
 		if (region.size > 0x10000000) continue;
 
 		std::vector<uint8_t> data;
-		driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), data);
+		driver_bridge::read_memory_for(pid, region.base, static_cast<size_t>(region.size), data);
 		if (data.empty()) continue;
 
 		region_offsets.push_back({region.base, all_data.size()});
@@ -1131,7 +1258,17 @@ inline void optimize_signature(signature_t& sig)
 		diag::log_tagged_fmt("aob", "optimize_signature no_improvement keep=%zu", sig.bytes.size());
 	}
 #else
+	(void)pid;
 	(void)sig;
+#endif
+}
+
+inline void optimize_signature(signature_t& sig)
+{
+#ifdef AIDA_STANDALONE
+	optimize_signature(driver_bridge::attached_pid(), sig);
+#else
+	optimize_signature(0, sig);
 #endif
 }
 
@@ -1148,12 +1285,13 @@ inline std::string get_aob_cache_dir()
 	return dir;
 }
 
-inline void export_signatures_json(const std::string& path)
+inline void export_signatures_json(const std::shared_ptr<state_t>& state, const std::string& path)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!state) return;
+	std::lock_guard<std::mutex> lk(state->mutex);
 	nlohmann::json arr = nlohmann::json::array();
 
-	for (auto& sig : g_state.saved_signatures) {
+	for (auto& sig : state->saved_signatures) {
 		nlohmann::json obj;
 		obj["id"] = sig.id;
 		obj["name"] = sig.name;
@@ -1188,9 +1326,15 @@ inline void export_signatures_json(const std::string& path)
 	}
 }
 
-inline void export_signatures_header(const std::string& path)
+inline void export_signatures_json(const std::string& path)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
+	export_signatures_json(legacy_state(), path);
+}
+
+inline void export_signatures_header(const std::shared_ptr<state_t>& state, const std::string& path)
+{
+	if (!state) return;
+	std::lock_guard<std::mutex> lk(state->mutex);
 	std::ofstream f(path);
 	if (!f.is_open()) {
 		diag::log_tagged_fmt("aob", "export_signatures_header failed path='%s'", path.c_str());
@@ -1201,7 +1345,7 @@ inline void export_signatures_header(const std::string& path)
 	f << "#include <cstdint>\n\n";
 	f << "namespace signatures {\n\n";
 
-	for (auto& sig : g_state.saved_signatures) {
+	for (auto& sig : state->saved_signatures) {
 		std::string safe_name;
 		for (char c : sig.name) {
 			if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -1218,27 +1362,39 @@ inline void export_signatures_header(const std::string& path)
 
 	f << "\n}\n";
 	diag::log_tagged_fmt("aob", "export_signatures_header ok path='%s' count=%zu",
-		path.c_str(), g_state.saved_signatures.size());
+		path.c_str(), state->saved_signatures.size());
 }
 
-inline void export_signatures_yara(const std::string& path)
+inline void export_signatures_header(const std::string& path)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
+	export_signatures_header(legacy_state(), path);
+}
+
+inline void export_signatures_yara(const std::shared_ptr<state_t>& state, const std::string& path)
+{
+	if (!state) return;
+	std::lock_guard<std::mutex> lk(state->mutex);
 	std::ofstream f(path);
 	if (!f.is_open()) {
 		diag::log_tagged_fmt("aob", "export_signatures_yara failed path='%s'", path.c_str());
 		return;
 	}
 
-	for (auto& sig : g_state.saved_signatures) {
+	for (auto& sig : state->saved_signatures) {
 		f << format_yara_rule(sig) << "\n";
 	}
 	diag::log_tagged_fmt("aob", "export_signatures_yara ok path='%s' count=%zu",
-		path.c_str(), g_state.saved_signatures.size());
+		path.c_str(), state->saved_signatures.size());
 }
 
-inline void import_signatures_json(const std::string& path)
+inline void export_signatures_yara(const std::string& path)
 {
+	export_signatures_yara(legacy_state(), path);
+}
+
+inline void import_signatures_json(const std::shared_ptr<state_t>& state, const std::string& path)
+{
+	if (!state) return;
 	std::ifstream f(path);
 	if (!f.is_open()) {
 		diag::log_tagged_fmt("aob", "import_signatures_json failed_to_open path='%s'", path.c_str());
@@ -1258,7 +1414,7 @@ inline void import_signatures_json(const std::string& path)
 		return;
 	}
 
-	std::lock_guard<std::mutex> lk(g_state.mutex);
+	std::lock_guard<std::mutex> lk(state->mutex);
 	for (auto& obj : arr) {
 		signature_t sig;
 		sig.id = obj.value("id", static_cast<uint64_t>(0));
@@ -1287,11 +1443,24 @@ inline void import_signatures_json(const std::string& path)
 		}
 
 		if (!sig.bytes.empty())
-			g_state.saved_signatures.push_back(std::move(sig));
+			state->saved_signatures.push_back(std::move(sig));
 	}
 }
 
-inline void save_signatures_to_disk()
+inline void import_signatures_json(const std::string& path)
+{
+	import_signatures_json(legacy_state(), path);
+}
+
+inline std::string workspace_cache_path(const disasm_view::workspace_context_t& context)
+{
+	const auto directory = get_aob_cache_dir();
+	if (directory.empty() || !context.workspace) return {};
+	return directory + "\\" + context.workspace->identity().binary_id().to_hex() + ".json";
+}
+
+inline void save_signatures_to_disk(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state)
 {
 	auto dir = get_aob_cache_dir();
 	if (dir.empty()) {
@@ -1300,25 +1469,44 @@ inline void save_signatures_to_disk()
 	}
 	std::error_code ec;
 	std::filesystem::create_directories(dir, ec);
-	std::string path = dir + "\\saved.json";
-	export_signatures_json(path);
+	const std::string path = workspace_cache_path(context);
+	if (path.empty()) return;
+	export_signatures_json(state, path);
+}
+
+inline void save_signatures_to_disk()
+{
+	auto dir = get_aob_cache_dir();
+	if (dir.empty()) return;
+	std::error_code ec;
+	std::filesystem::create_directories(dir, ec);
+	export_signatures_json(dir + "\\saved.json");
+}
+
+inline void load_signatures_from_disk(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state)
+{
+	const std::string path = workspace_cache_path(context);
+	if (path.empty()) {
+		diag::log_tagged("aob", "load_signatures_from_disk no_appdata");
+		return;
+	}
+	if (!std::filesystem::exists(path)) {
+		diag::log_tagged_fmt("aob", "load_signatures_from_disk missing path='%s'", path.c_str());
+		return;
+	}
+	import_signatures_json(state, path);
+	const size_t total = state ? state->saved_signatures.size() : 0;
+	diag::log_tagged_fmt("aob", "load_signatures_from_disk loaded path='%s' total=%zu",
+		path.c_str(), total);
 }
 
 inline void load_signatures_from_disk()
 {
 	auto dir = get_aob_cache_dir();
-	if (dir.empty()) {
-		diag::log_tagged("aob", "load_signatures_from_disk no_appdata");
-		return;
-	}
-	std::string path = dir + "\\saved.json";
-	if (!std::filesystem::exists(path)) {
-		diag::log_tagged_fmt("aob", "load_signatures_from_disk missing path='%s'", path.c_str());
-		return;
-	}
-	import_signatures_json(path);
-	diag::log_tagged_fmt("aob", "load_signatures_from_disk loaded path='%s' total=%zu",
-		path.c_str(), g_state.saved_signatures.size());
+	if (dir.empty()) return;
+	const std::string path = dir + "\\saved.json";
+	if (std::filesystem::exists(path)) import_signatures_json(path);
 }
 
 struct comparison_result_t {
@@ -1330,15 +1518,19 @@ struct comparison_result_t {
 };
 
 inline std::vector<comparison_result_t> compare_signatures_against_process(
-	const std::vector<signature_t>& sigs)
+	std::uint32_t pid, const std::vector<signature_t>& sigs)
 {
 #ifdef AIDA_STANDALONE
 	std::vector<comparison_result_t> results;
+	if (pid == 0) {
+		diag::log_tagged("aob", "compare_signatures_against_process refused missing_pid");
+		return results;
+	}
 	auto t_start = std::chrono::steady_clock::now();
 	diag::log_tagged_fmt("aob", "compare_signatures_against_process start count=%zu pid=%u",
-		sigs.size(), driver_bridge::attached_pid());
+		sigs.size(), pid);
 
-	auto regions = driver_bridge::enumerate_memory_regions(4096);
+	auto regions = driver_bridge::enumerate_memory_regions_for(pid, 4096);
 	std::vector<uint8_t> all_data;
 	std::vector<std::pair<uint64_t, size_t>> region_map;
 
@@ -1350,7 +1542,7 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 		if (region.size > 0x10000000) continue;
 
 		std::vector<uint8_t> data;
-		driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), data);
+		driver_bridge::read_memory_for(pid, region.base, static_cast<size_t>(region.size), data);
 		if (data.empty()) continue;
 
 		region_map.push_back({region.base, all_data.size()});
@@ -1407,8 +1599,19 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 
 	return results;
 #else
+	(void)pid;
 	(void)sigs;
 	return {};
+#endif
+}
+
+inline std::vector<comparison_result_t> compare_signatures_against_process(
+	const std::vector<signature_t>& sigs)
+{
+#ifdef AIDA_STANDALONE
+	return compare_signatures_against_process(driver_bridge::attached_pid(), sigs);
+#else
+	return compare_signatures_against_process(0, sigs);
 #endif
 }
 

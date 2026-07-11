@@ -4,8 +4,10 @@
 #include <intrin.h>
 #include <bcrypt.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -568,6 +570,771 @@ inline emulation_report_t full_scan()
     if (report.smc_prefetch_inconsistent) report.summary += "smc_prefetch ";
 
     return report;
+}
+
+inline void show_message_and_exit(const wchar_t* message)
+{
+    MessageBoxW(nullptr, message, L"AiDA",
+        MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+    ExitProcess(1);
+}
+
+inline bool is_hypervisor_vendor_known_good()
+{
+    int regs[4] = {};
+    __try
+    {
+        __cpuid(regs, 0x40000000);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    char vendor[12] = {};
+    std::memcpy(vendor + 0, &regs[1], 4);
+    std::memcpy(vendor + 4, &regs[2], 4);
+    std::memcpy(vendor + 8, &regs[3], 4);
+
+    static const char kKnownGoodVendors[6][12] = {
+        {'M','i','c','r','o','s','o','f','t',' ','H','v'},
+        {'V','M','w','a','r','e','V','M','w','a','r','e'},
+        {'K','V','M','K','V','M','K','V','M', 0, 0, 0},
+        {'X','e','n','V','M','M','X','e','n','V','M','M'},
+        {'V','B','o','x','V','B','o','x','V','B','o','x'},
+        {'P','a','r','a','l','l','e','l','s', 0, 0, 0},
+    };
+
+    for (int i = 0; i < 6; ++i)
+    {
+        if (std::memcmp(vendor, kKnownGoodVendors[i], 12) == 0)
+            return true;
+    }
+    return false;
+}
+
+inline bool check_hypervisor_timing_uniform()
+{
+    constexpr uint32_t kSamples = 100;
+
+    HANDLE thread = GetCurrentThread();
+    DWORD_PTR previous_mask = 0;
+    DWORD_PTR active_processors = 0;
+    DWORD_PTR system_processors = 0;
+    bool affinity_set = false;
+
+    if (GetProcessAffinityMask(GetCurrentProcess(), &active_processors, &system_processors) && active_processors != 0)
+    {
+        DWORD_PTR target_mask = active_processors & (~active_processors + 1);
+        DWORD_PTR prev = SetThreadAffinityMask(thread, target_mask);
+        if (prev != 0)
+        {
+            previous_mask = prev;
+            affinity_set = true;
+        }
+    }
+
+    int previous_priority = GetThreadPriority(thread);
+    bool priority_set = false;
+    if (previous_priority != THREAD_PRIORITY_ERROR_RETURN)
+    {
+        if (SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL))
+            priority_set = true;
+    }
+
+    uint64_t deltas[kSamples] = {};
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < kSamples; ++i)
+    {
+        int dummy[4] = {};
+        unsigned int aux0 = 0;
+        unsigned int aux1 = 0;
+        uint64_t t0 = __rdtscp(&aux0);
+        __cpuid(dummy, 0);
+        uint64_t t1 = __rdtscp(&aux1);
+        uint64_t d = t1 >= t0 ? t1 - t0 : 0;
+        deltas[count++] = d;
+    }
+
+    if (priority_set)
+        SetThreadPriority(thread, previous_priority);
+    if (affinity_set)
+        SetThreadAffinityMask(thread, previous_mask);
+
+    if (count < 50)
+        return false;
+
+    double sum = 0.0;
+    for (uint32_t i = 0; i < count; ++i)
+        sum += static_cast<double>(deltas[i]);
+    double mean = sum / static_cast<double>(count);
+
+    if (mean < 1.0)
+        return true;
+
+    double sq_sum = 0.0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        double diff = static_cast<double>(deltas[i]) - mean;
+        sq_sum += diff * diff;
+    }
+    double variance = sq_sum / static_cast<double>(count - 1);
+    double stdev = sqrt(variance);
+    double cv = stdev / mean;
+
+    return cv < 0.001;
+}
+
+inline bool check_unicorn_syscall_handling()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+    size_t off = 0;
+    code[off++] = 0x4D; code[off++] = 0x31; code[off++] = 0xDF;
+    code[off++] = 0xB8; code[off++] = 0xFF; code[off++] = 0xFF;
+    code[off++] = 0x00; code[off++] = 0x00;
+    code[off++] = 0x0F; code[off++] = 0x05;
+    code[off++] = 0x4C; code[off++] = 0x89; code[off++] = 0xD8;
+    code[off++] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = uint64_t(*)();
+    auto fn = reinterpret_cast<fn_t>(code);
+
+    uint64_t r11_after = 0;
+    bool exception = false;
+
+    __try
+    {
+        r11_after = fn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        exception = true;
+    }
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (exception)
+        return true;
+
+    return r11_after == 0;
+}
+
+inline bool check_unicorn_rdrand_deterministic()
+{
+    int regs[4] = {};
+    __cpuid(regs, 1);
+    if (!((regs[2] >> 30) & 1))
+        return false;
+
+    uint64_t samples[32] = {};
+    for (int i = 0; i < 32; ++i)
+    {
+        bool got_value = false;
+        for (int retry = 0; retry < 10; ++retry)
+        {
+            unsigned __int64 val = 0;
+            if (_rdrand64_step(&val))
+            {
+                samples[i] = static_cast<uint64_t>(val);
+                got_value = true;
+                break;
+            }
+        }
+        if (!got_value)
+            samples[i] = 0;
+    }
+
+    uint64_t sorted[32];
+    std::memcpy(sorted, samples, sizeof(sorted));
+    std::sort(sorted, sorted + 32);
+
+    int distinct = 1;
+    for (int i = 1; i < 32; ++i)
+    {
+        if (sorted[i] != sorted[i - 1])
+            ++distinct;
+    }
+
+    return distinct < 30;
+}
+
+inline bool check_unicorn_xgetbv_ecx1()
+{
+    int regs[4] = {};
+    __cpuid(regs, 1);
+    if (!((regs[2] >> 26) & 1) || !((regs[2] >> 27) & 1))
+        return false;
+
+    unsigned __int64 xcr0 = 0;
+    unsigned __int64 xcr1 = 0;
+    bool xcr0_ok = false;
+    bool xcr1_ok = false;
+
+    __try
+    {
+        xcr0 = _xgetbv(0);
+        xcr0_ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    __try
+    {
+        xcr1 = _xgetbv(1);
+        xcr1_ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (!xcr0_ok || xcr0 == 0)
+        return false;
+
+    if (!xcr1_ok)
+        return false;
+
+    return xcr1 == 0;
+}
+
+inline bool check_unicorn_emulation_preflight()
+{
+    int emulation_signals = 0;
+
+    if (check_unicorn_syscall_handling())
+        emulation_signals++;
+    if (check_unicorn_rdrand_deterministic())
+        emulation_signals++;
+    if (check_unicorn_xgetbv_ecx1())
+        emulation_signals++;
+
+    return emulation_signals == 3;
+}
+
+inline bool run_anti_emulation_preflight()
+{
+    if (check_unicorn_emulation_preflight())
+    {
+        webhook::send_debug_log("anti_emu", "emulation_detected_unicorn_3probe_gate", true);
+        show_message_and_exit(L"Unsupported environment");
+        return false;
+    }
+
+    int cpuid_data[4] = {};
+    __cpuid(cpuid_data, 1);
+    bool hypervisor_present = (cpuid_data[2] >> 31) & 1;
+
+    if (hypervisor_present)
+    {
+        if (!is_hypervisor_vendor_known_good())
+        {
+            webhook::send_debug_log("anti_emu", "unsupported_hypervisor_vendor", true);
+            show_message_and_exit(L"Unsupported virtualization environment");
+            return false;
+        }
+
+        if (check_hypervisor_timing_uniform())
+        {
+            webhook::send_debug_log("anti_emu", "hijacked_hypervisor_uniform_timing", true);
+            show_message_and_exit(L"Unsupported virtualization environment");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+inline bool check_unicorn_page_fault_behavior()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* page = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_NOACCESS);
+    if (!page) return false;
+
+    DWORD exception_code = 0;
+    bool got_exception = false;
+
+    __try
+    {
+        volatile uint64_t val = *static_cast<volatile uint64_t*>(page);
+        (void)val;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        got_exception = true;
+        exception_code = GetExceptionCode();
+    }
+
+    VirtualFree(page, 0, MEM_RELEASE);
+
+    if (!got_exception)
+        return true;
+
+    return exception_code != EXCEPTION_ACCESS_VIOLATION;
+}
+
+inline bool check_unicorn_no_tlb()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* page = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE);
+    if (!page) return false;
+
+    auto* ptr = static_cast<volatile uint64_t*>(page);
+    *ptr = 0xDEADBEEFCAFEBABEULL;
+    volatile uint64_t warm = *ptr;
+    (void)warm;
+
+    DWORD old_prot = 0;
+    if (!VirtualProtect(page, page_size, PAGE_NOACCESS, &old_prot))
+    {
+        VirtualFree(page, 0, MEM_RELEASE);
+        return false;
+    }
+
+    Sleep(1);
+
+    bool got_exception = false;
+    DWORD exception_code = 0;
+
+    __try
+    {
+        volatile uint64_t val = *ptr;
+        (void)val;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        got_exception = true;
+        exception_code = GetExceptionCode();
+    }
+
+    VirtualProtect(page, page_size, PAGE_READWRITE, &old_prot);
+    VirtualFree(page, 0, MEM_RELEASE);
+
+    if (!got_exception)
+        return true;
+
+    return exception_code != EXCEPTION_ACCESS_VIOLATION;
+}
+
+inline bool check_unicorn_invlpg_no_ud()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+    code[0] = 0x33; code[1] = 0xC0;
+    code[2] = 0x0F; code[3] = 0x01; code[4] = 0x38;
+    code[5] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = void(*)();
+    auto fn = reinterpret_cast<fn_t>(code);
+
+    DWORD exception_code = 0;
+    bool got_exception = false;
+
+    __try
+    {
+        fn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        got_exception = true;
+        exception_code = GetExceptionCode();
+    }
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (!got_exception)
+        return true;
+
+    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+}
+
+inline bool check_unicorn_wbinvd_no_ud()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+    code[0] = 0x0F; code[1] = 0x09;
+    code[2] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = void(*)();
+    auto fn = reinterpret_cast<fn_t>(code);
+
+    DWORD exception_code = 0;
+    bool got_exception = false;
+
+    __try
+    {
+        fn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        got_exception = true;
+        exception_code = GetExceptionCode();
+    }
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (!got_exception)
+        return true;
+
+    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+}
+
+inline bool check_unicorn_vmx_unmodeled()
+{
+    int regs[4] = {};
+    __cpuid(regs, 1);
+    if (!((regs[2] >> 5) & 1))
+        return false;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+    code[0] = 0x48; code[1] = 0x8D; code[2] = 0x04; code[3] = 0x24;
+    code[4] = 0xF3; code[5] = 0x0F; code[6] = 0xC7; code[7] = 0x30;
+    code[8] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = void(*)();
+    auto fn = reinterpret_cast<fn_t>(code);
+
+    DWORD exception_code = 0;
+    bool got_exception = false;
+
+    __try
+    {
+        fn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        got_exception = true;
+        exception_code = GetExceptionCode();
+    }
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (!got_exception)
+        return true;
+
+    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+}
+
+inline bool check_unicorn_sgx_unmodeled()
+{
+    int regs[4] = {};
+    __cpuidex(regs, 7, 0);
+    if (!((regs[1] >> 2) & 1))
+        return false;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+    code[0] = 0x0F; code[1] = 0x01; code[2] = 0xD7;
+    code[3] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = void(*)();
+    auto fn = reinterpret_cast<fn_t>(code);
+
+    DWORD exception_code = 0;
+    bool got_exception = false;
+
+    __try
+    {
+        fn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        got_exception = true;
+        exception_code = GetExceptionCode();
+    }
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (!got_exception)
+        return true;
+
+    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+}
+
+inline bool check_unicorn_rdpid_zeros()
+{
+    int regs[4] = {};
+    __cpuidex(regs, 7, 0);
+    if (!((regs[2] >> 22) & 1))
+        return false;
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+    code[0] = 0xF3; code[1] = 0x0F; code[2] = 0xC7; code[3] = 0xC0;
+    code[4] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = uint64_t(*)();
+    auto fn = reinterpret_cast<fn_t>(code);
+
+    HANDLE thread = GetCurrentThread();
+    DWORD_PTR previous_mask = 0;
+    DWORD_PTR active_processors = 0;
+    DWORD_PTR system_processors = 0;
+    bool affinity_set = false;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &active_processors, &system_processors) && active_processors != 0)
+    {
+        DWORD_PTR target_mask = active_processors & (~active_processors + 1);
+        DWORD_PTR prev = SetThreadAffinityMask(thread, target_mask);
+        if (prev != 0)
+        {
+            previous_mask = prev;
+            affinity_set = true;
+        }
+    }
+
+    uint64_t values[4] = {};
+    bool exception = false;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        __try
+        {
+            values[i] = fn();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            exception = true;
+            values[i] = 0;
+        }
+    }
+
+    if (affinity_set)
+        SetThreadAffinityMask(thread, previous_mask);
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (exception)
+        return true;
+
+    if (values[0] == 0 && values[1] == 0 && values[2] == 0 && values[3] == 0)
+        return true;
+
+    return false;
+}
+
+inline bool check_unicorn_rdpmc_zeros()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+    code[0] = 0x33; code[1] = 0xC9;
+    code[2] = 0x0F; code[3] = 0x33;
+    code[4] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = uint64_t(*)();
+    auto fn = reinterpret_cast<fn_t>(code);
+
+    uint64_t values[16] = {};
+    bool any_exception = false;
+
+    for (int i = 0; i < 16; ++i)
+    {
+        __try
+        {
+            values[i] = fn();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            any_exception = true;
+            values[i] = 0;
+        }
+    }
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (any_exception)
+        return false;
+
+    bool all_zero = true;
+    for (int i = 0; i < 16; ++i)
+    {
+        if (values[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero)
+        return true;
+
+    bool all_same = true;
+    for (int i = 1; i < 16; ++i)
+    {
+        if (values[i] != values[0]) { all_same = false; break; }
+    }
+    return all_same;
+}
+
+inline bool check_unicorn_endbr_behavior()
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
+
+    void* code_pg = VirtualAlloc(nullptr, page_size, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    if (!code_pg) return false;
+
+    auto* code = static_cast<uint8_t*>(code_pg);
+
+    size_t off = 0;
+    code[off++] = 0xF3; code[off++] = 0x0F; code[off++] = 0x1E; code[off++] = 0xFA;
+    code[off++] = 0xB8; code[off++] = 0x41; code[off++] = 0x41; code[off++] = 0x41; code[off++] = 0x41;
+    code[off++] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    using fn_t = uint32_t(*)();
+    auto fn1 = reinterpret_cast<fn_t>(code);
+
+    uint32_t result1 = 0;
+    bool exception1 = false;
+
+    __try
+    {
+        result1 = fn1();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        exception1 = true;
+    }
+
+    if (exception1 || result1 != 0x41414141)
+    {
+        VirtualFree(code_pg, 0, MEM_RELEASE);
+        return true;
+    }
+
+    off = 0;
+    code[off++] = 0xF3; code[off++] = 0x0F; code[off++] = 0x1E; code[off++] = 0xFB;
+    code[off++] = 0xB8; code[off++] = 0x42; code[off++] = 0x42; code[off++] = 0x42; code[off++] = 0x42;
+    code[off++] = 0xC3;
+
+    FlushInstructionCache(GetCurrentProcess(), code_pg, page_size);
+
+    auto fn2 = reinterpret_cast<fn_t>(code);
+
+    uint32_t result2 = 0;
+    bool exception2 = false;
+
+    __try
+    {
+        result2 = fn2();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        exception2 = true;
+    }
+
+    VirtualFree(code_pg, 0, MEM_RELEASE);
+
+    if (exception2 || result2 != 0x42424242)
+        return true;
+
+    return false;
+}
+
+inline bool check_unicorn_rdseed_deterministic()
+{
+    int regs[4] = {};
+    __cpuidex(regs, 7, 0);
+    if (!((regs[1] >> 18) & 1))
+        return false;
+
+    uint64_t samples[32] = {};
+    for (int i = 0; i < 32; ++i)
+    {
+        bool got_value = false;
+        for (int retry = 0; retry < 10; ++retry)
+        {
+            unsigned __int64 val = 0;
+            if (_rdseed64_step(&val))
+            {
+                samples[i] = static_cast<uint64_t>(val);
+                got_value = true;
+                break;
+            }
+        }
+        if (!got_value)
+            samples[i] = 0;
+    }
+
+    uint64_t sorted[32];
+    std::memcpy(sorted, samples, sizeof(sorted));
+    std::sort(sorted, sorted + 32);
+
+    int distinct = 1;
+    for (int i = 1; i < 32; ++i)
+    {
+        if (sorted[i] != sorted[i - 1])
+            ++distinct;
+    }
+
+    return distinct < 30;
 }
 
 }

@@ -4,631 +4,2707 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cctype>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <limits>
 #include <mutex>
+#include <set>
 #include <string>
+#include <unordered_map>
+#include <utility>
 
-#include "../ui/loading_binary_overlay.hpp"
-#include "../runtime/standalone_driver.hpp"
 #include "../analysis/stealth_engine.hpp"
+#include "../analysis/pdb_downloader.hpp"
+#include "../analysis/symbol_store.hpp"
+#include "../analysis/workspace/analysis_metrics.hpp"
+#include "../analysis/workspace/baseline_pipeline.hpp"
+#include "../analysis/workspace/decompiler_service.hpp"
+#include "../analysis/workspace/live_snapshot_provider.hpp"
+#include "../analysis/workspace/overlay_journal.hpp"
+#include "../analysis/workspace/search_index.hpp"
+#include "../analysis/workspace/workspace_database.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
+#include "../infra/executor.hpp"
+#include "../runtime/standalone_driver.hpp"
+#include "../runtime/standalone_driver_identity.hpp"
+#include "../ui/loading_binary_overlay.hpp"
 #include "../../helpers/diag_log.hpp"
-
-extern DisasmState g_disasm;
 
 namespace analysis_session {
 
-namespace {
-
-struct session_state_t {
-	std::vector<std::unique_ptr<analysis_session_t>> sessions;
-	int                                              active_idx = -1;
-	uint64_t                                         id_counter = 0;
-	std::mutex                                       mu;
-	std::string                                      last_error;
+struct pdb_expected_identity_t {
+    std::array<std::uint8_t, 16> guid{};
+    std::uint32_t signature = 0;
+    std::uint32_t age = 0;
+    bool uses_guid = false;
 };
 
-inline session_state_t& state() {
-	static session_state_t s;
-	return s;
+struct pdb_session_state_t {
+    std::mutex mutex;
+    std::mutex publication_mutex;
+    aida::analysis::binary_id_t binary_id;
+    std::string module_name;
+    std::string pdb_name;
+    std::string pdb_guid;
+    std::uint32_t pdb_age = 0;
+    std::vector<pdb_expected_identity_t> expected_identities;
+    std::string symbol_server = "https://msdl.microsoft.com/download/symbols";
+    std::string local_candidate;
+    std::string reason;
+    std::string status;
+    bool remote_pending = false;
+    bool local_pending = false;
+    bool loading = false;
+    bool failed = false;
+    bool declined = false;
+    bool committing = false;
+    bool operation_remote = false;
+    bool load_types = true;
+    bool load_names = true;
+    std::uint64_t bytes_received = 0;
+    std::uint64_t bytes_total = 0;
+    int progress_percent = 0;
+    std::uint64_t workspace_generation = 0;
+    std::uint64_t generation = 0;
+    std::optional<std::uint64_t> task_id;
+    std::shared_ptr<std::atomic<bool>> parser_cancel;
+    std::shared_ptr<std::atomic<float>> parser_progress;
+};
+
+namespace {
+
+using aida::analysis::analysis_metrics_t;
+using aida::analysis::analysis_workspace_t;
+using aida::analysis::baseline_analysis_service_t;
+using aida::analysis::baseline_analysis_settings_t;
+using aida::analysis::cancellation_token_t;
+using aida::analysis::decompiler_service_t;
+using aida::analysis::make_workspace_error;
+using aida::analysis::open_live_workspace_request_t;
+using aida::analysis::open_static_workspace_request_t;
+using aida::analysis::overlay_journal_t;
+using aida::analysis::persisted_search_products_t;
+using aida::analysis::search_index_t;
+using aida::analysis::workspace_database_options_t;
+using aida::analysis::workspace_database_t;
+using aida::analysis::workspace_database_versions_t;
+using aida::analysis::workspace_error_code_t;
+using aida::analysis::workspace_error_t;
+using aida::analysis::workspace_readiness_t;
+using aida::analysis::workspace_registry;
+using aida::analysis::workspace_result_t;
+
+struct live_session_binding_t {
+    driver_bridge::identity::live_target_identity_t source_identity;
+    std::uint64_t capture_time_100ns = 0;
+    std::uint64_t capture_size = 0;
+    std::string capture_hash;
+    bool stale = false;
+    std::string stale_code;
+    std::string stale_detail;
+};
+
+struct session_state_t {
+    std::vector<std::shared_ptr<analysis_session_t>> sessions;
+    std::unordered_map<std::string, live_session_binding_t> live_bindings;
+    int active_idx = -1;
+    std::uint64_t id_counter = 0;
+    std::mutex mutex;
+    std::recursive_mutex activation_mutex;
+    std::string last_error;
+};
+
+session_state_t& state()
+{
+    static session_state_t value;
+    return value;
 }
 
-inline uint64_t now_steady_ms() {
-	auto tp = std::chrono::steady_clock::now().time_since_epoch();
-	return static_cast<uint64_t>(
-		std::chrono::duration_cast<std::chrono::milliseconds>(tp).count());
+struct static_workspace_gate_registry_t {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::weak_ptr<std::timed_mutex>> gates;
+};
+
+static_workspace_gate_registry_t& static_workspace_gates()
+{
+    static static_workspace_gate_registry_t value;
+    return value;
 }
 
-inline std::string derive_filename(const std::string& path) {
-	size_t sl = path.find_last_of("/\\");
-	return (sl != std::string::npos) ? path.substr(sl + 1) : path;
+std::shared_ptr<std::timed_mutex> static_workspace_gate(const std::string& binary_id)
+{
+    auto& registry = static_workspace_gates();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto found = registry.gates.find(binary_id);
+    if (found != registry.gates.end()) {
+        if (auto existing = found->second.lock()) return existing;
+        registry.gates.erase(found);
+    }
+    if (registry.gates.size() >= 4096) {
+        for (auto it = registry.gates.begin(); it != registry.gates.end();) {
+            if (it->second.expired()) it = registry.gates.erase(it);
+            else ++it;
+        }
+    }
+    auto created = std::make_shared<std::timed_mutex>();
+    registry.gates.emplace(binary_id, created);
+    return created;
 }
 
-inline std::string make_session_id(uint64_t counter) {
-	char buf[40];
-	std::snprintf(buf, sizeof(buf), "as_%016llx", static_cast<unsigned long long>(counter));
-	return std::string(buf);
+std::uint64_t now_steady_ms()
+{
+    const auto value = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(value).count());
 }
 
-inline bool paths_equal(const std::string& a, const std::string& b) {
-	if (a.size() != b.size()) return false;
-	for (size_t i = 0; i < a.size(); ++i) {
-		char ca = a[i];
-		char cb = b[i];
-		if (ca == '/' ) ca = '\\';
-		if (cb == '/') cb = '\\';
-		if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
-		if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
-		if (ca != cb) return false;
-	}
-	return true;
+std::string derive_filename(const std::string& path)
+{
+    const size_t separator = path.find_last_of("/\\");
+    return separator == std::string::npos ? path : path.substr(separator + 1);
 }
 
-inline std::wstring widen_utf8(const std::string& s) {
-	if (s.empty()) return {};
-	int needed = MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
-		static_cast<int>(s.size()), nullptr, 0);
-	if (needed <= 0) return {};
-	std::wstring out(static_cast<size_t>(needed), L'\0');
-	MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
-		static_cast<int>(s.size()), out.data(), needed);
-	return out;
+std::string make_session_id(std::uint64_t counter)
+{
+    char text[40]{};
+    std::snprintf(text, sizeof(text), "as_%016llx",
+                  static_cast<unsigned long long>(counter));
+    return text;
 }
 
-inline void capture_live_into_session_locked(analysis_session_t& dst) {
-	dst.disasm_file = std::make_unique<DisasmFile>(std::move(g_disasm.file));
-	g_disasm.file = DisasmFile{};
-	dst.fn_cache = function_index::detach_snapshot();
-	dst.xref_registry = xref_index::detach_snapshot();
-	dst.symbol_snap = symbol_store::detach_snapshot();
-	dst.decomp_snap = decompiler_engine::detach_snapshot();
-	dst.disasm_view_snap = disasm_view::detach_snapshot();
-	dst.types_hub_snap = types_hub_view::detach_snapshot();
-	dst.crypto_snap = crypto_scanner::detach_snapshot();
-	dst.xref_db_snap = xref_db::detach_snapshot();
-
-	if (dst.attached_pid != 0) {
-		auto live = std::make_unique<live_attach_snapshot_t>();
-		live->breakpoints = debugger_engine::snapshot_breakpoints();
-		live->watches = debugger_engine::snapshot_watches();
-		dst.live_snap = std::move(live);
-		debugger_engine::clear_breakpoints_and_watches();
-	}
+bool paths_equal(const std::string& lhs, const std::string& rhs)
+{
+    if (lhs.size() != rhs.size()) return false;
+    for (size_t index = 0; index < lhs.size(); ++index) {
+        char left = lhs[index] == '/' ? '\\' : lhs[index];
+        char right = rhs[index] == '/' ? '\\' : rhs[index];
+        if (left >= 'A' && left <= 'Z') left = static_cast<char>(left - 'A' + 'a');
+        if (right >= 'A' && right <= 'Z') right = static_cast<char>(right - 'A' + 'a');
+        if (left != right) return false;
+    }
+    return true;
 }
 
-inline void restore_session_into_live_locked(analysis_session_t& src) {
-	if (src.disasm_file) {
-		g_disasm.file = std::move(*src.disasm_file);
-		src.disasm_file.reset();
-	} else {
-		g_disasm.file = DisasmFile{};
-	}
-	function_index::attach_snapshot(std::move(src.fn_cache));
-	xref_index::attach_snapshot(std::move(src.xref_registry));
-	symbol_store::attach_snapshot(std::move(src.symbol_snap));
-	decompiler_engine::attach_snapshot(std::move(src.decomp_snap));
-	disasm_view::attach_snapshot(std::move(src.disasm_view_snap));
-	types_hub_view::attach_snapshot(std::move(src.types_hub_snap));
-	crypto_scanner::attach_snapshot(std::move(src.crypto_snap));
-	xref_db::attach_snapshot(std::move(src.xref_db_snap));
-
-	const uint32_t previous_pid = driver_bridge::attached_pid();
-	if (src.attached_pid != 0) {
-		if (previous_pid != 0 && previous_pid != src.attached_pid)
-			stealth_engine::disable_for_detach(previous_pid, "analysis_session.restore.replace");
-		bool active_ok = driver_bridge::set_active_pid(src.attached_pid);
-		if (!active_ok) {
-			(void)driver_bridge::attach_additional(src.attached_pid);
-			active_ok = driver_bridge::set_active_pid(src.attached_pid);
-		}
-		if (active_ok && driver_bridge::attached_pid() == src.attached_pid) {
-			(void)stealth_engine::ensure_default_enabled(src.attached_pid, "analysis_session.restore");
-		} else if (previous_pid != 0 && driver_bridge::attached_pid() == previous_pid) {
-			(void)stealth_engine::ensure_default_enabled(previous_pid, "analysis_session.restore_failed_switch");
-		}
-	} else {
-		if (previous_pid != 0)
-			stealth_engine::disable_for_detach(previous_pid, "analysis_session.restore.clear");
-		(void)driver_bridge::clear_active_pid();
-	}
-
-	if (src.live_snap) {
-		debugger_engine::restore_breakpoints_and_watches(
-			std::move(src.live_snap->breakpoints),
-			std::move(src.live_snap->watches));
-		src.live_snap.reset();
-	} else {
-		debugger_engine::clear_breakpoints_and_watches();
-	}
+std::wstring widen_utf8(const std::string& text)
+{
+    if (text.empty()) return {};
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (required <= 0) return {};
+    std::wstring result(static_cast<size_t>(required), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(),
+            static_cast<int>(text.size()), result.data(), required) != required)
+        return {};
+    return result;
 }
 
-inline void reset_live_to_default_locked() {
-	const uint32_t pid_before = driver_bridge::attached_pid();
-	const std::string name_before = driver_bridge::attached_process_name();
-	diag::log_tagged_fmt("analysis_session",
-		"reset_live_to_default_begin pid_before=%u name='%s' active_idx=%d sessions=%llu path='%s'",
-		pid_before,
-		name_before.c_str(),
-		state().active_idx,
-		static_cast<unsigned long long>(state().sessions.size()),
-		g_disasm.file.path.c_str());
-	g_disasm.file = DisasmFile{};
-	function_index::attach_snapshot(nullptr);
-	xref_index::attach_snapshot(nullptr);
-	symbol_store::attach_snapshot(nullptr);
-	decompiler_engine::attach_snapshot(nullptr);
-	disasm_view::attach_snapshot(nullptr);
-	types_hub_view::attach_snapshot(nullptr);
-	crypto_scanner::attach_snapshot(nullptr);
-	xref_db::attach_snapshot(nullptr);
-	debugger_engine::clear_breakpoints_and_watches();
-	stealth_engine::disable_for_detach(pid_before, "analysis_session.reset_live");
-	const bool clear_ok = driver_bridge::clear_active_pid();
-	diag::log_tagged_fmt("analysis_session",
-		"reset_live_to_default_end pid_before=%u clear_ok=%d pid_after=%u last_error='%s'",
-		pid_before,
-		clear_ok ? 1 : 0,
-		driver_bridge::attached_pid(),
-		driver_bridge::last_error().c_str());
+std::string narrow_utf8(const std::wstring& text)
+{
+    if (text.empty()) return {};
+    const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (required <= 0) return {};
+    std::string result(static_cast<size_t>(required), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.c_str(),
+            static_cast<int>(text.size()), result.data(), required, nullptr, nullptr) != required)
+        return {};
+    return result;
 }
 
-inline void evict_lru_if_needed_locked() {
-	if (state().sessions.size() <= kMaxSessions) return;
-	size_t victim = 0;
-	uint64_t oldest = UINT64_MAX;
-	bool found = false;
-	for (size_t i = 0; i < state().sessions.size(); ++i) {
-		if (static_cast<int>(i) == state().active_idx) continue;
-		if (state().sessions[i]->last_active_steady_ms < oldest) {
-			oldest = state().sessions[i]->last_active_steady_ms;
-			victim = i;
-			found = true;
-		}
-	}
-	if (!found) return;
-	auto& vs = *state().sessions[victim];
-	if (vs.attached_pid != 0) {
-		(void)driver_bridge::detach_one(vs.attached_pid);
-	}
-	if (static_cast<int>(victim) < state().active_idx) {
-		state().active_idx -= 1;
-	}
-	state().sessions.erase(state().sessions.begin() + victim);
+workspace_database_versions_t database_versions(const analysis_workspace_t& workspace)
+{
+    workspace_database_versions_t versions;
+    versions.engine_version = "aida-pe-workspace-engine-1";
+    versions.specification_version = "pe-x86-zydis-4.1.1-ghidra-native-1";
+    versions.analysis_settings_hash = workspace.identity().load_profile_hash().to_hex();
+    return versions;
+}
+
+workspace_result_t<void> install_workspace_services(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    std::shared_ptr<workspace_database_t>& database_out)
+{
+    workspace_database_options_t expected;
+    expected.identity = workspace->identity_handle();
+    expected.versions = database_versions(*workspace);
+    auto validate_database = [&](const std::shared_ptr<workspace_database_t>& database)
+        -> workspace_result_t<void> {
+        if (!database || !database->options().identity ||
+            database->options().identity->binary_id() !=
+                workspace->identity().binary_id()) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "Installed database identity does not match its workspace",
+                "analysis_session.services.database"));
+        }
+        const auto& actual = database->options().versions;
+        if (actual.engine_version != expected.versions.engine_version ||
+            actual.specification_version != expected.versions.specification_version ||
+            actual.analysis_settings_hash !=
+                expected.versions.analysis_settings_hash) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "Installed database versions do not match the workspace engine",
+                "analysis_session.services.database"));
+        }
+        return workspace_result_t<void>::success();
+    };
+
+    auto database = workspace->database();
+    if (!database) {
+        auto opened = workspace_database_t::open(expected);
+        if (!opened)
+            return workspace_result_t<void>::failure(opened.error());
+        auto registered = workspace->register_lifecycle_participant(opened.value());
+        if (!registered) return registered;
+        auto installed = workspace->install_database(opened.value());
+        if (!installed) {
+            database = workspace->database();
+            if (!database)
+                return installed;
+        } else {
+            database = opened.take_value();
+        }
+    }
+    auto database_valid = validate_database(database);
+    if (!database_valid) return database_valid;
+
+    auto database_queue = database->queue();
+    if (!database_queue) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::persistence_failure,
+            "Workspace database did not provide its persistence queue",
+            "analysis_session.services.queue"));
+    }
+    auto installed_queue = workspace->persistence_queue();
+    if (!installed_queue) {
+        auto registered = workspace->register_lifecycle_participant(database_queue);
+        if (!registered) return registered;
+        auto installed = workspace->install_persistence_queue(database_queue);
+        if (!installed) {
+            installed_queue = workspace->persistence_queue();
+            if (!installed_queue) return installed;
+        } else {
+            installed_queue = database_queue;
+        }
+    }
+    if (installed_queue != database_queue) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "Installed persistence queue is not owned by the workspace database",
+            "analysis_session.services.queue"));
+    }
+
+    if (!workspace->overlay()) {
+        auto opened = overlay_journal_t::open(workspace, database);
+        if (!opened && !workspace->overlay())
+            return workspace_result_t<void>::failure(opened.error());
+    }
+    if (!workspace->overlay()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::service_conflict,
+            "Workspace overlay installation did not publish a service",
+            "analysis_session.services.overlay"));
+    }
+
+    if (!workspace->decompiler()) {
+        auto created = decompiler_service_t::create(
+            workspace, database, expected.versions);
+        if (!created && !workspace->decompiler())
+            return workspace_result_t<void>::failure(created.error());
+    }
+    if (!workspace->decompiler()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::service_conflict,
+            "Workspace decompiler installation did not publish a service",
+            "analysis_session.services.decompiler"));
+    }
+    database_out = std::move(database);
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<bool> reopen_persisted_analysis(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    const std::shared_ptr<workspace_database_t>& database,
+    const cancellation_token_t& cancel)
+{
+    auto loaded = database->load_snapshot(workspace->image(), cancel);
+    if (!loaded)
+        return workspace_result_t<bool>::failure(loaded.error());
+    if (!loaded.value())
+        return workspace_result_t<bool>::success(false);
+    const auto& snapshot = loaded.value();
+    if (snapshot->generation != workspace->generation() ||
+        snapshot->analysis_revision != workspace->analysis_revision() + 1 ||
+        snapshot->overlay_revision != workspace->overlay_revision()) {
+        return workspace_result_t<bool>::failure(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "Persisted analysis generation or revision does not match the reopened workspace",
+            "analysis_session.reopen"));
+    }
+    auto products = database->load_search_products(snapshot->generation,
+        snapshot->analysis_revision, snapshot->overlay_revision, cancel);
+    if (!products)
+        return workspace_result_t<bool>::failure(products.error());
+    auto metrics = std::make_shared<analysis_metrics_t>(snapshot->generation);
+    auto index = search_index_t::build(snapshot,
+        std::move(products.value().data_candidates),
+        std::move(products.value().switches),
+        std::move(products.value().types), metrics, {}, cancel);
+    if (!index)
+        return workspace_result_t<bool>::failure(index.error());
+    auto published = workspace->publish_analysis_bundle(workspace->generation(),
+        workspace->analysis_revision(), snapshot, index.take_value(),
+        snapshot->baseline_complete);
+    if (!published)
+        return workspace_result_t<bool>::failure(published.error());
+    return workspace_result_t<bool>::success(true);
+}
+
+void record_load_failure(const std::string& session_id, workspace_error_t error)
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    for (const auto& session : state().sessions) {
+        if (session->id != session_id) continue;
+        session->open_task_id.reset();
+        session->load_state = session_load_state_t::failed;
+        session->load_error = std::move(error);
+        state().last_error = session->load_error->stable_code() + ": " +
+                             session->load_error->message;
+        return;
+    }
+}
+
+std::vector<std::string> local_pdb_candidates(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    constexpr std::size_t kMaximumCandidates = 64;
+    constexpr std::uint64_t kMaximumPdbBytes =
+        2ULL * 1024ULL * 1024ULL * 1024ULL;
+    std::vector<std::filesystem::path> candidates;
+    const std::filesystem::path source(workspace->identity().normalized_source_path());
+    const std::filesystem::path parent = source.parent_path();
+    if (!source.empty()) {
+        auto sibling = source;
+        sibling.replace_extension(".pdb");
+        candidates.push_back(std::move(sibling));
+    }
+    if (const auto image = workspace->image()) {
+        for (const auto& record : image->codeview_records()) {
+            if (record.pdb_path.empty()) continue;
+            if (candidates.size() == kMaximumCandidates) break;
+            std::filesystem::path recorded(record.pdb_path);
+            if (!parent.empty())
+                candidates.push_back(parent / recorded.filename());
+        }
+    }
+    std::set<std::string> unique;
+    std::vector<std::string> result;
+    for (const auto& candidate : candidates) {
+        if (result.size() == kMaximumCandidates) break;
+        std::error_code error;
+        auto absolute = std::filesystem::absolute(candidate, error);
+        if (error) absolute = candidate;
+        if (!std::filesystem::is_regular_file(absolute, error) || error)
+            continue;
+        const auto size = std::filesystem::file_size(absolute, error);
+        if (error || size == 0 || size > kMaximumPdbBytes) continue;
+        std::string key = absolute.lexically_normal().string();
+        if (key.empty() || key.size() > 32768 ||
+            key.find('\0') != std::string::npos)
+            continue;
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        if (unique.insert(key).second)
+            result.push_back(absolute.string());
+    }
+    return result;
+}
+
+struct pdb_binding_t {
+    std::string session_id;
+    std::shared_ptr<analysis_workspace_t> workspace;
+    std::shared_ptr<symbol_store::workspace_state_t> symbols;
+    std::shared_ptr<pdb_session_state_t> prompt;
+};
+
+struct handle_closer_t {
+    void operator()(void* handle) const noexcept
+    {
+        if (handle && handle != INVALID_HANDLE_VALUE)
+            CloseHandle(static_cast<HANDLE>(handle));
+    }
+};
+
+using unique_handle_t = std::unique_ptr<void, handle_closer_t>;
+
+struct msf_superblock_t {
+    std::array<char, 32> magic{};
+    std::uint32_t block_size = 0;
+    std::uint32_t free_block_map = 0;
+    std::uint32_t block_count = 0;
+    std::uint32_t directory_bytes = 0;
+    std::uint32_t unknown = 0;
+    std::uint32_t block_map = 0;
+};
+
+struct pdb_info_header_t {
+    std::uint32_t version = 0;
+    std::uint32_t signature = 0;
+    std::uint32_t age = 0;
+    std::array<std::uint8_t, 16> guid{};
+};
+
+static_assert(sizeof(msf_superblock_t) == 56);
+static_assert(sizeof(pdb_info_header_t) == 28);
+
+bool read_file_exact(HANDLE file, std::uint64_t offset, void* destination,
+    std::size_t size, const std::shared_ptr<std::atomic<bool>>& cancel)
+{
+    if (file == INVALID_HANDLE_VALUE || !destination || size == 0 ||
+        offset > static_cast<std::uint64_t>(std::numeric_limits<LONGLONG>::max()))
+        return false;
+    LARGE_INTEGER position{};
+    position.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN)) return false;
+    auto* output = static_cast<std::uint8_t*>(destination);
+    std::size_t consumed = 0;
+    while (consumed < size) {
+        if (cancel && cancel->load(std::memory_order_acquire)) return false;
+        const DWORD requested = static_cast<DWORD>((std::min<std::size_t>)(
+            size - consumed, 1024 * 1024));
+        DWORD received = 0;
+        if (!ReadFile(file, output + consumed, requested, &received, nullptr) ||
+            received != requested)
+            return false;
+        consumed += received;
+    }
+    return true;
+}
+
+bool parse_pdb_file_identity(HANDLE file, std::uint64_t file_size,
+    const std::shared_ptr<std::atomic<bool>>& cancel,
+    pdb_info_header_t& identity, std::string& failure)
+{
+    constexpr std::array<char, 32> kMagic = {
+        'M', 'i', 'c', 'r', 'o', 's', 'o', 'f', 't', ' ', 'C', '/', 'C', '+', '+', ' ',
+        'M', 'S', 'F', ' ', '7', '.', '0', '0', '\r', '\n', '\x1a', 'D', 'S', '\0', '\0', '\0'};
+    constexpr std::uint64_t kMaximumDirectoryBytes = 64ULL * 1024ULL * 1024ULL;
+    constexpr std::uint32_t kMaximumStreams = 1024 * 1024;
+    auto reject = [&failure](std::string message) {
+        failure = std::move(message);
+        return false;
+    };
+    msf_superblock_t superblock;
+    if (!read_file_exact(file, 0, &superblock, sizeof(superblock), cancel))
+        return reject(cancel && cancel->load(std::memory_order_acquire)
+            ? "PDB identity read was cancelled" : "PDB superblock is unreadable");
+    if (superblock.magic != kMagic)
+        return reject("PDB uses an unsupported or malformed MSF container");
+    switch (superblock.block_size) {
+    case 512:
+    case 1024:
+    case 2048:
+    case 4096:
+    case 8192:
+    case 16384:
+    case 32768:
+        break;
+    default:
+        return reject("PDB block size is unsupported");
+    }
+    if (superblock.free_block_map != 1 && superblock.free_block_map != 2)
+        return reject("PDB free-block map is malformed");
+    if (superblock.block_count == 0 ||
+        static_cast<std::uint64_t>(superblock.block_count) * superblock.block_size !=
+            file_size)
+        return reject("PDB block count does not match its immutable file size");
+    if (superblock.directory_bytes == 0 ||
+        superblock.directory_bytes > kMaximumDirectoryBytes ||
+        (superblock.directory_bytes % sizeof(std::uint32_t)) != 0)
+        return reject("PDB directory size is invalid or exceeds its budget");
+    const std::uint64_t directory_block_count =
+        (static_cast<std::uint64_t>(superblock.directory_bytes) +
+            superblock.block_size - 1) / superblock.block_size;
+    if (directory_block_count == 0 ||
+        directory_block_count > superblock.block_size / sizeof(std::uint32_t) ||
+        superblock.block_map == 0 || superblock.block_map >= superblock.block_count)
+        return reject("PDB directory block map is malformed");
+    auto free_map_block = [&superblock](std::uint32_t block) {
+        const std::uint32_t interval = block % superblock.block_size;
+        return interval == 1 || interval == 2;
+    };
+    if (free_map_block(superblock.block_map))
+        return reject("PDB directory block map overlaps a reserved block");
+    auto reserved_block = [&superblock, &free_map_block](std::uint32_t block) {
+        return block == 0 || block == superblock.block_map || free_map_block(block);
+    };
+    std::vector<std::uint32_t> directory_blocks(
+        static_cast<std::size_t>(directory_block_count));
+    const std::uint64_t block_map_offset =
+        static_cast<std::uint64_t>(superblock.block_map) * superblock.block_size;
+    if (!read_file_exact(file, block_map_offset, directory_blocks.data(),
+            directory_blocks.size() * sizeof(std::uint32_t), cancel))
+        return reject(cancel && cancel->load(std::memory_order_acquire)
+            ? "PDB identity read was cancelled" : "PDB directory block map is unreadable");
+    std::unordered_set<std::uint32_t> occupied_blocks;
+    occupied_blocks.reserve(directory_blocks.size() * 2 + 8);
+    occupied_blocks.insert(0);
+    occupied_blocks.insert(superblock.free_block_map);
+    occupied_blocks.insert(3U - superblock.free_block_map);
+    occupied_blocks.insert(superblock.block_map);
+    std::vector<std::uint8_t> directory(superblock.directory_bytes);
+    std::size_t directory_offset = 0;
+    for (const std::uint32_t block : directory_blocks) {
+        if (block >= superblock.block_count || reserved_block(block) ||
+            !occupied_blocks.insert(block).second)
+            return reject("PDB directory contains an overlapping or invalid block");
+        const std::size_t take = (std::min<std::size_t>)(
+            superblock.block_size, directory.size() - directory_offset);
+        if (!read_file_exact(file,
+                static_cast<std::uint64_t>(block) * superblock.block_size,
+                directory.data() + directory_offset, take, cancel))
+            return reject(cancel && cancel->load(std::memory_order_acquire)
+                ? "PDB identity read was cancelled" : "PDB directory block is unreadable");
+        directory_offset += take;
+    }
+    if (directory_offset != directory.size())
+        return reject("PDB directory is incomplete");
+    std::size_t cursor = 0;
+    auto read_u32 = [&directory, &cursor](std::uint32_t& value) {
+        if (cursor > directory.size() || directory.size() - cursor < sizeof(value))
+            return false;
+        std::memcpy(&value, directory.data() + cursor, sizeof(value));
+        cursor += sizeof(value);
+        return true;
+    };
+    std::uint32_t stream_count = 0;
+    if (!read_u32(stream_count) || stream_count < 2 || stream_count > kMaximumStreams)
+        return reject("PDB stream count is invalid or exceeds its budget");
+    if (static_cast<std::uint64_t>(stream_count) * sizeof(std::uint32_t) >
+        directory.size() - cursor)
+        return reject("PDB stream-size table is truncated");
+    std::vector<std::uint32_t> stream_sizes(stream_count);
+    std::memcpy(stream_sizes.data(), directory.data() + cursor,
+        stream_sizes.size() * sizeof(std::uint32_t));
+    cursor += stream_sizes.size() * sizeof(std::uint32_t);
+    std::vector<std::uint32_t> info_blocks;
+    for (std::uint32_t stream = 0; stream < stream_count; ++stream) {
+        const std::uint32_t stream_size = stream_sizes[stream];
+        const std::uint64_t block_count = stream_size == UINT32_MAX || stream_size == 0
+            ? 0
+            : (static_cast<std::uint64_t>(stream_size) + superblock.block_size - 1) /
+                superblock.block_size;
+        if (block_count > (directory.size() - cursor) / sizeof(std::uint32_t))
+            return reject("PDB stream block map is truncated");
+        if (stream == 1) info_blocks.reserve(static_cast<std::size_t>(block_count));
+        for (std::uint64_t block_index = 0; block_index < block_count; ++block_index) {
+            std::uint32_t block = 0;
+            if (!read_u32(block) || block >= superblock.block_count ||
+                reserved_block(block) ||
+                !occupied_blocks.insert(block).second)
+                return reject("PDB streams contain an overlapping or invalid block");
+            if (stream == 1) info_blocks.push_back(block);
+        }
+    }
+    if (cursor != directory.size())
+        return reject("PDB directory contains trailing unaccounted data");
+    if (stream_sizes[1] < sizeof(pdb_info_header_t) || info_blocks.empty())
+        return reject("PDB information stream is missing or truncated");
+    std::array<std::uint8_t, sizeof(pdb_info_header_t)> header_bytes{};
+    std::size_t header_offset = 0;
+    for (const std::uint32_t block : info_blocks) {
+        if (header_offset == header_bytes.size()) break;
+        const std::size_t take = (std::min<std::size_t>)(
+            superblock.block_size, header_bytes.size() - header_offset);
+        if (!read_file_exact(file,
+                static_cast<std::uint64_t>(block) * superblock.block_size,
+                header_bytes.data() + header_offset, take, cancel))
+            return reject(cancel && cancel->load(std::memory_order_acquire)
+                ? "PDB identity read was cancelled" : "PDB information stream is unreadable");
+        header_offset += take;
+    }
+    if (header_offset != header_bytes.size())
+        return reject("PDB information stream header is incomplete");
+    std::memcpy(&identity, header_bytes.data(), sizeof(identity));
+    switch (identity.version) {
+    case 20000404:
+    case 20030901:
+    case 20091201:
+    case 20140508:
+        break;
+    default:
+        return reject("PDB information stream version is unsupported");
+    }
+    return true;
+}
+
+bool pdb_identity_matches(const pdb_info_header_t& actual,
+    const std::vector<pdb_expected_identity_t>& expected)
+{
+    for (const auto& candidate : expected) {
+        if (candidate.age != actual.age) continue;
+        if (candidate.uses_guid) {
+            if (candidate.guid == actual.guid) return true;
+        } else if (candidate.signature != 0 && candidate.signature == actual.signature) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<pdb_binding_t> pdb_binding_for_workspace(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    if (!workspace) return std::nullopt;
+    std::lock_guard<std::mutex> lock(state().mutex);
+    for (const auto& session : state().sessions) {
+        if (session->workspace != workspace || !session->symbols || !session->pdb_state)
+            continue;
+        if (session->symbols->binary_id() != workspace->identity().binary_id() ||
+            session->pdb_state->binary_id != workspace->identity().binary_id())
+            return std::nullopt;
+        return pdb_binding_t{session->id, workspace, session->symbols, session->pdb_state};
+    }
+    return std::nullopt;
+}
+
+std::string format_codeview_guid(const std::array<std::uint8_t, 16>& guid)
+{
+    std::uint32_t data1 = 0;
+    std::uint16_t data2 = 0;
+    std::uint16_t data3 = 0;
+    std::memcpy(&data1, guid.data(), sizeof(data1));
+    std::memcpy(&data2, guid.data() + 4, sizeof(data2));
+    std::memcpy(&data3, guid.data() + 6, sizeof(data3));
+    char text[40]{};
+    std::snprintf(text, sizeof(text),
+        "%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X",
+        data1, data2, data3, guid[8], guid[9], guid[10], guid[11], guid[12],
+        guid[13], guid[14], guid[15]);
+    return text;
+}
+
+bool valid_remote_pdb_name(const std::string& name)
+{
+    if (name.empty() || name.size() > 260 || name == "." || name == "..") return false;
+    for (unsigned char value : name) {
+        if ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+            (value >= '0' && value <= '9') || value == '.' || value == '_' || value == '-')
+            continue;
+        return false;
+    }
+    return true;
+}
+
+bool valid_codeview_guid(const std::string& guid)
+{
+    if (guid.size() != 32) return false;
+    bool nonzero = false;
+    for (unsigned char value : guid) {
+        const bool hex = (value >= '0' && value <= '9') ||
+            (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F');
+        if (!hex) return false;
+        if (value != '0') nonzero = true;
+    }
+    return nonzero;
+}
+
+void initialize_pdb_prompt(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    const std::shared_ptr<pdb_session_state_t>& prompt)
+{
+    if (!workspace || !prompt) return;
+    std::string pdb_name;
+    std::string pdb_guid;
+    std::uint32_t pdb_age = 0;
+    std::vector<pdb_expected_identity_t> expected_identities;
+    bool remote_identity_selected = false;
+    if (const auto image = workspace->image()) {
+        for (const auto& record : image->codeview_records()) {
+            if (record.pdb_path.empty()) continue;
+            pdb_expected_identity_t expected;
+            expected.guid = record.guid;
+            expected.signature = record.timestamp;
+            expected.age = record.age;
+            expected.uses_guid = std::any_of(record.guid.begin(), record.guid.end(),
+                [](std::uint8_t value) { return value != 0; });
+            if (expected_identities.size() < 64)
+                expected_identities.push_back(expected);
+            const std::string candidate_name =
+                std::filesystem::path(record.pdb_path).filename().string();
+            const std::string candidate_guid = format_codeview_guid(record.guid);
+            const bool remote_capable = expected.uses_guid && record.age != 0 &&
+                valid_remote_pdb_name(candidate_name) &&
+                valid_codeview_guid(candidate_guid);
+            if (pdb_name.empty() || (!remote_identity_selected && remote_capable)) {
+                pdb_name = candidate_name;
+                pdb_guid = candidate_guid;
+                pdb_age = record.age;
+                remote_identity_selected = remote_capable;
+            }
+        }
+    }
+    const auto candidates = local_pdb_candidates(workspace);
+    std::lock_guard<std::mutex> lock(prompt->mutex);
+    prompt->binary_id = workspace->identity().binary_id();
+    prompt->workspace_generation = workspace->generation();
+    prompt->module_name = workspace->identity().bin_name();
+    prompt->pdb_name = std::move(pdb_name);
+    prompt->pdb_guid = std::move(pdb_guid);
+    prompt->pdb_age = pdb_age;
+    prompt->expected_identities = std::move(expected_identities);
+    prompt->committing = false;
+    prompt->parser_progress.reset();
+    prompt->local_candidate = candidates.empty() ? std::string() : candidates.front();
+    prompt->remote_pending = prompt->local_candidate.empty() &&
+        valid_remote_pdb_name(prompt->pdb_name) &&
+        valid_codeview_guid(prompt->pdb_guid) && prompt->pdb_age != 0;
+    prompt->local_pending = prompt->local_candidate.empty() &&
+        !prompt->remote_pending && !prompt->pdb_name.empty();
+    prompt->reason = prompt->remote_pending
+        ? "The workspace references debug symbols available from the configured symbol server."
+        : (prompt->local_pending
+            ? "The workspace references a PDB that was not found beside the binary."
+            : std::string());
+    prompt->status = prompt->local_candidate.empty()
+        ? (prompt->remote_pending ? "Awaiting symbol download approval"
+            : (prompt->local_pending ? "Awaiting a local PDB path" : "No external PDB requested"))
+        : "Loading local PDB";
+}
+
+struct pdb_task_request_t {
+    bool remote = false;
+    bool load_types = true;
+    bool load_names = true;
+    std::string local_path;
+};
+
+workspace_result_t<void> submit_pdb_task(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    pdb_task_request_t request)
+{
+    auto binding = pdb_binding_for_workspace(workspace);
+    if (!binding) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::target_not_found,
+            "PDB operation requires an open workspace session",
+            "analysis_session.pdb"));
+    }
+    if (workspace->target_kind() != aida::analysis::target_kind_t::static_file ||
+        workspace->closing() || workspace->closed()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::workspace_closing,
+            "PDB operation requires an open static workspace",
+            "analysis_session.pdb"));
+    }
+    if (!request.load_types && !request.load_names) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "At least one PDB fact family must be selected",
+            "analysis_session.pdb"));
+    }
+    constexpr std::uint64_t kMaximumPdbBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    const auto workspace_binary_id = workspace->identity().binary_id();
+    const std::uint64_t workspace_generation = workspace->generation();
+    std::uint64_t generation = 0;
+    std::string module_name;
+    std::string pdb_name;
+    std::string pdb_guid;
+    std::uint32_t pdb_age = 0;
+    std::string symbol_server;
+    std::vector<pdb_expected_identity_t> expected_identities;
+    auto parser_cancel = std::make_shared<std::atomic<bool>>(false);
+    auto parser_progress = std::make_shared<std::atomic<float>>(0.0f);
+    {
+        std::lock_guard<std::mutex> lock(binding->prompt->mutex);
+        if (binding->prompt->loading) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::analysis_in_progress,
+                "A PDB operation is already active for this workspace",
+                "analysis_session.pdb"));
+        }
+        if (binding->prompt->binary_id != workspace_binary_id ||
+            binding->prompt->workspace_generation != workspace_generation ||
+            binding->symbols->binary_id() != workspace_binary_id) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "PDB state identity does not match the selected workspace",
+                "analysis_session.pdb"));
+        }
+        if (request.remote && (!valid_remote_pdb_name(binding->prompt->pdb_name) ||
+            !valid_codeview_guid(binding->prompt->pdb_guid) ||
+            binding->prompt->pdb_age == 0)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "The workspace has no valid CodeView symbol-server identity",
+                "analysis_session.pdb"));
+        }
+        if (binding->prompt->generation == UINT64_MAX) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::range_overflow,
+                "PDB operation generation overflowed",
+                "analysis_session.pdb"));
+        }
+        generation = ++binding->prompt->generation;
+        binding->prompt->loading = true;
+        binding->prompt->failed = false;
+        binding->prompt->declined = false;
+        binding->prompt->committing = false;
+        binding->prompt->operation_remote = request.remote;
+        binding->prompt->remote_pending = false;
+        binding->prompt->local_pending = false;
+        binding->prompt->load_types = request.load_types;
+        binding->prompt->load_names = request.load_names;
+        binding->prompt->bytes_received = 0;
+        binding->prompt->bytes_total = 0;
+        binding->prompt->progress_percent = 0;
+        binding->prompt->status = request.remote ? "Resolving PDB" : "Parsing local PDB";
+        binding->prompt->parser_cancel = parser_cancel;
+        binding->prompt->parser_progress = parser_progress;
+        module_name = binding->prompt->module_name;
+        pdb_name = binding->prompt->pdb_name;
+        pdb_guid = binding->prompt->pdb_guid;
+        pdb_age = binding->prompt->pdb_age;
+        symbol_server = binding->prompt->symbol_server;
+        expected_identities = binding->prompt->expected_identities;
+    }
+    const bool remote_operation = request.remote;
+    auto fail = [prompt = binding->prompt, generation, remote_operation](std::string message,
+        bool cancelled = false) {
+        std::lock_guard<std::mutex> lock(prompt->mutex);
+        if (prompt->generation != generation || !prompt->loading) return;
+        if (prompt->committing) {
+            prompt->status = "Finishing PDB publication";
+            return;
+        }
+        prompt->loading = false;
+        prompt->failed = !cancelled;
+        prompt->remote_pending = remote_operation;
+        prompt->local_pending = !remote_operation;
+        prompt->status = std::move(message);
+        prompt->parser_cancel.reset();
+        prompt->parser_progress.reset();
+        prompt->task_id.reset();
+    };
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "analysis_session";
+    submission.label = request.remote
+        ? "analysis_session.workspace_pdb_remote"
+        : "analysis_session.workspace_pdb_local";
+    submission.thread_class = "external_tool";
+    submission.domain = aida::infra::executor::domain_t::external_tool;
+    submission.priority = 2;
+    submission.generation = generation;
+    submission.target_id = binding->session_id.c_str();
+    submission.failure_policy = "reject_not_started";
+    submission.deadline_ms = aida::infra::executor::now_ms() + 240000;
+    submission.cancel_hook = [parser_cancel, fail]() {
+        parser_cancel->store(true, std::memory_order_release);
+        fail("PDB operation cancelled or deadline exceeded", true);
+    };
+    submission.body = [workspace, symbols = binding->symbols, prompt = binding->prompt,
+        request = std::move(request), module_name = std::move(module_name),
+        pdb_name = std::move(pdb_name), pdb_guid = std::move(pdb_guid), pdb_age,
+        symbol_server = std::move(symbol_server), parser_cancel, parser_progress,
+        generation, fail,
+        workspace_binary_id, workspace_generation,
+        expected_identities = std::move(expected_identities)]() mutable {
+        auto current = [&]() {
+            if (parser_cancel->load(std::memory_order_acquire) ||
+                workspace->cancellation_token().stop_requested() ||
+                workspace->closing() || workspace->closed() ||
+                workspace->generation() != workspace_generation ||
+                workspace->identity().binary_id() != workspace_binary_id ||
+                symbols->binary_id() != workspace_binary_id ||
+                analysis_session::symbols_for_workspace(workspace) != symbols)
+                return false;
+            std::lock_guard<std::mutex> lock(prompt->mutex);
+            return prompt->generation == generation && prompt->loading &&
+                prompt->binary_id == workspace_binary_id &&
+                prompt->workspace_generation == workspace_generation;
+        };
+        if (!current()) {
+            fail("PDB operation cancelled", true);
+            return;
+        }
+        std::string local_path = request.local_path;
+        if (request.remote) {
+            const auto paths = symbols->path_snapshot();
+            if (paths.truncated || paths.cache_dir.empty()) {
+                fail("Workspace symbol cache path is unavailable");
+                return;
+            }
+            pdb_downloader::download_request_t download;
+            download.pdb_name = pdb_name;
+            download.pdb_guid = pdb_guid;
+            download.pdb_age = pdb_age;
+            download.server_base = symbol_server;
+            download.cache_root = paths.cache_dir;
+            pdb_downloader::download_result_t result;
+            auto download_limit_exceeded = std::make_shared<std::atomic<bool>>(false);
+            auto progress = [prompt, parser_cancel, generation,
+                download_limit_exceeded, kMaximumPdbBytes](
+                const pdb_downloader::progress_t& value) {
+                if (parser_cancel->load(std::memory_order_acquire)) return;
+                if (value.bytes_received > kMaximumPdbBytes ||
+                    value.bytes_total > kMaximumPdbBytes) {
+                    download_limit_exceeded->store(true, std::memory_order_release);
+                    parser_cancel->store(true, std::memory_order_release);
+                }
+                std::lock_guard<std::mutex> lock(prompt->mutex);
+                if (prompt->generation != generation || !prompt->loading) return;
+                prompt->bytes_received = value.bytes_received;
+                prompt->bytes_total = value.bytes_total;
+                prompt->progress_percent = (std::max)(0, (std::min)(100, value.percent));
+                prompt->status = download_limit_exceeded->load(std::memory_order_acquire)
+                    ? "PDB download exceeds the workspace byte budget"
+                    : "Downloading PDB";
+            };
+            if (!pdb_downloader::download_pdb_sync(download, progress,
+                parser_cancel.get(), result) || !result.ok) {
+                const bool limit_exceeded =
+                    download_limit_exceeded->load(std::memory_order_acquire);
+                fail(limit_exceeded
+                        ? "PDB download exceeds the 2 GiB workspace budget"
+                        : (parser_cancel->load(std::memory_order_acquire)
+                            ? "PDB download cancelled"
+                            : "PDB download failed: " + result.error),
+                    !limit_exceeded &&
+                        parser_cancel->load(std::memory_order_acquire));
+                return;
+            }
+            if (result.bytes_downloaded > kMaximumPdbBytes) {
+                fail("PDB download exceeds the 2 GiB workspace budget");
+                return;
+            }
+            local_path = result.local_path;
+        }
+        if (!current()) {
+            fail("PDB operation cancelled", true);
+            return;
+        }
+        if (local_path.empty() || local_path.size() > 32768 ||
+            local_path.find('\0') != std::string::npos) {
+            fail("PDB path is empty or exceeds the workspace path budget");
+            return;
+        }
+        std::error_code error;
+        auto absolute = std::filesystem::absolute(std::filesystem::path(local_path), error);
+        if (error || !std::filesystem::is_regular_file(absolute, error) || error) {
+            fail("PDB path is not a readable regular file");
+            return;
+        }
+        HANDLE raw_file = CreateFileW(absolute.c_str(),
+            GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+        if (raw_file == INVALID_HANDLE_VALUE) {
+            fail("PDB file could not be opened with an immutable read lease");
+            return;
+        }
+        unique_handle_t file_guard(raw_file);
+        LARGE_INTEGER file_size_value{};
+        BY_HANDLE_FILE_INFORMATION file_identity{};
+        if (!GetFileSizeEx(raw_file, &file_size_value) ||
+            file_size_value.QuadPart <= 0 ||
+            static_cast<std::uint64_t>(file_size_value.QuadPart) > kMaximumPdbBytes ||
+            !GetFileInformationByHandle(raw_file, &file_identity)) {
+            fail("PDB file size is outside the 2 GiB workspace budget");
+            return;
+        }
+        const std::uint64_t file_size =
+            static_cast<std::uint64_t>(file_size_value.QuadPart);
+        pdb_info_header_t pdb_identity;
+        std::string identity_failure;
+        if (!parse_pdb_file_identity(raw_file, file_size, parser_cancel,
+                pdb_identity, identity_failure)) {
+            fail(identity_failure.empty()
+                ? "PDB identity validation failed" : std::move(identity_failure),
+                parser_cancel->load(std::memory_order_acquire));
+            return;
+        }
+        if (expected_identities.empty() ||
+            !pdb_identity_matches(pdb_identity, expected_identities)) {
+            fail("PDB identity does not match this workspace's CodeView record");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(prompt->mutex);
+            if (prompt->generation != generation || !prompt->loading) return;
+            prompt->status = "Parsing PDB";
+            prompt->progress_percent = 0;
+        }
+        pdb_parser::pdb_info_t information;
+        parser_progress->store(0.0f, std::memory_order_release);
+        const std::filesystem::path source(workspace->identity().normalized_source_path());
+        const bool parsed = pdb_parser::parse_pdb_bounded(absolute.string(),
+            source.parent_path().string(), information, parser_progress.get(), parser_cancel.get(),
+            symbol_store::k_explicit_pdb_load_timeout_ms);
+        if (!parsed || !information.loaded) {
+            fail(parser_cancel->load(std::memory_order_acquire)
+                ? "PDB parse cancelled" : "PDB parse failed",
+                parser_cancel->load(std::memory_order_acquire));
+            return;
+        }
+        BY_HANDLE_FILE_INFORMATION current_identity{};
+        LARGE_INTEGER current_size{};
+        if (!GetFileInformationByHandle(raw_file, &current_identity) ||
+            !GetFileSizeEx(raw_file, &current_size) ||
+            current_size.QuadPart != file_size_value.QuadPart ||
+            current_identity.dwVolumeSerialNumber != file_identity.dwVolumeSerialNumber ||
+            current_identity.nFileIndexHigh != file_identity.nFileIndexHigh ||
+            current_identity.nFileIndexLow != file_identity.nFileIndexLow ||
+            current_identity.ftLastWriteTime.dwHighDateTime !=
+                file_identity.ftLastWriteTime.dwHighDateTime ||
+            current_identity.ftLastWriteTime.dwLowDateTime !=
+                file_identity.ftLastWriteTime.dwLowDateTime) {
+            fail("PDB file changed during parsing");
+            return;
+        }
+        if (information.symbols.size() > 4 * 1024 * 1024 ||
+            information.structs.size() > 1024 * 1024 ||
+            information.enums.size() > 1024 * 1024) {
+            fail("PDB metadata exceeds workspace record budgets");
+            return;
+        }
+        if (!request.load_names) {
+            information.symbols.clear();
+            information.symbol_by_name.clear();
+            information.symbol_by_rva.clear();
+        }
+        if (!request.load_types) {
+            information.structs.clear();
+            information.enums.clear();
+            information.struct_by_name.clear();
+            information.struct_by_ti.clear();
+        }
+        symbol_store::module_symbols_t module;
+        module.module_name = module_name;
+        module.base = workspace->identity().image_base();
+        module.size = workspace->image() ? workspace->image()->image_size() : 0;
+        module.pdb = std::move(information);
+        module.pdb_path = absolute.string();
+        module.pdb_file_size = file_size;
+        module.parse_completed = true;
+        module.parse_progress = 1.0f;
+        module.status_text = "Loaded workspace PDB";
+        {
+            const bool symbols_current =
+                analysis_session::symbols_for_workspace(workspace) == symbols;
+            std::lock_guard<std::mutex> publication_lock(prompt->publication_mutex);
+            {
+                std::lock_guard<std::mutex> lock(prompt->mutex);
+                if (prompt->generation != generation || !prompt->loading)
+                    return;
+                const bool cancelled = parser_cancel->load(std::memory_order_acquire) ||
+                    workspace->cancellation_token().stop_requested() ||
+                    workspace->closing() || workspace->closed();
+                const bool identity_mismatch =
+                    prompt->binary_id != workspace_binary_id ||
+                    prompt->workspace_generation != workspace_generation ||
+                    workspace->generation() != workspace_generation ||
+                    workspace->identity().binary_id() != workspace_binary_id ||
+                    symbols->binary_id() != workspace_binary_id || !symbols_current;
+                if (cancelled || identity_mismatch) {
+                    prompt->loading = false;
+                    prompt->failed = identity_mismatch;
+                    prompt->remote_pending = !identity_mismatch && request.remote;
+                    prompt->local_pending = !identity_mismatch && !request.remote;
+                    prompt->status = identity_mismatch
+                        ? "PDB publication identity no longer matches its workspace"
+                        : "PDB operation cancelled before publication";
+                    prompt->parser_cancel.reset();
+                    prompt->parser_progress.reset();
+                    prompt->task_id.reset();
+                    return;
+                }
+                prompt->committing = true;
+                prompt->status = "Publishing PDB";
+            }
+            const bool published = symbols->upsert_module(std::move(module));
+            std::lock_guard<std::mutex> lock(prompt->mutex);
+            prompt->committing = false;
+            if (prompt->generation != generation || !prompt->loading ||
+                prompt->binary_id != workspace_binary_id ||
+                prompt->workspace_generation != workspace_generation)
+                return;
+            if (!published) {
+                prompt->loading = false;
+                prompt->failed = true;
+                prompt->remote_pending = request.remote;
+                prompt->local_pending = !request.remote;
+                prompt->status = "PDB metadata exceeds workspace symbol-store budgets";
+                prompt->parser_cancel.reset();
+                prompt->parser_progress.reset();
+                prompt->task_id.reset();
+                return;
+            }
+            prompt->loading = false;
+            prompt->failed = false;
+            prompt->declined = false;
+            prompt->local_candidate = absolute.string();
+            prompt->progress_percent = 100;
+            prompt->status = "Loaded workspace PDB";
+            prompt->parser_cancel.reset();
+            prompt->parser_progress.reset();
+            prompt->task_id.reset();
+        }
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        fail("Failed to queue workspace PDB operation");
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::service_conflict,
+            "Failed to queue workspace PDB operation: " + submitted.reject_reason,
+            "analysis_session.pdb"));
+    }
+    {
+        std::lock_guard<std::mutex> lock(binding->prompt->mutex);
+        if (binding->prompt->generation == generation && binding->prompt->loading)
+            binding->prompt->task_id = submitted.task_id;
+    }
+    return workspace_result_t<void>::success();
+}
+
+bool bind_workspace(const std::string& session_id,
+                    const std::shared_ptr<analysis_workspace_t>& workspace,
+                    std::optional<aida::infra::taskflow_runtime::job_handle_t> baseline_job,
+                    session_load_state_t load_state)
+{
+    bool selected = false;
+    bool merged = false;
+    std::string merged_session_id;
+    std::shared_ptr<symbol_store::workspace_state_t> symbols;
+    std::shared_ptr<pdb_session_state_t> pdb_state;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        size_t target_index = static_cast<size_t>(-1);
+        for (size_t index = 0; index < state().sessions.size(); ++index) {
+            if (state().sessions[index]->id == session_id) {
+                target_index = index;
+                break;
+            }
+        }
+        if (target_index == static_cast<size_t>(-1)) return false;
+        for (size_t index = 0; index < state().sessions.size(); ++index) {
+            if (index == target_index) continue;
+            auto& existing = state().sessions[index];
+            if (!existing->workspace || !existing->symbols || !existing->pdb_state ||
+                existing->workspace->closing() || existing->workspace->closed() ||
+                existing->workspace->identity().binary_id() !=
+                    workspace->identity().binary_id())
+                continue;
+            selected = state().active_idx == static_cast<int>(target_index);
+            if (selected) {
+                state().active_idx = static_cast<int>(index);
+                for (auto& s : state().sessions)
+                    s->ui_selected = false;
+                existing->ui_selected = true;
+            }
+            existing->last_active_steady_ms = now_steady_ms();
+            merged_session_id = state().sessions[target_index]->id;
+            state().sessions.erase(state().sessions.begin() +
+                static_cast<std::ptrdiff_t>(target_index));
+            if (state().active_idx > static_cast<int>(target_index))
+                --state().active_idx;
+            merged = true;
+            break;
+        }
+        if (!merged) {
+            auto& session = state().sessions[target_index];
+            session->workspace = workspace;
+            session->symbols = std::make_shared<symbol_store::workspace_state_t>(
+                workspace->identity().binary_id());
+            symbols = session->symbols;
+            session->pdb_state = std::make_shared<pdb_session_state_t>();
+            session->pdb_state->binary_id = workspace->identity().binary_id();
+            pdb_state = session->pdb_state;
+            session->open_task_id.reset();
+            session->baseline_job = baseline_job;
+            session->load_state = load_state;
+            session->load_error.reset();
+            selected = state().active_idx == static_cast<int>(target_index);
+        }
+    }
+    if (merged) {
+        loading_binary_overlay::release_session(merged_session_id);
+        if (selected) {
+            const auto selection = workspace_registry().select_for_ui(
+                workspace->identity().binary_id());
+            if (!selection) {
+                std::lock_guard<std::mutex> lock(state().mutex);
+                state().last_error = selection.error().stable_code() + ": " +
+                    selection.error().message;
+            }
+        }
+        return true;
+    }
+    if (symbols && pdb_state) {
+        const std::filesystem::path source(workspace->identity().normalized_source_path());
+        std::vector<std::string> search_paths;
+        if (!source.parent_path().empty())
+            search_paths.push_back(source.parent_path().string());
+        if (!symbols->configure_paths(std::move(search_paths),
+                symbol_store::detail::get_cache_dir().string())) {
+            auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "Workspace symbol paths exceed bounded storage limits",
+                "analysis_session.bind_workspace");
+            record_load_failure(session_id, std::move(error));
+            return false;
+        }
+        initialize_pdb_prompt(workspace, pdb_state);
+        std::string local_candidate;
+        {
+            std::lock_guard<std::mutex> lock(pdb_state->mutex);
+            local_candidate = pdb_state->local_candidate;
+        }
+        if (!local_candidate.empty()) {
+            pdb_task_request_t request;
+            request.local_path = std::move(local_candidate);
+            const auto queued = submit_pdb_task(workspace, std::move(request));
+            if (!queued) {
+                diag::log_tagged_fmt("analysis_session",
+                    "local_pdb_submit_failed session=%s code=%s message=%s",
+                    session_id.c_str(), queued.error().stable_code().c_str(),
+                    queued.error().message.c_str());
+            }
+        }
+    }
+    if (selected) {
+        const auto selection = workspace_registry().select_for_ui(
+            workspace->identity().binary_id());
+        if (!selection) {
+            record_load_failure(session_id, selection.error());
+            return false;
+        }
+    }
+    return workspace_for_session_id(session_id) != nullptr;
+}
+
+void static_open_worker(std::string session_id, std::string path,
+                        cancellation_token_t cancel)
+{
+    auto acquired = acquire_static_workspace(path, cancel);
+    if (!acquired) {
+        record_load_failure(session_id, acquired.error());
+        return;
+    }
+    auto result = acquired.take_value();
+    const auto readiness = result.workspace->progress().readiness;
+    const auto load_state =
+        readiness == workspace_readiness_t::baseline_ready ||
+        readiness == workspace_readiness_t::partial
+            ? session_load_state_t::ready
+            : session_load_state_t::analyzing;
+    if (!bind_workspace(session_id, result.workspace,
+                        std::move(result.analysis_job), load_state)) {
+        if (!workspace_for_session_id(session_id) && !result.joined_existing) {
+            result.workspace->request_cancel();
+            (void)workspace_registry().close(result.workspace->identity().binary_id(),
+                std::chrono::steady_clock::now() + std::chrono::seconds(10));
+        }
+        diag::log_tagged_fmt("analysis_session",
+            "static_workspace_bind_skipped session=%s binary_id=%s started=%d joined=%d",
+            session_id.c_str(),
+            result.workspace->identity().binary_id().to_hex().c_str(),
+            result.analysis_started ? 1 : 0,
+            result.joined_existing ? 1 : 0);
+    }
+}
+
+bool inspect_live_pe(std::uint32_t pid, std::uint64_t base,
+                     bool& is_64_bit)
+{
+    std::vector<std::uint8_t> header;
+    if (!driver_bridge::read_memory_for(pid, base, 4096, header) ||
+        header.size() < sizeof(IMAGE_DOS_HEADER))
+        return false;
+    IMAGE_DOS_HEADER dos{};
+    std::memcpy(&dos, header.data(), sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0)
+        return false;
+    const std::uint64_t nt_offset = static_cast<std::uint64_t>(dos.e_lfanew);
+    const std::uint64_t required = nt_offset + sizeof(DWORD) +
+        sizeof(IMAGE_FILE_HEADER) + sizeof(WORD);
+    if (required > header.size()) {
+        if (required > (1ull << 20)) return false;
+        if (!driver_bridge::read_memory_for(pid, base, static_cast<size_t>(required), header) ||
+            header.size() < required)
+            return false;
+    }
+    DWORD signature = 0;
+    IMAGE_FILE_HEADER file_header{};
+    WORD optional_magic = 0;
+    std::memcpy(&signature, header.data() + nt_offset, sizeof(signature));
+    std::memcpy(&file_header, header.data() + nt_offset + sizeof(DWORD),
+                sizeof(file_header));
+    std::memcpy(&optional_magic,
+        header.data() + nt_offset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER),
+        sizeof(optional_magic));
+    if (signature != IMAGE_NT_SIGNATURE) return false;
+    const bool pe32 = file_header.Machine == IMAGE_FILE_MACHINE_I386 &&
+        optional_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+    const bool pe64 = file_header.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+        optional_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    if (!pe32 && !pe64) return false;
+    is_64_bit = pe64;
+    return true;
+}
+
+bool make_live_session_binding(
+    const driver_bridge::identity::live_target_identity_t& source_identity,
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    live_session_binding_t& out, std::string& out_error)
+{
+    const auto provider = workspace
+        ? std::dynamic_pointer_cast<const aida::analysis::live_snapshot_provider_t>(
+            workspace->provider_handle())
+        : nullptr;
+    if (!provider) {
+        out_error = "TARGET_STALE: live workspace has no immutable snapshot provider";
+        return false;
+    }
+    const auto& metadata = provider->metadata();
+    if (metadata.process.pid != source_identity.process.pid ||
+        metadata.process.creation_time_100ns != source_identity.process.creation_time_100ns ||
+        metadata.process.normalized_process_path !=
+            source_identity.process.normalized_process_path ||
+        metadata.module.base != source_identity.module.base ||
+        metadata.module.size != source_identity.module.size ||
+        metadata.module.normalized_name != source_identity.module.normalized_name ||
+        metadata.module.normalized_path != source_identity.module.normalized_path) {
+        out_error = "TARGET_STALE: snapshot metadata does not match live target identity";
+        return false;
+    }
+    out = {};
+    out.source_identity = source_identity;
+    out.capture_time_100ns = metadata.capture_time_100ns;
+    out.capture_size = metadata.capture_size;
+    out.capture_hash = metadata.capture_hash.to_hex();
+    return true;
+}
+
+void mark_live_session_stale(const std::string& session_id,
+                             const live_session_binding_t& binding,
+                             const std::string& code,
+                             const std::string& detail)
+{
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        const auto found = state().live_bindings.find(session_id);
+        if (found != state().live_bindings.end()) {
+            found->second.stale = true;
+            found->second.stale_code = code;
+            found->second.stale_detail = detail;
+        }
+        for (const auto& session : state().sessions) {
+            if (session->id != session_id) continue;
+            session->load_error = make_workspace_error(workspace_error_code_t::target_stale,
+                detail, "analysis_session.live_identity");
+            break;
+        }
+        state().last_error = code + ": " + detail;
+    }
+    diag::log_tagged_fmt("analysis_session",
+        "live_session_stale session=%s source_pid=%u process_creation_100ns=%llu module_base=0x%llX module_size=%llu capture_time_100ns=%llu capture_sha256=%s stale_code=%s detail=%s",
+        session_id.c_str(),
+        binding.source_identity.process.pid,
+        static_cast<unsigned long long>(binding.source_identity.process.creation_time_100ns),
+        static_cast<unsigned long long>(binding.source_identity.module.base),
+        static_cast<unsigned long long>(binding.source_identity.module.size),
+        static_cast<unsigned long long>(binding.capture_time_100ns),
+        binding.capture_hash.c_str(), code.c_str(), detail.c_str());
+}
+
+bool validate_live_session_binding(const std::string& session_id,
+                                   const std::shared_ptr<analysis_workspace_t>& workspace,
+                                   live_session_binding_t* out_binding,
+                                   std::string& out_error)
+{
+    live_session_binding_t binding;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        const auto found = state().live_bindings.find(session_id);
+        if (found == state().live_bindings.end()) {
+            out_error = "TARGET_STALE: live session identity binding is missing";
+            return false;
+        }
+        binding = found->second;
+    }
+    const auto target_validation = driver_bridge::identity::validate_live_target_identity(
+        binding.source_identity);
+    if (!target_validation.matches) {
+        out_error = std::string(driver_bridge::identity::staleness_code(
+            target_validation.staleness)) + ": " + target_validation.detail;
+        mark_live_session_stale(session_id, binding,
+            driver_bridge::identity::staleness_code(target_validation.staleness), out_error);
+        return false;
+    }
+    const auto provider = workspace
+        ? std::dynamic_pointer_cast<const aida::analysis::live_snapshot_provider_t>(
+            workspace->provider_handle())
+        : nullptr;
+    if (!provider) {
+        out_error = "TARGET_STALE: live workspace has no immutable snapshot provider";
+        mark_live_session_stale(session_id, binding, "TARGET_PROVIDER_MISSING", out_error);
+        return false;
+    }
+    const auto provider_validation = provider->validate_current_identity();
+    if (!provider_validation) {
+        out_error = provider_validation.error().stable_code() + ": " +
+            provider_validation.error().message;
+        mark_live_session_stale(session_id, binding, "TARGET_SNAPSHOT_STALE", out_error);
+        return false;
+    }
+    const auto& metadata = provider->metadata();
+    if (metadata.process.pid != binding.source_identity.process.pid ||
+        metadata.process.creation_time_100ns !=
+            binding.source_identity.process.creation_time_100ns ||
+        metadata.process.normalized_process_path !=
+            binding.source_identity.process.normalized_process_path ||
+        metadata.module.base != binding.source_identity.module.base ||
+        metadata.module.size != binding.source_identity.module.size ||
+        metadata.module.normalized_name != binding.source_identity.module.normalized_name ||
+        metadata.module.normalized_path != binding.source_identity.module.normalized_path ||
+        metadata.capture_time_100ns != binding.capture_time_100ns ||
+        metadata.capture_size != binding.capture_size ||
+        metadata.capture_hash.to_hex() != binding.capture_hash) {
+        out_error = "TARGET_STALE: immutable snapshot metadata changed";
+        mark_live_session_stale(session_id, binding, "TARGET_SNAPSHOT_METADATA_CHANGED", out_error);
+        return false;
+    }
+    if (out_binding) *out_binding = std::move(binding);
+    return true;
+}
+
+bool attached_pid_contains(std::uint32_t pid)
+{
+    const auto pids = driver_bridge::attached_pids();
+    return std::find(pids.begin(), pids.end(), pid) != pids.end();
+}
+
+void restore_driver_active_pid(std::uint32_t previous_pid)
+{
+    if (previous_pid != 0 && attached_pid_contains(previous_pid)) {
+        (void)driver_bridge::set_active_pid(previous_pid);
+    } else {
+        (void)driver_bridge::clear_active_pid();
+    }
+}
+
+bool ensure_driver_active_for_session(std::uint32_t pid, bool& attached_by_transaction,
+                                      std::string& out_error)
+{
+    attached_by_transaction = false;
+    if (pid == 0 || pid == static_cast<std::uint32_t>(GetCurrentProcessId())) {
+        out_error = pid == static_cast<std::uint32_t>(GetCurrentProcessId())
+            ? "SELF_TARGET_REFUSED"
+            : "invalid_pid";
+        return false;
+    }
+    if (!attached_pid_contains(pid)) {
+        const auto attached = driver_bridge::attached_pids();
+        const bool added = attached.empty()
+            ? driver_bridge::attach(pid)
+            : driver_bridge::attach_additional(pid);
+        if (!added) {
+            out_error = "attach_failed: " + driver_bridge::last_error();
+            return false;
+        }
+        attached_by_transaction = true;
+    }
+    if (!driver_bridge::set_active_pid(pid)) {
+        out_error = "activate_failed: " + driver_bridge::last_error();
+        return false;
+    }
+    return true;
+}
+
+void rollback_driver_activation(std::uint32_t pid, std::uint32_t previous_pid,
+                                bool attached_by_transaction)
+{
+    if (attached_by_transaction)
+        (void)driver_bridge::detach_one(pid);
+    if (driver_bridge::attached_pid() != previous_pid)
+        restore_driver_active_pid(previous_pid);
+}
+
+bool activate_session_transaction(size_t idx, std::string* out_error)
+{
+    std::lock_guard<std::recursive_mutex> activation_lock(state().activation_mutex);
+    std::shared_ptr<analysis_session_t> session;
+    std::shared_ptr<analysis_workspace_t> workspace;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        if (idx >= state().sessions.size()) {
+            state().last_error = "idx_out_of_range";
+            if (out_error) *out_error = state().last_error;
+            return false;
+        }
+        session = state().sessions[idx];
+        workspace = session->workspace;
+    }
+    if (!workspace) {
+        const std::string error = "workspace_unavailable";
+        std::lock_guard<std::mutex> lock(state().mutex);
+        state().last_error = error;
+        if (out_error) *out_error = error;
+        return false;
+    }
+
+    const bool live = session->attached_pid != 0;
+    const std::uint32_t previous_driver_pid = driver_bridge::attached_pid();
+    bool attached_by_transaction = false;
+    std::string error;
+    if (live && !validate_live_session_binding(session->id, workspace, nullptr, error)) {
+        if (out_error) *out_error = error;
+        return false;
+    }
+    if (live && !ensure_driver_active_for_session(session->attached_pid,
+                                                   attached_by_transaction, error)) {
+        rollback_driver_activation(session->attached_pid, previous_driver_pid,
+                                   attached_by_transaction);
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        if (out_error) *out_error = error;
+        return false;
+    }
+    if (live && !validate_live_session_binding(session->id, workspace, nullptr, error)) {
+        rollback_driver_activation(session->attached_pid, previous_driver_pid,
+                                   attached_by_transaction);
+        if (out_error) *out_error = error;
+        return false;
+    }
+
+    const auto selected = workspace_registry().select_for_ui(workspace->identity().binary_id());
+    if (!selected) {
+        error = selected.error().stable_code() + ": " + selected.error().message;
+        if (live)
+            rollback_driver_activation(session->attached_pid, previous_driver_pid,
+                                       attached_by_transaction);
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        if (out_error) *out_error = error;
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        if (idx >= state().sessions.size() || state().sessions[idx] != session) {
+            error = "session_changed_during_activation";
+            state().last_error = error;
+        } else {
+            for (auto& candidate : state().sessions)
+                candidate->ui_selected = false;
+            session->ui_selected = true;
+            session->last_active_steady_ms = now_steady_ms();
+            state().active_idx = static_cast<int>(idx);
+            state().last_error.clear();
+            return true;
+        }
+    }
+    if (live)
+        rollback_driver_activation(session->attached_pid, previous_driver_pid,
+                                   attached_by_transaction);
+    if (out_error) *out_error = error;
+    return false;
+}
+
+bool may_detach_live_binding(std::uint32_t pid,
+                             const std::optional<live_session_binding_t>& binding,
+                             const char* reason)
+{
+    if (pid == 0 || !binding) return pid != 0;
+    const auto validation = driver_bridge::identity::validate_live_target_identity(
+        binding->source_identity);
+    if (validation.matches ||
+        validation.staleness == driver_bridge::identity::staleness_t::process_unavailable ||
+        validation.staleness == driver_bridge::identity::staleness_t::process_exited ||
+        validation.staleness == driver_bridge::identity::staleness_t::module_unavailable)
+        return true;
+    diag::log_tagged_fmt("analysis_session",
+        "live_session_detach_skipped reason=%s source_pid=%u process_creation_100ns=%llu module_base=0x%llX module_size=%llu capture_sha256=%s stale_code=%s detail=%s",
+        reason, pid,
+        static_cast<unsigned long long>(binding->source_identity.process.creation_time_100ns),
+        static_cast<unsigned long long>(binding->source_identity.module.base),
+        static_cast<unsigned long long>(binding->source_identity.module.size),
+        binding->capture_hash.c_str(),
+        driver_bridge::identity::staleness_code(validation.staleness),
+        validation.detail.c_str());
+    return false;
+}
+
+void close_workspace_async(std::shared_ptr<analysis_workspace_t> workspace,
+                           std::uint32_t pid,
+                           std::optional<live_session_binding_t> binding = {})
+{
+    auto fallback_workspace = workspace;
+    auto fallback_binding = binding;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "analysis_session";
+    submission.label = "analysis_session.close_workspace";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.target_pid = pid;
+    submission.body = [workspace = std::move(workspace), pid, binding = std::move(binding)]() {
+        if (workspace) {
+            workspace->request_cancel();
+            const auto closed = workspace_registry().close(workspace->identity().binary_id(),
+                std::chrono::steady_clock::now() + std::chrono::seconds(10));
+            if (!closed) {
+                diag::log_tagged_fmt("analysis_session",
+                    "workspace_close_failed binary_id=%s code=%s message=%s",
+                    workspace->identity().binary_id().to_hex().c_str(),
+                    closed.error().stable_code().c_str(), closed.error().message.c_str());
+            }
+        }
+        if (may_detach_live_binding(pid, binding, "analysis_session.close")) {
+            stealth_engine::disable_for_detach(pid, "analysis_session.close");
+            (void)driver_bridge::detach_one(pid);
+        }
+    };
+    if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+        if (fallback_workspace) {
+            fallback_workspace->request_cancel();
+            (void)workspace_registry().close(
+                fallback_workspace->identity().binary_id(),
+                std::chrono::steady_clock::now());
+        }
+        if (may_detach_live_binding(pid, fallback_binding, "analysis_session.close_submit_failed")) {
+            stealth_engine::disable_for_detach(pid, "analysis_session.close_submit_failed");
+            (void)driver_bridge::detach_one(pid);
+        }
+    }
+}
+
+void refresh_load_state(analysis_session_t& session)
+{
+    if (!session.workspace || session.load_state == session_load_state_t::closed)
+        return;
+    const auto progress = session.workspace->progress();
+    if (progress.error) session.load_error = progress.error;
+    switch (progress.readiness) {
+    case workspace_readiness_t::baseline_ready:
+    case workspace_readiness_t::partial:
+        session.load_state = session_load_state_t::ready;
+        break;
+    case workspace_readiness_t::failed:
+        session.load_state = session_load_state_t::failed;
+        break;
+    case workspace_readiness_t::closing:
+    case workspace_readiness_t::cancelling:
+        session.load_state = session_load_state_t::closing;
+        break;
+    case workspace_readiness_t::closed:
+        session.load_state = session_load_state_t::closed;
+        break;
+    default:
+        session.load_state = session_load_state_t::analyzing;
+        break;
+    }
+}
+
+session_summary_t make_summary(const analysis_session_t& session, bool active)
+{
+    session_summary_t summary;
+    summary.id = session.id;
+    summary.kind = session.attached_pid == 0
+        ? session_kind_t::static_file
+        : session_kind_t::live_attach;
+    summary.path = session.path;
+    summary.filename = session.filename;
+    summary.pid = session.attached_pid;
+    summary.process_name = narrow_utf8(session.process_name);
+    summary.is_active = active;
+    summary.is_alive = session.workspace
+        ? !session.workspace->closed()
+        : session.load_state != session_load_state_t::closed;
+    summary.last_active_steady_ms = session.last_active_steady_ms;
+    summary.load_state = session.load_state;
+    summary.error = session.load_error;
+    if (session.workspace) {
+        const auto publication = session.workspace->analysis_publication();
+        summary.binary_id = session.workspace->identity().binary_id().to_hex();
+        summary.process_creation_time_100ns = session.workspace->identity().process()
+            ? session.workspace->identity().process()->creation_time_100ns
+            : 0;
+        summary.analysis_revision = publication ? publication->analysis_revision : 0;
+        summary.overlay_revision = session.workspace->overlay_revision();
+        summary.readiness = session.workspace->progress().readiness;
+    }
+    if (session.pdb_state) {
+        std::lock_guard<std::mutex> lock(session.pdb_state->mutex);
+        if (!session.workspace ||
+            session.pdb_state->workspace_generation == session.workspace->generation()) {
+            summary.pdb_remote_pending = session.pdb_state->remote_pending;
+            summary.pdb_local_pending = session.pdb_state->local_pending;
+            summary.pdb_loading = session.pdb_state->loading;
+            summary.pdb_failed = session.pdb_state->failed;
+            summary.pdb_status = session.pdb_state->status;
+            summary.pdb_bytes_received = session.pdb_state->bytes_received;
+            summary.pdb_bytes_total = session.pdb_state->bytes_total;
+            summary.pdb_progress_percent = session.pdb_state->progress_percent;
+            if (session.pdb_state->parser_progress) {
+                const int parser_percent = static_cast<int>((std::clamp)(
+                    session.pdb_state->parser_progress->load(std::memory_order_acquire),
+                    0.0f, 1.0f) * 100.0f);
+                summary.pdb_progress_percent = (std::max)(
+                    summary.pdb_progress_percent, parser_percent);
+            }
+        }
+    }
+    if (session.symbols) summary.symbol_revision = session.symbols->revision();
+    return summary;
 }
 
 }
 
-bool open_session(const std::string& path) {
-	if (path.empty()) {
-		state().last_error = "empty_path";
-		return false;
-	}
-
-	if (loading_binary_overlay::is_active()) {
-		state().last_error = "load_in_flight";
-		return false;
-	}
-
-	{
-		std::lock_guard<std::mutex> lk(state().mu);
-		for (size_t i = 0; i < state().sessions.size(); ++i) {
-			if (paths_equal(state().sessions[i]->path, path)) {
-				if (static_cast<int>(i) == state().active_idx) {
-					state().sessions[i]->last_active_steady_ms = now_steady_ms();
-					return false;
-				}
-				int cur = state().active_idx;
-				if (cur >= 0 && cur < static_cast<int>(state().sessions.size())) {
-					auto& src = *state().sessions[cur];
-					capture_live_into_session_locked(src);
-					src.last_active_steady_ms = now_steady_ms();
-				}
-				auto& dst = *state().sessions[i];
-				restore_session_into_live_locked(dst);
-				dst.last_active_steady_ms = now_steady_ms();
-				state().active_idx = static_cast<int>(i);
-				return false;
-			}
-		}
-
-		int cur = state().active_idx;
-		if (cur >= 0 && cur < static_cast<int>(state().sessions.size())) {
-			auto& src = *state().sessions[cur];
-			capture_live_into_session_locked(src);
-			src.last_active_steady_ms = now_steady_ms();
-		}
-
-		reset_live_to_default_locked();
-
-		auto sess = std::make_unique<analysis_session_t>();
-		sess->id = make_session_id(++state().id_counter);
-		sess->path = path;
-		sess->filename = derive_filename(path);
-		sess->last_active_steady_ms = now_steady_ms();
-		state().sessions.push_back(std::move(sess));
-		state().active_idx = static_cast<int>(state().sessions.size()) - 1;
-
-		evict_lru_if_needed_locked();
-	}
-
-	loading_binary_overlay::begin_load(path,
-		loading_binary_overlay::completion_action_t::switch_to_disassembly_or_hex);
-	return true;
+aida::analysis::workspace_result_t<static_workspace_acquisition_t>
+acquire_static_workspace(const std::string& path,
+                         const aida::analysis::cancellation_token_t& cancel)
+{
+    auto fail = [](workspace_error_t error) {
+        return workspace_result_t<static_workspace_acquisition_t>::failure(
+            std::move(error));
+    };
+    if (path.empty()) {
+        return fail(make_workspace_error(workspace_error_code_t::invalid_argument,
+            "Static workspace path is empty", "analysis_session.acquire_static"));
+    }
+    if (cancel.stop_requested()) {
+        auto error = make_workspace_error(
+            cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                : workspace_error_code_t::cancelled,
+            cancel.deadline_exceeded() ? "Static workspace acquisition deadline expired"
+                : "Static workspace acquisition was cancelled",
+            "analysis_session.acquire_static");
+        error.deadline = cancel.deadline_exceeded();
+        error.cancellation = !error.deadline;
+        return fail(std::move(error));
+    }
+    baseline_analysis_settings_t settings;
+    open_static_workspace_request_t request;
+    request.source_path = path;
+    request.bin_name = derive_filename(path);
+    const std::string profile = "aida-pe-workspace-engine-1|" +
+        settings.canonical_json();
+    request.load_profile.assign(profile.begin(), profile.end());
+    auto opened = workspace_registry().open_static(request, cancel);
+    if (!opened) return fail(opened.error());
+    auto workspace = opened.take_value();
+    auto gate = static_workspace_gate(workspace->identity().binary_id().to_hex());
+    std::unique_lock<std::timed_mutex> gate_lock(*gate, std::defer_lock);
+    while (!gate_lock.try_lock_for(std::chrono::milliseconds(10))) {
+        if (cancel.stop_requested()) {
+            auto error = make_workspace_error(
+                cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                cancel.deadline_exceeded()
+                    ? "Static workspace gate deadline expired"
+                    : "Static workspace gate wait was cancelled",
+                "analysis_session.acquire_static.gate");
+            error.deadline = cancel.deadline_exceeded();
+            error.cancellation = !error.deadline;
+            return fail(std::move(error));
+        }
+        if (workspace->closing() || workspace->closed()) {
+            return fail(make_workspace_error(workspace_error_code_t::workspace_closing,
+                "Static workspace closed while waiting for its acquisition gate",
+                "analysis_session.acquire_static.gate"));
+        }
+    }
+    if (cancel.stop_requested()) {
+        auto error = make_workspace_error(
+            cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                : workspace_error_code_t::cancelled,
+            cancel.deadline_exceeded() ? "Static workspace acquisition deadline expired"
+                : "Static workspace acquisition was cancelled",
+            "analysis_session.acquire_static");
+        error.deadline = cancel.deadline_exceeded();
+        error.cancellation = !error.deadline;
+        return fail(std::move(error));
+    }
+    if (workspace->closing() || workspace->closed()) {
+        return fail(make_workspace_error(workspace_error_code_t::workspace_closing,
+            "Static workspace is closing", "analysis_session.acquire_static"));
+    }
+    const bool had_services = workspace->database() != nullptr;
+    std::shared_ptr<workspace_database_t> database;
+    auto services = install_workspace_services(workspace, database);
+    if (!services) return fail(services.error());
+    auto progress = workspace->progress();
+    static_workspace_acquisition_t result;
+    result.workspace = workspace;
+    result.joined_existing = had_services ||
+        progress.readiness == workspace_readiness_t::analyzing ||
+        progress.readiness == workspace_readiness_t::baseline_ready ||
+        progress.readiness == workspace_readiness_t::partial;
+    if (progress.readiness == workspace_readiness_t::analyzing ||
+        progress.readiness == workspace_readiness_t::baseline_ready ||
+        progress.readiness == workspace_readiness_t::partial) {
+        return workspace_result_t<static_workspace_acquisition_t>::success(
+            std::move(result));
+    }
+    auto reopened = reopen_persisted_analysis(workspace, database, cancel);
+    if (!reopened) return fail(reopened.error());
+    if (reopened.value()) {
+        result.joined_existing = true;
+        return workspace_result_t<static_workspace_acquisition_t>::success(
+            std::move(result));
+    }
+    progress = workspace->progress();
+    if (progress.readiness == workspace_readiness_t::analyzing ||
+        progress.readiness == workspace_readiness_t::baseline_ready ||
+        progress.readiness == workspace_readiness_t::partial) {
+        result.joined_existing = true;
+        return workspace_result_t<static_workspace_acquisition_t>::success(
+            std::move(result));
+    }
+    auto started = baseline_analysis_service_t::start(workspace, settings,
+        cancel.deadline());
+    if (!started) {
+        if (started.error().code == workspace_error_code_t::analysis_in_progress) {
+            progress = workspace->progress();
+            if (progress.readiness == workspace_readiness_t::analyzing ||
+                progress.readiness == workspace_readiness_t::baseline_ready ||
+                progress.readiness == workspace_readiness_t::partial) {
+                result.joined_existing = true;
+                return workspace_result_t<static_workspace_acquisition_t>::success(
+                    std::move(result));
+            }
+        }
+        return fail(started.error());
+    }
+    result.analysis_job = started.take_value();
+    result.analysis_started = true;
+    return workspace_result_t<static_workspace_acquisition_t>::success(
+        std::move(result));
 }
 
-bool open_attach_session(uint32_t pid, std::string* out_err) {
-	if (pid == 0) {
-		state().last_error = "invalid_pid";
-		if (out_err) *out_err = "invalid_pid";
-		diag::log_tagged("analysis_session", "open_attach_session_invalid_pid");
-		return false;
-	}
-
-	if (loading_binary_overlay::is_active() &&
-		!loading_binary_overlay::is_waiting_for_user_decision()) {
-		const uint32_t attached_now = driver_bridge::attached_pid();
-		const bool cancelled = (attached_now == pid)
-			? loading_binary_overlay::cancel_queued_load("analysis_session_open_attach_same_pid")
-			: false;
-		diag::log_tagged_fmt("analysis_session",
-			"open_attach_session_load_in_flight pid=%u attached_pid=%u phase=%s cancelled=%d",
-			pid,
-			attached_now,
-			loading_binary_overlay::current_phase_name(),
-			cancelled ? 1 : 0);
-		if (!cancelled) {
-			state().last_error = "load_in_flight";
-			if (out_err) *out_err = "load_in_flight";
-			return false;
-		}
-	}
-
-	std::lock_guard<std::mutex> lk(state().mu);
-
-	for (size_t i = 0; i < state().sessions.size(); ++i) {
-		if (state().sessions[i]->attached_pid == pid) {
-			if (static_cast<int>(i) == state().active_idx) {
-				state().sessions[i]->last_active_steady_ms = now_steady_ms();
-				return true;
-			}
-			int cur = state().active_idx;
-			if (cur >= 0 && cur < static_cast<int>(state().sessions.size())) {
-				auto& src = *state().sessions[cur];
-				capture_live_into_session_locked(src);
-				src.last_active_steady_ms = now_steady_ms();
-			}
-			auto& dst = *state().sessions[i];
-			restore_session_into_live_locked(dst);
-			dst.last_active_steady_ms = now_steady_ms();
-			state().active_idx = static_cast<int>(i);
-			return true;
-		}
-	}
-
-	uint32_t prev_active = driver_bridge::attached_pid();
-	bool attach_ok = false;
-	if (prev_active == pid) {
-		attach_ok = true;
-	} else {
-		if (prev_active != 0)
-			stealth_engine::disable_for_detach(prev_active, "analysis_session.open_attach.replace");
-		attach_ok = driver_bridge::attach(pid);
-	}
-	if (!attach_ok) {
-		if (prev_active != 0 && driver_bridge::attached_pid() == prev_active)
-			(void)stealth_engine::ensure_default_enabled(prev_active, "analysis_session.open_attach.restore_failed_switch");
-		state().last_error = std::string("attach_failed: ") + driver_bridge::last_error();
-		if (out_err) *out_err = state().last_error;
-		diag::log_tagged_fmt("analysis_session",
-			"open_attach_session pid=%u attach_failed err='%s'",
-			pid, state().last_error.c_str());
-		return false;
-	}
-	const bool stealth_ok = stealth_engine::ensure_default_enabled(pid, "analysis_session.open_attach");
-	diag::log_tagged_fmt("analysis_session",
-		"open_attach_session pid=%u attach_ok stealth_ok=%d name='%s'",
-		pid, stealth_ok ? 1 : 0, driver_bridge::attached_process_name().c_str());
-
-	int cur = state().active_idx;
-	if (cur >= 0 && cur < static_cast<int>(state().sessions.size())) {
-		auto& src = *state().sessions[cur];
-		capture_live_into_session_locked(src);
-		src.last_active_steady_ms = now_steady_ms();
-	}
-
-	g_disasm.file = DisasmFile{};
-	function_index::attach_snapshot(nullptr);
-	xref_index::attach_snapshot(nullptr);
-	symbol_store::attach_snapshot(nullptr);
-	decompiler_engine::attach_snapshot(nullptr);
-	disasm_view::attach_snapshot(nullptr);
-	types_hub_view::attach_snapshot(nullptr);
-	crypto_scanner::attach_snapshot(nullptr);
-	xref_db::attach_snapshot(nullptr);
-	debugger_engine::clear_breakpoints_and_watches();
-
-	auto sess = std::make_unique<analysis_session_t>();
-	sess->id = make_session_id(++state().id_counter);
-	sess->attached_pid = pid;
-	std::string pname = driver_bridge::attached_process_name();
-	sess->process_name = widen_utf8(pname);
-	sess->filename = pname.empty() ? (std::string("PID ") + std::to_string(pid)) : pname;
-	char path_buf[128];
-	std::snprintf(path_buf, sizeof(path_buf), "live://pid/%u", pid);
-	sess->path = path_buf;
-	sess->last_active_steady_ms = now_steady_ms();
-	state().sessions.push_back(std::move(sess));
-	state().active_idx = static_cast<int>(state().sessions.size()) - 1;
-
-	evict_lru_if_needed_locked();
-	return true;
+bool open_session(const std::string& path)
+{
+    if (path.empty()) {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        state().last_error = "empty_path";
+        return false;
+    }
+    std::string session_id;
+    cancellation_token_t cancel;
+    std::shared_ptr<analysis_workspace_t> existing_workspace;
+    bool existing_session = false;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        for (size_t index = 0; index < state().sessions.size(); ++index) {
+            if (!paths_equal(state().sessions[index]->path, path)) continue;
+            existing_session = true;
+            state().active_idx = static_cast<int>(index);
+            state().sessions[index]->last_active_steady_ms = now_steady_ms();
+            for (auto& s : state().sessions)
+                s->ui_selected = false;
+            state().sessions[index]->ui_selected = true;
+            existing_workspace = state().sessions[index]->workspace;
+            break;
+        }
+        if (!existing_session) {
+            if (state().sessions.size() >= kMaxSessions) {
+                state().last_error = "session_limit";
+                return false;
+            }
+            auto session = std::make_shared<analysis_session_t>();
+            session->id = make_session_id(++state().id_counter);
+            session->path = path;
+            session->filename = derive_filename(path);
+            session->session_name = session->filename;
+            session->session_created_ms = now_steady_ms();
+            session->last_active_steady_ms = now_steady_ms();
+            session->ui_selected = true;
+            session_id = session->id;
+            cancel = session->load_cancellation.token();
+            for (auto& existing_session : state().sessions)
+                existing_session->ui_selected = false;
+            state().sessions.push_back(std::move(session));
+            state().active_idx = static_cast<int>(state().sessions.size()) - 1;
+        }
+    }
+    if (existing_session) {
+        if (existing_workspace) {
+            const auto selected = workspace_registry().select_for_ui(
+                existing_workspace->identity().binary_id());
+            if (!selected) {
+                std::lock_guard<std::mutex> lock(state().mutex);
+                state().last_error = selected.error().stable_code();
+            }
+        }
+        return false;
+    }
+    loading_binary_overlay::track_session(session_id, path,
+        loading_binary_overlay::completion_action_t::switch_to_disassembly_or_hex);
+    if (cancel.stop_requested()) {
+        loading_binary_overlay::release_session(session_id);
+        return false;
+    }
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "analysis_session";
+    submission.label = "analysis_session.open_static";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.body = [session_id, path, cancel]() mutable {
+        static_open_worker(std::move(session_id), std::move(path), std::move(cancel));
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        auto error = make_workspace_error(workspace_error_code_t::provider_unavailable,
+            "Static workspace open task was rejected", "analysis_session.open");
+        error.details.emplace_back("reason", submitted.reject_reason);
+        record_load_failure(session_id, std::move(error));
+        return false;
+    }
+    bool session_present = false;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        for (const auto& session : state().sessions) {
+            if (session->id != session_id) continue;
+            session_present = true;
+            if (!session->workspace &&
+                session->load_state == session_load_state_t::opening)
+                session->open_task_id = submitted.task_id;
+            break;
+        }
+    }
+    if (!session_present) {
+        (void)aida::infra::executor::cancel(submitted.task_id);
+        loading_binary_overlay::release_session(session_id);
+        return false;
+    }
+    return true;
 }
 
-bool switch_session(size_t idx) {
-	std::lock_guard<std::mutex> lk(state().mu);
-	if (idx >= state().sessions.size()) {
-		state().last_error = "idx_out_of_range";
-		diag::log_tagged_fmt("analysis_session",
-			"switch_session_idx_out_of_range requested_idx=%llu count=%llu",
-			static_cast<unsigned long long>(idx),
-			static_cast<unsigned long long>(state().sessions.size()));
-		return false;
-	}
-	uint32_t dst_pid = state().sessions[idx]->attached_pid;
-	int src_idx = state().active_idx;
-	diag::log_tagged_fmt("analysis_session",
-		"switch_session src=%lld dst=%llu live_pid=%u path='%s'",
-		static_cast<long long>(src_idx),
-		static_cast<unsigned long long>(idx),
-		dst_pid,
-		state().sessions[idx]->path.c_str());
-	if (state().active_idx == static_cast<int>(idx)) {
-		state().sessions[idx]->last_active_steady_ms = now_steady_ms();
-		diag::log_tagged_fmt("analysis_session",
-			"switch_session_noop idx=%llu phase=%s",
-			static_cast<unsigned long long>(idx),
-			loading_binary_overlay::current_phase_name());
-		return true;
-	}
-	if (loading_binary_overlay::is_active() &&
-		!loading_binary_overlay::is_waiting_for_user_decision()) {
-		state().last_error = "load_in_flight";
-		diag::log_tagged_fmt("analysis_session",
-			"switch_session_refused_load_in_flight requested_idx=%llu phase=%s",
-			static_cast<unsigned long long>(idx),
-			loading_binary_overlay::current_phase_name());
-		return false;
-	}
-	int cur = state().active_idx;
-	if (cur >= 0 && cur < static_cast<int>(state().sessions.size())) {
-		auto& src = *state().sessions[cur];
-		capture_live_into_session_locked(src);
-		src.last_active_steady_ms = now_steady_ms();
-	}
-	auto& dst = *state().sessions[idx];
-	restore_session_into_live_locked(dst);
-	dst.last_active_steady_ms = now_steady_ms();
-	state().active_idx = static_cast<int>(idx);
-	return true;
+bool open_attach_session(std::uint32_t pid, std::string* out_err)
+{
+    std::lock_guard<std::recursive_mutex> activation_lock(state().activation_mutex);
+    if (pid == 0 || pid == GetCurrentProcessId()) {
+        const std::string error = pid == GetCurrentProcessId()
+            ? "SELF_TARGET_REFUSED"
+            : "invalid_pid";
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        if (out_err) *out_err = error;
+        return false;
+    }
+    size_t existing = 0;
+    if (find_session_by_pid(pid, &existing)) {
+        const auto workspace = workspace_for_session(existing);
+        std::string existing_session_id;
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            if (existing < state().sessions.size())
+                existing_session_id = state().sessions[existing]->id;
+        }
+        std::string existing_error;
+        if (!existing_session_id.empty() && validate_live_session_binding(
+                existing_session_id, workspace, nullptr, existing_error)) {
+            const bool activated = activate_session_transaction(existing, out_err);
+            if (!activated && out_err && out_err->empty()) *out_err = last_error();
+            return activated;
+        }
+        if (attached_pid_contains(pid))
+            (void)driver_bridge::detach_one(pid);
+        if (!close_session(existing)) {
+            const std::string error = "stale_session_close_failed";
+            {
+                std::lock_guard<std::mutex> lock(state().mutex);
+                state().last_error = error;
+            }
+            if (out_err) *out_err = error;
+            return false;
+        }
+    }
+
+    driver_bridge::identity::live_target_identity_t source_identity;
+    std::string identity_error;
+    if (!driver_bridge::identity::capture_live_target_identity(pid, 0, source_identity,
+                                                               &identity_error)) {
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = identity_error;
+        }
+        if (out_err) *out_err = identity_error;
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        if (state().sessions.size() >= kMaxSessions) {
+            state().last_error = "session_limit";
+            if (out_err) *out_err = state().last_error;
+            return false;
+        }
+    }
+    const std::uint32_t previous_pid = driver_bridge::attached_pid();
+    bool attached_by_transaction = false;
+    std::string driver_error;
+    if (!ensure_driver_active_for_session(pid, attached_by_transaction, driver_error)) {
+        rollback_driver_activation(pid, previous_pid, attached_by_transaction);
+        const std::string error = std::move(driver_error);
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        if (out_err) *out_err = error;
+        return false;
+    }
+    auto rollback_attach = [previous_pid, pid, attached_by_transaction](
+        const std::shared_ptr<analysis_workspace_t>& workspace = {}) {
+        if (workspace) {
+            workspace->request_cancel();
+            (void)workspace_registry().close(workspace->identity().binary_id(),
+                std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        }
+        rollback_driver_activation(pid, previous_pid, attached_by_transaction);
+    };
+    bool is_64_bit = true;
+    if (!inspect_live_pe(pid, source_identity.module.base, is_64_bit)) {
+        const std::string error = "MALFORMED_PE: live module header is invalid";
+        if (out_err) *out_err = error;
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        rollback_attach();
+        return false;
+    }
+    open_live_workspace_request_t request;
+    request.bin_name = source_identity.module.normalized_name;
+    request.snapshot.pid = pid;
+    request.snapshot.module_base = source_identity.module.base;
+    request.snapshot.module_size = source_identity.module.size;
+    request.snapshot.module_name = source_identity.module.normalized_name;
+    request.snapshot.module_path = source_identity.module.normalized_path;
+    request.snapshot.capture_address.space = aida::analysis::address_space_id_t::live_virtual;
+    request.snapshot.capture_address.value = source_identity.module.base;
+    request.snapshot.capture_address.architecture = is_64_bit
+        ? aida::analysis::architecture_id_t::x86_64
+        : aida::analysis::architecture_id_t::x86;
+    request.snapshot.capture_address.mode = is_64_bit
+        ? aida::analysis::architecture_mode_t::x86_64
+        : aida::analysis::architecture_mode_t::x86_32;
+    request.snapshot.capture_size = (std::min<std::uint64_t>)(source_identity.module.size,
+                                                               64ull * 1024ull);
+    request.format = is_64_bit
+        ? aida::analysis::format_id_t::pe32_plus
+        : aida::analysis::format_id_t::pe32;
+    request.architecture = request.snapshot.capture_address.architecture;
+    request.abi = is_64_bit
+        ? aida::analysis::abi_id_t::windows_x64
+        : aida::analysis::abi_id_t::windows_x86;
+    request.image_base = source_identity.module.base;
+    const std::string profile = "aida-live-header-snapshot-v1";
+    request.capture_profile.assign(profile.begin(), profile.end());
+    auto opened = workspace_registry().open_live(request);
+    if (!opened) {
+        const std::string error = opened.error().stable_code() + ": " + opened.error().message;
+        if (out_err) *out_err = error;
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        rollback_attach();
+        return false;
+    }
+    auto workspace = opened.take_value();
+    std::shared_ptr<workspace_database_t> database;
+    auto services = install_workspace_services(workspace, database);
+    if (!services) {
+        const std::string error = services.error().stable_code() + ": " + services.error().message;
+        if (out_err) *out_err = error;
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        rollback_attach(workspace);
+        return false;
+    }
+    live_session_binding_t binding;
+    std::string binding_error;
+    if (!make_live_session_binding(source_identity, workspace, binding, binding_error)) {
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = binding_error;
+        }
+        if (out_err) *out_err = binding_error;
+        rollback_attach(workspace);
+        return false;
+    }
+    const auto current_identity = driver_bridge::identity::validate_live_target_identity(
+        source_identity);
+    const auto provider = std::dynamic_pointer_cast<const aida::analysis::live_snapshot_provider_t>(
+        workspace->provider_handle());
+    const auto provider_identity = provider
+        ? provider->validate_current_identity()
+        : workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::target_stale,
+            "Live workspace has no immutable snapshot provider",
+            "analysis_session.open_attach"));
+    if (!current_identity.matches || !provider_identity) {
+        const std::string error = !current_identity.matches
+            ? std::string(driver_bridge::identity::staleness_code(current_identity.staleness)) +
+                ": " + current_identity.detail
+            : provider_identity.error().stable_code() + ": " + provider_identity.error().message;
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        if (out_err) *out_err = error;
+        rollback_attach(workspace);
+        return false;
+    }
+    auto session = std::make_shared<analysis_session_t>();
+    bool session_limit_reached = false;
+    size_t session_index = static_cast<size_t>(-1);
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        if (state().sessions.size() >= kMaxSessions) {
+            state().last_error = "session_limit";
+            session_limit_reached = true;
+        } else {
+            session->id = make_session_id(++state().id_counter);
+            session->attached_pid = pid;
+            session->process_name = widen_utf8(
+                derive_filename(source_identity.process.normalized_process_path));
+            session->filename = request.bin_name.empty()
+                ? "PID " + std::to_string(pid)
+                : request.bin_name;
+            session->session_name = session->filename;
+            session->session_created_ms = now_steady_ms();
+            session->path = "live://pid/" + std::to_string(pid);
+            session->last_active_steady_ms = now_steady_ms();
+            session->ui_selected = false;
+            session->workspace = workspace;
+            session->symbols = std::make_shared<symbol_store::workspace_state_t>(
+                workspace->identity().binary_id());
+            session->load_state = session_load_state_t::ready;
+            state().sessions.push_back(session);
+            state().live_bindings.emplace(session->id, binding);
+            session_index = state().sessions.size() - 1;
+        }
+    }
+    if (session_limit_reached) {
+        if (out_err) *out_err = "session_limit";
+        rollback_attach(workspace);
+        return false;
+    }
+    std::string activation_error;
+    if (!activate_session_transaction(session_index, &activation_error)) {
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            const auto iterator = std::find(state().sessions.begin(), state().sessions.end(), session);
+            if (iterator != state().sessions.end())
+                state().sessions.erase(iterator);
+            state().live_bindings.erase(session->id);
+            state().last_error = activation_error;
+        }
+        if (out_err) *out_err = activation_error;
+        rollback_attach(workspace);
+        return false;
+    }
+    const bool stealth = stealth_engine::ensure_default_enabled(pid,
+        "analysis_session.open_attach");
+    diag::log_tagged_fmt("analysis_session",
+        "open_attach_session session=%s source_pid=%u process_creation_100ns=%llu process_path=%s module_name=%s module_path=%s module_base=0x%llX module_size=%llu capture_time_100ns=%llu capture_size=%llu capture_sha256=%s staleness=NONE stealth=%d",
+        session->id.c_str(), pid,
+        static_cast<unsigned long long>(binding.source_identity.process.creation_time_100ns),
+        binding.source_identity.process.normalized_process_path.c_str(),
+        binding.source_identity.module.normalized_name.c_str(),
+        binding.source_identity.module.normalized_path.c_str(),
+        static_cast<unsigned long long>(binding.source_identity.module.base),
+        static_cast<unsigned long long>(binding.source_identity.module.size),
+        static_cast<unsigned long long>(binding.capture_time_100ns),
+        static_cast<unsigned long long>(binding.capture_size), binding.capture_hash.c_str(),
+        stealth ? 1 : 0);
+    return true;
 }
 
-bool close_session(size_t idx) {
-	if (loading_binary_overlay::is_active() &&
-		!loading_binary_overlay::is_waiting_for_user_decision()) {
-		state().last_error = "load_in_flight";
-		diag::log_tagged_fmt("analysis_session",
-			"close_session_refused_load_in_flight idx=%llu phase=%s",
-			static_cast<unsigned long long>(idx),
-			loading_binary_overlay::current_phase_name());
-		return false;
-	}
-	std::lock_guard<std::mutex> lk(state().mu);
-	if (idx >= state().sessions.size()) {
-		state().last_error = "idx_out_of_range";
-		diag::log_tagged_fmt("analysis_session",
-			"close_session_idx_out_of_range idx=%llu count=%llu",
-			static_cast<unsigned long long>(idx),
-			static_cast<unsigned long long>(state().sessions.size()));
-		return false;
-	}
-
-	int cur = state().active_idx;
-	bool was_active = (cur == static_cast<int>(idx));
-	uint32_t closed_pid = state().sessions[idx]->attached_pid;
-	diag::log_tagged_fmt("analysis_session",
-		"close_session idx=%llu attached_pid=%u was_active=%d",
-		static_cast<unsigned long long>(idx), closed_pid, was_active ? 1 : 0);
-
-	if (was_active) {
-		if (state().sessions.size() == 1) {
-			reset_live_to_default_locked();
-			if (closed_pid != 0) {
-				(void)driver_bridge::detach_one(closed_pid);
-			}
-			state().sessions.clear();
-			state().active_idx = -1;
-			return true;
-		}
-		size_t neighbor = (idx + 1 < state().sessions.size()) ? (idx + 1) : (idx - 1);
-		auto& dst = *state().sessions[neighbor];
-		restore_session_into_live_locked(dst);
-		dst.last_active_steady_ms = now_steady_ms();
-		if (closed_pid != 0 && closed_pid != dst.attached_pid) {
-			(void)driver_bridge::detach_one(closed_pid);
-		}
-		state().sessions.erase(state().sessions.begin() + idx);
-		if (neighbor > idx) {
-			state().active_idx = static_cast<int>(neighbor - 1);
-		} else {
-			state().active_idx = static_cast<int>(neighbor);
-		}
-		return true;
-	}
-
-	if (closed_pid != 0) {
-		(void)driver_bridge::detach_one(closed_pid);
-	}
-	state().sessions.erase(state().sessions.begin() + idx);
-	if (cur > static_cast<int>(idx)) {
-		state().active_idx = cur - 1;
-	}
-	return true;
+bool switch_session(size_t idx)
+{
+    return activate_session_transaction(idx, nullptr);
 }
 
-size_t active_session_idx() {
-	std::lock_guard<std::mutex> lk(state().mu);
-	int a = state().active_idx;
-	if (a < 0) return static_cast<size_t>(-1);
-	return static_cast<size_t>(a);
+bool cancel_session(size_t idx)
+{
+    std::shared_ptr<analysis_workspace_t> workspace;
+    std::optional<std::uint64_t> open_task_id;
+    std::optional<aida::infra::taskflow_runtime::job_handle_t> baseline_job;
+    std::optional<std::uint64_t> pdb_task_id;
+    std::shared_ptr<std::atomic<bool>> pdb_cancel;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        if (idx >= state().sessions.size()) {
+            state().last_error = "idx_out_of_range";
+            return false;
+        }
+        auto& session = *state().sessions[idx];
+        session.load_cancellation.request_cancel();
+        workspace = session.workspace;
+        open_task_id = session.open_task_id;
+        baseline_job = session.baseline_job;
+        session.open_task_id.reset();
+        session.baseline_job.reset();
+        if (!workspace) {
+            auto error = make_workspace_error(workspace_error_code_t::cancelled,
+                "Workspace open was cancelled", "analysis_session.cancel");
+            error.cancellation = true;
+            session.load_state = session_load_state_t::failed;
+            session.load_error = error;
+            state().last_error = error.stable_code() + ": " + error.message;
+        }
+        if (session.pdb_state) {
+            std::lock_guard<std::mutex> pdb_lock(session.pdb_state->mutex);
+            auto& prompt = *session.pdb_state;
+            pdb_cancel = prompt.parser_cancel;
+            pdb_task_id = prompt.task_id;
+            if (prompt.committing) {
+                prompt.status = "Finishing PDB publication before session cancellation";
+            } else {
+                if (prompt.generation != UINT64_MAX) ++prompt.generation;
+                prompt.loading = false;
+                prompt.parser_cancel.reset();
+                prompt.parser_progress.reset();
+                prompt.task_id.reset();
+                prompt.status = "PDB operation cancelled with session";
+            }
+            prompt.remote_pending = false;
+            prompt.local_pending = false;
+        }
+    }
+    if (pdb_cancel) pdb_cancel->store(true, std::memory_order_release);
+    if (pdb_task_id) (void)aida::infra::executor::cancel(*pdb_task_id);
+    if (open_task_id) (void)aida::infra::executor::cancel(*open_task_id);
+    if (baseline_job) (void)aida::infra::taskflow_runtime::cancel(*baseline_job);
+    if (workspace) workspace->request_cancel();
+    return true;
 }
 
-size_t session_count() {
-	std::lock_guard<std::mutex> lk(state().mu);
-	return state().sessions.size();
+bool close_session(size_t idx)
+{
+    std::lock_guard<std::recursive_mutex> activation_lock(state().activation_mutex);
+    std::shared_ptr<analysis_workspace_t> workspace;
+    std::uint32_t pid = 0;
+    std::optional<std::uint64_t> open_task_id;
+    std::optional<aida::infra::taskflow_runtime::job_handle_t> baseline_job;
+    std::optional<std::uint64_t> pdb_task_id;
+    std::shared_ptr<std::atomic<bool>> pdb_cancel;
+    std::string session_id;
+    std::optional<live_session_binding_t> live_binding;
+    std::optional<size_t> successor_index;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        if (idx >= state().sessions.size()) {
+            state().last_error = "idx_out_of_range";
+            return false;
+        }
+        auto session = state().sessions[idx];
+        session->load_cancellation.request_cancel();
+        session->load_state = session_load_state_t::closing;
+        workspace = session->workspace;
+        pid = session->attached_pid;
+        session_id = session->id;
+        const auto binding = state().live_bindings.find(session_id);
+        if (binding != state().live_bindings.end())
+            live_binding = binding->second;
+        open_task_id = session->open_task_id;
+        baseline_job = session->baseline_job;
+        if (session->pdb_state) {
+            std::lock_guard<std::mutex> pdb_lock(session->pdb_state->mutex);
+            pdb_cancel = session->pdb_state->parser_cancel;
+            pdb_task_id = session->pdb_state->task_id;
+            if (session->pdb_state->generation != UINT64_MAX)
+                ++session->pdb_state->generation;
+            session->pdb_state->loading = false;
+            session->pdb_state->remote_pending = false;
+            session->pdb_state->local_pending = false;
+            session->pdb_state->status = "PDB operation cancelled with session close";
+            session->pdb_state->parser_cancel.reset();
+            session->pdb_state->parser_progress.reset();
+            session->pdb_state->task_id.reset();
+        }
+        const bool was_active = state().active_idx == static_cast<int>(idx);
+        state().sessions.erase(state().sessions.begin() + static_cast<std::ptrdiff_t>(idx));
+        state().live_bindings.erase(session_id);
+        if (state().sessions.empty()) {
+            state().active_idx = -1;
+        } else if (was_active) {
+            state().active_idx = -1;
+            for (auto& s : state().sessions)
+                s->ui_selected = false;
+            successor_index = (std::min)(idx, state().sessions.size() - 1);
+        } else if (state().active_idx > static_cast<int>(idx)) {
+            --state().active_idx;
+        }
+    }
+    if (pdb_cancel) pdb_cancel->store(true, std::memory_order_release);
+    if (pdb_task_id) (void)aida::infra::executor::cancel(*pdb_task_id);
+    if (open_task_id) (void)aida::infra::executor::cancel(*open_task_id);
+    if (baseline_job) (void)aida::infra::taskflow_runtime::cancel(*baseline_job);
+    loading_binary_overlay::release_session(session_id);
+    close_workspace_async(std::move(workspace), pid, std::move(live_binding));
+    if (successor_index) {
+        std::string activation_error;
+        if (!activate_session_transaction(*successor_index, &activation_error)) {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = activation_error;
+        }
+    }
+    return true;
 }
 
-const analysis_session_t* session_at(size_t idx) {
-	std::lock_guard<std::mutex> lk(state().mu);
-	if (idx >= state().sessions.size()) return nullptr;
-	return state().sessions[idx].get();
+size_t active_session_idx()
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    return state().active_idx < 0
+        ? static_cast<size_t>(-1)
+        : static_cast<size_t>(state().active_idx);
 }
 
-bool find_session_by_path(const std::string& path, size_t* out_idx) {
-	std::lock_guard<std::mutex> lk(state().mu);
-	for (size_t i = 0; i < state().sessions.size(); ++i) {
-		if (paths_equal(state().sessions[i]->path, path)) {
-			if (out_idx) *out_idx = i;
-			return true;
-		}
-	}
-	return false;
+size_t session_count()
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    return state().sessions.size();
 }
 
-bool find_session_by_pid(uint32_t pid, size_t* out_idx) {
-	if (pid == 0) return false;
-	std::lock_guard<std::mutex> lk(state().mu);
-	for (size_t i = 0; i < state().sessions.size(); ++i) {
-		if (state().sessions[i]->attached_pid == pid) {
-			if (out_idx) *out_idx = i;
-			return true;
-		}
-	}
-	return false;
+std::shared_ptr<const analysis_session_t> session_handle_at(size_t idx)
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    if (idx >= state().sessions.size()) return {};
+    refresh_load_state(*state().sessions[idx]);
+    return std::make_shared<const analysis_session_t>(*state().sessions[idx]);
 }
 
-void prune_lru(size_t max_keep) {
-	std::lock_guard<std::mutex> lk(state().mu);
-	if (max_keep == 0) max_keep = 1;
-	while (state().sessions.size() > max_keep) {
-		size_t victim = 0;
-		uint64_t oldest = UINT64_MAX;
-		bool found = false;
-		for (size_t i = 0; i < state().sessions.size(); ++i) {
-			if (static_cast<int>(i) == state().active_idx) continue;
-			if (state().sessions[i]->last_active_steady_ms < oldest) {
-				oldest = state().sessions[i]->last_active_steady_ms;
-				victim = i;
-				found = true;
-			}
-		}
-		if (!found) break;
-		auto& vs = *state().sessions[victim];
-		if (vs.attached_pid != 0) {
-			(void)driver_bridge::detach_one(vs.attached_pid);
-		}
-		if (static_cast<int>(victim) < state().active_idx) {
-			state().active_idx -= 1;
-		}
-		state().sessions.erase(state().sessions.begin() + victim);
-	}
+const analysis_session_t* session_at(size_t idx)
+{
+    thread_local std::shared_ptr<const analysis_session_t> snapshot;
+    snapshot = session_handle_at(idx);
+    return snapshot.get();
 }
 
-const char* last_error() {
-	std::lock_guard<std::mutex> lk(state().mu);
-	return state().last_error.c_str();
+std::shared_ptr<analysis_workspace_t> active_workspace()
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    if (state().active_idx < 0 ||
+        state().active_idx >= static_cast<int>(state().sessions.size()))
+        return {};
+    return state().sessions[static_cast<size_t>(state().active_idx)]->workspace;
 }
 
-bool find_session_by_id(const std::string& session_id, size_t* out_idx) {
-	if (session_id.empty()) return false;
-	std::lock_guard<std::mutex> lk(state().mu);
-	for (size_t i = 0; i < state().sessions.size(); ++i) {
-		if (state().sessions[i]->id == session_id) {
-			if (out_idx) *out_idx = i;
-			return true;
-		}
-	}
-	return false;
+std::shared_ptr<analysis_workspace_t> workspace_for_session(size_t idx)
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    return idx < state().sessions.size() ? state().sessions[idx]->workspace : nullptr;
 }
 
-bool has_active_target() {
-	if (driver_bridge::attached_pid() != 0) return true;
-	if (g_disasm.file.loaded && !g_disasm.file.path.empty() && g_disasm.file.image_base != 0) return true;
-	{
-		std::lock_guard<std::mutex> lk(state().mu);
-		if (!state().sessions.empty()) return true;
-	}
-	return false;
+std::shared_ptr<analysis_workspace_t>
+workspace_for_session_id(const std::string& session_id)
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    for (const auto& session : state().sessions) {
+        if (session->id == session_id) return session->workspace;
+    }
+    return {};
 }
 
-std::vector<session_summary_t> list_session_summaries() {
-	std::vector<session_summary_t> out;
-	std::lock_guard<std::mutex> lk(state().mu);
-	out.reserve(state().sessions.size());
-	for (size_t i = 0; i < state().sessions.size(); ++i) {
-		const auto& s = *state().sessions[i];
-		session_summary_t sum;
-		sum.id = s.id;
-		sum.kind = (s.attached_pid != 0)
-			? session_kind_t::live_attach
-			: session_kind_t::static_file;
-		sum.path = s.path;
-		sum.filename = s.filename;
-		sum.pid = s.attached_pid;
-		if (!s.process_name.empty()) {
-			int needed = WideCharToMultiByte(CP_UTF8, 0, s.process_name.c_str(),
-				static_cast<int>(s.process_name.size()), nullptr, 0, nullptr, nullptr);
-			if (needed > 0) {
-				std::string utf8(static_cast<size_t>(needed), '\0');
-				WideCharToMultiByte(CP_UTF8, 0, s.process_name.c_str(),
-					static_cast<int>(s.process_name.size()), utf8.data(), needed, nullptr, nullptr);
-				sum.process_name = std::move(utf8);
-			}
-		}
-		sum.is_active = (static_cast<int>(i) == state().active_idx);
-		sum.is_alive = true;
-		sum.last_active_steady_ms = s.last_active_steady_ms;
-		out.push_back(std::move(sum));
-	}
-	return out;
+std::shared_ptr<symbol_store::workspace_state_t> symbols_for_workspace(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    if (!workspace) return {};
+    std::lock_guard<std::mutex> lock(state().mutex);
+    for (const auto& session : state().sessions) {
+        if (session->workspace != workspace || !session->symbols) continue;
+        if (session->symbols->binary_id() != workspace->identity().binary_id())
+            return {};
+        return session->symbols;
+    }
+    return {};
 }
 
-session_summary_t summarize_session_at(size_t idx) {
-	session_summary_t sum;
-	std::lock_guard<std::mutex> lk(state().mu);
-	if (idx >= state().sessions.size()) return sum;
-	const auto& s = *state().sessions[idx];
-	sum.id = s.id;
-	sum.kind = (s.attached_pid != 0)
-		? session_kind_t::live_attach
-		: session_kind_t::static_file;
-	sum.path = s.path;
-	sum.filename = s.filename;
-	sum.pid = s.attached_pid;
-	if (!s.process_name.empty()) {
-		int needed = WideCharToMultiByte(CP_UTF8, 0, s.process_name.c_str(),
-			static_cast<int>(s.process_name.size()), nullptr, 0, nullptr, nullptr);
-		if (needed > 0) {
-			std::string utf8(static_cast<size_t>(needed), '\0');
-			WideCharToMultiByte(CP_UTF8, 0, s.process_name.c_str(),
-				static_cast<int>(s.process_name.size()), utf8.data(), needed, nullptr, nullptr);
-			sum.process_name = std::move(utf8);
-		}
-	}
-	sum.is_active = (static_cast<int>(idx) == state().active_idx);
-	sum.is_alive = true;
-	sum.last_active_steady_ms = s.last_active_steady_ms;
-	return sum;
+workspace_result_t<pdb_prompt_snapshot_t> pdb_prompt_snapshot(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    auto binding = pdb_binding_for_workspace(workspace);
+    if (!binding) {
+        return workspace_result_t<pdb_prompt_snapshot_t>::failure(
+            make_workspace_error(workspace_error_code_t::target_not_found,
+                "PDB state requires an open workspace session",
+                "analysis_session.pdb_snapshot"));
+    }
+    {
+        std::lock_guard<std::mutex> lock(binding->prompt->mutex);
+        if (binding->prompt->workspace_generation != workspace->generation()) {
+            return workspace_result_t<pdb_prompt_snapshot_t>::failure(
+                make_workspace_error(workspace_error_code_t::stale_generation,
+                    "PDB prompt generation does not match the workspace",
+                    "analysis_session.pdb_snapshot"));
+        }
+    }
+    pdb_prompt_snapshot_t output;
+    {
+        std::lock_guard<std::mutex> lock(binding->prompt->mutex);
+        output.binary_id = binding->prompt->binary_id.to_hex();
+        output.remote_pending = binding->prompt->remote_pending;
+        output.local_pending = binding->prompt->local_pending;
+        output.loading = binding->prompt->loading;
+        output.failed = binding->prompt->failed;
+        output.declined = binding->prompt->declined;
+        output.load_types = binding->prompt->load_types;
+        output.load_names = binding->prompt->load_names;
+        output.module_name = binding->prompt->module_name;
+        output.pdb_name = binding->prompt->pdb_name;
+        output.pdb_guid = binding->prompt->pdb_guid;
+        output.pdb_age = binding->prompt->pdb_age;
+        output.symbol_server = binding->prompt->symbol_server;
+        output.local_candidate = binding->prompt->local_candidate;
+        output.reason = binding->prompt->reason;
+        output.status = binding->prompt->status;
+        output.bytes_received = binding->prompt->bytes_received;
+        output.bytes_total = binding->prompt->bytes_total;
+        output.progress_percent = binding->prompt->progress_percent;
+        if (binding->prompt->parser_progress) {
+            const int parser_percent = static_cast<int>((std::clamp)(
+                binding->prompt->parser_progress->load(std::memory_order_acquire),
+                0.0f, 1.0f) * 100.0f);
+            output.progress_percent = (std::max)(output.progress_percent,
+                parser_percent);
+        }
+    }
+    output.symbol_revision = binding->symbols->revision();
+    return workspace_result_t<pdb_prompt_snapshot_t>::success(std::move(output));
+}
+
+workspace_result_t<void> approve_remote_pdb(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    bool load_types, bool load_names)
+{
+    pdb_task_request_t request;
+    request.remote = true;
+    request.load_types = load_types;
+    request.load_names = load_names;
+    return submit_pdb_task(workspace, std::move(request));
+}
+
+workspace_result_t<void> approve_local_pdb(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    const std::string& path, bool load_types, bool load_names)
+{
+    if (path.empty() || path.size() > 32768 || path.find('\0') != std::string::npos) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "Local PDB path is empty or exceeds the path budget",
+            "analysis_session.pdb_local"));
+    }
+    pdb_task_request_t request;
+    request.load_types = load_types;
+    request.load_names = load_names;
+    request.local_path = path;
+    return submit_pdb_task(workspace, std::move(request));
+}
+
+workspace_result_t<void> decline_remote_pdb(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    auto binding = pdb_binding_for_workspace(workspace);
+    if (!binding) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::target_not_found,
+            "PDB state requires an open workspace session",
+            "analysis_session.pdb_remote_decline"));
+    }
+    std::lock_guard<std::mutex> lock(binding->prompt->mutex);
+    if (binding->prompt->loading) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::analysis_in_progress,
+            "A PDB operation is already active for this workspace",
+            "analysis_session.pdb_remote_decline"));
+    }
+    binding->prompt->remote_pending = false;
+    binding->prompt->local_pending = !binding->prompt->pdb_name.empty();
+    binding->prompt->failed = false;
+    binding->prompt->declined = true;
+    binding->prompt->status = binding->prompt->local_pending
+        ? "Remote PDB declined; awaiting a local PDB path"
+        : "Remote PDB declined";
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> decline_local_pdb(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    auto binding = pdb_binding_for_workspace(workspace);
+    if (!binding) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::target_not_found,
+            "PDB state requires an open workspace session",
+            "analysis_session.pdb_local_decline"));
+    }
+    std::lock_guard<std::mutex> lock(binding->prompt->mutex);
+    if (binding->prompt->loading) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::analysis_in_progress,
+            "A PDB operation is already active for this workspace",
+            "analysis_session.pdb_local_decline"));
+    }
+    binding->prompt->local_pending = false;
+    binding->prompt->failed = false;
+    binding->prompt->declined = true;
+    binding->prompt->status = "Local PDB selection declined";
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> cancel_pdb(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    auto binding = pdb_binding_for_workspace(workspace);
+    if (!binding) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::target_not_found,
+            "PDB state requires an open workspace session",
+            "analysis_session.pdb_cancel"));
+    }
+    std::shared_ptr<std::atomic<bool>> cancel;
+    std::optional<std::uint64_t> task_id;
+    {
+        std::lock_guard<std::mutex> lock(binding->prompt->mutex);
+        if (!binding->prompt->loading) return workspace_result_t<void>::success();
+        cancel = binding->prompt->parser_cancel;
+        task_id = binding->prompt->task_id;
+        if (binding->prompt->committing) {
+            binding->prompt->status = "Finishing PDB publication";
+        } else {
+            if (binding->prompt->generation != UINT64_MAX)
+                ++binding->prompt->generation;
+            binding->prompt->loading = false;
+            binding->prompt->failed = false;
+            binding->prompt->remote_pending = binding->prompt->operation_remote;
+            binding->prompt->local_pending = !binding->prompt->operation_remote;
+            binding->prompt->status = "PDB operation cancelled";
+            binding->prompt->parser_cancel.reset();
+            binding->prompt->parser_progress.reset();
+            binding->prompt->task_id.reset();
+        }
+    }
+    if (cancel) cancel->store(true, std::memory_order_release);
+    if (task_id) (void)aida::infra::executor::cancel(*task_id);
+    return workspace_result_t<void>::success();
+}
+
+bool find_session_by_path(const std::string& path, size_t* out_idx)
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    for (size_t index = 0; index < state().sessions.size(); ++index) {
+        if (!paths_equal(state().sessions[index]->path, path)) continue;
+        if (out_idx) *out_idx = index;
+        return true;
+    }
+    return false;
+}
+
+bool find_session_by_pid(std::uint32_t pid, size_t* out_idx)
+{
+    if (pid == 0) return false;
+    std::lock_guard<std::mutex> lock(state().mutex);
+    for (size_t index = 0; index < state().sessions.size(); ++index) {
+        const auto& session = state().sessions[index];
+        if (session->attached_pid != pid) continue;
+        if (session->workspace && session->workspace->identity().process() &&
+            session->workspace->identity().process()->pid != pid)
+            continue;
+        if (out_idx) *out_idx = index;
+        return true;
+    }
+    return false;
+}
+
+bool find_session_by_id(const std::string& session_id, size_t* out_idx)
+{
+    if (session_id.empty()) return false;
+    std::lock_guard<std::mutex> lock(state().mutex);
+    for (size_t index = 0; index < state().sessions.size(); ++index) {
+        const auto& session = state().sessions[index];
+        const bool matches_session = session->id == session_id;
+        const bool matches_binary = session->workspace &&
+            session->workspace->identity().binary_id().to_hex() == session_id;
+        if (!matches_session && !matches_binary) continue;
+        if (out_idx) *out_idx = index;
+        return true;
+    }
+    return false;
+}
+
+void prune_lru(size_t max_keep)
+{
+    if (max_keep == 0) max_keep = 1;
+    for (;;) {
+        size_t victim = static_cast<size_t>(-1);
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            if (state().sessions.size() <= max_keep) return;
+            std::uint64_t oldest = (std::numeric_limits<std::uint64_t>::max)();
+            for (size_t index = 0; index < state().sessions.size(); ++index) {
+                if (state().active_idx == static_cast<int>(index)) continue;
+                if (state().sessions[index]->last_active_steady_ms >= oldest) continue;
+                oldest = state().sessions[index]->last_active_steady_ms;
+                victim = index;
+            }
+        }
+        if (victim == static_cast<size_t>(-1) || !close_session(victim)) return;
+    }
+}
+
+const char* last_error()
+{
+    thread_local std::string snapshot;
+    std::lock_guard<std::mutex> lock(state().mutex);
+    snapshot = state().last_error;
+    return snapshot.c_str();
+}
+
+bool has_active_target()
+{
+    return active_workspace() != nullptr;
+}
+
+std::vector<session_summary_t> list_session_summaries()
+{
+    std::vector<session_summary_t> result;
+    std::lock_guard<std::mutex> lock(state().mutex);
+    result.reserve(state().sessions.size());
+    for (size_t index = 0; index < state().sessions.size(); ++index) {
+        refresh_load_state(*state().sessions[index]);
+        result.push_back(make_summary(*state().sessions[index],
+            state().active_idx == static_cast<int>(index)));
+    }
+    return result;
+}
+
+session_summary_t summarize_session_at(size_t idx)
+{
+    std::lock_guard<std::mutex> lock(state().mutex);
+    if (idx >= state().sessions.size()) return {};
+    refresh_load_state(*state().sessions[idx]);
+    return make_summary(*state().sessions[idx],
+        state().active_idx == static_cast<int>(idx));
 }
 
 }

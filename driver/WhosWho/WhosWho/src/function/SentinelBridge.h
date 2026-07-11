@@ -48,6 +48,97 @@ namespace sentinel_bridge {
     constexpr ULONG BRIDGE_CMD_SENTINEL_THREAD_INJECT = 18;
     constexpr ULONG BRIDGE_CMD_LATCH_TARGETING        = 19;
 
+    constexpr ULONG BRIDGE_CMD_DMA_KEY_SCRUB        = 0x0000B001u;
+    constexpr ULONG BRIDGE_CMD_DMA_BSOD             = 0x0000B003u;
+    constexpr ULONG BRIDGE_CMD_DMA_ATTACK_REPORT    = 0x0000B004u;
+
+    constexpr ULONG BRIDGE_CMD_HONEYPOT_CANARY_PATCH     = 0x0000C001u;
+    constexpr ULONG BRIDGE_CMD_HONEYPOT_STRING_ACCESS    = 0x0000C002u;
+    constexpr ULONG BRIDGE_CMD_REGISTER_HONEYPOT_PID     = 0x0000C003u;
+    constexpr ULONG BRIDGE_CMD_REGISTER_HONEYPOT_GUARD   = 0x0000C004u;
+
+    constexpr ULONG BUGCHECK_HONEYPOT_STRING_ACCESS = 0xA1DA0001u;
+    constexpr ULONG BUGCHECK_HONEYPOT_CANARY_PATCH  = 0xA1DA0002u;
+
+    inline volatile HANDLE g_aida_pid = nullptr;
+    inline PVOID g_honeypot_guard_page_base = nullptr;
+    inline SIZE_T g_honeypot_guard_page_size = 0;
+
+    inline const wchar_t* g_av_allowlist[] = {
+        L"MsMpEng.exe",
+        L"MpCopyAccelerator.exe",
+        L"NisSrv.exe",
+        L"SearchIndexer.exe",
+        L"SearchProtocolHandler.exe",
+        L"TiWorker.exe",
+        L"CompatTelRunner.exe",
+        L"WerFault.exe",
+    };
+    constexpr SIZE_T g_av_allowlist_count = sizeof(g_av_allowlist) / sizeof(g_av_allowlist[0]);
+
+    __forceinline BOOLEAN is_av_allowlisted_process(HANDLE pid)
+    {
+        PEPROCESS process = NULL;
+        NTSTATUS status = PsLookupProcessByProcessId(pid, &process);
+        if (!NT_SUCCESS(status) || process == NULL)
+            return FALSE;
+
+        PUNICODE_STRING image_name = NULL;
+        SeQueryInformationProcess(process, ProcessImageFileName, &image_name);
+
+        BOOLEAN allowed = FALSE;
+        if (image_name != NULL && image_name->Buffer != NULL) {
+            PWSTR filename = image_name->Buffer;
+            USHORT char_count = image_name->Length / sizeof(WCHAR);
+            for (SHORT i = char_count - 1; i >= 0; --i) {
+                if (image_name->Buffer[i] == L'\\') {
+                    filename = &image_name->Buffer[i + 1];
+                    break;
+                }
+            }
+
+            UNICODE_STRING fname_u;
+            RtlInitUnicodeString(&fname_u, filename);
+
+            for (SIZE_T i = 0; i < g_av_allowlist_count; ++i) {
+                UNICODE_STRING allowlist_u;
+                RtlInitUnicodeString(&allowlist_u, g_av_allowlist[i]);
+                if (RtlEqualUnicodeString(&fname_u, &allowlist_u, TRUE)) {
+                    allowed = TRUE;
+                    break;
+                }
+            }
+            ExFreePool(image_name);
+        }
+        ObDereferenceObject(process);
+        return allowed;
+    }
+
+    __forceinline VOID handle_honeypot_guard_page_access(
+        UINT64 rip, UINT64 accessed_addr)
+    {
+        HANDLE accessing_pid = PsGetCurrentProcessId();
+
+        if (accessing_pid == g_aida_pid) {
+            WW_LOG("honeypot_guard: internal access rip=0x%llx addr=0x%llx pid=%p (allowed)",
+                rip, accessed_addr, accessing_pid);
+            return;
+        }
+
+        if (is_av_allowlisted_process(accessing_pid)) {
+            WW_LOG("honeypot_guard: av_allowlisted access rip=0x%llx addr=0x%llx pid=%p (allowed)",
+                rip, accessed_addr, accessing_pid);
+            return;
+        }
+
+        WW_LOG("honeypot_guard: EXTERNAL access rip=0x%llx addr=0x%llx pid=%p -> BUGCHECK 0x%lx",
+            rip, accessed_addr, accessing_pid, BUGCHECK_HONEYPOT_STRING_ACCESS);
+        if (_KeBugCheckEx)
+            _KeBugCheckEx(BUGCHECK_HONEYPOT_STRING_ACCESS,
+                (ULONG_PTR)rip, (ULONG_PTR)accessed_addr,
+                (ULONG_PTR)accessing_pid, 0);
+    }
+
     constexpr ULONG BRIDGE_CMD_TIER_A_DRIVER_PRESENT = BRIDGE_CMD_HOSTILE_DRIVER;
     constexpr ULONG BRIDGE_CMD_KDBG_TRANSITION       = BRIDGE_CMD_KD_ENABLED;
     constexpr ULONG BRIDGE_CMD_CANARY_FOREIGN_PT     = BRIDGE_CMD_DMA_CANARY_HIT;
@@ -76,6 +167,13 @@ namespace sentinel_bridge {
     constexpr ULONG RE_REASON_DEBUG_PORT_TRAP           = 0x0000AB04u;
     constexpr ULONG RE_REASON_DR_ON_TEXT               = RE_REASON_DR_SET;
     constexpr ULONG RE_REASON_SIDECHANNEL_CORROBORATED = 0x0000AE03u;
+    constexpr ULONG RE_REASON_SELF_ANALYSIS_ATTEMPT    = 0x0000AE40u;
+
+    constexpr ULONG RE_REASON_DMA_IOMMU_BYPASS      = 0x00005E44u;
+    constexpr ULONG RE_REASON_DMA_UNKNOWN_PCIE      = 0x00005E45u;
+    constexpr ULONG RE_REASON_DMA_EPT_HOOK          = 0x00005E46u;
+    constexpr ULONG RE_REASON_DMA_PTE_TAMPER        = 0x00005E47u;
+    constexpr ULONG RE_REASON_DMA_KEY_SCRUB         = 0x00005E48u;
 
     constexpr UINT32 EVIDENCE_FAMILY_SIDECHANNEL = 0x01u;
     constexpr UINT32 EVIDENCE_FAMILY_DEBUG       = 0x02u;
@@ -86,6 +184,11 @@ namespace sentinel_bridge {
     constexpr UINT32 EVIDENCE_FAMILY_INJECTION   = 0x40u;
     constexpr UINT32 EVIDENCE_FAMILY_TARGET      = 0x80u;
     constexpr UINT32 EVIDENCE_FAMILY_KD          = 0x100u;
+
+    constexpr UINT32 EVIDENCE_FAMILY_DMA_IOMMU    = 0x44u;
+    constexpr UINT32 EVIDENCE_FAMILY_DMA_PCIE     = 0x45u;
+    constexpr UINT32 EVIDENCE_FAMILY_DMA_EPT      = 0x46u;
+    constexpr UINT32 EVIDENCE_FAMILY_DMA_PTE      = 0x47u;
 
     struct RE_EVIDENCE_BLOB {
         UINT64 magic;
@@ -331,6 +434,7 @@ namespace sentinel_bridge {
         inline volatile LONG g_entry_count = 0;
 
         __forceinline UINT32 classify_family(ULONG reason) {
+            if (reason == RE_REASON_SELF_ANALYSIS_ATTEMPT) return EVIDENCE_FAMILY_TARGET;
             if (reason >= 0xAE00 && reason <= 0xAEFF) return EVIDENCE_FAMILY_SIDECHANNEL;
             if (reason == RE_REASON_TARGET_FILE_OPENED)    return EVIDENCE_FAMILY_TARGET;
             if (reason == RE_REASON_TARGET_SECTION_MAPPED) return EVIDENCE_FAMILY_TARGET;
@@ -345,13 +449,19 @@ namespace sentinel_bridge {
             if (reason == RE_REASON_PARENT_RE_TOOL)        return EVIDENCE_FAMILY_TARGET;
             if (reason == RE_REASON_VAD_MAPPED_IN_RE)      return EVIDENCE_FAMILY_TARGET;
             if (reason == RE_REASON_DMA_CANARY)            return EVIDENCE_FAMILY_DMA;
+            if (reason == RE_REASON_DMA_IOMMU_BYPASS)      return EVIDENCE_FAMILY_DMA;
+            if (reason == RE_REASON_DMA_UNKNOWN_PCIE)      return EVIDENCE_FAMILY_DMA;
+            if (reason == RE_REASON_DMA_EPT_HOOK)          return EVIDENCE_FAMILY_DMA;
+            if (reason == RE_REASON_DMA_PTE_TAMPER)        return EVIDENCE_FAMILY_DMA;
+            if (reason == RE_REASON_DMA_KEY_SCRUB)         return EVIDENCE_FAMILY_DMA;
             if (reason == RE_REASON_KD_ENABLED)            return EVIDENCE_FAMILY_KD;
             return 0;
         }
 
         __forceinline bool is_direct_bsod_reason(ULONG reason) {
             return reason == RE_REASON_DEBUG_BY_RE_TOOL
-                || reason == RE_REASON_DMA_CANARY;
+                || reason == RE_REASON_DMA_CANARY
+                || reason == RE_REASON_SELF_ANALYSIS_ATTEMPT;
         }
 
         __forceinline ULONG popcount32(UINT32 v) {
@@ -697,6 +807,35 @@ namespace sentinel_bridge {
                             elapsed);
                         if (_KeBugCheckEx)
                             _KeBugCheckEx(BUGCHECK_RE_USERMODE_CONFIRMED, cmd, param, 0, 0);
+                    }
+                    else if (cmd == BRIDGE_CMD_HONEYPOT_CANARY_PATCH) {
+                        WW_LOG("watchdog_dpc: HONEYPOT_CANARY_PATCH decoy_id=%lu -> BUGCHECK 0x%lx",
+                            param, BUGCHECK_HONEYPOT_CANARY_PATCH);
+                        log_watchdog_bugcheck_intent("honeypot_canary_patch",
+                            BUGCHECK_HONEYPOT_CANARY_PATCH,
+                            cmd, param, raw_cmd, raw_param,
+                            current_sentinel_tsc, last, elapsed);
+                        if (_KeBugCheckEx)
+                            _KeBugCheckEx(BUGCHECK_HONEYPOT_CANARY_PATCH,
+                                (ULONG_PTR)param, 0, 0, 0);
+                    }
+                    else if (cmd == BRIDGE_CMD_HONEYPOT_STRING_ACCESS) {
+                        WW_LOG("watchdog_dpc: HONEYPOT_STRING_ACCESS -> BUGCHECK 0x%lx",
+                            BUGCHECK_HONEYPOT_STRING_ACCESS);
+                        log_watchdog_bugcheck_intent("honeypot_string_access",
+                            BUGCHECK_HONEYPOT_STRING_ACCESS,
+                            cmd, param, raw_cmd, raw_param,
+                            current_sentinel_tsc, last, elapsed);
+                        if (_KeBugCheckEx)
+                            _KeBugCheckEx(BUGCHECK_HONEYPOT_STRING_ACCESS,
+                                (ULONG_PTR)param, 0, 0, 0);
+                    }
+                    else if (cmd == BRIDGE_CMD_REGISTER_HONEYPOT_PID) {
+                        g_aida_pid = (HANDLE)(ULONG_PTR)param;
+                        WW_LOG("watchdog_dpc: REGISTER_HONEYPOT_PID pid=%p", g_aida_pid);
+                    }
+                    else if (cmd == BRIDGE_CMD_REGISTER_HONEYPOT_GUARD) {
+                        WW_LOG("watchdog_dpc: REGISTER_HONEYPOT_GUARD param=0x%lx", param);
                     }
                 }
             }

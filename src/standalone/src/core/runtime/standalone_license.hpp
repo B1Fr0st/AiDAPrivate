@@ -135,6 +135,64 @@ namespace standalone_license
                                      bool exports_verified,
                                      std::string& out_json,
                                      std::string& error_out);
+
+    bool compute_integrity_gated_hmac(
+        const uint8_t* heartbeat_payload, size_t payload_len,
+        const uint8_t* server_nonce, size_t nonce_len,
+        uint8_t hmac_out[32]);
+
+    std::string get_build_id();
+
+
+    bool validate_server_response(const uint8_t* response, size_t response_len,
+                                   uint64_t server_nonce_hash);
+    bool check_kernel_attestation(uint64_t attestation_value);
+    bool verify_gate_chain(uint64_t session_token);
+    bool check_heartbeat_freshness(uint64_t heartbeat_time, uint64_t now);
+    bool verify_session_epoch(uint64_t epoch);
+    bool check_driver_bridge_active();
+    bool verify_filesystem_baseline(uint64_t fs_hash);
+    bool finalize_validation(bool* partial_results, size_t count);
+
+
+    constexpr int REAL_VALIDATION_FUNC_COUNT = 12;
+    constexpr int DECOY_VALIDATION_FUNC_COUNT = 8;
+    constexpr int TOTAL_CALL_TARGETS = REAL_VALIDATION_FUNC_COUNT + DECOY_VALIDATION_FUNC_COUNT;
+    constexpr int VALIDATION_BRANCHING = 3;
+    constexpr int VALIDATION_DEPTH = 6;
+    constexpr int VALIDATION_GRAPH_PATHS = 729;
+
+    struct distributed_validation_node_t
+    {
+        int function_id;
+        int next_nodes[3];
+        bool is_decoy;
+    };
+
+    inline constexpr distributed_validation_node_t g_validation_graph[TOTAL_CALL_TARGETS] = {
+        {0,  {1, 2, 9},  false},
+        {1,  {3, 10, 4}, false},
+        {2,  {5, 6, 11}, false},
+        {3,  {7, 8, 12}, false},
+        {4,  {13, 5, 14},false},
+        {5,  {9, 15, 6}, false},
+        {6,  {10, 7, 16},false},
+        {7,  {11, 8, 17},false},
+        {8,  {0, 1, 18}, false},
+        {9,  {14, 15, 19},false},
+        {10, {16, 17, 12},false},
+        {11, {18, 19, 13},false},
+        {12, {0, 3, 6},  true},
+        {13, {1, 4, 7},  true},
+        {14, {2, 5, 8},  true},
+        {15, {0, 6, 9},  true},
+        {16, {1, 7, 10}, true},
+        {17, {2, 8, 11}, true},
+        {18, {3, 9, 12}, true},
+        {19, {4, 10, 13},true},
+    };
+
+    bool validate_with_environmental_resistance();
 }
 
 

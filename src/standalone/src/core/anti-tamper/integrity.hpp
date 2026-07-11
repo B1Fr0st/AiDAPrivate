@@ -1723,6 +1723,72 @@ inline bool verify_usermode(const state::code_snapshot_t& snap)
     return true;
 }
 
+inline bool get_current_text_sha256(uint8_t out[32])
+{
+    auto& snap = state::get().code_snap;
+    if (snap.text_base == 0 || snap.text_size == 0)
+        return false;
+
+    auto& rt = state::get();
+    if (rt.reloc_mask_table.empty())
+        return sha256::hash(
+            reinterpret_cast<const void*>(snap.text_base),
+            snap.text_size, out);
+
+    const uint64_t preferred_base = rt.preferred_image_base;
+    const uint64_t runtime_base = snap.module_base;
+
+    std::vector<uint8_t> buffer(snap.text_size);
+    memcpy(buffer.data(), reinterpret_cast<const void*>(snap.text_base),
+           snap.text_size);
+
+    for (const auto& entry : rt.reloc_mask_table)
+    {
+        if (entry.offset + entry.size > snap.text_size)
+            continue;
+
+        uint64_t actual_value = 0;
+        memcpy(&actual_value, buffer.data() + entry.offset, entry.size);
+
+        uint64_t original_value = 0;
+        memcpy(&original_value, entry.original_value, entry.size);
+
+        uint64_t delta = runtime_base - preferred_base;
+        uint64_t expected_value;
+        if (entry.reloc_type == IMAGE_REL_BASED_DIR64)
+        {
+            expected_value = original_value + delta;
+        }
+        else if (entry.reloc_type == IMAGE_REL_BASED_HIGHLOW)
+        {
+            expected_value = (original_value + (delta & 0xFFFFFFFFULL)) & 0xFFFFFFFFULL;
+        }
+        else
+        {
+            return false;
+        }
+
+        uint64_t masked_actual = actual_value;
+        uint64_t masked_expected = expected_value;
+        if (entry.size == 4)
+        {
+            masked_actual &= 0xFFFFFFFFULL;
+            masked_expected &= 0xFFFFFFFFULL;
+        }
+
+        if (masked_actual != masked_expected)
+        {
+            return false;
+        }
+
+        memset(buffer.data() + entry.offset, 0, entry.size);
+    }
+
+    bool ok = sha256::hash(buffer.data(), buffer.size(), out);
+    SecureZeroMemory(buffer.data(), buffer.size());
+    return ok;
+}
+
 inline void snapshot_iat(std::vector<state::iat_entry_t>& snap)
 {
     const uint64_t started = GetTickCount64();

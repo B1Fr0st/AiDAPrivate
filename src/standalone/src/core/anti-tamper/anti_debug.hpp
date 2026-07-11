@@ -44,6 +44,7 @@ struct debug_report_t
     bool ipi_latency_anomaly = false;
     bool cache_coherency_anomaly = false;
     bool function_call_timing_anomaly = false;
+    bool trap_flag = false;
     std::string summary;
 
     bool any_detected() const
@@ -53,7 +54,7 @@ struct debug_report_t
             || remote_debugger || is_debugger_present || close_handle_trap
             || output_debug_string || hw_breakpoints_local || hw_breakpoints_kernel
             || kernel_debugger || kd_shared_data || thread_hidden
-            || instrumentation_callback;
+            || instrumentation_callback || trap_flag;
     }
 
     bool any_timing_anomaly() const
@@ -61,6 +62,25 @@ struct debug_report_t
         return branch_miss_flat || page_fault_timing_anomaly
             || ipi_latency_anomaly || cache_coherency_anomaly
             || function_call_timing_anomaly;
+    }
+
+    uint32_t get_bug_check_code_or(uint32_t fallback) const
+    {
+        if (debug_port || debug_object_handle || debug_flags)
+            return 0x0000DBDBu;
+        if (hw_breakpoints_local || hw_breakpoints_kernel)
+            return 0x0000D7D7u;
+        if (kernel_debugger || kd_shared_data)
+            return 0x00007A63u;
+        if (instrumentation_callback || trap_flag)
+            return 0xA1DA0002u;
+        if (peb_being_debugged || peb_nt_global_flag || peb_heap_flags
+            || remote_debugger || is_debugger_present
+            || close_handle_trap || output_debug_string)
+            return 0x0000DEEEu;
+        if (thread_hidden)
+            return 0x0000D7D7u;
+        return fallback;
     }
 };
 
@@ -731,6 +751,15 @@ inline bool check_instrumentation_callback()
     return st >= 0 && info.Callback != nullptr;
 }
 
+inline bool check_trap_flag()
+{
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    if (!GetThreadContext(GetCurrentThread(), &ctx))
+        return false;
+    return (ctx.EFlags & 0x100u) != 0;
+}
+
 inline void hide_thread_from_debugger(HANDLE thread)
 {
     if (!syscall::is_initialized()) return;
@@ -808,6 +837,10 @@ inline debug_report_t full_scan(uint64_t mod_base = 0, uint64_t mod_end = 0)
     if (report.instrumentation_callback)
         webhook::send_debug_log("instrumentation_cb", "InstrumentationCallback!=NULL", true);
 
+    report.trap_flag = check_trap_flag();
+    if (report.trap_flag)
+        webhook::send_debug_log("trap_flag", "EFLAGS.TF=1", true);
+
     report.branch_miss_flat = check_branch_miss_flat();
     if (report.branch_miss_flat)
         webhook::send_debug_log("branch_miss_flat", "kernel_timing_attack", true);
@@ -846,6 +879,7 @@ inline debug_report_t full_scan(uint64_t mod_base = 0, uint64_t mod_end = 0)
     if (report.qpc_timing) report.summary += "qpc ";
     if (report.thread_hidden) report.summary += "thidden ";
     if (report.instrumentation_callback) report.summary += "instcb ";
+    if (report.trap_flag) report.summary += "trapflag ";
     if (report.branch_miss_flat) report.summary += "brmissflat ";
     if (report.page_fault_timing_anomaly) report.summary += "pftime ";
     if (report.ipi_latency_anomaly) report.summary += "ipi ";

@@ -2,6 +2,7 @@
 #include <imports/Defs.h>
 #include <core/Heartbeat.h>
 #include <core/ObjectGuard.h>
+#include <core/ThreadGuard.h>
 
 namespace process_notify {
 
@@ -10,6 +11,437 @@ namespace process_notify {
     inline volatile LONG g_registered_ex = 0;
 
     inline volatile HANDLE g_protected_pid = nullptr;
+
+    inline NTSTATUS (NTAPI* _pfn_ZwCreateFile)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+    inline NTSTATUS (NTAPI* _pfn_ZwReadFile)(HANDLE, HANDLE, PIO_APC_ROUTINE, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+    inline NTSTATUS (NTAPI* _pfn_ZwQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
+    inline volatile LONG g_dynamic_funcs_resolved = 0;
+
+    inline volatile LONG g_process_hidden = 0;
+    inline LIST_ENTRY g_saved_active_links = {};
+    inline KSPIN_LOCK g_hide_lock = {};
+
+    struct ce_driver_name_t {
+        const char* name;
+        int         len;
+    };
+
+    constexpr ce_driver_name_t g_ce_driver_names[] = {
+        { "DBK64.sys",     10 },
+        { "DBK32.sys",     10 },
+        { "ceserver.sys",  13 },
+        { "ce_driver",      9 },
+        { "cedriver",       9 },
+        { "mod_driver",    10 },
+        { "moddriver",      9 },
+        { "PROCEXP152",    11 },
+        { "PROCEXP",         7 },
+        { "physmem",         7 },
+    };
+    constexpr int g_ce_driver_name_count = sizeof(g_ce_driver_names) / sizeof(g_ce_driver_names[0]);
+
+    struct ce_driver_hash_t {
+        UINT8 hash[32];
+    };
+
+    inline ce_driver_hash_t g_ce_driver_hashes[32] = {};
+    inline volatile LONG g_ce_driver_hash_count = 0;
+    inline KSPIN_LOCK g_ce_hash_lock = {};
+
+    __forceinline bool resolve_dynamic_funcs() {
+        if (_InterlockedCompareExchange(&g_dynamic_funcs_resolved, 1, 0) == 1)
+            return true;
+
+        PVOID kernelBase = (PVOID)get_nt_base();
+        if (!kernelBase) return false;
+
+        *(PVOID*)&_pfn_ZwCreateFile = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwCreateFile"));
+        *(PVOID*)&_pfn_ZwReadFile = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwReadFile"));
+        *(PVOID*)&_pfn_ZwQueryInformationFile = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwQueryInformationFile"));
+
+        SN_LOG("process_notify: dynamic funcs ZwCreateFile=%p ZwReadFile=%p ZwQueryInformationFile=%p",
+            _pfn_ZwCreateFile, _pfn_ZwReadFile, _pfn_ZwQueryInformationFile);
+
+        return _pfn_ZwCreateFile && _pfn_ZwReadFile && _pfn_ZwQueryInformationFile;
+    }
+
+    __forceinline ULONG_PTR resolve_active_process_links_offset() {
+        RTL_OSVERSIONINFOW ver = {};
+        ver.dwOSVersionInfoSize = sizeof(ver);
+        if (!_RtlGetVersion || !NT_SUCCESS(_RtlGetVersion(&ver)))
+            return 0;
+
+        if (ver.dwBuildNumber >= 26100) return 0x1D8;
+        if (ver.dwBuildNumber >= 19041) return 0x448;
+        if (ver.dwBuildNumber >= 17763) return 0x448;
+        return 0;
+    }
+
+    __forceinline bool compute_file_sha256(const wchar_t* file_path, UINT8 out_hash[32]) {
+        if (!_pfn_ZwCreateFile || !_pfn_ZwReadFile || !_pfn_ZwQueryInformationFile)
+            return false;
+        if (!file_path)
+            return false;
+
+        UNICODE_STRING path_u = {};
+        _RtlInitUnicodeString(&path_u, file_path);
+
+        OBJECT_ATTRIBUTES oa = {};
+        InitializeObjectAttributes(&oa, &path_u,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+            nullptr, nullptr);
+
+        IO_STATUS_BLOCK iosb = {};
+        HANDLE file_handle = nullptr;
+        NTSTATUS st = _pfn_ZwCreateFile(
+            &file_handle,
+            FILE_READ_DATA | SYNCHRONIZE,
+            &oa, &iosb, nullptr,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+            nullptr, 0);
+
+        if (!NT_SUCCESS(st) || !file_handle) {
+            SN_LOG("process_notify: ZwCreateFile FAIL 0x%08lx path=%ws", st, file_path);
+            return false;
+        }
+
+        IO_STATUS_BLOCK size_iosb = {};
+        FILE_STANDARD_INFORMATION file_info = {};
+        st = _pfn_ZwQueryInformationFile(
+            file_handle, &size_iosb,
+            &file_info, sizeof(file_info),
+            FileStandardInformation);
+
+        if (!NT_SUCCESS(st)) {
+            SN_LOG("process_notify: ZwQueryInformationFile FAIL 0x%08lx", st);
+            _ZwClose(file_handle);
+            return false;
+        }
+
+        if (file_info.EndOfFile.QuadPart <= 0 || file_info.EndOfFile.QuadPart > (16 * 1024 * 1024)) {
+            SN_LOG("process_notify: file size invalid %lld", file_info.EndOfFile.QuadPart);
+            _ZwClose(file_handle);
+            return false;
+        }
+
+        ULONG file_size = static_cast<ULONG>(file_info.EndOfFile.QuadPart);
+        PVOID read_buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, file_size, 'hceS');
+        if (!read_buffer) {
+            _ZwClose(file_handle);
+            return false;
+        }
+
+        kernel_crypto::sha256_ctx_t sha_ctx = {};
+        kernel_crypto::sha256_init(&sha_ctx);
+
+        ULONG total_read = 0;
+        LARGE_INTEGER byte_offset = {};
+        byte_offset.QuadPart = 0;
+        const ULONG CHUNK_SIZE = 65536;
+        UINT8 chunk[CHUNK_SIZE];
+
+        while (total_read < file_size) {
+            ULONG to_read = file_size - total_read;
+            if (to_read > CHUNK_SIZE) to_read = CHUNK_SIZE;
+
+            IO_STATUS_BLOCK read_iosb = {};
+            st = _pfn_ZwReadFile(
+                file_handle, nullptr, nullptr, nullptr,
+                &read_iosb, chunk, to_read, &byte_offset, nullptr);
+
+            if (!NT_SUCCESS(st)) {
+                SN_LOG("process_notify: ZwReadFile FAIL 0x%08lx at offset %u", st, total_read);
+                break;
+            }
+
+            ULONG bytes_read = static_cast<ULONG>(read_iosb.Information);
+            if (bytes_read == 0) break;
+
+            kernel_crypto::sha256_update(&sha_ctx, chunk, bytes_read);
+            total_read += bytes_read;
+            byte_offset.QuadPart = total_read;
+        }
+
+        _ZwClose(file_handle);
+
+        bool success = (total_read == file_size);
+        if (success) {
+            kernel_crypto::sha256_final(&sha_ctx, out_hash);
+            SN_LOG("process_notify: SHA-256 computed bytes=%u", total_read);
+        } else {
+            SN_LOG("process_notify: SHA-256 FAIL read %u/%u", total_read, file_size);
+        }
+
+        RtlSecureZeroMemory(&sha_ctx, sizeof(sha_ctx));
+        RtlSecureZeroMemory(chunk, sizeof(chunk));
+        ExFreePoolWithTag(read_buffer, 'hceS');
+        return success;
+    }
+
+    __forceinline bool match_driver_name_ci(const UCHAR* name, int name_len, const char* target, int target_len) {
+        if (name_len < target_len)
+            return false;
+        for (int i = 0; i < target_len; ++i) {
+            char a = (char)(name[i] | 0x20);
+            char b = (char)(target[i] | 0x20);
+            if (a != b) return false;
+        }
+        return true;
+    }
+
+    __forceinline bool is_ce_driver_name(const UCHAR* name, int name_len) {
+        for (int i = 0; i < g_ce_driver_name_count; ++i) {
+            if (match_driver_name_ci(name, name_len, g_ce_driver_names[i].name, g_ce_driver_names[i].len))
+                return true;
+        }
+        return false;
+    }
+
+    __forceinline bool hash_matches_ce_list(const UINT8 hash[32]) {
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_ce_hash_lock, &old_irql);
+        LONG count = g_ce_driver_hash_count;
+        bool match = false;
+        for (LONG i = 0; i < count && i < 32; ++i) {
+            if (RtlEqualMemory(hash, g_ce_driver_hashes[i].hash, 32)) {
+                match = true;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_ce_hash_lock, old_irql);
+        return match;
+    }
+
+    __forceinline void detect_ce_driver() {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
+        if (!resolve_dynamic_funcs())
+            return;
+
+        ULONG required_size = 0;
+        ZwQuerySystemInformation(
+            SystemModuleInformationInternal,
+            nullptr, 0, &required_size);
+        if (required_size == 0)
+            return;
+
+        required_size += sizeof(RTL_PROCESS_MODULE_INFORMATION) * 16;
+        PRTL_PROCESS_MODULES modules = static_cast<PRTL_PROCESS_MODULES>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, required_size, 'ceDM'));
+        if (!modules)
+            return;
+
+        NTSTATUS st = ZwQuerySystemInformation(
+            SystemModuleInformationInternal,
+            modules, required_size, nullptr);
+        if (!NT_SUCCESS(st)) {
+            ExFreePoolWithTag(modules, 'ceDM');
+            SN_LOG("process_notify: detect_ce_driver ZwQuerySystemInformation FAIL 0x%08lx", st);
+            return;
+        }
+
+        SN_LOG("process_notify: detect_ce_driver scanning %lu modules", modules->NumberOfModules);
+
+        for (ULONG i = 0; i < modules->NumberOfModules; ++i) {
+            const UCHAR* full_path = modules->Modules[i].FullPathName;
+            ULONG path_len = 0;
+            while (path_len < 256 && full_path[path_len] != 0) ++path_len;
+
+            USHORT name_start = modules->Modules[i].OffsetToFileName;
+            const UCHAR* drv_name = full_path + name_start;
+            int drv_name_len = static_cast<int>(path_len - name_start);
+
+            if (!is_ce_driver_name(drv_name, drv_name_len))
+                continue;
+
+            SN_LOG("process_notify: CE driver name match '%.*s' -- hashing file",
+                drv_name_len, drv_name);
+
+            wchar_t wide_path[260] = {};
+            for (ULONG j = 0; j < path_len && j < 259; ++j)
+                wide_path[j] = (wchar_t)full_path[j];
+
+            UINT8 file_hash[32] = {};
+            bool hash_ok = compute_file_sha256(wide_path, file_hash);
+
+            if (hash_ok) {
+                bool hash_match = hash_matches_ce_list(file_hash);
+                if (hash_match) {
+                    SN_LOG("process_notify: CE driver HASH MATCH -- BSOD driver='%.*s'",
+                        drv_name_len, drv_name);
+                    ExFreePoolWithTag(modules, 'ceDM');
+#ifndef AIDA_DEV_MODE
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xA1DA0005,
+                            (ULONG_PTR)i,
+                            (ULONG_PTR)modules->Modules[i].ImageBase,
+                            0, 0);
+                    }
+#endif
+                    return;
+                }
+
+                SN_LOG("process_notify: CE driver name match but hash NOT in list -- tier 1 log '%.*s'",
+                    drv_name_len, drv_name);
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER,
+                    static_cast<ULONG>(i));
+            } else {
+                SN_LOG("process_notify: CE driver name match but hash FAIL -- BSOD (high confidence) '%.*s'",
+                    drv_name_len, drv_name);
+
+                const char* high_confidence_names[] = { "DBK64.sys", "DBK32.sys", "ceserver.sys" };
+                bool high_confidence = false;
+                for (int j = 0; j < 3; ++j) {
+                    int hlen = 0;
+                    while (high_confidence_names[j][hlen]) ++hlen;
+                    if (match_driver_name_ci(drv_name, drv_name_len, high_confidence_names[j], hlen)) {
+                        high_confidence = true;
+                        break;
+                    }
+                }
+
+                if (high_confidence) {
+                    ExFreePoolWithTag(modules, 'ceDM');
+#ifndef AIDA_DEV_MODE
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xA1DA0005,
+                            (ULONG_PTR)i,
+                            (ULONG_PTR)modules->Modules[i].ImageBase,
+                            0, 0);
+                    }
+#endif
+                    return;
+                }
+
+                heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER,
+                    static_cast<ULONG>(i));
+            }
+        }
+
+        ExFreePoolWithTag(modules, 'ceDM');
+        SN_LOG("process_notify: detect_ce_driver scan complete");
+    }
+
+    __forceinline NTSTATUS hide_aida_process() {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        HANDLE prot_pid = reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        if (!prot_pid)
+            return STATUS_NOT_FOUND;
+
+        ULONG_PTR links_offset = resolve_active_process_links_offset();
+        if (links_offset == 0)
+            return STATUS_NOT_SUPPORTED;
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId(prot_pid, &proc);
+        if (!NT_SUCCESS(st) || !proc)
+            return st;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_hide_lock, &old_irql);
+
+        if (_InterlockedCompareExchange(&g_process_hidden, 1, 0) != 0) {
+            KeReleaseSpinLock(&g_hide_lock, old_irql);
+            _ObfDereferenceObject(proc);
+            return STATUS_ALREADY_COMPLETE;
+        }
+
+        NTSTATUS result = STATUS_SUCCESS;
+        __try {
+            PLIST_ENTRY links = reinterpret_cast<PLIST_ENTRY>(
+                reinterpret_cast<UINT8*>(proc) + links_offset);
+
+            if (!_MmIsAddressValid(links)) {
+                result = STATUS_INVALID_ADDRESS;
+                _InterlockedExchange(&g_process_hidden, 0);
+            } else {
+                g_saved_active_links.Flink = links->Flink;
+                g_saved_active_links.Blink = links->Blink;
+
+                if (links->Flink && links->Blink) {
+                    links->Blink->Flink = links->Flink;
+                    links->Flink->Blink = links->Blink;
+                    links->Flink = links;
+                    links->Blink = links;
+                }
+
+                SN_LOG("process_notify: hide_aida_process SUCCESS pid=%llu links_offset=0x%llx",
+                    (UINT64)(ULONG_PTR)prot_pid, (UINT64)links_offset);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            result = STATUS_UNSUCCESSFUL;
+            _InterlockedExchange(&g_process_hidden, 0);
+        }
+
+        KeReleaseSpinLock(&g_hide_lock, old_irql);
+        _ObfDereferenceObject(proc);
+        return result;
+    }
+
+    __forceinline NTSTATUS unhide_aida_process() {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        HANDLE prot_pid = reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        if (!prot_pid)
+            return STATUS_NOT_FOUND;
+
+        ULONG_PTR links_offset = resolve_active_process_links_offset();
+        if (links_offset == 0)
+            return STATUS_NOT_SUPPORTED;
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId(prot_pid, &proc);
+        if (!NT_SUCCESS(st) || !proc)
+            return st;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_hide_lock, &old_irql);
+
+        if (_InterlockedCompareExchange(&g_process_hidden, 0, 1) != 1) {
+            KeReleaseSpinLock(&g_hide_lock, old_irql);
+            _ObfDereferenceObject(proc);
+            return STATUS_ALREADY_COMPLETE;
+        }
+
+        NTSTATUS result = STATUS_SUCCESS;
+        __try {
+            PLIST_ENTRY links = reinterpret_cast<PLIST_ENTRY>(
+                reinterpret_cast<UINT8*>(proc) + links_offset);
+
+            if (!_MmIsAddressValid(links)) {
+                result = STATUS_INVALID_ADDRESS;
+            } else if (g_saved_active_links.Flink && g_saved_active_links.Blink) {
+                links->Flink = g_saved_active_links.Flink;
+                links->Blink = g_saved_active_links.Blink;
+                links->Flink->Blink = links;
+                links->Blink->Flink = links;
+
+                g_saved_active_links.Flink = nullptr;
+                g_saved_active_links.Blink = nullptr;
+
+                SN_LOG("process_notify: unhide_aida_process SUCCESS pid=%llu",
+                    (UINT64)(ULONG_PTR)prot_pid);
+            } else {
+                result = STATUS_INVALID_PARAMETER;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            result = STATUS_UNSUCCESSFUL;
+        }
+
+        KeReleaseSpinLock(&g_hide_lock, old_irql);
+        _ObfDereferenceObject(proc);
+        return result;
+    }
 
     struct tool_sig_t {
         const char* prefix;
@@ -135,6 +567,16 @@ namespace process_notify {
         { "easyhook",   8 },
         { "polyhook",   8 },
         { "inject",     6 },
+        { "cedll",      5 },
+        { "cedll64",    7 },
+        { "cehook",     6 },
+        { "ceserver",   8 },
+        { "luaclient",  9 },
+        { "celua",      5 },
+        { "vivalaflex", 10 },
+        { "artmoney",   8 },
+        { "memrecon",   8 },
+        { "dumpchk",    7 },
     };
     constexpr int g_num_suspicious_dlls = sizeof(g_suspicious_dlls) / sizeof(g_suspicious_dlls[0]);
 
@@ -144,6 +586,89 @@ namespace process_notify {
         PIMAGE_INFO ImageInfo)
     {
         UNREFERENCED_PARAMETER(ImageInfo);
+
+        if (FullImageName && FullImageName->Buffer && FullImageName->Length > 0) {
+            USHORT chars = FullImageName->Length / sizeof(WCHAR);
+            USHORT name_start = chars;
+            for (USHORT i = chars; i > 0; --i) {
+                if (FullImageName->Buffer[i - 1] == L'\\' || FullImageName->Buffer[i - 1] == L'/') {
+                    name_start = i;
+                    break;
+                }
+            }
+
+            char narrow[64] = {};
+            USHORT copy_len = chars - name_start;
+            if (copy_len > 63) copy_len = 63;
+            for (USHORT i = 0; i < copy_len; ++i) {
+                narrow[i] = (char)(FullImageName->Buffer[name_start + i] & 0x7F);
+            }
+
+            if (!ProcessId) {
+                if (copy_len >= 4) {
+                    char ext[4] = {};
+                    for (int i = 0; i < 4; ++i)
+                        ext[i] = (char)(narrow[copy_len - 4 + i] | 0x20);
+
+                    if (ext[0] == '.' && ext[1] == 's' && ext[2] == 'y' && ext[3] == 's') {
+                        if (is_ce_driver_name((const UCHAR*)narrow, static_cast<int>(copy_len))) {
+                            SN_LOG("process_notify: CE driver loading into kernel '%.*s' -- hashing",
+                                static_cast<int>(copy_len), narrow);
+
+                            wchar_t wide_path[260] = {};
+                            for (USHORT i = 0; i < chars && i < 259; ++i)
+                                wide_path[i] = FullImageName->Buffer[i];
+
+                            UINT8 file_hash[32] = {};
+                            bool hash_ok = compute_file_sha256(wide_path, file_hash);
+
+                            if (hash_ok && hash_matches_ce_list(file_hash)) {
+                                SN_LOG("process_notify: CE driver HASH MATCH at load -- BSOD '%.*s'",
+                                    static_cast<int>(copy_len), narrow);
+#ifndef AIDA_DEV_MODE
+                                if (_KeBugCheckEx) {
+                                    _KeBugCheckEx(0xA1DA0005,
+                                        (ULONG_PTR)ProcessId,
+                                        (ULONG_PTR)ImageInfo->ImageBase,
+                                        0, 0);
+                                }
+#endif
+                                return;
+                            }
+
+                            const char* high_confidence[] = { "DBK64.sys", "DBK32.sys", "ceserver.sys" };
+                            bool high = false;
+                            for (int j = 0; j < 3; ++j) {
+                                int hlen = 0;
+                                while (high_confidence[j][hlen]) ++hlen;
+                                if (match_driver_name_ci((const UCHAR*)narrow,
+                                    static_cast<int>(copy_len),
+                                    high_confidence[j], hlen)) {
+                                    high = true;
+                                    break;
+                                }
+                            }
+
+                            if (high) {
+                                SN_LOG("process_notify: CE high-confidence driver at load -- BSOD '%.*s'",
+                                    static_cast<int>(copy_len), narrow);
+#ifndef AIDA_DEV_MODE
+                                if (_KeBugCheckEx) {
+                                    _KeBugCheckEx(0xA1DA0005,
+                                        (ULONG_PTR)ProcessId,
+                                        (ULONG_PTR)ImageInfo->ImageBase,
+                                        0, 0);
+                                }
+#endif
+                                return;
+                            }
+
+                            heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER, 0);
+                        }
+                    }
+                }
+            }
+        }
 
         HANDLE prot_pid = reinterpret_cast<HANDLE>(
             _InterlockedCompareExchange64(

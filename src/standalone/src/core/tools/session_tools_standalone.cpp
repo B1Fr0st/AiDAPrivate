@@ -3,20 +3,26 @@
 
 #include "../mcp/mcp_standalone.hpp"
 #include "../session/analysis_session.hpp"
+#include "../analysis/workspace/workspace_database.hpp"
+#include "../analysis/workspace/live_snapshot_provider.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../session/session_health.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/run_target.hpp"
 #include "../runtime/vm_guest_bridge.hpp"
-#include "../ui/loading_binary_overlay.hpp"
+#include "../anti-tamper/self_guard.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <string>
+#include <thread>
 
 namespace session_tools {
 
@@ -44,18 +50,179 @@ json summary_to_json(const analysis_session::session_summary_t& s)
 	return o;
 }
 
-uint32_t parse_pid(const json& v)
+const char* readiness_name(aida::analysis::workspace_readiness_t readiness)
 {
-	if (v.is_number_unsigned()) return static_cast<uint32_t>(v.get<uint64_t>());
-	if (v.is_number_integer()) {
-		int64_t s = v.get<int64_t>();
-		return (s > 0) ? static_cast<uint32_t>(s) : 0u;
+	switch (readiness) {
+	case aida::analysis::workspace_readiness_t::created: return "created";
+	case aida::analysis::workspace_readiness_t::provider_ready: return "provider_ready";
+	case aida::analysis::workspace_readiness_t::parsed: return "parsed";
+	case aida::analysis::workspace_readiness_t::analyzing: return "analyzing";
+	case aida::analysis::workspace_readiness_t::baseline_ready: return "baseline_ready";
+	case aida::analysis::workspace_readiness_t::partial: return "partial";
+	case aida::analysis::workspace_readiness_t::failed: return "failed";
+	case aida::analysis::workspace_readiness_t::cancelling: return "cancelling";
+	case aida::analysis::workspace_readiness_t::closing: return "closing";
+	case aida::analysis::workspace_readiness_t::closed: return "closed";
 	}
-	if (v.is_string()) {
-		try { return static_cast<uint32_t>(std::stoul(v.get<std::string>(), nullptr, 0)); }
-		catch (...) { return 0u; }
+	return "unknown";
+}
+
+const char* architecture_name(aida::analysis::architecture_id_t architecture)
+{
+	switch (architecture) {
+	case aida::analysis::architecture_id_t::x86: return "x86";
+	case aida::analysis::architecture_id_t::x86_64: return "x86_64";
+	default: return "unknown";
 	}
-	return 0u;
+}
+
+const char* format_name(aida::analysis::format_id_t format)
+{
+	switch (format) {
+	case aida::analysis::format_id_t::pe32: return "pe32";
+	case aida::analysis::format_id_t::pe32_plus: return "pe32_plus";
+	default: return "unknown";
+	}
+}
+
+tool_result_t list_instances(int port)
+{
+	auto workspaces = aida::analysis::workspace_registry().list();
+	json instances = json::array();
+	std::uint32_t only_live_pid = 0;
+	std::size_t live_count = 0;
+	for (const auto& workspace : workspaces) {
+		const auto& identity = workspace->identity();
+		const bool live = identity.target_kind() == aida::analysis::target_kind_t::live_snapshot;
+		const std::uint32_t pid = live && identity.process() ? identity.process()->pid : 0;
+		std::shared_ptr<const aida::analysis::live_snapshot_provider_t> live_provider;
+		bool snapshot_stale = false;
+		if (live) {
+			live_provider = std::dynamic_pointer_cast<const aida::analysis::live_snapshot_provider_t>(
+				workspace->provider_handle());
+			snapshot_stale = !live_provider || !live_provider->validate_current_identity();
+		}
+		if (pid != 0 && !snapshot_stale) {
+			++live_count;
+			only_live_pid = pid;
+		}
+		json instance;
+		instance["pid"] = pid;
+		instance["binary"] = identity.bin_name();
+		instance["host"] = "127.0.0.1";
+		instance["port"] = port;
+		auto database = workspace->database();
+		instance["idb_path"] = database ? database->path() : std::string();
+		instance["backend"] = live ? "aida_driver_live" : "aida_static";
+		instance["binary_id"] = identity.binary_id().to_hex();
+		instance["kind"] = live ? "live" : "static";
+		instance["path"] = identity.normalized_source_path();
+		instance["process_creation_id"] = identity.process()
+			? json(std::to_string(identity.process()->creation_time_100ns))
+			: json(nullptr);
+		instance["architecture"] = architecture_name(identity.architecture());
+		instance["format"] = format_name(identity.format());
+		instance["analysis_revision"] = workspace->analysis_revision();
+		instance["overlay_revision"] = workspace->overlay_revision();
+		instance["readiness"] = readiness_name(workspace->progress().readiness);
+		instance["snapshot_stale"] = snapshot_stale;
+		if (live_provider) {
+			const auto& metadata = live_provider->metadata();
+			instance["capture_time_100ns"] = std::to_string(metadata.capture_time_100ns);
+			instance["capture_address"] = std::to_string(metadata.capture_address);
+			instance["capture_size"] = metadata.capture_size;
+			instance["capture_hash"] = metadata.capture_hash.to_hex();
+			instance["module_base"] = std::to_string(metadata.module.base);
+			instance["module_size"] = metadata.module.size;
+			instance["module_name"] = metadata.module.normalized_name;
+		}
+		instances.push_back(std::move(instance));
+	}
+	json result;
+	result["instances"] = std::move(instances);
+	result["count"] = workspaces.size();
+	result["default_pid"] = live_count == 1 ? json(only_live_pid) : json(nullptr);
+	return tool_result_t::ok(result);
+}
+
+bool parse_pid(const json& value, uint32_t& out, std::string* out_code = nullptr, std::string* out_message = nullptr, json* out_details = nullptr)
+{
+	auto set_error = [&](const char* code, const char* message, std::int64_t provided) {
+		if (out_code) *out_code = code;
+		if (out_message) *out_message = message;
+		if (out_details) *out_details = json{{"provided", provided}, {"min", 0}, {"max", 4294967295u}};
+	};
+
+	std::int64_t signed_value = 0;
+	bool have_signed = false;
+
+	if (value.is_number_integer()) {
+		signed_value = value.get<std::int64_t>();
+		have_signed = true;
+	} else if (value.is_number_unsigned()) {
+		const std::uint64_t unsigned_value = value.get<std::uint64_t>();
+		if (unsigned_value > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())) {
+			set_error("INVALID_ARGUMENT", "pid exceeds the valid 32-bit process id range",
+				static_cast<std::int64_t>((std::numeric_limits<std::int64_t>::max)()));
+			if (out_details) (*out_details)["provided"] = unsigned_value;
+			return false;
+		}
+		signed_value = static_cast<std::int64_t>(unsigned_value);
+		have_signed = true;
+	} else if (value.is_string()) {
+		try {
+			const std::string text = value.get<std::string>();
+			if (text.empty()) {
+				set_error("INVALID_ARGUMENT", "pid string is empty", 0);
+				return false;
+			}
+			if (text.front() == '-') {
+				set_error("INVALID_ARGUMENT", "pid must be non-negative", 0);
+				if (out_details) (*out_details)["provided"] = text;
+				return false;
+			}
+			std::size_t consumed = 0;
+			const std::uint64_t parsed = std::stoull(text, &consumed, 0);
+			if (consumed != text.size()) {
+				set_error("INVALID_ARGUMENT", "pid string has trailing characters", 0);
+				if (out_details) (*out_details)["provided"] = text;
+				return false;
+			}
+			if (parsed > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())) {
+				set_error("INVALID_ARGUMENT", "pid exceeds the valid 32-bit process id range",
+					static_cast<std::int64_t>((std::numeric_limits<std::int64_t>::max)()));
+				if (out_details) (*out_details)["provided"] = parsed;
+				return false;
+			}
+			signed_value = static_cast<std::int64_t>(parsed);
+			have_signed = true;
+		} catch (...) {
+			set_error("INVALID_ARGUMENT", "pid string could not be parsed", 0);
+			return false;
+		}
+	} else {
+		set_error("INVALID_ARGUMENT", "pid must be a number or numeric string", 0);
+		return false;
+	}
+
+	if (!have_signed) {
+		set_error("INVALID_ARGUMENT", "pid could not be parsed", 0);
+		return false;
+	}
+	if (signed_value < 0) {
+		set_error("INVALID_ARGUMENT", "pid must be non-negative", signed_value);
+		return false;
+	}
+	if (static_cast<std::uint64_t>(signed_value) > static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)())) {
+		set_error("INVALID_ARGUMENT", "pid exceeds the 32-bit process id range", signed_value);
+		return false;
+	}
+	if (signed_value == 0) {
+		set_error("INVALID_ARGUMENT", "pid must be a positive process id", 0);
+		return false;
+	}
+	out = static_cast<std::uint32_t>(signed_value);
+	return true;
 }
 
 bool parse_u32_value(const json& v, uint32_t& out)
@@ -73,120 +240,45 @@ bool parse_u32_value(const json& v, uint32_t& out)
 			const std::string text = v.get<std::string>();
 			if (!text.empty() && text[0] == '-')
 				return false;
-			raw = std::stoull(text, nullptr, 0);
+			size_t consumed = 0;
+			raw = std::stoull(text, &consumed, 0);
+			if (consumed != text.size())
+				return false;
 		} catch (...) {
 			return false;
 		}
 	} else {
 		return false;
 	}
-	out = static_cast<uint32_t>(raw > 0xFFFFFFFFull ? 0xFFFFFFFFu : raw);
+	if (raw > (std::numeric_limits<uint32_t>::max)())
+		return false;
+	out = static_cast<uint32_t>(raw);
 	return true;
 }
 
-bool wait_for_binary_load_quiescent(uint32_t timeout_ms)
+tool_result_t session_wait_error(const std::string& message, const std::string& code,
+                                 const std::string& session_id)
 {
-	const ULONGLONG start = GetTickCount64();
-	ULONGLONG last_log = 0;
-	ULONGLONG last_poll_log = 0;
-	uint32_t poll_count = 0;
-	bool first_poll = true;
-	loading_binary_overlay::log_state("session_wait_begin");
-	for (;;) {
-		const ULONGLONG before_tick = GetTickCount64();
-		const ULONGLONG before_elapsed = before_tick - start;
-		const char* phase_before = loading_binary_overlay::current_phase_name();
-		const bool log_poll = first_poll || before_elapsed - last_poll_log >= 250;
-		if (log_poll) {
-			last_poll_log = before_elapsed;
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_poll_pre poll=%u elapsed_ms=%llu timeout_ms=%u phase=%s active=%d",
-				poll_count,
-				static_cast<unsigned long long>(before_elapsed),
-				timeout_ms,
-				phase_before,
-				loading_binary_overlay::is_active() ? 1 : 0);
-		}
-		try {
-			loading_binary_overlay::poll_completion();
-		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_poll_exception poll=%u elapsed_ms=%llu phase_before=%s what=%s",
-				poll_count,
-				static_cast<unsigned long long>(GetTickCount64() - start),
-				phase_before,
-				ex.what());
-			loading_binary_overlay::log_state("session_wait_poll_exception");
-			return false;
-		} catch (...) {
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_poll_exception poll=%u elapsed_ms=%llu phase_before=%s what=unknown",
-				poll_count,
-				static_cast<unsigned long long>(GetTickCount64() - start),
-				phase_before);
-			loading_binary_overlay::log_state("session_wait_poll_exception");
-			return false;
-		}
-		++poll_count;
-		first_poll = false;
-		if (log_poll) {
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_poll_post poll=%u elapsed_ms=%llu phase_before=%s phase_after=%s active=%d waiting_decision=%d",
-				poll_count,
-				static_cast<unsigned long long>(GetTickCount64() - start),
-				phase_before,
-				loading_binary_overlay::current_phase_name(),
-				loading_binary_overlay::is_active() ? 1 : 0,
-				loading_binary_overlay::is_waiting_for_user_decision() ? 1 : 0);
-		}
-		if (!loading_binary_overlay::is_active()) {
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_done elapsed_ms=%llu phase=%s polls=%u",
-				static_cast<unsigned long long>(GetTickCount64() - start),
-				loading_binary_overlay::current_phase_name(),
-				poll_count);
-			return true;
-		}
-		if (loading_binary_overlay::is_load_ready_for_tools()) {
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_loaded elapsed_ms=%llu phase=%s polls=%u",
-				static_cast<unsigned long long>(GetTickCount64() - start),
-				loading_binary_overlay::current_phase_name(),
-				poll_count);
-			loading_binary_overlay::log_state("session_wait_loaded");
-			return true;
-		}
-		if (loading_binary_overlay::is_waiting_for_user_decision()) {
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_quiescent_user_decision elapsed_ms=%llu phase=%s polls=%u",
-				static_cast<unsigned long long>(GetTickCount64() - start),
-				loading_binary_overlay::current_phase_name(),
-				poll_count);
-			return true;
-		}
-		const ULONGLONG elapsed = GetTickCount64() - start;
-		if (elapsed - last_log >= 1000) {
-			last_log = elapsed;
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_pending elapsed_ms=%llu timeout_ms=%u phase=%s",
-				static_cast<unsigned long long>(elapsed),
-				timeout_ms,
-				loading_binary_overlay::current_phase_name());
-		}
-		if (elapsed >= timeout_ms) {
-			loading_binary_overlay::log_state("session_wait_timeout");
-			const bool cancelled = loading_binary_overlay::cancel_queued_load("session_wait_timeout");
-			diag::log_tagged_fmt("sess_tools",
-				"session_wait_timeout elapsed_ms=%llu timeout_ms=%u phase=%s polls=%u cancelled_queued_load=%d",
-				static_cast<unsigned long long>(elapsed),
-				timeout_ms,
-				loading_binary_overlay::current_phase_name(),
-				poll_count,
-				cancelled ? 1 : 0);
-			return false;
-		}
-		Sleep(25);
+	return tool_result_t::error(message, code, json{{"session_id", session_id}});
+}
+
+tool_result_t wait_for_workspace_closed(
+	const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+	const std::string& session_id)
+{
+	if (!workspace || workspace->closed())
+		return tool_result_t::ok(json{{"session_id", session_id}, {"drain_pending", false}});
+	const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
+	if (deadline == 0)
+		return tool_result_t::ok(json{{"session_id", session_id}, {"drain_pending", true}});
+	while (!workspace->closed()) {
+		if (mcp_standalone::current_call_cancelled())
+			return session_wait_error("Session close wait was cancelled", "CANCELLED", session_id);
+		if (static_cast<std::uint64_t>(GetTickCount64()) >= deadline)
+			return session_wait_error("Session close drain deadline expired", "DEADLINE_EXCEEDED", session_id);
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 	}
+	return tool_result_t::ok(json{{"session_id", session_id}, {"drain_pending", false}});
 }
 
 }
@@ -231,190 +323,87 @@ static tool_result_t sessions_open_file(const json& params)
 	diag::log_tagged_fmt("sess_tools", "sessions_open_file entry path='%.120s'",
 		params.contains("path") && params["path"].is_string()
 			? params["path"].get<std::string>().c_str() : "");
-	if (!params.contains("path") || !params["path"].is_string()) {
+	if (!params.contains("path") || !params["path"].is_string())
 		return tool_result_t::error("path (string) is required");
-	}
-	std::string path = params["path"].get<std::string>();
-	if (path.empty()) {
+	const std::string path = params["path"].get<std::string>();
+	if (path.empty())
 		return tool_result_t::error("path must be non-empty");
+	{
+		self_guard::self_guard_context_t sg_ctx;
+		sg_ctx.tool_name = "sessions_open_file";
+		sg_ctx.has_binary_path = true;
+		sg_ctx.target_binary_path = path;
+		auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+		if (guard_result != self_guard::self_guard_result_t::allow)
+			self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
 	}
-	const size_t before_count = analysis_session::list_session_summaries().size();
-	const size_t before_active = analysis_session::active_session_idx();
-	const uint32_t attached_before = driver_bridge::attached_pid();
-	diag::log_tagged_fmt("sess_tools",
-		"sessions_open_file open_begin path='%s' sessions_before=%llu active_before=%llu attached_pid=%u phase=%s",
-		path.c_str(),
-		static_cast<unsigned long long>(before_count),
-		static_cast<unsigned long long>(before_active),
-		attached_before,
-		loading_binary_overlay::current_phase_name());
-	const bool opened = analysis_session::open_session(path);
-	const size_t after_count = analysis_session::list_session_summaries().size();
-	const size_t after_active = analysis_session::active_session_idx();
-	diag::log_tagged_fmt("sess_tools",
-		"sessions_open_file open_return path='%s' opened=%d sessions_after=%llu active_after=%llu attached_pid=%u phase=%s",
-		path.c_str(),
-		opened ? 1 : 0,
-		static_cast<unsigned long long>(after_count),
-		static_cast<unsigned long long>(after_active),
-		driver_bridge::attached_pid(),
-		loading_binary_overlay::current_phase_name());
-	if (!opened) {
-		std::string err = analysis_session::last_error();
-		size_t idx = 0;
-		if (analysis_session::find_session_by_path(path, &idx)) {
-			diag::log_tagged_fmt("sess_tools",
-				"sessions_open_file existing_session_found path='%s' idx=%llu err='%s'",
-				path.c_str(),
-				static_cast<unsigned long long>(idx),
-				err.c_str());
-			const bool wait_ok = wait_for_binary_load_quiescent(30000);
-			diag::log_tagged_fmt("sess_tools",
-				"sessions_open_file existing_wait_done path='%s' idx=%llu wait_ok=%d phase=%s",
-				path.c_str(),
-				static_cast<unsigned long long>(idx),
-				wait_ok ? 1 : 0,
-				loading_binary_overlay::current_phase_name());
-			if (!wait_ok) {
-				return tool_result_t::error("open failed: load timeout");
-			}
-			auto sum = analysis_session::summarize_session_at(idx);
-			json root;
-			root["opened"] = summary_to_json(sum);
-			root["already_open"] = true;
-			diag::log_tagged_fmt("sess_tools",
-				"sessions_open_file path='%s' already_open id='%s'",
-				path.c_str(), sum.id.c_str());
-			return tool_result_t::ok(root);
-		}
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_open_file path='%s' open_failed err='%s'",
-			path.c_str(), err.c_str());
-		return tool_result_t::error(std::string("open failed: ") + err);
+	size_t existing_index = 0;
+	const bool already_open = analysis_session::find_session_by_path(path, &existing_index);
+	if (!analysis_session::open_session(path)) {
+		if (!analysis_session::find_session_by_path(path, &existing_index))
+			return tool_result_t::error(std::string("open failed: ") + analysis_session::last_error());
 	}
-	diag::log_tagged_fmt("sess_tools",
-		"sessions_open_file wait_begin path='%s' phase=%s attached_pid=%u",
-		path.c_str(),
-		loading_binary_overlay::current_phase_name(),
-		driver_bridge::attached_pid());
-	const bool wait_ok = wait_for_binary_load_quiescent(30000);
-	diag::log_tagged_fmt("sess_tools",
-		"sessions_open_file wait_done path='%s' wait_ok=%d phase=%s attached_pid=%u",
-		path.c_str(),
-		wait_ok ? 1 : 0,
-		loading_binary_overlay::current_phase_name(),
-		driver_bridge::attached_pid());
-	if (!wait_ok) {
-		return tool_result_t::error("open failed: load timeout");
-	}
-	size_t idx = 0;
-	if (!analysis_session::find_session_by_path(path, &idx)) {
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_open_file lookup_failed path='%s' sessions_after_wait=%llu active=%llu",
-			path.c_str(),
-			static_cast<unsigned long long>(analysis_session::list_session_summaries().size()),
-			static_cast<unsigned long long>(analysis_session::active_session_idx()));
-		return tool_result_t::error("session created but lookup failed");
-	}
-	auto sum = analysis_session::summarize_session_at(idx);
+	size_t index = 0;
+	if (!analysis_session::find_session_by_path(path, &index))
+		return tool_result_t::error("session created but lookup failed", "SESSION_LOOKUP_FAILED", json::object());
+	const auto summary = analysis_session::summarize_session_at(index);
 	json root;
-	root["opened"] = summary_to_json(sum);
-	root["already_open"] = false;
+	root["opened"] = summary_to_json(summary);
+	root["already_open"] = already_open;
 	diag::log_tagged_fmt("sess_tools",
-		"sessions_open_file path='%s' opened id='%s' idx=%llu active=%d attached_pid=%u",
-		path.c_str(),
-		sum.id.c_str(),
-		static_cast<unsigned long long>(idx),
-		sum.is_active ? 1 : 0,
-		driver_bridge::attached_pid());
+		"sessions_open_file ready path='%s' id='%s' binary_id='%s' readiness=%s",
+		path.c_str(), summary.id.c_str(), summary.binary_id.c_str(), readiness_name(summary.readiness));
 	return tool_result_t::ok(root);
 }
 
 static tool_result_t sessions_attach_pid(const json& params)
 {
 	diag::log_tagged_fmt("sess_tools", "sessions_attach_pid entry");
-	if (!params.contains("pid")) {
+	if (!params.contains("pid"))
 		return tool_result_t::error("pid is required");
+	uint32_t pid = 0;
+	std::string pid_code, pid_message;
+	json pid_details;
+	if (!parse_pid(params["pid"], pid, &pid_code, &pid_message, &pid_details))
+		return tool_result_t::error(pid_message.empty() ? std::string("invalid pid") : pid_message,
+			pid_code.empty() ? std::string("INVALID_ARGUMENT") : pid_code,
+			pid_details.is_object() ? pid_details : json::object());
+	{
+		self_guard::self_guard_context_t sg_ctx;
+		sg_ctx.tool_name = "sessions_attach_pid";
+		sg_ctx.has_pid = true;
+		sg_ctx.target_pid = pid;
+		auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+		if (guard_result != self_guard::self_guard_result_t::allow)
+			self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
 	}
-	uint32_t pid = parse_pid(params["pid"]);
-	if (pid == 0) {
-		return tool_result_t::error("invalid pid");
+	size_t index = 0;
+	const bool already_attached = analysis_session::find_session_by_pid(pid, &index);
+	if (!already_attached) {
+		std::string error;
+		if (!analysis_session::open_attach_session(pid, &error)) {
+			if (analysis_session::find_session_by_pid(pid, &index)) {
+				diag::log_tagged_fmt("sess_tools",
+					"sessions_attach_pid pid=%u attach_failed_but_found error='%s'",
+					pid, error.c_str());
+			} else {
+				return tool_result_t::error(std::string("attach failed: ") + error);
+			}
+		} else if (!analysis_session::find_session_by_pid(pid, &index))
+			return tool_result_t::error("session attached but lookup failed",
+				"SESSION_LOOKUP_FAILED", json{{"pid", pid}});
 	}
-	diag::log_tagged_fmt("sess_tools",
-		"sessions_attach_pid parsed pid=%u attached_pid=%u phase=%s",
-		pid,
-		driver_bridge::attached_pid(),
-		loading_binary_overlay::current_phase_name());
-	size_t existing_idx = 0;
-	if (analysis_session::find_session_by_pid(pid, &existing_idx)) {
-		auto sum = analysis_session::summarize_session_at(existing_idx);
-		json root;
-		root["attached"] = summary_to_json(sum);
-		root["already_attached"] = true;
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_attach_pid pid=%u existing_session idx=%llu id='%s'",
-			pid,
-			static_cast<unsigned long long>(existing_idx),
-			sum.id.c_str());
-		return tool_result_t::ok(root);
-	}
-	const uint32_t already_active_pid = driver_bridge::attached_pid();
-	if (already_active_pid == pid && session_health::is_alive(pid)) {
-		bool cleared_stale_load = false;
-		if (loading_binary_overlay::is_active() &&
-			!loading_binary_overlay::is_waiting_for_user_decision()) {
-			cleared_stale_load = loading_binary_overlay::cancel_queued_load("sessions_attach_pid_same_pid");
-			diag::log_tagged_fmt("sess_tools",
-				"sessions_attach_pid same_active_pid pid=%u phase=%s cleared_stale_load=%d",
-				pid,
-				loading_binary_overlay::current_phase_name(),
-				cleared_stale_load ? 1 : 0);
-		}
-		std::string adopt_err;
-		if (analysis_session::open_attach_session(pid, &adopt_err) &&
-			analysis_session::find_session_by_pid(pid, &existing_idx)) {
-			auto sum = analysis_session::summarize_session_at(existing_idx);
-			json root;
-			root["attached"] = summary_to_json(sum);
-			root["already_attached"] = true;
-			root["cleared_stale_load"] = cleared_stale_load;
-			diag::log_tagged_fmt("sess_tools",
-				"sessions_attach_pid pid=%u adopted_active_driver_session idx=%llu id='%s' cleared_stale_load=%d",
-				pid,
-				static_cast<unsigned long long>(existing_idx),
-				sum.id.c_str(),
-				cleared_stale_load ? 1 : 0);
-			return tool_result_t::ok(root);
-		}
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_attach_pid pid=%u same_active_pid_adopt_deferred err='%s' phase=%s cleared_stale_load=%d",
-			pid,
-			adopt_err.c_str(),
-			loading_binary_overlay::current_phase_name(),
-			cleared_stale_load ? 1 : 0);
-		if (cleared_stale_load) {
-			return tool_result_t::error(std::string("attach failed: ") + adopt_err);
-		}
-	}
-	if (!wait_for_binary_load_quiescent(30000)) {
-		return tool_result_t::error("attach failed: load timeout");
-	}
-	std::string err;
-	if (!analysis_session::open_attach_session(pid, &err)) {
-		diag::log_tagged_fmt("sess_tools",
-			"sessions_attach_pid pid=%u attach_failed err='%s'", pid, err.c_str());
-		return tool_result_t::error(std::string("attach failed: ") + err);
-	}
-	size_t idx = 0;
-	if (!analysis_session::find_session_by_pid(pid, &idx)) {
-		return tool_result_t::error("session attached but lookup failed");
-	}
-	auto sum = analysis_session::summarize_session_at(idx);
+	const auto summary = analysis_session::summarize_session_at(index);
+	if (summary.load_state == analysis_session::session_load_state_t::failed && summary.error)
+		return tool_result_t::error(summary.error->message, summary.error->stable_code(),
+			json{{"pid", pid}, {"phase", summary.error->phase}});
 	json root;
-	root["attached"] = summary_to_json(sum);
+	root["attached"] = summary_to_json(summary);
+	root["already_attached"] = already_attached;
+	root["cleared_stale_load"] = false;
 	diag::log_tagged_fmt("sess_tools",
-		"sessions_attach_pid pid=%u attached id='%s'",
-		pid, sum.id.c_str());
+		"sessions_attach_pid pid=%u id='%s' binary_id='%s' already=%d",
+		pid, summary.id.c_str(), summary.binary_id.c_str(), already_attached ? 1 : 0);
 	return tool_result_t::ok(root);
 }
 
@@ -431,15 +420,13 @@ static tool_result_t sessions_close(const json& params)
 	if (!analysis_session::find_session_by_id(id, &idx)) {
 		return tool_result_t::error("binary_id not found: " + id);
 	}
+	auto workspace = analysis_session::workspace_for_session(idx);
 	diag::log_tagged_fmt("sess_tools",
-		"sessions_close resolved id='%s' idx=%llu active=%llu phase=%s",
+		"sessions_close resolved id='%s' idx=%llu active=%llu binary_id='%s'",
 		id.c_str(),
 		static_cast<unsigned long long>(idx),
 		static_cast<unsigned long long>(analysis_session::active_session_idx()),
-		loading_binary_overlay::current_phase_name());
-	if (!wait_for_binary_load_quiescent(30000)) {
-		return tool_result_t::error("close failed: load timeout");
-	}
+		workspace ? workspace->identity().binary_id().to_hex().c_str() : "");
 	if (!analysis_session::close_session(idx)) {
 		std::string err = analysis_session::last_error();
 		diag::log_tagged_fmt("sess_tools",
@@ -447,9 +434,13 @@ static tool_result_t sessions_close(const json& params)
 			id.c_str(), err.c_str());
 		return tool_result_t::error(std::string("close failed: ") + err);
 	}
+	auto drained = wait_for_workspace_closed(workspace, id);
+	if (!drained.success)
+		return drained;
 	json root;
 	root["closed_id"] = id;
 	root["closed_idx"] = static_cast<uint64_t>(idx);
+	root["drain_pending"] = drained.data.value("drain_pending", false);
 	diag::log_tagged_fmt("sess_tools",
 		"sessions_close id='%s' idx=%llu",
 		id.c_str(), static_cast<unsigned long long>(idx));
@@ -487,6 +478,18 @@ static tool_result_t sessions_run_binary(const json& params)
 			? params["path"].get<std::string>().c_str() : "");
 	if (!params.contains("path") || !params["path"].is_string()) {
 		return tool_result_t::error("path (string) is required");
+	}
+	{
+		const std::string run_path = params["path"].get<std::string>();
+		if (!run_path.empty()) {
+			self_guard::self_guard_context_t sg_ctx;
+			sg_ctx.tool_name = "sessions_run_binary";
+			sg_ctx.has_binary_path = true;
+			sg_ctx.target_binary_path = run_path;
+			auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+			if (guard_result != self_guard::self_guard_result_t::allow)
+				self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+		}
 	}
 	run_target::launch_options_t opts;
 	opts.exe_path = widen(params["path"].get<std::string>());
@@ -562,6 +565,13 @@ static tool_result_t sessions_run_binary(const json& params)
 void register_session_tools(mcp_standalone::server_t& srv)
 {
 	diag::log_tagged_fmt("sess_tools", "register_session_tools entry");
+	srv.register_tool({
+		"list_instances",
+		"List every open AiDA static workspace and driver-backed live target without consulting or changing the active UI tab.",
+		{},
+		true,
+		[&srv](const json&) -> tool_result_t { return list_instances(srv.get_port()); }
+	});
 	srv.register_tool({
 		"sessions_manage",
 		"Manage static file, live process, and sandbox sessions. Actions: list, get_active, open_file, attach_pid, close, run_binary.",

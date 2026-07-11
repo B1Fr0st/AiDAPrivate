@@ -390,6 +390,13 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
     if (ida_utils::is_self_target_database())
         return tool_result_t::error(OBFSTR("Operation blocked."));
 
+    if (ida_utils::idb_is_aida_binary())
+    {
+        msg(OBFSTR_C("AiDA: self-analysis guard triggered for tool=%s — terminating.\n"), name.c_str());
+        constexpr uint32_t kSelfAnalysisBsodCode = 0xA1DA0001u;
+        __fastfail(static_cast<unsigned int>(kSelfAnalysisBsodCode));
+    }
+
     const auto* tool = get_tool(name);
     if (!tool)
         return tool_result_t::error(OBFSTR("Unknown tool: ") + name);

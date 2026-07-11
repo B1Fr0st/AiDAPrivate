@@ -32,6 +32,54 @@ const SESSION_RATCHET_AUTHENTICATED_ACTIONS = new Set([
 
 const SESSION_RATCHET_ENABLED = (process.env.SESSION_RATCHET_ENABLED || '1') !== '0';
 
+const INTEGRITY_HMAC_INFO = Buffer.from('aida_license_integrity_v1', 'utf8');
+
+async function getBuildTextHash(buildId) {
+    if (!buildId || typeof buildId !== 'string' || buildId.length < 4 || buildId.length > 128) {
+        return null;
+    }
+    try {
+        const { rows } = await pool.query(
+            'SELECT expected_text_sha256, retired FROM builds WHERE build_id = $1',
+            [buildId]
+        );
+        if (rows.length === 0) return null;
+        const row = rows[0];
+        const hash = typeof row.expected_text_sha256 === 'string' ? row.expected_text_sha256.trim().toLowerCase() : '';
+        if (!/^[0-9a-f]{64}$/.test(hash)) return null;
+        return { hash, retired: !!row.retired };
+    } catch (err) {
+        console.warn('[license] getBuildTextHash failed:', err && err.message ? err.message : err);
+        return null;
+    }
+}
+
+function hkdfExpandSha256(prk, info, length) {
+    if (length > 255 * 32) return null;
+    const blocks = Math.ceil(length / 32);
+    let t = Buffer.alloc(0);
+    const out = Buffer.alloc(length);
+    let pos = 0;
+    for (let i = 1; i <= blocks; i++) {
+        const hmacInput = Buffer.concat([t, info, Buffer.from([i])]);
+        t = crypto.createHmac('sha256', prk).update(hmacInput).digest();
+        const toCopy = Math.min(32, length - pos);
+        t.copy(out, pos, 0, toCopy);
+        pos += toCopy;
+    }
+    return out;
+}
+
+function computeIntegrityGatedHmac(serverNonceBuf, expectedHashHex, heartbeatPayloadBuf) {
+    const expectedHashBuf = Buffer.from(expectedHashHex, 'hex');
+    if (expectedHashBuf.length !== 32) return null;
+    const prk = crypto.createHmac('sha256', serverNonceBuf).update(expectedHashBuf).digest();
+    const sessionKey = hkdfExpandSha256(prk, INTEGRITY_HMAC_INFO, 32);
+    if (!sessionKey) return null;
+    const hmac = crypto.createHmac('sha256', sessionKey).update(heartbeatPayloadBuf).digest();
+    return hmac.toString('hex');
+}
+
 const router = express.Router();
 
 const REASON_INVALID = 1;
@@ -583,6 +631,19 @@ const NON_ENFORCING_BAN_REASONS = new Set([
     'cross_session_anomaly_ban',
 ]);
 const IGNORED_HWID_V2_FACTOR_KEYS = new Set(['5']);
+
+const COSINE_DIVERGENT_THRESHOLD = 0.30;
+const BEHAVIORAL_WINDOW_SIZE = 500;
+const BEHAVIORAL_TRAINING_PERIOD = 100;
+const BEHAVIORAL_RECOMPUTE_INTERVAL_SEC = 604800;
+const BEHAVIORAL_DIVERGENCE_WINDOW_SEC = 3600;
+const GEO_IMPOSSIBLE_SPEED_KMH = 900;
+const HWID_RATE_FLAG_PER_MIN = 120;
+const HWID_RATE_KILL_PER_MIN = 240;
+const HWID_RATE_PER_HOUR = 5000;
+const HWID_RATE_PER_DAY = 50000;
+const TEMPLATE_GRACE_PERIOD_SEC = 2592000;
+const CLONE_MIN_FEATURES = 3;
 
 
 function todayStr() {
@@ -2276,6 +2337,617 @@ function dbgHb(stage, fields) {
     }
 }
 
+function cosineSimilarity(vecA, vecB) {
+    const keys = new Set([...Object.keys(vecA), ...Object.keys(vecB)]);
+    let dot = 0, normA = 0, normB = 0;
+    for (const key of keys) {
+        const a = Number(vecA[key] || 0);
+        const b = Number(vecB[key] || 0);
+        dot += a * b;
+        normA += a * a;
+        normB += b * b;
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+function haversineDistanceKm(lat1, lon1, lat2, lon2) {
+    const R = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLon / 2) ** 2;
+    return R * 2 * Math.asin(Math.sqrt(a));
+}
+
+async function recordSentinelEventSafe(licenseKey, quorumId, eventType, severity, payload, ip) {
+    try {
+        const now = Math.floor(Date.now() / 1000);
+        await pool.query(
+            `INSERT INTO sentinel_events (license_key, quorum_id, event_type, severity, payload, received_at, client_ip)
+             VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)`,
+            [licenseKey, quorumId || '', eventType, severity || 'info', JSON.stringify(payload || {}), now, ip || '']
+        );
+    } catch (err) {
+        console.warn('[license] recordSentinelEventSafe failed:', err && err.message ? err.message : err);
+    }
+}
+
+async function verifyWatermarkProof(licenseRow, session, wmProof, hwid) {
+    const capsuleId = normalizeCapsuleId(wmProof.capsule_id);
+    const watermarkHex = String(wmProof.watermark_id_hex || '').trim().toLowerCase();
+    const watermarkHmac = String(wmProof.watermark_hmac || '').trim().toLowerCase();
+    const binarySha256 = String(wmProof.binary_sha256 || '').trim().toLowerCase();
+
+    if (!capsuleId || !/^[0-9a-f]{32}$/.test(watermarkHex) || !/^[0-9a-f]{64}$/.test(watermarkHmac)) {
+        return { ok: false, reason: 'watermark_proof_format' };
+    }
+
+    let rows;
+    try {
+        const result = await pool.query(
+            'SELECT marker_hex, license_key, capsule_sha256 FROM standalone_customer_capsules WHERE capsule_id = $1 AND license_key = $2',
+            [capsuleId, licenseRow.key]
+        );
+        rows = result.rows;
+    } catch (err) {
+        if (isMissingCapsuleSchemaError(err)) {
+            return { ok: false, reason: 'watermark_capsule_schema_missing' };
+        }
+        return { ok: false, reason: 'watermark_capsule_lookup_failed' };
+    }
+
+    if (rows.length === 0) {
+        return { ok: false, reason: 'watermark_capsule_not_found' };
+    }
+
+    const expectedMarker = String(rows[0].marker_hex || '').trim().toLowerCase();
+    const expectedCapsuleSha = String(rows[0].capsule_sha256 || '').trim().toLowerCase();
+    let markerMismatch = false;
+
+    if (!expectedMarker || expectedMarker !== watermarkHex) {
+        markerMismatch = true;
+    }
+
+    const sessionToken = session.session_token || '';
+    const expectedHmac = crypto.createHmac('sha256', Buffer.from(sessionToken, 'utf8'))
+        .update(sessionToken, 'utf8')
+        .update(watermarkHex, 'utf8')
+        .update(String(hwid || ''), 'utf8')
+        .digest('hex');
+
+    const a = Buffer.from(expectedHmac, 'utf8');
+    const b = Buffer.from(watermarkHmac, 'utf8');
+    let hmacMismatch = (a.length !== b.length || !crypto.timingSafeEqual(a, b));
+
+    if (!markerMismatch && !hmacMismatch) {
+        return { ok: true, capsule_id: capsuleId };
+    }
+
+    if (markerMismatch || hmacMismatch) {
+        if (!binarySha256 || !/^[0-9a-f]{64}$/.test(binarySha256) || !expectedCapsuleSha) {
+            return { ok: false, reason: 'watermark_mismatch_no_binary_hash' };
+        }
+        const hashBuf = Buffer.from(binarySha256, 'utf8');
+        const expectedBuf = Buffer.from(expectedCapsuleSha, 'utf8');
+        if (hashBuf.length === expectedBuf.length && crypto.timingSafeEqual(hashBuf, expectedBuf)) {
+            await recordSentinelEventSafe(licenseRow.key, '', 'watermark_extraction_fallback', 'warning',
+                { expected_marker: expectedMarker, got_marker: watermarkHex, binary_hash_match: true }, '');
+            return { ok: true, capsule_id: capsuleId, fallback: 'binary_hash' };
+        }
+        return { ok: false, reason: 'watermark_mismatch_binary_hash_fail' };
+    }
+
+    return { ok: true, capsule_id: capsuleId };
+}
+
+async function checkHwidRateLimit(hwid, licenseKey) {
+    if (!hwid || hwid.length < 8) return { ok: true };
+    const now = Math.floor(Date.now() / 1000);
+    const minuteStart = now - (now % 60);
+    const hourStart = now - (now % 3600);
+    const dayStart = now - (now % 86400);
+
+    try {
+        await pool.query(
+            `INSERT INTO hwid_rate_counters (hwid, window_kind, window_start, count, license_key)
+             VALUES ($1, 'minute', $2, 1, $3)
+             ON CONFLICT (hwid, window_kind, window_start)
+             DO UPDATE SET count = hwid_rate_counters.count + 1
+             RETURNING count`,
+            [hwid, minuteStart, licenseKey]
+        );
+        await pool.query(
+            `INSERT INTO hwid_rate_counters (hwid, window_kind, window_start, count, license_key)
+             VALUES ($1, 'hour', $2, 1, $3)
+             ON CONFLICT (hwid, window_kind, window_start)
+             DO UPDATE SET count = hwid_rate_counters.count + 1`,
+            [hwid, hourStart, licenseKey]
+        );
+        await pool.query(
+            `INSERT INTO hwid_rate_counters (hwid, window_kind, window_start, count, license_key)
+             VALUES ($1, 'day', $2, 1, $3)
+             ON CONFLICT (hwid, window_kind, window_start)
+             DO UPDATE SET count = hwid_rate_counters.count + 1`,
+            [hwid, dayStart, licenseKey]
+        );
+
+        const { rows } = await pool.query(
+            `SELECT window_kind, count FROM hwid_rate_counters
+             WHERE hwid = $1 AND window_start IN ($2, $3, $4)
+             AND window_kind IN ('minute', 'hour', 'day')`,
+            [hwid, minuteStart, hourStart, dayStart]
+        );
+
+        let minuteCount = 0, hourCount = 0, dayCount = 0;
+        for (const row of rows) {
+            if (row.window_kind === 'minute') minuteCount = Number(row.count || 0);
+            if (row.window_kind === 'hour') hourCount = Number(row.count || 0);
+            if (row.window_kind === 'day') dayCount = Number(row.count || 0);
+        }
+
+        if (minuteCount > HWID_RATE_KILL_PER_MIN) {
+            return { ok: false, kill: true, reason: 'hwid_rate_kill', scope: 'minute', current: minuteCount, limit: HWID_RATE_KILL_PER_MIN };
+        }
+        if (minuteCount > HWID_RATE_FLAG_PER_MIN) {
+            return { ok: false, kill: false, reason: 'hwid_rate_limited', scope: 'minute', current: minuteCount, limit: HWID_RATE_FLAG_PER_MIN, retry_after: 60 };
+        }
+        if (hourCount > HWID_RATE_PER_HOUR) {
+            return { ok: false, kill: false, reason: 'hwid_rate_limited', scope: 'hour', current: hourCount, limit: HWID_RATE_PER_HOUR, retry_after: 3600 };
+        }
+        if (dayCount > HWID_RATE_PER_DAY) {
+            return { ok: false, kill: false, reason: 'hwid_rate_limited', scope: 'day', current: dayCount, limit: HWID_RATE_PER_DAY, retry_after: 86400 };
+        }
+
+        return { ok: true };
+    } catch (err) {
+        if (err && err.code === '42P01') return { ok: true };
+        console.warn('[license] checkHwidRateLimit failed:', err && err.message ? err.message : err);
+        return { ok: true };
+    }
+}
+
+async function purgeHwidRateCounters() {
+    try {
+        const now = Math.floor(Date.now() / 1000);
+        await pool.query('DELETE FROM hwid_rate_counters WHERE window_start < $1', [now - 86400]);
+    } catch (_) { }
+}
+
+setInterval(purgeHwidRateCounters, 300 * 1000).unref();
+
+async function checkGeoImpossibility(licenseKey, hwid, clientIp, session, lookup) {
+    if (!clientIp || clientIp === 'unknown' || clientIp === '127.0.0.1' || clientIp === '::1') {
+        return { ok: true };
+    }
+
+    let lastDifferentIpRecord = null;
+    try {
+        const { rows } = await pool.query(
+            `SELECT ip, last_heartbeat, hwid FROM sessions
+             WHERE license_key = $1 AND ip != $2 AND ip != '' AND ip != 'unknown'
+             ORDER BY last_heartbeat DESC LIMIT 1`,
+            [licenseKey, clientIp]
+        );
+        if (rows.length > 0) {
+            lastDifferentIpRecord = rows[0];
+        }
+    } catch (_) { }
+
+    if (!lastDifferentIpRecord) return { ok: true };
+
+    const lastIp = lastDifferentIpRecord.ip;
+    const lastHb = Number(lastDifferentIpRecord.last_heartbeat || 0);
+    const lastHwid = lastDifferentIpRecord.hwid || '';
+    if (!lastIp || lastHb === 0) return { ok: true };
+
+    const now = Math.floor(Date.now() / 1000);
+    const timeDeltaSec = now - lastHb;
+    if (timeDeltaSec <= 0 || timeDeltaSec > 86400 * 7) return { ok: true };
+
+    const timeDeltaHours = timeDeltaSec / 3600;
+    if (timeDeltaHours < 0.001) return { ok: true };
+
+    const [geoCurrent, geoLast] = await Promise.all([
+        fetchGeolocation(clientIp),
+        fetchGeolocation(lastIp),
+    ]);
+
+    if (!geoCurrent || !geoLast || !Number.isFinite(geoCurrent.lat) || !Number.isFinite(geoCurrent.lon) ||
+        !Number.isFinite(geoLast.lat) || !Number.isFinite(geoLast.lon)) {
+        return { ok: true };
+    }
+
+    const distanceKm = haversineDistanceKm(geoCurrent.lat, geoCurrent.lon, geoLast.lat, geoLast.lon);
+    const speedKmh = distanceKm / timeDeltaHours;
+
+    if (speedKmh <= GEO_IMPOSSIBLE_SPEED_KMH) {
+        await recordSentinelEventSafe(licenseKey, '', 'geo_relocation', 'info',
+            { distance_km: distanceKm, speed_kmh: speedKmh, current_ip: clientIp, last_ip: lastIp }, clientIp);
+        return { ok: true };
+    }
+
+    const currentHwidFactors = deriveHwidFactors({ hwid });
+    const prevHwidFactors = parseHwidFactors(lookup.data && lookup.data.hwid_factors);
+    const hwidComparison = compareHwidFactors(prevHwidFactors, currentHwidFactors);
+
+    if (hwidComparison.changed <= 1 && isRichHwidV2Factors(prevHwidFactors) && isRichHwidV2Factors(currentHwidFactors)) {
+        await recordSentinelEventSafe(licenseKey, '', 'geo_vpn_switch', 'info',
+            { distance_km: distanceKm, speed_kmh: speedKmh, current_ip: clientIp, last_ip: lastIp, hwid_match: true }, clientIp);
+        return { ok: true };
+    }
+
+    let profileRow = null;
+    try {
+        const { rows } = await pool.query(
+            'SELECT hwids_seen, training_complete, tool_frequency FROM behavioral_profiles WHERE license_key = $1',
+            [licenseKey]
+        );
+        if (rows.length > 0) profileRow = rows[0];
+    } catch (_) { }
+
+    if (!profileRow || !profileRow.training_complete) {
+        await recordSentinelEventSafe(licenseKey, '', 'geo_impossible_training_incomplete', 'warn',
+            { distance_km: distanceKm, speed_kmh: speedKmh, current_ip: clientIp, last_ip: lastIp, hwid_current: hwid, hwid_last: lastHwid }, clientIp);
+        return { ok: true };
+    }
+
+    const hwidsSeen = Array.isArray(profileRow.hwids_seen) ? profileRow.hwids_seen : [];
+    const bothHwidsKnown = hwidsSeen.includes(hwid) && hwidsSeen.includes(lastHwid);
+
+    if (bothHwidsKnown) {
+        let cosine = 0;
+        try {
+            const { rows: ipRows } = await pool.query(
+                `SELECT client_ip, tool_name, COUNT(*) as cnt
+                 FROM mcp_tool_calls
+                 WHERE license_key = $1 AND called_at > $2
+                 GROUP BY client_ip, tool_name`,
+                [licenseKey, now - BEHAVIORAL_DIVERGENCE_WINDOW_SEC]
+            );
+            const ipGroups = {};
+            for (const row of ipRows) {
+                if (!ipGroups[row.client_ip]) ipGroups[row.client_ip] = {};
+                ipGroups[row.client_ip][row.tool_name] = Number(row.cnt || 0);
+            }
+            const currentVec = ipGroups[clientIp] || {};
+            const lastVec = ipGroups[lastIp] || {};
+            const totalCurrent = Object.values(currentVec).reduce((a, b) => a + b, 0);
+            const totalLast = Object.values(lastVec).reduce((a, b) => a + b, 0);
+            if (totalCurrent > 0) for (const k of Object.keys(currentVec)) currentVec[k] /= totalCurrent;
+            if (totalLast > 0) for (const k of Object.keys(lastVec)) lastVec[k] /= totalLast;
+            cosine = cosineSimilarity(currentVec, lastVec);
+
+            if (cosine > COSINE_DIVERGENT_THRESHOLD) {
+                await recordSentinelEventSafe(licenseKey, '', 'geo_multi_machine', 'info',
+                    { distance_km: distanceKm, speed_kmh: speedKmh, cosine, current_ip: clientIp, last_ip: lastIp, hwids: [hwid, lastHwid] }, clientIp);
+                return { ok: true };
+            }
+        } catch (_) { }
+    }
+
+    return {
+        ok: false,
+        revoke: true,
+        reason: 'geo_impossible_travel',
+        details: { distance_km: distanceKm, speed_kmh: speedKmh, current_ip: clientIp, last_ip: lastIp, hwid_current: hwid, hwid_last: lastHwid },
+    };
+}
+
+async function checkTemplateVersion(licenseKey, body) {
+    const clientTemplateVersion = typeof body.template_version === 'string' ? body.template_version.trim() : '';
+    if (!clientTemplateVersion) return { ok: true };
+
+    let activeTemplate = null;
+    try {
+        const { rows } = await pool.query(
+            'SELECT version, uploaded_at FROM build_templates WHERE is_active = true LIMIT 1'
+        );
+        if (rows.length > 0) activeTemplate = rows[0];
+    } catch (err) {
+        if (err && err.code === '42P01') return { ok: true };
+        return { ok: true };
+    }
+
+    if (!activeTemplate) return { ok: true };
+
+    const activeVersion = String(activeTemplate.version || '').trim();
+    if (!activeVersion || activeVersion === clientTemplateVersion) return { ok: true };
+
+    const uploadedAt = Number(activeTemplate.uploaded_at || 0);
+    const now = Math.floor(Date.now() / 1000);
+    const ageSec = uploadedAt > 0 ? (now - uploadedAt) : 0;
+
+    if (ageSec < TEMPLATE_GRACE_PERIOD_SEC) {
+        return { ok: true, logging: { template_old: true, client_version: clientTemplateVersion, active_version: activeVersion, age_sec: ageSec } };
+    }
+
+    return { ok: false, reason: 'template_update_required', client_version: clientTemplateVersion, active_version: activeVersion, age_sec: ageSec };
+}
+
+async function recordMcpToolCalls(licenseKey, hwid, sessionToken, clientIp, toolCalls) {
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) return;
+
+    const now = Math.floor(Date.now() / 1000);
+    const hour = new Date().getUTCHours();
+
+    for (const tc of toolCalls.slice(0, 100)) {
+        if (!tc || typeof tc !== 'object') continue;
+        const toolName = typeof tc.tool_name === 'string' ? tc.tool_name.slice(0, 128) : '';
+        const paramsHash = typeof tc.params_hash === 'string' ? tc.params_hash.slice(0, 64) : '';
+        const calledAt = typeof tc.called_at_ms === 'number' && Number.isFinite(tc.called_at_ms)
+            ? Math.floor(tc.called_at_ms / 1000) : now;
+        if (!toolName) continue;
+        try {
+            await pool.query(
+                `INSERT INTO mcp_tool_calls (license_key, hwid, session_token, tool_name, tool_params_hash, called_at, called_at_hour, client_ip, source)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'heartbeat')`,
+                [licenseKey, hwid || '', sessionToken || '', toolName, paramsHash, calledAt, hour, clientIp || '']
+            );
+        } catch (err) {
+            if (err && err.code === '42P01') return;
+            console.warn('[license] recordMcpToolCalls insert failed:', err && err.message ? err.message : err);
+            return;
+        }
+    }
+
+    try {
+        const { rows: profileRows } = await pool.query(
+            'SELECT * FROM behavioral_profiles WHERE license_key = $1',
+            [licenseKey]
+        );
+        let profile = profileRows.length > 0 ? profileRows[0] : null;
+
+        if (!profile) {
+            await pool.query(
+                `INSERT INTO behavioral_profiles (license_key, first_call_at, last_updated_at)
+                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+                [licenseKey, now, now]
+            );
+            const { rows: newRows } = await pool.query(
+                'SELECT * FROM behavioral_profiles WHERE license_key = $1',
+                [licenseKey]
+            );
+            profile = newRows.length > 0 ? newRows[0] : null;
+        }
+        if (!profile) return;
+
+        const totalCalls = Number(profile.total_calls || 0) + toolCalls.length;
+        const trainingComplete = totalCalls >= BEHAVIORAL_TRAINING_PERIOD;
+
+        let hwidsSeen = Array.isArray(profile.hwids_seen) ? profile.hwids_seen : [];
+        let ipsSeen = Array.isArray(profile.ips_seen) ? profile.ips_seen : [];
+        if (hwid && !hwidsSeen.includes(hwid)) hwidsSeen = [...hwidsSeen, hwid].slice(-32);
+        if (clientIp && !ipsSeen.includes(clientIp)) ipsSeen = [...ipsSeen, clientIp].slice(-32);
+
+        const lastUpdated = Number(profile.last_updated_at || 0);
+        const needsRecompute = !trainingComplete ||
+            (lastUpdated > 0 && (now - lastUpdated) > BEHAVIORAL_RECOMPUTE_INTERVAL_SEC);
+
+        let toolFrequency = profile.tool_frequency || {};
+        let hourHistogram = profile.hour_histogram || new Array(24).fill(0);
+        let toolSequenceHash = profile.tool_sequence_hash || '';
+
+        if (needsRecompute || !trainingComplete) {
+            const { rows: recentCalls } = await pool.query(
+                `SELECT tool_name, called_at_hour FROM mcp_tool_calls
+                 WHERE license_key = $1 ORDER BY called_at DESC LIMIT $2`,
+                [licenseKey, BEHAVIORAL_WINDOW_SIZE]
+            );
+            const freq = {};
+            const histogram = new Array(24).fill(0);
+            for (const call of recentCalls) {
+                const tn = String(call.tool_name || '');
+                if (tn) freq[tn] = (freq[tn] || 0) + 1;
+                const h = Number(call.called_at_hour || 0);
+                if (h >= 0 && h < 24) histogram[h] = (histogram[h] || 0) + 1;
+            }
+            const total = Object.values(freq).reduce((a, b) => a + b, 0);
+            if (total > 0) {
+                for (const k of Object.keys(freq)) freq[k] /= total;
+            }
+            toolFrequency = freq;
+            hourHistogram = histogram;
+
+            if (!trainingComplete && totalCalls <= BEHAVIORAL_TRAINING_PERIOD) {
+                const { rows: firstCalls } = await pool.query(
+                    `SELECT tool_name FROM mcp_tool_calls
+                     WHERE license_key = $1 ORDER BY called_at ASC LIMIT 50`,
+                    [licenseKey]
+                );
+                const seqConcat = firstCalls.map(r => String(r.tool_name || '')).join('|');
+                toolSequenceHash = crypto.createHash('sha256').update(seqConcat, 'utf8').digest('hex');
+            }
+        }
+
+        await pool.query(
+            `UPDATE behavioral_profiles SET
+                tool_frequency = $1::jsonb,
+                tool_sequence_hash = $2,
+                hour_histogram = $3::jsonb,
+                total_calls = $4,
+                training_complete = $5,
+                last_updated_at = $6,
+                hwids_seen = $7::TEXT[],
+                ips_seen = $8::TEXT[]
+              WHERE license_key = $9`,
+            [
+                JSON.stringify(toolFrequency),
+                toolSequenceHash,
+                JSON.stringify(hourHistogram),
+                totalCalls,
+                trainingComplete,
+                now,
+                hwidsSeen,
+                ipsSeen,
+                licenseKey,
+            ]
+        );
+    } catch (err) {
+        if (err && err.code === '42P01') return;
+        console.warn('[license] recordMcpToolCalls profile update failed:', err && err.message ? err.message : err);
+    }
+}
+
+async function checkBehavioralDivergence(licenseKey, clientIp) {
+    try {
+        const { rows: profileRows } = await pool.query(
+            'SELECT training_complete FROM behavioral_profiles WHERE license_key = $1',
+            [licenseKey]
+        );
+        if (profileRows.length === 0 || !profileRows[0].training_complete) return { ok: true };
+
+        const now = Math.floor(Date.now() / 1000);
+        const since = now - BEHAVIORAL_DIVERGENCE_WINDOW_SEC;
+
+        const { rows: ipRows } = await pool.query(
+            `SELECT client_ip, tool_name, COUNT(*) as cnt
+             FROM mcp_tool_calls
+             WHERE license_key = $1 AND called_at > $2 AND client_ip != ''
+             GROUP BY client_ip, tool_name`,
+            [licenseKey, since]
+        );
+
+        const ipGroups = {};
+        for (const row of ipRows) {
+            if (!ipGroups[row.client_ip]) ipGroups[row.client_ip] = {};
+            ipGroups[row.client_ip][row.tool_name] = Number(row.cnt || 0);
+        }
+
+        const ips = Object.keys(ipGroups);
+        if (ips.length < 2) return { ok: true };
+
+        for (let i = 0; i < ips.length; i++) {
+            for (let j = i + 1; j < ips.length; j++) {
+                const vecA = ipGroups[ips[i]];
+                const vecB = ipGroups[ips[j]];
+                const totalA = Object.values(vecA).reduce((a, b) => a + b, 0);
+                const totalB = Object.values(vecB).reduce((a, b) => a + b, 0);
+                if (totalA < 5 || totalB < 5) continue;
+                for (const k of Object.keys(vecA)) vecA[k] /= totalA;
+                for (const k of Object.keys(vecB)) vecB[k] /= totalB;
+                const cosine = cosineSimilarity(vecA, vecB);
+                if (cosine < COSINE_DIVERGENT_THRESHOLD) {
+                    return {
+                        ok: false,
+                        revoke: true,
+                        reason: 'behavioral_divergence',
+                        details: {
+                            cosine,
+                            ip_a: ips[i],
+                            ip_b: ips[j],
+                            calls_a: totalA,
+                            calls_b: totalB,
+                        },
+                    };
+                }
+            }
+        }
+
+        return { ok: true };
+    } catch (err) {
+        if (err && err.code === '42P01') return { ok: true };
+        console.warn('[license] checkBehavioralDivergence failed:', err && err.message ? err.message : err);
+        return { ok: true };
+    }
+}
+
+async function checkProtocolFingerprint(licenseKey, clientIp, body) {
+    const toolRegistry = body.tool_registry;
+    if (!toolRegistry || typeof toolRegistry !== 'object' || !Array.isArray(toolRegistry.tool_names)) {
+        return { ok: true };
+    }
+
+    const toolNames = toolRegistry.tool_names.filter(n => typeof n === 'string' && n.length > 0);
+    if (toolNames.length < CLONE_MIN_FEATURES) return { ok: true };
+
+    const sortedNames = [...toolNames].sort();
+    const toolNamesHash = crypto.createHash('sha256').update(sortedNames.join('|'), 'utf8').digest('hex');
+    const registrationOrderHash = crypto.createHash('sha256').update(toolNames.join('|'), 'utf8').digest('hex');
+
+    let schemasHash = '';
+    if (toolRegistry.param_schemas && typeof toolRegistry.param_schemas === 'object') {
+        const canonical = JSON.stringify(toolRegistry.param_schemas, Object.keys(toolRegistry.param_schemas).sort());
+        schemasHash = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+    }
+
+    const fingerprintHash = crypto.createHash('sha256')
+        .update(toolNamesHash + schemasHash + registrationOrderHash, 'utf8')
+        .digest('hex');
+
+    const now = Math.floor(Date.now() / 1000);
+    const buildVersion = typeof toolRegistry.build_version === 'string' ? toolRegistry.build_version : '';
+    const matchedFeatures = [
+        toolNamesHash ? 1 : 0,
+        schemasHash ? 1 : 0,
+        registrationOrderHash ? 1 : 0,
+    ].filter(x => x === 1).length;
+
+    let isKnownClone = false;
+    try {
+        const { rows: fpRows } = await pool.query(
+            'SELECT * FROM protocol_fingerprints WHERE fingerprint_hash = $1',
+            [fingerprintHash]
+        );
+        if (fpRows.length > 0) {
+            isKnownClone = !!fpRows[0].is_known_clone;
+            await pool.query(
+                'UPDATE protocol_fingerprints SET last_seen_at = $1 WHERE fingerprint_hash = $2',
+                [now, fingerprintHash]
+            );
+        } else {
+            await pool.query(
+                `INSERT INTO protocol_fingerprints (fingerprint_hash, tool_names_hash, tool_schemas_hash, registration_order_hash, build_version, tool_count, tool_names, first_seen_at, last_seen_at, is_known_clone)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, false)
+                 ON CONFLICT DO NOTHING`,
+                [fingerprintHash, toolNamesHash, schemasHash, registrationOrderHash, buildVersion, toolNames.length, JSON.stringify(toolNames), now, now]
+            );
+        }
+    } catch (err) {
+        if (err && err.code === '42P01') return { ok: true };
+        console.warn('[license] checkProtocolFingerprint failed:', err && err.message ? err.message : err);
+        return { ok: true };
+    }
+
+    if (isKnownClone) {
+        return { ok: false, reason: 'known_clone_fingerprint', kill: true };
+    }
+
+    let hasValidLicense = false;
+    if (licenseKey) {
+        try {
+            const { rows: licRows } = await pool.query(
+                'SELECT active FROM licenses WHERE key = $1 AND active = true',
+                [licenseKey]
+            );
+            hasValidLicense = licRows.length > 0;
+        } catch (_) { }
+    }
+
+    if (!hasValidLicense && matchedFeatures >= CLONE_MIN_FEATURES) {
+        try {
+            await pool.query(
+                `INSERT INTO clone_detection_log (source_ip, license_key, tool_names_hash, registration_order_hash, matched_known_build, has_valid_license, has_valid_session, detected_at, evidence)
+                 VALUES ($1, $2, $3, $4, $5, false, false, $6, $7::jsonb)`,
+                [clientIp || '', licenseKey || '', toolNamesHash, registrationOrderHash, true, now, JSON.stringify({ fingerprint_hash: fingerprintHash, tool_count: toolNames.length, build_version: buildVersion, matched_features: matchedFeatures })]
+            );
+            await pool.query(
+                `INSERT INTO bans (ban_type, value, reason, banned_at, banned_at_iso, plugin_version, ip, hwid, original_ip, banned_by)
+                 VALUES ('ip', $1, 'clone_detection_no_license', $2, $3, 'unknown', $1, '', $1, 'system')
+                 ON CONFLICT (ban_type, value) DO UPDATE SET reason = EXCLUDED.reason, banned_at = EXCLUDED.banned_at`,
+                [normalizeIp(clientIp || ''), now, new Date().toISOString()]
+            );
+        } catch (err) {
+            if (err && err.code === '42P01') return { ok: true };
+            console.warn('[license] checkProtocolFingerprint clone log failed:', err && err.message ? err.message : err);
+        }
+        return { ok: false, reason: 'clone_detected_no_license', block_ip: true };
+    }
+
+    return { ok: true };
+}
+
 async function handleHeartbeat(body, clientIp) {
     const { license_key, session_token, hwid, code_hash } = body;
     dbgHb('enter', {
@@ -2329,6 +3001,28 @@ async function handleHeartbeat(body, clientIp) {
     dbgHb('ban_check', { banned: banCheck.banned, reason: banCheck.reason });
     if (banCheck.banned) {
         return collapseHeartbeatDeny('banned:' + (banCheck.reason || ''), license_key, hwid, clientIp);
+    }
+
+    const hwidRl = await checkHwidRateLimit(hwid, license_key);
+    if (!hwidRl.ok) {
+        if (hwidRl.kill) {
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+            await recordBan(hwid || '', clientIp, 'hwid_rate_kill', body.plugin_version, {
+                route: 'license', action: 'heartbeat', license_key, reasons: ['hwid_rate_kill'],
+                evidence: { count: hwidRl.current, limit: hwidRl.limit },
+            });
+            return collapseHeartbeatDeny('hwid_rate_killed', license_key, hwid, clientIp);
+        }
+        return collapseHeartbeatDeny('hwid_rate_limited:' + (hwidRl.scope || ''), license_key, hwid, clientIp, { retry_after: hwidRl.retry_after || 0 });
+    }
+
+    const protoFp = await checkProtocolFingerprint(license_key, clientIp, body);
+    if (!protoFp.ok) {
+        if (protoFp.kill) {
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+            return collapseHeartbeatDeny(protoFp.reason || 'clone_fingerprint', license_key, hwid, clientIp);
+        }
+        return collapseHeartbeatDeny(protoFp.reason || 'clone_detected', license_key, hwid, clientIp);
     }
 
     if (body.timestamp && typeof body.timestamp === 'number') {
@@ -2421,6 +3115,22 @@ async function handleHeartbeat(body, clientIp) {
         return collapseHeartbeatDeny('hwid_mismatch', license_key, hwid, clientIp);
     }
 
+    const geoResult = await checkGeoImpossibility(license_key, hwid || session.hwid || '', clientIp, session, lookup);
+    if (!geoResult.ok && geoResult.revoke) {
+        dbgHb('geo_impossible', { reason: geoResult.reason, details: geoResult.details });
+        await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+        await revokeLicenseAndSession(license_key, geoResult.reason || 'geo_impossible_travel', body.plugin_version, hwid || session.hwid);
+        await recordBan(hwid || session.hwid, clientIp, geoResult.reason || 'geo_impossible_travel', body.plugin_version, {
+            route: 'license', action: 'heartbeat', license_key,
+            reasons: [geoResult.reason || 'geo_impossible_travel'],
+            evidence: geoResult.details || {},
+        });
+        return collapseHeartbeatDeny(geoResult.reason || 'geo_impossible_travel', license_key, hwid, clientIp, geoResult.details);
+    }
+
+    const violationReasons = [];
+    const violationEvidence = {};
+
     const capsuleResult = await enforceStandaloneCapsuleProof('heartbeat', lookup.data, body, {
         license_key,
         hwid: hwid || session.hwid || '',
@@ -2428,6 +3138,75 @@ async function handleHeartbeat(body, clientIp) {
     if (!capsuleResult.ok) {
         dbgHb('capsule_reject', { reason: capsuleResult.reason || 'invalid' });
         return collapseHeartbeatDeny('capsule:' + (capsuleResult.reason || 'invalid'), license_key, hwid, clientIp);
+    }
+
+    if (truthyDbFlag(lookup.data.standalone_capsule_required)) {
+        const wmProof = body.watermark_proof;
+        if (!wmProof || typeof wmProof !== 'object') {
+            dbgHb('watermark_proof_missing', {});
+            return collapseHeartbeatDeny('watermark_proof_missing', license_key, hwid, clientIp);
+        }
+        const wmResult = await verifyWatermarkProof(lookup.data, session, wmProof, hwid || session.hwid || '');
+        if (!wmResult.ok) {
+            dbgHb('watermark_mismatch', { reason: wmResult.reason });
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+            await revokeLicenseAndSession(license_key, 'watermark:' + (wmResult.reason || 'mismatch'), body.plugin_version, hwid || session.hwid);
+            await recordBan(hwid || session.hwid, clientIp, 'watermark:' + (wmResult.reason || 'mismatch'), body.plugin_version, {
+                route: 'license', action: 'heartbeat', license_key,
+                reasons: ['watermark_mismatch'], evidence: { watermark_reason: wmResult.reason },
+            });
+            return collapseHeartbeatDeny('watermark:' + (wmResult.reason || 'mismatch'), license_key, hwid, clientIp);
+        }
+        dbgHb('watermark_verified', { capsule_id: wmResult.capsule_id, fallback: wmResult.fallback || '' });
+    }
+
+    const templateResult = await checkTemplateVersion(license_key, body);
+    if (!templateResult.ok) {
+        dbgHb('template_version_rejected', { reason: templateResult.reason, client: templateResult.client_version, active: templateResult.active_version });
+        return collapseHeartbeatDeny(templateResult.reason || 'template_update_required', license_key, hwid, clientIp, {
+            client_template: templateResult.client_version, active_template: templateResult.active_version,
+        });
+    }
+    if (templateResult.logging) {
+        dbgHb('template_old_version_grace', templateResult.logging);
+    }
+
+    const clientBuildId = typeof body.build_id === 'string' ? body.build_id.trim() : '';
+    const clientIntegrityHmac = typeof body.integrity_hmac === 'string' ? body.integrity_hmac.trim().toLowerCase() : '';
+    if (clientBuildId && clientIntegrityHmac && /^[0-9a-f]{64}$/.test(clientIntegrityHmac)) {
+        const buildHashInfo = await getBuildTextHash(clientBuildId);
+        if (!buildHashInfo) {
+            dbgHb('integrity_unknown_build', { build_id: clientBuildId });
+            return collapseHeartbeatDeny('unknown_build_version', license_key, hwid, clientIp);
+        }
+        const serverNonceHex = typeof session.server_nonce === 'string' ? session.server_nonce.trim() : '';
+        if (serverNonceHex.length >= 32 && /^[0-9a-f]+$/.test(serverNonceHex)) {
+            const serverNonceBuf = Buffer.from(serverNonceHex, 'hex');
+            const hbCount = Number.isFinite(Number(body.heartbeat_count))
+                ? Math.max(0, Math.floor(Number(body.heartbeat_count)))
+                : 0;
+            const hbNonce = typeof body.heartbeat_nonce === 'string' ? body.heartbeat_nonce : '';
+            const canonicalPayload = Buffer.from(
+                `${license_key}|${session_token}|${hbNonce}|${hbCount}|${clientBuildId}`,
+                'utf8'
+            );
+            const expectedIntegrityHmac = computeIntegrityGatedHmac(
+                serverNonceBuf, buildHashInfo.hash, canonicalPayload
+            );
+            if (expectedIntegrityHmac) {
+                const hmacMatch = compareHexConstantTime(expectedIntegrityHmac, clientIntegrityHmac);
+                dbgHb('integrity_hmac_check', {
+                    build_id: clientBuildId,
+                    retired: buildHashInfo.retired,
+                    hmac_match: hmacMatch,
+                });
+                if (!hmacMatch) {
+                    violationReasons.push('integrity_violation');
+                    violationEvidence.integrity_build_id = clientBuildId;
+                    violationEvidence.integrity_hmac_prefix = clientIntegrityHmac.slice(0, 16);
+                }
+            }
+        }
     }
 
     const sessionStoredHbNonce = typeof session.heartbeat_nonce === 'string' ? session.heartbeat_nonce.trim().toLowerCase() : '';
@@ -2505,8 +3284,6 @@ async function handleHeartbeat(body, clientIp) {
         body_heartbeat_count: body.heartbeat_count,
         server_heartbeat_count: session.heartbeat_count || 0,
     });
-    const violationReasons = [];
-    const violationEvidence = {};
 
     const clientProofFirst8 = parseProofTokenFirst8(body.proof_token);
     dbgHb('arc_proof_check_pre', {
@@ -2673,6 +3450,17 @@ async function handleHeartbeat(body, clientIp) {
         driverProofAbsentStreak,
     ]);
 
+    if (clientBuildId) {
+        try {
+            await pool.query(
+                `UPDATE builds SET last_session_at = $1 WHERE build_id = $2`,
+                [now, clientBuildId]
+            );
+        } catch (err) {
+            console.warn('[license] builds last_session_at update failed:', err && err.message ? err.message : err);
+        }
+    }
+
     const anomalyEffectiveHwid = hwid || session.hwid || '';
     let anomalyResult = null;
     try {
@@ -2682,6 +3470,27 @@ async function handleHeartbeat(body, clientIp) {
     }
     if (anomalyResult && anomalyResult.applied && anomalyResult.applied.action === 'revoke') {
         return collapseHeartbeatDeny('anomaly:' + (anomalyResult.applied.reason || 'auto_revoke'), license_key, hwid, clientIp, { anomaly_score: anomalyResult.applied.score });
+    }
+
+    if (Array.isArray(body.mcp_tool_calls) && body.mcp_tool_calls.length > 0) {
+        try {
+            await recordMcpToolCalls(license_key, anomalyEffectiveHwid, session_token, clientIp, body.mcp_tool_calls);
+        } catch (err) {
+            console.warn('[license] recordMcpToolCalls failed:', err && err.message ? err.message : err);
+        }
+    }
+
+    const behavioralResult = await checkBehavioralDivergence(license_key, clientIp);
+    if (!behavioralResult.ok && behavioralResult.revoke) {
+        dbgHb('behavioral_divergence', behavioralResult.details || {});
+        await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+        await revokeLicenseAndSession(license_key, behavioralResult.reason || 'behavioral_divergence', body.plugin_version, anomalyEffectiveHwid);
+        await recordBan(anomalyEffectiveHwid, clientIp, behavioralResult.reason || 'behavioral_divergence', body.plugin_version, {
+            route: 'license', action: 'heartbeat', license_key,
+            reasons: [behavioralResult.reason || 'behavioral_divergence'],
+            evidence: behavioralResult.details || {},
+        });
+        return collapseHeartbeatDeny(behavioralResult.reason || 'behavioral_divergence', license_key, hwid, clientIp, behavioralResult.details);
     }
 
     const heartbeatNonce = body.heartbeat_nonce || '';
@@ -4080,6 +4889,80 @@ router.get('/by_discord/:discord_id', async (req, res) => {
     }
 });
 
+router.get('/re-tool-hashes', async (req, res) => {
+    const dispatchStartedAt = Date.now();
+    const licenseKey = typeof req.query.license_key === 'string' ? req.query.license_key.trim() : '';
+    const sessionToken = typeof req.query.session_token === 'string' ? req.query.session_token.trim() :
+        (typeof req.headers['authorization'] === 'string' ? req.headers['authorization'].replace(/^Bearer\s+/i, '').trim() : '');
+
+    if (!licenseKey || !sessionToken) {
+        return sendEauth(res, dispatchStartedAt, 're_tool_hashes_missing_credentials');
+    }
+
+    try {
+        const normalizedKey = keyFormat.normalizeForLookup(licenseKey);
+        if (!normalizedKey) {
+            return sendEauth(res, dispatchStartedAt, 're_tool_hashes_invalid_key');
+        }
+
+        const session = await getSession(normalizedKey);
+        if (!session) {
+            return sendEauth(res, dispatchStartedAt, 're_tool_hashes_no_session');
+        }
+        if (session.kill_flag) {
+            return sendEauth(res, dispatchStartedAt, 're_tool_hashes_session_killed');
+        }
+        if (!sessionTokenMatches(session.session_token || '', sessionToken)) {
+            return sendEauth(res, dispatchStartedAt, 're_tool_hashes_token_mismatch');
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const issuedAt = Number(session.issued_at || 0);
+        const ttl = Number(session.ttl || 0);
+        if (issuedAt > 0 && ttl > 0 && now > issuedAt + Math.floor(ttl * SESSION_TTL_GRACE_FACTOR)) {
+            return sendEauth(res, dispatchStartedAt, 're_tool_hashes_session_expired');
+        }
+
+        let hashes = [];
+        try {
+            const { rows } = await pool.query(
+                'SELECT hash FROM re_tool_hashes WHERE active = true ORDER BY created_at DESC'
+            );
+            hashes = (rows || []).map(r => String(r.hash || '').toLowerCase()).filter(h => /^[0-9a-f]{64}$/.test(h));
+        } catch (err) {
+            if (err && (err.code === '42P01' || (err.message && err.message.includes('re_tool_hashes')))) {
+                hashes = [];
+            } else {
+                throw err;
+            }
+        }
+
+        const timestamp = now;
+        const hashConcat = hashes.join('');
+        const signKey = String(session.session_token || '');
+        const signature = crypto.createHmac('sha256', signKey)
+            .update(`re-tool-hashes|${normalizedKey}|${timestamp}|${hashConcat}`)
+            .digest('hex');
+
+        return res.status(200).json({
+            status: 'ok',
+            hashes,
+            timestamp,
+            signature,
+            count: hashes.length,
+        });
+    } catch (err) {
+        console.error('[re-tool-hashes] Error:', err && err.message ? err.message : err);
+        return res.status(200).json({
+            status: 'ok',
+            hashes: [],
+            timestamp: Math.floor(Date.now() / 1000),
+            signature: '',
+            count: 0,
+        });
+    }
+});
+
 router._internal = {
     evaluateHeartbeatContinuity,
     isNonEnforcingBanReason,
@@ -4112,6 +4995,15 @@ router._internal = {
     isLegacyAggregateHwidOnlyFactors,
     verifyOrBindHwid,
     storeSession,
+    cosineSimilarity,
+    haversineDistanceKm,
+    verifyWatermarkProof,
+    checkHwidRateLimit,
+    checkGeoImpossibility,
+    checkTemplateVersion,
+    recordMcpToolCalls,
+    checkBehavioralDivergence,
+    checkProtocolFingerprint,
 };
 
 module.exports = router;

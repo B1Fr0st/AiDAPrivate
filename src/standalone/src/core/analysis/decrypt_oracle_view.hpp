@@ -21,8 +21,6 @@
 #include <unordered_map>
 #include <vector>
 
-extern DisasmState g_disasm;
-
 namespace decrypt_oracle_view {
 
 struct row_anim_t {
@@ -50,6 +48,7 @@ static local_state_t s_state;
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	const auto workspace_context = disasm_view::capture_selected_workspace();
 	(void)pos_x; (void)pos_y;
 	(void)accent_r; (void)accent_g; (void)accent_b;
 
@@ -342,7 +341,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(r.source_function, g_disasm);
+			disasm_view::goto_address(r.source_function, workspace_context);
 		}
 
 		ImFont* code_font = aida::ui::fonts::code();

@@ -17,6 +17,7 @@
 
 #include "arc_build_seed.hpp"
 #include "wbaes.hpp"
+#include "wb_crypto.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace anti_tamper {
@@ -142,40 +143,6 @@ namespace detail_kp {
         EVP_MAC_CTX_free(ctx);
     }
 
-    inline void aes_gcm_encrypt_internal(const uint8_t key[32], const uint8_t iv[12],
-                                         const uint8_t* aad, size_t aad_len,
-                                         const uint8_t* pt, size_t pt_len,
-                                         uint8_t* ct, uint8_t tag[16],
-                                         bool& ok)
-    {
-        ok = false;
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        if (!ctx) return;
-
-        do {
-            if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
-            if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1) break;
-            if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv) != 1) break;
-
-            int outlen = 0;
-            if (aad && aad_len > 0)
-            {
-                if (EVP_EncryptUpdate(ctx, nullptr, &outlen, aad, static_cast<int>(aad_len)) != 1) break;
-            }
-            if (pt && pt_len > 0)
-            {
-                if (EVP_EncryptUpdate(ctx, ct, &outlen, pt, static_cast<int>(pt_len)) != 1) break;
-            }
-            int finlen = 0;
-            if (EVP_EncryptFinal_ex(ctx, ct ? ct + outlen : nullptr, &finlen) != 1) break;
-            if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1) break;
-
-            ok = true;
-        } while (false);
-
-        EVP_CIPHER_CTX_free(ctx);
-    }
-
     inline bool ct_equal(const uint8_t* a, const uint8_t* b, size_t n)
     {
         uint8_t r = 0;
@@ -262,76 +229,32 @@ namespace detail_kp {
         }
 
         {
-            const uint8_t key[32] = {
-                0xfe,0xff,0xe9,0x92,0x86,0x65,0x73,0x1c,
-                0x6d,0x6a,0x8f,0x94,0x67,0x30,0x83,0x08,
-                0xfe,0xff,0xe9,0x92,0x86,0x65,0x73,0x1c,
-                0x6d,0x6a,0x8f,0x94,0x67,0x30,0x83,0x08
-            };
-            const uint8_t iv[12] = {
-                0xca,0xfe,0xba,0xbe,0xfa,0xce,0xdb,0xad,
-                0xde,0xca,0xf8,0x88
-            };
-            const uint8_t aad[20] = {
-                0xfe,0xed,0xfa,0xce,0xde,0xad,0xbe,0xef,
-                0xfe,0xed,0xfa,0xce,0xde,0xad,0xbe,0xef,
-                0xab,0xad,0xda,0xd2
-            };
-            const uint8_t pt[60] = {
-                0xd9,0x31,0x32,0x25,0xf8,0x84,0x06,0xe5,
-                0xa5,0x59,0x09,0xc5,0xaf,0xf5,0x26,0x9a,
-                0x86,0xa7,0xa9,0x53,0x15,0x34,0xf7,0xda,
-                0x2e,0x4c,0x30,0x3d,0x8a,0x31,0x8a,0x72,
-                0x1c,0x3c,0x0c,0x95,0x95,0x68,0x09,0x53,
-                0x2f,0xcf,0x0e,0x24,0x49,0xa6,0xb5,0x25,
-                0xb1,0x6a,0xed,0xf5,0xaa,0x0d,0xe6,0x57,
-                0xba,0x63,0x7b,0x39
-            };
-            const uint8_t expected_ct[60] = {
-                0x52,0x2d,0xc1,0xf0,0x99,0x56,0x7d,0x07,
-                0xf4,0x7f,0x37,0xa3,0x2a,0x84,0x42,0x7d,
-                0x64,0x3a,0x8c,0xdc,0xbf,0xe5,0xc0,0xc9,
-                0x75,0x98,0xa2,0xbd,0x25,0x55,0xd1,0xaa,
-                0x8c,0xb0,0x8e,0x48,0x59,0x0d,0xbb,0x3d,
-                0xa7,0xb0,0x8b,0x10,0x56,0x82,0x88,0x38,
-                0xc5,0xf6,0x1e,0x63,0x93,0xba,0x7a,0x0a,
-                0xbc,0xc9,0xf6,0x62
-            };
-            const uint8_t expected_tag[16] = {
-                0x76,0xfc,0x6e,0xce,0x0f,0x4e,0x17,0x68,
-                0xcd,0xdf,0x88,0x53,0xbb,0x2d,0x55,0x1b
-            };
-            uint8_t ct[60] = {};
-            uint8_t tag[16] = {};
-            bool ok = false;
-            kat_dbg_log("run_kat: AES-GCM calling");
-            aes_gcm_encrypt_internal(key, iv, aad, sizeof(aad), pt, sizeof(pt),
-                                     ct, tag, ok);
-            kat_dbg_log(ok ? "run_kat: AES-GCM call returned ok=true" : "run_kat: AES-GCM call returned ok=FALSE");
-            if (!ok) { set_last_error("kat_aes_gcm_call_failed"); kat_dbg_log("run_kat: FAIL kat_aes_gcm_call_failed"); return false; }
-            if (!ct_equal(ct, expected_ct, sizeof(expected_ct)))
+            kat_dbg_log("run_kat: WB-AES init calling");
+            if (!wbaes::initialize_tables())
             {
-                set_last_error("kat_aes_gcm_ct_mismatch");
-                char buf[256];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "run_kat: FAIL kat_aes_gcm_ct_mismatch first8=%02X%02X%02X%02X%02X%02X%02X%02X expected_first8=%02X%02X%02X%02X%02X%02X%02X%02X",
-                    ct[0],ct[1],ct[2],ct[3],ct[4],ct[5],ct[6],ct[7],
-                    expected_ct[0],expected_ct[1],expected_ct[2],expected_ct[3],expected_ct[4],expected_ct[5],expected_ct[6],expected_ct[7]);
-                kat_dbg_log(buf);
+                set_last_error("kat_wbaes_init_failed");
+                kat_dbg_log("run_kat: FAIL kat_wbaes_init_failed");
                 return false;
             }
-            if (!ct_equal(tag, expected_tag, sizeof(expected_tag)))
+            kat_dbg_log("run_kat: WB-AES init PASS");
+
+            kat_dbg_log("run_kat: WB-AES test vector calling");
+            if (!wbaes::verify_test_vector())
             {
-                set_last_error("kat_aes_gcm_tag_mismatch");
-                char buf[256];
-                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                    "run_kat: FAIL kat_aes_gcm_tag_mismatch tag=%02X%02X%02X%02X%02X%02X%02X%02X expected_tag=%02X%02X%02X%02X%02X%02X%02X%02X",
-                    tag[0],tag[1],tag[2],tag[3],tag[4],tag[5],tag[6],tag[7],
-                    expected_tag[0],expected_tag[1],expected_tag[2],expected_tag[3],expected_tag[4],expected_tag[5],expected_tag[6],expected_tag[7]);
-                kat_dbg_log(buf);
+                set_last_error("kat_wbaes_test_vector_failed");
+                kat_dbg_log("run_kat: FAIL kat_wbaes_test_vector_failed");
                 return false;
             }
-            kat_dbg_log("run_kat: AES-GCM PASS");
+            kat_dbg_log("run_kat: WB-AES test vector PASS");
+
+            kat_dbg_log("run_kat: WB-AES table hash calling");
+            if (!wbaes::verify_table_hash())
+            {
+                set_last_error("kat_wbaes_table_hash_failed");
+                kat_dbg_log("run_kat: FAIL kat_wbaes_table_hash_failed");
+                return false;
+            }
+            kat_dbg_log("run_kat: WB-AES table hash PASS");
         }
 
         kat_dbg_log("run_kat: ALL PASS, returning true");
@@ -491,66 +414,83 @@ inline void build_commitment(uint8_t out[32])
     arc_internal::arc_build_commitment_bytes(out);
 }
 
-inline bool encrypt_with_wbaes(const char* domain,
-                                const uint8_t* salt, size_t salt_len,
-                                const uint8_t iv[16],
-                                const uint8_t* pt, size_t pt_len,
-                                uint8_t* ct)
+inline bool encrypt_with_wbaes_precomputed(
+    const uint8_t iv[16],
+    const uint8_t* pt, size_t pt_len,
+    uint8_t* ct)
 {
-    if (!domain || !iv || (pt_len > 0 && (!pt || !ct)))
+    if (!iv || (pt_len > 0 && (!pt || !ct)))
     {
-        detail_kp::set_last_error("encrypt_with_wbaes_invalid_args");
+        detail_kp::set_last_error("encrypt_with_wbaes_precomputed_invalid_args");
         return false;
     }
     if (!ensure_kat_passed())
     {
-        detail_kp::set_last_error("encrypt_with_wbaes_kat_not_passed");
+        detail_kp::set_last_error("encrypt_with_wbaes_precomputed_kat_not_passed");
         return false;
     }
 
-    uint8_t key[16];
-    if (!derive(domain, salt, salt_len, key, sizeof(key)))
+    bool ok = wb_crypto::ctr_crypt(pt, ct, pt_len, iv);
+    if (!ok)
     {
-        SecureZeroMemory(key, sizeof(key));
-        detail_kp::set_last_error("encrypt_with_wbaes_derive_failed");
+        detail_kp::set_last_error("encrypt_with_wbaes_precomputed_ctr_failed");
         return false;
     }
 
-    uint8_t seed_bytes[32];
-    arc_internal::arc_build_seed_bytes(seed_bytes);
-    uint64_t seed_low = 0;
-    std::memcpy(&seed_low, seed_bytes, sizeof(seed_low));
-    SecureZeroMemory(seed_bytes, sizeof(seed_bytes));
+    detail_kp::set_last_error(nullptr);
+    return true;
+}
 
-    uint64_t entropy_seed = static_cast<uint64_t>(__rdtsc()) ^ seed_low;
-
-    wbaes::white_box_table_t* tbl = static_cast<wbaes::white_box_table_t*>(
-        HeapAlloc(GetProcessHeap(), 0, sizeof(wbaes::white_box_table_t)));
-    if (!tbl)
+inline bool encrypt_with_wbaes_gcm(
+    const uint8_t* pt, size_t pt_len,
+    const uint8_t* aad, size_t aad_len,
+    const uint8_t nonce[12],
+    uint8_t* ct, uint8_t tag[16])
+{
+    if (!nonce || (pt_len > 0 && (!pt || !ct)))
     {
-        SecureZeroMemory(key, sizeof(key));
-        detail_kp::set_last_error("encrypt_with_wbaes_alloc_failed");
+        detail_kp::set_last_error("encrypt_with_wbaes_gcm_invalid_args");
+        return false;
+    }
+    if (!ensure_kat_passed())
+    {
+        detail_kp::set_last_error("encrypt_with_wbaes_gcm_kat_not_passed");
         return false;
     }
 
-    bool generated = wbaes::generate_tables(key, entropy_seed, *tbl);
-    SecureZeroMemory(key, sizeof(key));
-    if (!generated)
+    bool ok = wb_crypto::gcm_encrypt(pt, pt_len, aad, aad_len, nonce, ct, tag);
+    if (!ok)
     {
-        SecureZeroMemory(tbl, sizeof(wbaes::white_box_table_t));
-        HeapFree(GetProcessHeap(), 0, tbl);
-        detail_kp::set_last_error("encrypt_with_wbaes_generate_failed");
+        detail_kp::set_last_error("encrypt_with_wbaes_gcm_failed");
         return false;
     }
 
-    bool encrypted = wbaes::encrypt_ctr(*tbl, iv, pt, ct, pt_len);
+    detail_kp::set_last_error(nullptr);
+    return true;
+}
 
-    SecureZeroMemory(tbl, sizeof(wbaes::white_box_table_t));
-    HeapFree(GetProcessHeap(), 0, tbl);
-
-    if (!encrypted)
+inline bool decrypt_with_wbaes_gcm(
+    const uint8_t* ct, size_t ct_len,
+    const uint8_t* aad, size_t aad_len,
+    const uint8_t nonce[12],
+    const uint8_t tag[16],
+    uint8_t* pt)
+{
+    if (!nonce || !tag || (ct_len > 0 && (!ct || !pt)))
     {
-        detail_kp::set_last_error("encrypt_with_wbaes_ctr_failed");
+        detail_kp::set_last_error("decrypt_with_wbaes_gcm_invalid_args");
+        return false;
+    }
+    if (!ensure_kat_passed())
+    {
+        detail_kp::set_last_error("decrypt_with_wbaes_gcm_kat_not_passed");
+        return false;
+    }
+
+    bool ok = wb_crypto::gcm_decrypt(ct, ct_len, aad, aad_len, nonce, tag, pt);
+    if (!ok)
+    {
+        detail_kp::set_last_error("decrypt_with_wbaes_gcm_failed");
         return false;
     }
 

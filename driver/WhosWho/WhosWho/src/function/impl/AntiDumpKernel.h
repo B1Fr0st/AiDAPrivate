@@ -11,6 +11,11 @@ namespace anti_dump_kernel {
     inline volatile LONG g_initialized = 0;
     inline volatile UINT64 g_blocks_count = 0;
 
+    inline PVOID g_canary_page_addr = nullptr;
+    inline UINT64 g_canary_pattern = 0;
+    inline PMDL g_locked_mdls[32] = {};
+    inline volatile LONG g_canary_initialized = 0;
+
     inline volatile LONG g_permitted_pids[8] = {};
 
     __forceinline char lowercase_ascii_char(char ch)
@@ -158,7 +163,8 @@ namespace anti_dump_kernel {
                 PROCESS_VM_WRITE |
                 PROCESS_VM_OPERATION |
                 PROCESS_DUP_HANDLE |
-                PROCESS_CREATE_THREAD;
+                PROCESS_CREATE_THREAD |
+                PROCESS_QUERY_INFORMATION;
 
             if (OperationInfo->Operation == OB_OPERATION_HANDLE_CREATE) {
                 OperationInfo->Parameters->CreateHandleInformation.DesiredAccess &= ~DENY_MASK;
@@ -363,6 +369,67 @@ namespace anti_dump_kernel {
         return status;
     }
 
+    inline NTSTATUS verify_headers_zeroed(UINT32 pid, p_admp_header_state out_state)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (!out_state) return STATUS_INVALID_PARAMETER;
+
+        out_state->dos_magic = 0;
+        out_state->nt_signature = 0;
+        out_state->first_section_va = 0;
+        out_state->checksum = 0;
+        out_state->headers_restored = 0;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        PVOID base = _PsGetProcessSectionBaseAddress(process);
+        if (!base) {
+            ObDereferenceObject(process);
+            return STATUS_NOT_FOUND;
+        }
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+            out_state->dos_magic = dos->e_magic;
+
+            UINT32 simple_checksum = dos->e_magic;
+            LONG e_lfanew = dos->e_lfanew;
+
+            if (e_lfanew > 0 && static_cast<UINT32>(e_lfanew) < 0x10000) {
+                PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((UINT8*)base + e_lfanew);
+                if (_MmIsAddressValid(nt)) {
+                    out_state->nt_signature = nt->Signature;
+                    simple_checksum += nt->Signature;
+
+                    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+                    if (_MmIsAddressValid(sec) && nt->FileHeader.NumberOfSections > 0) {
+                        out_state->first_section_va = sec[0].VirtualAddress;
+                        simple_checksum += sec[0].VirtualAddress;
+                    }
+                }
+            }
+
+            out_state->checksum = simple_checksum;
+
+            if (out_state->dos_magic == IMAGE_DOS_SIGNATURE ||
+                out_state->nt_signature == IMAGE_NT_SIGNATURE) {
+                out_state->headers_restored = 1;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+        return status;
+    }
+
     inline NTSTATUS scramble_peb_loader_data(UINT32 pid)
     {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
@@ -408,6 +475,11 @@ namespace anti_dump_kernel {
     }
 
 
+    inline NTSTATUS place_canary_page(UINT32 pid);
+    inline NTSTATUS check_canary_page(UINT32 pid, bool& canary_intact, bool& canary_accessed);
+    inline NTSTATUS lock_pages(UINT32 pid, UINT64* bases, UINT64* sizes, UINT32 count);
+    inline void unlock_all_pages();
+
     inline NTSTATUS full_protect(UINT32 pid)
     {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
@@ -434,12 +506,168 @@ namespace anti_dump_kernel {
         corrupt_section_headers(pid);
         scramble_peb_loader_data(pid);
 
+        place_canary_page(pid);
+
         return STATUS_SUCCESS;
     }
 
+    inline NTSTATUS place_canary_page(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            PVOID canary = nullptr;
+            SIZE_T page_size = 4096;
+            status = _ZwAllocateVirtualMemory(
+                ZwCurrentProcess(), &canary, 0, &page_size,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+            if (NT_SUCCESS(status) && canary) {
+                UINT64 pattern = 0xA1DA0000ULL | (static_cast<UINT64>(pid) << 32);
+                UINT64* words = reinterpret_cast<UINT64*>(canary);
+                for (SIZE_T i = 0; i < page_size / sizeof(UINT64); ++i)
+                    words[i] = pattern ^ (i * 0x9E3779B97F4A7C15ULL);
+
+                ULONG old_prot = 0;
+                PVOID prot_base = canary;
+                SIZE_T prot_size = page_size;
+                _ZwProtectVirtualMemory(
+                    ZwCurrentProcess(), &prot_base, &prot_size,
+                    PAGE_READONLY, &old_prot);
+
+                g_canary_page_addr = canary;
+                g_canary_pattern = pattern;
+                _InterlockedExchange(&g_canary_initialized, 1);
+
+                WW_LOG("anti_dump: canary placed pid=%u addr=%p pattern=0x%llX",
+                    pid, canary, pattern);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    inline NTSTATUS check_canary_page(UINT32 pid, bool& canary_intact, bool& canary_accessed)
+    {
+        canary_intact = false;
+        canary_accessed = false;
+
+        if (_InterlockedCompareExchange(&g_canary_initialized, 0, 0) == 0)
+            return STATUS_NOT_FOUND;
+        if (!g_canary_page_addr)
+            return STATUS_NOT_FOUND;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            PVOID canary = g_canary_page_addr;
+            if (_MmIsAddressValid(canary)) {
+                UINT64* words = reinterpret_cast<UINT64*>(canary);
+                UINT64 expected = g_canary_pattern;
+                bool intact = true;
+                for (SIZE_T i = 0; i < 4; ++i) {
+                    if (words[i] != (expected ^ (i * 0x9E3779B97F4A7C15ULL))) {
+                        intact = false;
+                        break;
+                    }
+                }
+                canary_intact = intact;
+
+                MEMORY_BASIC_INFORMATION mbi{};
+                SIZE_T ret_len = 0;
+                NTSTATUS qst = _ZwQueryVirtualMemory(
+                    ZwCurrentProcess(), canary,
+                    MemoryWorkingSetExInformation,
+                    &mbi, sizeof(mbi), &ret_len);
+                if (NT_SUCCESS(qst) && (mbi.Protect & PAGE_GUARD) == 0) {
+                    DWORD prot = mbi.Protect & 0xFF;
+                    if (prot != PAGE_READONLY && prot != PAGE_NOACCESS)
+                        canary_accessed = true;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    inline NTSTATUS lock_pages(UINT32 pid, UINT64* bases, UINT64* sizes, UINT32 count)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (!bases || !sizes || count == 0 || count > 32) return STATUS_INVALID_PARAMETER;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            for (UINT32 i = 0; i < count; ++i) {
+                if (!bases[i] || !sizes[i]) continue;
+
+                PMDL mdl = _IoAllocateMdl(
+                    reinterpret_cast<PVOID>(bases[i]),
+                    static_cast<ULONG>(sizes[i]),
+                    FALSE, FALSE, nullptr);
+                if (!mdl) continue;
+
+                __try {
+                    _MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+                    g_locked_mdls[i] = mdl;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    _IoFreeMdl(mdl);
+                }
+            }
+            WW_LOG("anti_dump: locked %u pages for pid=%u", count, pid);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    inline void unlock_all_pages()
+    {
+        for (int i = 0; i < 32; ++i) {
+            if (g_locked_mdls[i]) {
+                _MmUnlockPages(g_locked_mdls[i]);
+                _IoFreeMdl(g_locked_mdls[i]);
+                g_locked_mdls[i] = nullptr;
+            }
+        }
+    }
 
     inline void cleanup()
     {
+        unlock_all_pages();
         if (g_ob_handle && _ObUnRegisterCallbacks) {
             _ObUnRegisterCallbacks(g_ob_handle);
             g_ob_handle = nullptr;
@@ -589,6 +817,30 @@ namespace continuous_anti_dump {
 
             if ((cycle % 15) == 0) {
                 anti_dump_kernel::scramble_peb_loader_data(pid);
+            }
+
+            if ((cycle % 5) == 0) {
+                admp_header_state state{};
+                NTSTATUS vs = anti_dump_kernel::verify_headers_zeroed(pid, &state);
+                if (NT_SUCCESS(vs) && state.headers_restored) {
+                    WW_LOG("continuous_admp: HEADER_RESTORE detected pid=%u dos=0x%X nt=0x%X",
+                        pid, state.dos_magic, state.nt_signature);
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xA1DA0002u, pid, state.dos_magic, state.nt_signature, 0);
+                    }
+                }
+            }
+
+            if ((cycle % 3) == 0) {
+                bool canary_intact = false;
+                bool canary_accessed = false;
+                NTSTATUS cs = anti_dump_kernel::check_canary_page(pid, canary_intact, canary_accessed);
+                if (NT_SUCCESS(cs) && canary_accessed && !canary_intact) {
+                    WW_LOG("continuous_admp: CANARY_CORRUPTION detected pid=%u", pid);
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xA1DA0002u, pid, 0, 0, 0);
+                    }
+                }
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {

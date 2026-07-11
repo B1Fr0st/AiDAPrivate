@@ -9,7 +9,14 @@
 #include "../analysis/binary_map.hpp"
 #include "../analysis/source_reconstructor.hpp"
 #include "../analysis/xref_engine.hpp"
-#include "../analysis/xref_db.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
+#include "../analysis/workspace/advanced_cfg.hpp"
+#include "../analysis/workspace/calling_convention.hpp"
+#include "../analysis/workspace/decompiler_feedback.hpp"
+#include "../analysis/workspace/decompiler_service.hpp"
+#include "../analysis/workspace/pseudocode_readability.hpp"
+#include "../analysis/workspace/semantic_fusion.hpp"
+#include "../analysis/workspace/type_recovery.hpp"
 #include "../analysis/fuzzer_engine.hpp"
 #include "../analysis/struct_recon_engine.hpp"
 #include "../analysis/stealth_engine.hpp"
@@ -17,13 +24,14 @@
 #include "../analysis/pdb_downloader.hpp"
 #include "../analysis/analysis_hub_view.hpp"
 #include "../analysis/types_hub_view.hpp"
-#include "../disasm/comment_store.hpp"
-#include "../disasm/rename_store.hpp"
+#include "../disasm/disasm_view.hpp"
+#include "../disasm/xref_index.hpp"
 #include "../editor/expression_eval.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <Windows.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -33,6 +41,9 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +51,8 @@
 namespace test_all_features {
 
 namespace {
+
+static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...);
 
 static void format_timestamp(char* out, std::size_t cap) {
     SYSTEMTIME st;
@@ -56,6 +69,283 @@ static void format_timestamp(char* out, std::size_t cap) {
 
 static void write_log_file(HANDLE hf, const std::string& line) {
     test_all_features::write_full_test_log_line(hf, line.data(), line.size());
+}
+
+static std::shared_ptr<aida::analysis::analysis_workspace_t> analysis_fixture_workspace() {
+    for (const auto& workspace : aida::analysis::workspace_registry().list()) {
+        if (workspace && workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
+            !workspace->closing() && !workspace->closed())
+            return workspace;
+    }
+    return {};
+}
+
+static disasm_view::workspace_context_t analysis_fixture_context() {
+    return disasm_view::capture_workspace(analysis_fixture_workspace());
+}
+
+static bool wait_for_analysis_overlay(const disasm_view::workspace_context_t& context,
+                                      std::string& error) {
+    if (!context || !context.view)
+        return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (context.view->pending_mutations.load(std::memory_order_acquire) != 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        Sleep(10);
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    error = context.view->mutation_error;
+    return context.view->pending_mutations.load(std::memory_order_acquire) == 0 && error.empty();
+}
+
+static bool analysis_comment(const disasm_view::workspace_context_t& context,
+                             const aida::analysis::address_t& address,
+                             const std::string& text, std::string& error) {
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        context.view->mutation_error.clear();
+    }
+    return disasm_view::queue_comment(context, address, text) &&
+        wait_for_analysis_overlay(context, error);
+}
+
+static bool analysis_rename(const disasm_view::workspace_context_t& context,
+                            const aida::analysis::address_t& address,
+                            const std::string& name, std::string& error) {
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        context.view->mutation_error.clear();
+    }
+    return disasm_view::queue_rename(context, address, name) &&
+        wait_for_analysis_overlay(context, error);
+}
+
+static std::vector<aida::analysis::address_t> analysis_fixture_addresses(
+    const disasm_view::workspace_context_t& context, std::size_t count) {
+    std::vector<aida::analysis::address_t> result;
+    if (!context || !context.publication || !context.publication->snapshot)
+        return result;
+    for (const auto& instruction : context.publication->snapshot->instructions) {
+        if (std::find(result.begin(), result.end(), instruction.address) == result.end())
+            result.push_back(instruction.address);
+        if (result.size() == count)
+            break;
+    }
+    return result;
+}
+
+struct analysis_xref_fixture_t {
+    std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+    aida::analysis::address_t target;
+    std::size_t count = 0;
+};
+
+static analysis_xref_fixture_t analysis_xref_fixture() {
+    analysis_xref_fixture_t result;
+    for (const auto& workspace : aida::analysis::workspace_registry().list()) {
+        if (!workspace || workspace->target_kind() != aida::analysis::target_kind_t::static_file)
+            continue;
+        const auto snapshot = workspace->snapshot();
+        if (!snapshot)
+            continue;
+        std::map<aida::analysis::address_t, std::size_t> counts;
+        for (const auto& xref : snapshot->xrefs)
+            ++counts[xref.target];
+        for (const auto& item : counts) {
+            if (item.second > result.count) {
+                result.workspace = workspace;
+                result.target = item.first;
+                result.count = item.second;
+            }
+        }
+    }
+    return result;
+}
+
+static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    const auto fixture = analysis_xref_fixture();
+    if (!fixture.workspace || fixture.count == 0) {
+        log_msg(hf, "xrefdb_st", "FAIL -- no explicit static workspace with published xrefs");
+        failed.fetch_add(1);
+        return;
+    }
+    const auto publication = fixture.workspace->analysis_publication();
+    const auto queried = xref_index::query_to(fixture.workspace, fixture.target, fixture.count);
+    const bool valid = publication && publication->snapshot && queried &&
+        queried.value().size() == fixture.count &&
+        publication->snapshot->xrefs.size() >= fixture.count;
+    log_msg(hf, "xrefdb_st", "STATE -- binary_id=%s published=%d total_xrefs=%zu target_count=%zu queried=%zu",
+        fixture.workspace->identity().binary_id().to_hex().c_str(), publication ? 1 : 0,
+        publication && publication->snapshot ? publication->snapshot->xrefs.size() : 0,
+        fixture.count, queried ? queried.value().size() : 0);
+    if (valid) {
+        log_msg(hf, "xrefdb_st", "PASS -- workspace-owned xref publication is complete and queryable");
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "xrefdb_st", "FAIL -- workspace-owned xref publication/query mismatch");
+        failed.fetch_add(1);
+    }
+}
+
+static void test_xref_db_query_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    const auto fixture = analysis_xref_fixture();
+    if (!fixture.workspace || fixture.count == 0) {
+        log_msg(hf, "xrefdb_qt", "FAIL -- no explicit static workspace xref fixture");
+        failed.fetch_add(1);
+        return;
+    }
+    const auto queried = xref_index::query_to(fixture.workspace, fixture.target, fixture.count + 1);
+    const bool valid = queried && queried.value().size() == fixture.count &&
+        !xref_index::has_more(fixture.workspace, fixture.target, fixture.count);
+    log_msg(hf, "xrefdb_qt", "STATE -- binary_id=%s expected=%zu returned=%zu has_more_at_total=%d",
+        fixture.workspace->identity().binary_id().to_hex().c_str(), fixture.count,
+        queried ? queried.value().size() : 0,
+        xref_index::has_more(fixture.workspace, fixture.target, fixture.count) ? 1 : 0);
+    if (valid) {
+        log_msg(hf, "xrefdb_qt", "PASS -- explicit workspace query_to returned the complete target set");
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "xrefdb_qt", "FAIL -- explicit workspace query_to result mismatch");
+        failed.fetch_add(1);
+    }
+}
+
+static bool restore_analysis_comment(const disasm_view::workspace_context_t& context,
+                                     const aida::analysis::address_t& address,
+                                     const std::string& original) {
+    std::string error;
+    return analysis_comment(context, address, original, error);
+}
+
+static bool restore_analysis_name(const disasm_view::workspace_context_t& context,
+                                  const aida::analysis::address_t& address,
+                                  const std::string& original_symbol,
+                                  const std::string& original_resolved) {
+    std::string error;
+    const std::string original_custom = original_resolved == original_symbol ? std::string() : original_resolved;
+    return analysis_rename(context, address, original_custom, error);
+}
+
+static void test_comment_store(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    const auto context = analysis_fixture_context();
+    const auto addresses = analysis_fixture_addresses(context, 1);
+    if (addresses.size() != 1) {
+        log_msg(hf, "cmt_store", "FAIL -- no explicit workspace instruction address");
+        failed.fetch_add(1);
+        return;
+    }
+    const auto original = disasm_view::comment(context, addresses[0]);
+    std::string error;
+    const bool written = analysis_comment(context, addresses[0], "test_comment_analysis", error);
+    const bool roundtrip = written && disasm_view::comment(context, addresses[0]) == "test_comment_analysis";
+    const bool cleared = analysis_comment(context, addresses[0], std::string(), error) &&
+        disasm_view::comment(context, addresses[0]).empty();
+    const bool restored = restore_analysis_comment(context, addresses[0], original);
+    if (roundtrip && cleared && restored) {
+        log_msg(hf, "cmt_store", "PASS -- workspace comment set/get/clear roundtrip preserved prior state");
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "cmt_store", "FAIL -- workspace comment roundtrip failed error=\"%s\"", error.c_str());
+        failed.fetch_add(1);
+    }
+}
+
+static void test_comment_store_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    const auto context = analysis_fixture_context();
+    const auto addresses = analysis_fixture_addresses(context, 2);
+    if (addresses.size() != 2) {
+        log_msg(hf, "cmt_multi", "FAIL -- fewer than two workspace instruction addresses");
+        failed.fetch_add(1);
+        return;
+    }
+    const std::string original_a = disasm_view::comment(context, addresses[0]);
+    const std::string original_b = disasm_view::comment(context, addresses[1]);
+    std::string error;
+    const bool set_a = analysis_comment(context, addresses[0], "analysis_comment_a", error);
+    const bool set_b = analysis_comment(context, addresses[1], "analysis_comment_b", error);
+    const bool distinct = set_a && set_b &&
+        disasm_view::comment(context, addresses[0]) == "analysis_comment_a" &&
+        disasm_view::comment(context, addresses[1]) == "analysis_comment_b";
+    const bool restored = restore_analysis_comment(context, addresses[0], original_a) &&
+        restore_analysis_comment(context, addresses[1], original_b);
+    if (distinct && restored) {
+        log_msg(hf, "cmt_multi", "PASS -- two workspace comments remained address-isolated");
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "cmt_multi", "FAIL -- workspace comment isolation failed error=\"%s\"", error.c_str());
+        failed.fetch_add(1);
+    }
+}
+
+static void test_comment_store_overwrite(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    const auto context = analysis_fixture_context();
+    const auto addresses = analysis_fixture_addresses(context, 1);
+    if (addresses.empty()) {
+        log_msg(hf, "cmt_over", "FAIL -- no workspace instruction address");
+        failed.fetch_add(1);
+        return;
+    }
+    const auto original = disasm_view::comment(context, addresses[0]);
+    std::string error;
+    const bool first = analysis_comment(context, addresses[0], "analysis_comment_first", error);
+    const bool second = analysis_comment(context, addresses[0], "analysis_comment_second", error);
+    const bool overwritten = first && second &&
+        disasm_view::comment(context, addresses[0]) == "analysis_comment_second";
+    const bool restored = restore_analysis_comment(context, addresses[0], original);
+    if (overwritten && restored) {
+        log_msg(hf, "cmt_over", "PASS -- workspace comment overwrite retained the newest value");
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "cmt_over", "FAIL -- workspace comment overwrite failed error=\"%s\"", error.c_str());
+        failed.fetch_add(1);
+    }
+}
+
+static void test_rename_store(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    const auto context = analysis_fixture_context();
+    const auto addresses = analysis_fixture_addresses(context, 1);
+    if (addresses.empty()) {
+        log_msg(hf, "ren_store", "FAIL -- no workspace instruction address");
+        failed.fetch_add(1);
+        return;
+    }
+    const auto symbol = disasm_view::resolve_symbol(context, addresses[0]);
+    const auto original = disasm_view::resolve_name(context, addresses[0]);
+    std::string error;
+    const bool written = analysis_rename(context, addresses[0], "test_label_analysis", error);
+    const bool roundtrip = written && disasm_view::resolve_name(context, addresses[0]) == "test_label_analysis";
+    const bool restored = restore_analysis_name(context, addresses[0], symbol, original);
+    if (roundtrip && restored) {
+        log_msg(hf, "ren_store", "PASS -- workspace rename set/get roundtrip preserved prior state");
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "ren_store", "FAIL -- workspace rename roundtrip failed error=\"%s\"", error.c_str());
+        failed.fetch_add(1);
+    }
+}
+
+static void test_rename_store_resolve_or(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    const auto context = analysis_fixture_context();
+    const auto addresses = analysis_fixture_addresses(context, 1);
+    if (addresses.empty()) {
+        log_msg(hf, "ren_resolve", "FAIL -- no workspace instruction address");
+        failed.fetch_add(1);
+        return;
+    }
+    const auto symbol = disasm_view::resolve_symbol(context, addresses[0]);
+    const auto original = disasm_view::resolve_name(context, addresses[0]);
+    std::string error;
+    const bool renamed = analysis_rename(context, addresses[0], "analysis_resolve_override", error) &&
+        disasm_view::resolve_name(context, addresses[0]) == "analysis_resolve_override";
+    const bool cleared = analysis_rename(context, addresses[0], std::string(), error) &&
+        disasm_view::resolve_name(context, addresses[0]) == symbol;
+    const bool restored = restore_analysis_name(context, addresses[0], symbol, original);
+    if (renamed && cleared && restored) {
+        log_msg(hf, "ren_resolve", "PASS -- workspace rename override fell back to the published symbol");
+        passed.fetch_add(1);
+    } else {
+        log_msg(hf, "ren_resolve", "FAIL -- workspace resolve-or behavior failed error=\"%s\"", error.c_str());
+        failed.fetch_add(1);
+    }
 }
 
 static void log_msg(HANDLE hf, const char* tag, const char* fmt, ...) {
@@ -1511,161 +1801,6 @@ static std::vector<uint8_t> symbolic_branch_fixture() {
     };
 }
 
-struct source_recon_fixture_t {
-    uint64_t address = 0;
-    size_t size = 0;
-    bool release_on_reset = true;
-
-    source_recon_fixture_t() = default;
-    source_recon_fixture_t(const source_recon_fixture_t&) = delete;
-    source_recon_fixture_t& operator=(const source_recon_fixture_t&) = delete;
-    source_recon_fixture_t(source_recon_fixture_t&& other) noexcept {
-        address = other.address;
-        size = other.size;
-        release_on_reset = other.release_on_reset;
-        other.address = 0;
-        other.size = 0;
-        other.release_on_reset = true;
-    }
-    source_recon_fixture_t& operator=(source_recon_fixture_t&& other) noexcept {
-        if (this != &other) {
-            reset();
-            address = other.address;
-            size = other.size;
-            release_on_reset = other.release_on_reset;
-            other.address = 0;
-            other.size = 0;
-            other.release_on_reset = true;
-        }
-        return *this;
-    }
-    ~source_recon_fixture_t() {
-        reset();
-    }
-    void disarm() {
-        release_on_reset = false;
-    }
-    void reset() {
-        if (address != 0 && release_on_reset)
-            driver_bridge::free_memory(address);
-        address = 0;
-        size = 0;
-        release_on_reset = true;
-    }
-};
-
-static void put_u16(std::vector<uint8_t>& b, size_t off, uint16_t v) {
-    if (off + sizeof(v) <= b.size())
-        std::memcpy(b.data() + off, &v, sizeof(v));
-}
-
-static void put_u32(std::vector<uint8_t>& b, size_t off, uint32_t v) {
-    if (off + sizeof(v) <= b.size())
-        std::memcpy(b.data() + off, &v, sizeof(v));
-}
-
-static void put_u64(std::vector<uint8_t>& b, size_t off, uint64_t v) {
-    if (off + sizeof(v) <= b.size())
-        std::memcpy(b.data() + off, &v, sizeof(v));
-}
-
-static std::vector<uint8_t> make_source_recon_pe_image(uint64_t image_base) {
-    std::vector<uint8_t> image(0x2000, 0);
-    image[0] = 'M';
-    image[1] = 'Z';
-    put_u32(image, 0x3C, 0x80);
-
-    const size_t nt = 0x80;
-    put_u32(image, nt, 0x00004550);
-    put_u16(image, nt + 4, 0x8664);
-    put_u16(image, nt + 6, 1);
-    put_u32(image, nt + 8, 0x66550000);
-    put_u16(image, nt + 20, 0xF0);
-    put_u16(image, nt + 22, 0x0022);
-
-    const size_t opt = nt + 24;
-    put_u16(image, opt + 0, 0x020B);
-    image[opt + 2] = 14;
-    put_u32(image, opt + 4, 0x200);
-    put_u32(image, opt + 16, 0x1000);
-    put_u32(image, opt + 20, 0x1000);
-    put_u64(image, opt + 24, image_base);
-    put_u32(image, opt + 32, 0x1000);
-    put_u32(image, opt + 36, 0x200);
-    put_u16(image, opt + 48, 6);
-    put_u16(image, opt + 50, 0);
-    put_u16(image, opt + 64, 3);
-    put_u32(image, opt + 56, static_cast<uint32_t>(image.size()));
-    put_u32(image, opt + 60, 0x400);
-    put_u16(image, opt + 68, 3);
-    put_u64(image, opt + 72, 0x100000);
-    put_u64(image, opt + 80, 0x1000);
-    put_u64(image, opt + 88, 0x100000);
-    put_u64(image, opt + 96, 0x1000);
-    put_u32(image, opt + 108, 16);
-
-    const size_t sec = opt + 0xF0;
-    const char text_name[8] = { '.', 't', 'e', 'x', 't', 0, 0, 0 };
-    std::memcpy(image.data() + sec, text_name, sizeof(text_name));
-    put_u32(image, sec + 8, 0x200);
-    put_u32(image, sec + 12, 0x1000);
-    put_u32(image, sec + 16, 0x200);
-    put_u32(image, sec + 20, 0x400);
-    put_u32(image, sec + 36, 0x60000020);
-
-    const size_t entry = 0x1000;
-    const uint64_t call_src = image_base + 0x1000;
-    const uint64_t call_dst = image_base + 0x1010;
-    const int32_t rel = static_cast<int32_t>(call_dst - (call_src + 5));
-    image[entry + 0] = 0xE8;
-    std::memcpy(image.data() + entry + 1, &rel, sizeof(rel));
-    image[entry + 5] = 0xC3;
-    const uint8_t fn[] = {
-        0x48, 0x83, 0xEC, 0x28,
-        0xB8, 0x2A, 0x00, 0x00, 0x00,
-        0x48, 0x83, 0xC4, 0x28,
-        0xC3
-    };
-    std::memcpy(image.data() + 0x1010, fn, sizeof(fn));
-    return image;
-}
-
-static source_recon_fixture_t make_source_recon_fixture(HANDLE hf, const char* tag) {
-    source_recon_fixture_t fx;
-    fx.size = 0x2000;
-    fx.address = driver_bridge::allocate_memory(fx.size);
-    if (fx.address == 0) {
-        log_msg(hf, tag, "FAIL -- allocate_memory returned 0 for source reconstruction fixture");
-        fx.size = 0;
-        return fx;
-    }
-
-    std::vector<uint8_t> image = make_source_recon_pe_image(fx.address);
-    if (!driver_bridge::write_memory(fx.address, image)) {
-        log_msg(hf, tag, "FAIL -- write_memory failed for source reconstruction fixture addr=0x%016llX size=%zu",
-            static_cast<unsigned long long>(fx.address), image.size());
-        fx.reset();
-        return fx;
-    }
-
-    uint32_t old_protect = 0;
-    if (!driver_bridge::protect_memory(fx.address, fx.size, PAGE_EXECUTE_READWRITE, &old_protect)) {
-        log_msg(hf, tag, "FAIL -- protect_memory failed for source reconstruction fixture addr=0x%016llX size=%zu",
-            static_cast<unsigned long long>(fx.address), fx.size);
-        fx.reset();
-        return fx;
-    }
-
-    log_msg(hf, tag, "fixture target_pid=%u tid=%lu base=0x%016llX end=0x%016llX size=%zu old_protect=0x%08X",
-        driver_bridge::attached_pid(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(fx.address),
-        static_cast<unsigned long long>(fx.address + fx.size),
-        fx.size,
-        old_protect);
-    return fx;
-}
-
 static std::string source_recon_output_dir() {
     char tmp[MAX_PATH + 1] = {};
     DWORD len = GetTempPathA(MAX_PATH, tmp);
@@ -1749,31 +1884,6 @@ static aida::binary_map::map_t make_binary_map_fixture() {
     map.imports.push_back("kernel32!CloseHandle");
     map.exports.push_back("FixtureExport");
     return map;
-}
-
-static constexpr const char* k_xref_fixture_module_key = "fixture_xref_module";
-
-static void seed_xref_db_fixture(uint64_t from, uint64_t to) {
-    xref_db::module_index_t mod;
-    mod.name = k_xref_fixture_module_key;
-    mod.base = from & ~0xFFFULL;
-    mod.size = 0x1000;
-    mod.timestamp = static_cast<uint64_t>(
-        std::chrono::system_clock::now().time_since_epoch().count());
-    mod.total_xrefs = 1;
-    mod.built = true;
-
-    xref_db::xref_entry_t entry;
-    entry.from_addr = from;
-    entry.to_addr = to;
-    entry.type = xref_engine::xref_type_t::lea;
-    entry.disasm_text = "lea rax, [rip+1]";
-    mod.to_index[to].push_back(entry);
-    mod.from_index[from].push_back(entry);
-
-    std::string key = mod.name;
-    std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-    xref_db::g_state.modules[key] = std::move(mod);
 }
 
 static void test_symbolic_execute(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -2122,22 +2232,18 @@ static void test_binary_map_generate(HANDLE hf, std::atomic<int>& passed, std::a
 }
 
 static void test_source_reconstructor_status(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "srcrecon", "START -- source reconstructor idle state contract check");
+    log_msg(hf, "srcrecon", "START -- source reconstructor workspace state contract check");
     auto t0 = std::chrono::steady_clock::now();
 
-    bool running = source_reconstructor::is_running();
-    float progress = source_reconstructor::get_progress();
-    int stage = static_cast<int>(source_reconstructor::get_stage());
-    std::string status = source_reconstructor::get_status();
-    source_reconstructor::reconstruction_result_t result{};
-    {
-        std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
-        result = source_reconstructor::g_state.last_result;
-    }
+    source_reconstructor::workspace_reconstruction_state_t state;
+    bool running = source_reconstructor::is_running_workspace(state);
+    float progress = source_reconstructor::get_progress_workspace(state);
+    int stage = state.stage.load(std::memory_order_relaxed);
+    std::string status = source_reconstructor::get_status_workspace(state);
+    const auto& result = source_reconstructor::get_last_result_workspace(state);
     bool progress_ok = progress >= 0.f && progress <= 1.f;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "srcrecon", "STATE target_pid=%u tid=%lu running=%d progress=%.3f stage=%d status_len=%zu status=\"%s\" last_success=%d last_error_len=%zu last_error=\"%s\" module=%s base=0x%llX size=0x%X funcs=%d decompiled=%d files=%zu preload_read=%zu elapsed_ms=%lld",
-        driver_bridge::attached_pid(),
+    log_msg(hf, "srcrecon", "STATE tid=%lu running=%d progress=%.3f stage=%d status_len=%zu status=\"%s\" last_success=%d last_error_len=%zu last_error=\"%s\" module=%s funcs=%d decompiled=%d files=%zu elapsed_ms=%lld",
         GetCurrentThreadId(),
         running ? 1 : 0,
         static_cast<double>(progress),
@@ -2148,19 +2254,16 @@ static void test_source_reconstructor_status(HANDLE hf, std::atomic<int>& passed
         result.error.size(),
         result.error.c_str(),
         result.module_name.c_str(),
-        (unsigned long long)result.module_base,
-        result.module_size,
         result.total_functions,
         result.decompiled_functions,
         result.files_created.size(),
-        result.preload.total_read,
         (long long)ms);
     if (progress_ok) {
-        log_msg(hf, "srcrecon", "CONTRACT-PASS -- source reconstructor state accessible and coherent; functional coverage is source_recon_last_result elapsed_ms=%lld",
+        log_msg(hf, "srcrecon", "CONTRACT-PASS -- workspace reconstruction state accessible and coherent elapsed_ms=%lld",
             (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "srcrecon", "FAIL -- source reconstructor progress out of range progress=%.3f elapsed_ms=%lld",
+        log_msg(hf, "srcrecon", "FAIL -- workspace reconstruction progress out of range progress=%.3f elapsed_ms=%lld",
             static_cast<double>(progress), (long long)ms);
         failed.fetch_add(1);
     }
@@ -2242,129 +2345,6 @@ static void test_expression_eval_register(HANDLE hf, std::atomic<int>& passed, s
     } else {
         log_msg(hf, "expr_reg", "FAIL -- ok=%d value=%llu error=\"%s\" (elapsed %lld ms)",
             result.ok, (unsigned long long)result.value, result.error.c_str(), (long long)ms);
-        failed.fetch_add(1);
-    }
-}
-
-static void test_comment_store(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "cmt_store", "START -- comment store set/get/has");
-    auto t0 = std::chrono::steady_clock::now();
-
-    uint64_t test_addr = 0xDEAD0001;
-    bool before_has = comment_store::has(test_addr);
-    const char* expected_value = "test_comment_analysis";
-    log_msg(hf, "cmt_store", "INPUT addr=0x%llX comment=\"%s\" before_has=%d tid=%lu",
-        static_cast<unsigned long long>(test_addr),
-        expected_value,
-        before_has ? 1 : 0,
-        static_cast<unsigned long>(GetCurrentThreadId()));
-
-    comment_store::set(test_addr, expected_value);
-
-    bool has = comment_store::has(test_addr);
-    std::string got = comment_store::get(test_addr);
-
-    comment_store::set(test_addr, "");
-
-    bool has_after = comment_store::has(test_addr);
-
-    long long us = elapsed_us_since(t0);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "cmt_store", "RESULT addr=0x%llX has_after_set=%d got=\"%s\" has_after_clear=%d elapsed_us=%lld",
-        static_cast<unsigned long long>(test_addr),
-        has ? 1 : 0,
-        got.c_str(),
-        has_after ? 1 : 0,
-        us);
-    if (has && got == expected_value && !has_after) {
-        log_msg(hf, "cmt_store", "PASS -- set/get/has/clear all correct (elapsed %lld ms us=%lld)", (long long)ms, us);
-        passed.fetch_add(1);
-    } else {
-        log_msg(hf, "cmt_store", "FAIL -- has=%d got=\"%s\" has_after=%d (elapsed %lld ms us=%lld)",
-            has, got.c_str(), has_after, (long long)ms, us);
-        failed.fetch_add(1);
-    }
-}
-
-static void test_rename_store(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "ren_store", "START -- rename store set/get/has");
-    auto t0 = std::chrono::steady_clock::now();
-
-    uint64_t test_addr = 0xDEAD0002;
-    bool before_has = rename_store::has(test_addr);
-    const char* expected_value = "test_label_analysis";
-    log_msg(hf, "ren_store", "INPUT addr=0x%llX label=\"%s\" before_has=%d tid=%lu",
-        static_cast<unsigned long long>(test_addr),
-        expected_value,
-        before_has ? 1 : 0,
-        static_cast<unsigned long>(GetCurrentThreadId()));
-
-    rename_store::set(test_addr, expected_value);
-
-    bool has = rename_store::has(test_addr);
-    std::string got = rename_store::get(test_addr);
-
-    rename_store::clear(test_addr);
-
-    bool has_after = rename_store::has(test_addr);
-
-    long long us = elapsed_us_since(t0);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "ren_store", "RESULT addr=0x%llX has_after_set=%d got=\"%s\" has_after_clear=%d elapsed_us=%lld",
-        static_cast<unsigned long long>(test_addr),
-        has ? 1 : 0,
-        got.c_str(),
-        has_after ? 1 : 0,
-        us);
-    if (has && got == expected_value && !has_after) {
-        log_msg(hf, "ren_store", "PASS -- set/get/has/clear all correct (elapsed %lld ms us=%lld)", (long long)ms, us);
-        passed.fetch_add(1);
-    } else {
-        log_msg(hf, "ren_store", "FAIL -- has=%d got=\"%s\" has_after=%d (elapsed %lld ms us=%lld)",
-            has, got.c_str(), has_after, (long long)ms, us);
-        failed.fetch_add(1);
-    }
-}
-
-static void test_rename_store_resolve_or(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "ren_reso", "START -- rename store resolve_or");
-    auto t0 = std::chrono::steady_clock::now();
-
-    uint64_t test_addr = 0xDEAD0003;
-    uint64_t unset_addr = 0xDEAD9999;
-    const char* set_value = "resolved_name";
-    const char* fallback_found = "fallback";
-    const char* fallback_not_found = "fallback_val";
-    log_msg(hf, "ren_reso", "INPUT set_addr=0x%llX set_value=\"%s\" unset_addr=0x%llX fallback_found=\"%s\" fallback_not_found=\"%s\" tid=%lu",
-        static_cast<unsigned long long>(test_addr),
-        set_value,
-        static_cast<unsigned long long>(unset_addr),
-        fallback_found,
-        fallback_not_found,
-        static_cast<unsigned long>(GetCurrentThreadId()));
-
-    rename_store::set(test_addr, set_value);
-
-    std::string found = rename_store::resolve_or(test_addr, fallback_found);
-    std::string not_found = rename_store::resolve_or(unset_addr, fallback_not_found);
-
-    rename_store::clear(test_addr);
-
-    long long us = elapsed_us_since(t0);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "ren_reso", "RESULT found_addr=0x%llX found=\"%s\" not_found_addr=0x%llX not_found=\"%s\" elapsed_us=%lld",
-        static_cast<unsigned long long>(test_addr),
-        found.c_str(),
-        static_cast<unsigned long long>(unset_addr),
-        not_found.c_str(),
-        us);
-    if (found == set_value && not_found == fallback_not_found) {
-        log_msg(hf, "ren_reso", "PASS -- resolve_or correct: found=\"%s\" not_found=\"%s\" (elapsed %lld ms us=%lld)",
-            found.c_str(), not_found.c_str(), (long long)ms, us);
-        passed.fetch_add(1);
-    } else {
-        log_msg(hf, "ren_reso", "FAIL -- found=\"%s\" not_found=\"%s\" (elapsed %lld ms us=%lld)",
-            found.c_str(), not_found.c_str(), (long long)ms, us);
         failed.fetch_add(1);
     }
 }
@@ -3387,18 +3367,24 @@ static void test_binary_map_pin_unpin(HANDLE hf, std::atomic<int>& passed, std::
     log_msg(hf, "binmap_pin", "START -- binary map pin/unpin function");
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t test_va = 0xDEAD1234;
-    aida::binary_map::pin_function(test_va);
+    auto workspace = analysis_fixture_workspace();
+    if (!workspace || !workspace->image()) {
+        log_msg(hf, "binmap_pin", "FAIL -- no explicit static workspace fixture");
+        failed.fetch_add(1);
+        return;
+    }
+    uint64_t test_va = workspace->image()->image_base() + workspace->image()->entry_rva();
+    aida::binary_map::pin_function(workspace, test_va);
 
-    auto pinned = aida::binary_map::pinned_functions();
+    auto pinned = aida::binary_map::pinned_functions(workspace);
     bool found = false;
     for (auto va : pinned) {
         if (va == test_va) { found = true; break; }
     }
 
-    aida::binary_map::unpin_function(test_va);
+    aida::binary_map::unpin_function(workspace, test_va);
 
-    auto pinned_after = aida::binary_map::pinned_functions();
+    auto pinned_after = aida::binary_map::pinned_functions(workspace);
     bool found_after = false;
     for (auto va : pinned_after) {
         if (va == test_va) { found_after = true; break; }
@@ -3419,7 +3405,13 @@ static void test_binary_map_clear_cache(HANDLE hf, std::atomic<int>& passed, std
     log_msg(hf, "binmap_cc", "START -- binary map clear_cache contract");
     auto t0 = std::chrono::steady_clock::now();
 
-    bool ok = aida::binary_map::clear_cache();
+    auto workspace = analysis_fixture_workspace();
+    if (!workspace) {
+        log_msg(hf, "binmap_cc", "FAIL -- no explicit static workspace fixture");
+        failed.fetch_add(1);
+        return;
+    }
+    bool ok = aida::binary_map::clear_cache(workspace);
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     log_msg(hf, "binmap_cc", "CONTRACT-PASS -- clear_cache returned %d last_error=\"%s\" elapsed_ms=%lld",
@@ -3473,23 +3465,19 @@ static void test_binary_map_render_text(HANDLE hf, std::atomic<int>& passed, std
 }
 
 static void test_source_reconstructor_running(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "srcrecon_r", "START -- source reconstructor running/progress state contract");
+    log_msg(hf, "srcrecon_r", "START -- source reconstructor workspace running/progress state contract");
     auto t0 = std::chrono::steady_clock::now();
 
-    bool running = source_reconstructor::is_running();
-    float progress = source_reconstructor::get_progress();
-    std::string status = source_reconstructor::get_status();
-    int stage = static_cast<int>(source_reconstructor::get_stage());
-    source_reconstructor::reconstruction_result_t result{};
-    {
-        std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
-        result = source_reconstructor::g_state.last_result;
-    }
+    source_reconstructor::workspace_reconstruction_state_t state;
+    bool running = source_reconstructor::is_running_workspace(state);
+    float progress = source_reconstructor::get_progress_workspace(state);
+    std::string status = source_reconstructor::get_status_workspace(state);
+    int stage = state.stage.load(std::memory_order_relaxed);
+    const auto& result = source_reconstructor::get_last_result_workspace(state);
     bool progress_ok = progress >= 0.f && progress <= 1.f;
 
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "srcrecon_r", "STATE target_pid=%u tid=%lu running=%d progress=%.3f stage=%d status_len=%zu status=\"%s\" last_success=%d last_error_len=%zu last_error=\"%s\" result_funcs=%d result_files=%zu preload_read=%zu elapsed_ms=%lld",
-        driver_bridge::attached_pid(),
+    log_msg(hf, "srcrecon_r", "STATE tid=%lu running=%d progress=%.3f stage=%d status_len=%zu status=\"%s\" last_success=%d last_error_len=%zu last_error=\"%s\" result_funcs=%d result_files=%zu elapsed_ms=%lld",
         GetCurrentThreadId(),
         running ? 1 : 0,
         static_cast<double>(progress),
@@ -3501,79 +3489,56 @@ static void test_source_reconstructor_running(HANDLE hf, std::atomic<int>& passe
         result.error.c_str(),
         result.total_functions,
         result.files_created.size(),
-        result.preload.total_read,
         (long long)ms);
     if (progress_ok) {
-        log_msg(hf, "srcrecon_r", "CONTRACT-PASS -- running/progress state coherent; no source generation claimed elapsed_ms=%lld",
+        log_msg(hf, "srcrecon_r", "CONTRACT-PASS -- workspace running/progress state coherent elapsed_ms=%lld",
             (long long)ms);
         passed.fetch_add(1);
     } else {
-        log_msg(hf, "srcrecon_r", "FAIL -- invalid source reconstructor progress %.3f elapsed_ms=%lld",
+        log_msg(hf, "srcrecon_r", "FAIL -- invalid workspace reconstruction progress %.3f elapsed_ms=%lld",
             static_cast<double>(progress), (long long)ms);
         failed.fetch_add(1);
     }
 }
 
 static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "srcrecon_lr", "START -- source reconstructor get_last_result");
+    log_msg(hf, "srcrecon_lr", "START -- source reconstructor workspace last_result");
     auto t0 = std::chrono::steady_clock::now();
 
-    if (source_reconstructor::is_running()) {
-        const ULONGLONG wait_start = GetTickCount64();
-        while (source_reconstructor::is_running() && GetTickCount64() - wait_start < 3000)
-            Sleep(25);
-        if (source_reconstructor::is_running()) {
-            float progress = source_reconstructor::get_progress();
-            std::string status = source_reconstructor::get_status();
-            auto stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-            log_msg(hf, "srcrecon_lr", "FAIL -- previous reconstruction still running progress=%.2f status=\"%s\" queue_alive=%d queue_pending=%zu queue_active=%u elapsed=%lld ms",
-                progress, status.c_str(), stats.alive ? 1 : 0, stats.pending, stats.active, (long long)ms);
-            failed.fetch_add(1);
-            return;
-        }
-    }
-
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    source_recon_fixture_t fx = make_source_recon_fixture(hf, "srcrecon_lr");
-    if (fx.address == 0 || fx.size == 0) {
+    auto workspace = analysis_fixture_workspace();
+    if (!workspace) {
+        log_msg(hf, "srcrecon_lr", "SKIP -- no static workspace available for reconstruction test");
         failed.fetch_add(1);
         return;
     }
 
-    source_reconstructor::reconstruction_config_t config;
+    auto snapshot = workspace->snapshot();
+    if (!snapshot || snapshot->functions.empty()) {
+        log_msg(hf, "srcrecon_lr", "SKIP -- workspace has no snapshot or no functions");
+        failed.fetch_add(1);
+        return;
+    }
+
+    source_reconstructor::workspace_reconstruction_state_t state;
+    source_reconstructor::workspace_reconstruction_config_t config;
+    config.workspace = workspace;
     config.project_name = "aida_test_recon";
     config.output_dir = source_recon_output_dir();
-    config.module_name = "aida_sr_fixture.exe";
-    config.module_base = fx.address;
-    config.module_size = static_cast<uint32_t>(fx.size);
     config.include_imports = false;
     config.include_exports = true;
     config.generate_cmake = true;
-    config.use_ai_refinement = false;
     config.max_functions = 1;
 
-    log_msg(hf, "srcrecon_lr", "RUN -- reconstruct target_pid=%u tid=%lu base=0x%016llX end=0x%016llX size=%u output=\"%s\" max_functions=%d running=%d progress=%.3f stage=%d status=\"%s\"",
-        driver_bridge::attached_pid(),
-        GetCurrentThreadId(),
-        static_cast<unsigned long long>(config.module_base),
-        static_cast<unsigned long long>(config.module_base + config.module_size),
-        static_cast<unsigned>(config.module_size),
+    log_msg(hf, "srcrecon_lr", "RUN -- reconstruct_workspace bin=%s functions=%zu output=\"%s\" max_functions=%d",
+        workspace->identity().bin_name().c_str(),
+        snapshot->functions.size(),
         config.output_dir.c_str(),
-        config.max_functions,
-        source_reconstructor::is_running() ? 1 : 0,
-        static_cast<double>(source_reconstructor::get_progress()),
-        static_cast<int>(source_reconstructor::get_stage()),
-        source_reconstructor::get_status().c_str());
+        config.max_functions);
 
-    source_reconstructor::reconstruct(config);
-    if (!source_reconstructor::is_running()) {
-        source_reconstructor::reconstruction_result_t immediate{};
-        {
-            std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
-            immediate = source_reconstructor::g_state.last_result;
-        }
-        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruct returned without entering running state success=%d error=\"%s\" total_funcs=%d files=%zu",
+    source_reconstructor::reconstruct_workspace(config, state);
+    if (!source_reconstructor::is_running_workspace(state)) {
+        const auto& immediate = source_reconstructor::get_last_result_workspace(state);
+        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruct_workspace returned without entering running state success=%d error=\"%s\" total_funcs=%d files=%zu",
             immediate.success ? 1 : 0,
             immediate.error.c_str(),
             immediate.total_functions,
@@ -3585,17 +3550,14 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
     const ULONGLONG run_start = GetTickCount64();
     ULONGLONG next_log = run_start + 500;
     bool timed_out = false;
-    while (source_reconstructor::is_running()) {
+    while (source_reconstructor::is_running_workspace(state)) {
         ULONGLONG now = GetTickCount64();
         if (now >= next_log) {
-            auto stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
-            log_msg(hf, "srcrecon_lr", "WAIT -- elapsed_ms=%llu progress=%.2f stage=%d status=\"%s\" queue_pending=%zu queue_active=%u",
+            log_msg(hf, "srcrecon_lr", "WAIT -- elapsed_ms=%llu progress=%.2f stage=%d status=\"%s\"",
                 static_cast<unsigned long long>(now - run_start),
-                source_reconstructor::get_progress(),
-                static_cast<int>(source_reconstructor::get_stage()),
-                source_reconstructor::get_status().c_str(),
-                stats.pending,
-                stats.active);
+                source_reconstructor::get_progress_workspace(state),
+                state.stage.load(std::memory_order_relaxed),
+                source_reconstructor::get_status_workspace(state).c_str());
             next_log = now + 500;
         }
         if (now - run_start >= 8000) {
@@ -3606,54 +3568,31 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
     }
 
     if (timed_out) {
-        source_reconstructor::cancel();
+        source_reconstructor::cancel_workspace(state);
         const ULONGLONG cancel_start = GetTickCount64();
-        while (source_reconstructor::is_running() && GetTickCount64() - cancel_start < 5000)
+        while (source_reconstructor::is_running_workspace(state) && GetTickCount64() - cancel_start < 5000)
             Sleep(25);
         const ULONGLONG cancel_elapsed = GetTickCount64() - cancel_start;
-        if (source_reconstructor::is_running())
-            fx.disarm();
-        source_reconstructor::reconstruction_result_t result{};
-        {
-            std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
-            result = source_reconstructor::g_state.last_result;
-        }
-        auto stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
-        auto svc_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
-        auto critical_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::critical);
-        ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction timeout cancel_wait_ms=%llu running=%d progress=%.2f stage=%d status=\"%s\" success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu preload_read=%zu work_pending=%zu work_active=%u work_rejected=%llu service_pending=%zu service_active=%u service_rejected=%llu critical_pending=%zu critical_active=%u critical_rejected=%llu elapsed=%lld ms",
+        const auto& result = source_reconstructor::get_last_result_workspace(state);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction timeout cancel_wait_ms=%llu running=%d progress=%.2f stage=%d status=\"%s\" success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu elapsed=%lld ms",
             static_cast<unsigned long long>(cancel_elapsed),
-            source_reconstructor::is_running() ? 1 : 0,
-            source_reconstructor::get_progress(),
-            static_cast<int>(source_reconstructor::get_stage()),
-            source_reconstructor::get_status().c_str(),
+            source_reconstructor::is_running_workspace(state) ? 1 : 0,
+            source_reconstructor::get_progress_workspace(state),
+            state.stage.load(std::memory_order_relaxed),
+            source_reconstructor::get_status_workspace(state).c_str(),
             result.success ? 1 : 0,
             result.error.c_str(),
             result.total_functions,
             result.decompiled_functions,
             result.modules_created,
             result.files_created.size(),
-            result.preload.total_read,
-            stats.pending,
-            stats.active,
-            static_cast<unsigned long long>(stats.rejected),
-            svc_stats.pending,
-            svc_stats.active,
-            static_cast<unsigned long long>(svc_stats.rejected),
-            critical_stats.pending,
-            critical_stats.active,
-            static_cast<unsigned long long>(critical_stats.rejected),
             (long long)ms);
         failed.fetch_add(1);
         return;
     }
 
-    source_reconstructor::reconstruction_result_t result{};
-    {
-        std::lock_guard<std::mutex> lk(source_reconstructor::g_state.mutex);
-        result = source_reconstructor::g_state.last_result;
-    }
+    const auto& result = source_reconstructor::get_last_result_workspace(state);
 
     size_t existing_files = 0;
     size_t source_files = 0;
@@ -3670,27 +3609,21 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
             std::string text;
             if (read_text_file_limited(path, text, 65536) &&
                 (text.find("sub_") != std::string::npos ||
-                 text.find("__asm") != std::string::npos ||
                  text.find("void ") != std::string::npos)) {
                 source_content_ok = true;
             }
         }
     }
 
-    ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     const bool ok = result.success && result.total_functions > 0 &&
-        result.modules_created > 0 && !result.files_created.empty() &&
+        !result.files_created.empty() &&
         existing_files == result.files_created.size() && source_files > 0 &&
-        source_content_ok && result.preload.total_read > 0 &&
-        result.preload.mz && result.preload.pe_header_ok;
+        source_content_ok;
 
     if (!ok) {
-        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction result target_pid=%u tid=%lu fixture_base=0x%llX fixture_end=0x%llX fixture_size=%zu success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu existing=%zu source_files=%zu source_content=%d bytes=%llu preload_base=0x%llX preload_requested=%zu preload_read=%zu mz=%d pe=%d chunks_ok=%zu chunks_failed=%zu chunks_skipped=%zu query_ok=%zu query_failed=%zu output=\"%s\" status=\"%s\" (elapsed %lld ms)",
-            driver_bridge::attached_pid(),
-            GetCurrentThreadId(),
-            (unsigned long long)fx.address,
-            (unsigned long long)(fx.address + fx.size),
-            fx.size,
+        log_msg(hf, "srcrecon_lr", "FAIL -- reconstruction result bin=%s success=%d error=\"%s\" total_funcs=%d decompiled=%d modules=%d files=%zu existing=%zu source_files=%zu source_content=%d bytes=%llu output=\"%s\" status=\"%s\" (elapsed %lld ms)",
+            workspace->identity().bin_name().c_str(),
             result.success ? 1 : 0,
             result.error.c_str(),
             result.total_functions,
@@ -3701,45 +3634,23 @@ static void test_source_reconstructor_last_result(HANDLE hf, std::atomic<int>& p
             source_files,
             source_content_ok ? 1 : 0,
             total_bytes,
-            (unsigned long long)result.preload.base,
-            result.preload.requested_size,
-            result.preload.total_read,
-            result.preload.mz ? 1 : 0,
-            result.preload.pe_header_ok ? 1 : 0,
-            result.preload.chunks_ok,
-            result.preload.chunks_failed,
-            result.preload.chunks_skipped,
-            result.preload.query_ok,
-            result.preload.query_failed,
             result.output_dir.c_str(),
-            source_reconstructor::get_status().c_str(),
+            source_reconstructor::get_status_workspace(state).c_str(),
             (long long)ms);
         failed.fetch_add(1);
         return;
     }
 
-    log_msg(hf, "srcrecon_lr", "FIXTURE-PASS -- target_pid=%u tid=%lu fixture_base=0x%llX fixture_end=0x%llX fixture_size=%zu success=%d total_funcs=%d decompiled=%d fallback_only=%d modules=%d files=%zu existing=%zu source_files=%zu bytes=%llu preload_base=0x%llX preload_requested=%zu preload_read=%zu chunks_ok=%zu chunks_failed=%zu query_ok=%zu query_failed=%zu output=\"%s\" (elapsed %lld ms)",
-        driver_bridge::attached_pid(),
-        GetCurrentThreadId(),
-        (unsigned long long)fx.address,
-        (unsigned long long)(fx.address + fx.size),
-        fx.size,
+    log_msg(hf, "srcrecon_lr", "PASS -- bin=%s success=%d total_funcs=%d decompiled=%d modules=%d files=%zu existing=%zu source_files=%zu bytes=%llu output=\"%s\" (elapsed %lld ms)",
+        workspace->identity().bin_name().c_str(),
         result.success ? 1 : 0,
         result.total_functions,
         result.decompiled_functions,
-        result.decompiled_functions == 0 ? 1 : 0,
         result.modules_created,
         result.files_created.size(),
         existing_files,
         source_files,
         total_bytes,
-        (unsigned long long)result.preload.base,
-        result.preload.requested_size,
-        result.preload.total_read,
-        result.preload.chunks_ok,
-        result.preload.chunks_failed,
-        result.preload.query_ok,
-        result.preload.query_failed,
         result.output_dir.c_str(),
         (long long)ms);
     passed.fetch_add(1);
@@ -3830,159 +3741,6 @@ static void test_xref_type_names(HANDLE hf, std::atomic<int>& passed, std::atomi
         log_msg(hf, "xref_tn", "FAIL -- unexpected type names (elapsed %lld ms)", (long long)ms);
         failed.fetch_add(1);
     }
-}
-
-static void test_xref_db_state(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "xrefdb_st", "START -- xref_db fixture store state check");
-    auto t0 = std::chrono::steady_clock::now();
-
-    uint64_t from = 0x140001020;
-    uint64_t addr = 0x140002000;
-    size_t module_count_before = 0;
-    size_t query_count_before = 0;
-    bool building_before = xref_db::g_state.building.load(std::memory_order_acquire);
-    float progress_before = xref_db::g_state.progress.load(std::memory_order_acquire);
-    {
-        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-        module_count_before = xref_db::g_state.modules.size();
-        query_count_before = xref_db::g_state.query_results.size();
-    }
-    log_msg(hf, "xrefdb_st", "STATE before_seed module_key=%s building=%d progress=%.3f modules=%zu query_results=%zu fixture_from=0x%llX fixture_to=0x%llX",
-        k_xref_fixture_module_key,
-        building_before ? 1 : 0,
-        static_cast<double>(progress_before),
-        module_count_before,
-        query_count_before,
-        (unsigned long long)from,
-        (unsigned long long)addr);
-
-    seed_xref_db_fixture(from, addr);
-    bool building = xref_db::g_state.building.load();
-    float progress_after = xref_db::g_state.progress.load(std::memory_order_acquire);
-    size_t module_count = 0;
-    size_t built_count = 0;
-    size_t total_xrefs = 0;
-    size_t query_count_after = 0;
-    bool fixture_to_found = false;
-    bool fixture_from_found = false;
-    {
-        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-        module_count = xref_db::g_state.modules.size();
-        query_count_after = xref_db::g_state.query_results.size();
-        for (const auto& kv : xref_db::g_state.modules) {
-            if (kv.second.built) {
-                ++built_count;
-                total_xrefs += kv.second.total_xrefs;
-            }
-            auto to_it = kv.second.to_index.find(addr);
-            if (to_it != kv.second.to_index.end()) {
-                for (const auto& x : to_it->second) {
-                    if (x.from_addr == from && x.to_addr == addr)
-                        fixture_to_found = true;
-                }
-            }
-            auto from_it = kv.second.from_index.find(from);
-            if (from_it != kv.second.from_index.end()) {
-                for (const auto& x : from_it->second) {
-                    if (x.from_addr == from && x.to_addr == addr)
-                        fixture_from_found = true;
-                }
-            }
-        }
-    }
-
-    long long us = elapsed_us_since(t0);
-    bool progress_ok = progress_after >= 0.f && progress_after <= 1.f;
-    if (!building && (module_count == 0 || built_count == 0 || total_xrefs == 0 || !fixture_to_found || !fixture_from_found || !progress_ok)) {
-        log_msg(hf, "xrefdb_st", "FAIL -- xref_db fixture state invalid module_key=%s modules=%zu built=%zu total_xrefs=%zu query_results=%zu from=0x%llX to=0x%llX fixture_to=%d fixture_from=%d progress=%.3f progress_ok=%d elapsed_us=%lld",
-            k_xref_fixture_module_key,
-            module_count,
-            built_count,
-            total_xrefs,
-            query_count_after,
-            (unsigned long long)from,
-            (unsigned long long)addr,
-            fixture_to_found ? 1 : 0,
-            fixture_from_found ? 1 : 0,
-            static_cast<double>(progress_after),
-            progress_ok ? 1 : 0,
-            us);
-        failed.fetch_add(1);
-        return;
-    }
-    log_msg(hf, "xrefdb_st", "FIXTURE-PASS -- module_key=%s from=0x%llX to=0x%llX before(modules=%zu query=%zu building=%d progress=%.3f) after(building=%d modules=%zu built=%zu total_xrefs=%zu query_results=%zu fixture_to=%d fixture_from=%d progress=%.3f) elapsed_us=%lld",
-        k_xref_fixture_module_key,
-        (unsigned long long)from,
-        (unsigned long long)addr,
-        module_count_before,
-        query_count_before,
-        building_before ? 1 : 0,
-        static_cast<double>(progress_before),
-        building ? 1 : 0,
-        module_count,
-        built_count,
-        total_xrefs,
-        query_count_after,
-        fixture_to_found ? 1 : 0,
-        fixture_from_found ? 1 : 0,
-        static_cast<double>(progress_after),
-        us);
-    passed.fetch_add(1);
-}
-
-static void test_xref_db_query_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "xrefdb_qt", "START -- xref_db query_xrefs_to fixture store");
-    auto t0 = std::chrono::steady_clock::now();
-
-    uint64_t from = 0x140001020;
-    uint64_t addr = 0x140002000;
-    seed_xref_db_fixture(from, addr);
-    xref_db::query_xrefs_to(addr);
-
-    size_t results = 0;
-    size_t total_xrefs = 0;
-    size_t module_count = 0;
-    bool query_addr_ok = false;
-    bool query_is_to = false;
-    {
-        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-        results = xref_db::g_state.query_results.size();
-        module_count = xref_db::g_state.modules.size();
-        query_addr_ok = xref_db::g_state.query_addr == addr;
-        query_is_to = xref_db::g_state.query_is_to;
-        auto it = xref_db::g_state.modules.find(k_xref_fixture_module_key);
-        if (it != xref_db::g_state.modules.end())
-            total_xrefs = it->second.total_xrefs;
-    }
-
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "xrefdb_qt", "RESULT coverage=fixture_store module_key=%s modules=%zu total_xrefs=%zu from=0x%llX to=0x%llX query_results=%zu query_addr_ok=%d query_is_to=%d elapsed_ms=%lld",
-        k_xref_fixture_module_key,
-        module_count,
-        total_xrefs,
-        (unsigned long long)from,
-        (unsigned long long)addr,
-        results,
-        query_addr_ok ? 1 : 0,
-        query_is_to ? 1 : 0,
-        (long long)ms);
-    if (results == 0 || total_xrefs == 0 || !query_addr_ok || !query_is_to) {
-        log_msg(hf, "xrefdb_qt", "FAIL -- fixture query evidence insufficient module_key=%s total_xrefs=%zu query_results=%zu query_addr_ok=%d query_is_to=%d elapsed_ms=%lld",
-            k_xref_fixture_module_key,
-            total_xrefs,
-            results,
-            query_addr_ok ? 1 : 0,
-            query_is_to ? 1 : 0,
-            (long long)ms);
-        failed.fetch_add(1); return;
-    }
-    log_msg(hf, "xrefdb_qt", "FIXTURE-PASS -- query_xrefs_to returned %zu fixture results module_key=%s from=0x%llX to=0x%llX elapsed_ms=%lld",
-        results,
-        k_xref_fixture_module_key,
-        (unsigned long long)from,
-        (unsigned long long)addr,
-        (long long)ms);
-    passed.fetch_add(1);
 }
 
 static void test_expression_eval_multiply(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
@@ -4549,87 +4307,6 @@ static void test_pdb_resolve_cache_path(HANDLE hf, std::atomic<int>& passed, std
     }
 }
 
-static void test_comment_store_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "cmt_multi", "START -- comment store multiple addresses");
-    auto t0 = std::chrono::steady_clock::now();
-
-    const uint64_t addr_a = 0xBEEF0001;
-    const uint64_t addr_b = 0xBEEF0002;
-    const uint64_t addr_c = 0xBEEF0003;
-    const char* val_a = "comment_alpha";
-    const char* val_b = "comment_beta";
-    const char* val_c = "comment_gamma";
-    log_msg(hf, "cmt_multi", "INPUT a={addr=0x%llX value=\"%s\"} b={addr=0x%llX value=\"%s\"} c={addr=0x%llX value=\"%s\"} tid=%lu",
-        static_cast<unsigned long long>(addr_a), val_a,
-        static_cast<unsigned long long>(addr_b), val_b,
-        static_cast<unsigned long long>(addr_c), val_c,
-        static_cast<unsigned long>(GetCurrentThreadId()));
-
-    comment_store::set(addr_a, val_a);
-    comment_store::set(addr_b, val_b);
-    comment_store::set(addr_c, val_c);
-
-    std::string a = comment_store::get(addr_a);
-    std::string b = comment_store::get(addr_b);
-    std::string c = comment_store::get(addr_c);
-
-    comment_store::set(addr_a, "");
-    comment_store::set(addr_b, "");
-    comment_store::set(addr_c, "");
-
-    long long us = elapsed_us_since(t0);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "cmt_multi", "RESULT a={addr=0x%llX got=\"%s\"} b={addr=0x%llX got=\"%s\"} c={addr=0x%llX got=\"%s\"} elapsed_us=%lld",
-        static_cast<unsigned long long>(addr_a), a.c_str(),
-        static_cast<unsigned long long>(addr_b), b.c_str(),
-        static_cast<unsigned long long>(addr_c), c.c_str(),
-        us);
-    if (a == val_a && b == val_b && c == val_c) {
-        log_msg(hf, "cmt_multi", "PASS -- all 3 comments stored/retrieved correctly (elapsed %lld ms us=%lld)", (long long)ms, us);
-        passed.fetch_add(1);
-    } else {
-        log_msg(hf, "cmt_multi", "FAIL -- a=\"%s\" b=\"%s\" c=\"%s\" (elapsed %lld ms us=%lld)",
-            a.c_str(), b.c_str(), c.c_str(), (long long)ms, us);
-        failed.fetch_add(1);
-    }
-}
-
-static void test_comment_store_overwrite(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
-    log_msg(hf, "cmt_over", "START -- comment store overwrite");
-    auto t0 = std::chrono::steady_clock::now();
-
-    uint64_t addr = 0xBEEF1234;
-    const char* first_value = "first_value";
-    const char* second_value = "second_value";
-    log_msg(hf, "cmt_over", "INPUT addr=0x%llX first=\"%s\" second=\"%s\" tid=%lu",
-        static_cast<unsigned long long>(addr),
-        first_value,
-        second_value,
-        static_cast<unsigned long>(GetCurrentThreadId()));
-
-    comment_store::set(addr, first_value);
-    std::string after_first = comment_store::get(addr);
-    comment_store::set(addr, second_value);
-
-    std::string got = comment_store::get(addr);
-    comment_store::set(addr, "");
-
-    long long us = elapsed_us_since(t0);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    log_msg(hf, "cmt_over", "RESULT addr=0x%llX after_first=\"%s\" after_second=\"%s\" elapsed_us=%lld",
-        static_cast<unsigned long long>(addr),
-        after_first.c_str(),
-        got.c_str(),
-        us);
-    if (got == second_value) {
-        log_msg(hf, "cmt_over", "PASS -- overwrite correct: \"%s\" (elapsed %lld ms us=%lld)", got.c_str(), (long long)ms, us);
-        passed.fetch_add(1);
-    } else {
-        log_msg(hf, "cmt_over", "FAIL -- got \"%s\" (elapsed %lld ms us=%lld)", got.c_str(), (long long)ms, us);
-        failed.fetch_add(1);
-    }
-}
-
 static void select_analysis_hub_tab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed,
                                      const char* tag, analysis_hub_view::sub_tab_t value) {
     auto t0 = std::chrono::steady_clock::now();
@@ -4826,6 +4503,436 @@ static void test_protection_inner_controls(HANDLE hf, std::atomic<int>& passed, 
     select_protection_inner_tab(hf, passed, failed, "protection_inner.controls", 1, "Stealth Status");
 }
 
+static aida::analysis::semantic_scope_key_t quality_semantic_scope() {
+    aida::analysis::semantic_scope_key_t scope;
+    scope.function_address.space = aida::analysis::address_space_id_t::relative_virtual;
+    scope.function_address.value = 0x1400;
+    scope.function_address.architecture = aida::analysis::architecture_id_t::x86_64;
+    scope.function_address.mode = aida::analysis::architecture_mode_t::x86_64;
+    scope.architecture = scope.function_address.architecture;
+    scope.architecture_mode = scope.function_address.mode;
+    scope.abi = aida::analysis::abi_id_t::windows_x64;
+    scope.generation = 17;
+    scope.analysis_revision = 23;
+    scope.overlay_revision = 29;
+    return scope;
+}
+
+static aida::analysis::semantic_evidence_t quality_constant_evidence(
+    const aida::analysis::semantic_scope_key_t& scope, std::uint64_t evidence_id) {
+    aida::analysis::semantic_evidence_t evidence;
+    evidence.evidence_id = evidence_id;
+    evidence.kind = aida::analysis::semantic_fact_kind_t::value;
+    evidence.subject.kind = aida::analysis::semantic_subject_kind_t::function;
+    evidence.subject.function_id = 7;
+    evidence.subject.address = scope.function_address;
+    aida::analysis::constant_value_t value;
+    value.kind = aida::analysis::semantic_value_kind_t::constant;
+    value.value = 0x41;
+    value.bit_width = 32;
+    value.known = true;
+    evidence.payload = value;
+    evidence.provenance.origin = aida::analysis::semantic_origin_t::decompiler_type_recovery;
+    evidence.provenance.source = aida::analysis::fact_provenance_t::decompiler_feedback;
+    evidence.provenance.source_entity_id = evidence_id;
+    evidence.provenance.source_address = scope.function_address;
+    evidence.provenance.stable_source_id = evidence_id;
+    evidence.provenance.source_generation = scope.generation;
+    evidence.provenance.source_analysis_revision = scope.analysis_revision;
+    evidence.provenance.source_overlay_revision = scope.overlay_revision;
+    evidence.provenance.independently_validated = true;
+    evidence.validation = aida::analysis::semantic_validation_t::validated;
+    evidence.confidence = 100;
+    return evidence;
+}
+
+static void test_semantic_fusion_bounded_deterministic(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    log_msg(hf, "quality_sem", "START -- bounded semantic evidence reduction and deterministic ordering");
+    const auto scope = quality_semantic_scope();
+    aida::analysis::semantic_merge_budget_t budget;
+    budget.max_evidence_records = 8;
+    budget.max_evidence_per_subject = 2;
+    budget.max_fused_facts = 8;
+    budget.max_conflicts = 8;
+    budget.max_abstentions = 8;
+    budget.max_provenance_per_fact = 8;
+    budget.cancellation_poll_interval = 1;
+    std::vector<aida::analysis::semantic_evidence_t> evidence;
+    evidence.push_back(quality_constant_evidence(scope, 31));
+    evidence.push_back(quality_constant_evidence(scope, 11));
+    evidence.push_back(quality_constant_evidence(scope, 23));
+    const auto forward = aida::analysis::reduce_semantic_evidence(scope, evidence, budget);
+    std::reverse(evidence.begin(), evidence.end());
+    const auto reversed = aida::analysis::reduce_semantic_evidence(scope, evidence, budget);
+    const bool bounded = forward && reversed && forward.value().bounded && reversed.value().bounded &&
+        forward.value().evidence_dropped == 1 && reversed.value().evidence_dropped == 1 &&
+        forward.value().facts.size() == 1 && reversed.value().facts.size() == 1 &&
+        forward.value().facts.front().contributing_evidence_ids.size() == 2 &&
+        forward.value().facts.front().contributing_evidence_ids ==
+            reversed.value().facts.front().contributing_evidence_ids &&
+        forward.value().cache_key.evidence_fingerprint == reversed.value().cache_key.evidence_fingerprint;
+    if (!bounded) {
+        log_msg(hf, "quality_sem", "FAIL -- bounded=%d/%d dropped=%llu/%llu facts=%zu/%zu contributors=%zu/%zu fingerprint=%llu/%llu",
+            forward && forward.value().bounded ? 1 : 0,
+            reversed && reversed.value().bounded ? 1 : 0,
+            (unsigned long long)(forward ? forward.value().evidence_dropped : 0),
+            (unsigned long long)(reversed ? reversed.value().evidence_dropped : 0),
+            forward ? forward.value().facts.size() : 0,
+            reversed ? reversed.value().facts.size() : 0,
+            forward && !forward.value().facts.empty() ? forward.value().facts.front().contributing_evidence_ids.size() : 0,
+            reversed && !reversed.value().facts.empty() ? reversed.value().facts.front().contributing_evidence_ids.size() : 0,
+            (unsigned long long)(forward ? forward.value().cache_key.evidence_fingerprint : 0),
+            (unsigned long long)(reversed ? reversed.value().cache_key.evidence_fingerprint : 0));
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "quality_sem", "PASS -- bounded propagation dropped=%llu contributors=%zu deterministic_fingerprint=%llu",
+        (unsigned long long)forward.value().evidence_dropped,
+        forward.value().facts.front().contributing_evidence_ids.size(),
+        (unsigned long long)forward.value().cache_key.evidence_fingerprint);
+    passed.fetch_add(1);
+}
+
+static void test_semantic_fusion_cancellation_deadline(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    log_msg(hf, "quality_cancel", "START -- semantic fusion cancellation and deadline propagation");
+    const auto scope = quality_semantic_scope();
+    aida::analysis::semantic_merge_budget_t budget;
+    budget.cancellation_poll_interval = 1;
+    budget.max_abstentions = 4;
+    std::vector<aida::analysis::semantic_evidence_t> evidence;
+    evidence.push_back(quality_constant_evidence(scope, 41));
+    aida::analysis::cancellation_source_t cancelled;
+    cancelled.request_cancel();
+    const auto cancelled_result = aida::analysis::reduce_semantic_evidence(
+        scope, evidence, budget, {}, cancelled.token());
+    aida::analysis::cancellation_source_t expired{
+        std::optional<std::chrono::steady_clock::time_point>(
+            std::chrono::steady_clock::now() - std::chrono::milliseconds(1))};
+    const auto deadline_result = aida::analysis::reduce_semantic_evidence(
+        scope, evidence, budget, {}, expired.token());
+    const bool cancellation_observed = cancelled_result && cancelled_result.value().cancelled &&
+        !cancelled_result.value().deadline_exceeded && !cancelled_result.value().abstentions.empty() &&
+        cancelled_result.value().abstentions.front().reason ==
+            aida::analysis::semantic_abstention_reason_t::cancellation_requested;
+    const bool deadline_observed = deadline_result && deadline_result.value().cancelled &&
+        deadline_result.value().deadline_exceeded && !deadline_result.value().abstentions.empty() &&
+        deadline_result.value().abstentions.front().reason ==
+            aida::analysis::semantic_abstention_reason_t::deadline_exceeded;
+    if (!cancellation_observed || !deadline_observed) {
+        log_msg(hf, "quality_cancel", "FAIL -- cancelled_ok=%d deadline_ok=%d cancelled_flags=%d/%d deadline_flags=%d/%d",
+            cancellation_observed ? 1 : 0, deadline_observed ? 1 : 0,
+            cancelled_result && cancelled_result.value().cancelled ? 1 : 0,
+            deadline_result && deadline_result.value().cancelled ? 1 : 0,
+            cancelled_result && cancelled_result.value().deadline_exceeded ? 1 : 0,
+            deadline_result && deadline_result.value().deadline_exceeded ? 1 : 0);
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "quality_cancel", "PASS -- cancellation and expired deadline produced distinct abstentions");
+    passed.fetch_add(1);
+}
+
+static void test_decompiler_feedback_range_publication(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    log_msg(hf, "quality_feedback", "START -- range-validated decompiler feedback publication");
+    aida::analysis::decompiler_feedback_model_t model;
+    aida::analysis::decompiler_feedback_scope_key_t scope;
+    scope.workspace_id = "testlab-quality";
+    scope.binary_id = "quality-binary";
+    scope.address_space_id = "relative-virtual";
+    scope.architecture_id = "x86-64";
+    scope.generation = 3;
+    scope.overlay_revision = 5;
+    scope.type_revision = 7;
+    aida::analysis::decompiler_feedback_fact_t valid;
+    valid.fact_id = "quality-valid-name";
+    valid.logical_key = "name:0x401004";
+    valid.publisher_id = "testlab-quality";
+    valid.kind = aida::analysis::decompiler_feedback_fact_kind_t::name;
+    valid.authority = aida::analysis::decompiler_feedback_authority_t::trusted_recovery;
+    valid.validation.grade = aida::analysis::decompiler_feedback_validation_grade_t::proven;
+    valid.validation.validator_id = "quality-validator";
+    valid.validation.evidence_id = "quality-evidence";
+    valid.validation.evidence_revision = 11;
+    valid.source_revision = 13;
+    valid.affected_range = {0x401000, 0x20};
+    valid.payload = aida::analysis::decompiler_feedback_name_t{0x401004, "quality_name"};
+    auto invalid = valid;
+    invalid.fact_id = "quality-invalid-range";
+    invalid.logical_key = "name:0x402000";
+    invalid.affected_range = {0x402000, 0};
+    invalid.payload = aida::analysis::decompiler_feedback_name_t{0x402000, "invalid_name"};
+    aida::analysis::decompiler_feedback_publication_request_t request;
+    request.scope = scope;
+    request.facts = {invalid, valid};
+    const auto result = model.publish(request);
+    const auto snapshot = model.snapshot(scope);
+    const bool range_rejected = result.rejections.size() == 1 &&
+        result.rejections.front().fact_id == invalid.fact_id &&
+        result.rejections.front().code == "invalid_affected_range";
+    const bool published = result.status == aida::analysis::decompiler_feedback_publication_status_t::published &&
+        result.accepted_fact_ids.size() == 1 && result.accepted_fact_ids.front() == valid.fact_id &&
+        result.affected_ranges.bounded && result.affected_ranges.ranges.size() == 1 &&
+        result.cache_invalidations.bounded && !result.cache_invalidations.keys.empty() &&
+        snapshot.exists && snapshot.facts.size() == 1 && snapshot.facts.front().fact_id == valid.fact_id;
+    if (!range_rejected || !published) {
+        log_msg(hf, "quality_feedback", "FAIL -- status=%d accepted=%zu rejected=%zu range_bounded=%d ranges=%zu cache_bounded=%d cache_keys=%zu snapshot=%d/%zu",
+            static_cast<int>(result.status), result.accepted_fact_ids.size(), result.rejections.size(),
+            result.affected_ranges.bounded ? 1 : 0, result.affected_ranges.ranges.size(),
+            result.cache_invalidations.bounded ? 1 : 0, result.cache_invalidations.keys.size(),
+            snapshot.exists ? 1 : 0, snapshot.facts.size());
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "quality_feedback", "PASS -- published proven in-range feedback and rejected zero-length range");
+    passed.fetch_add(1);
+}
+
+static void test_pseudocode_typed_ast_rendering(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    log_msg(hf, "quality_pseudo", "START -- typed AST pseudocode rendering and deterministic node ordering");
+    aida::analysis::pseudocode_type_t unsigned32;
+    unsigned32.kind = aida::analysis::pseudocode_type_kind_t::unsigned_integer;
+    unsigned32.spelling = "uint32_t";
+    unsigned32.bit_width = 32;
+    aida::analysis::typed_pseudocode_variable_t parameter;
+    parameter.id = 1;
+    parameter.source_name = "input_value";
+    parameter.role = aida::analysis::pseudocode_variable_role_t::parameter;
+    parameter.type = unsigned32;
+    aida::analysis::typed_pseudocode_node_t function;
+    function.id = 1;
+    function.kind = aida::analysis::pseudocode_node_kind_t::function;
+    function.type = unsigned32;
+    aida::analysis::pseudocode_function_t function_payload;
+    function_payload.name = "quality_identity";
+    function_payload.return_type = unsigned32;
+    function_payload.parameters = {parameter.id};
+    function_payload.body = 2;
+    function.payload = function_payload;
+    aida::analysis::typed_pseudocode_node_t block;
+    block.id = 2;
+    block.kind = aida::analysis::pseudocode_node_kind_t::block;
+    block.payload = aida::analysis::pseudocode_block_t{{3}};
+    aida::analysis::typed_pseudocode_node_t returned;
+    returned.id = 3;
+    returned.kind = aida::analysis::pseudocode_node_kind_t::return_statement;
+    returned.type = unsigned32;
+    returned.payload = aida::analysis::pseudocode_return_statement_t{4};
+    aida::analysis::typed_pseudocode_node_t identifier;
+    identifier.id = 4;
+    identifier.kind = aida::analysis::pseudocode_node_kind_t::identifier_expression;
+    identifier.type = unsigned32;
+    identifier.payload = aida::analysis::pseudocode_identifier_expression_t{parameter.id};
+    aida::analysis::typed_pseudocode_ast_t ast;
+    ast.root = function.id;
+    ast.nodes = {function, block, returned, identifier};
+    ast.variables = {parameter};
+    ast.revision = 17;
+    aida::analysis::pseudocode_render_request_t request;
+    request.cache_key_material.workspace_identity = "testlab-quality";
+    request.cache_key_material.workspace_generation = 3;
+    request.cache_key_material.overlay_revision = 5;
+    request.cache_key_material.type_revision = 7;
+    request.cache_key_material.function_address = 0x401000;
+    request.cache_key_material.ast_revision = ast.revision;
+    request.cache_key_material.service_revision = "quality";
+    const auto rendered = aida::analysis::render_typed_pseudocode(ast, request);
+    auto reordered = ast;
+    std::reverse(reordered.nodes.begin(), reordered.nodes.end());
+    const auto rendered_reordered = aida::analysis::render_typed_pseudocode(reordered, request);
+    const bool output_ok = rendered.succeeded() && rendered_reordered.succeeded() &&
+        rendered.output->text.find("uint32_t") != std::string::npos &&
+        rendered.output->text.find("quality_identity") != std::string::npos &&
+        rendered.output->text.find("return input_value;") != std::string::npos &&
+        rendered.output->variable_decisions.size() == 1 &&
+        rendered.output->text == rendered_reordered.output->text &&
+        rendered.output->cache_key == rendered_reordered.output->cache_key;
+    if (!output_ok) {
+        log_msg(hf, "quality_pseudo", "FAIL -- rendered=%d reordered=%d text_bytes=%zu/%zu variables=%zu/%zu",
+            rendered.succeeded() ? 1 : 0, rendered_reordered.succeeded() ? 1 : 0,
+            rendered.output ? rendered.output->text.size() : 0,
+            rendered_reordered.output ? rendered_reordered.output->text.size() : 0,
+            rendered.output ? rendered.output->variable_decisions.size() : 0,
+            rendered_reordered.output ? rendered_reordered.output->variable_decisions.size() : 0);
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "quality_pseudo", "PASS -- typed AST rendered %zu bytes with deterministic output", rendered.output->text.size());
+    passed.fetch_add(1);
+}
+
+static void test_type_recovery_semantic_cfg_cc_binding(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    log_msg(hf, "quality_types", "START -- type recovery consuming semantic, CFG, and calling-convention evidence");
+    const auto workspace = analysis_fixture_workspace();
+    const auto snapshot = workspace ? workspace->snapshot() : nullptr;
+    if (!workspace || !snapshot || snapshot->functions.empty()) {
+        log_msg(hf, "quality_types", "FAIL -- static workspace fixture with published functions is required");
+        failed.fetch_add(1);
+        return;
+    }
+    std::vector<const aida::analysis::function_record_t*> functions;
+    functions.reserve(snapshot->functions.size());
+    for (const auto& function : snapshot->functions)
+        functions.push_back(&function);
+    std::sort(functions.begin(), functions.end(), [](const auto* lhs, const auto* rhs) {
+        return lhs->start < rhs->start || (!(rhs->start < lhs->start) && lhs->id < rhs->id);
+    });
+    const aida::analysis::function_record_t* selected_function = nullptr;
+    std::optional<aida::analysis::cfg_analysis_result_t> selected_cfg;
+    const std::size_t candidates = (std::min)(functions.size(), static_cast<std::size_t>(16));
+    for (std::size_t index = 0; index < candidates; ++index) {
+        const auto candidate = aida::analysis::analyze_advanced_cfg(*workspace, functions[index]->start.value, {});
+        if (!candidate)
+            continue;
+        const auto& cfg = candidate.value();
+        if (!cfg.function_noreturn && cfg.callgraph_edges.empty() && cfg.thunks.empty() && cfg.noreturn_effects.empty())
+            continue;
+        selected_function = functions[index];
+        selected_cfg = candidate.value();
+        break;
+    }
+    if (!selected_function || !selected_cfg) {
+        log_msg(hf, "quality_types", "FAIL -- no CFG-bearing function found in %zu published fixture functions", candidates);
+        failed.fetch_add(1);
+        return;
+    }
+    aida::analysis::semantic_evidence_t type_evidence;
+    type_evidence.evidence_id = 101;
+    type_evidence.kind = aida::analysis::semantic_fact_kind_t::type;
+    type_evidence.subject.kind = aida::analysis::semantic_subject_kind_t::function;
+    type_evidence.subject.function_id = selected_function->id;
+    type_evidence.subject.address = selected_function->start;
+    aida::analysis::type_evidence_t semantic_type;
+    semantic_type.location.kind = aida::analysis::semantic_location_kind_t::function_return;
+    semantic_type.type.kind = aida::analysis::semantic_type_kind_t::integer;
+    semantic_type.type.bit_width = 32;
+    semantic_type.type.display_name = "uint32_t";
+    semantic_type.instruction_id = selected_function->id;
+    semantic_type.address = selected_function->start;
+    type_evidence.payload = semantic_type;
+    type_evidence.provenance.origin = aida::analysis::semantic_origin_t::decompiler_type_recovery;
+    type_evidence.provenance.source = aida::analysis::fact_provenance_t::decompiler_feedback;
+    type_evidence.provenance.source_entity_id = selected_function->id;
+    type_evidence.provenance.source_address = selected_function->start;
+    type_evidence.provenance.stable_source_id = 101;
+    type_evidence.provenance.source_generation = snapshot->generation;
+    type_evidence.provenance.source_analysis_revision = snapshot->analysis_revision;
+    type_evidence.provenance.source_overlay_revision = snapshot->overlay_revision;
+    type_evidence.provenance.independently_validated = true;
+    type_evidence.validation = aida::analysis::semantic_validation_t::validated;
+    type_evidence.confidence = 100;
+    aida::analysis::semantic_fusion_request_t semantic_request;
+    semantic_request.function_rva = selected_function->start.value;
+    semantic_request.derive_workspace_evidence = false;
+    semantic_request.decompiler_evidence = {type_evidence};
+    const auto semantic = aida::analysis::fuse_semantic_evidence(*workspace, semantic_request);
+    const auto calling_convention = aida::analysis::analyze_calling_convention(
+        *workspace, selected_function->start.value);
+    if (!semantic || !calling_convention) {
+        log_msg(hf, "quality_types", "FAIL -- semantic=%d cc=%d semantic_error=%s cc_error=%s",
+            semantic ? 1 : 0, calling_convention ? 1 : 0,
+            semantic ? "" : semantic.error().stable_code().c_str(),
+            calling_convention ? "" : calling_convention.error().stable_code().c_str());
+        failed.fetch_add(1);
+        return;
+    }
+    aida::analysis::type_recovery_request_t request;
+    request.function_rva = selected_function->start.value;
+    request.include_image_metadata = false;
+    request.include_interprocedural = false;
+    request.semantic_result = &semantic.value();
+    request.cfg_result = &*selected_cfg;
+    request.calling_convention_result = &calling_convention.value();
+    const auto recovered = aida::analysis::recover_types(*workspace, request);
+    const bool semantic_consumed = recovered && std::any_of(recovered.value().evidence.begin(), recovered.value().evidence.end(),
+        [](const auto& evidence) { return evidence.detail == "semantic_type"; });
+    const bool cfg_consumed = recovered && std::any_of(recovered.value().evidence.begin(), recovered.value().evidence.end(),
+        [](const auto& evidence) { return evidence.detail.find("cfg_") == 0; });
+    const bool cc_consumed = recovered && std::any_of(recovered.value().evidence.begin(), recovered.value().evidence.end(),
+        [](const auto& evidence) {
+            return evidence.provenance == aida::analysis::type_evidence_provenance_t::calling_convention &&
+                evidence.kind == aida::analysis::type_evidence_kind_t::calling_convention_function;
+        });
+    if (!semantic_consumed || !cfg_consumed || !cc_consumed) {
+        log_msg(hf, "quality_types", "FAIL -- recovered=%d semantic=%d cfg=%d cc=%d evidence=%zu constraints=%zu function_rva=0x%llX",
+            recovered ? 1 : 0, semantic_consumed ? 1 : 0, cfg_consumed ? 1 : 0, cc_consumed ? 1 : 0,
+            recovered ? recovered.value().evidence.size() : 0,
+            recovered ? recovered.value().constraints.size() : 0,
+            (unsigned long long)selected_function->start.value);
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "quality_types", "PASS -- semantic, CFG, and calling-convention evidence reached type recovery for 0x%llX",
+        (unsigned long long)selected_function->start.value);
+    passed.fetch_add(1);
+}
+
+static void test_stale_revisions_and_decompiler_errors(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    log_msg(hf, "quality_service", "START -- stale revision rejection and structured decompiler errors");
+    const auto workspace = analysis_fixture_workspace();
+    const auto snapshot = workspace ? workspace->snapshot() : nullptr;
+    if (!workspace || !snapshot || snapshot->functions.empty() || !workspace->decompiler()) {
+        log_msg(hf, "quality_service", "FAIL -- workspace, snapshot, functions, and decompiler service are required");
+        failed.fetch_add(1);
+        return;
+    }
+    const auto function = std::find_if(snapshot->functions.begin(), snapshot->functions.end(),
+        [](const auto& item) { return item.id != 0; });
+    if (function == snapshot->functions.end()) {
+        log_msg(hf, "quality_service", "FAIL -- published snapshot has no function with a stable entity id");
+        failed.fetch_add(1);
+        return;
+    }
+    aida::analysis::calling_convention_request_t stale_cc_request;
+    stale_cc_request.function = function->start;
+    stale_cc_request.expected_generation = snapshot->generation + 1;
+    stale_cc_request.expected_analysis_revision = snapshot->analysis_revision + 1;
+    stale_cc_request.expected_overlay_revision = snapshot->overlay_revision + 1;
+    const auto stale_cc = aida::analysis::infer_calling_convention(*workspace, stale_cc_request, {});
+    aida::analysis::cancellation_source_t cancelled;
+    cancelled.request_cancel();
+    const auto cancelled_service = workspace->decompiler()->decompile(function->start, {}, cancelled.token());
+    aida::analysis::decompiler_request_t deadline_request;
+    deadline_request.deadline = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    const auto deadline_service = workspace->decompiler()->decompile(function->start, deadline_request);
+    aida::analysis::decompiler_request_context_t stale_context;
+    stale_context.workspace_id = "testlab-quality";
+    stale_context.function_id = function->id;
+    stale_context.function_address = function->start;
+    stale_context.address_space = function->start.space;
+    stale_context.generation = workspace->generation() + 1;
+    stale_context.overlay_revision = workspace->overlay_revision() + 1;
+    stale_context.type_revision = 1;
+    aida::analysis::decompiler_request_t stale_request;
+    stale_request.use_memory_cache = false;
+    stale_request.use_persistent_cache = false;
+    stale_request.publish_feedback = false;
+    stale_request.context = stale_context;
+    const auto stale_service = workspace->decompiler()->decompile(function->start, stale_request);
+    const bool cc_stale = !stale_cc && stale_cc.error().code == aida::analysis::workspace_error_code_t::stale_generation &&
+        !stale_cc.error().phase.empty();
+    const bool service_cancelled = !cancelled_service &&
+        cancelled_service.error().code == aida::analysis::workspace_error_code_t::cancelled &&
+        cancelled_service.error().cancellation && !cancelled_service.error().phase.empty();
+    const bool service_deadline = !deadline_service &&
+        deadline_service.error().code == aida::analysis::workspace_error_code_t::deadline_exceeded &&
+        deadline_service.error().deadline && !deadline_service.error().phase.empty();
+    const bool service_stale = !stale_service &&
+        stale_service.error().code == aida::analysis::workspace_error_code_t::stale_generation &&
+        stale_service.error().phase == "decompiler.context" && !stale_service.error().message.empty();
+    if (!cc_stale || !service_cancelled || !service_deadline || !service_stale) {
+        log_msg(hf, "quality_service", "FAIL -- cc_stale=%d cancelled=%d deadline=%d service_stale=%d codes=%d/%d/%d/%d",
+            cc_stale ? 1 : 0, service_cancelled ? 1 : 0, service_deadline ? 1 : 0, service_stale ? 1 : 0,
+            stale_cc ? -1 : static_cast<int>(stale_cc.error().code),
+            cancelled_service ? -1 : static_cast<int>(cancelled_service.error().code),
+            deadline_service ? -1 : static_cast<int>(deadline_service.error().code),
+            stale_service ? -1 : static_cast<int>(stale_service.error().code));
+        failed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "quality_service", "PASS -- stale, cancellation, and deadline requests preserved structured errors");
+    passed.fetch_add(1);
+}
+
 using analysis_test_fn_t = void (*)(HANDLE, std::atomic<int>&, std::atomic<int>&);
 
 struct analysis_test_entry_t {
@@ -4992,6 +5099,11 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "xref_type_names",             test_xref_type_names             },
         { "xref_db_state",               test_xref_db_state               },
         { "xref_db_query_to",            test_xref_db_query_to            },
+        { "comment_store",               test_comment_store               },
+        { "comment_store_multiple",      test_comment_store_multiple      },
+        { "comment_store_overwrite",     test_comment_store_overwrite     },
+        { "rename_store",                test_rename_store                },
+        { "rename_store_resolve_or",     test_rename_store_resolve_or     },
         { "expression_eval_hex",         test_expression_eval_hex         },
         { "expression_eval_register",    test_expression_eval_register    },
         { "expression_eval_multiply",    test_expression_eval_multiply    },
@@ -5000,11 +5112,6 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "expression_eval_nested_paren",test_expression_eval_nested_parens},
         { "expression_eval_xor",         test_expression_eval_xor         },
         { "expression_eval_multi_reg",   test_expression_eval_multi_register },
-        { "comment_store",               test_comment_store               },
-        { "comment_store_multiple",      test_comment_store_multiple      },
-        { "comment_store_overwrite",     test_comment_store_overwrite     },
-        { "rename_store",                test_rename_store                },
-        { "rename_store_resolve_or",     test_rename_store_resolve_or     },
         { "fuzzer_state",                test_fuzzer_state                },
         { "fuzzer_config",               test_fuzzer_config               },
         { "stealth_state",               test_stealth_state               },
@@ -5014,6 +5121,12 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "decrypt_oracle_state",        test_decrypt_oracle_state        },
         { "decrypt_oracle_config",       test_decrypt_oracle_config       },
         { "pdb_resolve_cache_path",      test_pdb_resolve_cache_path      },
+        { "quality_semantic_bounded",    test_semantic_fusion_bounded_deterministic },
+        { "quality_semantic_cancel",     test_semantic_fusion_cancellation_deadline },
+        { "quality_feedback_ranges",     test_decompiler_feedback_range_publication },
+        { "quality_pseudocode_typed",    test_pseudocode_typed_ast_rendering },
+        { "quality_type_evidence",       test_type_recovery_semantic_cfg_cc_binding, 15000 },
+        { "quality_service_errors",      test_stale_revisions_and_decompiler_errors },
 
         { "analysis_hub_tab_symbolic",   test_analysis_hub_tab_symbolic   },
         { "analysis_hub_tab_taint",      test_analysis_hub_tab_taint      },

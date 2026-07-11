@@ -25,6 +25,76 @@ namespace process_guard {
     inline volatile LONG g_create_notify_registered = 0;
     inline volatile LONG g_thread_notify_registered = 0;
 
+    inline volatile HANDLE g_known_re_tool_pids[16] = {};
+    inline volatile LONG g_known_re_tool_pid_count = 0;
+    inline KSPIN_LOCK g_re_tool_pid_lock = {};
+    inline volatile LONG g_re_tool_pid_lock_init = 0;
+
+    __forceinline void ensure_re_tool_pid_lock() {
+        if (_InterlockedCompareExchange(&g_re_tool_pid_lock_init, 1, 0) == 0) {
+            KeInitializeSpinLock(&g_re_tool_pid_lock);
+        }
+    }
+
+    __forceinline bool is_known_re_tool_pid(HANDLE pid) {
+        if (!pid)
+            return false;
+        ensure_re_tool_pid_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_re_tool_pid_lock, &old_irql);
+        bool found = false;
+        LONG count = g_known_re_tool_pid_count;
+        if (count > 16) count = 16;
+        for (LONG i = 0; i < count; ++i) {
+            if (g_known_re_tool_pids[i] == pid) {
+                found = true;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_re_tool_pid_lock, old_irql);
+        return found;
+    }
+
+    __forceinline void register_re_tool_pid(HANDLE pid) {
+        if (!pid)
+            return;
+        ensure_re_tool_pid_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_re_tool_pid_lock, &old_irql);
+        LONG count = g_known_re_tool_pid_count;
+        if (count > 16) count = 16;
+        for (LONG i = 0; i < count; ++i) {
+            if (g_known_re_tool_pids[i] == pid) {
+                KeReleaseSpinLock(&g_re_tool_pid_lock, old_irql);
+                return;
+            }
+        }
+        if (count < 16) {
+            g_known_re_tool_pids[count] = pid;
+            _InterlockedIncrement(&g_known_re_tool_pid_count);
+        }
+        KeReleaseSpinLock(&g_re_tool_pid_lock, old_irql);
+    }
+
+    __forceinline void unregister_re_tool_pid(HANDLE pid) {
+        if (!pid)
+            return;
+        ensure_re_tool_pid_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_re_tool_pid_lock, &old_irql);
+        LONG count = g_known_re_tool_pid_count;
+        if (count > 16) count = 16;
+        for (LONG i = 0; i < count; ++i) {
+            if (g_known_re_tool_pids[i] == pid) {
+                g_known_re_tool_pids[i] = g_known_re_tool_pids[count - 1];
+                g_known_re_tool_pids[count - 1] = nullptr;
+                _InterlockedDecrement(&g_known_re_tool_pid_count);
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_re_tool_pid_lock, old_irql);
+    }
+
     __forceinline bool tracked_process_exit_needs_cleanup(
         UINT32 dying_pid,
         HANDLE registered,
@@ -345,12 +415,146 @@ namespace process_guard {
         if (!Info || !Info->Object)
             return OB_PREOP_SUCCESS;
 
-        if (Info->KernelHandle)
+        if (Info->KernelHandle) {
+            HANDLE kh_client_pid = caller_validation::g_registered_client_pid;
+
+            if (!kh_client_pid) {
+                HANDLE kh_caller_fc = PsGetCurrentProcessId();
+                if (is_werfault_caller(kh_caller_fc))
+                    return OB_PREOP_SUCCESS;
+                if (is_allowlisted_system_caller(kh_caller_fc))
+                    return OB_PREOP_SUCCESS;
+
+                ACCESS_MASK kh_req_fc = 0;
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    kh_req_fc = Info->Parameters->CreateHandleInformation.DesiredAccess;
+                else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                    kh_req_fc = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+                constexpr ACCESS_MASK KH_FAIL_CLOSED_STRIP =
+                    PROCESS_TERMINATE | PROCESS_CREATE_THREAD |
+                    PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+                    PROCESS_DUP_HANDLE | PROCESS_SUSPEND_RESUME;
+
+                if (kh_req_fc & KH_FAIL_CLOSED_STRIP) {
+                    if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~KH_FAIL_CLOSED_STRIP;
+                    else
+                        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~KH_FAIL_CLOSED_STRIP;
+
+                    targeting_latch::latch_targeting(
+                        sentinel_bridge::RE_REASON_FOREIGN_HND,
+                        (UINT64)(ULONG_PTR)kh_caller_fc,
+                        (UINT64)kh_req_fc, 0, 0);
+                    WW_LOG("[THREAT] kernel_handle_fail_closed caller=%llu requested=0x%08X stripped=0x%08X",
+                        (UINT64)(ULONG_PTR)kh_caller_fc, (UINT32)kh_req_fc, (UINT32)KH_FAIL_CLOSED_STRIP);
+                }
+                return OB_PREOP_SUCCESS;
+            }
+
+            HANDLE kh_target = PsGetProcessId(static_cast<PEPROCESS>(Info->Object));
+            if (kh_target != kh_client_pid)
+                return OB_PREOP_SUCCESS;
+
+            HANDLE kh_caller = PsGetCurrentProcessId();
+            if (kh_caller == kh_client_pid)
+                return OB_PREOP_SUCCESS;
+
+            if (is_werfault_caller(kh_caller))
+                return OB_PREOP_SUCCESS;
+
+            if (is_known_re_tool_pid(kh_caller)) {
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    Info->Parameters->CreateHandleInformation.DesiredAccess = 0;
+                else
+                    Info->Parameters->DuplicateHandleInformation.DesiredAccess = 0;
+
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_FOREIGN_HND,
+                    (UINT64)(ULONG_PTR)kh_caller, 0, 0, 0);
+                WW_LOG("[THREAT] kernel_handle_re_tool caller=%llu stripped_all=1",
+                    (UINT64)(ULONG_PTR)kh_caller);
+                return OB_PREOP_SUCCESS;
+            }
+
+            ACCESS_MASK kh_requested = 0;
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                kh_requested = Info->Parameters->CreateHandleInformation.DesiredAccess;
+            else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                kh_requested = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+            bool kh_allowlisted = is_allowlisted_system_caller(kh_caller);
+
+            if (kh_allowlisted) {
+                constexpr ACCESS_MASK KH_ALLOWLIST_STRIP =
+                    PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION;
+
+                if (kh_requested & KH_ALLOWLIST_STRIP) {
+                    if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~KH_ALLOWLIST_STRIP;
+                    else
+                        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~KH_ALLOWLIST_STRIP;
+                }
+            } else {
+                constexpr ACCESS_MASK KH_FULL_STRIP =
+                    PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
+                    PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION |
+                    PROCESS_SET_INFORMATION | PROCESS_DUP_HANDLE | PROCESS_VM_READ;
+
+                if (kh_requested & KH_FULL_STRIP) {
+                    if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~KH_FULL_STRIP;
+                    else
+                        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~KH_FULL_STRIP;
+
+                    targeting_latch::latch_targeting(
+                        sentinel_bridge::RE_REASON_FOREIGN_HND,
+                        (UINT64)(ULONG_PTR)kh_caller,
+                        (UINT64)kh_requested, 0, 0);
+                    WW_LOG("[THREAT] kernel_handle_strip caller=%llu requested=0x%08X stripped=0x%08X allowlisted=0",
+                        (UINT64)(ULONG_PTR)kh_caller, (UINT32)kh_requested, (UINT32)KH_FULL_STRIP);
+                }
+            }
             return OB_PREOP_SUCCESS;
+        }
 
         HANDLE client_pid = caller_validation::g_registered_client_pid;
         if (!client_pid)
+        {
+            HANDLE caller_pid_fc = PsGetCurrentProcessId();
+            if (reinterpret_cast<UINT64>(caller_pid_fc) == 4)
+                return OB_PREOP_SUCCESS;
+            if (is_werfault_caller(caller_pid_fc))
+                return OB_PREOP_SUCCESS;
+            if (is_allowlisted_system_caller(caller_pid_fc))
+                return OB_PREOP_SUCCESS;
+
+            constexpr ACCESS_MASK HOSTILE_FAIL_CLOSED =
+                PROCESS_TERMINATE | PROCESS_CREATE_THREAD |
+                PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+                PROCESS_DUP_HANDLE | PROCESS_SUSPEND_RESUME;
+
+            ACCESS_MASK requested_fc = 0;
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                requested_fc = Info->Parameters->CreateHandleInformation.DesiredAccess;
+            else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                requested_fc = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+            if (requested_fc & HOSTILE_FAIL_CLOSED) {
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    Info->Parameters->CreateHandleInformation.DesiredAccess &= ~HOSTILE_FAIL_CLOSED;
+                else
+                    Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~HOSTILE_FAIL_CLOSED;
+
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_OB_WRITE,
+                    (UINT64)(ULONG_PTR)caller_pid_fc,
+                    (UINT64)requested_fc,
+                    0, 0
+                );
+            }
             return OB_PREOP_SUCCESS;
+        }
 
         HANDLE target_pid = PsGetProcessId(static_cast<PEPROCESS>(Info->Object));
         if (target_pid != client_pid)
@@ -362,6 +566,14 @@ namespace process_guard {
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
             return OB_PREOP_SUCCESS;
 
+        if (is_known_re_tool_pid(caller_pid)) {
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                Info->Parameters->CreateHandleInformation.DesiredAccess = 0;
+            else
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess = 0;
+            return OB_PREOP_SUCCESS;
+        }
+
         ACCESS_MASK requested = 0;
         if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
             requested = Info->Parameters->CreateHandleInformation.DesiredAccess;
@@ -371,18 +583,22 @@ namespace process_guard {
         if (is_werfault_caller(caller_pid))
             return OB_PREOP_SUCCESS;
 
-        constexpr ACCESS_MASK HOSTILE_PROC =
+        constexpr ACCESS_MASK BASE_HOSTILE =
             PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
             PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION;
         constexpr ACCESS_MASK STRIP_READ = PROCESS_VM_READ;
 
         bool is_system = is_allowlisted_system_caller(caller_pid);
 
-        if (requested & HOSTILE_PROC) {
+        ACCESS_MASK hostile_proc = BASE_HOSTILE;
+        if (!is_system)
+            hostile_proc |= PROCESS_DUP_HANDLE;
+
+        if (requested & hostile_proc) {
             if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
-                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~(HOSTILE_PROC | STRIP_READ);
+                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~(hostile_proc | STRIP_READ);
             else
-                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~(HOSTILE_PROC | STRIP_READ);
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~(hostile_proc | STRIP_READ);
 
             if (!is_system) {
                 targeting_latch::latch_targeting(
@@ -409,8 +625,65 @@ namespace process_guard {
         if (!Info || !Info->Object)
             return OB_PREOP_SUCCESS;
 
-        if (Info->KernelHandle)
+        if (Info->KernelHandle) {
+            HANDLE kh_thr_client_pid = caller_validation::g_registered_client_pid;
+            if (!kh_thr_client_pid)
+                return OB_PREOP_SUCCESS;
+
+            PEPROCESS kh_thr_owner = IoThreadToProcess(static_cast<PETHREAD>(Info->Object));
+            if (!kh_thr_owner)
+                return OB_PREOP_SUCCESS;
+
+            HANDLE kh_thr_owner_pid = PsGetProcessId(kh_thr_owner);
+            if (kh_thr_owner_pid != kh_thr_client_pid)
+                return OB_PREOP_SUCCESS;
+
+            HANDLE kh_thr_caller = PsGetCurrentProcessId();
+            if (kh_thr_caller == kh_thr_client_pid)
+                return OB_PREOP_SUCCESS;
+
+            if (is_werfault_caller(kh_thr_caller))
+                return OB_PREOP_SUCCESS;
+
+            if (is_known_re_tool_pid(kh_thr_caller)) {
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    Info->Parameters->CreateHandleInformation.DesiredAccess = 0;
+                else
+                    Info->Parameters->DuplicateHandleInformation.DesiredAccess = 0;
+
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_OB_SUSPEND,
+                    (UINT64)(ULONG_PTR)kh_thr_caller, 0, 0, 0);
+                WW_LOG("[THREAT] kernel_thread_handle_re_tool caller=%llu stripped_all=1",
+                    (UINT64)(ULONG_PTR)kh_thr_caller);
+                return OB_PREOP_SUCCESS;
+            }
+
+            ACCESS_MASK kh_thr_req = 0;
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                kh_thr_req = Info->Parameters->CreateHandleInformation.DesiredAccess;
+            else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                kh_thr_req = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+            constexpr ACCESS_MASK KH_THR_STRIP =
+                THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME |
+                THREAD_TERMINATE | THREAD_GET_CONTEXT;
+
+            if (kh_thr_req & KH_THR_STRIP) {
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    Info->Parameters->CreateHandleInformation.DesiredAccess &= ~KH_THR_STRIP;
+                else
+                    Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~KH_THR_STRIP;
+
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_OB_SUSPEND,
+                    (UINT64)(ULONG_PTR)kh_thr_caller,
+                    (UINT64)kh_thr_req, 0, 0);
+                WW_LOG("[THREAT] kernel_thread_handle_strip caller=%llu requested=0x%08X stripped=0x%08X",
+                    (UINT64)(ULONG_PTR)kh_thr_caller, (UINT32)kh_thr_req, (UINT32)KH_THR_STRIP);
+            }
             return OB_PREOP_SUCCESS;
+        }
 
         HANDLE client_pid = caller_validation::g_registered_client_pid;
         if (!client_pid)
@@ -486,8 +759,40 @@ namespace process_guard {
         if (!Info || !Info->Object)
             return OB_PREOP_SUCCESS;
 
-        if (Info->KernelHandle)
+        if (Info->KernelHandle) {
+            HANDLE kh_br_client_pid = caller_validation::g_registered_client_pid;
+            if (!kh_br_client_pid)
+                return OB_PREOP_SUCCESS;
+
+            HANDLE kh_br_caller = PsGetCurrentProcessId();
+            if (kh_br_caller == kh_br_client_pid)
+                return OB_PREOP_SUCCESS;
+
+            if (is_werfault_caller(kh_br_caller))
+                return OB_PREOP_SUCCESS;
+
+            if (is_known_re_tool_pid(kh_br_caller)) {
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    Info->Parameters->CreateHandleInformation.DesiredAccess = 0;
+                else
+                    Info->Parameters->DuplicateHandleInformation.DesiredAccess = 0;
+                return OB_PREOP_SUCCESS;
+            }
+
+            UINT64 br_start = g_bridge_region_start;
+            UINT64 br_end = g_bridge_region_end;
+            if (br_start == 0 || br_end == 0)
+                return OB_PREOP_SUCCESS;
+
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                Info->Parameters->CreateHandleInformation.DesiredAccess &=
+                    ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE);
+            else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess &=
+                    ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE);
+
             return OB_PREOP_SUCCESS;
+        }
 
         HANDLE client_pid = caller_validation::g_registered_client_pid;
         if (!client_pid)
@@ -535,6 +840,18 @@ namespace process_guard {
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
             return;
 
+        if (_KeBugCheckEx) {
+            WW_LOG("[THREAT] thread_injection detected client_pid=%llu caller_pid=%llu thread_id=%llu",
+                reinterpret_cast<UINT64>(client_pid),
+                reinterpret_cast<UINT64>(caller_pid),
+                reinterpret_cast<UINT64>(ThreadId));
+            _KeBugCheckEx(0xA1DA0005,
+                reinterpret_cast<ULONG_PTR>(caller_pid),
+                reinterpret_cast<ULONG_PTR>(ProcessId),
+                reinterpret_cast<ULONG_PTR>(ThreadId),
+                0);
+        }
+
         UNREFERENCED_PARAMETER(ThreadId);
     }
 
@@ -547,6 +864,7 @@ namespace process_guard {
         if (!CreateInfo) {
             UINT32 dying_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(ProcessId));
             if (dying_pid != 0 && dying_pid != 4) {
+                unregister_re_tool_pid((HANDLE)(ULONG_PTR)dying_pid);
                 HANDLE registered = caller_validation::g_registered_client_pid;
                 bool registered_client = false;
                 bool canary_possible = false;
@@ -576,6 +894,8 @@ namespace process_guard {
                     InvalidateDTBCache(dying_pid);
                 if (adbg_target)
                     continuous_anti_debug::stop_if_target(dying_pid);
+                if (registered_client)
+                    context_guard::uninstall();
                 if (admp_target)
                     continuous_anti_dump::stop_if_target(dying_pid);
                 if (antidump_protected)
@@ -649,6 +969,26 @@ namespace process_guard {
 
         if (reinterpret_cast<UINT64>(parent_pid) == 4)
             return;
+
+        if (CreateInfo->ImageFileName && CreateInfo->ImageFileName->Buffer) {
+            LONG hash_count = anti_debug::g_re_tool_hash_count;
+            if (hash_count > 0 && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+                UINT8 file_hash[32] = {};
+                NTSTATUS hash_status = anti_debug::compute_file_sha256(
+                    CreateInfo->ImageFileName, file_hash);
+                if (NT_SUCCESS(hash_status)) {
+                    bool matched = anti_debug::match_re_tool_hash(file_hash);
+                    if (matched) {
+                        register_re_tool_pid(ProcessId);
+                        WW_LOG("create_process_notify: re_tool_hash_match pid=%llu",
+                            reinterpret_cast<UINT64>(ProcessId));
+                        RtlSecureZeroMemory(file_hash, sizeof(file_hash));
+                        return;
+                    }
+                }
+                RtlSecureZeroMemory(file_hash, sizeof(file_hash));
+            }
+        }
     }
 
     inline NTSTATUS init()
@@ -772,3 +1112,9 @@ namespace process_guard {
     }
 
 }
+
+namespace anti_debug { namespace process_guard_fwd {
+    __forceinline void register_re_tool_pid(HANDLE pid) {
+        process_guard::register_re_tool_pid(pid);
+    }
+}}

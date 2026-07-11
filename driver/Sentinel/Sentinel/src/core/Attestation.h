@@ -6,11 +6,13 @@
 #include "KernelCrypto.h"
 #include "HardwareId.h"
 #include "WitnessKey.h"
+#include "Integrity.h"
 
 namespace attestation
 {
     constexpr ULONG ATTEST_POOL_TAG = 'tA7k';
     constexpr ULONG HWID_SIZE = 32;
+    constexpr ULONG BUILD_ID_SIZE = 16;
 
     struct attest_state_t
     {
@@ -19,7 +21,22 @@ namespace attestation
         UINT8   attest_hmac[HWID_SIZE];
         BOOLEAN valid;
         UINT64  boot_timestamp;
+        UINT8   build_id[BUILD_ID_SIZE];
     };
+
+#pragma pack(push, 1)
+    struct attest_with_integrity_t
+    {
+        UINT8   nonce[16];
+        UINT8   usermode_code_hash[32];
+        UINT64  timestamp;
+        UINT8   hardware_id[32];
+        UINT8   build_id[16];
+        UINT8   hmac[32];
+    };
+#pragma pack(pop)
+    static_assert(sizeof(attest_with_integrity_t) == 136,
+        "attest_with_integrity_t must be 136 bytes");
 
     inline attest_state_t g_attest = {};
 
@@ -232,6 +249,60 @@ namespace attestation
             g_attest.attest_hmac);
 
         RtlSecureZeroMemory(install_secret, sizeof(install_secret));
+        return st;
+    }
+
+    __forceinline NTSTATUS compute_attest_with_integrity(
+        attest_with_integrity_t& out)
+    {
+        RtlZeroMemory(&out, sizeof(out));
+
+        if (!_InterlockedCompareExchange(&integrity::g_usermode_hash_initialized, 1, 1)) {
+            SN_LOG("attestation::compute_attest_with_integrity: usermode hash not initialized, skipping");
+            return STATUS_NOT_FOUND;
+        }
+
+        NTSTATUS st = kernel_crypto::gen_random(out.nonce, 16);
+        if (!NT_SUCCESS(st)) {
+            SN_LOG("attestation::compute_attest_with_integrity: gen_random nonce failed status=0x%08lx", st);
+            return st;
+        }
+
+        RtlCopyMemory(out.usermode_code_hash,
+            integrity::g_usermode_last_computed_sha256, 32);
+
+        LARGE_INTEGER ts;
+        KeQuerySystemTime(&ts);
+        out.timestamp = static_cast<UINT64>(ts.QuadPart);
+
+        RtlCopyMemory(out.hardware_id, g_attest.hardware_id, 32);
+
+        RtlCopyMemory(out.build_id, g_attest.build_id, 16);
+
+        UINT8 install_secret[32];
+        if (!witness_key::read_kw(install_secret)) {
+            SN_LOG("attestation::compute_attest_with_integrity: witness_key read_kw failed");
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        UINT8 hmac_input[104];
+        RtlCopyMemory(hmac_input + 0,  out.nonce, 16);
+        RtlCopyMemory(hmac_input + 16, out.usermode_code_hash, 32);
+        RtlCopyMemory(hmac_input + 48, &out.timestamp, 8);
+        RtlCopyMemory(hmac_input + 56, out.hardware_id, 32);
+        RtlCopyMemory(hmac_input + 88, out.build_id, 16);
+
+        st = kernel_crypto::hmac_sha256(
+            install_secret, 32,
+            hmac_input, sizeof(hmac_input),
+            out.hmac);
+
+        RtlSecureZeroMemory(install_secret, sizeof(install_secret));
+        RtlSecureZeroMemory(hmac_input, sizeof(hmac_input));
+
+        if (!NT_SUCCESS(st)) {
+            SN_LOG("attestation::compute_attest_with_integrity: hmac_sha256 failed status=0x%08lx", st);
+        }
         return st;
     }
 

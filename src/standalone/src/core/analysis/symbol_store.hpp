@@ -6,14 +6,19 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "workspace/workspace_types.hpp"
 
 #include "pdb_default_skip.hpp"
 #include "pdb_events.hpp"
@@ -65,6 +70,515 @@ struct state_t {
 	std::string                                       cache_dir;
 	bool                                              auto_download = false;
 	std::string                                       symbol_server_url = "https://msdl.microsoft.com/download/symbols";
+};
+
+struct workspace_symbol_t {
+	aida::analysis::address_t address;
+	std::uint64_t size = 0;
+	std::string name;
+	std::string module_name;
+	bool is_function = false;
+};
+
+struct workspace_path_snapshot_t {
+	std::vector<std::string> search_paths;
+	std::string cache_dir;
+	uint64_t revision = 0;
+	bool truncated = false;
+};
+
+class workspace_state_t {
+public:
+	explicit workspace_state_t(aida::analysis::binary_id_t binary_id)
+		: binary_id_(std::move(binary_id)) {}
+
+	const aida::analysis::binary_id_t& binary_id() const noexcept { return binary_id_; }
+	uint64_t revision() const noexcept { return revision_.load(std::memory_order_acquire); }
+
+	bool upsert_module(module_symbols_t module) {
+		module_budget_t budget;
+		if (!measure_module(module, budget)) return false;
+		auto function_index = build_function_index(module);
+		const std::string key = module_key(module.module_name);
+		if (key.empty()) return false;
+		std::lock_guard<std::mutex> lock(mutex_);
+		const auto existing = modules_.find(key);
+		if (existing == modules_.end() && modules_.size() >= kMaximumModules)
+			return false;
+		if (!module_range_fits_locked(key, module) ||
+			!aggregate_fits_locked(key, budget)) return false;
+		modules_.insert_or_assign(key, std::move(module));
+		module_budgets_.insert_or_assign(key, budget);
+		function_indexes_.insert_or_assign(key, std::move(function_index));
+		revision_.fetch_add(1, std::memory_order_acq_rel);
+		return true;
+	}
+
+	bool update_module(const std::string& module_name, module_symbols_t module) {
+		const std::string key = module_key(module_name);
+		if (key.empty() || module_key(module.module_name) != key) return false;
+		module_budget_t budget;
+		if (!measure_module(module, budget)) return false;
+		auto function_index = build_function_index(module);
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto found = modules_.find(key);
+		if (found == modules_.end()) return false;
+		if (!module_range_fits_locked(key, module) ||
+			!aggregate_fits_locked(key, budget)) return false;
+		found->second = std::move(module);
+		module_budgets_.insert_or_assign(key, budget);
+		function_indexes_.insert_or_assign(key, std::move(function_index));
+		revision_.fetch_add(1, std::memory_order_acq_rel);
+		return true;
+	}
+
+	void erase_module(const std::string& module_name) {
+		const std::string key = module_key(module_name);
+		if (key.empty()) return;
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (modules_.erase(key) != 0) {
+			module_budgets_.erase(key);
+			function_indexes_.erase(key);
+			revision_.fetch_add(1, std::memory_order_acq_rel);
+		}
+	}
+
+	void clear() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (modules_.empty() && search_paths_.empty() && cache_dir_.empty()) return;
+		modules_.clear();
+		module_budgets_.clear();
+		function_indexes_.clear();
+		search_paths_.clear();
+		cache_dir_.clear();
+		revision_.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	bool configure_paths(std::vector<std::string> search_paths,
+		std::string cache_dir) {
+		if (search_paths.size() > kMaximumPaths ||
+			cache_dir.size() > kMaximumPathBytes ||
+			cache_dir.find('\0') != std::string::npos)
+			return false;
+		size_t consumed = cache_dir.size();
+		for (const auto& path : search_paths) {
+			if (path.empty() || path.size() > 32768 ||
+				path.find('\0') != std::string::npos ||
+				path.size() > kMaximumPathBytes - consumed)
+				return false;
+			consumed += path.size();
+		}
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (search_paths_ == search_paths && cache_dir_ == cache_dir) return true;
+		search_paths_ = std::move(search_paths);
+		cache_dir_ = std::move(cache_dir);
+		revision_.fetch_add(1, std::memory_order_acq_rel);
+		return true;
+	}
+
+	workspace_path_snapshot_t path_snapshot(
+		size_t maximum_paths = 4096,
+		size_t maximum_utf8_bytes = 1024 * 1024) const {
+		workspace_path_snapshot_t output;
+		if (maximum_paths == 0 || maximum_paths > 4096 ||
+			maximum_utf8_bytes == 0 || maximum_utf8_bytes > 1024 * 1024) {
+			output.truncated = true;
+			return output;
+		}
+		std::lock_guard<std::mutex> lock(mutex_);
+		output.revision = revision_.load(std::memory_order_acquire);
+		size_t consumed = 0;
+		output.search_paths.reserve((std::min)(maximum_paths, search_paths_.size()));
+		for (const auto& path : search_paths_) {
+			if (output.search_paths.size() == maximum_paths ||
+				path.size() > maximum_utf8_bytes - consumed) {
+				output.truncated = true;
+				break;
+			}
+			consumed += path.size();
+			output.search_paths.push_back(path);
+		}
+		if (cache_dir_.size() <= maximum_utf8_bytes - consumed) {
+			output.cache_dir = cache_dir_;
+		} else {
+			output.truncated = true;
+		}
+		if (output.search_paths.size() != search_paths_.size())
+			output.truncated = true;
+		return output;
+	}
+
+	std::optional<module_symbols_t> module_snapshot(
+		const std::string& module_name,
+		size_t maximum_symbols = 4 * 1024 * 1024) const {
+		if (module_name.empty() || maximum_symbols == 0 ||
+			maximum_symbols > kMaximumSymbols)
+			return std::nullopt;
+		const std::string key = module_key(module_name);
+		if (key.empty()) return std::nullopt;
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto found = modules_.find(key);
+		if (found == modules_.end() ||
+			found->second.pdb.symbols.size() > maximum_symbols)
+			return std::nullopt;
+		return found->second;
+	}
+
+	std::optional<module_symbols_t> module_snapshot_containing(
+		const aida::analysis::address_t& address,
+		size_t maximum_symbols = 4 * 1024 * 1024) const {
+		if ((address.space != aida::analysis::address_space_id_t::virtual_address &&
+			 address.space != aida::analysis::address_space_id_t::live_virtual) ||
+			maximum_symbols == 0 || maximum_symbols > kMaximumSymbols)
+			return std::nullopt;
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (const auto& item : modules_) {
+			const auto& module = item.second;
+			if (module.size == 0 || address.value < module.base ||
+				address.value - module.base >= module.size)
+				continue;
+			if (module.pdb.symbols.size() > maximum_symbols)
+				return std::nullopt;
+			return module;
+		}
+		return std::nullopt;
+	}
+
+	std::optional<workspace_symbol_t> symbol_snapshot_exact(
+		const aida::analysis::address_t& address) const {
+		if (address.space != aida::analysis::address_space_id_t::virtual_address &&
+			address.space != aida::analysis::address_space_id_t::live_virtual)
+			return std::nullopt;
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (const auto& item : modules_) {
+			const auto& module = item.second;
+			if (!module.pdb.loaded || module.size == 0 || address.value < module.base ||
+				address.value - module.base >= module.size)
+				continue;
+			const uint64_t rva = address.value - module.base;
+			auto found = module.pdb.symbol_by_rva.find(rva);
+			if (found == module.pdb.symbol_by_rva.end() ||
+				found->second >= module.pdb.symbols.size())
+				return std::nullopt;
+			const auto& symbol = module.pdb.symbols[found->second];
+			workspace_symbol_t result;
+			result.address = address;
+			result.size = symbol.size;
+			result.name = symbol.name;
+			result.module_name = module.module_name;
+			result.is_function = symbol.is_function;
+			return result;
+		}
+		return std::nullopt;
+	}
+
+	std::string resolve_exact(const aida::analysis::address_t& address) const {
+		auto symbol = symbol_snapshot_exact(address);
+		return symbol ? symbol->name : std::string{};
+	}
+
+	std::string resolve_nearest(const aida::analysis::address_t& address,
+		uint64_t maximum_distance = 0x10000) const {
+		if ((address.space != aida::analysis::address_space_id_t::virtual_address &&
+			 address.space != aida::analysis::address_space_id_t::live_virtual) ||
+			maximum_distance == 0 || maximum_distance > 0x1000000)
+			return {};
+		std::lock_guard<std::mutex> lock(mutex_);
+		for (const auto& item : modules_) {
+			const auto& module = item.second;
+			if (!module.pdb.loaded || module.size == 0 || address.value < module.base ||
+				address.value - module.base >= module.size)
+				continue;
+			const uint64_t rva = address.value - module.base;
+			auto exact = module.pdb.symbol_by_rva.find(rva);
+			if (exact != module.pdb.symbol_by_rva.end() &&
+				exact->second < module.pdb.symbols.size())
+				return format_resolved_name(module.module_name,
+					module.pdb.symbols[exact->second].name, 0);
+			const auto index_found = function_indexes_.find(item.first);
+			if (index_found == function_indexes_.end() || index_found->second.empty())
+				return {};
+			const auto& index = index_found->second;
+			auto after = std::upper_bound(index.begin(), index.end(), rva,
+				[](uint64_t value, const auto& item) { return value < item.first; });
+			if (after == index.begin()) return {};
+			--after;
+			if (after->second >= module.pdb.symbols.size()) return {};
+			const auto& best = module.pdb.symbols[after->second];
+			const uint64_t distance = rva - best.rva;
+			if (distance >= maximum_distance) return {};
+			return format_resolved_name(module.module_name, best.name, distance);
+		}
+		return {};
+	}
+
+	std::vector<std::pair<std::string, module_symbols_t>> modules_snapshot(
+		size_t maximum_modules = kMaximumModules) const {
+		if (maximum_modules == 0 || maximum_modules > kMaximumModules) return {};
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (modules_.size() > maximum_modules) return {};
+		std::vector<std::pair<std::string, module_symbols_t>> output;
+		output.reserve(modules_.size());
+		for (const auto& item : modules_)
+			output.emplace_back(item.second.module_name, item.second);
+		return output;
+	}
+
+	std::vector<workspace_symbol_t> function_snapshot(
+		aida::analysis::architecture_id_t architecture,
+		aida::analysis::architecture_mode_t mode,
+		size_t maximum_functions = kMaximumSymbols,
+		aida::analysis::address_space_id_t address_space =
+			aida::analysis::address_space_id_t::virtual_address) const {
+		if (maximum_functions == 0 || maximum_functions > kMaximumSymbols ||
+			(address_space != aida::analysis::address_space_id_t::virtual_address &&
+			 address_space != aida::analysis::address_space_id_t::live_virtual))
+			return {};
+		std::lock_guard<std::mutex> lock(mutex_);
+		std::vector<workspace_symbol_t> output;
+		size_t total_functions = 0;
+		for (const auto& item : function_indexes_) {
+			if (item.second.size() > maximum_functions - total_functions) return {};
+			total_functions += item.second.size();
+		}
+		output.reserve(total_functions);
+		for (const auto& module_item : modules_) {
+			const auto& module = module_item.second;
+			if (!module.pdb.loaded || module.size == 0)
+				continue;
+			const auto index_found = function_indexes_.find(module_item.first);
+			if (index_found == function_indexes_.end()) continue;
+			for (const auto& indexed : index_found->second) {
+				if (indexed.second >= module.pdb.symbols.size()) continue;
+				const auto& symbol = module.pdb.symbols[indexed.second];
+				if (module.base > UINT64_MAX - symbol.rva)
+					continue;
+				workspace_symbol_t item;
+				item.address.space = address_space;
+				item.address.value = module.base + symbol.rva;
+				item.address.architecture = architecture;
+				item.address.mode = mode;
+				item.size = symbol.size;
+				item.name = symbol.name;
+				item.module_name = module.module_name;
+				item.is_function = true;
+				output.push_back(std::move(item));
+			}
+		}
+		std::sort(output.begin(), output.end(),
+			[](const workspace_symbol_t& left, const workspace_symbol_t& right) {
+				if (left.address != right.address)
+					return left.address < right.address;
+				if (left.name != right.name)
+					return left.name < right.name;
+				return left.module_name < right.module_name;
+			});
+		return output;
+	}
+
+private:
+	static constexpr size_t kMaximumModules = 4096;
+	static constexpr size_t kMaximumPaths = 4096;
+	static constexpr size_t kMaximumPathBytes = 1024 * 1024;
+	static constexpr size_t kMaximumSymbols = 4 * 1024 * 1024;
+	static constexpr size_t kMaximumStructs = 1024 * 1024;
+	static constexpr size_t kMaximumEnums = 1024 * 1024;
+	static constexpr size_t kMaximumMembers = 4 * 1024 * 1024;
+	static constexpr size_t kMaximumUtf8Bytes = 512ULL * 1024ULL * 1024ULL;
+	static constexpr size_t kMaximumStringBytes = 64 * 1024;
+	static constexpr size_t kMaximumResolvedNameBytes = 128 * 1024;
+
+	struct module_budget_t {
+		size_t symbols = 0;
+		size_t structs = 0;
+		size_t enums = 0;
+		size_t members = 0;
+		size_t utf8_bytes = 0;
+	};
+
+	using function_index_t = std::vector<std::pair<uint64_t, size_t>>;
+
+	static std::string module_key(const std::string& value) {
+		if (value.empty()) return {};
+		std::string key = value;
+		std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
+			return static_cast<char>(std::tolower(ch));
+		});
+		return key;
+	}
+
+	static std::string format_resolved_name(const std::string& module_name,
+		const std::string& symbol_name, uint64_t distance) {
+		if (module_name.empty() || symbol_name.empty()) return {};
+		char suffix[32]{};
+		if (distance != 0) {
+			std::snprintf(suffix, sizeof(suffix), "+0x%llX",
+				static_cast<unsigned long long>(distance));
+		}
+		const size_t suffix_size = std::strlen(suffix);
+		if (module_name.size() > kMaximumResolvedNameBytes ||
+			symbol_name.size() > kMaximumResolvedNameBytes - module_name.size() ||
+			1 + suffix_size > kMaximumResolvedNameBytes - module_name.size() -
+				symbol_name.size())
+			return {};
+		std::string result;
+		result.reserve(module_name.size() + 1 + symbol_name.size() + suffix_size);
+		result.append(module_name);
+		result.push_back('!');
+		result.append(symbol_name);
+		result.append(suffix, suffix_size);
+		return result;
+	}
+
+	static bool add_string_budget(size_t& total, const std::string& value) {
+		if (value.size() > kMaximumStringBytes ||
+			value.find('\0') != std::string::npos ||
+			value.size() > kMaximumUtf8Bytes - total)
+			return false;
+		total += value.size();
+		return true;
+	}
+
+	static bool measure_module(const module_symbols_t& module,
+		module_budget_t& budget) {
+		if (module.module_name.empty() || module.module_name.size() > 4096 ||
+			module.module_name.find('\0') != std::string::npos ||
+			(module.size != 0 && module.base > UINT64_MAX - module.size) ||
+			module.pdb.symbols.size() > kMaximumSymbols ||
+			module.pdb.structs.size() > kMaximumStructs ||
+			module.pdb.enums.size() > kMaximumEnums ||
+			module.pdb.symbol_by_name.size() > module.pdb.symbols.size() ||
+			module.pdb.symbol_by_rva.size() > module.pdb.symbols.size() ||
+			module.pdb.struct_by_name.size() > module.pdb.structs.size() ||
+			module.pdb.struct_by_ti.size() > module.pdb.structs.size())
+			return false;
+		budget.symbols = module.pdb.symbols.size();
+		budget.structs = module.pdb.structs.size();
+		budget.enums = module.pdb.enums.size();
+		if (!add_string_budget(budget.utf8_bytes, module.module_name) ||
+			!add_string_budget(budget.utf8_bytes, module.status_text) ||
+			!add_string_budget(budget.utf8_bytes, module.pdb_path) ||
+			!add_string_budget(budget.utf8_bytes, module.load_failure_detail) ||
+			!add_string_budget(budget.utf8_bytes, module.load_phase) ||
+			!add_string_budget(budget.utf8_bytes, module.parse_diagnostic) ||
+			!add_string_budget(budget.utf8_bytes, module.pdb.file_path) ||
+			!add_string_budget(budget.utf8_bytes, module.pdb.module_name))
+			return false;
+		for (const auto& symbol : module.pdb.symbols) {
+			if (!add_string_budget(budget.utf8_bytes, symbol.name)) return false;
+		}
+		for (const auto& structure : module.pdb.structs) {
+			if (!add_string_budget(budget.utf8_bytes, structure.name) ||
+				structure.members.size() > kMaximumMembers - budget.members)
+				return false;
+			budget.members += structure.members.size();
+			for (const auto& member : structure.members) {
+				if (!add_string_budget(budget.utf8_bytes, member.name) ||
+					!add_string_budget(budget.utf8_bytes, member.type_name))
+					return false;
+			}
+		}
+		for (const auto& enumeration : module.pdb.enums) {
+			if (!add_string_budget(budget.utf8_bytes, enumeration.name) ||
+				enumeration.members.size() > kMaximumMembers - budget.members)
+				return false;
+			budget.members += enumeration.members.size();
+			for (const auto& member : enumeration.members) {
+				if (!add_string_budget(budget.utf8_bytes, member.name)) return false;
+			}
+		}
+		for (const auto& item : module.pdb.symbol_by_name) {
+			if (item.second >= module.pdb.symbols.size() ||
+				module.pdb.symbols[item.second].name != item.first ||
+				!add_string_budget(budget.utf8_bytes, item.first))
+				return false;
+		}
+		for (const auto& item : module.pdb.symbol_by_rva) {
+			if (item.second >= module.pdb.symbols.size() ||
+				module.pdb.symbols[item.second].rva != item.first)
+				return false;
+		}
+		for (const auto& item : module.pdb.struct_by_name) {
+			if (item.second >= module.pdb.structs.size() ||
+				module.pdb.structs[item.second].name != item.first ||
+				!add_string_budget(budget.utf8_bytes, item.first))
+				return false;
+		}
+		for (const auto& item : module.pdb.struct_by_ti) {
+			if (item.second >= module.pdb.structs.size() ||
+				module.pdb.structs[item.second].type_index != item.first)
+				return false;
+		}
+		return true;
+	}
+
+	static function_index_t build_function_index(const module_symbols_t& module) {
+		function_index_t output;
+		output.reserve(module.pdb.symbols.size());
+		for (size_t index = 0; index < module.pdb.symbols.size(); ++index) {
+			const auto& symbol = module.pdb.symbols[index];
+			if (!symbol.is_function || symbol.name.empty() ||
+				module.size == 0 || symbol.rva >= module.size)
+				continue;
+			output.emplace_back(symbol.rva, index);
+		}
+		std::sort(output.begin(), output.end(), [&module](const auto& left,
+			const auto& right) {
+			if (left.first != right.first) return left.first < right.first;
+			const auto& left_name = module.pdb.symbols[left.second].name;
+			const auto& right_name = module.pdb.symbols[right.second].name;
+			if (left_name != right_name) return left_name < right_name;
+			return left.second < right.second;
+		});
+		output.erase(std::unique(output.begin(), output.end(),
+			[](const auto& left, const auto& right) {
+				return left.first == right.first;
+			}), output.end());
+		return output;
+	}
+
+	bool module_range_fits_locked(const std::string& replacing,
+		const module_symbols_t& candidate) const {
+		if (candidate.size == 0) return true;
+		const uint64_t candidate_end = candidate.base + candidate.size;
+		for (const auto& item : modules_) {
+			if (item.first == replacing || item.second.size == 0) continue;
+			const uint64_t existing_end = item.second.base + item.second.size;
+			if (candidate.base < existing_end && item.second.base < candidate_end)
+				return false;
+		}
+		return true;
+	}
+
+	bool aggregate_fits_locked(const std::string& replacing,
+		const module_budget_t& candidate) const {
+		module_budget_t total = candidate;
+		for (const auto& item : module_budgets_) {
+			if (item.first == replacing) continue;
+			const auto& value = item.second;
+			if (value.symbols > kMaximumSymbols - total.symbols ||
+				value.structs > kMaximumStructs - total.structs ||
+				value.enums > kMaximumEnums - total.enums ||
+				value.members > kMaximumMembers - total.members ||
+				value.utf8_bytes > kMaximumUtf8Bytes - total.utf8_bytes)
+				return false;
+			total.symbols += value.symbols;
+			total.structs += value.structs;
+			total.enums += value.enums;
+			total.members += value.members;
+			total.utf8_bytes += value.utf8_bytes;
+		}
+		return true;
+	}
+
+	aida::analysis::binary_id_t binary_id_;
+	mutable std::mutex mutex_;
+	std::map<std::string, module_symbols_t> modules_;
+	std::map<std::string, module_budget_t> module_budgets_;
+	std::map<std::string, function_index_t> function_indexes_;
+	std::vector<std::string> search_paths_;
+	std::string cache_dir_;
+	std::atomic<uint64_t> revision_{0};
 };
 
 inline state_t g_state;
@@ -415,47 +929,6 @@ inline std::string pdb_parse_failure_status(const char* prefix)
 	if (!loader.empty())
 		out += " [" + loader + "]";
 	return out;
-}
-
-struct snapshot_t {
-	std::unordered_map<std::string, module_symbols_t> modules;
-	std::vector<std::string>                          search_paths;
-	std::string                                       cache_dir;
-	bool                                              auto_download = false;
-	std::string                                       symbol_server_url = "https://msdl.microsoft.com/download/symbols";
-};
-
-inline std::unique_ptr<snapshot_t> detach_snapshot() {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	auto out = std::make_unique<snapshot_t>();
-	out->modules = std::move(g_state.modules);
-	out->search_paths = std::move(g_state.search_paths);
-	out->cache_dir = std::move(g_state.cache_dir);
-	out->auto_download = g_state.auto_download;
-	out->symbol_server_url = std::move(g_state.symbol_server_url);
-	g_state.modules.clear();
-	g_state.search_paths.clear();
-	g_state.cache_dir.clear();
-	g_state.auto_download = false;
-	g_state.symbol_server_url = "https://msdl.microsoft.com/download/symbols";
-	return out;
-}
-
-inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	if (!snap) {
-		g_state.modules.clear();
-		g_state.search_paths.clear();
-		g_state.cache_dir.clear();
-		g_state.auto_download = false;
-		g_state.symbol_server_url = "https://msdl.microsoft.com/download/symbols";
-		return;
-	}
-	g_state.modules = std::move(snap->modules);
-	g_state.search_paths = std::move(snap->search_paths);
-	g_state.cache_dir = std::move(snap->cache_dir);
-	g_state.auto_download = snap->auto_download;
-	g_state.symbol_server_url = std::move(snap->symbol_server_url);
 }
 
 namespace detail {

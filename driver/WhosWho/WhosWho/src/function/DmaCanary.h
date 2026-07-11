@@ -6,6 +6,7 @@
 #include <function/SentinelBridge.h>
 #include <function/impl/driver/Strong.h>
 #include <function/TargetingLatch.h>
+#include <function/DmaDefense.h>
 
 namespace anti_dma_canary {
 
@@ -26,6 +27,13 @@ namespace anti_dma_canary {
         PMDL mdl;
         UINT32 owner_pid;
         UINT32 active;
+    };
+
+    struct canary_poison_t {
+        UINT64 poison_signature;
+        UINT64 original_value;
+        UINT32 poisoned;
+        UINT32 pad;
     };
 
     struct scan_hit_t {
@@ -64,6 +72,12 @@ namespace anti_dma_canary {
     inline volatile LONG64 g_scan_batch_id = 0;
     inline volatile LONG64 g_first_canary_time = 0;
     inline volatile LONG g_warmup_logged = 0;
+
+    inline canary_poison_t g_canary_poisons[MAX_CANARIES] = {};
+    inline volatile LONG g_scan_cycle_since_refresh = 0;
+    inline volatile ULONG g_canary_crc_hits = 0;
+    inline volatile ULONG g_canary_accessed_hits = 0;
+    inline volatile ULONG g_canary_refresh_count = 0;
 
     __forceinline ULONG elapsed_us_from_100ns(ULONGLONG start_100ns, ULONGLONG end_100ns) {
         return end_100ns >= start_100ns
@@ -496,6 +510,7 @@ namespace anti_dma_canary {
         if (ok) {
             LONG64 now = static_cast<LONG64>(KeQueryInterruptTime());
             _InterlockedCompareExchange64(&g_first_canary_time, now, 0);
+            refresh_canary_slot(slot);
             WW_LOG("dma_canary::register_ok slot=%lu owner=%lu va=0x%llx size=0x%llx pa=0x%llx page_pa=0x%llx count=%lu",
                 slot,
                 owner_pid,
@@ -659,6 +674,72 @@ namespace anti_dma_canary {
         return hit;
     }
 
+    __forceinline void write_canary_signature(UINT64 canary_pa, UINT64* sig1_out, UINT64* sig2_out) {
+        if (!canary_pa) return;
+        UINT8 payload[16] = {};
+        UINT64 r1 = anti_dma::xorshift128p();
+        UINT64 r2 = anti_dma::xorshift128p();
+        RtlCopyMemory(payload, &r1, 8);
+        RtlCopyMemory(payload + 8, &r2, 8);
+        UINT32 crc = anti_dma::compute_crc32(payload, 16);
+        UINT8 block[20] = {};
+        RtlCopyMemory(block, payload, 16);
+        RtlCopyMemory(block + 16, &crc, 4);
+        SIZE_T bw = 0;
+        strong::write_physical(reinterpret_cast<PVOID>(canary_pa), block, 20, &bw);
+        if (sig1_out) *sig1_out = r1;
+        if (sig2_out) *sig2_out = r2;
+    }
+
+    __forceinline void refresh_canary_slot(ULONG slot) {
+        if (slot >= MAX_CANARIES) return;
+        if (!g_canaries[slot].active || !g_canaries[slot].pa) return;
+        UINT64 s1 = 0, s2 = 0;
+        write_canary_signature(g_canaries[slot].pa, &s1, &s2);
+        g_canary_poisons[slot].poison_signature = s1;
+        g_canary_poisons[slot].original_value = s2;
+    }
+
+    __forceinline void refresh_all_canaries() {
+        ensure_lock();
+        KIRQL old;
+        KeAcquireSpinLock(&g_canary_lock, &old);
+        ULONG refreshed = 0;
+        for (ULONG i = 0; i < g_canary_count && i < MAX_CANARIES; i++) {
+            if (g_canaries[i].active && g_canaries[i].pa) {
+                refresh_canary_slot(i);
+                refreshed++;
+            }
+        }
+        KeReleaseSpinLock(&g_canary_lock, old);
+        _InterlockedExchange(&g_scan_cycle_since_refresh, 0);
+        _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_canary_refresh_count));
+        WW_LOG("dma_canary::refresh_all refreshed=%lu total_refreshes=%lu",
+            refreshed,
+            _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_canary_refresh_count), 0, 0));
+    }
+
+    __forceinline void corrupt_canaries() {
+        ensure_lock();
+        KIRQL old;
+        KeAcquireSpinLock(&g_canary_lock, &old);
+        ULONG corrupted = 0;
+        UINT8 garbage[20] = {};
+        for (ULONG i = 0; i < 16; i++) garbage[i] = 0xDE;
+        for (ULONG i = 16; i < 20; i++) garbage[i] = 0xAD;
+        for (ULONG i = 0; i < g_canary_count && i < MAX_CANARIES; i++) {
+            if (g_canaries[i].active && g_canaries[i].pa) {
+                SIZE_T bw = 0;
+                strong::write_physical(reinterpret_cast<PVOID>(g_canaries[i].pa), garbage, 20, &bw);
+                g_canary_poisons[i].poisoned = 0;
+                g_canary_poisons[i].original_value = 0;
+                corrupted++;
+            }
+        }
+        KeReleaseSpinLock(&g_canary_lock, old);
+        WW_LOG("dma_canary::corrupt_canaries corrupted=%lu", corrupted);
+    }
+
     __forceinline void do_scan_batch() {
         UINT32 registered_pid = current_registered_client_pid();
         if (!registered_pid) {
@@ -686,6 +767,11 @@ namespace anti_dma_canary {
 
         cleanup_dead_owners();
 
+        LONG cycles = _InterlockedIncrement(&g_scan_cycle_since_refresh);
+        if (cycles >= 12) {
+            refresh_all_canaries();
+        }
+
         if (g_canary_count == 0) {
             WW_LOG("dma_canary::batch_quiesce reason=no_canaries client=%u running=%ld queued=%ld work_running=%ld",
                 registered_pid,
@@ -707,6 +793,52 @@ namespace anti_dma_canary {
                 _InterlockedCompareExchange(&g_work_running, 0, 0));
             stop_timer("batch_empty_snapshot", registered_pid, FALSE);
             return;
+        }
+
+        for (ULONG ci = 0; ci < snapshot_count && ci < MAX_CANARIES; ci++) {
+            if (!snapshot[ci].active || !snapshot[ci].pa) continue;
+            UINT8 canary_block[20] = {};
+            SIZE_T br = 0;
+            if (!NT_SUCCESS(strong::read_physical(snapshot[ci].pa, canary_block, 20, &br)) || br != 20)
+                continue;
+            ULONG slot = MAX_CANARIES;
+            for (ULONG si = 0; si < MAX_CANARIES; si++) {
+                if (g_canaries[si].active && g_canaries[si].pa == snapshot[ci].pa) {
+                    slot = si;
+                    break;
+                }
+            }
+            UINT32 stored_crc = 0;
+            RtlCopyMemory(&stored_crc, canary_block + 16, 4);
+            UINT32 computed_crc = anti_dma::compute_crc32(canary_block, 16);
+            if (stored_crc != computed_crc) {
+                WW_LOG("dma_canary::crc_mismatch pa=0x%llx stored=0x%08x computed=0x%08x refreshing",
+                    snapshot[ci].pa, stored_crc, computed_crc);
+                if (slot < MAX_CANARIES) refresh_canary_slot(slot);
+                else { UINT64 s1, s2; write_canary_signature(snapshot[ci].pa, &s1, &s2); }
+                continue;
+            }
+            UINT64 r1 = 0, r2 = 0;
+            RtlCopyMemory(&r1, canary_block, 8);
+            RtlCopyMemory(&r2, canary_block + 8, 8);
+            if (r1 == 0 && r2 == 0) {
+                WW_LOG("dma_canary::crc_valid_zeroed pa=0x%llx refreshing", snapshot[ci].pa);
+                if (slot < MAX_CANARIES) refresh_canary_slot(slot);
+                else { UINT64 s1, s2; write_canary_signature(snapshot[ci].pa, &s1, &s2); }
+                continue;
+            }
+            if (slot < MAX_CANARIES && g_canary_poisons[slot].poison_signature != 0) {
+                if (r1 != g_canary_poisons[slot].poison_signature ||
+                    r2 != g_canary_poisons[slot].original_value) {
+                    _InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_canary_crc_hits));
+                    UINT64 evidence_hash = r1 ^ r2 ^ snapshot[ci].pa ^ __rdtsc();
+                    WW_LOG("dma_canary::dma_attack_canary_disturbed pa=0x%llx r1=0x%llx r2=0x%llx expected_s1=0x%llx expected_s2=0x%llx",
+                        snapshot[ci].pa, r1, r2,
+                        g_canary_poisons[slot].poison_signature,
+                        g_canary_poisons[slot].original_value);
+                    anti_dma::countermeasure::trigger_bsod(0x01, snapshot[ci].pa, 0, evidence_hash);
+                }
+            }
         }
 
         LONG64 batch_id = _InterlockedIncrement64(&g_scan_batch_id);
@@ -811,6 +943,31 @@ namespace anti_dma_canary {
                 _InterlockedCompareExchange(&g_scan_cursor_pid, 0, 0),
                 snapshot_count,
                 batch_budget);
+        }
+
+        if (g_scan_cycle_since_refresh > 1) {
+            ULONG accessed_hits = 0;
+            if (anti_dma::accessed_bit::check_canary_accessed_bits(snapshot, snapshot_count, &accessed_hits)) {
+                _InterlockedExchangeAdd(reinterpret_cast<volatile LONG*>(&g_canary_accessed_hits), accessed_hits);
+                UINT64 evidence_hash = __rdtsc() ^ snapshot[0].pa;
+                WW_LOG("dma_canary::accessed_bit_dma_attack detected_hits=%lu", accessed_hits);
+                anti_dma::countermeasure::trigger_bsod(0x03, snapshot[0].pa, 0, evidence_hash);
+            }
+        }
+
+        for (ULONG ai = 0; ai < snapshot_count && ai < MAX_CANARIES; ai++) {
+            if (!snapshot[ai].active || !snapshot[ai].owner_pid) continue;
+            UINT64 owner_cr3 = anti_dma::get_process_dtb(snapshot[ai].owner_pid);
+            if (!owner_cr3) continue;
+            UINT64 pte_phys = anti_dma::accessed_bit::get_pte_phys_addr(owner_cr3, snapshot[ai].va);
+            if (!pte_phys) continue;
+            SIZE_T bw = 0;
+            UINT64 cur_pte = 0;
+            if (!NT_SUCCESS(strong::read_physical(pte_phys, &cur_pte, 8, &bw)) || bw != 8) continue;
+            if (cur_pte & 0x20) {
+                UINT64 cleared = cur_pte & ~0x20ULL;
+                strong::write_physical(reinterpret_cast<PVOID>(pte_phys), &cleared, sizeof(cleared), &bw);
+            }
         }
 
         if (hit_pid != 0) {

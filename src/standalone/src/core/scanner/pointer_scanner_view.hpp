@@ -24,8 +24,6 @@
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
 
-extern DisasmState g_disasm;
-
 namespace pointer_scanner_view {
 
 struct chain_anim_t {
@@ -200,8 +198,9 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		if (clk) {
 			uint64_t addr = resolve_step_address(chain, 0);
 			if (addr != 0) {
-				hex_view::read_from_process(addr, 256);
-				globals::ui::active_center_view = center_view_t::hex_view;
+				const auto context = disasm_view::capture_selected_workspace();
+				if (hex_view::read_live_memory(context, addr, 256))
+					globals::ui::active_center_view = center_view_t::hex_view;
 			}
 		}
 		ImGui::PopID();
@@ -261,8 +260,9 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		if (clk) {
 			uint64_t addr = resolve_step_address(chain, step_idx);
 			if (addr != 0) {
-				hex_view::read_from_process(addr, 256);
-				globals::ui::active_center_view = center_view_t::hex_view;
+				const auto context = disasm_view::capture_selected_workspace();
+				if (hex_view::read_live_memory(context, addr, 256))
+					globals::ui::active_center_view = center_view_t::hex_view;
 			}
 		}
 		ImGui::PopID();
@@ -820,8 +820,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				else
 					addr = chain.base_offset;
 				if (addr != 0) {
-					g_disasm.goto_address = addr;
-					g_disasm.has_new_goto = true;
+					disasm_view::goto_address(addr,
+						disasm_view::capture_selected_workspace());
 					globals::ui::active_center_view = center_view_t::disassembly;
 				}
 			}

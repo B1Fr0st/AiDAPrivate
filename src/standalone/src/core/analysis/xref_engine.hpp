@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -13,6 +15,7 @@
 #include "../infra/executor.hpp"
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
+#include "workspace/analysis_workspace.hpp"
 
 namespace xref_engine {
 
@@ -52,6 +55,242 @@ inline std::string xref_type_name(xref_type_t t)
 	case xref_type_t::data_ref:         return "DATA";
 	}
 	return "???";
+}
+
+inline aida::analysis::workspace_result_t<aida::analysis::address_t>
+normalize_address(
+	const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+	const aida::analysis::address_t& address)
+{
+	using namespace aida::analysis;
+	if (!workspace) {
+		return workspace_result_t<address_t>::failure(make_workspace_error(
+			workspace_error_code_t::target_not_found,
+			"Xref query requires an explicit workspace", "xref_engine.address"));
+	}
+	if (address.architecture != architecture_id_t::unknown &&
+		address.architecture != workspace->identity().architecture()) {
+		return workspace_result_t<address_t>::failure(make_workspace_error(
+			workspace_error_code_t::unsupported_address_space,
+			"Xref query architecture does not match the workspace",
+			"xref_engine.address"));
+	}
+	if (workspace->target_kind() == target_kind_t::live_snapshot) {
+		return workspace_result_t<address_t>::failure(make_workspace_error(
+			workspace_error_code_t::live_target_bulk_analysis_unsupported,
+			"A live target has no whole-module xref index", "xref_engine.address"));
+	}
+	auto image = workspace->image();
+	if (!image) {
+		return workspace_result_t<address_t>::failure(make_workspace_error(
+			workspace_error_code_t::malformed_pe,
+			"Xref workspace has no normalized image", "xref_engine.address"));
+	}
+	address_t result = address;
+	result.architecture = image->architecture();
+	result.mode = image->architecture_mode();
+	if (address.space == address_space_id_t::relative_virtual) {
+		if (address.value >= image->image_size()) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::out_of_range,
+				"Xref RVA is outside the normalized image", "xref_engine.address"));
+		}
+		result.space = address_space_id_t::relative_virtual;
+	} else if (address.space == address_space_id_t::file_offset) {
+		auto rva = image->file_offset_to_rva(address.value);
+		if (!rva) return workspace_result_t<address_t>::failure(rva.error());
+		result.space = address_space_id_t::relative_virtual;
+		result.value = rva.value();
+	} else if (address.space == address_space_id_t::virtual_address) {
+		if (address.value < image->image_base() ||
+			address.value - image->image_base() >= image->image_size()) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::out_of_range,
+				"Xref virtual address is outside the normalized image",
+				"xref_engine.address"));
+		}
+		result.space = address_space_id_t::relative_virtual;
+		result.value = address.value - image->image_base();
+	} else {
+		return workspace_result_t<address_t>::failure(make_workspace_error(
+			workspace_error_code_t::unsupported_address_space,
+			"Xref query address space is unsupported", "xref_engine.address"));
+	}
+	return workspace_result_t<address_t>::success(result);
+}
+
+inline uint64_t workspace_display_address(
+	const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+	const aida::analysis::address_t& address)
+{
+	using namespace aida::analysis;
+	if (!workspace) return 0;
+	if (address.space == address_space_id_t::virtual_address ||
+		address.space == address_space_id_t::live_virtual)
+		return address.value;
+	const auto image = workspace->image();
+	if (!image) return 0;
+	uint64_t rva = 0;
+	if (address.space == address_space_id_t::relative_virtual) {
+		rva = address.value;
+	} else if (address.space == address_space_id_t::file_offset) {
+		auto translated = image->file_offset_to_rva(address.value);
+		if (!translated) return 0;
+		rva = translated.value();
+	} else {
+		return 0;
+	}
+	if (rva >= image->image_size() || image->image_base() > UINT64_MAX - rva)
+		return 0;
+	return image->image_base() + rva;
+}
+
+inline xref_type_t workspace_xref_type(aida::analysis::xref_kind_t kind)
+{
+	switch (kind) {
+	case aida::analysis::xref_kind_t::call: return xref_type_t::call;
+	case aida::analysis::xref_kind_t::code: return xref_type_t::jump;
+	case aida::analysis::xref_kind_t::read:
+	case aida::analysis::xref_kind_t::write:
+	case aida::analysis::xref_kind_t::address:
+	case aida::analysis::xref_kind_t::relocation:
+		return xref_type_t::data_ref;
+	}
+	return xref_type_t::data_ref;
+}
+
+inline aida::analysis::workspace_result_t<std::vector<xref_t>> find_xrefs_to(
+	const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+	const aida::analysis::address_t& target, size_t limit = 1000,
+	const aida::analysis::cancellation_token_t& cancel = {})
+{
+	using namespace aida::analysis;
+	if (limit > 100000) {
+		return workspace_result_t<std::vector<xref_t>>::failure(make_workspace_error(
+			workspace_error_code_t::limit_exceeded,
+			"Xref query exceeds 100000 records", "xref_engine.query_to"));
+	}
+	auto normalized = normalize_address(workspace, target);
+	if (!normalized)
+		return workspace_result_t<std::vector<xref_t>>::failure(normalized.error());
+	if (limit == 0)
+		return workspace_result_t<std::vector<xref_t>>::success(std::vector<xref_t>{});
+	auto publication = workspace->analysis_publication();
+	if (!publication || !publication->snapshot) {
+		return workspace_result_t<std::vector<xref_t>>::failure(make_workspace_error(
+			workspace_error_code_t::analysis_in_progress,
+			"Xref index is not published yet", "xref_engine.query_to"));
+	}
+	if (publication->binary_id != workspace->identity().binary_id() ||
+		publication->generation != workspace->generation()) {
+		return workspace_result_t<std::vector<xref_t>>::failure(make_workspace_error(
+			workspace_error_code_t::stale_generation,
+			"Xref publication does not match the workspace generation",
+			"xref_engine.query_to"));
+	}
+	const auto workspace_cancel = workspace->cancellation_token();
+	auto cancellation_error = [&]() {
+		const bool deadline = cancel.deadline_exceeded() ||
+			workspace_cancel.deadline_exceeded();
+		auto error = make_workspace_error(deadline
+			? workspace_error_code_t::deadline_exceeded
+			: workspace_error_code_t::cancelled,
+			deadline ? "Xref query deadline expired" : "Xref query was cancelled",
+			"xref_engine.query_to");
+		error.deadline = deadline;
+		error.cancellation = !deadline;
+		return error;
+	};
+	if (cancel.stop_requested() || workspace_cancel.stop_requested())
+		return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
+	const auto& snapshot = publication->snapshot;
+	std::vector<xref_t> result;
+	result.reserve((std::min)(limit, snapshot->xrefs.size()));
+	size_t visited = 0;
+	for (const auto& entry : snapshot->xrefs) {
+		if ((++visited & 0xFFFu) == 0 &&
+			(cancel.stop_requested() || workspace_cancel.stop_requested()))
+			return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
+		if (entry.target.space != normalized.value().space ||
+			entry.target.value != normalized.value().value)
+			continue;
+		xref_t item;
+		item.from_addr = workspace_display_address(workspace, entry.source);
+		item.to_addr = workspace_display_address(workspace, entry.target);
+		if (item.from_addr == 0 || item.to_addr == 0) continue;
+		item.type = workspace_xref_type(entry.kind);
+		item.module_name = workspace->identity().bin_name();
+		result.push_back(std::move(item));
+		if (result.size() == limit) break;
+	}
+	return workspace_result_t<std::vector<xref_t>>::success(std::move(result));
+}
+
+inline aida::analysis::workspace_result_t<std::vector<xref_t>> find_xrefs_from(
+	const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+	const aida::analysis::address_t& source, size_t limit = 1000,
+	const aida::analysis::cancellation_token_t& cancel = {})
+{
+	using namespace aida::analysis;
+	if (limit > 100000) {
+		return workspace_result_t<std::vector<xref_t>>::failure(make_workspace_error(
+			workspace_error_code_t::limit_exceeded,
+			"Xref query exceeds 100000 records", "xref_engine.query_from"));
+	}
+	auto normalized = normalize_address(workspace, source);
+	if (!normalized)
+		return workspace_result_t<std::vector<xref_t>>::failure(normalized.error());
+	if (limit == 0)
+		return workspace_result_t<std::vector<xref_t>>::success(std::vector<xref_t>{});
+	auto publication = workspace->analysis_publication();
+	if (!publication || !publication->snapshot) {
+		return workspace_result_t<std::vector<xref_t>>::failure(make_workspace_error(
+			workspace_error_code_t::analysis_in_progress,
+			"Xref index is not published yet", "xref_engine.query_from"));
+	}
+	if (publication->binary_id != workspace->identity().binary_id() ||
+		publication->generation != workspace->generation()) {
+		return workspace_result_t<std::vector<xref_t>>::failure(make_workspace_error(
+			workspace_error_code_t::stale_generation,
+			"Xref publication does not match the workspace generation",
+			"xref_engine.query_from"));
+	}
+	const auto workspace_cancel = workspace->cancellation_token();
+	auto cancellation_error = [&]() {
+		const bool deadline = cancel.deadline_exceeded() ||
+			workspace_cancel.deadline_exceeded();
+		auto error = make_workspace_error(deadline
+			? workspace_error_code_t::deadline_exceeded
+			: workspace_error_code_t::cancelled,
+			deadline ? "Xref query deadline expired" : "Xref query was cancelled",
+			"xref_engine.query_from");
+		error.deadline = deadline;
+		error.cancellation = !deadline;
+		return error;
+	};
+	if (cancel.stop_requested() || workspace_cancel.stop_requested())
+		return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
+	const auto& snapshot = publication->snapshot;
+	std::vector<xref_t> result;
+	result.reserve((std::min)(limit, snapshot->xrefs.size()));
+	size_t visited = 0;
+	for (const auto& entry : snapshot->xrefs) {
+		if ((++visited & 0xFFFu) == 0 &&
+			(cancel.stop_requested() || workspace_cancel.stop_requested()))
+			return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
+		if (entry.source.space != normalized.value().space ||
+			entry.source.value != normalized.value().value)
+			continue;
+		xref_t item;
+		item.from_addr = workspace_display_address(workspace, entry.source);
+		item.to_addr = workspace_display_address(workspace, entry.target);
+		if (item.from_addr == 0 || item.to_addr == 0) continue;
+		item.type = workspace_xref_type(entry.kind);
+		item.module_name = workspace->identity().bin_name();
+		result.push_back(std::move(item));
+		if (result.size() == limit) break;
+	}
+	return workspace_result_t<std::vector<xref_t>>::success(std::move(result));
 }
 
 inline bool wait_until_idle(uint32_t timeout_ms)

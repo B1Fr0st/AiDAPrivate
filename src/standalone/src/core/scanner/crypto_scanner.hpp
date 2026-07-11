@@ -21,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +37,7 @@
 #include "standalone_settings.hpp"
 #include "xref_engine.hpp"
 #include "zydis_disasm.hpp"
+#include "../analysis/workspace/workspace_types.hpp"
 #include "../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -123,65 +125,135 @@ struct scan_state_t {
 	label_query_diagnostics_t last_label_query;
 };
 
-inline scan_state_t g_state;
-
-struct snapshot_t {
-	std::vector<crypto_hit_t> results;
-	std::vector<entropy_region_t> entropy_map;
-	std::vector<custom_signature_t> custom_sigs;
-	bool                      scanning = false;
-	float                     progress = 0.f;
-	bool                      cancel = false;
-	bool                      active = false;
-	std::unordered_map<uint64_t, std::string> function_labels;
-	float                     entropy_threshold = 7.0f;
-	label_scan_diagnostics_t  last_label_scan;
-	label_query_diagnostics_t last_label_query;
+struct workspace_crypto_hit_t {
+	std::string signature_name;
+	std::string algorithm;
+	crypto_category_t category = crypto_category_t::symmetric;
+	aida::analysis::address_t address;
+	std::string module_name;
+	std::uint64_t module_offset = 0;
+	std::vector<aida::analysis::address_t> referencing_functions;
 };
 
-inline std::unique_ptr<snapshot_t> detach_snapshot() {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	auto out = std::make_unique<snapshot_t>();
-	out->results = std::move(g_state.results);
-	out->entropy_map = std::move(g_state.entropy_map);
-	out->custom_sigs = std::move(g_state.custom_sigs);
-	out->scanning = g_state.scanning.load(std::memory_order_acquire);
-	out->progress = g_state.progress.load(std::memory_order_acquire);
-	out->cancel = g_state.cancel.load(std::memory_order_acquire);
-	out->active = g_state.active;
-	out->function_labels = std::move(g_state.function_labels);
-	out->entropy_threshold = g_state.entropy_threshold;
-	out->last_label_scan = std::move(g_state.last_label_scan);
-	out->last_label_query = std::move(g_state.last_label_query);
-	g_state.results.clear();
-	g_state.entropy_map.clear();
-	g_state.custom_sigs.clear();
-	g_state.scanning.store(false, std::memory_order_release);
-	g_state.progress.store(0.f, std::memory_order_release);
-	g_state.cancel.store(false, std::memory_order_release);
-	g_state.active = false;
-	g_state.function_labels.clear();
-	g_state.entropy_threshold = 7.0f;
-	g_state.last_label_scan = {};
-	g_state.last_label_query = {};
-	return out;
-}
+struct workspace_entropy_region_t {
+	aida::analysis::address_t address;
+	float entropy = 0.0f;
+	std::uint32_t block_size = 256;
+	std::string module_name;
+};
 
-inline void attach_snapshot(std::unique_ptr<snapshot_t> snap) {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	if (!snap) snap = std::make_unique<snapshot_t>();
-	g_state.results = std::move(snap->results);
-	g_state.entropy_map = std::move(snap->entropy_map);
-	g_state.custom_sigs = std::move(snap->custom_sigs);
-	g_state.scanning.store(snap->scanning, std::memory_order_release);
-	g_state.progress.store(snap->progress, std::memory_order_release);
-	g_state.cancel.store(snap->cancel, std::memory_order_release);
-	g_state.active = snap->active;
-	g_state.function_labels = std::move(snap->function_labels);
-	g_state.entropy_threshold = snap->entropy_threshold;
-	g_state.last_label_scan = std::move(snap->last_label_scan);
-	g_state.last_label_query = std::move(snap->last_label_query);
-}
+struct workspace_scan_snapshot_t {
+	std::vector<workspace_crypto_hit_t> results;
+	std::vector<workspace_entropy_region_t> entropy_map;
+	std::vector<custom_signature_t> custom_signatures;
+	std::map<aida::analysis::address_t, std::string> function_labels;
+	float entropy_threshold = 7.0f;
+	float progress = 0.0f;
+	bool scanning = false;
+	bool cancellation_requested = false;
+};
+
+class workspace_scan_state_t {
+public:
+	explicit workspace_scan_state_t(aida::analysis::binary_id_t binary_id)
+		: binary_id_(std::move(binary_id)) {}
+
+	const aida::analysis::binary_id_t& binary_id() const noexcept { return binary_id_; }
+
+	bool begin_scan() {
+		bool expected = false;
+		if (!scanning_.compare_exchange_strong(expected, true,
+			std::memory_order_acq_rel, std::memory_order_acquire))
+			return false;
+		cancellation_requested_.store(false, std::memory_order_release);
+		progress_.store(0.0f, std::memory_order_release);
+		std::lock_guard<std::mutex> lock(mutex_);
+		results_.clear();
+		entropy_map_.clear();
+		function_labels_.clear();
+		return true;
+	}
+
+	void request_cancel() noexcept {
+		cancellation_requested_.store(true, std::memory_order_release);
+	}
+
+	bool cancellation_requested() const noexcept {
+		return cancellation_requested_.load(std::memory_order_acquire);
+	}
+
+	void publish(std::vector<workspace_crypto_hit_t> results,
+		std::vector<workspace_entropy_region_t> entropy_map,
+		std::map<aida::analysis::address_t, std::string> function_labels) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		std::sort(results.begin(), results.end(),
+			[](const workspace_crypto_hit_t& left, const workspace_crypto_hit_t& right) {
+				if (left.address != right.address)
+					return left.address < right.address;
+				return left.signature_name < right.signature_name;
+			});
+		std::sort(entropy_map.begin(), entropy_map.end(),
+			[](const workspace_entropy_region_t& left,
+				const workspace_entropy_region_t& right) {
+				return left.address < right.address;
+			});
+		results_ = std::move(results);
+		entropy_map_ = std::move(entropy_map);
+		function_labels_ = std::move(function_labels);
+		progress_.store(1.0f, std::memory_order_release);
+		scanning_.store(false, std::memory_order_release);
+	}
+
+	void fail_or_cancel() noexcept {
+		scanning_.store(false, std::memory_order_release);
+	}
+
+	void set_progress(float value) noexcept {
+		progress_.store((std::max)(0.0f, (std::min)(1.0f, value)),
+			std::memory_order_release);
+	}
+
+	void set_custom_signatures(std::vector<custom_signature_t> signatures) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		custom_signatures_ = std::move(signatures);
+	}
+
+	void set_entropy_threshold(float threshold) noexcept {
+		if (std::isfinite(threshold)) {
+			std::lock_guard<std::mutex> lock(mutex_);
+			entropy_threshold_ = (std::max)(0.0f, (std::min)(8.0f, threshold));
+		}
+	}
+
+	workspace_scan_snapshot_t snapshot() const {
+		std::lock_guard<std::mutex> lock(mutex_);
+		workspace_scan_snapshot_t output;
+		output.results = results_;
+		output.entropy_map = entropy_map_;
+		output.custom_signatures = custom_signatures_;
+		output.function_labels = function_labels_;
+		output.entropy_threshold = entropy_threshold_;
+		output.progress = progress_.load(std::memory_order_acquire);
+		output.scanning = scanning_.load(std::memory_order_acquire);
+		output.cancellation_requested =
+			cancellation_requested_.load(std::memory_order_acquire);
+		return output;
+	}
+
+private:
+	aida::analysis::binary_id_t binary_id_;
+	mutable std::mutex mutex_;
+	std::vector<workspace_crypto_hit_t> results_;
+	std::vector<workspace_entropy_region_t> entropy_map_;
+	std::vector<custom_signature_t> custom_signatures_;
+	std::map<aida::analysis::address_t, std::string> function_labels_;
+	float entropy_threshold_ = 7.0f;
+	std::atomic<float> progress_{0.0f};
+	std::atomic<bool> scanning_{false};
+	std::atomic<bool> cancellation_requested_{false};
+};
+
+inline scan_state_t g_state;
 
 namespace constants {
 

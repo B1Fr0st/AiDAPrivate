@@ -1003,6 +1003,9 @@ static_assert(sizeof(server_token_relay) == 32, "server_token_relay size must be
 #define ADMP_OP_SCRAMBLE_PEB      9
 #define ADMP_OP_PERMIT_PID       10
 #define ADMP_OP_UNPERMIT_PID     11
+#define ADMP_OP_VERIFY_HEADERS    12
+#define ADMP_OP_LOCK_PAGES        13
+#define ADMP_OP_REGISTER_MODULE_RANGE 14
 
 typedef struct _ADMP {
     UINT32 operation;
@@ -1012,6 +1015,32 @@ typedef struct _ADMP {
     UINT32 padding;
 } anti_dump_request, *p_anti_dump_request;
 static_assert(sizeof(anti_dump_request) == 24, "anti_dump_request size must be 24 bytes");
+
+typedef struct _ADMP_HEADER_STATE {
+    UINT16 dos_magic;
+    UINT32 nt_signature;
+    UINT32 first_section_va;
+    UINT32 checksum;
+    UINT32 headers_restored;
+} admp_header_state, *p_admp_header_state;
+
+typedef struct _ADMP_LOCK_PAGES_REQ {
+    UINT32 operation;
+    UINT32 pid;
+    UINT32 page_count;
+    UINT32 padding;
+    UINT64 page_bases[32];
+    UINT64 page_sizes[32];
+} admp_lock_pages_req, *p_admp_lock_pages_req;
+
+typedef struct _ADMP_MODULE_RANGE {
+    UINT32 operation;
+    UINT32 pid;
+    UINT32 range_count;
+    UINT32 padding;
+    UINT64 bases[16];
+    UINT64 sizes[16];
+} admp_module_range_req, *p_admp_module_range_req;
 
 
 #define ADBG_OP_CLEAR_PROC_DR      4
@@ -1119,3 +1148,153 @@ __forceinline void InvalidateDTBCache(UINT32 pid) {
 
     ReleaseCacheLock();
 }
+
+
+typedef struct _IOMMU_STATUS {
+    UINT8  dmar_present;
+    UINT8  ivrs_present;
+    UINT8  vtd_enabled;
+    UINT8  amd_vi_enabled;
+    UINT8  iommu_present;
+    UINT8  remapping_bypassed;
+    UINT8  pad[2];
+    UINT64 dmar_table_pa;
+    UINT64 ivrs_table_pa;
+    UINT32 remapping_units;
+    UINT32 risk_level;
+    UINT64 detection_timestamp;
+} iommu_status_k, *p_iommu_status_k;
+static_assert(sizeof(iommu_status_k) == 40, "iommu_status_k must be 40 bytes");
+
+
+typedef struct _PCIE_DEVICE_ENTRY {
+    UINT16 vendor_id;
+    UINT16 device_id;
+    UINT32 class_code;
+    UINT8  bus;
+    UINT8  device;
+    UINT8  function;
+    UINT8  header_type;
+    UINT64 bar_pa[6];
+    UINT64 bar_size;
+    UINT32 flags;
+    UINT32 whitelist_status;
+} pcie_device_entry_k, *p_pcie_device_entry_k;
+static_assert(sizeof(pcie_device_entry_k) == 80, "pcie_device_entry_k must be 80 bytes");
+
+
+#define MAX_PCIE_DEVICES 256
+
+typedef struct _PCIE_ENUM_RESULT {
+    UINT32 device_count;
+    UINT32 unknown_count;
+    pcie_device_entry_k entries[MAX_PCIE_DEVICES];
+} pcie_enum_result_k, *p_pcie_enum_result_k;
+static_assert(sizeof(pcie_enum_result_k) == 8 + sizeof(pcie_device_entry_k) * MAX_PCIE_DEVICES,
+    "pcie_enum_result_k size check");
+
+
+typedef struct _PCIE_WHITELIST_REQUEST {
+    UINT32 operation;
+    UINT32 entry_count;
+    UINT16 vendor_id;
+    UINT16 device_id;
+    UINT32 result;
+    UINT64 timestamp;
+} pcie_whitelist_request_k, *p_pcie_whitelist_request_k;
+static_assert(sizeof(pcie_whitelist_request_k) == 24, "pcie_whitelist_request_k must be 24 bytes");
+
+
+typedef struct _CANARY_POISON_REQUEST {
+    UINT64 va;
+    UINT64 pa;
+    UINT64 poison_signature;
+    UINT64 original_value;
+    UINT32 active;
+    UINT32 result;
+} canary_poison_request_k, *p_canary_poison_request_k;
+static_assert(sizeof(canary_poison_request_k) == 40, "canary_poison_request_k must be 40 bytes");
+
+
+typedef struct _PTE_PROTECTION_ENTRY {
+    UINT64 va;
+    UINT64 pa;
+    UINT64 original_pte;
+    UINT64 current_pte;
+    UINT32 page_size;
+    UINT32 active;
+} pte_protection_entry_k, *p_pte_protection_entry_k;
+static_assert(sizeof(pte_protection_entry_k) == 40, "pte_protection_entry_k must be 40 bytes");
+
+
+#define MAX_PTE_PROTECTION_ENTRIES 64
+
+typedef struct _PTE_PROTECTION_TABLE {
+    UINT32 entry_count;
+    UINT32 active_count;
+    pte_protection_entry_k entries[MAX_PTE_PROTECTION_ENTRIES];
+} pte_protection_table_k, *p_pte_protection_table_k;
+static_assert(sizeof(pte_protection_table_k) == 8 + sizeof(pte_protection_entry_k) * MAX_PTE_PROTECTION_ENTRIES,
+    "pte_protection_table_k size check");
+
+
+typedef struct _EPT_CHECK_RESULT {
+    UINT8  ept_present;
+    UINT8  npte_present;
+    UINT8  ept_hook_detected;
+    UINT8  vmm_present;
+    UINT8  pad[4];
+    UINT64 ept_pointer_msr;
+    UINT32 npte_anomaly_count;
+    UINT32 risk_level;
+    UINT64 detection_timestamp;
+} ept_check_result_k, *p_ept_check_result_k;
+static_assert(sizeof(ept_check_result_k) == 32, "ept_check_result_k must be 32 bytes");
+
+
+typedef struct _DMA_PROTECTION_STATE {
+    iommu_status_k iommu;
+    UINT32 canary_count;
+    UINT32 canary_hits;
+    UINT32 pcie_unknown_count;
+    UINT32 ept_anomaly_count;
+    UINT32 tier1_refused;
+    UINT32 tier2_bsod_armed;
+    UINT64 timestamp;
+} dma_protection_state_k, *p_dma_protection_state_k;
+static_assert(sizeof(dma_protection_state_k) == 72, "dma_protection_state_k must be 72 bytes");
+
+
+typedef struct _DMA_COUNTERMEASURE_REQUEST {
+    UINT32 action;
+    UINT32 reason;
+    UINT32 target_pid;
+    UINT32 result;
+    UINT64 evidence_hash;
+    UINT64 timestamp;
+} dma_countermeasure_request_k, *p_dma_countermeasure_request_k;
+static_assert(sizeof(dma_countermeasure_request_k) == 32, "dma_countermeasure_request_k must be 32 bytes");
+
+#pragma pack(push, 8)
+typedef struct _RE_TOOL_HASH_UPDATE_REQUEST_K {
+    UINT32 magic;
+    UINT32 hash_count;
+    UINT32 session_key;
+    UINT32 padding;
+    UINT8  hashes[16 * 32];
+    UINT64 timestamp;
+} re_tool_hash_update_request_k, *p_re_tool_hash_update_request_k;
+#pragma pack(pop)
+static_assert(sizeof(re_tool_hash_update_request_k) == (16 + 512 + 8), "re_tool_hash_update_request_k size mismatch");
+
+
+#pragma pack(push, 8)
+typedef struct _TEXT_SCAN_REQUEST_K {
+    UINT64 module_base;
+    UINT64 exception_dir_va;
+    UINT32 exception_dir_size;
+    UINT32 padding;
+    UINT64 hit_rva;
+} text_scan_request_k, *p_text_scan_request_k;
+#pragma pack(pop)
+static_assert(sizeof(text_scan_request_k) == 32, "text_scan_request_k must be 32 bytes");

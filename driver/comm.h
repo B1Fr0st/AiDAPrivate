@@ -196,6 +196,19 @@ namespace ioctl_codes {
     __forceinline DWORD TQIF() { return make(60); }
     __forceinline DWORD TTERM(){ return make(61); }
     __forceinline DWORD HCLS() { return make(62); }
+    __forceinline DWORD DMAR() { return make(63); }
+    __forceinline DWORD PCIE() { return make(64); }
+    __forceinline DWORD PCWL() { return make(65); }
+    __forceinline DWORD DMCP() { return make(66); }
+    __forceinline DWORD PMPT() { return make(67); }
+    __forceinline DWORD EPTH() { return make(68); }
+    __forceinline DWORD DMST() { return make(69); }
+    __forceinline DWORD DMCT() { return make(70); }
+    __forceinline DWORD TXTS() { return make(71); }
+
+    __forceinline DWORD KRDM() { return make(72); }
+    __forceinline DWORD XREV() { return make(73); }
+    __forceinline DWORD RUHS() { return make(74); }
 
     __forceinline DWORD HWID() {
         return static_cast<DWORD>(CTL_CODE(FILE_DEVICE_UNKNOWN, 0xA1D0, METHOD_BUFFERED, FILE_READ_DATA));
@@ -298,7 +311,7 @@ namespace voyager {
             if (encoded < base)
                 return false;
             const std::uint32_t candidate = encoded - base;
-            if (candidate > 62u)
+            if (candidate > 74u)
                 return false;
             offset = candidate;
             return true;
@@ -1262,6 +1275,15 @@ namespace voyager {
         };
         static_assert(sizeof(anti_debug_request) == 32, "anti_debug_request must match kernel struct");
 
+        struct text_scan_request {
+            std::uint64_t module_base;
+            std::uint64_t exception_dir_va;
+            std::uint32_t exception_dir_size;
+            std::uint32_t padding;
+            std::uint64_t hit_rva;
+        };
+        static_assert(sizeof(text_scan_request) == 32, "text_scan_request must match kernel struct");
+
         struct server_token_relay {
             std::uint32_t token_hash;
             std::uint32_t session_key;
@@ -1312,6 +1334,17 @@ namespace voyager {
             re_evidence_blob_t evidence;
         };
         static_assert(sizeof(re_confirmed_usermode_request) == 64, "re_confirmed_usermode_request must match kernel struct");
+
+        struct kernel_read_usermem_request {
+            std::uint32_t pid;
+            std::uint32_t padding;
+            std::uint64_t address;
+            std::uint64_t size;
+            std::uint32_t status;
+            std::uint32_t bytes_copied;
+            std::uint8_t  data[4096];
+        };
+        static_assert(sizeof(kernel_read_usermem_request) == 4128, "kernel_read_usermem_request size mismatch");
 
         struct tier_a_query_request {
             std::uint32_t magic;
@@ -1496,6 +1529,174 @@ namespace voyager {
         };
         static_assert(sizeof(hv_detect_result) == 80, "hv_detect_result must match kernel struct");
 #pragma pack(pop)
+
+        struct iommu_status {
+            std::uint8_t  dmar_present;
+            std::uint8_t  ivrs_present;
+            std::uint8_t  vtd_enabled;
+            std::uint8_t  amd_vi_enabled;
+            std::uint8_t  iommu_present;
+            std::uint8_t  remapping_bypassed;
+            std::uint8_t  pad[2];
+            std::uint64_t dmar_table_pa;
+            std::uint64_t ivrs_table_pa;
+            std::uint32_t remapping_units;
+            std::uint32_t risk_level;
+            std::uint64_t detection_timestamp;
+        };
+        static_assert(sizeof(iommu_status) == 40, "iommu_status must match kernel struct");
+
+        struct pcie_device_entry {
+            std::uint16_t vendor_id;
+            std::uint16_t device_id;
+            std::uint32_t class_code;
+            std::uint8_t  bus;
+            std::uint8_t  device;
+            std::uint8_t  function;
+            std::uint8_t  header_type;
+            std::uint64_t bar_pa[6];
+            std::uint64_t bar_size;
+            std::uint32_t flags;
+            std::uint32_t whitelist_status;
+        };
+        static_assert(sizeof(pcie_device_entry) == 80, "pcie_device_entry must match kernel struct");
+
+        static constexpr std::size_t MAX_PCIE_DEVICES = 256;
+
+        struct pcie_enum_result {
+            std::uint32_t device_count;
+            std::uint32_t unknown_count;
+            pcie_device_entry entries[MAX_PCIE_DEVICES];
+        };
+        static_assert(sizeof(pcie_enum_result) == 8 + sizeof(pcie_device_entry) * MAX_PCIE_DEVICES,
+            "pcie_enum_result must match kernel struct");
+
+        struct pcie_whitelist_request {
+            std::uint32_t operation;
+            std::uint32_t entry_count;
+            std::uint16_t vendor_id;
+            std::uint16_t device_id;
+            std::uint32_t result;
+            std::uint64_t timestamp;
+        };
+        static_assert(sizeof(pcie_whitelist_request) == 24, "pcie_whitelist_request must match kernel struct");
+
+        struct canary_poison_request {
+            std::uint64_t va;
+            std::uint64_t pa;
+            std::uint64_t poison_signature;
+            std::uint64_t original_value;
+            std::uint32_t active;
+            std::uint32_t result;
+        };
+        static_assert(sizeof(canary_poison_request) == 40, "canary_poison_request must match kernel struct");
+
+        struct pte_protection_entry {
+            std::uint64_t va;
+            std::uint64_t pa;
+            std::uint64_t original_pte;
+            std::uint64_t current_pte;
+            std::uint32_t page_size;
+            std::uint32_t active;
+        };
+        static_assert(sizeof(pte_protection_entry) == 40, "pte_protection_entry must match kernel struct");
+
+        static constexpr std::size_t MAX_PTE_PROTECTION_ENTRIES = 64;
+
+        struct pte_protection_table {
+            std::uint32_t entry_count;
+            std::uint32_t active_count;
+            pte_protection_entry entries[MAX_PTE_PROTECTION_ENTRIES];
+        };
+        static_assert(sizeof(pte_protection_table) == 8 + sizeof(pte_protection_entry) * MAX_PTE_PROTECTION_ENTRIES,
+            "pte_protection_table must match kernel struct");
+
+        struct ept_check_result {
+            std::uint8_t  ept_present;
+            std::uint8_t  npte_present;
+            std::uint8_t  ept_hook_detected;
+            std::uint8_t  vmm_present;
+            std::uint8_t  pad[4];
+            std::uint64_t ept_pointer_msr;
+            std::uint32_t npte_anomaly_count;
+            std::uint32_t risk_level;
+            std::uint64_t detection_timestamp;
+        };
+        static_assert(sizeof(ept_check_result) == 32, "ept_check_result must match kernel struct");
+
+        struct dma_protection_state {
+            iommu_status  iommu;
+            std::uint32_t canary_count;
+            std::uint32_t canary_hits;
+            std::uint32_t pcie_unknown_count;
+            std::uint32_t ept_anomaly_count;
+            std::uint32_t tier1_refused;
+            std::uint32_t tier2_bsod_armed;
+            std::uint64_t timestamp;
+        };
+        static_assert(sizeof(dma_protection_state) == 72, "dma_protection_state must match kernel struct");
+
+        struct dma_countermeasure_request {
+            std::uint32_t action;
+            std::uint32_t reason;
+            std::uint32_t target_pid;
+            std::uint32_t result;
+            std::uint64_t evidence_hash;
+            std::uint64_t timestamp;
+        };
+        static_assert(sizeof(dma_countermeasure_request) == 32, "dma_countermeasure_request must match kernel struct");
+
+#pragma pack(push, 8)
+        struct re_tool_hash_update_request {
+            std::uint32_t magic;
+            std::uint32_t hash_count;
+            std::uint32_t session_key;
+            std::uint32_t padding;
+            std::uint8_t  hashes[16 * 32];
+            std::uint64_t timestamp;
+        };
+        static_assert(sizeof(re_tool_hash_update_request) == 536, "re_tool_hash_update_request must match kernel struct");
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+        struct reloc_mask_entry_abi_t {
+            std::uint32_t offset;
+            std::uint32_t size;
+            std::uint32_t reloc_type;
+            std::uint32_t _pad;
+            std::uint8_t  original_value[8];
+        };
+#pragma pack(pop)
+        static_assert(sizeof(reloc_mask_entry_abi_t) == 24, "reloc_mask_entry_abi_t must be 24 bytes");
+
+        constexpr std::uint32_t MAX_RELOC_MASK_ENTRIES_ABI = 512;
+
+        struct usermode_hash_register_t {
+            std::uint64_t text_base;
+            std::uint32_t text_size;
+            std::uint32_t mask_count;
+            std::uint64_t reloc_delta;
+            std::uint8_t  expected_sha256[32];
+            std::uint32_t result;
+            std::uint32_t _pad;
+            reloc_mask_entry_abi_t mask_entries[MAX_RELOC_MASK_ENTRIES_ABI];
+        };
+        static_assert(sizeof(usermode_hash_register_t) == 64 + 24 * MAX_RELOC_MASK_ENTRIES_ABI,
+            "usermode_hash_register_t size mismatch");
+
+        struct cross_ring_evidence_abi_t {
+            std::uint32_t detecting_checker_id;
+            std::uint32_t target_checker_id;
+            std::uint64_t region_base;
+            std::uint64_t region_size;
+            std::uint8_t  expected_hash[32];
+            std::uint8_t  actual_hash[32];
+            std::uint8_t  modified_bytes[256];
+            std::uint32_t modified_bytes_len;
+            std::uint32_t _pad;
+        };
+        static_assert(sizeof(cross_ring_evidence_abi_t) == 352,
+            "cross_ring_evidence_abi_t must be 352 bytes");
 
 #pragma pack(pop)
     }
@@ -1708,6 +1909,8 @@ namespace voyager {
 
         std::size_t read_kernel_raw(std::uint64_t address, void* buffer, std::size_t size) const noexcept;
         std::size_t write_kernel_raw(std::uint64_t address, const void* buffer, std::size_t size) const noexcept;
+
+        bool kernel_read_usermem(std::uint32_t pid, std::uint64_t address, void* out, std::size_t len) noexcept;
 
         std::uint64_t allocate_memory(std::size_t size) noexcept;
         bool free_memory(std::uint64_t address) noexcept;
@@ -2088,6 +2291,13 @@ namespace voyager {
         bool unregister_dll_protection() noexcept;
         bool unregister_dll_protection_for_pid(std::uint32_t pid, std::uint64_t module_base = 0) noexcept;
 
+        bool register_usermode_hash(std::uint64_t text_base, std::uint32_t text_size,
+                                    std::uint64_t reloc_delta,
+                                    const std::uint8_t sha256[32],
+                                    const detail::reloc_mask_entry_abi_t* mask_entries,
+                                    std::uint32_t mask_count) noexcept;
+        bool verify_cross_ring_evidence(const detail::cross_ring_evidence_abi_t& evidence) noexcept;
+
 
         bool trigger_kernel_bsod(std::uint32_t reason_code, std::uint64_t evidence_hash) noexcept;
         bool latch_targeting_from_usermode(std::uint32_t reason) noexcept;
@@ -2099,6 +2309,18 @@ namespace voyager {
         bool canary_query_count(std::uint32_t& out_count) noexcept;
         bool re_confirmed_usermode_bsod(const detail::re_evidence_blob_t& evidence) noexcept;
 
+        bool query_dma_protection_state(detail::dma_protection_state& out) noexcept;
+        bool query_iommu_status(detail::iommu_status& out) noexcept;
+        bool enumerate_pcie_devices(detail::pcie_enum_result& out) noexcept;
+        bool add_pcie_whitelist(std::uint16_t vendor_id, std::uint16_t device_id) noexcept;
+        bool register_canary_poison(std::uint64_t va, std::uint64_t poison_signature) noexcept;
+        bool protect_page_pte(std::uint64_t va) noexcept;
+        bool unprotect_page_pte(std::uint64_t va) noexcept;
+        bool check_ept_state(detail::ept_check_result& out) noexcept;
+        bool trigger_dma_countermeasure(std::uint32_t action, std::uint32_t reason) noexcept;
+
+        bool update_re_tool_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept;
+
         struct anti_debug_result {
             std::uint32_t result_flags;
             std::uint64_t detected_debugger_pid;
@@ -2108,6 +2330,7 @@ namespace voyager {
         bool kernel_anti_debug_clear_dr(std::uint64_t* out_clear_count = nullptr) noexcept;
         bool kernel_anti_debug_clear_process_dr(std::uint32_t pid, std::uint64_t* out_clear_count = nullptr) noexcept;
         bool kernel_anti_debug_scan_debuggers(std::uint64_t* out_debugger_pid = nullptr) noexcept;
+        bool kernel_anti_debug_scan_text(std::uint64_t module_base, std::uint64_t exception_dir_va, std::uint32_t exception_dir_size, std::uint64_t* out_hit_rva) noexcept;
         bool kernel_anti_debug_hide_thread(std::uint32_t pid, std::uint32_t tid) noexcept;
         bool kernel_anti_debug_hide_all_threads(std::uint32_t pid) noexcept;
         bool kernel_anti_debug_install_instrumentation(std::uint32_t pid, void* callback) noexcept;

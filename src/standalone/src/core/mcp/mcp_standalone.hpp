@@ -10,6 +10,13 @@
 #include <memory>
 
 #include <nlohmann/json.hpp>
+#include <optional>
+#include "../analysis/workspace/workspace_types.hpp"
+
+namespace aida::analysis
+{
+    class analysis_workspace_t;
+}
 
 namespace mcp_standalone
 {
@@ -129,6 +136,26 @@ namespace mcp_standalone
 
     json active_session_policy_debug_snapshot();
 
+    struct workspace_request_context_t
+    {
+        std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+        aida::analysis::target_kind_t kind = aida::analysis::target_kind_t::static_file;
+        aida::analysis::binary_id_t binary_id;
+        std::optional<std::uint32_t> pid;
+        std::uint64_t analysis_revision = 0;
+        std::uint64_t overlay_revision = 0;
+        std::atomic<bool>* cancellation = nullptr;
+        std::uint64_t deadline_ms = 0;
+        std::string diagnostic_id;
+        std::string request_id;
+        std::string tool_name;
+
+        bool cancellation_requested() const noexcept
+        {
+            return cancellation && cancellation->load(std::memory_order_acquire);
+        }
+    };
+
     struct tool_def_t
     {
         std::string name;
@@ -137,7 +164,15 @@ namespace mcp_standalone
         bool read_only = true;
         std::function<tool_result_t(const json& params)> handler;
         tool_visibility_t visibility = tool_visibility_t::external_visible;
+        std::function<tool_result_t(
+            const json& params,
+            const workspace_request_context_t& context)> workspace_handler;
+        json input_schema;
     };
+
+    using tool_validation_hook_t = std::function<tool_result_t(const tool_def_t&, const json&)>;
+
+    void set_pre_dispatch_validation_hook(tool_validation_hook_t hook);
 
     class server_t
     {
@@ -150,6 +185,16 @@ namespace mcp_standalone
         bool is_running() const { return _running.load(); }
         int  get_port() const { return _port; }
         bool register_tool(tool_def_t tool);
+        bool register_tool(
+            tool_def_t tool,
+            std::function<tool_result_t(
+                const json&,
+                const std::shared_ptr<aida::analysis::analysis_workspace_t>&)> handler);
+        bool register_tool(
+            tool_def_t tool,
+            std::function<tool_result_t(
+                const json&,
+                const workspace_request_context_t&)> handler);
         tool_result_t call_registered_tool(const std::string& name, const json& arguments, bool external_visible_only);
         tool_result_t describe_tools(const json& params);
         void write_client_configs() const;
@@ -187,19 +232,20 @@ namespace mcp_standalone
     struct target_scope_t
     {
         bool        ok = false;
-        bool        swapped = false;
         bool        resolved = false;
-        size_t      prev_active_idx = static_cast<size_t>(-1);
         size_t      target_idx      = static_cast<size_t>(-1);
         std::string resolved_id;
         std::string err;
+        std::string error_code;
+        json        error_details;
+        std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
 
         target_scope_t() = default;
         target_scope_t(const target_scope_t&) = delete;
         target_scope_t& operator=(const target_scope_t&) = delete;
-        target_scope_t(target_scope_t&&) noexcept;
-        target_scope_t& operator=(target_scope_t&&) noexcept;
-        ~target_scope_t();
+        target_scope_t(target_scope_t&&) noexcept = default;
+        target_scope_t& operator=(target_scope_t&&) noexcept = default;
+        ~target_scope_t() = default;
     };
 
     target_scope_t resolve_target(const json& args, std::string* out_err);

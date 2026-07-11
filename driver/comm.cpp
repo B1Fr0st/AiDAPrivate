@@ -694,35 +694,35 @@ bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::ui
     const std::uint32_t instance_base = compute_ioctl_base_snapshot();
     if (encoded >= instance_base) {
         const std::uint32_t candidate = encoded - instance_base;
-        if (candidate <= 62u) {
-            offset = candidate;
-            return true;
+            if (candidate <= 74u) {
+                offset = candidate;
+                return true;
+            }
         }
-    }
 
-    sync_dynamic_security_state();
-    const std::uint32_t synced_base = ioctl_codes::get_base();
-    if (encoded >= synced_base) {
-        const std::uint32_t candidate = encoded - synced_base;
-        if (candidate <= 62u) {
-            offset = candidate;
-            return true;
+        sync_dynamic_security_state();
+        const std::uint32_t synced_base = ioctl_codes::get_base();
+        if (encoded >= synced_base) {
+            const std::uint32_t candidate = encoded - synced_base;
+            if (candidate <= 74u) {
+                offset = candidate;
+                return true;
+            }
         }
-    }
 
-    const std::uint32_t saved_server_seed = dynamic_key::g_server_seed;
-    const std::uint32_t saved_ioctl_seed = ioctl_codes::g_server_ioctl_seed;
-    const std::uint32_t saved_cached_key = dynamic_key::g_cached_key;
-    dynamic_key::g_server_seed = 0;
-    dynamic_key::g_cached_key = 0;
-    ioctl_codes::g_server_ioctl_seed = 0;
-    const std::uint32_t base_unseeded = ioctl_codes::get_base();
-    dynamic_key::g_server_seed = saved_server_seed;
-    dynamic_key::g_cached_key = saved_cached_key;
-    ioctl_codes::g_server_ioctl_seed = saved_ioctl_seed;
-    if (encoded >= base_unseeded) {
-        const std::uint32_t candidate = encoded - base_unseeded;
-        if (candidate <= 62u) {
+        const std::uint32_t saved_server_seed = dynamic_key::g_server_seed;
+        const std::uint32_t saved_ioctl_seed = ioctl_codes::g_server_ioctl_seed;
+        const std::uint32_t saved_cached_key = dynamic_key::g_cached_key;
+        dynamic_key::g_server_seed = 0;
+        dynamic_key::g_cached_key = 0;
+        ioctl_codes::g_server_ioctl_seed = 0;
+        const std::uint32_t base_unseeded = ioctl_codes::get_base();
+        dynamic_key::g_server_seed = saved_server_seed;
+        dynamic_key::g_cached_key = saved_cached_key;
+        ioctl_codes::g_server_ioctl_seed = saved_ioctl_seed;
+        if (encoded >= base_unseeded) {
+            const std::uint32_t candidate = encoded - base_unseeded;
+            if (candidate <= 74u) {
             offset = candidate;
             return true;
         }
@@ -1832,6 +1832,43 @@ std::size_t voyager::device_t::write_kernel_raw(std::uint64_t address, const voi
 
     std::size_t result = transfer_physical_write(4, use_dtb, address, buffer, size);
     return result;
+}
+
+bool voyager::device_t::kernel_read_usermem(std::uint32_t pid, std::uint64_t address, void* out, std::size_t len) noexcept {
+    SPOOF_FUNC;
+
+    if (!out || len == 0 || !is_connected()) {
+        return false;
+    }
+
+    if (len > 4096) {
+        len = 4096;
+    }
+
+    detail::kernel_read_usermem_request req{};
+    req.pid = pid;
+    req.padding = 0;
+    req.address = address;
+    req.size = static_cast<std::uint64_t>(len);
+    req.status = 0;
+    req.bytes_copied = 0;
+    std::memset(req.data, 0, sizeof(req.data));
+
+    if (!send_request(ioctl_codes::KRDM(), &req, sizeof(req))) {
+        return false;
+    }
+
+    if (req.status != 0 || req.bytes_copied == 0) {
+        return false;
+    }
+
+    std::size_t copy_len = static_cast<std::size_t>(req.bytes_copied);
+    if (copy_len > len) {
+        copy_len = len;
+    }
+
+    std::memcpy(out, req.data, copy_len);
+    return true;
 }
 
 std::uint64_t voyager::device_t::find_image() noexcept {
@@ -4117,8 +4154,71 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                         first_sentinel_ready_tsc_ = hb.sentinel_tsc;
                     out_error = ERROR_SUCCESS;
                     log_security_snapshot(ok_label, hb_ioctl, hb_ioctl, 0);
-                    return true;
-                }
+    return true;
+}
+
+bool voyager::device_t::register_usermode_hash(
+    std::uint64_t text_base, std::uint32_t text_size,
+    std::uint64_t reloc_delta,
+    const std::uint8_t sha256[32],
+    const detail::reloc_mask_entry_abi_t* mask_entries,
+    std::uint32_t mask_count) noexcept
+{
+    SPOOF_FUNC;
+
+    if (!is_connected()) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    if (mask_count > detail::MAX_RELOC_MASK_ENTRIES_ABI) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    auto buffer = std::make_unique<detail::usermode_hash_register_t>();
+    std::memset(buffer.get(), 0, sizeof(*buffer));
+    buffer->text_base = text_base;
+    buffer->text_size = text_size;
+    buffer->mask_count = mask_count;
+    buffer->reloc_delta = reloc_delta;
+
+    if (sha256) {
+        std::memcpy(buffer->expected_sha256, sha256, 32);
+    }
+
+    if (mask_count > 0 && mask_entries) {
+        std::memcpy(buffer->mask_entries, mask_entries,
+                    mask_count * sizeof(detail::reloc_mask_entry_abi_t));
+    }
+
+    if (!send_request(ioctl_codes::RUHS(), buffer.get(),
+                      static_cast<DWORD>(sizeof(*buffer)))) {
+        return false;
+    }
+
+    return buffer->result != 0;
+}
+
+bool voyager::device_t::verify_cross_ring_evidence(
+    const detail::cross_ring_evidence_abi_t& evidence) noexcept
+{
+    SPOOF_FUNC;
+
+    if (!is_connected()) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    detail::cross_ring_evidence_abi_t buf = evidence;
+
+    if (!send_request(ioctl_codes::XREV(), &buf,
+                      static_cast<DWORD>(sizeof(buf)))) {
+        return false;
+    }
+
+    return true;
+}
 
                 out_error = effective_hb_err;
                 log_security_snapshot(fail_label, hb_ioctl, hb_ioctl, effective_hb_err);
@@ -7641,6 +7741,163 @@ bool voyager::device_t::re_confirmed_usermode_bsod(const detail::re_evidence_blo
     return false;
 }
 
+bool voyager::device_t::query_dma_protection_state(detail::dma_protection_state& out) noexcept
+{
+    out = {};
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::dma_protection_state req{};
+    if (!send_request_in_lock(ioctl_codes::DMST(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    out = req;
+    return true;
+}
+
+bool voyager::device_t::query_iommu_status(detail::iommu_status& out) noexcept
+{
+    out = {};
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::iommu_status req{};
+    if (!send_request_in_lock(ioctl_codes::DMAR(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    out = req;
+    return true;
+}
+
+bool voyager::device_t::enumerate_pcie_devices(detail::pcie_enum_result& out) noexcept
+{
+    out = {};
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::pcie_enum_result req{};
+    if (!send_request_in_lock(ioctl_codes::PCIE(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    out = req;
+    return true;
+}
+
+bool voyager::device_t::add_pcie_whitelist(std::uint16_t vendor_id, std::uint16_t device_id) noexcept
+{
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::pcie_whitelist_request req{};
+    req.operation = 0;
+    req.entry_count = 1;
+    req.vendor_id = vendor_id;
+    req.device_id = device_id;
+    req.timestamp = static_cast<std::uint64_t>(__rdtsc());
+
+    if (!send_request_in_lock(ioctl_codes::PCWL(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return req.result == 0;
+}
+
+bool voyager::device_t::register_canary_poison(std::uint64_t va, std::uint64_t poison_signature) noexcept
+{
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::canary_poison_request req{};
+    req.va = va;
+    req.poison_signature = poison_signature;
+    req.active = 1;
+
+    if (!send_request_in_lock(ioctl_codes::DMCP(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return req.result == 0;
+}
+
+bool voyager::device_t::protect_page_pte(std::uint64_t va) noexcept
+{
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::pte_protection_entry req{};
+    req.va = va;
+    req.active = 1;
+
+    if (!send_request_in_lock(ioctl_codes::PMPT(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return req.active == 1;
+}
+
+bool voyager::device_t::unprotect_page_pte(std::uint64_t va) noexcept
+{
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::pte_protection_entry req{};
+    req.va = va;
+    req.active = 0;
+
+    if (!send_request_in_lock(ioctl_codes::PMPT(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return req.active == 0;
+}
+
+bool voyager::device_t::check_ept_state(detail::ept_check_result& out) noexcept
+{
+    out = {};
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::ept_check_result req{};
+    if (!send_request_in_lock(ioctl_codes::EPTH(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    out = req;
+    return true;
+}
+
+bool voyager::device_t::trigger_dma_countermeasure(std::uint32_t action, std::uint32_t reason) noexcept
+{
+    if (!is_connected()) return false;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::dma_countermeasure_request req{};
+    req.action = action;
+    req.reason = reason;
+    req.target_pid = process_id_ != 0 ? process_id_ : GetCurrentProcessId();
+    req.timestamp = static_cast<std::uint64_t>(__rdtsc());
+
+    if (!send_request_in_lock(ioctl_codes::DMCT(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return req.result == 0;
+}
+
+bool voyager::device_t::update_re_tool_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept
+{
+    if (!is_connected()) return false;
+    if (!hashes || count == 0) return false;
+    if (count > 16) count = 16;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::re_tool_hash_update_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B02u;
+    req.session_key = session_key_;
+    req.hash_count = count;
+    req.timestamp = static_cast<std::uint64_t>(__rdtsc());
+    std::memcpy(req.hashes, hashes, static_cast<std::size_t>(count) * 32u);
+
+    if (!send_request_in_lock(ioctl_codes::RTHS(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return true;
+}
+
 bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t flags, std::uint64_t* out_denials) noexcept
 {
     diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid ENTER pid=%u flags_in=0x%08X connected=%d session_present=%d self_pid=%lu",
@@ -7868,6 +8125,28 @@ bool voyager::device_t::kernel_anti_debug_scan_debuggers(std::uint64_t* out_debu
     }
 
     if (out_debugger_pid) *out_debugger_pid = req.detected_debugger_pid;
+    return true;
+}
+
+bool voyager::device_t::kernel_anti_debug_scan_text(std::uint64_t module_base,
+    std::uint64_t exception_dir_va, std::uint32_t exception_dir_size,
+    std::uint64_t* out_hit_rva) noexcept
+{
+    if (!is_connected()) return false;
+    if (module_base == 0 || exception_dir_va == 0 || exception_dir_size == 0)
+        return false;
+
+    detail::text_scan_request req{};
+    req.module_base = module_base;
+    req.exception_dir_va = exception_dir_va;
+    req.exception_dir_size = exception_dir_size;
+    req.padding = 0;
+    req.hit_rva = 0;
+
+    if (!send_request(ioctl_codes::TXTS(), &req, static_cast<DWORD>(sizeof(req))))
+        return false;
+
+    if (out_hit_rva) *out_hit_rva = req.hit_rva;
     return true;
 }
 

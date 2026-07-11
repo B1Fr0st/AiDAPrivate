@@ -276,6 +276,13 @@ APL_STATIC_ASSERT(resource_fixup_key, offsetof(resource_fixup_t, rolling_key) ==
 #define APL_EVENT_IMPORT_SLOT_WRITE     0x3010u
 #define APL_EVENT_IMPORT_SLOT_RESTORE   0x3011u
 
+#define APL_EVENT_LARGE_PAGES_OK        0x4001u
+#define APL_EVENT_LARGE_PAGES_FALLBACK  0x4002u
+
+#define MEM_LARGE_PAGES_PL              0x20000000u
+#define LARGE_PAGE_SIZE                 (2u * 1024u * 1024u)
+#define SE_LOCK_MEMORY_PRIVILEGE_LUID   4u
+
 #define APL_FASTFAIL_IMPORT_REBUILD     0xA1DA0003u
 #define APL_FASTFAIL_SECTION_UNPACK     0xA1DA0004u
 
@@ -3919,6 +3926,43 @@ static void env_react_to_hostile(int reason, const resolved_t* r) {
     __fastfail(0xDEADC0DEu);
 }
 
+static int check_large_page_support(const resolved_t* r) {
+    int regs[4];
+    regs[0] = 0; regs[1] = 0; regs[2] = 0; regs[3] = 0;
+    __cpuid(regs, (int)0x80000001u);
+    uint32_t edx = (uint32_t)regs[3];
+    if ((edx & (1u << 26u)) == 0u) {
+        payload_log_event(APL_EVENT_LARGE_PAGES_FALLBACK,
+                          0x01u,
+                          (uint64_t)edx,
+                          0u);
+        return 0;
+    }
+
+    void* large_buf = 0;
+    size_t large_sz = LARGE_PAGE_SIZE;
+    long st = r->NtAllocateVirtualMemory(
+        (void*)(intptr_t)-1, &large_buf, 0, &large_sz,
+        MEM_COMMIT_RESERVE | MEM_LARGE_PAGES_PL, PAGE_EX_R);
+    if (st < 0 || large_buf == 0) {
+        payload_log_event(APL_EVENT_LARGE_PAGES_FALLBACK,
+                          0x02u,
+                          (uint64_t)(uint32_t)st,
+                          (uint64_t)large_sz);
+        return 0;
+    }
+
+    void* free_addr = large_buf;
+    size_t free_sz = 0;
+    r->NtFreeVirtualMemory((void*)(intptr_t)-1, &free_addr, &free_sz, MEM_RELEASE);
+
+    payload_log_event(APL_EVENT_LARGE_PAGES_OK,
+                      (uint64_t)(uintptr_t)large_buf,
+                      (uint64_t)large_sz,
+                      0u);
+    return 1;
+}
+
 void __cdecl aida_unpack(void* image_base_arg) {
     uint8_t* image_base = (uint8_t*)image_base_arg;
     payload_log_event(APL_EVENT_UNPACK_ENTER, (uint64_t)(uintptr_t)image_base, 0u, 0u);
@@ -4037,6 +4081,9 @@ void __cdecl aida_unpack(void* image_base_arg) {
     payload_log_event(APL_EVENT_PHASE_ENTER, 5u, 0u, 0u);
     apply_relocations(image_base, packed_base, hdr, &r);
     payload_log_event(APL_EVENT_PHASE_EXIT, 5u, 0u, 0u);
+    payload_log_event(APL_EVENT_PHASE_ENTER, 6u, 0u, 0u);
+    check_large_page_support(&r);
+    payload_log_event(APL_EVENT_PHASE_EXIT, 6u, 0u, 0u);
     hdr->reserved[0] = IMG_UNPACK_DONE;
     payload_log_event(APL_EVENT_UNPACK_DONE, (uint64_t)(uintptr_t)image_base, (uint64_t)(uintptr_t)packed_base, 0u);
 }

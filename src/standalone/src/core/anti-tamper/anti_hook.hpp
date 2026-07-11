@@ -6,6 +6,7 @@
 #include <bcrypt.h>
 #include <winternl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +17,9 @@
 #include "webhook.hpp"
 #include "state.hpp"
 #include "syscall.hpp"
+#include "../runtime/standalone_driver.hpp"
+#include "standalone_driver.hpp"
+#include "enforcement.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "psapi.lib")
@@ -36,7 +40,14 @@ struct hook_report_t
     bool veh_chain_tampered = false;
     bool dr_in_text_range = false;
     bool dispatch_table_redirected = false;
+    bool vtable_hooked = false;
+    bool self_prologue_mismatch = false;
+    bool server_hash_mismatch = false;
+    bool self_hook_detected = false;
+    bool kernel_callback_hooked = false;
+    bool kernel_dispatch_hooked = false;
     std::string hooked_function;
+    std::string vtable_mismatched_class;
     std::string summary;
 
     bool any_detected() const
@@ -45,7 +56,10 @@ struct hook_report_t
             || syscall_stubs_modified || eat_hooked
             || prologue_hash_mismatch || disk_image_mismatch
             || veh_chain_tampered || dr_in_text_range
-            || dispatch_table_redirected;
+            || dispatch_table_redirected
+            || vtable_hooked || self_prologue_mismatch
+            || server_hash_mismatch || self_hook_detected
+            || kernel_callback_hooked || kernel_dispatch_hooked;
     }
 };
 
@@ -114,6 +128,101 @@ namespace detail {
             return false;
         }
         return false;
+    }
+
+    inline bool check_inline_hook_deep(const uint8_t* func, const char*,
+        size_t func_size = k_prologue_bytes,
+        bool func_size_verified = false)
+    {
+        __try
+        {
+            const size_t scan_limit = (func_size < k_prologue_bytes)
+                ? func_size : k_prologue_bytes;
+            for (size_t off = 0; off < scan_limit; ++off)
+            {
+                if (off + 5 <= scan_limit && func[off] == 0xE9)
+                    return true;
+
+                if (off + 5 <= scan_limit && func[off] == 0xE8)
+                    return true;
+
+                if (off + 2 <= scan_limit && func[off] == 0xEB)
+                    return true;
+
+                if (off + 6 <= scan_limit && func[off] == 0xFF && func[off+1] == 0x25)
+                    return true;
+
+                if (off + 6 <= scan_limit && func[off] == 0xFF && func[off+1] == 0x15)
+                    return true;
+
+                if (off + 12 <= scan_limit &&
+                    func[off] == 0x48 && func[off+1] == 0xB8 &&
+                    func[off+10] == 0xFF && func[off+11] == 0xE0)
+                    return true;
+
+                if (off + 6 <= scan_limit && func[off] == 0x68 && func[off+5] == 0xC3)
+                    return true;
+
+                if (func[off] == 0xCC && (off == 0 || func_size_verified))
+                    return true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return false;
+    }
+
+    inline bool lookup_runtime_function_size(HMODULE mod, uint64_t func_va,
+        size_t& out_size)
+    {
+        out_size = 0;
+        if (!mod || func_va == 0) return false;
+
+        auto* base = reinterpret_cast<const uint8_t*>(mod);
+        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+        if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+            return false;
+
+        const auto& exc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (exc_dir.VirtualAddress == 0 || exc_dir.Size == 0) return false;
+
+        const uint32_t func_count = exc_dir.Size / 12;
+        if (func_count == 0) return false;
+
+        const uint64_t mod_base = reinterpret_cast<uint64_t>(base);
+        const uint32_t func_rva = static_cast<uint32_t>(func_va - mod_base);
+
+        const RUNTIME_FUNCTION* rf_base = reinterpret_cast<const RUNTIME_FUNCTION*>(
+            base + exc_dir.VirtualAddress);
+
+        for (uint32_t i = 0; i < func_count; ++i)
+        {
+            if (rf_base[i].BeginAddress == func_rva)
+            {
+                out_size = rf_base[i].EndAddress - rf_base[i].BeginAddress;
+                return out_size > 0;
+            }
+        }
+        return false;
+    }
+
+    inline bool check_inline_hook_deep_at_export(HMODULE mod, const char* name)
+    {
+        if (!mod || !name) return false;
+        auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(mod, name));
+        if (!addr) return false;
+
+        size_t func_size = k_prologue_bytes;
+        bool verified = false;
+        lookup_runtime_function_size(mod, reinterpret_cast<uint64_t>(addr), func_size);
+        if (func_size > 0) verified = true;
+
+        return check_inline_hook_deep(addr, name, func_size, verified);
     }
 
     inline bool verify_syscall_stub(const uint8_t* func)
@@ -462,6 +571,98 @@ namespace detail {
             ok);
 
         return ok;
+    }
+
+    struct self_hook_allowlist_entry_t
+    {
+        uint64_t hooked_va;
+        uint64_t hook_dest_va;
+        const char* subsystem;
+    };
+
+    inline std::vector<self_hook_allowlist_entry_t>& self_hook_allowlist()
+    {
+        static std::vector<self_hook_allowlist_entry_t> v;
+        return v;
+    }
+
+    struct vtable_baseline_t
+    {
+        const char* class_name;
+        uint64_t vtable_va;
+        uint32_t entry_count;
+        bool dynamic_vtable;
+        std::vector<uint8_t> hash_snapshot;
+    };
+
+    inline std::vector<vtable_baseline_t>& vtable_baselines()
+    {
+        static std::vector<vtable_baseline_t> v;
+        return v;
+    }
+
+    struct original_bytes_entry_t
+    {
+        uint64_t function_va;
+        uint32_t byte_count;
+        uint8_t encrypted_bytes[32];
+        uint64_t encryption_key;
+        char function_name[64];
+    };
+
+    inline std::vector<original_bytes_entry_t>& original_bytes_store()
+    {
+        static std::vector<original_bytes_entry_t> v;
+        return v;
+    }
+
+    struct server_prologue_hash_t
+    {
+        std::string function_name;
+        uint8_t expected_hash[32];
+        std::string module_name;
+    };
+
+    inline std::vector<server_prologue_hash_t>& server_hash_table()
+    {
+        static std::vector<server_prologue_hash_t> v;
+        return v;
+    }
+
+    inline std::atomic<uint32_t>& server_hash_version_tag()
+    {
+        static std::atomic<uint32_t> v{0};
+        return v;
+    }
+
+    inline std::atomic<bool>& server_hash_version_ok()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline std::atomic<bool>& server_hash_hmac_valid()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline std::mutex& self_hook_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::mutex& vtable_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::mutex& original_bytes_mtx()
+    {
+        static std::mutex m;
+        return m;
     }
 
 }
@@ -923,6 +1124,455 @@ namespace dispatch_check {
 
 }
 
+inline void register_self_hook(uint64_t hooked_va, uint64_t hook_dest_va,
+    const char* subsystem)
+{
+    std::lock_guard<std::mutex> lk(detail::self_hook_mtx());
+    detail::self_hook_allowlist().push_back({hooked_va, hook_dest_va, subsystem});
+}
+
+inline bool is_self_hooked(uint64_t func_va)
+{
+    std::lock_guard<std::mutex> lk(detail::self_hook_mtx());
+    for (const auto& e : detail::self_hook_allowlist())
+    {
+        if (e.hooked_va != func_va)
+            continue;
+
+        auto* bytes = reinterpret_cast<const uint8_t*>(func_va);
+        uint64_t current_dest = 0;
+        __try
+        {
+            if (bytes[0] == 0xFF && bytes[1] == 0x25)
+            {
+                int32_t disp = *reinterpret_cast<const int32_t*>(bytes + 2);
+                uint64_t slot = func_va + 6 + disp;
+                current_dest = *reinterpret_cast<const uint64_t*>(slot);
+            }
+            else if (bytes[0] == 0xE9)
+            {
+                int32_t disp = *reinterpret_cast<const int32_t*>(bytes + 1);
+                current_dest = func_va + 5 + disp;
+            }
+            else if (bytes[0] == 0x48 && bytes[1] == 0xB8)
+            {
+                current_dest = *reinterpret_cast<const uint64_t*>(bytes + 2);
+            }
+            else if (bytes[0] == 0x68 && bytes[5] == 0xC3)
+            {
+                uint32_t imm32 = *reinterpret_cast<const uint32_t*>(bytes + 1);
+                current_dest = static_cast<uint64_t>(imm32);
+            }
+        }
+        __except(1) { return false; }
+
+        if (current_dest == 0)
+            return false;
+
+        if (current_dest != e.hook_dest_va)
+            return false;
+
+        return true;
+    }
+    return false;
+}
+
+namespace vtable_check {
+
+    inline void register_vtable(const char* class_name, void* vtable_ptr,
+        uint32_t entry_count, bool dynamic_vtable = false)
+    {
+        if (!class_name || !vtable_ptr || entry_count == 0) return;
+        std::lock_guard<std::mutex> lk(detail::vtable_mtx());
+        auto* vt = reinterpret_cast<const uint8_t*>(vtable_ptr);
+        detail::vtable_baseline_t b{};
+        b.class_name = class_name;
+        b.vtable_va = reinterpret_cast<uint64_t>(vtable_ptr);
+        b.entry_count = entry_count;
+        b.dynamic_vtable = dynamic_vtable;
+        if (dynamic_vtable)
+        {
+            b.hash_snapshot.clear();
+            detail::vtable_baselines().push_back(std::move(b));
+            return;
+        }
+        uint8_t hash[32];
+        if (detail::sha256_hash(vt, static_cast<size_t>(entry_count) * 8, hash))
+        {
+            b.hash_snapshot.assign(hash, hash + 32);
+            detail::vtable_baselines().push_back(std::move(b));
+        }
+    }
+
+    inline bool verify_vtables(std::string& mismatched_class)
+    {
+        std::lock_guard<std::mutex> lk(detail::vtable_mtx());
+        for (const auto& b : detail::vtable_baselines())
+        {
+            if (b.dynamic_vtable)
+                continue;
+
+            auto* vt = reinterpret_cast<const uint8_t*>(b.vtable_va);
+            uint8_t hash[32];
+            if (!detail::sha256_hash(vt,
+                static_cast<size_t>(b.entry_count) * 8, hash))
+            {
+                mismatched_class = b.class_name;
+                return false;
+            }
+            if (memcmp(hash, b.hash_snapshot.data(), 32) != 0)
+            {
+                mismatched_class = b.class_name;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    inline bool detect_vtable_hooks(std::string& mismatched_class)
+    {
+        return !verify_vtables(mismatched_class);
+    }
+
+}
+
+namespace self_heal {
+
+    inline void capture_original_bytes(void* fn, const char* name)
+    {
+        if (!fn || !name) return;
+        std::lock_guard<std::mutex> lk(detail::original_bytes_mtx());
+        detail::original_bytes_entry_t e{};
+        e.function_va = reinterpret_cast<uint64_t>(fn);
+        e.byte_count = static_cast<uint32_t>(detail::k_prologue_bytes);
+
+        uint8_t plain[32];
+        __try { memcpy(plain, fn, 32); } __except(1) { return; }
+
+        uint64_t k0 = 0, k1 = 0;
+        __try {
+            auto& sip_k0 = anti_tamper::integrity::detail::s_siphash_k0_obf;
+            auto& sip_k1 = anti_tamper::integrity::detail::s_siphash_k1_obf;
+            k0 = sip_k0.load(std::memory_order_acquire);
+            k1 = sip_k1.load(std::memory_order_acquire);
+        } __except(1) {
+            k0 = static_cast<uint64_t>(__rdtsc());
+            k1 = static_cast<uint64_t>(GetCurrentProcessId());
+        }
+        e.encryption_key = k0 ^ k1 ^ 0xA1DA5EED12345678ULL;
+
+        for (uint32_t i = 0; i < 32; ++i)
+            e.encrypted_bytes[i] = plain[i] ^ static_cast<uint8_t>(
+                (e.encryption_key >> ((i & 7) * 8)) & 0xFF);
+
+        strncpy_s(e.function_name, name, 63);
+        e.function_name[63] = 0;
+
+        SecureZeroMemory(plain, sizeof(plain));
+        detail::original_bytes_store().push_back(std::move(e));
+    }
+
+    inline bool restore_prologue(uint64_t function_va, const char* name)
+    {
+        detail::original_bytes_entry_t* found = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(detail::original_bytes_mtx());
+            for (auto& e : detail::original_bytes_store())
+            {
+                if (e.function_va == function_va)
+                {
+                    found = &e;
+                    break;
+                }
+            }
+        }
+        if (!found) return false;
+
+        uint8_t plain[32];
+        for (uint32_t i = 0; i < 32; ++i)
+            plain[i] = found->encrypted_bytes[i] ^ static_cast<uint8_t>(
+                (found->encryption_key >> ((i & 7) * 8)) & 0xFF);
+
+        const uint32_t byte_count = found->byte_count;
+        const uint64_t va_start = function_va;
+        const uint64_t va_end = function_va + byte_count;
+
+        NTSTATUS susp_st = static_cast<NTSTATUS>(0xC0000001L);
+        if (syscall::is_initialized())
+        {
+            susp_st = syscall::call_NtSuspendProcess(GetCurrentProcess());
+        }
+
+        bool abort_restore = false;
+        if (susp_st >= 0 || !syscall::is_initialized())
+        {
+            DWORD self_pid = GetCurrentProcessId();
+            DWORD self_tid = GetCurrentThreadId();
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snap != INVALID_HANDLE_VALUE)
+            {
+                THREADENTRY32 te = {sizeof(te)};
+                if (Thread32First(snap, &te))
+                {
+                    do {
+                        if (te.th32OwnerProcessID != self_pid)
+                            continue;
+                        if (te.th32ThreadID == self_tid)
+                            continue;
+
+                        HANDLE th = OpenThread(
+                            THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                            FALSE, te.th32ThreadID);
+                        if (!th) continue;
+
+                        CONTEXT ctx{};
+                        ctx.ContextFlags = CONTEXT_CONTROL;
+                        bool got_ctx = false;
+                        if (syscall::is_initialized())
+                        {
+                            NTSTATUS ctx_st = syscall::call_NtGetContextThread(th, &ctx);
+                            got_ctx = ctx_st >= 0;
+                        }
+                        if (!got_ctx)
+                            got_ctx = GetThreadContext(th, &ctx) != FALSE;
+
+                        if (got_ctx)
+                        {
+                            uint64_t rip = ctx.Rip;
+                            if (rip >= va_start && rip < va_end)
+                                abort_restore = true;
+                        }
+                        CloseHandle(th);
+                    } while (Thread32Next(snap, &te) && !abort_restore);
+                }
+                CloseHandle(snap);
+            }
+        }
+
+        if (abort_restore)
+        {
+            if (syscall::is_initialized())
+                syscall::call_NtResumeProcess(GetCurrentProcess());
+            SecureZeroMemory(plain, sizeof(plain));
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "hook_self_healing_aborted thread_in_range func=%s va=0x%llX",
+                name ? name : "?",
+                static_cast<unsigned long long>(function_va));
+            webhook::write_log_critical("hook_heal", dbg);
+            return false;
+        }
+
+        PVOID base = reinterpret_cast<PVOID>(function_va);
+        SIZE_T region_size = byte_count;
+        ULONG old_prot = 0;
+        bool prot_ok = false;
+
+        if (syscall::is_initialized())
+        {
+            NTSTATUS st = syscall::call_NtProtectVirtualMemory(
+                GetCurrentProcess(), &base, &region_size,
+                PAGE_EXECUTE_READWRITE, &old_prot);
+            prot_ok = (st >= 0);
+        }
+        if (!prot_ok)
+        {
+            DWORD old_dw = 0;
+            prot_ok = VirtualProtect(reinterpret_cast<void*>(function_va),
+                byte_count, PAGE_EXECUTE_READWRITE, &old_dw) != FALSE;
+            if (prot_ok) old_prot = old_dw;
+        }
+
+        if (!prot_ok)
+        {
+            if (syscall::is_initialized())
+                syscall::call_NtResumeProcess(GetCurrentProcess());
+            SecureZeroMemory(plain, sizeof(plain));
+            return false;
+        }
+
+        __try {
+            memcpy(reinterpret_cast<void*>(function_va), plain, byte_count);
+        } __except(1) {
+            if (syscall::is_initialized())
+                syscall::call_NtResumeProcess(GetCurrentProcess());
+            SecureZeroMemory(plain, sizeof(plain));
+            return false;
+        }
+
+        if (syscall::is_initialized())
+        {
+            PVOID base2 = reinterpret_cast<PVOID>(function_va);
+            SIZE_T rs2 = byte_count;
+            ULONG dummy = 0;
+            syscall::call_NtProtectVirtualMemory(
+                GetCurrentProcess(), &base2, &rs2,
+                old_prot, &dummy);
+        }
+        else
+        {
+            DWORD old_dw = 0;
+            VirtualProtect(reinterpret_cast<void*>(function_va),
+                byte_count, old_prot, &old_dw);
+        }
+
+        FlushInstructionCache(GetCurrentProcess(),
+            reinterpret_cast<void*>(function_va), byte_count);
+
+        if (syscall::is_initialized())
+            syscall::call_NtResumeProcess(GetCurrentProcess());
+
+        SecureZeroMemory(plain, sizeof(plain));
+
+        char dbg[256];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "hook_self_healing_restored func=%s va=0x%llX bytes=%u",
+            name ? name : "?",
+            static_cast<unsigned long long>(function_va),
+            byte_count);
+        webhook::write_log_critical("hook_heal", dbg);
+        return true;
+    }
+
+    inline uint32_t heal_detected_hooks(const hook_report_t& report)
+    {
+        uint32_t healed = 0;
+
+        if (report.ntdll_inline_hooked && !report.hooked_function.empty())
+        {
+            HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+            if (ntdll)
+            {
+                auto* fn = GetProcAddress(ntdll, report.hooked_function.c_str());
+                if (fn && restore_prologue(reinterpret_cast<uint64_t>(fn),
+                    report.hooked_function.c_str()))
+                    ++healed;
+            }
+        }
+
+        if (report.kernel32_inline_hooked && !report.hooked_function.empty())
+        {
+            HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+            if (k32)
+            {
+                auto* fn = GetProcAddress(k32, report.hooked_function.c_str());
+                if (fn && restore_prologue(reinterpret_cast<uint64_t>(fn),
+                    report.hooked_function.c_str()))
+                    ++healed;
+            }
+        }
+
+        return healed;
+    }
+
+}
+
+namespace server_hashes {
+
+    inline void set_server_prologue_hashes(
+        uint32_t version_tag,
+        bool hmac_valid,
+        const std::vector<detail::server_prologue_hash_t>& hashes)
+    {
+        detail::server_hash_version_tag().store(version_tag,
+            std::memory_order_release);
+        detail::server_hash_hmac_valid().store(hmac_valid,
+            std::memory_order_release);
+
+        OSVERSIONINFOEXW vi{};
+        vi.dwOSVersionInfoSize = sizeof(vi);
+        typedef LONG(NTAPI* RtlGetVersion_t)(POSVERSIONINFOEXW);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll)
+        {
+            auto pRtlGetVersion = reinterpret_cast<RtlGetVersion_t>(
+                GetProcAddress(ntdll, "RtlGetVersion"));
+            if (pRtlGetVersion && pRtlGetVersion(&vi) == 0)
+            {
+                uint32_t client_build = static_cast<uint32_t>(vi.dwBuildNumber);
+                detail::server_hash_version_ok().store(
+                    version_tag == client_build && hmac_valid,
+                    std::memory_order_release);
+            }
+            else
+            {
+                detail::server_hash_version_ok().store(false,
+                    std::memory_order_release);
+            }
+        }
+        else
+        {
+            detail::server_hash_version_ok().store(false,
+                std::memory_order_release);
+        }
+
+        if (hmac_valid)
+        {
+            detail::server_hash_table() = hashes;
+        }
+        else
+        {
+            detail::server_hash_table().clear();
+        }
+
+        char dbg[256];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "server_prologue_hashes_set version_tag=0x%08X hmac_valid=%d count=%zu version_ok=%d",
+            version_tag, hmac_valid ? 1 : 0,
+            hashes.size(),
+            detail::server_hash_version_ok().load() ? 1 : 0);
+        webhook::write_log("server_hashes", dbg);
+    }
+
+    inline bool verify_against_server_hashes(std::string& mismatched_name)
+    {
+        if (detail::server_hash_table().empty())
+            return true;
+
+        if (!detail::server_hash_version_ok().load())
+        {
+            webhook::write_log("server_hashes",
+                "server_hash_version_mismatch_skipping_verification");
+            return true;
+        }
+
+        if (!detail::server_hash_hmac_valid().load())
+        {
+            webhook::write_log("server_hashes",
+                "server_hash_hmac_fail_skipping_verification");
+            return true;
+        }
+
+        for (const auto& sh : detail::server_hash_table())
+        {
+            HMODULE mod = GetModuleHandleW(
+                sh.module_name == "ntdll.dll" ? L"ntdll.dll" : L"kernel32.dll");
+            if (!mod) continue;
+
+            auto* fn = reinterpret_cast<const uint8_t*>(
+                GetProcAddress(mod, sh.function_name.c_str()));
+            if (!fn) continue;
+
+            uint8_t current_hash[32];
+            if (!baseline::seh_hash_prologue(fn, current_hash))
+                continue;
+
+            if (memcmp(current_hash, sh.expected_hash, 32) != 0)
+            {
+                if (sh.module_name == "ntdll.dll" &&
+                    detail::system_owned_nt_export_wrapper(
+                        sh.function_name.c_str(), fn))
+                    continue;
+
+                mismatched_name = sh.function_name;
+                return false;
+            }
+        }
+        return true;
+    }
+
+}
+
 inline bool verify_iat_entries(const std::vector<state::iat_entry_t>& snapshot)
 {
     for (size_t idx = 0; idx < snapshot.size(); ++idx)
@@ -1116,7 +1766,15 @@ inline bool scan_inline_hooks_ntdll(std::string& hooked_name)
         auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(ntdll, name));
         if (!addr) continue;
 
-        if (detail::check_inline_hook_bytes(addr, name))
+        uint64_t va = reinterpret_cast<uint64_t>(addr);
+        if (is_self_hooked(va))
+        {
+            webhook::write_log("ntdll_hook",
+                "self_hook_allowlisted skip (ghost_veh/protector)");
+            continue;
+        }
+
+        if (detail::check_inline_hook_deep_at_export(ntdll, name))
         {
             hooked_name = name;
             return true;
@@ -1135,7 +1793,15 @@ inline bool scan_inline_hooks_kernel32(std::string& hooked_name)
         auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(k32, name));
         if (!addr) continue;
 
-        if (detail::check_inline_hook_bytes(addr, name))
+        uint64_t va = reinterpret_cast<uint64_t>(addr);
+        if (is_self_hooked(va))
+        {
+            webhook::write_log("k32_hook",
+                "self_hook_allowlisted skip");
+            continue;
+        }
+
+        if (detail::check_inline_hook_deep_at_export(k32, name))
         {
             hooked_name = name;
             return true;
@@ -1382,6 +2048,47 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
         }
     }
 
+    std::string vtable_class;
+    report.vtable_hooked = vtable_check::detect_vtable_hooks(vtable_class);
+    if (report.vtable_hooked)
+    {
+        report.vtable_mismatched_class = vtable_class;
+        webhook::send_debug_log("vtable_hook", "vtable_modified: " + vtable_class, true);
+    }
+
+    std::string server_mismatch;
+    bool server_ok = server_hashes::verify_against_server_hashes(server_mismatch);
+    if (!server_ok)
+    {
+        report.server_hash_mismatch = true;
+        report.hooked_function = server_mismatch;
+        webhook::send_debug_log("server_hashes",
+            "server_hash_mismatch: " + server_mismatch, true);
+    }
+
+    if (report.any_detected())
+    {
+        self_heal::heal_detected_hooks(report);
+
+        uint64_t evidence = static_cast<uint64_t>(__rdtsc()) ^
+            (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
+            0xA1DA0004ULL;
+
+        webhook::write_log_critical_fmt("hook_detect",
+            "TIER2_BSOD trigger=0x%08X summary=%s pid=%lu tid=%lu",
+            0xA1DA0004u,
+            report.summary.c_str(),
+            GetCurrentProcessId(),
+            GetCurrentThreadId());
+
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+        {
+            driver_bridge::trigger_kernel_bsod(0xA1DA0004u, evidence);
+        }
+
+        enforce_violation("hook_detected", report.summary);
+    }
+
     if (report.iat_modified) report.summary += "iat ";
     if (report.ntdll_inline_hooked) report.summary += "ntdll:" + (!ntdll_hooked.empty() ? ntdll_hooked : report.hooked_function) + " ";
     if (report.kernel32_inline_hooked) report.summary += "k32:" + k32_hooked + " ";
@@ -1392,6 +2099,8 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
     if (report.veh_chain_tampered) report.summary += "veh ";
     if (report.dr_in_text_range) report.summary += "dr ";
     if (report.dispatch_table_redirected) report.summary += "redir:" + redir_name + " ";
+    if (report.vtable_hooked) report.summary += "vtable:" + vtable_class + " ";
+    if (report.server_hash_mismatch) report.summary += "srvhash:" + server_mismatch + " ";
 
     return report;
 }

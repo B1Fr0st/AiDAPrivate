@@ -12,6 +12,9 @@
 #include <core/HyperVAllowList.h>
 #include <core/DebugPortTrap.h>
 #include <core/VadTextGuard.h>
+#include <core/WskTransport.h>
+#include <core/ModuleCrossCheck.h>
+#include <core/Attestation.h>
 
 
 namespace guardian {
@@ -295,15 +298,9 @@ namespace guardian {
 
         step = perf_mark();
         BOOLEAN integrity_fail_sent = FALSE;
-        if (integrity::g_integrity_strikes >= integrity::INTEGRITY_STRIKE_THRESHOLD) {
-            heartbeat::send_command(heartbeat::BRIDGE_CMD_INTEGRITY_FAIL,
-                static_cast<ULONG>(integrity::g_integrity_strikes));
-            integrity_fail_sent = TRUE;
-        }
-        SN_LOG("guardian::step cycle=%ld name=integrity_strikes elapsed_us=%lu strikes=%ld sent=%u",
+        SN_LOG("guardian::step cycle=%ld name=integrity_strikes elapsed_us=%lu sent=%u",
             cycle,
             perf_elapsed_us(step),
-            integrity::g_integrity_strikes,
             integrity_fail_sent ? 1u : 0u);
 
         step = perf_mark();
@@ -315,11 +312,10 @@ namespace guardian {
 
         step = perf_mark();
         bool integrity_ok = integrity::verify();
-        SN_LOG("guardian::step cycle=%ld name=integrity elapsed_us=%lu result=%u strikes=%ld",
+        SN_LOG("guardian::step cycle=%ld name=integrity elapsed_us=%lu result=%u",
             cycle,
             perf_elapsed_us(step),
-            integrity_ok ? 1u : 0u,
-            integrity::g_integrity_strikes);
+            integrity_ok ? 1u : 0u);
 
         step = perf_mark();
         bool dispatch_ok = dispatch_guard::verify();
@@ -357,8 +353,8 @@ namespace guardian {
             static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
 
         step = perf_mark();
-        vad_text_guard::check(protected_pid);
-        SN_LOG("guardian::step cycle=%ld name=vad_text_guard elapsed_us=%lu protected_pid=%llu",
+        vad_text_guard::check_with_content(protected_pid);
+        SN_LOG("guardian::step cycle=%ld name=vad_text_guard_with_content elapsed_us=%lu protected_pid=%llu",
             cycle,
             perf_elapsed_us(step),
             static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
@@ -440,6 +436,63 @@ namespace guardian {
             aperf_detected ? 1u : 0u,
             aperf_consecutive,
             _InterlockedCompareExchange(&g_aperf_warmup_done, 0, 0));
+
+        step = perf_mark();
+        BOOLEAN dma_cmd_processed = FALSE;
+        if (heartbeat::g_bridge && _MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)))) {
+            __try {
+                ULONG raw_dma_cmd = _InterlockedCompareExchange(
+                    (volatile LONG*)&heartbeat::g_bridge->sentinel_cmd, 0, 0);
+                ULONG raw_dma_param = _InterlockedCompareExchange(
+                    (volatile LONG*)&heartbeat::g_bridge->sentinel_cmd_param, 0, 0);
+                if (raw_dma_cmd != 0) {
+                    ULONG dma_cmd = raw_dma_cmd;
+                    ULONG dma_param = raw_dma_param;
+                    heartbeat::bridge_encrypt_cmd(dma_cmd, dma_param);
+                    if (dma_cmd == heartbeat::BRIDGE_CMD_DMA_KEY_SCRUB ||
+                        dma_cmd == heartbeat::BRIDGE_CMD_DMA_BSOD ||
+                        dma_cmd == heartbeat::BRIDGE_CMD_DMA_ATTACK_REPORT) {
+
+                        SN_LOG("guardian::dpc: DMA bridge command cmd=0x%lx param=0x%lx cycle=%ld",
+                            dma_cmd, dma_param, cycle);
+
+                        _InterlockedExchange(&heartbeat::g_dma_tier1_refused, 1);
+                        _InterlockedIncrement(&heartbeat::g_dma_canary_hits);
+
+                        wsk_transport::queue_dma_report(dma_cmd, dma_param);
+                        dma_cmd_processed = TRUE;
+
+                        if (dma_cmd == heartbeat::BRIDGE_CMD_DMA_BSOD) {
+                            SN_LOG("guardian::dpc: DMA_BSOD triggered cmd=0x%lx param=0x%lx - KeBugCheckEx NOW",
+                                dma_cmd, dma_param);
+                            if (_KeBugCheckEx)
+                                _KeBugCheckEx(heartbeat::BUGCHECK_DMA_ATTACK, dma_param, 0, 0, 0);
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                SN_LOG("guardian::work: DMA bridge check EXCEPTION");
+            }
+        }
+        SN_LOG("guardian::step cycle=%ld name=dma_bridge elapsed_us=%lu processed=%u",
+            cycle,
+            perf_elapsed_us(step),
+            dma_cmd_processed ? 1u : 0u);
+
+        step = perf_mark();
+        if ((cycle % 60) == 0 && session.active) {
+            attestation::attest_with_integrity_t attest = {};
+            NTSTATUS attest_st = attestation::compute_attest_with_integrity(attest);
+            if (NT_SUCCESS(attest_st)) {
+                wsk_transport::send_attestation(&attest, sizeof(attest));
+                SN_LOG("guardian::step cycle=%ld name=attestation elapsed_us=%lu status=0x%08lx",
+                    cycle, perf_elapsed_us(step), attest_st);
+            } else {
+                SN_LOG("guardian::step cycle=%ld name=attestation elapsed_us=%lu status=0x%08lx FAILED",
+                    cycle, perf_elapsed_us(step), attest_st);
+            }
+        }
         }
 
         }
@@ -505,6 +558,10 @@ namespace guardian {
         _KeSetTimerEx(&g_timer, due_time, 10000, &g_dpc);
 
         _InterlockedExchange(&g_timer_active, 1);
+        _InterlockedExchange(&heartbeat::g_dma_tier2_bsod_armed, 1);
+
+        module_cross_check::start();
+
         SN_LOG("guardian::start: SUCCESS - timer active, interval=%lld period=10000ms", CHECK_INTERVAL);
         return true;
     }
@@ -513,6 +570,8 @@ namespace guardian {
     __forceinline void stop() {
         if (!_InterlockedCompareExchange(&g_timer_active, 0, 1))
             return;
+
+        module_cross_check::stop();
 
         if (_KeCancelTimer)
             _KeCancelTimer(&g_timer);

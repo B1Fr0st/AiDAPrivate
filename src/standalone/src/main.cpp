@@ -36,6 +36,7 @@
 #include "core/anti-tamper/hv_preflight.hpp"
 #include "core/anti-tamper/mcp_posture.hpp"
 #include "core/anti-tamper/enforcement.hpp"
+#include "core/anti-tamper/re_tool_preflight.hpp"
 #include "core/runtime/reason_ids.hpp"
 #include "core/mcp/mcp_standalone.hpp"
 #include "core/tools/command_sessions.hpp"
@@ -74,6 +75,9 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <dbghelp.h>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "dbghelp.lib")
@@ -513,7 +517,9 @@ static HICON g_aidaWindowIcon = nullptr;
 
 helpers helper;
 HWND g_hwnd = nullptr;
-static constexpr const wchar_t* kAidaWindowTitle = L"AiDA Standalone";
+static wchar_t g_aidaWindowTitle[128] = L"AiDA Standalone";
+static wchar_t g_aidaClassName[128] = L"AiDAStandaloneWindow";
+static constexpr const wchar_t* kAidaWindowTitle = g_aidaWindowTitle;
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
 static constexpr UINT kAidaUiDispatcherWakeMessage = WM_APP + 0x1DB;
 static constexpr UINT kAidaQueuedPeekFlags = PM_REMOVE | PM_QS_INPUT | PM_QS_POSTMESSAGE | PM_QS_PAINT | PM_QS_SENDMESSAGE;
@@ -2340,7 +2346,7 @@ static HANDLE& single_instance_mutex_handle()
 
 static void focus_existing_aida_window()
 {
-    HWND existing = FindWindowW(L"AiDAStandaloneWindow", kAidaWindowTitle);
+    HWND existing = FindWindowW(g_aidaClassName, g_aidaWindowTitle);
     if (!existing) {
         startup_log_critical_fmt("single_instance_existing_window_missing pid=%lu tid=%lu gle=%lu",
             GetCurrentProcessId(), GetCurrentThreadId(), GetLastError());
@@ -6794,6 +6800,115 @@ static void log_disk_backed_startup_state(const char* phase)
         static_cast<unsigned long long>(tls_slot51));
 }
 
+static std::string get_customer_id_for_window_gen()
+{
+    std::string id = g_sa_settings.license_key;
+    if (id.empty())
+        id = "aida_default_customer";
+    return id;
+}
+
+namespace aida_preflight {
+
+static void base32_encode(const uint8_t* data, size_t data_len, char* out, size_t out_cap)
+{
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    if (!out || out_cap == 0) return;
+    size_t out_idx = 0;
+    size_t bit_buf = 0;
+    int bits_in_buf = 0;
+    for (size_t i = 0; i < data_len && out_idx + 1 < out_cap; ++i) {
+        bit_buf = (bit_buf << 8) | data[i];
+        bits_in_buf += 8;
+        while (bits_in_buf >= 5 && out_idx + 1 < out_cap) {
+            int idx = static_cast<int>((bit_buf >> (bits_in_buf - 5)) & 0x1F);
+            out[out_idx++] = alphabet[idx];
+            bits_in_buf -= 5;
+        }
+    }
+    if (bits_in_buf > 0 && out_idx + 1 < out_cap) {
+        int idx = static_cast<int>((bit_buf << (5 - bits_in_buf)) & 0x1F);
+        out[out_idx++] = alphabet[idx];
+    }
+    out[out_idx] = '\0';
+}
+
+static void sha256_hkdf_extract(const uint8_t* ikm, size_t ikm_len,
+                                const uint8_t* salt, size_t salt_len,
+                                uint8_t out[32])
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0 || !alg)
+        return;
+
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) != 0 || !hash) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return;
+    }
+
+    if (salt && salt_len > 0)
+        BCryptHashData(hash, const_cast<PUCHAR>(salt), static_cast<ULONG>(salt_len), 0);
+    if (ikm && ikm_len > 0)
+        BCryptHashData(hash, const_cast<PUCHAR>(ikm), static_cast<ULONG>(ikm_len), 0);
+    BCryptFinishHash(hash, out, 32, 0);
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(alg, 0);
+}
+
+static void generate_window_class_name(wchar_t* out, size_t out_cap)
+{
+#ifdef AIDA_DEV_MODE
+    wcsncpy_s(out, out_cap, L"AiDA_DevClass", _TRUNCATE);
+    return;
+#else
+    std::string cid = get_customer_id_for_window_gen();
+    const char class_salt[] = ":aida_class_salt";
+    std::string ikm = cid + class_salt;
+
+    uint8_t hash[32] = {};
+    sha256_hkdf_extract(
+        reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
+        nullptr, 0, hash);
+
+    char class_name[32] = {};
+    base32_encode(hash, 10, class_name, sizeof(class_name));
+
+    wchar_t wname[32] = {};
+    MultiByteToWideChar(CP_ACP, 0, class_name, -1, wname, 32);
+    wcsncpy_s(out, out_cap, wname, _TRUNCATE);
+#endif
+}
+
+static void generate_window_title(wchar_t* out, size_t out_cap)
+{
+#ifdef AIDA_DEV_MODE
+    wcsncpy_s(out, out_cap, L"AiDA [DEV BUILD - NOT FOR DISTRIBUTION]", _TRUNCATE);
+    return;
+#else
+    std::string cid = get_customer_id_for_window_gen();
+    const char title_salt[] = ":aida_title_salt";
+    std::string ikm = cid + title_salt;
+
+    uint8_t hash[32] = {};
+    sha256_hkdf_extract(
+        reinterpret_cast<const uint8_t*>(ikm.data()), ikm.size(),
+        nullptr, 0, hash);
+
+    char title_part[32] = {};
+    base32_encode(hash, 8, title_part, sizeof(title_part));
+
+    char full_title[64] = {};
+    _snprintf_s(full_title, sizeof(full_title), _TRUNCATE, "App_%s", title_part);
+
+    wchar_t wtitle[64] = {};
+    MultiByteToWideChar(CP_ACP, 0, full_title, -1, wtitle, 64);
+    wcsncpy_s(out, out_cap, wtitle, _TRUNCATE);
+#endif
+}
+
+}
+
 int main(int, char**)
 {
     aida_early_startup::install();
@@ -7158,6 +7273,28 @@ int main(int, char**)
     crash_log_write("exception_filter_set");
 
     {
+        const uint64_t re_tool_tick = static_cast<uint64_t>(GetTickCount64());
+        startup_log_critical_fmt("re_tool_preflight_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(re_tool_tick));
+        auto re_result = re_tool_preflight::check_window_titles();
+        startup_log_critical_fmt("re_tool_preflight_post re_detected=%d ida_detected=%d elapsed_ms=%llu",
+            re_result.re_tool_detected ? 1 : 0,
+            re_result.ida_detected ? 1 : 0,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - re_tool_tick));
+        crash_log_write("re_tool_preflight_done");
+        if (re_result.re_tool_detected) {
+            startup_log_critical_fmt("re_tool_preflight_refuse sig=%.32ws pid=%lu tid=%lu tick=%llu",
+                re_result.detected_sig ? re_result.detected_sig : L"<null>",
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
+                static_cast<unsigned long long>(GetTickCount64()));
+            re_tool_preflight::show_refuse_dialog_and_exit(re_result);
+        }
+    }
+
+    {
         const uint64_t hv_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("hv_preflight_run_pre pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -7248,6 +7385,41 @@ int main(int, char**)
             settings_loaded ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
         crash_log_write("startup_ban_check_passed");
+
+        {
+            const uint64_t hash_tick = static_cast<uint64_t>(GetTickCount64());
+            std::string server_host = "https://aidapro.net";
+            std::string lic_key = g_sa_settings.license_key;
+            std::string sess_token = standalone_license::get_session_token();
+            startup_log_critical_fmt("re_tool_hash_preflight_pre has_key=%d has_token=%d tick=%llu",
+                !lic_key.empty() ? 1 : 0,
+                !sess_token.empty() ? 1 : 0,
+                static_cast<unsigned long long>(hash_tick));
+            if (!lic_key.empty() && !sess_token.empty()) {
+                auto hashes = re_tool_preflight::fetch_re_tool_hashes(server_host, lic_key, sess_token);
+                startup_log_critical_fmt("re_tool_hash_preflight_post count=%zu elapsed_ms=%llu",
+                    hashes.size(),
+                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
+                if (!hashes.empty()) {
+                    bool hash_match = re_tool_preflight::check_process_hashes(hashes);
+                    if (hash_match) {
+                        startup_log_critical_fmt("re_tool_hash_preflight_refuse pid=%lu tid=%lu tick=%llu",
+                            GetCurrentProcessId(),
+                            GetCurrentThreadId(),
+                            static_cast<unsigned long long>(GetTickCount64()));
+                        re_tool_preflight::preflight_result_t hash_result = {};
+                        hash_result.re_tool_detected = true;
+                        hash_result.detected_sig = L"<hash_match>";
+                        hash_result.detected_title[0] = L'\0';
+                        re_tool_preflight::show_refuse_dialog_and_exit(hash_result);
+                    }
+                }
+            } else {
+                startup_log_critical_fmt("re_tool_hash_preflight_skip no_credentials elapsed_ms=%llu",
+                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
+            }
+            crash_log_write("re_tool_hash_preflight_done");
+        }
     }
 
     HRESULT aumid_hr = ::SetCurrentProcessExplicitAppUserModelID(L"AiDA.Standalone.IDE");
@@ -7263,7 +7435,13 @@ int main(int, char**)
         static_cast<unsigned long>(GetLastError()));
     crash_log_write("dpi_awareness_set");
 
-    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"AiDAStandaloneWindow", nullptr };
+    aida_preflight::generate_window_class_name(g_aidaClassName, 128);
+    aida_preflight::generate_window_title(g_aidaWindowTitle, 128);
+    startup_log_critical_fmt("window_identity_generated class_len=%zu title_len=%zu pid=%lu tid=%lu",
+        wcslen(g_aidaClassName), wcslen(g_aidaWindowTitle),
+        GetCurrentProcessId(), GetCurrentThreadId());
+
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, g_aidaClassName, nullptr };
     startup_log_critical_fmt("register_class_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -8352,7 +8530,6 @@ int main(int, char**)
                     Sleep(1);
                     continue;
                 }
-
                 if (ide_resize_applied) {
                     globals::ui::window_w = (float)resize_w;
                     globals::ui::window_h = (float)resize_h;

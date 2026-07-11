@@ -19,12 +19,12 @@
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
-extern DisasmState g_disasm;
-
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -63,7 +63,35 @@ struct local_state_t {
 	float scrub_anim_v = 0.f;
 };
 
-static local_state_t s_state;
+inline std::mutex& state_registry_mutex()
+{
+	static std::mutex value;
+	return value;
+}
+
+inline std::unordered_map<aida::analysis::binary_id_t,
+	std::shared_ptr<local_state_t>, aida::analysis::binary_id_hash_t>& state_registry()
+{
+	static std::unordered_map<aida::analysis::binary_id_t,
+		std::shared_ptr<local_state_t>, aida::analysis::binary_id_hash_t> value;
+	return value;
+}
+
+inline std::shared_ptr<local_state_t> state_for(
+	const disasm_view::workspace_context_t& context)
+{
+	if (!context.workspace)
+		return {};
+	std::lock_guard<std::mutex> lock(state_registry_mutex());
+	auto& values = state_registry();
+	const auto id = context.workspace->identity().binary_id();
+	auto found = values.find(id);
+	if (found != values.end())
+		return found->second;
+	auto created = std::make_shared<local_state_t>();
+	values.emplace(id, created);
+	return created;
+}
 
 namespace detail {
 
@@ -363,14 +391,21 @@ inline void render_arrow_head(ImDrawList* dl, ImVec2 tip, ImU32 col, float alpha
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
-                   float alpha, float accent_r, float accent_g, float accent_b)
+                   float alpha, float accent_r, float accent_g, float accent_b,
+                   const disasm_view::workspace_context_t& context)
 {
 	(void)pos_x; (void)pos_y; (void)accent_r; (void)accent_g; (void)accent_b;
 
 	ImGui::BeginChild("##taint_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	auto* dl = ImGui::GetWindowDrawList();
-	auto& st = s_state;
+	auto state = state_for(context);
+	if (!state) {
+		ImGui::TextUnformatted("No analysis workspace is selected.");
+		ImGui::EndChild();
+		return;
+	}
+	auto& st = *state;
 
 	ImVec2 wp = ImGui::GetWindowPos();
 	float cx = wp.x;
@@ -732,7 +767,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (clicked) st.selected_row = i;
 			if (dbl) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(n.address, g_disasm);
+				disasm_view::goto_address(n.address, context);
 			}
 
 			auto& fl = st.row_flashes[i];
@@ -923,7 +958,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (clicked) st.selected_row = i;
 			if (dbl) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(n.address, g_disasm);
+				disasm_view::goto_address(n.address, context);
 			}
 
 			auto& fl = st.row_flashes[i];
@@ -990,6 +1025,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopClipRect();
 
 	ImGui::EndChild();
+}
+
+inline void render(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b)
+{
+	render(pos_x, pos_y, width, height, alpha, accent_r, accent_g, accent_b,
+		disasm_view::capture_selected_workspace());
 }
 
 }

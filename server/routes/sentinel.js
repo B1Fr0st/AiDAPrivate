@@ -14,6 +14,112 @@ try { columnCrypt = require('../crypto/column_crypt'); } catch (_) { columnCrypt
 
 const router = express.Router();
 
+const CLONE_MIN_FEATURES = 3;
+
+async function checkSentinelCloneDetection(licenseKey, ip, body) {
+    const toolRegistry = body && body.tool_registry;
+    if (!toolRegistry || typeof toolRegistry !== 'object' || !Array.isArray(toolRegistry.tool_names)) {
+        return { ok: true };
+    }
+
+    const toolNames = toolRegistry.tool_names.filter(n => typeof n === 'string' && n.length > 0);
+    if (toolNames.length < CLONE_MIN_FEATURES) return { ok: true };
+
+    const sortedNames = [...toolNames].sort();
+    const toolNamesHash = crypto.createHash('sha256').update(sortedNames.join('|'), 'utf8').digest('hex');
+    const registrationOrderHash = crypto.createHash('sha256').update(toolNames.join('|'), 'utf8').digest('hex');
+
+    let schemasHash = '';
+    if (toolRegistry.param_schemas && typeof toolRegistry.param_schemas === 'object') {
+        const canonical = JSON.stringify(toolRegistry.param_schemas, Object.keys(toolRegistry.param_schemas).sort());
+        schemasHash = crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+    }
+
+    const fingerprintHash = crypto.createHash('sha256')
+        .update(toolNamesHash + schemasHash + registrationOrderHash, 'utf8')
+        .digest('hex');
+
+    const matchedFeatures = [
+        toolNamesHash ? 1 : 0,
+        schemasHash ? 1 : 0,
+        registrationOrderHash ? 1 : 0,
+    ].filter(x => x === 1).length;
+
+    const now = Math.floor(Date.now() / 1000);
+    const buildVersion = typeof toolRegistry.build_version === 'string' ? toolRegistry.build_version : '';
+    let isKnownClone = false;
+
+    try {
+        const { rows: fpRows } = await pool.query(
+            'SELECT * FROM protocol_fingerprints WHERE fingerprint_hash = $1',
+            [fingerprintHash]
+        );
+        if (fpRows.length > 0) {
+            isKnownClone = !!fpRows[0].is_known_clone;
+            await pool.query(
+                'UPDATE protocol_fingerprints SET last_seen_at = $1 WHERE fingerprint_hash = $2',
+                [now, fingerprintHash]
+            );
+        } else {
+            await pool.query(
+                `INSERT INTO protocol_fingerprints (fingerprint_hash, tool_names_hash, tool_schemas_hash, registration_order_hash, build_version, tool_count, tool_names, first_seen_at, last_seen_at, is_known_clone)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, false)
+                 ON CONFLICT DO NOTHING`,
+                [fingerprintHash, toolNamesHash, schemasHash, registrationOrderHash, buildVersion, toolNames.length, JSON.stringify(toolNames), now, now]
+            );
+        }
+    } catch (err) {
+        if (err && err.code === '42P01') return { ok: true };
+        console.warn('[sentinel] protocol fingerprint check failed:', err && err.message ? err.message : err);
+        return { ok: true };
+    }
+
+    if (isKnownClone) {
+        await recordSentinelEvent(licenseKey, '', 'known_clone_fingerprint', 'critical',
+            { fingerprint_hash: fingerprintHash, tool_count: toolNames.length, ip }, ip, undefined, undefined, 0);
+        return { ok: false, reason: 'known_clone_fingerprint', kill: true };
+    }
+
+    let hasValidLicense = false;
+    if (licenseKey) {
+        try {
+            const { rows: licRows } = await pool.query(
+                'SELECT active FROM licenses WHERE key = $1 AND active = true',
+                [licenseKey]
+            );
+            hasValidLicense = licRows.length > 0;
+        } catch (_) { }
+    }
+
+    if (!hasValidLicense && matchedFeatures >= CLONE_MIN_FEATURES) {
+        try {
+            await pool.query(
+                `INSERT INTO clone_detection_log (source_ip, license_key, tool_names_hash, registration_order_hash, matched_known_build, has_valid_license, has_valid_session, detected_at, evidence)
+                 VALUES ($1, $2, $3, $4, $5, false, false, $6, $7::jsonb)`,
+                [ip || '', licenseKey || '', toolNamesHash, registrationOrderHash, true, now,
+                 JSON.stringify({ fingerprint_hash: fingerprintHash, tool_count: toolNames.length, build_version: buildVersion, matched_features: matchedFeatures })]
+            );
+            const normalizedIp = (ip || '').replace(/[.:]/g, '_');
+            if (normalizedIp) {
+                await pool.query(
+                    `INSERT INTO bans (ban_type, value, reason, banned_at, banned_at_iso, plugin_version, ip, original_ip, banned_by)
+                     VALUES ('ip', $1, 'clone_detection_no_license', $2, $3, 'unknown', $4, $4, 'system')
+                     ON CONFLICT (ban_type, value) DO UPDATE SET reason = EXCLUDED.reason, banned_at = EXCLUDED.banned_at`,
+                    [normalizedIp, now, new Date().toISOString(), ip || '']
+                );
+            }
+        } catch (err) {
+            if (err && err.code === '42P01') return { ok: true };
+            console.warn('[sentinel] clone detection log failed:', err && err.message ? err.message : err);
+        }
+        await recordSentinelEvent(licenseKey, '', 'clone_detected_no_license', 'critical',
+            { fingerprint_hash: fingerprintHash, tool_count: toolNames.length, ip, matched_features: matchedFeatures }, ip, undefined, undefined, 0);
+        return { ok: false, reason: 'clone_detected_no_license', block_ip: true };
+    }
+
+    return { ok: true };
+}
+
 async function verifyAttestBindToken(req) {
     const body = req.body || {};
     const provided = typeof body.bind_token === 'string' ? body.bind_token.trim().toLowerCase() : '';
@@ -83,6 +189,8 @@ const ATTEST_HMAC_LABEL = 'aida/attest/v1';
 const KW_ISSUANCE_LABEL = 'aida/kw_issuance/v1';
 const RING_BUFFER_MAX = parseInt(process.env.SENTINEL_RING_MAX || '2048', 10);
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
+const REASON_SELF_ANALYSIS_ATTEMPT = 0xAE40;
+const SELF_ANALYSIS_EVENT_TYPE = 'self_analysis_attempt';
 
 function clientIp(req) {
     return (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
@@ -149,6 +257,89 @@ async function recordSentinelViolation(licenseKey, quorumId, reason, evidence, i
         { name: 'NT Build', value: ntBuild || 'unknown' },
         { name: 'Evidence', value: JSON.stringify(evidence || {}) },
     ], 0xFF0000);
+}
+
+async function recordSelfAnalysisAttempt(licenseKey, quorumId, eventPayload, ip) {
+    const hwidHash = typeof eventPayload.hwid_hash === 'string' ? eventPayload.hwid_hash.slice(0, 64) : '';
+    const licenseKeyHashInput = typeof eventPayload.license_key_hash === 'string' ? eventPayload.license_key_hash.trim().toLowerCase() : '';
+    const licenseKeyHash = licenseKeyHashInput && /^[0-9a-f]{64}$/.test(licenseKeyHashInput)
+        ? licenseKeyHashInput
+        : (licenseKey ? crypto.createHash('sha256').update(licenseKey).digest('hex') : null);
+    const toolName = typeof eventPayload.tool_name === 'string' ? eventPayload.tool_name.slice(0, 128) : null;
+    const detectionType = typeof eventPayload.detection_type === 'number' && Number.isFinite(eventPayload.detection_type)
+        ? Math.floor(eventPayload.detection_type) : 0;
+    const targetPid = typeof eventPayload.target_pid === 'number' && Number.isFinite(eventPayload.target_pid)
+        ? Math.floor(eventPayload.target_pid) : null;
+    const targetAddress = typeof eventPayload.target_address === 'number' && Number.isFinite(eventPayload.target_address)
+        ? Math.floor(eventPayload.target_address) : null;
+
+    if (!hwidHash) return;
+
+    try {
+        await pool.query(
+            `INSERT INTO self_analysis_attempts (hwid_hash, license_key_hash, tool_name, detection_type, target_pid, target_address)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [hwidHash, licenseKeyHash, toolName, detectionType, targetPid, targetAddress]
+        );
+    } catch (err) {
+        console.warn('[sentinel] self_analysis_attempt persist failed:', err && err.message ? err.message : err);
+    }
+
+    if (licenseKey) {
+        try {
+            const now = Math.floor(Date.now() / 1000);
+            await pool.query(
+                `UPDATE licenses
+                    SET flagged = true,
+                        flagged_reason = $1,
+                        flagged_at = $2,
+                        flagged_score = 1.0
+                  WHERE key = $3`,
+                [`self_analysis_attempt:tool=${toolName || 'unknown'}:type=${detectionType}`, now, licenseKey]
+            );
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [licenseKey]);
+        } catch (err) {
+            console.warn('[sentinel] self_analysis_attempt license flag failed:', err && err.message ? err.message : err);
+        }
+    }
+
+    await sendDiscordWebhook('AiDA Self-Analysis Attempt Detected', [
+        { name: 'Tool', value: toolName || 'unknown' },
+        { name: 'Detection Type', value: String(detectionType) },
+        { name: 'HWID', value: `\`${hwidHash.slice(0, 32)}...\`` },
+        { name: 'License', value: licenseKey ? `\`${licenseKey}\`` : 'unknown' },
+        { name: 'IP', value: `\`${ip || 'unknown'}\`` },
+        { name: 'Target PID', value: targetPid !== null ? String(targetPid) : 'n/a' },
+        { name: 'Target Address', value: targetAddress !== null ? `0x${targetAddress.toString(16)}` : 'n/a' },
+    ], 0xFF0044);
+}
+
+async function getSelfAnalysisBlocklist() {
+    try {
+        const now = Math.floor(Date.now() / 1000);
+        const { rows } = await pool.query(
+            `SELECT image_hash, watermark, name_pattern, flags, blocklist_epoch, expires_at
+               FROM self_analysis_blocklist
+              WHERE active = true
+                AND (expires_at = 0 OR expires_at > $1)
+              ORDER BY blocklist_epoch DESC, id ASC
+              LIMIT 64`,
+            [now]
+        );
+        if (rows.length === 0) return null;
+        const maxEpoch = rows.reduce((mx, r) => Math.max(mx, Number(r.blocklist_epoch || 0)), 0);
+        const entries = rows.map(r => ({
+            image_hash: String(r.image_hash || ''),
+            watermark: String(r.watermark || ''),
+            name_pattern: String(r.name_pattern || ''),
+            flags: Number(r.flags || 0),
+            expires_at: Number(r.expires_at || 0),
+        }));
+        return { blocklist_epoch: maxEpoch, entries };
+    } catch (err) {
+        console.warn('[sentinel] blocklist query failed:', err && err.message ? err.message : err);
+        return null;
+    }
 }
 
 async function upsertQuorumSeen(licenseKey, quorumId, ntBuild, hvci) {
@@ -380,6 +571,173 @@ async function recordPeerCodeHash(licenseKey, quorumId, peerHashHex, hvci, ntBui
     }
 }
 
+const INTEGRITY_ATTEST_NONCE_TTL_MS = 10 * 60 * 1000;
+const INTEGRITY_ATTEST_TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
+const KNOWN_INTEGRITY_NONCES = new Map();
+
+async function getBuildTextHash(buildId) {
+    if (!buildId || typeof buildId !== 'string') return null;
+    try {
+        const { rows } = await pool.query(
+            'SELECT expected_text_sha256 FROM builds WHERE build_id = $1 AND (retired IS NULL OR retired = false)',
+            [buildId]
+        );
+        if (rows.length > 0 && rows[0].expected_text_sha256) {
+            return rows[0].expected_text_sha256;
+        }
+    } catch (err) {
+        console.warn('[sentinel] getBuildTextHash failed:', err && err.message ? err.message : err);
+    }
+    return null;
+}
+
+async function storeIntegrityAttestation(hwidHash, nonce, usermodeCodeHash, buildId, timestamp) {
+    try {
+        await pool.query(
+            `INSERT INTO attestation_records
+                (hwid_hash, nonce, usermode_code_hash, build_id, timestamp, created_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())`,
+            [hwidHash, nonce, usermodeCodeHash, buildId, timestamp]
+        );
+    } catch (err) {
+        console.warn('[sentinel] storeIntegrityAttestation failed:', err && err.message ? err.message : err);
+    }
+}
+
+router.post('/integrity-attest', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const {
+            nonce,
+            usermode_code_hash,
+            timestamp,
+            hardware_id,
+            build_id,
+            hmac,
+        } = body;
+
+        if (!nonce || typeof nonce !== 'string' || !/^[0-9a-f]{32}$/.test(nonce)) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_nonce' });
+        }
+        if (!usermode_code_hash || typeof usermode_code_hash !== 'string' || !/^[0-9a-f]{64}$/.test(usermode_code_hash)) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_usermode_code_hash' });
+        }
+        if (typeof timestamp !== 'number' && typeof timestamp !== 'string') {
+            return res.status(400).json({ status: 'error', reason: 'invalid_timestamp' });
+        }
+        if (!hardware_id || typeof hardware_id !== 'string' || !/^[0-9a-f]{64}$/.test(hardware_id)) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_hardware_id' });
+        }
+        if (!build_id || typeof build_id !== 'string' || !/^[0-9a-f]{32}$/.test(build_id)) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_build_id' });
+        }
+        if (!hmac || typeof hmac !== 'string' || !/^[0-9a-f]{64}$/.test(hmac)) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_hmac' });
+        }
+
+        const { rows: licRows } = await pool.query(
+            'SELECT key, active, witness_key_wrapped FROM licenses WHERE hardware_id_sha256 = $1',
+            [hardware_id]
+        );
+        if (licRows.length === 0) {
+            return res.status(403).json({ status: 'error', reason: 'license_not_found' });
+        }
+        const lic = licRows[0];
+        if (!lic.active) {
+            return res.status(403).json({ status: 'error', reason: 'license_inactive' });
+        }
+
+        let witnessKey;
+        try {
+            witnessKey = kw.unwrap(lic.witness_key_wrapped, 'kw/v1');
+        } catch (err) {
+            console.error('[sentinel] integrity-attest witness key unwrap failed:', err.message);
+            return res.status(500).json({ status: 'error', reason: 'witness_key_unwrap_failed' });
+        }
+
+        const tsVal = typeof timestamp === 'string' ? timestamp : String(timestamp);
+        const tsBigInt = BigInt(tsVal);
+        const WINDOWS_EPOCH_DIFF_MS = 11644473600000;
+        const tsMs = Math.floor(Number(tsBigInt / 10000n) - BigInt(WINDOWS_EPOCH_DIFF_MS));
+        const hmacInput = Buffer.concat([
+            Buffer.from(nonce, 'hex'),
+            Buffer.from(usermode_code_hash, 'hex'),
+            Buffer.from(new BigInt64Array([tsBigInt]).buffer),
+            Buffer.from(hardware_id, 'hex'),
+            Buffer.from(build_id, 'hex'),
+        ]);
+        const expectedHmac = crypto.createHmac('sha256', witnessKey)
+            .update(hmacInput)
+            .digest('hex');
+
+        const hmacA = Buffer.from(expectedHmac, 'hex');
+        const hmacB = Buffer.from(hmac, 'hex');
+        if (hmacA.length !== hmacB.length || !crypto.timingSafeEqual(hmacA, hmacB)) {
+            await recordSentinelEvent(lic.key, '', 'integrity_attest_hmac_fail', 'critical',
+                { hardware_id, build_id }, clientIp(req), undefined, undefined, 0);
+            return res.status(403).json({ status: 'error', reason: 'attestation_hmac_invalid' });
+        }
+
+        const nonceKey = `${hardware_id}:${nonce}`;
+        const now = Date.now();
+        if (KNOWN_INTEGRITY_NONCES.has(nonceKey)) {
+            await recordSentinelEvent(lic.key, '', 'integrity_attest_nonce_replay', 'critical',
+                { nonce, hardware_id }, clientIp(req), undefined, undefined, 0);
+            return res.status(409).json({ status: 'error', reason: 'nonce_replay' });
+        }
+        KNOWN_INTEGRITY_NONCES.set(nonceKey, now);
+        for (const [k, ts] of KNOWN_INTEGRITY_NONCES) {
+            if (now - ts > INTEGRITY_ATTEST_NONCE_TTL_MS) KNOWN_INTEGRITY_NONCES.delete(k);
+        }
+
+        if (Math.abs(now - tsMs) > INTEGRITY_ATTEST_TIMESTAMP_WINDOW_MS) {
+            await recordSentinelEvent(lic.key, '', 'integrity_attest_timestamp_stale', 'warn',
+                { timestamp: tsMs, server_now: now }, clientIp(req), undefined, undefined, 0);
+            return res.status(409).json({ status: 'error', reason: 'timestamp_stale' });
+        }
+
+        const expectedHash = await getBuildTextHash(build_id);
+        if (!expectedHash) {
+            await recordSentinelEvent(lic.key, '', 'integrity_attest_unknown_build', 'warn',
+                { build_id }, clientIp(req), undefined, undefined, 0);
+            return res.status(400).json({ status: 'error', reason: 'unknown_build_version' });
+        }
+
+        if (usermode_code_hash !== expectedHash) {
+            await recordSentinelEvent(lic.key, '', 'integrity_violation', 'critical',
+                { expected: expectedHash, observed: usermode_code_hash, build_id, hardware_id },
+                clientIp(req), undefined, undefined, 0);
+            try {
+                await pool.query(
+                    'UPDATE sessions SET kill_flag = true WHERE license_key = $1',
+                    [lic.key]
+                );
+            } catch (_) {}
+            try {
+                await pool.query(
+                    'UPDATE licenses SET active = false WHERE key = $1',
+                    [lic.key]
+                );
+            } catch (_) {}
+            return res.status(403).json({ status: 'error', reason: 'integrity_violation' });
+        }
+
+        await storeIntegrityAttestation(hardware_id, nonce, usermode_code_hash, build_id, tsMs);
+
+        await recordSentinelEvent(lic.key, '', 'integrity_attest_ok', 'info',
+            { build_id, hardware_id }, clientIp(req), undefined, undefined, 0);
+
+        return res.json(canonicalResponse.buildEnvelope({
+            status: 'ok',
+            verified_at: Math.floor(now / 1000),
+            build_id,
+        }));
+    } catch (err) {
+        console.error('[sentinel] /integrity-attest error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
 router.post('/heartbeat', async (req, res) => {
     try {
         const {
@@ -401,6 +759,16 @@ router.post('/heartbeat', async (req, res) => {
         if (!lic || !lic.active) return res.status(403).json({ status: 'error', reason: 'license_inactive' });
 
         const ip = clientIp(req);
+
+        const cloneCheck = await checkSentinelCloneDetection(license_key, ip, req.body || {});
+        if (!cloneCheck.ok) {
+            if (cloneCheck.kill) {
+                await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+                return res.status(403).json({ status: 'error', reason: cloneCheck.reason || 'clone_detected' });
+            }
+            return res.status(403).json({ status: 'error', reason: cloneCheck.reason || 'clone_detected' });
+        }
+
         await upsertQuorumSeen(license_key, quorum_id, nt_build, hvci_enabled);
         if (typeof peer_code_hash === 'string' && peer_code_hash.length > 0) {
             await recordPeerCodeHash(license_key, quorum_id, peer_code_hash, hvci_enabled, nt_build, ip);
@@ -412,6 +780,14 @@ router.post('/heartbeat', async (req, res) => {
             const type = String(ev.type || 'unknown').slice(0, 64);
             const sev = ['info', 'warn', 'critical'].includes(ev.severity) ? ev.severity : 'info';
             await recordSentinelEvent(license_key, quorum_id, type, sev, ev.payload || {}, ip, hvci_enabled, nt_build, boot_count);
+
+            const evReason = typeof ev.reason === 'number' ? ev.reason : (ev.payload && typeof ev.payload.reason === 'number' ? ev.payload.reason : null);
+            const isSelfAnalysis = type === SELF_ANALYSIS_EVENT_TYPE
+                || evReason === REASON_SELF_ANALYSIS_ATTEMPT
+                || (ev.payload && ev.payload.self_analysis === true);
+            if (isSelfAnalysis) {
+                await recordSelfAnalysisAttempt(license_key, quorum_id, ev.payload || {}, ip);
+            }
         }
 
         const sensorDeviations = [];
@@ -479,6 +855,12 @@ router.post('/heartbeat', async (req, res) => {
             kill_flag: killFlag,
             next_interval_seconds: liveQuorum >= 2 ? 45 : 20,
         };
+
+        const blocklist = await getSelfAnalysisBlocklist();
+        if (blocklist) {
+            response.blocklist = blocklist;
+        }
+
         return res.json(canonicalResponse.buildEnvelope(response));
     } catch (err) {
         console.error('[sentinel] /heartbeat error:', err);
@@ -500,6 +882,98 @@ router.post('/honeypot', async (req, res) => {
         return res.json({ status: 'ok', killed: true });
     } catch (err) {
         console.error('[sentinel] /honeypot error:', err);
+        return res.status(500).json({ status: 'error', reason: 'internal_error' });
+    }
+});
+
+
+const VALID_DMA_ATTACK_TYPES = new Set([
+    'iommu_bypass', 'unknown_pcie', 'ept_hook', 'pte_tamper', 'canary_hit',
+]);
+
+router.post('/dma-report', async (req, res) => {
+    try {
+        const body = req.body || {};
+        const licenseKey = req.aidaSession ? req.aidaSession.license_key : '';
+        const sessionHwid = req.aidaSession ? req.aidaSession.hwid : '';
+
+        if (!licenseKey) {
+            return res.status(403).json({ status: 'error', reason: 'auth_required' });
+        }
+
+        const hwid = typeof body.hwid === 'string' ? body.hwid.trim() : (sessionHwid || '');
+        if (!hwid || hwid.length > 128) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_hwid' });
+        }
+
+        const attackType = typeof body.attack_type === 'string' ? body.attack_type.trim().toLowerCase() : '';
+        if (!VALID_DMA_ATTACK_TYPES.has(attackType)) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_attack_type' });
+        }
+
+        const detectionType = typeof body.detection_type === 'number' && Number.isFinite(body.detection_type)
+            ? Math.floor(body.detection_type) : 0;
+        if (detectionType < 0 || detectionType > 65535) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_detection_type' });
+        }
+
+        const tier = typeof body.tier === 'number' && Number.isFinite(body.tier)
+            ? Math.floor(body.tier) : 0;
+        if (tier < 0 || tier > 2) {
+            return res.status(400).json({ status: 'error', reason: 'invalid_tier' });
+        }
+
+        const evidenceHash = typeof body.evidence_hash === 'number' && Number.isFinite(body.evidence_hash)
+            ? Math.floor(body.evidence_hash) : null;
+
+        const licenseKeyHashInput = typeof body.license_key_hash === 'string' ? body.license_key_hash.trim().toLowerCase() : '';
+        const licenseKeyHash = licenseKeyHashInput && /^[0-9a-f]{64}$/.test(licenseKeyHashInput)
+            ? licenseKeyHashInput
+            : crypto.createHash('sha256').update(licenseKey).digest('hex');
+
+        const ip = clientIp(req);
+
+        await pool.query(
+            `INSERT INTO dma_attack_log (hwid_hash, license_key_hash, attack_type, detection_type, tier, evidence_hash)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [hwid.slice(0, 64), licenseKeyHash, attackType, detectionType, tier, evidenceHash]
+        );
+
+        const shouldFlag = (attackType === 'canary_hit' && tier === 2) || tier === 2;
+
+        if (shouldFlag) {
+            const now = Math.floor(Date.now() / 1000);
+            await pool.query(
+                `UPDATE licenses
+                    SET flagged = true,
+                        flagged_reason = $1,
+                        flagged_at = $2,
+                        flagged_score = 1.0
+                  WHERE key = $3`,
+                [`dma_attack:${attackType}:tier${tier}`, now, licenseKey]
+            );
+            await pool.query(
+                'UPDATE sessions SET kill_flag = true WHERE license_key = $1',
+                [licenseKey]
+            );
+            await sendDiscordWebhook('AiDA DMA Attack Detected', [
+                { name: 'Attack Type', value: attackType },
+                { name: 'Tier', value: String(tier) },
+                { name: 'Detection', value: String(detectionType) },
+                { name: 'License', value: `\`${licenseKey}\`` },
+                { name: 'HWID', value: `\`${hwid.slice(0, 32)}...\`` },
+                { name: 'IP', value: `\`${ip}\`` },
+                { name: 'Evidence Hash', value: evidenceHash !== null ? `0x${evidenceHash.toString(16)}` : 'none' },
+            ], 0xFF0066);
+        }
+
+        return res.json(canonicalResponse.buildEnvelope({
+            status: 'ok',
+            logged: true,
+            flagged: shouldFlag,
+        }));
+    } catch (err) {
+        console.error('[sentinel] /dma-report error:', err);
         return res.status(500).json({ status: 'error', reason: 'internal_error' });
     }
 });

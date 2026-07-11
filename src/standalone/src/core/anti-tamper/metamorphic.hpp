@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "integrity.hpp"
+#include "anti_symbolic.hpp"
+#include "webhook.hpp"
 
 namespace anti_tamper {
 namespace metamorphic {
@@ -339,6 +341,205 @@ namespace mba {
         return (base ^ mba) * c2;
     }
 
+    __forceinline uint64_t mba_add_plain(uint64_t a, uint64_t b)
+    {
+        return (a ^ b) + 2 * (a & b);
+    }
+
+    __forceinline uint64_t mba_xor_plain(uint64_t a, uint64_t b)
+    {
+        return (a | b) - (a & b);
+    }
+
+    __forceinline uint64_t mba_and_plain(uint64_t a, uint64_t b)
+    {
+        return (a + b) - (a | b);
+    }
+
+    __forceinline uint64_t mba_or_plain(uint64_t a, uint64_t b)
+    {
+        return (a + b) - (a & b);
+    }
+
+    __forceinline uint64_t mba_not_plain(uint64_t a)
+    {
+        return a ^ 0xFFFFFFFFFFFFFFFFULL;
+    }
+
+    __forceinline uint64_t environmental_mba_chain(
+        uint64_t input,
+        const anti_symbolic::env_bundle_t& env)
+    {
+        uint64_t layer1 = mba_xor_plain(input, env.server_hmac);
+        uint64_t ka_rotated = _rotl64(env.kernel_attestation, 23);
+        uint64_t layer2 = mba_add_plain(layer1, ka_rotated);
+        uint64_t layer3 = mba_and_plain(layer2, env.rdtsc_delta);
+        uint64_t layer4 = mba_xor_plain(layer3, env.process_state);
+        return layer4;
+    }
+
+    __forceinline uint64_t deep_mba_nest(uint64_t x, uint64_t env_val)
+    {
+        uint64_t layer1 = (x ^ (x - 1)) + ((~x & (x - 1)) | (x & ~(x - 1)));
+        uint64_t layer2 = mba_xor_plain(layer1, env_val);
+        uint64_t not_env = mba_not_plain(env_val);
+        uint64_t layer3 = mba_add_plain(layer2, not_env);
+        uint64_t or_val = mba_or_plain(layer2, env_val);
+        uint64_t layer4 = mba_and_plain(layer3, or_val);
+        return layer4;
+    }
+
+    __forceinline uint64_t fs_hash_mba(uint64_t input, uint64_t fs_hash)
+    {
+        uint64_t step1 = mba_xor_plain(input, fs_hash);
+        uint64_t step2 = mba_add_plain(step1, mba_not_plain(fs_hash));
+        uint64_t step3 = mba_and_plain(step2, _rotl64(fs_hash, 17));
+        uint64_t step4 = mba_xor_plain(step3, input);
+        return step4;
+    }
+
+    struct mba_test_pair_t
+    {
+        uint64_t a;
+        uint64_t b;
+    };
+
+    static const mba_test_pair_t s_mba_test_vectors[1000] = {
+#include "mba_test_vectors.inc"
+    };
+
+    static const uint64_t s_keyed_entropy_values[42] = {
+        0x0000000000000000ULL, 0x08D12E6B76C84D11ULL,
+        0x1715609F7C746C69ULL, 0x2344B9ADDB213444ULL,
+        0x2E2AC13EF8E8D8D2ULL, 0x33500733FC7D6606ULL,
+        0x35E2AA2E7E47ACA0ULL, 0x3C6EF372FE94F82AULL,
+        0x454021DE755D453BULL, 0x4E115049EC25924CULL,
+        0x538454127B096493ULL, 0x56E27EB562EDDF5DULL,
+        0x5C55827DF1D1B1A4ULL, 0x6526B0E96899FEB5ULL,
+        0x6A99B4B1F77DD0FCULL, 0x74E4409BFEA6EB64ULL,
+        0x76C90DC0562A98D7ULL, 0x78DDE6E5FD29F054ULL,
+        0x7B7089E07EF436EEULL, 0x81AF155173F23D65ULL,
+        0x8FF34785799E5CBDULL, 0x9285EA7FFB68A357ULL,
+        0x95188D7A7D32E9F1ULL, 0x97AB3074FEFD308BULL,
+        0x98C475F0F066A9CEULL, 0x9E3779B97F4A7C15ULL,
+        0xA708A824F612C926ULL, 0xB54CDA58FBBEE87EULL,
+        0xBA72204DFF5375B2ULL, 0xC6EF372FE94F82A0ULL,
+        0xCC623AF8783354E7ULL, 0xCFC0659B6017CFB1ULL,
+        0xD41A23E7FD9228B5ULL, 0xD5336963EEFBA1F8ULL,
+        0xD6ACC6E27F5C6F4FULL, 0xDAA66D2C7DDF743FULL,
+        0xDD391026FFA9BAD9ULL, 0xDE0497CF65C3EF09ULL,
+        0xE3779B97F4A7C150ULL, 0xEC5B24327F181D62ULL,
+        0xF1BBCDCBFA53E0A8ULL, 0xF6E113C0FDE86DDCULL,
+    };
+
+    inline uint32_t verify_mba_correctness()
+    {
+        uint32_t fail_count = 0;
+
+        for (int i = 0; i < 1000; ++i)
+        {
+            uint64_t a = s_mba_test_vectors[i].a;
+            uint64_t b = s_mba_test_vectors[i].b;
+
+            if (mba_add_plain(a, b) != (a + b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_add idx=%d a=0x%016llX b=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b);
+            }
+            if (mba_xor_plain(a, b) != (a ^ b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_xor idx=%d a=0x%016llX b=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b);
+            }
+            if (mba_and_plain(a, b) != (a & b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_and idx=%d a=0x%016llX b=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b);
+            }
+            if (mba_or_plain(a, b) != (a | b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_or idx=%d a=0x%016llX b=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b);
+            }
+        }
+
+        for (int e = 0; e < 42; ++e)
+        {
+            uint64_t ent = s_keyed_entropy_values[e];
+            for (int i = 0; i < 1000; ++i)
+            {
+                uint64_t a = s_mba_test_vectors[i].a;
+                uint64_t b = s_mba_test_vectors[i].b;
+
+                if (keyed_xor(a, b, ent) != (a ^ b))
+                {
+                    ++fail_count;
+                    if (fail_count <= 4)
+                        webhook::write_log_critical_fmt("metamorphic",
+                            "mba_verify_fail keyed_xor ent_idx=%d vec_idx=%d "
+                            "ent=0x%016llX a=0x%016llX b=0x%016llX",
+                            e, i, (unsigned long long)ent,
+                            (unsigned long long)a, (unsigned long long)b);
+                }
+                if (keyed_add(a, b, ent) != (a + b))
+                {
+                    ++fail_count;
+                    if (fail_count <= 4)
+                        webhook::write_log_critical_fmt("metamorphic",
+                            "mba_verify_fail keyed_add ent_idx=%d vec_idx=%d "
+                            "ent=0x%016llX a=0x%016llX b=0x%016llX",
+                            e, i, (unsigned long long)ent,
+                            (unsigned long long)a, (unsigned long long)b);
+                }
+                if (keyed_and(a, b, ent) != (a & b))
+                {
+                    ++fail_count;
+                    if (fail_count <= 4)
+                        webhook::write_log_critical_fmt("metamorphic",
+                            "mba_verify_fail keyed_and ent_idx=%d vec_idx=%d "
+                            "ent=0x%016llX a=0x%016llX b=0x%016llX",
+                            e, i, (unsigned long long)ent,
+                            (unsigned long long)a, (unsigned long long)b);
+                }
+                if (keyed_or(a, b, ent) != (a | b))
+                {
+                    ++fail_count;
+                    if (fail_count <= 4)
+                        webhook::write_log_critical_fmt("metamorphic",
+                            "mba_verify_fail keyed_or ent_idx=%d vec_idx=%d "
+                            "ent=0x%016llX a=0x%016llX b=0x%016llX",
+                            e, i, (unsigned long long)ent,
+                            (unsigned long long)a, (unsigned long long)b);
+                }
+            }
+        }
+
+        if (fail_count > 0)
+        {
+            webhook::write_log_critical_fmt("metamorphic",
+                "mba_verify_complete failures=%u total_tests=%d",
+                fail_count, 4000 + 42 * 4000);
+        }
+        else
+        {
+            webhook::write_log("metamorphic", "mba_verify_ok all_primitives_correct");
+        }
+
+        return fail_count;
+    }
+
 }
 
 struct decryptor_stub_t
@@ -556,6 +757,7 @@ inline void initialize()
 {
     uint64_t seed = __rdtsc() ^ GetCurrentProcessId() ^ reinterpret_cast<uint64_t>(&detail::get_regmap);
     detail::generate_register_map(seed);
+    mba::verify_mba_correctness();
 }
 
 }

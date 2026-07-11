@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "workspace/analysis_workspace.hpp"
 
 namespace aida {
 namespace binary_map {
@@ -68,14 +71,21 @@ namespace binary_map {
 		int64_t                      generated_unix = 0;
 	};
 
-	bool                  generate(const map_options_t& opts, map_t& out);
+	bool                  generate(const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const map_options_t& opts, map_t& out);
 	std::string           render_text(const map_t& map, const map_options_t& opts);
-	bool                  pin_function(uint64_t va);
-	bool                  unpin_function(uint64_t va);
-	std::vector<uint64_t> pinned_functions();
-	bool                  clear_cache();
+	bool                  pin_function(const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		uint64_t va);
+	bool                  unpin_function(const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		uint64_t va);
+	std::vector<uint64_t> pinned_functions(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace);
+	bool                  clear_cache(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace);
 	const std::string&    last_error();
-	std::string           auto_inject_text(size_t max_chars);
+	std::string           auto_inject_text(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		size_t max_chars);
 
 }
 }

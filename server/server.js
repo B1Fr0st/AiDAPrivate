@@ -56,6 +56,20 @@
         'BOOTSTRAP_TOKEN_SECRET_B64',
         'BOOTSTRAP_TOKEN_TTL_SECONDS',
         'BOOTSTRAP_TOKEN_BIND_IP',
+        'AIDA_BUILD_MASTER_KEY_B64',
+        'ADMIN_HMAC_SECRET_B64',
+        'AIDA_PERSONALIZER_PATH',
+        'AIDA_PERSONALIZER_SHA256',
+        'AIDA_TEMPLATE_DIR',
+        'AIDA_OUTPUT_DIR',
+        'AIDA_BUILD_TMP_DIR',
+        'AIDA_BUILD_TIMEOUT_SECONDS',
+        'AIDA_BUILD_ADAPTIVE_EXTENSION_SECONDS',
+        'AIDA_OUTPUT_TTL_SECONDS',
+        'AIDA_BUILD_CLEANUP_INTERVAL_SECONDS',
+        'AIDA_BUILD_API_RATE_LIMIT_PER_MINUTE',
+        'AIDA_BUILD_RATE_LIMIT_PER_HOUR',
+        'AIDA_STRICT_TEMPLATE_VERSION',
     ]);
     for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
         const t = line.trim();
@@ -90,6 +104,8 @@ const attestationRoutes = require('./routes/attestation');
 const serverInfoRoutes = require('./routes/server_info');
 const bootstrapRoutes = require('./routes/bootstrap');
 const customerDownloadRoutes = require('./routes/customer_download');
+const buildRoutes = require('./routes/build');
+const honeypotRoutes = require('./routes/honeypot');
 const tlsExporter = require('./crypto/tls_exporter');
 const killSwitch = require('./middleware/kill_switch');
 
@@ -126,7 +142,7 @@ const corsOrigins = corsOriginEnv === '*' ? '*' : corsOriginEnv.split(',').map(s
 app.use(cors({
     origin: corsOrigins,
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-TLS-Exporter', 'X-Challenge-Id', 'X-Challenge-Signature', 'X-Sentinel-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-TLS-Exporter', 'X-Challenge-Id', 'X-Challenge-Signature', 'X-Sentinel-Token', 'X-Bot-Signature', 'X-Admin-Signature'],
 }));
 app.use(express.json({
     limit: '1mb',
@@ -184,6 +200,7 @@ app.use('/api/download', killSwitch.middleware);
 app.use('/api/arc', killSwitch.middleware);
 app.use('/api/bootstrap', killSwitch.middleware);
 app.use('/api/customer-download', killSwitch.middleware);
+app.use('/api/build', killSwitch.middleware);
 app.use('/validateLicense', killSwitch.middleware);
 
 app.use('/api/', tlsExporter.middleware);
@@ -253,6 +270,22 @@ const bootstrapApiLimiter = rateLimit({
     },
 });
 
+const buildApiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: positiveIntEnv('AIDA_BUILD_API_RATE_LIMIT_PER_MINUTE', 20),
+    standardHeaders: true,
+    legacyHeaders: false,
+    passOnStoreError: false,
+    skipFailedRequests: false,
+    skipSuccessfulRequests: false,
+    keyGenerator: (req) => {
+        return clientIp(req);
+    },
+    handler: (_req, res) => {
+        res.status(429).json({ status: 'error', reason: 'build_api_rate_limited' });
+    },
+});
+
 app.use((req, res, next) => {
     if (req.path === '/' || req.path === '/kill') {
         const bodyAction = (req.body && typeof req.body === 'object') ? req.body.action : null;
@@ -271,6 +304,7 @@ app.use('/api/attestation', attestationRoutes);
 app.use('/api/server_info', serverInfoRoutes);
 app.use('/api/bootstrap', bootstrapApiLimiter, bootstrapRoutes.router);
 app.use('/api/customer-download', customerDownloadRoutes.router);
+app.use('/api/build', buildApiLimiter, buildRoutes.router);
 const bootstrapScriptRoutes = bootstrapRoutes.getScriptRouteConfig();
 if (bootstrapScriptRoutes.root_content_negotiation) {
     app.get('/', bootstrapScriptLimiter, bootstrapRoutes.rootScriptHandler);
@@ -288,11 +322,15 @@ app.get('/d/a/:token', customerDownloadRoutes.landingHandler);
 app.use('/api/download', downloadRoutes);
 app.use('/api/arc', downloadRoutes);
 app.use('/api/arc/function', functionsRoutes);
+app.use('/api/honeypot', honeypotRoutes);
 
 
 app.get('/health', (_req, res) => {
     res.json({ status: 'ok', timestamp: Date.now() });
 });
+
+const buildQueue = require('./workers/build_queue');
+buildQueue.start();
 
 
 app.use((_req, res) => {

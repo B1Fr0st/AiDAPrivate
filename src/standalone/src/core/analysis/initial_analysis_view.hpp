@@ -6,982 +6,468 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
 #include <windows.h>
-#include <commdlg.h>
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
 #include "initial_analysis.hpp"
-#include "../disasm/function_index.hpp"
-#include "../disasm/xref_index.hpp"
+#include "symbol_store.hpp"
+#include "../disasm/disasm_view.hpp"
+#include "../session/analysis_session.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/fonts.hpp"
-#include "../ui/clock.hpp"
 #include "../ui/blur_layer.hpp"
-#include "../../helpers/diag_log.hpp"
 #include "../../helpers/win32_dialog.hpp"
 
 #include <algorithm>
 #include <array>
-#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
-#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
-#include <system_error>
+#include <unordered_map>
 
 extern HWND g_hwnd;
 
 namespace initial_analysis_view {
 
-namespace detail {
+enum class pdb_prompt_status_t : int {
+    pending = 0,
+    loading = 1,
+    success = 2,
+    failed = 3,
+};
 
-inline float& modal_anim()       { static float v = 0.f; return v; }
-inline bool&  modal_closing()    { static bool v = false; return v; }
-inline int&   modal_open_frame() { static int v = -1; return v; }
-inline float& overlay_anim()     { static float v = 0.f; return v; }
-inline bool&  pending_close()    { static bool v = false; return v; }
+struct pdb_prompt_state_t {
+    bool visible = false;
+    std::string codeview_id;
+    std::string suggested_path;
+    std::optional<std::string> user_selected_path;
+    pdb_prompt_status_t status = pdb_prompt_status_t::pending;
+    std::string error_message;
+};
 
-inline bool& load_types_local() { static bool v = true; return v; }
-inline bool& load_names_local() { static bool v = true; return v; }
+struct view_state_t {
+	bool dismissed = false;
+	bool load_types = true;
+	bool load_names = true;
+	std::uint64_t generation = 0;
+	std::array<char, 32768> local_pdb_path{};
+	std::string analysis_error;
+	std::string pdb_error;
+	pdb_prompt_state_t pdb_prompt;
+};
 
-inline void sync_local_options()
+inline std::mutex& states_mutex()
 {
-	load_types_local() = initial_analysis::g_state.opt_load_types.load(std::memory_order_acquire);
-	load_names_local() = initial_analysis::g_state.opt_load_names.load(std::memory_order_acquire);
+	static std::mutex mutex;
+	return mutex;
 }
 
-inline ImU32 step_color(const initial_analysis::step_t& s)
+inline std::unordered_map<std::string, std::shared_ptr<view_state_t>>& states()
 {
-	const auto& t = aida::ui::resolved();
-	if (s.skipped.load(std::memory_order_acquire)) return t.text_dim;
-	if (s.done.load(std::memory_order_acquire))    return t.success;
-	if (s.running.load(std::memory_order_acquire)) return t.accent_u32;
-	return t.text_dim;
+	static std::unordered_map<std::string, std::shared_ptr<view_state_t>> value;
+	return value;
 }
 
-inline const char* step_glyph(const initial_analysis::step_t& s)
+inline std::shared_ptr<view_state_t> state_for(
+	const disasm_view::workspace_context_t& context)
 {
-	if (s.skipped.load(std::memory_order_acquire)) return "-";
-	if (s.done.load(std::memory_order_acquire))    return "v";
-	if (s.running.load(std::memory_order_acquire)) return ">";
-	return "o";
-}
-
-}
-
-inline void render_modal()
-{
-	auto& st = initial_analysis::g_state;
-	bool pending_before_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
-	bool local_pending_before_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
-	const auto automation = symbol_store::pdb_automation_context();
-	if (pending_before_decline && automation.pdb_skip_active) {
-		initial_analysis::pdb_hint_t hint;
-		{
-			std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
-			hint = st.pdb_hint;
-		}
-		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_visible_attempt source=render_modal kind=remote prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb pdb=%s guid=%s age=%u is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-			hint.pdb_name.c_str(),
-			hint.pdb_guid.c_str(),
-			static_cast<unsigned>(hint.pdb_age),
-			automation.is_running ? 1 : 0,
-			automation.anti_tamper_full_test_running ? 1 : 0,
-			automation.full_test_env_active ? 1 : 0,
-			automation.unattended_active ? 1 : 0,
-			automation.post_suppression_active ? 1 : 0,
-			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0,
-			automation.user_default_skip_active ? 1 : 0,
-			automation.pdb_skip_active ? 1 : 0);
+	if (!context.workspace) return {};
+	const std::string key = context.workspace->identity().binary_id().to_hex();
+	std::lock_guard<std::mutex> lock(states_mutex());
+	auto& state = states()[key];
+	if (!state) state = std::make_shared<view_state_t>();
+	if (state->generation != context.workspace->generation()) {
+		state->generation = context.workspace->generation();
+		state->dismissed = false;
+		state->load_types = true;
+		state->load_names = true;
+		state->local_pdb_path.fill('\0');
+		state->analysis_error.clear();
+		state->pdb_error.clear();
 	}
-	float& anim     = detail::modal_anim();
-	bool&  closing  = detail::modal_closing();
-	int&   open_fr  = detail::modal_open_frame();
-	bool&  pending  = detail::pending_close();
-
-	if (automation.pdb_skip_active) {
-		st.needs_pdb_prompt.store(false, std::memory_order_release);
-		st.needs_local_pdb_prompt.store(false, std::memory_order_release);
-		st.pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
-		st.local_pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
-		const bool log_close = pending_before_decline || local_pending_before_decline ||
-			anim > 0.f || open_fr >= 0 || closing || pending;
-		if (log_close) {
-			initial_analysis::pdb_hint_t hint;
-			{
-				std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
-				hint = st.pdb_hint;
-			}
-			diag::log_tagged_critical_fmt("initial_analysis",
-				"pdb_modal_forbidden_render_suppressed source=render_modal kind=remote remote_pending_before=%d local_pending_before=%d remote_pending_after=0 local_pending_after=0 decision=do_not_load_pdb frame=%d animation=%.3f closing=%d pending_close=%d open_frame=%d pdb=%s guid=%s age=%u is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-				pending_before_decline ? 1 : 0,
-				local_pending_before_decline ? 1 : 0,
-				ImGui::GetFrameCount(),
-				static_cast<double>(anim),
-				closing ? 1 : 0,
-				pending ? 1 : 0,
-				open_fr,
-				hint.pdb_name.empty() ? "<none>" : hint.pdb_name.c_str(),
-				hint.pdb_guid.empty() ? "<none>" : hint.pdb_guid.c_str(),
-				static_cast<unsigned>(hint.pdb_age),
-				automation.is_running ? 1 : 0,
-				automation.anti_tamper_full_test_running ? 1 : 0,
-				automation.full_test_env_active ? 1 : 0,
-				automation.unattended_active ? 1 : 0,
-				automation.post_suppression_active ? 1 : 0,
-				static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-				automation.pdb_automation_active ? 1 : 0,
-				automation.user_default_skip_active ? 1 : 0,
-				automation.pdb_skip_active ? 1 : 0);
-		}
-		anim = 0.f;
-		closing = false;
-		open_fr = -1;
-		pending = false;
-		return;
-	}
-
-	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_modal");
-	bool wants_prompt = st.needs_pdb_prompt.load(std::memory_order_acquire);
-	bool local_pending_after_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
-	(void)local_pending_after_decline;
-
-	float dt = ImGui::GetIO().DeltaTime;
-	float target = (wants_prompt && !closing) ? 1.f : 0.f;
-	anim += (target - anim) * (std::min)(dt * 14.f, 1.f);
-	if (std::fabs(anim - target) < 0.003f) anim = target;
-
-	if (pending && anim < 0.01f) {
-		pending = false;
-		closing = false;
-		open_fr = -1;
-		anim = 0.f;
-		return;
-	}
-
-	if (!wants_prompt && anim < 0.005f) {
-		if (open_fr >= 0) open_fr = -1;
-		return;
-	}
-
-	const int frame = ImGui::GetFrameCount();
-	if (open_fr < 0) {
-		open_fr = frame;
-		detail::sync_local_options();
-	}
-
-	ImVec2 vp = ImGui::GetIO().DisplaySize;
-	ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), vp,
-		IM_COL32(0, 0, 0, static_cast<int>(150.f * anim)));
-
-	float pw = 620.f, ph = 500.f;
-	float scale = 0.96f + 0.04f * anim;
-	float sw = pw * scale, sh = ph * scale;
-	float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
-
-	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !closing && wants_prompt) {
-		initial_analysis::decline_pdb_prompt();
-		closing = true;
-		pending = true;
-	}
-
-	ImGui::SetNextWindowPos(ImVec2(px, py));
-	ImGui::SetNextWindowSize(ImVec2(sw, sh));
-	if (open_fr == frame)
-		ImGui::SetNextWindowFocus();
-	const auto& th = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th.bg_elevated, anim * 0.97f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th.border_strong, anim));
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 16));
-
-	if (wants_prompt) {
-		initial_analysis::pdb_hint_t modal_hint;
-		{
-			std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
-			modal_hint = st.pdb_hint;
-		}
-		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_render kind=remote frame=%d anim=%.3f open_frame=%d wants_prompt=%d skip_active=%d pdb_automation_active=%d unattended_active=%d post_suppression_active=%d user_default_skip_active=%d pdb=%s guid=%s age=%u",
-			frame,
-			static_cast<double>(anim),
-			open_fr,
-			wants_prompt ? 1 : 0,
-			automation.pdb_skip_active ? 1 : 0,
-			automation.pdb_automation_active ? 1 : 0,
-			automation.unattended_active ? 1 : 0,
-			automation.post_suppression_active ? 1 : 0,
-			automation.user_default_skip_active ? 1 : 0,
-			modal_hint.pdb_name.empty() ? "<none>" : modal_hint.pdb_name.c_str(),
-			modal_hint.pdb_guid.empty() ? "<none>" : modal_hint.pdb_guid.c_str(),
-			static_cast<unsigned>(modal_hint.pdb_age));
-	}
-
-	ImGui::Begin("Debug information available##ia_pdb_dlg", nullptr,
-		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-		ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
-
-	{
-		ImGui::PushFont(aida::ui::fonts::h2());
-		ImVec4 acc = th.accent;
-		ImGui::TextColored(acc, "Debug information available");
-		ImGui::PopFont();
-
-		ImGui::Dummy(ImVec2(0.f, 4.f));
-		ImGui::PushFont(aida::ui::fonts::body());
-
-		initial_analysis::pdb_hint_t hint;
-		{
-			std::lock_guard<std::mutex> lk(st.pdb_hint_mtx);
-			hint = st.pdb_hint;
-		}
-
-		ImGui::TextWrapped("The input file was linked with debug information stored here: %s",
-			hint.pdb_name.c_str());
-		ImGui::Dummy(ImVec2(0.f, 6.f));
-		ImGui::TextWrapped("Do you want to look for this file at the specified path and the Microsoft Symbol Server?");
-		ImGui::Dummy(ImVec2(0.f, 8.f));
-
-		ImGui::PushStyleColor(ImGuiCol_Text, th.text_dim);
-		ImGui::PushFont(aida::ui::fonts::caption());
-		ImGui::TextWrapped("GUID: %s   Age: %u", hint.pdb_guid.c_str(),
-			static_cast<unsigned>(hint.pdb_age));
-		ImGui::PushFont(aida::ui::fonts::code());
-		ImGui::TextWrapped("%s", hint.symbol_url.c_str());
-		ImGui::PopFont();
-		ImGui::PopFont();
-		ImGui::PopStyleColor();
-
-		ImGui::PopFont();
-	}
-
-	float btn_h = 38.f;
-	float btn_w = 156.f;
-	float btn_spacing = 14.f;
-	float total_w = btn_w * 2.f + btn_spacing;
-	float bx = (sw - total_w) * 0.5f;
-	float by_btn = sh - btn_h - 24.f;
-	float toggle_row_h = 60.f;
-	float toggle_block_top = by_btn - toggle_row_h - 20.f;
-
-	{
-		ImGui::SetCursorPos(ImVec2(20.f, toggle_block_top));
-		ImGui::PushFont(aida::ui::fonts::body());
-		bool lt = detail::load_types_local();
-		bool ln = detail::load_names_local();
-		if (aida::ui::toggle_switch("Load Types", &lt, aida::ui::size_t_::md))
-			detail::load_types_local() = lt;
-		ImGui::Dummy(ImVec2(0.f, 12.f));
-		if (aida::ui::toggle_switch("Load Names", &ln, aida::ui::size_t_::md))
-			detail::load_names_local() = ln;
-		ImGui::PopFont();
-	}
-
-	{
-		ImGui::SetCursorPos(ImVec2(bx, by_btn));
-		bool yes_clicked = aida::ui::button("Yes, download",
-			aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::md, ImVec2(btn_w, btn_h));
-		ImGui::SetCursorPos(ImVec2(bx + btn_w + btn_spacing, by_btn));
-		bool no_clicked = aida::ui::button("No, skip",
-			aida::ui::button_kind_t::secondary,
-			aida::ui::size_t_::md, ImVec2(btn_w, btn_h));
-
-		if (yes_clicked && !closing) {
-			initial_analysis::accept_pdb_prompt(detail::load_types_local(),
-				detail::load_names_local());
-			closing = true;
-			pending = true;
-		}
-		if (no_clicked && !closing) {
-			initial_analysis::decline_pdb_prompt();
-			closing = true;
-			pending = true;
-		}
-	}
-
-	ImGui::End();
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(2);
-}
-
-inline void render_overlay()
-{
-	auto& st = initial_analysis::g_state;
-	bool running = st.running.load(std::memory_order_acquire);
-	bool finished = st.finished.load(std::memory_order_acquire);
-	bool dismissed = st.overlay_dismissed.load(std::memory_order_acquire);
-	bool any_logs_yet = false;
-	{
-		std::lock_guard<std::mutex> lk(st.log_mtx);
-		any_logs_yet = !st.log_lines.empty();
-	}
-
-	bool wants_visible = (running || (finished && !dismissed)) && any_logs_yet;
-
-	ImVec2 vp_for_hit = ImGui::GetIO().DisplaySize;
-	float w_for_hit = 420.f;
-	float h_for_hit = 240.f;
-	float margin_for_hit = 24.f;
-	float ov_x_for_hit = vp_for_hit.x - w_for_hit - margin_for_hit;
-	float ov_y_for_hit = vp_for_hit.y - h_for_hit - margin_for_hit - 28.f;
-	if (ov_y_for_hit < 80.f) ov_y_for_hit = 80.f;
-	ImVec2 mp_for_hit = ImGui::GetMousePos();
-	bool hovered_overlay = (mp_for_hit.x >= ov_x_for_hit && mp_for_hit.x <= ov_x_for_hit + w_for_hit &&
-	                       mp_for_hit.y >= ov_y_for_hit && mp_for_hit.y <= ov_y_for_hit + h_for_hit);
-
-	if (finished && !dismissed) {
-		uint64_t fin_ns = st.finish_time_ns.load(std::memory_order_acquire);
-		if (fin_ns != 0 && !hovered_overlay) {
-			uint64_t now = initial_analysis::detail::now_ns();
-			if (now - fin_ns > 5ull * 1000000000ull) {
-				wants_visible = false;
-				st.overlay_dismissed.store(true, std::memory_order_release);
-			}
-		} else if (fin_ns != 0 && hovered_overlay) {
-			st.finish_time_ns.store(initial_analysis::detail::now_ns(), std::memory_order_release);
-		}
-	}
-
-	float& anim = detail::overlay_anim();
-	float dt = ImGui::GetIO().DeltaTime;
-	float target = wants_visible ? 1.f : 0.f;
-	anim += (target - anim) * (std::min)(dt * 8.f, 1.f);
-	if (std::fabs(anim - target) < 0.003f) anim = target;
-	st.overlay_visibility.store(anim, std::memory_order_release);
-
-	if (anim < 0.005f) return;
-
-	const auto& th = aida::ui::resolved();
-
-	ImVec2 vp = ImGui::GetIO().DisplaySize;
-	float w = 420.f;
-	float h = 240.f;
-	float margin = 24.f;
-	float x = vp.x - w - margin;
-	float y = vp.y - h - margin - 28.f;
-	if (y < 80.f) y = 80.f;
-
-	float slide = (1.f - anim) * 24.f;
-	x += slide;
-
-	ImVec2 a(x, y);
-	ImVec2 b(x + w, y + h);
-
-	ImDrawList* fg = ImGui::GetForegroundDrawList();
-
-	ImU32 shadow_col = aida::ui::with_alpha(IM_COL32(0, 0, 0, 220), anim * 0.55f);
-	for (int i = 0; i < 4; ++i) {
-		float k = static_cast<float>(i + 1);
-		fg->AddRectFilled(ImVec2(a.x - k, a.y - k + 3.f), ImVec2(b.x + k, b.y + k + 3.f),
-			aida::ui::with_alpha(shadow_col, 0.16f / k), 14.f + k);
-	}
-
-	fg->AddRectFilled(a, b, aida::ui::with_alpha(th.bg_elevated, anim * 0.96f), 12.f);
-	fg->AddRect(a, b, aida::ui::with_alpha(th.border_strong, anim), 12.f, 0, 1.2f);
-
-	float pad = 14.f;
-	float header_h = 30.f;
-
-	bool ov_running = st.running.load(std::memory_order_acquire);
-	bool ov_finished = st.finished.load(std::memory_order_acquire);
-
-	ImFont* hf = aida::ui::fonts::body_strong();
-	float hfs = hf ? 14.f : 14.f;
-	const char* title = "Initial autoanalysis";
-	fg->AddText(hf, hfs, ImVec2(a.x + pad, a.y + pad - 2.f),
-		aida::ui::with_alpha(th.text_primary, anim), title);
-
-	const char* status_text = ov_finished ? "complete"
-	                         : (ov_running ? "in progress" : "idle");
-	ImU32 status_col = ov_finished ? th.success : (ov_running ? th.accent_u32 : th.text_dim);
-	ImFont* cf = aida::ui::fonts::caption();
-	float cfs = cf ? 12.f : 12.f;
-	float sw = cf ? cf->CalcTextSizeA(cfs, FLT_MAX, 0.f, status_text).x : 50.f;
-
-	float status_right_x = b.x - pad;
-	bool show_rerun_btn = ov_finished && initial_analysis::can_run_for_disk_load();
-	if (show_rerun_btn) {
-		const char* rerun_lbl = "Re-run";
-		float rerun_text_w = cf ? cf->CalcTextSizeA(cfs, FLT_MAX, 0.f, rerun_lbl).x : 44.f;
-		float rerun_btn_w = rerun_text_w + 14.f;
-		float rerun_btn_h = 18.f;
-		float rerun_btn_x = b.x - pad - rerun_btn_w;
-		float rerun_btn_y = a.y + pad - 3.f;
-		ImVec2 rmin(rerun_btn_x, rerun_btn_y);
-		ImVec2 rmax(rerun_btn_x + rerun_btn_w, rerun_btn_y + rerun_btn_h);
-		bool rhov = (mp_for_hit.x >= rmin.x && mp_for_hit.x <= rmax.x &&
-		             mp_for_hit.y >= rmin.y && mp_for_hit.y <= rmax.y);
-		ImU32 rbg = rhov
-			? aida::ui::with_alpha(th.accent_grad_top, anim * 0.92f)
-			: aida::ui::with_alpha(th.panel_header, anim * 0.85f);
-		ImU32 rbr = rhov
-			? aida::ui::with_alpha(th.accent_hover, anim)
-			: aida::ui::with_alpha(th.border_subtle, anim);
-		fg->AddRectFilled(rmin, rmax, rbg, 5.f);
-		fg->AddRect(rmin, rmax, rbr, 5.f, 0, 1.f);
-		ImU32 rtxt = rhov
-			? aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), anim)
-			: aida::ui::with_alpha(th.text_primary, anim);
-		fg->AddText(cf, cfs,
-			ImVec2(rmin.x + (rerun_btn_w - rerun_text_w) * 0.5f,
-			       rmin.y + (rerun_btn_h - cfs) * 0.5f + 1.f),
-			rtxt, rerun_lbl);
-		if (rhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			anti_tamper::webhook::write_log("analysis_audit",
-				"[analysis_audit] initial_analysis rerun_clicked");
-			diag::log_tagged("initial_analysis", "[analysis_audit] view_rerun_request");
-			initial_analysis::run_initial_analysis_for_loaded_file();
-		}
-		status_right_x = rmin.x - 8.f;
-
-		bool deep_done = function_index::deep_static_analysis_requested();
-		const char* deep_lbl = deep_done ? "Deep [running]" : "Deep";
-		float deep_text_w = cf ? cf->CalcTextSizeA(cfs, FLT_MAX, 0.f, deep_lbl).x : 36.f;
-		float deep_btn_w = deep_text_w + 14.f;
-		float deep_btn_h = 18.f;
-		float deep_btn_x = rerun_btn_x - 8.f - deep_btn_w;
-		float deep_btn_y = a.y + pad - 3.f;
-		ImVec2 dmin(deep_btn_x, deep_btn_y);
-		ImVec2 dmax(deep_btn_x + deep_btn_w, deep_btn_y + deep_btn_h);
-		bool dhov = (mp_for_hit.x >= dmin.x && mp_for_hit.x <= dmax.x &&
-		             mp_for_hit.y >= dmin.y && mp_for_hit.y <= dmax.y);
-		ImU32 dbg = deep_done
-			? aida::ui::with_alpha(th.success, anim * 0.55f)
-			: (dhov
-				? aida::ui::with_alpha(th.accent_grad_top, anim * 0.85f)
-				: aida::ui::with_alpha(th.panel_header, anim * 0.85f));
-		ImU32 dbr = dhov
-			? aida::ui::with_alpha(th.accent_hover, anim)
-			: aida::ui::with_alpha(th.border_subtle, anim);
-		fg->AddRectFilled(dmin, dmax, dbg, 5.f);
-		fg->AddRect(dmin, dmax, dbr, 5.f, 0, 1.f);
-		ImU32 dtxt = dhov
-			? aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), anim)
-			: aida::ui::with_alpha(th.text_primary, anim);
-		fg->AddText(cf, cfs,
-			ImVec2(dmin.x + (deep_btn_w - deep_text_w) * 0.5f,
-			       dmin.y + (deep_btn_h - cfs) * 0.5f + 1.f),
-			dtxt, deep_lbl);
-		if (dhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !deep_done) {
-			anti_tamper::webhook::write_log("analysis_audit",
-				"[analysis_audit] deep_static_analysis_clicked");
-			diag::log_tagged("initial_analysis", "[analysis_audit] deep_static_analysis_request");
-			function_index::request_deep_static_analysis();
-			xref_index::request_deep_static_xref();
-		}
-		status_right_x = dmin.x - 8.f;
-	}
-
-	fg->AddText(cf, cfs, ImVec2(status_right_x - sw, a.y + pad),
-		aida::ui::with_alpha(status_col, anim), status_text);
-
-	std::string fn;
-	{
-		std::lock_guard<std::mutex> lk(st.path_mtx);
-		fn = st.target_filename;
-	}
-	if (!fn.empty()) {
-		ImFont* sf = aida::ui::fonts::caption();
-		float sfs = 11.f;
-		fg->AddText(sf, sfs, ImVec2(a.x + pad, a.y + pad + 18.f),
-			aida::ui::with_alpha(th.text_dim, anim), fn.c_str());
-	}
-
-	float bar_y = a.y + header_h + 12.f;
-	float bar_w = w - pad * 2.f;
-	float bar_h = 4.f;
-
-	float prog = st.overall_progress.load(std::memory_order_acquire);
-	fg->AddRectFilled(ImVec2(a.x + pad, bar_y), ImVec2(a.x + pad + bar_w, bar_y + bar_h),
-		aida::ui::with_alpha(th.panel_header, anim), bar_h * 0.5f);
-	if (prog > 0.f) {
-		float fw = bar_w * prog;
-		fg->AddRectFilledMultiColor(ImVec2(a.x + pad, bar_y),
-			ImVec2(a.x + pad + fw, bar_y + bar_h),
-			aida::ui::with_alpha(th.accent_grad_top, anim),
-			aida::ui::with_alpha(th.accent_grad_top, anim),
-			aida::ui::with_alpha(th.accent_grad_bot, anim),
-			aida::ui::with_alpha(th.accent_grad_bot, anim));
-	}
-
-	int active = st.active_step_index.load(std::memory_order_acquire);
-	std::string active_label;
-	if (active >= 0 && active < static_cast<int>(st.steps.size())) {
-		active_label = st.steps[active]->label;
-	} else if (st.finished.load(std::memory_order_acquire)) {
-		active_label = "The initial autoanalysis has been finished.";
-	}
-	if (!active_label.empty()) {
-		ImFont* lf = aida::ui::fonts::body();
-		float lfs = 12.5f;
-		fg->AddText(lf, lfs,
-			ImVec2(a.x + pad, bar_y + bar_h + 8.f),
-			aida::ui::with_alpha(th.text_secondary, anim), active_label.c_str());
-	}
-
-	float log_y = bar_y + bar_h + 32.f;
-	float log_h = b.y - log_y - pad;
-	if (log_h < 40.f) log_h = 40.f;
-
-	fg->AddRectFilled(ImVec2(a.x + pad, log_y),
-		ImVec2(b.x - pad, log_y + log_h),
-		aida::ui::with_alpha(th.bg_base, anim * 0.85f), 6.f);
-	fg->AddRect(ImVec2(a.x + pad, log_y),
-		ImVec2(b.x - pad, log_y + log_h),
-		aida::ui::with_alpha(th.border_subtle, anim), 6.f);
-
-	ImFont* lf = aida::ui::fonts::code();
-	float lfs = 11.f;
-	float line_h = lfs + 3.f;
-	int max_lines = static_cast<int>(log_h / line_h) - 1;
-	if (max_lines < 1) max_lines = 1;
-
-	std::vector<std::string> tail;
-	{
-		std::lock_guard<std::mutex> lk(st.log_mtx);
-		int total = static_cast<int>(st.log_lines.size());
-		int from = (total > max_lines) ? (total - max_lines) : 0;
-		tail.reserve(static_cast<size_t>(total - from));
-		for (int i = from; i < total; ++i)
-			tail.push_back(st.log_lines[static_cast<size_t>(i)]);
-	}
-
-	float ty = log_y + 4.f;
-	float tx = a.x + pad + 6.f;
-	float tw = w - pad * 2.f - 12.f;
-	fg->PushClipRect(ImVec2(a.x + pad, log_y),
-		ImVec2(b.x - pad, log_y + log_h), true);
-	for (const auto& line : tail) {
-		std::string display = line;
-		if (lf) {
-			while (lf->CalcTextSizeA(lfs, FLT_MAX, 0.f, display.c_str()).x > tw &&
-				display.size() > 4)
-			{
-				display.pop_back();
-			}
-		}
-		fg->AddText(lf, lfs, ImVec2(tx, ty),
-			aida::ui::with_alpha(th.text_secondary, anim * 0.95f),
-			display.c_str());
-		ty += line_h;
-		if (ty > log_y + log_h - 3.f) break;
-	}
-	fg->PopClipRect();
+	return state;
 }
 
 namespace detail {
 
-inline float& local_pdb_anim()      { static float v = 0.f; return v; }
-inline bool&  local_pdb_closing()   { static bool v = false; return v; }
-inline int&   local_pdb_open_frame(){ static int v = -1; return v; }
-inline bool&  local_pdb_pending()   { static bool v = false; return v; }
-inline std::string& local_pdb_typed_path()
+inline void sync_pdb_prompt_state(
+    const disasm_view::workspace_context_t& context,
+    const std::shared_ptr<view_state_t>& state)
 {
-	static std::string s;
-	return s;
-}
-inline std::array<char, 1024>& local_pdb_typed_buf()
-{
-	static std::array<char, 1024> buf{};
-	return buf;
+    if (!context.workspace || !state) return;
+    auto snapshot = analysis_session::pdb_prompt_snapshot(context.workspace);
+    if (!snapshot) {
+        state->pdb_prompt.visible = false;
+        state->pdb_prompt.status = pdb_prompt_status_t::pending;
+        return;
+    }
+    const auto& snap = snapshot.value();
+    state->pdb_prompt.visible = snap.remote_pending || snap.local_pending || snap.loading;
+    char codeview_buf[64]{};
+    std::snprintf(codeview_buf, sizeof(codeview_buf), "%s/%u",
+        snap.pdb_guid.c_str(), static_cast<unsigned>(snap.pdb_age));
+    state->pdb_prompt.codeview_id = codeview_buf;
+    state->pdb_prompt.suggested_path = snap.local_candidate;
+    if (state->local_pdb_path[0] != '\0')
+        state->pdb_prompt.user_selected_path = std::string(state->local_pdb_path.data());
+    else
+        state->pdb_prompt.user_selected_path = std::nullopt;
+    if (snap.loading)
+        state->pdb_prompt.status = pdb_prompt_status_t::loading;
+    else if (snap.failed)
+        state->pdb_prompt.status = pdb_prompt_status_t::failed;
+    else if (!snap.remote_pending && !snap.local_pending && !snap.loading &&
+             !snap.failed && snap.symbol_revision > 0)
+        state->pdb_prompt.status = pdb_prompt_status_t::success;
+    else
+        state->pdb_prompt.status = pdb_prompt_status_t::pending;
+    state->pdb_prompt.error_message = state->pdb_error;
 }
 
-inline std::string browse_for_pdb_dialog(HWND owner, const std::string& initial_name)
+inline const char* readiness_name(aida::analysis::workspace_readiness_t readiness)
+{
+	using aida::analysis::workspace_readiness_t;
+	switch (readiness) {
+	case workspace_readiness_t::created: return "Created";
+	case workspace_readiness_t::provider_ready: return "Provider ready";
+	case workspace_readiness_t::parsed: return "Parsed";
+	case workspace_readiness_t::analyzing: return "Analyzing";
+	case workspace_readiness_t::baseline_ready: return "Baseline ready";
+	case workspace_readiness_t::partial: return "Partial";
+	case workspace_readiness_t::failed: return "Failed";
+	case workspace_readiness_t::cancelling: return "Cancelling";
+	case workspace_readiness_t::closing: return "Closing";
+	case workspace_readiness_t::closed: return "Closed";
+	default: return "Unknown";
+	}
+}
+
+inline bool target_matches(const disasm_view::workspace_context_t& context)
+{
+	return context.workspace && context.workspace->target_kind() ==
+		aida::analysis::target_kind_t::static_file &&
+		!context.workspace->closing() && !context.workspace->closed();
+}
+
+inline void suppress_automated_prompts(
+	const disasm_view::workspace_context_t& context)
 {
 	const auto automation = symbol_store::pdb_automation_context();
-	if (automation.pdb_skip_active) {
-		const bool remote_pending_before = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
-		const bool local_pending_before = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
-		initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("initial_analysis_view.browse_for_pdb_dialog");
-		const bool remote_pending_after = initial_analysis::g_state.needs_pdb_prompt.load(std::memory_order_acquire);
-		const bool local_pending_after = initial_analysis::g_state.needs_local_pdb_prompt.load(std::memory_order_acquire);
-		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_native_dialog_attempt source=initial_analysis_view::browse_for_pdb title=\"Select PDB file\" suppressed=1 decision=do_not_load_pdb initial_name=%s remote_pending_before=%d local_pending_before=%d remote_pending_after=%d local_pending_after=%d is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-			initial_name.empty() ? "<empty>" : initial_name.c_str(),
-			remote_pending_before ? 1 : 0,
-			local_pending_before ? 1 : 0,
-			remote_pending_after ? 1 : 0,
-			local_pending_after ? 1 : 0,
-			automation.is_running ? 1 : 0,
-			automation.anti_tamper_full_test_running ? 1 : 0,
-			automation.full_test_env_active ? 1 : 0,
-			automation.unattended_active ? 1 : 0,
-			automation.post_suppression_active ? 1 : 0,
-			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0,
-			automation.user_default_skip_active ? 1 : 0,
-			automation.pdb_skip_active ? 1 : 0);
-		return std::string();
-	}
-	char file_buf[1024] = {};
-	if (!initial_name.empty()) {
-		std::strncpy(file_buf, initial_name.c_str(),
-			sizeof(file_buf) - 1);
-	}
+	if (!automation.pdb_skip_active || !context.workspace) return;
+	auto snapshot = analysis_session::pdb_prompt_snapshot(context.workspace);
+	if (!snapshot) return;
+	if (snapshot.value().remote_pending)
+		(void)analysis_session::decline_remote_pdb(context.workspace);
+	if (snapshot.value().local_pending)
+		(void)analysis_session::decline_local_pdb(context.workspace);
+}
 
-	static const char k_initial_pdb_filter[] =
+inline float progress_fraction(const aida::analysis::workspace_progress_t& progress)
+{
+	if (progress.total_units != 0)
+		return static_cast<float>((std::min)(1.0,
+			static_cast<double>(progress.completed_units) /
+			static_cast<double>(progress.total_units)));
+	if (progress.total_bytes != 0)
+		return static_cast<float>((std::min)(1.0,
+			static_cast<double>(progress.completed_bytes) /
+			static_cast<double>(progress.total_bytes)));
+	return progress.readiness == aida::analysis::workspace_readiness_t::baseline_ready ? 1.0f : 0.0f;
+}
+
+inline std::string browse_for_pdb(const disasm_view::workspace_context_t& context,
+	const std::string& initial_name)
+{
+	if (symbol_store::pdb_automation_context().pdb_skip_active) {
+		if (context.workspace)
+			(void)analysis_session::decline_local_pdb(context.workspace);
+		return {};
+	}
+	std::array<char, 32768> path{};
+	if (!initial_name.empty())
+		std::strncpy(path.data(), initial_name.c_str(), path.size() - 1);
+	static const char filter[] =
 		"PDB files (*.pdb)\0*.pdb\0"
 		"All files (*.*)\0*.*\0\0";
-	if (!win32_dialog::show_open_file_dialog(owner,
-			"Select PDB file",
-			k_initial_pdb_filter,
-			file_buf, sizeof(file_buf),
-			"initial_analysis_view::browse_for_pdb")) {
-		return std::string();
-	}
-	return std::string(file_buf);
+	if (!win32_dialog::show_open_file_dialog(g_hwnd, "Select PDB file", filter,
+		path.data(), path.size(), "initial_analysis_view::browse_for_pdb")) return {};
+	return path.data();
 }
 
-}
-
-inline void render_local_pdb_modal()
+inline void render_progress(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<view_state_t>& state)
 {
-	auto& st = initial_analysis::g_state;
-	bool pending_before_decline = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
-	bool remote_pending_before_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
-	const auto automation = symbol_store::pdb_automation_context();
-	if (pending_before_decline && automation.pdb_skip_active) {
-		std::string module_name;
-		std::string reason;
-		uint64_t image_base = 0;
-		uint64_t image_size = 0;
-		{
-			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
-			module_name = st.local_pdb_module_name;
-			reason = st.local_pdb_reason;
-			image_base = st.local_pdb_image_base;
-			image_size = st.local_pdb_image_size;
-		}
-		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_visible_attempt source=render_local_pdb_modal kind=local prompt_pending=1 prompt_suppressed=1 decision=do_not_load_pdb module=%s base=0x%llX size=0x%llX reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-			module_name.empty() ? "<unknown>" : module_name.c_str(),
-			static_cast<unsigned long long>(image_base),
-			static_cast<unsigned long long>(image_size),
-			reason.empty() ? "<none>" : reason.c_str(),
-			automation.is_running ? 1 : 0,
-			automation.anti_tamper_full_test_running ? 1 : 0,
-			automation.full_test_env_active ? 1 : 0,
-			automation.unattended_active ? 1 : 0,
-			automation.post_suppression_active ? 1 : 0,
-			static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-			automation.pdb_automation_active ? 1 : 0,
-			automation.user_default_skip_active ? 1 : 0,
-			automation.pdb_skip_active ? 1 : 0);
-	}
-	float& anim    = detail::local_pdb_anim();
-	bool&  closing = detail::local_pdb_closing();
-	int&   open_fr = detail::local_pdb_open_frame();
-	bool&  pending = detail::local_pdb_pending();
-
-	if (automation.pdb_skip_active) {
-		st.needs_local_pdb_prompt.store(false, std::memory_order_release);
-		st.needs_pdb_prompt.store(false, std::memory_order_release);
-		st.local_pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
-		st.pdb_decision.store(initial_analysis::pdb_decision_t::declined, std::memory_order_release);
-		const bool log_close = pending_before_decline || remote_pending_before_decline ||
-			anim > 0.f || open_fr >= 0 || closing || pending;
-		if (log_close) {
-			std::string module_name;
-			std::string reason;
-			uint64_t image_base = 0;
-			uint64_t image_size = 0;
-			{
-				std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
-				module_name = st.local_pdb_module_name;
-				reason = st.local_pdb_reason;
-				image_base = st.local_pdb_image_base;
-				image_size = st.local_pdb_image_size;
-			}
-			diag::log_tagged_critical_fmt("initial_analysis",
-				"pdb_modal_forbidden_render_suppressed source=render_local_pdb_modal kind=local remote_pending_before=%d local_pending_before=%d remote_pending_after=0 local_pending_after=0 decision=do_not_load_pdb frame=%d animation=%.3f closing=%d pending_close=%d open_frame=%d module=%s base=0x%llX size=0x%llX reason=%s is_running=%d anti_tamper_full_test_running=%d full_test_env_active=%d unattended_active=%d post_suppression_active=%d post_suppression_remaining_ms=%llu pdb_automation_active=%d user_default_skip_active=%d pdb_skip_active=%d",
-				remote_pending_before_decline ? 1 : 0,
-				pending_before_decline ? 1 : 0,
-				ImGui::GetFrameCount(),
-				static_cast<double>(anim),
-				closing ? 1 : 0,
-				pending ? 1 : 0,
-				open_fr,
-				module_name.empty() ? "<unknown>" : module_name.c_str(),
-				static_cast<unsigned long long>(image_base),
-				static_cast<unsigned long long>(image_size),
-				reason.empty() ? "<none>" : reason.c_str(),
-				automation.is_running ? 1 : 0,
-				automation.anti_tamper_full_test_running ? 1 : 0,
-				automation.full_test_env_active ? 1 : 0,
-				automation.unattended_active ? 1 : 0,
-				automation.post_suppression_active ? 1 : 0,
-				static_cast<unsigned long long>(automation.post_suppression_remaining_ms),
-				automation.pdb_automation_active ? 1 : 0,
-				automation.user_default_skip_active ? 1 : 0,
-				automation.pdb_skip_active ? 1 : 0);
-		}
-		anim = 0.f;
-		closing = false;
-		open_fr = -1;
-		pending = false;
-		return;
-	}
-
-	initial_analysis::detail::auto_decline_pdb_prompts_for_full_test("render_local_pdb_modal");
-	bool wants_prompt = st.needs_local_pdb_prompt.load(std::memory_order_acquire);
-	bool remote_pending_after_decline = st.needs_pdb_prompt.load(std::memory_order_acquire);
-	(void)remote_pending_after_decline;
-
-	float dt = ImGui::GetIO().DeltaTime;
-	float target = (wants_prompt && !closing) ? 1.f : 0.f;
-	anim += (target - anim) * (std::min)(dt * 14.f, 1.f);
-	if (std::fabs(anim - target) < 0.003f) anim = target;
-
-	if (pending && anim < 0.01f) {
-		pending = false;
-		closing = false;
-		open_fr = -1;
-		anim = 0.f;
-		return;
-	}
-
-	if (!wants_prompt && anim < 0.005f) {
-		if (open_fr >= 0) open_fr = -1;
-		return;
-	}
-
-	const int frame = ImGui::GetFrameCount();
-	if (open_fr < 0) {
-		open_fr = frame;
-		{
-			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
-			std::string seed = st.local_pdb_module_name;
-			auto dot = seed.rfind('.');
-			if (dot != std::string::npos) seed = seed.substr(0, dot);
-			if (!seed.empty()) seed += ".pdb";
-			detail::local_pdb_typed_path() = seed;
-			detail::local_pdb_typed_buf().fill(0);
-			std::strncpy(detail::local_pdb_typed_buf().data(), seed.c_str(),
-				detail::local_pdb_typed_buf().size() - 1);
-			diag::log_tagged_fmt("initial_analysis",
-				"local_pdb_modal_open frame=%d module='%s' seed='%s'",
-				open_fr,
-				st.local_pdb_module_name.c_str(),
-				seed.c_str());
-		}
-	}
-
-	ImVec2 vp = ImGui::GetIO().DisplaySize;
-	ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(0, 0), vp,
-		IM_COL32(0, 0, 0, static_cast<int>(160.f * anim)));
-
-	float pw = 680.f, ph = 360.f;
-	float scale = 0.96f + 0.04f * anim;
-	float sw = pw * scale, sh = ph * scale;
-	float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
-
-	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !closing && wants_prompt) {
-		initial_analysis::decline_local_pdb_prompt();
-		closing = true;
-		pending = true;
-	}
-
-	ImGui::SetNextWindowPos(ImVec2(px, py));
-	ImGui::SetNextWindowSize(ImVec2(sw, sh));
-	if (open_fr == frame)
-		ImGui::SetNextWindowFocus();
-	const auto& th = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th.bg_elevated, anim * 0.97f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th.border_strong, anim));
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(22, 18));
-
-	if (wants_prompt) {
-		std::string modal_module_name;
-		uint64_t modal_image_base = 0;
-		uint64_t modal_image_size = 0;
-		{
-			std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
-			modal_module_name = st.local_pdb_module_name;
-			modal_image_base = st.local_pdb_image_base;
-			modal_image_size = st.local_pdb_image_size;
-		}
-		diag::log_tagged_critical_fmt("initial_analysis",
-			"pdb_modal_render kind=local frame=%d anim=%.3f open_frame=%d wants_prompt=%d skip_active=%d pdb_automation_active=%d unattended_active=%d post_suppression_active=%d user_default_skip_active=%d module=%s base=0x%llX size=0x%llX",
-			frame,
-			static_cast<double>(anim),
-			open_fr,
-			wants_prompt ? 1 : 0,
-			automation.pdb_skip_active ? 1 : 0,
-			automation.pdb_automation_active ? 1 : 0,
-			automation.unattended_active ? 1 : 0,
-			automation.post_suppression_active ? 1 : 0,
-			automation.user_default_skip_active ? 1 : 0,
-			modal_module_name.empty() ? "<unknown>" : modal_module_name.c_str(),
-			static_cast<unsigned long long>(modal_image_base),
-			static_cast<unsigned long long>(modal_image_size));
-	}
-
-	ImGui::Begin("Local PDB needed##ia_local_pdb_dlg", nullptr,
-		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-		ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
-
-	std::string reason;
-	std::string module_name;
-	{
-		std::lock_guard<std::mutex> lk(st.local_pdb_mtx);
-		reason = st.local_pdb_reason;
-		module_name = st.local_pdb_module_name;
-	}
-
-	{
-		ImGui::PushFont(aida::ui::fonts::h2());
-		ImVec4 acc = th.accent;
-		ImGui::TextColored(acc, "Local PDB file");
-		ImGui::PopFont();
-
-		ImGui::Dummy(ImVec2(0.f, 4.f));
-		ImGui::PushFont(aida::ui::fonts::body());
-		ImGui::TextWrapped("%s", reason.c_str());
-		if (!module_name.empty()) {
-			ImGui::Dummy(ImVec2(0.f, 6.f));
-			ImGui::PushStyleColor(ImGuiCol_Text, th.text_dim);
-			ImGui::PushFont(aida::ui::fonts::caption());
-			ImGui::TextWrapped("Module: %s", module_name.c_str());
-			ImGui::PopFont();
-			ImGui::PopStyleColor();
-		}
-		ImGui::PopFont();
-	}
-
-	ImGui::Dummy(ImVec2(0.f, 12.f));
-
-	{
-		ImGui::PushFont(aida::ui::fonts::body());
-		ImGui::PushStyleColor(ImGuiCol_Text, th.text_secondary);
-		ImGui::TextUnformatted("Type the absolute path to the PDB, or click Browse...");
-		ImGui::PopStyleColor();
-		ImGui::PopFont();
-
-		ImGui::Dummy(ImVec2(0.f, 6.f));
-		auto& buf = detail::local_pdb_typed_buf();
-		ImGui::PushItemWidth(sw - 44.f - 110.f - 12.f);
-		ImGui::PushFont(aida::ui::fonts::code());
-		const bool path_changed = ImGui::InputText("##ia_local_pdb_path", buf.data(),
-			static_cast<int>(buf.size()),
-			ImGuiInputTextFlags_AutoSelectAll);
-		const bool path_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-		const bool path_activated = ImGui::IsItemActivated();
-		const bool path_deactivated = ImGui::IsItemDeactivated();
-		if (path_changed)
-			detail::local_pdb_typed_path() = buf.data();
-		if (path_clicked || path_activated || path_deactivated || path_changed) {
-			diag::log_tagged_fmt("initial_analysis",
-				"local_pdb_input event clicked=%d activated=%d deactivated=%d changed=%d len=%zu path='%s'",
-				path_clicked ? 1 : 0,
-				path_activated ? 1 : 0,
-				path_deactivated ? 1 : 0,
-				path_changed ? 1 : 0,
-				std::strlen(buf.data()),
-				buf.data());
-		}
-		ImGui::PopFont();
-		ImGui::PopItemWidth();
-		ImGui::SameLine();
-		if (aida::ui::button("Browse...",
-			aida::ui::button_kind_t::secondary,
-			aida::ui::size_t_::md, ImVec2(108.f, 28.f)))
-		{
-			std::string seed = module_name;
-			auto dot = seed.rfind('.');
-			if (dot != std::string::npos) seed = seed.substr(0, dot);
-			if (!seed.empty()) seed += ".pdb";
-			std::string picked = detail::browse_for_pdb_dialog(g_hwnd, seed);
-			if (!picked.empty()) {
-				detail::local_pdb_typed_path() = picked;
-				buf.fill(0);
-				std::strncpy(buf.data(), picked.c_str(), buf.size() - 1);
-				diag::log_tagged_fmt("initial_analysis",
-					"local_pdb_browse_selected len=%zu path='%s'",
-					picked.size(),
-					picked.c_str());
-			}
-		}
-	}
-
-	float btn_h = 38.f;
-	float btn_w = 156.f;
-	float btn_spacing = 14.f;
-	float total_w = btn_w * 2.f + btn_spacing;
-	float bx = (sw - total_w) * 0.5f;
-	float by_btn = sh - btn_h - 24.f;
-
-	{
-		ImGui::SetCursorPos(ImVec2(bx, by_btn));
-		bool load_clicked = aida::ui::button("Load this PDB",
-			aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::md, ImVec2(btn_w, btn_h));
-		ImGui::SetCursorPos(ImVec2(bx + btn_w + btn_spacing, by_btn));
-		bool skip_clicked = aida::ui::button("No, skip",
-			aida::ui::button_kind_t::secondary,
-			aida::ui::size_t_::md, ImVec2(btn_w, btn_h));
-
-		if (load_clicked && !closing) {
-			std::string picked = detail::local_pdb_typed_path();
-			while (!picked.empty() && (picked.front() == ' ' || picked.front() == '\t'))
-				picked.erase(picked.begin());
-			while (!picked.empty() && (picked.back() == ' ' || picked.back() == '\t' ||
-			                            picked.back() == '\r' || picked.back() == '\n'))
-				picked.pop_back();
-
-			std::error_code exists_ec;
-			std::error_code regular_ec;
-			const bool exists_ok = !picked.empty() && std::filesystem::exists(picked, exists_ec);
-			const bool regular_ok = exists_ok && std::filesystem::is_regular_file(picked, regular_ec);
-			bool path_ok = exists_ok && regular_ok && !exists_ec && !regular_ec;
-			diag::log_tagged_fmt("initial_analysis",
-				"local_pdb_load_clicked len=%zu exists_ok=%d regular_ok=%d exists_ec=%d regular_ec=%d path_ok=%d path='%s'",
-				picked.size(),
-				exists_ok ? 1 : 0,
-				regular_ok ? 1 : 0,
-				exists_ec.value(),
-				regular_ec.value(),
-				path_ok ? 1 : 0,
-				picked.c_str());
-			if (path_ok) {
-				initial_analysis::accept_local_pdb_prompt(picked);
-				closing = true;
-				pending = true;
+	if (!context.workspace || !state || state->dismissed) return;
+	const auto progress = context.workspace->progress();
+	using aida::analysis::workspace_readiness_t;
+	const bool visible = progress.readiness == workspace_readiness_t::analyzing ||
+		progress.readiness == workspace_readiness_t::baseline_ready ||
+		progress.readiness == workspace_readiness_t::cancelling ||
+		progress.readiness == workspace_readiness_t::failed ||
+		progress.readiness == workspace_readiness_t::partial;
+	if (!visible) return;
+	const auto& theme = aida::ui::resolved();
+	const ImGuiViewport* viewport = ImGui::GetMainViewport();
+	const ImVec2 size(430.0f,
+		(progress.error || !state->analysis_error.empty()) ? 196.0f : 166.0f);
+	const ImVec2 position(viewport->WorkPos.x + viewport->WorkSize.x - size.x - 20.0f,
+		viewport->WorkPos.y + 20.0f);
+	ImGui::SetNextWindowPos(position, ImGuiCond_Always);
+	ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(theme.bg_elevated, 0.98f));
+	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(theme.border_strong, 1.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 16.0f));
+	ImGui::Begin("Workspace analysis##workspace_analysis_progress", nullptr,
+		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::PushFont(aida::ui::fonts::body_em());
+	ImGui::TextUnformatted(context.workspace->identity().bin_name().c_str());
+	ImGui::PopFont();
+	ImGui::SameLine();
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_dim), "%s",
+		readiness_name(progress.readiness));
+	ImGui::Spacing();
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_secondary), "%s",
+		progress.phase.empty() ? "Preparing analysis" : progress.phase.c_str());
+	const float fraction = progress_fraction(progress);
+	ImGui::ProgressBar(fraction, ImVec2(-1.0f, 8.0f), "");
+	if (progress.total_units != 0)
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_dim),
+			"%llu / %llu units",
+			static_cast<unsigned long long>(progress.completed_units),
+			static_cast<unsigned long long>(progress.total_units));
+	if (progress.error)
+		ImGui::TextWrapped("%s: %s", progress.error->stable_code().c_str(),
+			progress.error->message.c_str());
+	if (!state->analysis_error.empty())
+		ImGui::TextWrapped("%s", state->analysis_error.c_str());
+	const bool running = progress.readiness == workspace_readiness_t::analyzing ||
+		progress.readiness == workspace_readiness_t::cancelling;
+	if (running) {
+		if (aida::ui::button(progress.readiness == workspace_readiness_t::cancelling
+			? "Cancelling" : "Cancel", aida::ui::button_kind_t::destructive,
+			aida::ui::size_t_::sm, ImVec2(), progress.cancellation_requested))
+			context.workspace->request_cancel();
+	} else if (progress.readiness != workspace_readiness_t::baseline_ready) {
+		if (aida::ui::button("Retry", aida::ui::button_kind_t::primary,
+			aida::ui::size_t_::sm)) {
+			state->dismissed = false;
+			auto started = initial_analysis::run_initial_analysis(context.workspace);
+			if (started) {
+				state->analysis_error.clear();
 			} else {
-				std::string seed = module_name;
-				auto dot = seed.rfind('.');
-				if (dot != std::string::npos) seed = seed.substr(0, dot);
-				if (!seed.empty()) seed += ".pdb";
-				std::string browsed = detail::browse_for_pdb_dialog(g_hwnd, seed);
-				if (!browsed.empty()) {
-					initial_analysis::accept_local_pdb_prompt(browsed);
-					closing = true;
-					pending = true;
-				}
+				state->analysis_error = started.error().stable_code() + ": " +
+					started.error().message;
 			}
 		}
-		if (skip_clicked && !closing) {
-			initial_analysis::decline_local_pdb_prompt();
-			closing = true;
-			pending = true;
-		}
 	}
-
+	if (!running) {
+		if (progress.readiness != workspace_readiness_t::baseline_ready) ImGui::SameLine();
+		if (aida::ui::button("Dismiss", aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::sm)) state->dismissed = true;
+	}
 	ImGui::End();
 	ImGui::PopStyleVar(2);
 	ImGui::PopStyleColor(2);
+}
+
+inline void render_remote_pdb(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<view_state_t>& state)
+{
+	if (!state || !target_matches(context)) return;
+	suppress_automated_prompts(context);
+	auto prompt = analysis_session::pdb_prompt_snapshot(context.workspace);
+	if (!prompt || !prompt.value().remote_pending) return;
+	const std::string popup = "Debug information available##" +
+		context.workspace->identity().binary_id().to_hex();
+	ImGui::OpenPopup(popup.c_str());
+	ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
+	if (!ImGui::BeginPopupModal(popup.c_str(), nullptr,
+		ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+	ImGui::PushFont(aida::ui::fonts::h2());
+	ImGui::TextUnformatted("Debug information available");
+	ImGui::PopFont();
+	ImGui::Separator();
+	ImGui::TextWrapped("The selected workspace references %s.",
+		prompt.value().pdb_name.empty() ? "an external PDB" :
+		prompt.value().pdb_name.c_str());
+	ImGui::TextWrapped("GUID: %s   Age: %u", prompt.value().pdb_guid.c_str(),
+		static_cast<unsigned>(prompt.value().pdb_age));
+	if (!prompt.value().symbol_server.empty())
+		ImGui::TextWrapped("%s", prompt.value().symbol_server.c_str());
+	if (!prompt.value().status.empty()) ImGui::TextWrapped("%s",
+		prompt.value().status.c_str());
+	if (!state->pdb_error.empty()) ImGui::TextWrapped("%s", state->pdb_error.c_str());
+	aida::ui::toggle_switch("Load types", &state->load_types, aida::ui::size_t_::md);
+	aida::ui::toggle_switch("Load names", &state->load_names, aida::ui::size_t_::md);
+	if (aida::ui::button("Yes, download", aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::md, ImVec2(), !state->load_types && !state->load_names)) {
+		auto accepted = analysis_session::approve_remote_pdb(context.workspace,
+			state->load_types, state->load_names);
+		if (accepted) {
+			state->pdb_error.clear();
+			ImGui::CloseCurrentPopup();
+		} else {
+			state->pdb_error = accepted.error().stable_code() + ": " +
+				accepted.error().message;
+		}
+	}
+	ImGui::SameLine();
+	if (aida::ui::button("No, skip", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::md) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+		auto declined = analysis_session::decline_remote_pdb(context.workspace);
+		if (declined) {
+			state->pdb_error.clear();
+			ImGui::CloseCurrentPopup();
+		} else {
+			state->pdb_error = declined.error().stable_code() + ": " +
+				declined.error().message;
+		}
+	}
+	ImGui::EndPopup();
+}
+
+inline void render_local_pdb(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<view_state_t>& state)
+{
+	if (!state || !target_matches(context)) return;
+	suppress_automated_prompts(context);
+	auto prompt = analysis_session::pdb_prompt_snapshot(context.workspace);
+	if (!prompt || !prompt.value().local_pending) return;
+	if (state->local_pdb_path[0] == '\0' && !prompt.value().local_candidate.empty())
+		std::strncpy(state->local_pdb_path.data(), prompt.value().local_candidate.c_str(),
+			state->local_pdb_path.size() - 1);
+	const std::string popup = "Locate local PDB##" +
+		context.workspace->identity().binary_id().to_hex();
+	ImGui::OpenPopup(popup.c_str());
+	ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
+	if (!ImGui::BeginPopupModal(popup.c_str(), nullptr,
+		ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+	ImGui::PushFont(aida::ui::fonts::h2());
+	ImGui::TextUnformatted("Locate local debug symbols");
+	ImGui::PopFont();
+	ImGui::Separator();
+	ImGui::TextWrapped("%s", prompt.value().module_name.empty()
+		? context.workspace->identity().bin_name().c_str()
+		: prompt.value().module_name.c_str());
+	if (!prompt.value().reason.empty())
+		ImGui::TextWrapped("%s", prompt.value().reason.c_str());
+	if (!prompt.value().status.empty())
+		ImGui::TextWrapped("%s", prompt.value().status.c_str());
+	if (!state->pdb_error.empty()) ImGui::TextWrapped("%s", state->pdb_error.c_str());
+	aida::ui::toggle_switch("Load types", &state->load_types, aida::ui::size_t_::md);
+	aida::ui::toggle_switch("Load names", &state->load_names, aida::ui::size_t_::md);
+	ImGui::InputText("PDB path", state->local_pdb_path.data(), state->local_pdb_path.size());
+	if (aida::ui::button("Browse...", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::md)) {
+		const std::string selected = browse_for_pdb(context,
+			state->local_pdb_path.data());
+		if (!selected.empty()) {
+			state->local_pdb_path.fill('\0');
+			std::strncpy(state->local_pdb_path.data(), selected.c_str(),
+				state->local_pdb_path.size() - 1);
+		}
+	}
+	ImGui::SameLine();
+	const bool valid = state->local_pdb_path[0] != '\0';
+	if (aida::ui::button("Load this PDB", aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::md, ImVec2(), !valid ||
+			(!state->load_types && !state->load_names))) {
+		auto accepted = analysis_session::approve_local_pdb(context.workspace,
+			state->local_pdb_path.data(), state->load_types, state->load_names);
+		if (accepted) {
+			state->pdb_error.clear();
+			ImGui::CloseCurrentPopup();
+		} else {
+			state->pdb_error = accepted.error().stable_code() + ": " +
+				accepted.error().message;
+		}
+	}
+	ImGui::SameLine();
+	if (aida::ui::button("No, skip", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::md) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+		auto declined = analysis_session::decline_local_pdb(context.workspace);
+		if (declined) {
+			state->pdb_error.clear();
+			ImGui::CloseCurrentPopup();
+		} else {
+			state->pdb_error = declined.error().stable_code() + ": " +
+				declined.error().message;
+		}
+	}
+	ImGui::EndPopup();
+}
+
+inline void render_pdb_status(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<view_state_t>& state)
+{
+	if (!state || !target_matches(context)) return;
+	auto prompt = analysis_session::pdb_prompt_snapshot(context.workspace);
+	if (!prompt || !prompt.value().loading) return;
+	const auto& theme = aida::ui::resolved();
+	const ImGuiViewport* viewport = ImGui::GetMainViewport();
+	const ImVec2 size(430.0f, 132.0f);
+	const ImVec2 position(viewport->WorkPos.x + viewport->WorkSize.x - size.x - 20.0f,
+		viewport->WorkPos.y + 224.0f);
+	ImGui::SetNextWindowPos(position, ImGuiCond_Always);
+	ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg,
+		aida::ui::with_alpha(theme.bg_elevated, 0.98f));
+	ImGui::PushStyleColor(ImGuiCol_Border,
+		aida::ui::with_alpha(theme.border_strong, 1.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 16.0f));
+	const std::string title = "PDB operation##" + prompt.value().binary_id;
+	ImGui::Begin(title.c_str(), nullptr, ImGuiWindowFlags_NoTitleBar |
+		ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+		ImGuiWindowFlags_NoSavedSettings);
+	ImGui::PushFont(aida::ui::fonts::body_em());
+	ImGui::TextUnformatted(prompt.value().module_name.c_str());
+	ImGui::PopFont();
+	ImGui::TextWrapped("%s", prompt.value().status.c_str());
+	const float fraction = prompt.value().bytes_total != 0
+		? static_cast<float>((std::min)(1.0,
+			static_cast<double>(prompt.value().bytes_received) /
+			static_cast<double>(prompt.value().bytes_total)))
+		: static_cast<float>((std::clamp)(prompt.value().progress_percent,
+			0, 100)) / 100.0f;
+	ImGui::ProgressBar(fraction, ImVec2(-1.0f, 8.0f), "");
+	if (aida::ui::button("Cancel PDB", aida::ui::button_kind_t::destructive,
+		aida::ui::size_t_::sm)) {
+		auto cancelled = analysis_session::cancel_pdb(context.workspace);
+		if (!cancelled) state->pdb_error = cancelled.error().stable_code() + ": " +
+			cancelled.error().message;
+	}
+	ImGui::End();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+}
+
+}
+
+inline void render_frame(const disasm_view::workspace_context_t& context)
+{
+	const auto state = state_for(context);
+	if (!state) return;
+	detail::sync_pdb_prompt_state(context, state);
+	detail::render_progress(context, state);
+	detail::render_remote_pdb(context, state);
+	detail::render_local_pdb(context, state);
+	detail::render_pdb_status(context, state);
 }
 
 inline void render_frame()
 {
-	render_overlay();
-	render_modal();
-	render_local_pdb_modal();
+	render_frame(disasm_view::capture_selected_workspace());
 }
 
 }

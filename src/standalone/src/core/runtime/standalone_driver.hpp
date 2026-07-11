@@ -359,6 +359,10 @@ namespace driver_bridge
     bool read_kernel_memory(uint64_t address, size_t size, std::vector<uint8_t>& out);
     bool write_kernel_memory(uint64_t address, const std::vector<uint8_t>& data);
 
+    bool kernel_read_user_memory(uint64_t addr, void* out, size_t len);
+
+    bool verify_cross_ring_evidence(const uint8_t* evidence_data, uint32_t evidence_size);
+
     uint64_t allocate_memory(size_t size);
     bool free_memory(uint64_t address);
     bool protect_memory(uint64_t address, uint64_t size, uint32_t new_protect, uint32_t* old_protect = nullptr);
@@ -561,6 +565,78 @@ namespace driver_bridge
     bool canary_register(void* va, size_t size);
     bool re_confirmed_usermode_bsod(const re_evidence_blob_t& evidence);
 
+    struct iommu_status_t {
+        uint8_t  dmar_present = 0;
+        uint8_t  ivrs_present = 0;
+        uint8_t  vtd_enabled = 0;
+        uint8_t  amd_vi_enabled = 0;
+        uint8_t  iommu_present = 0;
+        uint8_t  remapping_bypassed = 0;
+        uint8_t  pad[2] = {};
+        uint64_t dmar_table_pa = 0;
+        uint64_t ivrs_table_pa = 0;
+        uint32_t remapping_units = 0;
+        uint32_t risk_level = 0;
+        uint64_t detection_timestamp = 0;
+    };
+
+    struct pcie_device_entry_t {
+        uint16_t vendor_id = 0;
+        uint16_t device_id = 0;
+        uint32_t class_code = 0;
+        uint8_t  bus = 0;
+        uint8_t  device = 0;
+        uint8_t  function = 0;
+        uint8_t  header_type = 0;
+        uint64_t bar_pa[6] = {};
+        uint64_t bar_size = 0;
+        uint32_t flags = 0;
+        uint32_t whitelist_status = 0;
+    };
+
+    static constexpr size_t MAX_PCIE_DEVICES = 256;
+
+    struct pcie_enum_result_t {
+        uint32_t device_count = 0;
+        uint32_t unknown_count = 0;
+        pcie_device_entry_t entries[MAX_PCIE_DEVICES];
+    };
+
+    struct ept_check_result_t {
+        uint8_t  ept_present = 0;
+        uint8_t  npte_present = 0;
+        uint8_t  ept_hook_detected = 0;
+        uint8_t  vmm_present = 0;
+        uint8_t  pad[4] = {};
+        uint64_t ept_pointer_msr = 0;
+        uint32_t npte_anomaly_count = 0;
+        uint32_t risk_level = 0;
+        uint64_t detection_timestamp = 0;
+    };
+
+    struct dma_protection_state_t {
+        iommu_status_t iommu;
+        uint32_t canary_count = 0;
+        uint32_t canary_hits = 0;
+        uint32_t pcie_unknown_count = 0;
+        uint32_t ept_anomaly_count = 0;
+        uint32_t tier1_refused = 0;
+        uint32_t tier2_bsod_armed = 0;
+        uint64_t timestamp = 0;
+    };
+
+    bool query_dma_protection_state(dma_protection_state_t& out);
+    bool query_iommu_status(iommu_status_t& out);
+    bool enumerate_pcie_devices(pcie_enum_result_t& out);
+    bool add_pcie_whitelist(uint16_t vendor_id, uint16_t device_id);
+    bool register_canary_poison(uint64_t va, uint64_t poison_signature);
+    bool protect_page_pte(uint64_t va);
+    bool unprotect_page_pte(uint64_t va);
+    bool check_ept_state(ept_check_result_t& out);
+    bool trigger_dma_countermeasure(uint32_t action, uint32_t reason);
+
+    bool update_re_tool_hashes(const uint8_t* hashes, uint32_t count);
+
     struct anti_debug_result_t {
         uint32_t result_flags;
         uint64_t detected_debugger_pid;
@@ -570,6 +646,7 @@ namespace driver_bridge
     bool kernel_anti_debug_clear_dr(uint64_t* out_clear_count = nullptr);
     bool kernel_anti_debug_clear_process_dr(uint32_t pid, uint64_t* out_clear_count = nullptr);
     bool kernel_anti_debug_scan_debuggers(uint64_t* out_debugger_pid = nullptr);
+    bool kernel_anti_debug_scan_text(uint64_t module_base, uint64_t exception_dir_va, uint32_t exception_dir_size, uint64_t* hit_rva);
     bool kernel_anti_debug_hide_thread(uint32_t pid, uint32_t tid);
     bool kernel_anti_debug_hide_all_threads(uint32_t pid);
     bool kernel_anti_debug_install_instrumentation(uint32_t pid, void* callback);
@@ -614,6 +691,33 @@ namespace driver_bridge
 
     bool relay_server_token(uint32_t token_hash, uint64_t server_nonce);
     bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof = nullptr);
+
+    struct reloc_mask_entry_t {
+        uint32_t offset;
+        uint32_t size;
+        uint32_t reloc_type;
+        uint32_t _pad;
+        uint8_t  original_value[8];
+    };
+
+    struct cross_ring_evidence_t {
+        uint32_t detecting_checker_id;
+        uint32_t target_checker_id;
+        uint64_t region_base;
+        uint64_t region_size;
+        uint8_t  expected_hash[32];
+        uint8_t  actual_hash[32];
+        uint8_t  modified_bytes[256];
+        uint32_t modified_bytes_len;
+        uint32_t _pad;
+    };
+
+    bool register_usermode_hash(uint64_t text_base, uint32_t text_size,
+                                uint64_t reloc_delta,
+                                const uint8_t sha256[32],
+                                const reloc_mask_entry_t* mask_entries,
+                                uint32_t mask_count);
+    bool verify_cross_ring_evidence(const cross_ring_evidence_t& evidence);
 
     bool traffic_redirect_op(uint32_t operation, uint32_t rule_id = 0, uint32_t protocol = 0,
                              uint32_t match_port = 0, const uint8_t* match_addr = nullptr,

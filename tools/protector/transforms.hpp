@@ -1450,6 +1450,8 @@ struct packed_section_layout_t {
     uint32_t stub_offset;
     uint32_t tls_stub_offset;
     uint32_t total_size;
+    uint32_t key_slots_offset;
+    uint32_t key_slots_size;
 };
 
 struct transform_result_t {
@@ -4660,4 +4662,25 @@ inline bool patch_aux_phase_flags(pe_file::pe_image_t& pe,
     return true;
 }
 
+inline bool patch_aux_pin_reserved(pe_file::pe_image_t& pe,
+                                   uint32_t packed_section_rva,
+                                   const packed_section_layout_t& layout,
+                                   uint32_t r0, uint32_t r1,
+                                   uint32_t r2, uint32_t r3) {
+    pe_file::section_t* sec = pe.section_from_rva(packed_section_rva);
+    if (sec == nullptr) return false;
+    if (layout.aux_offset == 0u) return false;
+    if (static_cast<size_t>(layout.aux_offset) + sizeof(aux_block_t) > sec->data.size()) return false;
+    aux_block_t aux{};
+    std::memcpy(&aux, sec->data.data() + layout.aux_offset, sizeof(aux_block_t));
+    if (aux.magic != kAuxMagic || aux.version != kAuxVersion) return false;
+    aux.pin_reserved[0] = r0;
+    aux.pin_reserved[1] = r1;
+    aux.pin_reserved[2] = r2;
+    aux.pin_reserved[3] = r3;
+    std::memcpy(sec->data.data() + layout.aux_offset, &aux, sizeof(aux_block_t));
+    return true;
 }
+
+}
+

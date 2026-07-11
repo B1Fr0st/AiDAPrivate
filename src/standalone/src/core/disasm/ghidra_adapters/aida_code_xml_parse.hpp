@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -9,6 +11,9 @@ class Funcdata;
 }
 
 namespace aida_ghidra {
+
+inline constexpr std::size_t default_max_annotations = 1U << 20;
+inline constexpr std::size_t default_max_line_mappings = 1U << 20;
 
 enum class annotation_kind_t : uint8_t
 {
@@ -46,6 +51,9 @@ struct annotated_code_t
 	std::vector<std::pair<int, uint64_t>> line_to_address;
 };
 
-bool parse_code_xml(ghidra::Funcdata* func, const std::string& xml, annotated_code_t& out);
+bool parse_code_xml(ghidra::Funcdata* func, const std::string& xml, annotated_code_t& out,
+                    std::size_t max_annotations = default_max_annotations,
+                    std::size_t max_line_mappings = default_max_line_mappings,
+                    std::atomic<bool>* cancel = nullptr);
 
 }

@@ -11,6 +11,7 @@
 
 #include "virtualizer.hpp"
 #include "state.hpp"
+#include "webhook.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "wininet.lib")
@@ -826,6 +827,7 @@ namespace anti_tamper::decoy {
         {"NtScanPattern",        (void*)&decoy_memory_scan_pattern},
     };
     inline constexpr int FAKE_IMPORT_COUNT = 23;
+    inline constexpr int HONEYPOT_FAKE_IMPORT_COUNT = 8;
 
     inline void initialize()
     {
@@ -838,6 +840,414 @@ namespace anti_tamper::decoy {
             sink += reinterpret_cast<uintptr_t>(g_fake_imports[i].addr);
         (void)sink;
     }
+
+
+namespace taint_poison {
+
+    constexpr uint32_t DISCARD_BUFFER_SIZE = 4096;
+
+    alignas(64) static thread_local uint8_t* g_discard_buffer_ptr = nullptr;
+    alignas(64) static thread_local uint64_t g_decoy_accumulator = 0;
+    alignas(64) static thread_local uint64_t g_decoy_sink_taint = 0;
+
+    inline void ensure_discard_buffer()
+    {
+        if (g_discard_buffer_ptr) return;
+
+        constexpr uint32_t total_alloc = DISCARD_BUFFER_SIZE + 4096 * 2;
+        uint8_t* base = static_cast<uint8_t*>(
+            VirtualAlloc(nullptr, total_alloc, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!base) return;
+
+        DWORD old_prot = 0;
+        VirtualProtect(base, 4096, PAGE_NOACCESS, &old_prot);
+        VirtualProtect(base + 4096 + DISCARD_BUFFER_SIZE, 4096, PAGE_NOACCESS, &old_prot);
+
+        g_discard_buffer_ptr = base + 4096;
+    }
+
+    __forceinline uint8_t* discard_buf()
+    {
+        ensure_discard_buffer();
+        return g_discard_buffer_ptr ? g_discard_buffer_ptr : nullptr;
+    }
+
+    __forceinline void write_discard(size_t offset, uint64_t val)
+    {
+        uint8_t* buf = discard_buf();
+        if (buf && offset + 8 <= DISCARD_BUFFER_SIZE)
+            std::memcpy(buf + offset, &val, 8);
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_lic_0(
+        const uint8_t* data, size_t len, uint64_t tag)
+    {
+        volatile uint64_t v = 0;
+        if (data && len > 0)
+        {
+            for (size_t i = 0; i < len && i < 8; ++i)
+                v |= static_cast<uint64_t>(data[i]) << (i * 8);
+        }
+        v ^= tag;
+        decoy_validate_signature(data, len, tag);
+        write_discard(0, v);
+        g_decoy_sink_taint ^= v;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_lic_1(
+        uint64_t tainted_val, uint64_t tag)
+    {
+        volatile uint64_t v = tainted_val ^ tag;
+        uint64_t r = decoy_derive_session_key(v, tag);
+        write_discard(32, r);
+        g_decoy_accumulator ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_lic_2(
+        const uint8_t* tainted_mem, size_t len, uint64_t tag)
+    {
+        volatile uint64_t v = reinterpret_cast<uint64_t>(tainted_mem) ^ tag;
+        bool r = decoy_verify_certificate(tainted_mem,
+            static_cast<uint32_t>(len > 1024 ? 1024 : len));
+        (void)r;
+        write_discard(64, v);
+        g_decoy_sink_taint ^= v;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_lic_3(
+        uint64_t tainted_val, uint64_t tag)
+    {
+        volatile uint64_t v = tainted_val ^ tag;
+        int r = decoy_check_hardware_binding();
+        (void)r;
+        g_decoy_accumulator ^= v;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_lic_4(
+        uint64_t tainted_val, uint64_t tag)
+    {
+        volatile uint64_t v = tainted_val ^ tag;
+        uint64_t r = decoy_compute_integrity_hash(
+            reinterpret_cast<uintptr_t>(&v), sizeof(v));
+        write_discard(96, r);
+        g_decoy_sink_taint ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_key_0(
+        uint64_t key_material, uint64_t tag)
+    {
+        volatile uint64_t v = key_material ^ tag;
+        uint64_t r = decoy_derive_page_key(
+            static_cast<uint32_t>(tag & 0xFFFFFFFF), v);
+        write_discard(128, r);
+        g_decoy_accumulator ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_key_1(
+        uint64_t derived_key, uint64_t tag)
+    {
+        volatile uint64_t v = derived_key ^ tag;
+        uint64_t r = decoy_siphash_finalize(v, tag, v ^ tag, tag);
+        g_decoy_accumulator ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_key_2(
+        uint64_t session_key, uint64_t tag)
+    {
+        volatile uint64_t v = session_key ^ tag;
+        uint64_t r = decoy_blake2b_compress(v, tag, __rdtsc());
+        write_discard(160, r);
+        g_decoy_sink_taint ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_key_3(
+        uint64_t entropy, uint64_t tag)
+    {
+        volatile uint64_t v = entropy ^ tag;
+        uint64_t r = decoy_chacha_quarter(v, tag, v ^ tag, tag);
+        g_decoy_accumulator ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_key_4(
+        uint64_t master_key, uint64_t tag)
+    {
+        volatile uint64_t v = master_key ^ tag;
+        bool r = decoy_rsa_verify_stub(
+            reinterpret_cast<const uint8_t*>(&v), sizeof(v), tag);
+        (void)r;
+        write_discard(192, v);
+        g_decoy_sink_taint ^= v;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_hmac_0(
+        uint64_t hmac_input, uint64_t tag)
+    {
+        volatile uint64_t v = hmac_input ^ tag;
+        uint64_t r = decoy_validate_signature(
+            reinterpret_cast<const uint8_t*>(&v), sizeof(v), tag);
+        write_discard(224, r);
+        g_decoy_sink_taint ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_hmac_1(
+        uint64_t hmac_key, uint64_t tag)
+    {
+        volatile uint64_t v = hmac_key ^ tag;
+        uint64_t r = decoy_derive_session_key(v, tag);
+        g_decoy_accumulator ^= r;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_hmac_2(
+        uint64_t challenge, uint64_t tag)
+    {
+        volatile uint64_t v = challenge ^ tag;
+        bool r = decoy_verify_driver_proof(v, tag);
+        (void)r;
+        write_discard(240, v);
+        g_decoy_sink_taint ^= v;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_hmac_3(
+        uint64_t nonce, uint64_t tag)
+    {
+        volatile uint64_t v = nonce ^ tag;
+        int r = decoy_validate_server_token(v, tag);
+        (void)r;
+        g_decoy_accumulator ^= v;
+    }
+
+    __declspec(noinline) static void __cdecl decoy_sink_hmac_4(
+        uint64_t response, uint64_t tag)
+    {
+        volatile uint64_t v = response ^ tag;
+        bool r = decoy_ed25519_verify(
+            reinterpret_cast<const uint8_t*>(&v),
+            reinterpret_cast<const uint8_t*>(&tag),
+            sizeof(v));
+        (void)r;
+        write_discard(248, v);
+        g_decoy_sink_taint ^= v;
+    }
+
+    inline void initialize()
+    {
+        ensure_discard_buffer();
+        volatile uintptr_t anchor = 0;
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_lic_0);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_lic_1);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_lic_2);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_lic_3);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_lic_4);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_key_0);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_key_1);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_key_2);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_key_3);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_key_4);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_0);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_1);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_2);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_3);
+        anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_4);
+        (void)anchor;
+    }
+
+    inline uint32_t verify_discard_buffer_isolation()
+    {
+        ensure_discard_buffer();
+        uint8_t* buf = g_discard_buffer_ptr;
+        if (!buf)
+        {
+            webhook::write_log_critical("decoy_taint",
+                "discard_buffer_isolation_skip buffer_null");
+            return 0;
+        }
+
+        uintptr_t buf_start = reinterpret_cast<uintptr_t>(buf);
+        uintptr_t buf_end = buf_start + DISCARD_BUFFER_SIZE;
+
+        HMODULE hmod = GetModuleHandleW(nullptr);
+        if (!hmod)
+        {
+            webhook::write_log_critical("decoy_taint",
+                "discard_buffer_isolation_skip module_null");
+            return 0;
+        }
+
+        uint8_t* base = reinterpret_cast<uint8_t*>(hmod);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        {
+            webhook::write_log_critical("decoy_taint",
+                "discard_buffer_isolation_skip bad_dos_magic");
+            return 0;
+        }
+
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+        {
+            webhook::write_log_critical("decoy_taint",
+                "discard_buffer_isolation_skip bad_nt_sig");
+            return 0;
+        }
+
+        uint8_t* text_start = nullptr;
+        size_t text_size = 0;
+        IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+        {
+            if (memcmp(sections[i].Name, ".text", 5) == 0)
+            {
+                text_start = base + sections[i].VirtualAddress;
+                text_size = sections[i].Misc.VirtualSize;
+                break;
+            }
+        }
+
+        if (!text_start || text_size == 0)
+        {
+            webhook::write_log_critical("decoy_taint",
+                "discard_buffer_isolation_skip no_text_section");
+            return 0;
+        }
+
+        webhook::write_log_critical_fmt("decoy_taint",
+            "discard_buffer_isolation_scan buf=0x%016llX buf_end=0x%016llX "
+            "text=0x%016llX text_size=0x%llX",
+            (unsigned long long)buf_start,
+            (unsigned long long)buf_end,
+            (unsigned long long)reinterpret_cast<uintptr_t>(text_start),
+            (unsigned long long)text_size);
+
+        uint32_t hit_count = 0;
+        const uint8_t* scan = text_start;
+        const uint8_t* scan_end = text_start + text_size;
+
+        while (scan + 7 < scan_end)
+        {
+            size_t max_prefix = 0;
+            const uint8_t* p = scan;
+
+            while (max_prefix < 4 && scan + max_prefix < scan_end)
+            {
+                uint8_t b = scan[max_prefix];
+                if (b == 0x66 || b == 0x67 || b == 0xF2 || b == 0xF3 ||
+                    b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E ||
+                    b == 0x64 || b == 0x65)
+                {
+                    ++max_prefix;
+                    continue;
+                }
+                break;
+            }
+
+            p = scan + max_prefix;
+            if (p >= scan_end) { ++scan; continue; }
+
+            bool has_rex = false;
+            uint8_t rex = 0;
+            if ((*p & 0xF0) == 0x40)
+            {
+                rex = *p;
+                has_rex = true;
+                ++p;
+                if (p >= scan_end) { ++scan; continue; }
+            }
+
+            uint8_t opcode = *p;
+            ++p;
+            if (p >= scan_end) { ++scan; continue; }
+
+            bool is_two_byte = false;
+            if (opcode == 0x0F && p < scan_end)
+            {
+                is_two_byte = true;
+                opcode = *p;
+                ++p;
+                if (p >= scan_end) { ++scan; continue; }
+            }
+
+            static const uint8_t r_m_opcodes[] = {
+                0x8B, 0x89, 0x8D,
+                0x03, 0x01, 0x2B, 0x29,
+                0x23, 0x21, 0x0B, 0x09,
+                0x33, 0x31, 0x3B, 0x39,
+                0x85, 0x87,
+            };
+
+            bool is_r_m_opcode = false;
+            if (!is_two_byte)
+            {
+                for (size_t k = 0; k < sizeof(r_m_opcodes); ++k)
+                {
+                    if (opcode == r_m_opcodes[k]) { is_r_m_opcode = true; break; }
+                }
+                if (opcode == 0xFF || opcode == 0xC6 || opcode == 0xC7 ||
+                    opcode == 0x80 || opcode == 0x81 || opcode == 0x83 ||
+                    opcode == 0xF6 || opcode == 0xF7)
+                    is_r_m_opcode = true;
+            }
+            else
+            {
+                if (opcode == 0xBE || opcode == 0xBF ||
+                    opcode == 0xB6 || opcode == 0xB7)
+                    is_r_m_opcode = true;
+            }
+
+            if (!is_r_m_opcode)
+            {
+                ++scan;
+                continue;
+            }
+
+            if (p >= scan_end) { ++scan; continue; }
+            uint8_t modrm = *p;
+            ++p;
+
+            if ((modrm & 0xC7) == 0x05)
+            {
+                if (p + 4 > scan_end) { ++scan; continue; }
+
+                int32_t disp32 = 0;
+                memcpy(&disp32, p, 4);
+
+                uintptr_t instr_end = reinterpret_cast<uintptr_t>(p + 4);
+                uintptr_t target = instr_end + static_cast<int64_t>(disp32);
+
+                if (target >= buf_start && target < buf_end)
+                {
+                    ++hit_count;
+                    uintptr_t instr_va = reinterpret_cast<uintptr_t>(scan);
+                    webhook::write_log_critical_fmt("decoy_taint",
+                        "discard_buffer_isolation_HIT instr_va=0x%016llX "
+                        "target=0x%016llX buf_start=0x%016llX buf_end=0x%016llX "
+                        "opcode=0x%02X modrm=0x%02X rex=0x%02X disp=%d",
+                        (unsigned long long)instr_va,
+                        (unsigned long long)target,
+                        (unsigned long long)buf_start,
+                        (unsigned long long)buf_end,
+                        opcode, modrm, has_rex ? rex : 0, disp32);
+                }
+            }
+
+            ++scan;
+        }
+
+        if (hit_count > 0)
+        {
+            webhook::write_log_critical_fmt("decoy_taint",
+                "discard_buffer_isolation_FAIL hits=%u", hit_count);
+        }
+        else
+        {
+            webhook::write_log("decoy_taint",
+                "discard_buffer_isolation_ok no_text_refs");
+        }
+
+        return hit_count;
+    }
+
+}
+
 
 }
 
@@ -928,4 +1338,63 @@ namespace anti_tamper::decoy {
             (void)_r4;                                                           \
             anti_tamper::decoy::g_decoy_sink ^= _r2;                             \
         }                                                                        \
+    } while (0)
+
+#define TAINT_POISON_LIC(tag, tainted_var)                                       \
+    do {                                                                         \
+        uint64_t _tp_tag_##tag = 0x4C494330ULL | (uint64_t)__LINE__;            \
+        anti_tamper::decoy::taint_poison::decoy_sink_lic_0(                     \
+            reinterpret_cast<const uint8_t*>(&(tainted_var)),                    \
+            sizeof(tainted_var), _tp_tag_##tag);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_lic_1(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4C494331ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_lic_2(                     \
+            reinterpret_cast<const uint8_t*>(&(tainted_var)),                    \
+            sizeof(tainted_var),                                                 \
+            0x4C494332ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_lic_3(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4C494333ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_lic_4(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4C494334ULL | (uint64_t)__LINE__);                                 \
+    } while (0)
+
+#define TAINT_POISON_KEY(tag, tainted_var)                                       \
+    do {                                                                         \
+        anti_tamper::decoy::taint_poison::decoy_sink_key_0(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4B455930ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_key_1(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4B455931ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_key_2(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4B455932ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_key_3(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4B455933ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_key_4(                     \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x4B455934ULL | (uint64_t)__LINE__);                                 \
+    } while (0)
+
+#define TAINT_POISON_HMAC(tag, tainted_var)                                      \
+    do {                                                                         \
+        anti_tamper::decoy::taint_poison::decoy_sink_hmac_0(                    \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x484D4143ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_hmac_1(                    \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x484D4144ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_hmac_2(                    \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x484D4145ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_hmac_3(                    \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x484D4146ULL | (uint64_t)__LINE__);                                 \
+        anti_tamper::decoy::taint_poison::decoy_sink_hmac_4(                    \
+            static_cast<uint64_t>(tainted_var),                                  \
+            0x484D4147ULL | (uint64_t)__LINE__);                                 \
     } while (0)

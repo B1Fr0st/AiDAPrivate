@@ -506,10 +506,135 @@ endfunction()
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_MAN OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+set(ZYCORE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(ZYCORE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZYCORE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_FEATURE_ENCODER ON CACHE BOOL "" FORCE)
 
-set(zydis_SOURCE_DIR "${DEPS_DIR}/zydis")
-set(zydis_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zydis")
+set(zydis_SOURCE_DIR "${DEPS_DIR}/zydis-4.1.1")
+set(zydis_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zydis-4.1.1")
+set(zycore_SOURCE_DIR "${zydis_SOURCE_DIR}/dependencies/zycore")
+set(capstone_SOURCE_DIR "${DEPS_DIR}/capstone/capstone-5.0.9")
+set(capstone_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/capstone-5.0.9")
+set(json_schema_validator_SOURCE_DIR "${DEPS_DIR}/json-schema-validator-2.4.0")
+set(json_schema_validator_BINARY_DIR
+    "${CMAKE_BINARY_DIR}/.deps/json-schema-validator-2.4.0")
+set(ZYAN_SYSTEM_ZYCORE OFF CACHE BOOL "" FORCE)
+set(ZYAN_ZYCORE_PATH "${zycore_SOURCE_DIR}" CACHE PATH "" FORCE)
+set(AIDA_ANALYSIS_NOTICE_LEDGER_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/THIRD_PARTY_NOTICES_ANALYSIS.md")
+set(AIDA_CAPSTONE_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/Capstone-LICENSE.txt")
+set(AIDA_JSON_SCHEMA_VALIDATOR_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/nlohmann-json-schema-validator-LICENSE.txt")
+set(AIDA_GHIDRA_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/Ghidra-LICENSE.txt")
+set(AIDA_GHIDRA_NOTICE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/Ghidra-NOTICE.txt")
+foreach(_aida_required_analysis_dependency IN ITEMS
+        "${zydis_SOURCE_DIR}/CMakeLists.txt"
+        "${zydis_SOURCE_DIR}/include/Zydis/Zydis.h"
+        "${zycore_SOURCE_DIR}/CMakeLists.txt"
+        "${zycore_SOURCE_DIR}/include/Zycore/Zycore.h"
+        "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.c"
+        "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.h"
+        "${DEPS_DIR}/taskflow/taskflow/taskflow.hpp"
+        "${DEPS_DIR}/zlib/CMakeLists.txt"
+        "${DEPS_DIR}/zlib/zlib.h"
+        "${DEPS_DIR}/zlib/LICENSE"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/nlohmann/json.hpp"
+        "${capstone_SOURCE_DIR}/CMakeLists.txt"
+        "${capstone_SOURCE_DIR}/include/capstone/capstone.h"
+        "${capstone_SOURCE_DIR}/LICENSE.TXT"
+        "${json_schema_validator_SOURCE_DIR}/CMakeLists.txt"
+        "${json_schema_validator_SOURCE_DIR}/src/nlohmann/json-schema.hpp"
+        "${json_schema_validator_SOURCE_DIR}/LICENSE"
+        "${AIDA_ANALYSIS_NOTICE_LEDGER_FILE}")
+    if(NOT EXISTS "${_aida_required_analysis_dependency}")
+        message(FATAL_ERROR "AiDA: required pinned analysis dependency or notice is missing: ${_aida_required_analysis_dependency}")
+    endif()
+endforeach()
+function(aida_require_analysis_file_sha256 file_path expected_sha256)
+    if(NOT EXISTS "${file_path}")
+        message(FATAL_ERROR "AiDA: required pinned analysis file is missing: ${file_path}")
+    endif()
+    file(SHA256 "${file_path}" _aida_analysis_actual_sha256)
+    if(NOT "${_aida_analysis_actual_sha256}" STREQUAL "${expected_sha256}")
+        message(FATAL_ERROR "AiDA: pinned analysis file hash mismatch: ${file_path}")
+    endif()
+endfunction()
+function(aida_require_analysis_text_sha256 file_path expected_sha256)
+    if(NOT EXISTS "${file_path}")
+        message(FATAL_ERROR "AiDA: required pinned analysis notice is missing: ${file_path}")
+    endif()
+    file(READ "${file_path}" _aida_analysis_text)
+    string(REPLACE "\r\n" "\n" _aida_analysis_text "${_aida_analysis_text}")
+    string(REPLACE "\r" "\n" _aida_analysis_text "${_aida_analysis_text}")
+    string(SHA256 _aida_analysis_actual_sha256 "${_aida_analysis_text}")
+    if(NOT "${_aida_analysis_actual_sha256}" STREQUAL "${expected_sha256}")
+        message(FATAL_ERROR "AiDA: pinned analysis notice hash mismatch: ${file_path}")
+    endif()
+endfunction()
+aida_require_analysis_file_sha256(
+    "${zydis_SOURCE_DIR}/LICENSE"
+    "e5e99718209e94baaf3e9cbf6f64aa3329c9e73c63b1ab47e10f29d81974e6f3")
+aida_require_analysis_file_sha256(
+    "${zycore_SOURCE_DIR}/LICENSE"
+    "7991ec4481a82c51d196f7440fda34c578aab51f8b9c7023935c6e03b57638bd")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.c"
+    "87497ab605bedd0dbee27a209c1eeff8c89b229b13f921a7efdbb81a13f779fd")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.h"
+    "4ff81af4849acabc76fc8349abb926814395072617ca18e08800abf734ab7612")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/taskflow/LICENSE"
+    "aa797f3efb1fab9c55c3b2f6d905b6f447d23c17c53a56c19b1f885d55150a01")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/zlib/CMakeLists.txt"
+    "c11f6c94a007132d353d3bf865a4e89496104815c2f0f236df213c1fd3ca0b87")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/zlib/zlib.h"
+    "d31ea3abacb0e2ce9b5a43b53395440ebd282a9828f242c9d2d70d2e9395d8be")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/zlib/LICENSE"
+    "439c75ab12b340c5362b9d4b08ff05ec3a4d0eb7667a6fff49a9b16d8795c78e")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/licenses/nlohmann-json-3.12.0-LICENSE.MIT"
+    "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603")
+aida_require_analysis_file_sha256(
+    "${capstone_SOURCE_DIR}/CMakeLists.txt"
+    "2b5eb43abba6ad34b9fd4aabea18a0c6fe4b49e5aab34a8b6111e66c6f706f49")
+aida_require_analysis_file_sha256(
+    "${capstone_SOURCE_DIR}/include/capstone/capstone.h"
+    "b98e0fbd0f460fe4641ec2c7424bf6b6ad7120178c7d52cb6f8dd175c469bc6d")
+aida_require_analysis_file_sha256(
+    "${capstone_SOURCE_DIR}/LICENSE.TXT"
+    "65e9ed46a59976eda8f5bd1ea79a680dea38dd299c760bc9a8d87a764ef5029b")
+aida_require_analysis_text_sha256(
+    "${AIDA_CAPSTONE_LICENSE_FILE}"
+    "65e9ed46a59976eda8f5bd1ea79a680dea38dd299c760bc9a8d87a764ef5029b")
+aida_require_analysis_file_sha256(
+    "${json_schema_validator_SOURCE_DIR}/CMakeLists.txt"
+    "6855fe2ce65170637b067fe7362f71df0b8a1efe2ed27e05a93aa205c0676f4b")
+aida_require_analysis_file_sha256(
+    "${json_schema_validator_SOURCE_DIR}/src/nlohmann/json-schema.hpp"
+    "2d9772aee4cb7ddb6d338eac207c965fe2cd283a045dc35dfa9c0aaec481247b")
+aida_require_analysis_file_sha256(
+    "${json_schema_validator_SOURCE_DIR}/LICENSE"
+    "4294d027a5205eea79a5241b2c1423d556efaa3139df8cea5ac313fb5ffb07bf")
+aida_require_analysis_text_sha256(
+    "${AIDA_JSON_SCHEMA_VALIDATOR_LICENSE_FILE}"
+    "4294d027a5205eea79a5241b2c1423d556efaa3139df8cea5ac313fb5ffb07bf")
+aida_require_analysis_text_sha256(
+    "${AIDA_GHIDRA_LICENSE_FILE}"
+    "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4")
+aida_require_analysis_text_sha256(
+    "${AIDA_GHIDRA_NOTICE_FILE}"
+    "ad4b2bb6e75e908251226180081b5afa01c7161d7710e08b603d0c340a08a23f")
 add_subdirectory("${zydis_SOURCE_DIR}" "${zydis_BINARY_DIR}")
 
 if(MSVC AND TARGET Zycore)
@@ -706,20 +831,27 @@ set(Z3_VCRUNTIME140_DLL_PATH         "${Z3_INSTALL_DIR}/bin/vcruntime140.dll")
 set(Z3_VCRUNTIME140_1_DLL_PATH       "${Z3_INSTALL_DIR}/bin/vcruntime140_1.dll")
 set(Z3_VCRUNTIME140_THREADS_DLL_PATH "${Z3_INSTALL_DIR}/bin/vcruntime140_threads.dll")
 
-# --- Capstone (required by Triton) ---
-set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(CAPSTONE_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_CSTEST OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_INSTALL OFF CACHE BOOL "" FORCE)
-add_subdirectory("${DEPS_DIR}/capstone/capstone-5.0.7" "${CMAKE_BINARY_DIR}/.deps/capstone")
+set(CAPSTONE_ARM_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_ARM64_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_MIPS_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_PPC_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_RISCV_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)
+block()
+    set(BUILD_STATIC_LIBS ON)
+    set(BUILD_STATIC_RUNTIME ON)
+    set(BUILD_SHARED_LIBS OFF)
+    add_subdirectory("${capstone_SOURCE_DIR}" "${capstone_BINARY_DIR}")
+endblock()
 
-# Suppress warnings from Capstone on MSVC
 if(MSVC AND TARGET capstone)
     target_compile_options(capstone PRIVATE /W0)
 endif()
 
-# capstone 5.x creates capstone::capstone alias automatically, but guard just in case
 if(NOT TARGET capstone::capstone)
     if(TARGET capstone_static)
         add_library(capstone::capstone ALIAS capstone_static)
@@ -727,12 +859,41 @@ if(NOT TARGET capstone::capstone)
         add_library(capstone::capstone ALIAS capstone)
     endif()
 endif()
+if(NOT TARGET capstone::capstone)
+    message(FATAL_ERROR "AiDA: pinned Capstone 5.0.9 did not provide a linkable target")
+endif()
 
-# Pre-populate CAPSTONE variables so Triton's FindCAPSTONE.cmake does not call
-# find_path/find_library (which would fail at configure time before the build).
 set(CAPSTONE_FOUND TRUE CACHE BOOL "" FORCE)
-set(CAPSTONE_INCLUDE_DIRS "${DEPS_DIR}/capstone/capstone-5.0.7/include" CACHE PATH "" FORCE)
-set(CAPSTONE_LIBRARIES "capstone" CACHE STRING "" FORCE)
+set(CAPSTONE_INCLUDE_DIRS "${capstone_SOURCE_DIR}/include" CACHE PATH "" FORCE)
+set(CAPSTONE_LIBRARIES "capstone::capstone" CACHE STRING "" FORCE)
+
+if(TARGET nlohmann_json OR TARGET nlohmann_json::nlohmann_json)
+    message(FATAL_ERROR "AiDA: an unexpected nlohmann/json target exists before pinned local integration")
+endif()
+add_library(nlohmann_json INTERFACE)
+add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+target_include_directories(nlohmann_json SYSTEM INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs")
+set(nlohmann_json_VERSION "3.12.0")
+set(nlohmann_json_FOUND TRUE)
+set(JSON_FETCH_VERSION "v3.12.0" CACHE STRING "" FORCE)
+set(JSON_VALIDATOR_INSTALL OFF CACHE BOOL "" FORCE)
+set(JSON_VALIDATOR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(JSON_VALIDATOR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(JSON_VALIDATOR_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(JSON_VALIDATOR_TEST_COVERAGE OFF CACHE BOOL "" FORCE)
+set(FETCHCONTENT_FULLY_DISCONNECTED ON)
+add_subdirectory(
+    "${json_schema_validator_SOURCE_DIR}"
+    "${json_schema_validator_BINARY_DIR}"
+    EXCLUDE_FROM_ALL)
+unset(FETCHCONTENT_FULLY_DISCONNECTED)
+if(NOT TARGET nlohmann_json_schema_validator::validator)
+    message(FATAL_ERROR "AiDA: pinned JSON Schema Validator 2.4.0 target is unavailable")
+endif()
+if(MSVC AND TARGET nlohmann_json_schema_validator)
+    target_compile_options(nlohmann_json_schema_validator PRIVATE /W0)
+endif()
 
 # --- Triton (symbolic execution engine) ---
 set(BUILD_SHARED_LIBS_SAVED_TRITON "${BUILD_SHARED_LIBS}")
@@ -1340,11 +1501,18 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_scope.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_architecture.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_code_xml_parse.cpp"
+            "${STANDALONE_ROOT}/core/disasm/aida_arch_map.cpp"
+            "${STANDALONE_ROOT}/core/disasm/aida_function_db.cpp"
+            "${STANDALONE_ROOT}/core/disasm/aida_load_image.cpp"
             "${STANDALONE_ROOT}/core/editor/hex_view.cpp"
             "${STANDALONE_ROOT}/core/editor/image_view.cpp"
             "${STANDALONE_ROOT}/core/ui/chat_render.cpp"
             "${STANDALONE_ROOT}/core/mcp/mcp_client.cpp"
             "${STANDALONE_ROOT}/core/mcp/mcp_marketplace.cpp"
+            "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
+            "${STANDALONE_ROOT}/core/mcp/ida_compat_mut.cpp"
+            "${STANDALONE_ROOT}/core/mcp/calculator_tool.cpp"
+            "${STANDALONE_ROOT}/core/mcp/schema_validator.cpp"
             "${STANDALONE_ROOT}/core/network/protocol_parser.cpp"
             "${STANDALONE_ROOT}/core/network/cert_generator.cpp"
             "${STANDALONE_ROOT}/core/network/mitm_proxy.cpp"
@@ -1532,6 +1700,45 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/analysis/struct_recon_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/fuzzer_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/analysis_tools_standalone.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/byte_provider.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/live_snapshot_provider.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/pe_image.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/arch_decoder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/x86_decoder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/analysis_workspace.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/workspace_registry.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/analysis_metrics.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/function_recovery.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/xref_builder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/search_index.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/pe_baseline_analyzer.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/baseline_pipeline.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/persistence_queue.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/workspace_database.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/overlay_journal.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/patched_export.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/decompiler_service.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/decompiler_feedback.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/elf_image.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/macho_image.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/zip_container.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/apk_container.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/dex_image.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/ipa_container.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/jar_container.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/classfile_parser.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/coff_image.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/arm_decoder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/aarch64_decoder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/mips_decoder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/ppc_decoder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/riscv_decoder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/semantic_fusion.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/type_recovery.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/calling_convention.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/advanced_cfg.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/pseudocode_readability.cpp"
             "${STANDALONE_ROOT}/core/disasm/disasm_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/disasm/decompile_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/analysis/pdb_downloader.cpp"
@@ -1593,7 +1800,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/testlab/test_all_disasm.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_mcp.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_all_ui.cpp"
-            "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
+            "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.c"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
         )
@@ -1658,9 +1865,9 @@ if(WIN32)
         endforeach()
 
         set_source_files_properties(
-            "${DEPS_DIR}/sqlite-amalgamation-3530000/sqlite3.c"
+            "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.c"
             PROPERTIES
-                COMPILE_DEFINITIONS "SQLITE_THREADSAFE=1;SQLITE_DQS=0;SQLITE_OMIT_DEPRECATED;SQLITE_DEFAULT_MEMSTATUS=0;SQLITE_DEFAULT_WAL_SYNCHRONOUS=1;SQLITE_LIKE_DOESNT_MATCH_BLOBS;SQLITE_MAX_EXPR_DEPTH=0;SQLITE_OMIT_DECLTYPE;SQLITE_OMIT_PROGRESS_CALLBACK;SQLITE_OMIT_SHARED_CACHE;SQLITE_USE_ALLOCA"
+                COMPILE_DEFINITIONS "SQLITE_THREADSAFE=1;SQLITE_DQS=0;SQLITE_OMIT_DEPRECATED;SQLITE_DEFAULT_MEMSTATUS=0;SQLITE_DEFAULT_WAL_SYNCHRONOUS=1;SQLITE_LIKE_DOESNT_MATCH_BLOBS;SQLITE_MAX_EXPR_DEPTH=0;SQLITE_OMIT_DECLTYPE;SQLITE_OMIT_SHARED_CACHE;SQLITE_USE_ALLOCA"
                 COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:C>:/wd4146>;$<$<COMPILE_LANGUAGE:C>:/wd4244>;$<$<COMPILE_LANGUAGE:C>:/wd4267>;$<$<COMPILE_LANGUAGE:C>:/wd4996>"
         )
 
@@ -1770,6 +1977,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/network"
             "${STANDALONE_ROOT}/core/scanner"
             "${STANDALONE_ROOT}/core/analysis"
+            "${STANDALONE_ROOT}/core/analysis/workspace"
             "${STANDALONE_ROOT}/core/editor"
             "${STANDALONE_ROOT}/core/tools"
             "${STANDALONE_ROOT}/core/session"
@@ -1802,8 +2010,9 @@ if(WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}/mapper/src"
             "${TRITON_SOURCE_DIR}/src/libtriton/includes"
             "${CMAKE_BINARY_DIR}/.deps/triton/src/libtriton/includes"
+            "${capstone_SOURCE_DIR}/include"
             "${GHIDRA_DECOMP_DIR}"
-            "${DEPS_DIR}/sqlite-amalgamation-3530000"
+            "${DEPS_DIR}/sqlite-amalgamation-3530300"
         )
 
         target_include_directories(AiDAStandalone SYSTEM PRIVATE
@@ -1840,6 +2049,79 @@ if(WIN32)
             /bigobj
         )
 
+        set(AIDA_WORKSPACE_HARNESS_SOURCES
+            workspace_core_harness
+            workspace_persistence_harness
+            workspace_multitarget_harness
+            workspace_mcp_harness
+            analysis_benchmark_harness
+        )
+        foreach(_aida_workspace_harness IN LISTS AIDA_WORKSPACE_HARNESS_SOURCES)
+            add_library(aida_${_aida_workspace_harness} OBJECT EXCLUDE_FROM_ALL
+                "${STANDALONE_ROOT}/../tests/analysis_workspace/${_aida_workspace_harness}.cpp")
+            target_include_directories(aida_${_aida_workspace_harness} PRIVATE
+                "${CMAKE_CURRENT_BINARY_DIR}/generated"
+                "${STANDALONE_ROOT}"
+                "${STANDALONE_ROOT}/core"
+                "${STANDALONE_ROOT}/core/analysis"
+                "${STANDALONE_ROOT}/core/analysis/workspace"
+                "${STANDALONE_ROOT}/core/disasm"
+                "${STANDALONE_ROOT}/core/infra"
+                "${STANDALONE_ROOT}/core/mcp"
+                "${STANDALONE_ROOT}/core/runtime"
+                "${STANDALONE_ROOT}/core/session"
+                "${STANDALONE_ROOT}/core/tools"
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs"
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
+                "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+                "${zydis_SOURCE_DIR}/include"
+                "${zycore_SOURCE_DIR}/include"
+                "${zydis_BINARY_DIR}"
+                "${zydis_BINARY_DIR}/zycore"
+                "${DEPS_DIR}/sqlite-amalgamation-3530300")
+            target_include_directories(aida_${_aida_workspace_harness} SYSTEM PRIVATE
+                "${DEPS_DIR}/taskflow")
+            target_compile_definitions(aida_${_aida_workspace_harness} PRIVATE
+                __NT__
+                _CRT_SECURE_NO_WARNINGS
+                CPPHTTPLIB_OPENSSL_SUPPORT
+                NOMINMAX
+                WIN32_LEAN_AND_MEAN
+                IMGUI_ENABLE_FREETYPE
+                IMGUI_ENABLE_STB_TRUETYPE
+                UNICODE
+                _UNICODE
+                SOL_ALL_SAFETIES_ON=1
+                GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
+                AIDA_DEEP_STEAL=1
+                AIDA_STANDALONE
+                ZYCORE_STATIC_BUILD
+                ZYDIS_STATIC_BUILD)
+            if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
+                target_compile_definitions(aida_${_aida_workspace_harness} PRIVATE
+                    AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
+            endif()
+            target_compile_options(aida_${_aida_workspace_harness} PRIVATE
+                /W3
+                /wd4005
+                /wd4099
+                /EHsc
+                /Zc:__cplusplus
+                /permissive-
+                /Zp8
+                /bigobj
+                /GS
+                /guard:cf
+                /guard:ehcont
+                /Qspectre
+                /sdl
+                /guard:xfg)
+            set_target_properties(aida_${_aida_workspace_harness} PROPERTIES
+                CXX_STANDARD 17
+                CXX_STANDARD_REQUIRED YES
+                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endforeach()
+
         aida_use_static_msvc_runtime(
             AiDAStandalone
             AiDAStandalone_asm
@@ -1851,6 +2133,7 @@ if(WIN32)
             triton
             capstone
             capstone_static
+            nlohmann_json_schema_validator
             libdecomp_aida
             zlibstatic
             zlib
@@ -1911,6 +2194,8 @@ if(WIN32)
             Zydis
             unicorn
             triton
+            capstone::capstone
+            nlohmann_json_schema_validator::validator
             libdecomp_aida
             freetype
             zlibstatic
@@ -2130,6 +2415,43 @@ if(WIN32)
             RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/Debug"
             RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/Release"
             RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
+        )
+
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_ANALYSIS_NOTICE_LEDGER_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/THIRD_PARTY_NOTICES_ANALYSIS.md"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${zydis_SOURCE_DIR}/LICENSE"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/Zydis-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${zycore_SOURCE_DIR}/LICENSE"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/Zycore-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DEPS_DIR}/taskflow/LICENSE"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/Taskflow-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DEPS_DIR}/zlib/LICENSE"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/zlib-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DEPS_DIR}/licenses/nlohmann-json-3.12.0-LICENSE.MIT"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/nlohmann-json-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_CAPSTONE_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/Capstone-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_JSON_SCHEMA_VALIDATOR_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/nlohmann-json-schema-validator-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_GHIDRA_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/Ghidra-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_GHIDRA_NOTICE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/Ghidra-NOTICE.txt"
+            COMMENT "Staging pinned analysis dependency notices beside AiDAStandalone..."
+            VERBATIM
         )
 
         set_target_properties(AiDA_NetworkHookSidecar PROPERTIES
@@ -3234,6 +3556,25 @@ if(BUILD_PROTECTOR)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     )
     add_dependencies(AiDAProtectorLogger AiDAProtector AiDATestPayload)
+
+    add_executable(AiDAProtectorPersonalize
+        tools/protector/personalize_main.cpp
+    )
+    target_include_directories(AiDAProtectorPersonalize PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/protector
+    )
+    target_compile_definitions(AiDAProtectorPersonalize PRIVATE
+        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    target_compile_options(AiDAProtectorPersonalize PRIVATE
+        /W4 /EHsc /O2 /Zc:__cplusplus /permissive- /MD
+    )
+    target_link_libraries(AiDAProtectorPersonalize PRIVATE bcrypt advapi32)
+    set_target_properties(AiDAProtectorPersonalize PROPERTIES
+        OUTPUT_NAME "aida_protector_personalize"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
+    )
+    add_dependencies(AiDAProtectorPersonalize AiDAProtector)
 
     option(BUILD_PROTECTOR_TESTS "Register CTest for the AiDA protector full matrix" ON)
     if(BUILD_PROTECTOR_TESTS OR BUILD_TESTING)

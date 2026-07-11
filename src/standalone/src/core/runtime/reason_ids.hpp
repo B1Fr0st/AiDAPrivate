@@ -28,8 +28,10 @@ namespace aida::reason_ids
         reason_id_debugger_at_startup               = 0xE75EA00956FADB5CULL,
         reason_id_debugger_attached                 = 0xBF62BEC389C09A1FULL,
         reason_id_debugger_runtime                  = 0x2722683F760E49B5ULL,
+        reason_id_emulation_detected                = 0xFB30218D52C0B65EULL,
         reason_id_ghost_veh_unhooked                = 0xD5B7DACBF0983130ULL,
         reason_id_hardware_breakpoint_in_code       = 0x4E404EF1009FB577ULL,
+        reason_id_hijacked_hypervisor               = 0x60AEC6412D4EAA3CULL,
         reason_id_hook_at_startup                   = 0xDF339F61F2C519B0ULL,
         reason_id_hook_runtime                      = 0x054B9D70BD435141ULL,
         reason_id_iat_hook_detected                 = 0xFFF36644D3EE5120ULL,
@@ -53,11 +55,14 @@ namespace aida::reason_ids
         reason_id_server_page_tampered              = 0xCACF31E6BA4D055DULL,
         reason_id_stolen_basic_block_tamper         = 0x3DD40E11EABFD2E7ULL,
         reason_id_unpack_timing_anomaly             = 0x5A072B6917FD4A84ULL,
+        reason_id_unsupported_hypervisor            = 0x594833E8744DEAE4ULL,
         reason_id_vm_at_startup                     = 0x69D17A7E1AADF526ULL,
         reason_id_vm_integrity_check_failed         = 0x708A56680EA0EA15ULL,
         reason_id_watchdog_worker_anomaly           = 0x00EF44B5A3F0B513ULL,
         reason_id_watchdog_workers_stalled          = 0x0F55DAA8A90D32BAULL,
-        reason_id_writable_code_page                = 0x88E3AEC4746DCB93ULL
+        reason_id_writable_code_page                = 0x88E3AEC4746DCB93ULL,
+        reason_id_honeypot_canary_patched_bsod      = 0x44681B8D2EA8B609ULL,
+        reason_id_honeypot_string_external_access   = 0x202CE233A58F6D1CULL
     };
 
     constexpr uint64_t fnv1a_const(const char* s, uint64_t h = 0xcbf29ce484222325ULL) noexcept

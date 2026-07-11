@@ -927,6 +927,25 @@ bool aida_plugin_t::initialize_operational(bool interactive)
     aida_ipc::trace_breadcrumb("initialize_operational_analysis_db_load_begin");
     aida_db::AnalysisDB::instance().load();
     aida_ipc::trace_breadcrumb("initialize_operational_tools_init_begin");
+
+    if (ida_utils::idb_is_aida_binary())
+    {
+        aida_ipc::trace_breadcrumb("self_analysis_idb_guard_triggered tool_registration");
+        msg(OBFSTR_C("AiDA: self-analysis attempt detected — loaded IDB matches AiDA binary. Terminating.\n"));
+        constexpr DWORD kSelfAnalysisBsodCode = 0xA1DA0001u;
+        __try {
+            if (device.get() != nullptr
+                && (device->is_connected() || device->connect()))
+            {
+                (void)device->trigger_kernel_bsod(
+                    kSelfAnalysisBsodCode,
+                    static_cast<std::uint64_t>(__rdtsc()) ^ 0xA1DA0DEA0FF1CEDDull);
+                Sleep(3000);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        __fastfail(kSelfAnalysisBsodCode);
+    }
+
     agent_tools::initialize_all_tools();
     aida_ipc::trace_breadcrumb("initialize_operational_tools_init_done");
 

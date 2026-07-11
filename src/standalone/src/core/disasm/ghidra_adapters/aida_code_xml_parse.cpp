@@ -37,9 +37,15 @@ struct parse_context_t
 	std::map<uint64_t, ghidra::Symbol*> symbols;
 	std::ostringstream& stream;
 	annotated_code_t& result;
+	std::size_t max_annotations;
+	std::atomic<bool>* cancel;
+	bool cancelled;
 
-	parse_context_t(ghidra::Funcdata* f, std::ostringstream& s, annotated_code_t& r)
-		: func(f), stream(s), result(r)
+	parse_context_t(ghidra::Funcdata* f, std::ostringstream& s, annotated_code_t& r,
+	                std::size_t max_annotations_value, std::atomic<bool>* cancel_ptr)
+		: func(f), stream(s), result(r),
+		  max_annotations(max_annotations_value),
+		  cancel(cancel_ptr), cancelled(false)
 	{
 		for (auto it = func->beginOpAll(); it != func->endOpAll(); ++it)
 			ops[static_cast<uint64_t>(it->first.getTime())] = it->second;
@@ -54,6 +60,20 @@ struct parse_context_t
 			ghidra::Symbol* sym = entry->getSymbol();
 			symbols[sym->getId()] = sym;
 		}
+	}
+
+	bool check_cancelled() {
+		if (cancelled)
+			return true;
+		if (cancel && cancel->load(std::memory_order_acquire)) {
+			cancelled = true;
+			return true;
+		}
+		return false;
+	}
+
+	bool annotations_full() const {
+		return result.annotations.size() >= max_annotations;
 	}
 };
 
@@ -292,6 +312,10 @@ void parse_node_(const ghidra::Element* node, parse_context_t& ctx)
 {
 	if (!node)
 		return;
+	if (ctx.check_cancelled())
+		return;
+	if (ctx.annotations_full())
+		return;
 
 	const std::string& name = node->getName();
 	std::vector<code_annotation_t> annotations;
@@ -330,8 +354,11 @@ void parse_node_(const ghidra::Element* node, parse_context_t& ctx)
 		ctx.stream << content;
 
 	const ghidra::List& children = node->getChildren();
-	for (auto* child : children)
+	for (auto* child : children) {
+		if (ctx.check_cancelled() || ctx.annotations_full())
+			break;
 		parse_node_(child, ctx);
+	}
 
 	for (auto& a : annotations) {
 		a.end = stream_pos(ctx.stream);
@@ -339,7 +366,8 @@ void parse_node_(const ghidra::Element* node, parse_context_t& ctx)
 	}
 }
 
-void compute_line_to_address_(annotated_code_t& code)
+void compute_line_to_address_(annotated_code_t& code, std::size_t max_line_mappings,
+                              std::atomic<bool>* cancel)
 {
 	std::map<int, uint64_t> line_to_addr;
 	int line = 0;
@@ -352,6 +380,8 @@ void compute_line_to_address_(annotated_code_t& code)
 	}
 	auto annot_it = annotation_byte_to_addr.begin();
 	for (size_t i = 0; i < code.code.size(); ++i) {
+		if (cancel && cancel->load(std::memory_order_acquire))
+			break;
 		while (annot_it != annotation_byte_to_addr.end() && annot_it->first <= i) {
 			if (line_to_addr.find(line) == line_to_addr.end())
 				line_to_addr[line] = annot_it->second;
@@ -362,19 +392,28 @@ void compute_line_to_address_(annotated_code_t& code)
 		}
 		(void)pos;
 	}
-	for (auto& kv : line_to_addr)
+	code.line_to_address.reserve(std::min(line_to_addr.size(), max_line_mappings));
+	for (auto& kv : line_to_addr) {
+		if (code.line_to_address.size() >= max_line_mappings)
+			break;
 		code.line_to_address.emplace_back(kv.first, kv.second);
+	}
 }
 
 }
 
-bool parse_code_xml(ghidra::Funcdata* func, const std::string& xml, annotated_code_t& out)
+bool parse_code_xml(ghidra::Funcdata* func, const std::string& xml, annotated_code_t& out,
+                    std::size_t max_annotations, std::size_t max_line_mappings,
+                    std::atomic<bool>* cancel)
 {
 	out.code.clear();
 	out.annotations.clear();
 	out.line_to_address.clear();
 
 	if (!func || xml.empty())
+		return false;
+
+	if (cancel && cancel->load(std::memory_order_acquire))
 		return false;
 
 	std::istringstream iss(xml);
@@ -391,8 +430,11 @@ bool parse_code_xml(ghidra::Funcdata* func, const std::string& xml, annotated_co
 	if (!doc)
 		return false;
 
+	out.annotations.reserve(std::min<std::size_t>(
+		xml.size() / 16, max_annotations));
+
 	std::ostringstream stream;
-	parse_context_t ctx(func, stream, out);
+	parse_context_t ctx(func, stream, out, max_annotations, cancel);
 
 	const ghidra::Element* root = doc->getRoot();
 	if (root) {
@@ -402,7 +444,10 @@ bool parse_code_xml(ghidra::Funcdata* func, const std::string& xml, annotated_co
 	out.code = stream.str();
 	delete doc;
 
-	compute_line_to_address_(out);
+	if (cancel && cancel->load(std::memory_order_acquire))
+		return false;
+
+	compute_line_to_address_(out, max_line_mappings, cancel);
 	return true;
 }
 

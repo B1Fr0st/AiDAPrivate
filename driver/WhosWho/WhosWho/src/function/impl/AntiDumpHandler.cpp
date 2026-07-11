@@ -75,6 +75,30 @@ namespace functions {
                 }
                 break;
 
+            case ADMP_OP_VERIFY_HEADERS:
+            {
+                admp_header_state state{};
+                status = anti_dump_kernel::verify_headers_zeroed(request->pid, &state);
+                request->blocks_count = state.headers_restored;
+                request->result = NT_SUCCESS(status) ? 1 : 0;
+            }
+            break;
+
+            case ADMP_OP_LOCK_PAGES:
+            {
+                status = anti_dump_kernel::lock_pages(
+                    request->pid, nullptr, nullptr, 0);
+                request->result = NT_SUCCESS(status) ? 1 : 0;
+            }
+            break;
+
+            case ADMP_OP_REGISTER_MODULE_RANGE:
+            {
+                request->result = 1;
+                status = STATUS_SUCCESS;
+            }
+            break;
+
             default:
                 status = STATUS_INVALID_PARAMETER;
                 break;

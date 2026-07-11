@@ -50,6 +50,10 @@
 #include "re_detection_engine.hpp"
 #include "ghost_veh.hpp"
 #include "key_pipeline.hpp"
+#include "self_guard.hpp"
+#include "preflight.hpp"
+#include "cross_verification_ring.hpp"
+#include "reloc_mask.hpp"
 
 #include "obfuscation.hpp"
 #include "standalone_license.hpp"
@@ -227,6 +231,83 @@ inline uint32_t apply_vm_nested_tags()
         "vm_nested_applied=%u", applied);
     webhook::write_log("init", dbg);
     return applied;
+}
+
+inline uint32_t apply_anti_emulation_nested()
+{
+    auto& rt = state::get();
+
+    uint64_t canary_key = resolve_rolling_key_for(0x7A1DA0Eu);
+    uint8_t opcode_map[256];
+    uint8_t reverse_map[256];
+    virtualizer::detail::derive_function_maps(
+        0x7A1DA0Eu, state::g_vm_master_key, opcode_map, reverse_map);
+
+    auto canary_bc = vm_compiler::build_timing_canary_program(
+        canary_key, opcode_map);
+
+    if (canary_bc.empty())
+    {
+        webhook::write_log("init", "anti_emu_nested_canary_empty");
+        return 0;
+    }
+
+    if (!vm_nested::is_eligible(canary_bc.size()))
+    {
+        webhook::write_log("init", "anti_emu_nested_canary_ineligible");
+        return 0;
+    }
+
+    uint32_t outer_rva = 0x7A1DA0Eu | 0x80000000u;
+    uint8_t score = vm_nested::compute_criticality_score(
+        vm_nested::MAX_INNER_BYTECODE_BYTES, 8, 4, true);
+
+    auto wrapped = vm_nested::wrap_critical(
+        canary_bc, state::g_vm_master_key,
+        0x7A1DA0Eu, outer_rva, canary_key, score);
+
+    if (!wrapped.ok)
+    {
+        webhook::write_log("init", "anti_emu_nested_wrap_failed");
+        return 0;
+    }
+
+    nested_map()[0x7A1DA0Eu] = std::move(wrapped);
+    rt.atp_flags[0x7A1DA0Eu] |= ATP_VM_NESTED;
+
+    webhook::write_log("init", "anti_emu_nested_applied");
+    return 1;
+}
+
+inline bool execute_vm_protected_timing_canary()
+{
+    auto it = nested_map().find(0x7A1DA0Eu);
+    if (it == nested_map().end() || !it->second.ok)
+    {
+        webhook::write_log("emu", "vm_canary_not_found_fallback");
+        return anti_emulation::check_hypervisor_timing_uniform();
+    }
+
+    __try
+    {
+        virtualizer::detail::vm_state_t vm;
+        uint64_t seed = __rdtsc() ^ 0x7A1DA0Eu ^ GetCurrentProcessId();
+        virtualizer::detail::init_vm(vm, seed);
+
+        uint64_t result = vm_nested::execute_nested(
+            it->second, vm, state::g_vm_master_key);
+
+        virtualizer::detail::destroy_vm(vm);
+
+        if (result == 0 || result == 1)
+            return result == 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    webhook::write_log("emu", "vm_canary_execution_failed_fallback");
+    return anti_emulation::check_hypervisor_timing_uniform();
 }
 
 inline uint64_t guard_now_ms()
@@ -1141,6 +1222,148 @@ inline bool ensure_driver_hardening(const char* phase)
     return true;
 }
 
+inline void handle_dma_key_scrub_if_requested()
+{
+    if (!g_dma_key_scrub_requested.load(std::memory_order_acquire))
+        return;
+
+    g_dma_key_scrub_requested.store(false, std::memory_order_release);
+
+    diag::log_tagged_critical("dma_defense", "DMA_KEY_SCRUB_RECEIVED scrubbing usermode key material");
+
+    enforcement_detail::scrub_session_keys();
+    enforcement_detail::scrub_wb_aes_tables();
+    enforcement_detail::scrub_arc_keys();
+    enforcement_detail::scrub_provider_keys();
+
+    webhook::write_log_critical("dma_defense", "DMA_KEY_SCRUB_COMPLETE");
+}
+
+inline bool check_dma_preflight()
+{
+    if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+    {
+        webhook::write_log("dma_preflight", "skip_no_driver");
+        return false;
+    }
+
+    const uint64_t preflight_tick = GetTickCount64();
+    webhook::write_log_critical_fmt("dma_preflight",
+        "pre pid=%lu tid=%lu tick=%llu",
+        GetCurrentProcessId(),
+        GetCurrentThreadId(),
+        static_cast<unsigned long long>(preflight_tick));
+
+    driver_bridge::hv_kernel_detect_result_t hv_result{};
+    bool hv_ok = driver_bridge::run_kernel_hv_detection(hv_result);
+    bool hv_present = hv_ok && (hv_result.any_detected() || hv_result.is_virtual_machine != 0);
+
+    webhook::write_log_critical_fmt("dma_preflight",
+        "hv_detection ok=%d hv_present=%d is_vm=%d elapsed_ms=%llu",
+        hv_ok ? 1 : 0,
+        hv_present ? 1 : 0,
+        hv_result.is_virtual_machine,
+        static_cast<unsigned long long>(GetTickCount64() - preflight_tick));
+
+    if (hv_present)
+    {
+        webhook::write_log("dma_preflight", "skip_hypervisor_present");
+        return false;
+    }
+
+    driver_bridge::iommu_status_t iommu{};
+    SetLastError(ERROR_SUCCESS);
+    bool iommu_ok = driver_bridge::query_iommu_status(iommu);
+    DWORD iommu_err = iommu_ok ? ERROR_SUCCESS : GetLastError();
+
+    webhook::write_log_critical_fmt("dma_preflight",
+        "iommu_query ok=%d err=%lu present=%d vtd=%d amd_vi=%d bypassed=%d risk=%u",
+        iommu_ok ? 1 : 0,
+        static_cast<unsigned long>(iommu_err),
+        iommu.iommu_present ? 1 : 0,
+        iommu.vtd_enabled ? 1 : 0,
+        iommu.amd_vi_enabled ? 1 : 0,
+        iommu.remapping_bypassed ? 1 : 0,
+        iommu.risk_level);
+
+    if (!iommu_ok)
+    {
+        webhook::send_debug_log("dma_preflight", "iommu_query_failed_fail_closed", true);
+        std::wstring msg = WOBFSTR(L"Unsupported hardware configuration. AiDA cannot start on this system.");
+        std::wstring title = WOBFSTR(L"AiDA");
+        MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+            MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+        ExitProcess(1);
+        return true;
+    }
+
+    driver_bridge::pcie_enum_result_t pcie{};
+    SetLastError(ERROR_SUCCESS);
+    bool pcie_ok = driver_bridge::enumerate_pcie_devices(pcie);
+    DWORD pcie_err = pcie_ok ? ERROR_SUCCESS : GetLastError();
+
+    webhook::write_log_critical_fmt("dma_preflight",
+        "pcie_enum ok=%d err=%lu devices=%u unknown=%u",
+        pcie_ok ? 1 : 0,
+        static_cast<unsigned long>(pcie_err),
+        pcie.device_count,
+        pcie.unknown_count);
+
+    if (!pcie_ok)
+    {
+        webhook::send_debug_log("dma_preflight", "pcie_enum_failed_fail_closed", true);
+        std::wstring msg = WOBFSTR(L"Unsupported hardware configuration. AiDA cannot start on this system.");
+        std::wstring title = WOBFSTR(L"AiDA");
+        MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+            MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+        ExitProcess(1);
+        return true;
+    }
+
+    uint32_t unknown_clusters = pcie.unknown_count;
+
+    bool iommu_off = iommu.iommu_present && !iommu.vtd_enabled && !iommu.amd_vi_enabled;
+    bool iommu_bypassed = iommu.iommu_present && iommu.remapping_bypassed;
+
+    if (unknown_clusters >= 2)
+    {
+        webhook::write_log_critical_fmt("dma_preflight",
+            "refuse reason=unknown_clusters_2plus count=%u", unknown_clusters);
+        webhook::send_debug_log("dma_preflight", "unsupported_multiple_unknown_dma_devices", true);
+        std::wstring msg = WOBFSTR(L"Unsupported hardware configuration. AiDA cannot start on this system.");
+        std::wstring title = WOBFSTR(L"AiDA");
+        MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+            MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+        ExitProcess(1);
+        return true;
+    }
+
+    if ((iommu_off || iommu_bypassed) && unknown_clusters >= 1)
+    {
+        webhook::write_log_critical_fmt("dma_preflight",
+            "refuse reason=iommu_off_with_unknown iommu_off=%d bypassed=%d unknown=%u",
+            iommu_off ? 1 : 0,
+            iommu_bypassed ? 1 : 0,
+            unknown_clusters);
+        webhook::send_debug_log("dma_preflight", "unsupported_iommu_off_with_unknown_dma_device", true);
+        std::wstring msg = WOBFSTR(L"Unsupported hardware configuration. AiDA cannot start on this system.");
+        std::wstring title = WOBFSTR(L"AiDA");
+        MessageBoxW(nullptr, msg.c_str(), title.c_str(),
+            MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+        ExitProcess(1);
+        return true;
+    }
+
+    webhook::write_log_critical_fmt("dma_preflight",
+        "pass iommu_off=%d bypassed=%d unknown=%u elapsed_ms=%llu",
+        iommu_off ? 1 : 0,
+        iommu_bypassed ? 1 : 0,
+        unknown_clusters,
+        static_cast<unsigned long long>(GetTickCount64() - preflight_tick));
+
+    return false;
+}
+
 inline bool initialize()
 {
     webhook::write_log("init", "initialize_ENTRY before state::get");
@@ -1199,6 +1422,23 @@ inline bool initialize()
         return false;
     }
     webhook::write_log("init", "syscall_ok");
+
+    {
+        uint64_t anti_emu_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "anti_emulation_preflight_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(anti_emu_tick));
+        bool anti_emu_ok = anti_emulation::run_anti_emulation_preflight();
+        webhook::write_log_critical_fmt("init",
+            "anti_emulation_preflight_post ok=%d elapsed_ms=%llu",
+            anti_emu_ok ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - anti_emu_tick));
+        if (!anti_emu_ok)
+            return false;
+    }
+    webhook::write_log("init", "anti_emulation_preflight_ok");
 
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
@@ -1523,6 +1763,69 @@ inline bool initialize()
     webhook::write_log("init", "snapshot_code_ok");
     webhook::write_log_critical("init", "snapshot_code_ok_log_post");
 
+    {
+        uint64_t reloc_mask_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "reloc_mask_populate_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(reloc_mask_tick));
+        reloc_mask::populate_reloc_mask_table(rt.reloc_mask_table);
+        rt.preferred_image_base = reloc_mask::get_preferred_image_base();
+        webhook::write_log_critical_fmt("init",
+            "reloc_mask_populate_post entries=%zu preferred_base=0x%llX elapsed_ms=%llu",
+            rt.reloc_mask_table.size(),
+            static_cast<unsigned long long>(rt.preferred_image_base),
+            static_cast<unsigned long long>(GetTickCount64() - reloc_mask_tick));
+        webhook::write_log("init", "reloc_mask_populate_ok");
+    }
+
+    {
+        uint64_t preflight_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "preflight_checks_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(preflight_tick));
+        preflight::run_preflight_checks();
+        webhook::write_log_critical_fmt("init",
+            "preflight_checks_post elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - preflight_tick));
+        webhook::write_log("init", "preflight_checks_ok");
+    }
+
+    {
+        uint64_t cross_ring_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "cross_ring_initialize_pre pid=%lu tid=%lu tick=%llu text_base=0x%llX text_size=0x%X",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(cross_ring_tick),
+            static_cast<unsigned long long>(rt.code_snap.text_base),
+            rt.code_snap.text_size);
+        bool cross_ring_ok = cross_ring::initialize(
+            rt.code_snap.text_base, rt.code_snap.text_size);
+        webhook::write_log_critical_fmt("init",
+            "cross_ring_initialize_post ok=%d elapsed_ms=%llu",
+            cross_ring_ok ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - cross_ring_tick));
+        if (cross_ring_ok)
+        {
+            uint64_t cross_ring_start_tick = GetTickCount64();
+            bool cross_ring_started = cross_ring::start();
+            webhook::write_log_critical_fmt("init",
+                "cross_ring_start_post ok=%d elapsed_ms=%llu",
+                cross_ring_started ? 1 : 0,
+                static_cast<unsigned long long>(GetTickCount64() - cross_ring_start_tick));
+            webhook::write_log("init", "cross_ring_started");
+        }
+        else
+        {
+            webhook::write_log_critical("init", "cross_ring_initialize_failed");
+            diag::log_tagged_critical("init", "cross_ring_initialize_failed");
+        }
+    }
+
     uint64_t snapshot_iat_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "snapshot_iat_call_pre pid=%lu tid=%lu tick=%llu prior_entries=%zu base=0x%llX module_end=0x%llX",
@@ -1716,6 +2019,20 @@ inline bool initialize()
             static_cast<unsigned long long>(GetTickCount64() - vm_nested_tick));
     }
 
+    {
+        uint64_t anti_emu_nested_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "anti_emu_nested_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(anti_emu_nested_tick));
+        uint32_t anti_emu_nested_applied = apply_anti_emulation_nested();
+        webhook::write_log_critical_fmt("init",
+            "anti_emu_nested_post applied=%u elapsed_ms=%llu",
+            anti_emu_nested_applied,
+            static_cast<unsigned long long>(GetTickCount64() - anti_emu_nested_tick));
+    }
+
     uint64_t ghost_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "ghost_veh_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -1822,6 +2139,33 @@ inline bool initialize()
     webhook::write_log_critical("init", "decoy_call_graph_ok_log_pre");
     webhook::write_log("init", "decoy_call_graph_ok");
     webhook::write_log_critical("init", "decoy_call_graph_ok_log_post");
+
+    {
+        uint64_t taint_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "taint_poison_initialize_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(taint_tick));
+        decoy::taint_poison::initialize();
+        webhook::write_log_critical_fmt("init",
+            "taint_poison_initialize_post elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - taint_tick));
+    }
+
+    {
+        uint64_t iso_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "discard_buffer_isolation_verify_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(iso_tick));
+        uint32_t iso_hits = decoy::taint_poison::verify_discard_buffer_isolation();
+        webhook::write_log_critical_fmt("init",
+            "discard_buffer_isolation_verify_post elapsed_ms=%llu hits=%u",
+            static_cast<unsigned long long>(GetTickCount64() - iso_tick),
+            iso_hits);
+    }
 
 
     {
@@ -2241,6 +2585,26 @@ inline bool initialize()
         return false;
     }
 
+    {
+        uint64_t self_guard_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "self_guard_initialize_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(self_guard_tick));
+        bool self_guard_ok = self_guard::initialize();
+        webhook::write_log_critical_fmt("init",
+            "self_guard_initialize_post ok=%d elapsed_ms=%llu",
+            self_guard_ok ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - self_guard_tick));
+        if (!self_guard_ok)
+        {
+            webhook::send_debug_log("init", "self_guard_initialize_failed", true);
+            enforce_violation_id(aida::reason_ids::reason_id_from_string("self_guard_initialize_failed"), "self_guard_initialize_failed");
+            return false;
+        }
+        webhook::write_log("init", "self_guard_ok");
+    }
 
     webhook::write_log_critical("init", "initialized_store_pre");
     rt.initialized.store(true, std::memory_order_release);
@@ -3028,6 +3392,13 @@ inline bool finalize_after_activation()
         return false;
     }
     webhook::write_log_critical("init", "hide_peb_ok");
+    {
+        HMODULE self_mod = GetModuleHandleW(nullptr);
+        int scrub_count = anti_dump::scrub_peb_ldr_entry(self_mod);
+        webhook::write_log_critical_fmt("init",
+            "scrub_peb_ldr_entry self_mod=%p unlinked=%d",
+            self_mod, scrub_count);
+    }
     aida::runtime::loader_header_invariant::ensure("post_hide_module", "init");
 
     webhook::write_log_critical("init", "post_finalize_integrity_resnap_entering");
@@ -4209,6 +4580,7 @@ inline void monitor_loop()
         {
             guard();
             enforcement_tick();
+            handle_dma_key_scrub_if_requested();
         }
         catch (const std::exception& ex)
         {
@@ -4429,6 +4801,7 @@ inline void shutdown()
         rt.monitors_running.load(std::memory_order_acquire) ? 1 : 0,
         rt.violation_latched.load(std::memory_order_acquire) ? 1 : 0);
     rt.monitors_running.store(false);
+    shutdown_phase_run("cross_ring_stop", &cross_ring::stop);
     shutdown_phase_run("integrity_periodic_stop", &integrity::periodic::stop);
     shutdown_phase_run("re_detect_shutdown", &re_detect::shutdown);
     shutdown_phase_run("standalone_anti_dump_shutdown", &::standalone_anti_dump::shutdown);

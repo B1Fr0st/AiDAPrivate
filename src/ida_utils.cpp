@@ -2315,7 +2315,213 @@ namespace ida_utils
         return false;
     }
 
-    std::string get_imports_for_function(ea_t ea)
+    bool idb_is_aida_binary()
+    {
+        static const char* kAidaSectionNames[] = {
+            ".packed",
+            ".dseal",
+            ".dthunk",
+            ".rdiag",
+        };
+
+        static const char* kAidaBinaryNames[] = {
+            "aidastandalone",
+            "aida_core",
+            "aida.dll",
+            "aidaguestagent",
+            "aida_camoufoxreversemcp",
+            "camoufox-reverse-mcp",
+        };
+
+        static constexpr uint32_t kPackedMagic = 0x41504B44u;
+        static constexpr uint32_t kAuxMagic    = 0x4D585541u;
+
+        bool section_match  = false;
+        bool watermark_match = false;
+        bool hash_match      = false;
+
+        int section_hits = 0;
+        for (int i = 0; i < get_segm_qty(); i++)
+        {
+            segment_t* seg = getnseg(i);
+            if (!seg) continue;
+            qstring seg_name;
+            get_visible_segm_name(&seg_name, seg);
+            std::string name = seg_name.c_str();
+            for (const char* sname : kAidaSectionNames)
+            {
+                if (name == sname)
+                {
+                    ++section_hits;
+                    break;
+                }
+            }
+        }
+        section_match = (section_hits >= 2);
+
+        ea_t image_base = inf_get_min_ea();
+        if (image_base != BADADDR && is_loaded(image_base))
+        {
+            uint8_t dos_hdr[64] = {};
+            ssize_t dos_read = get_bytes(dos_hdr, sizeof(dos_hdr), image_base);
+            if (dos_read >= 64 && dos_hdr[0] == 'M' && dos_hdr[1] == 'Z')
+            {
+                uint32_t e_lfanew = 0;
+                memcpy(&e_lfanew, dos_hdr + 0x3C, 4);
+
+                if (e_lfanew > 0 && e_lfanew < 0x10000000)
+                {
+                    ea_t pe_hdr_ea = image_base + e_lfanew;
+                    uint8_t pe_sig[24] = {};
+                    ssize_t pe_read = get_bytes(pe_sig, sizeof(pe_sig), pe_hdr_ea);
+                    if (pe_read >= 24
+                        && pe_sig[0] == 'P' && pe_sig[1] == 'E'
+                        && pe_sig[2] == 0x00 && pe_sig[3] == 0x00)
+                    {
+                        uint16_t opt_magic = 0;
+                        memcpy(&opt_magic, pe_sig + 24, 2);
+                        if (pe_read >= 26)
+                            memcpy(&opt_magic, pe_sig + 24, 2);
+
+                        uint8_t opt_hdr[160] = {};
+                        ea_t opt_ea = pe_hdr_ea + 24;
+                        ssize_t opt_read = get_bytes(opt_hdr, sizeof(opt_hdr), opt_ea);
+                        if (opt_read >= 56)
+                        {
+                            uint32_t win32_version_value = 0;
+                            memcpy(&win32_version_value, opt_hdr + 52, 4);
+
+                            uint32_t loader_flags = 0;
+                            bool is_pe32_plus = (opt_magic == 0x20B);
+                            if (is_pe32_plus && opt_read >= 108)
+                            {
+                                memcpy(&loader_flags, opt_hdr + 104, 4);
+                            }
+                            else if (!is_pe32_plus && opt_read >= 92)
+                            {
+                                memcpy(&loader_flags, opt_hdr + 88, 4);
+                            }
+
+                            uint64_t combined_watermark =
+                                (static_cast<uint64_t>(loader_flags) << 32) | win32_version_value;
+
+                            if (combined_watermark != 0)
+                                watermark_match = true;
+
+                            if (!watermark_match && opt_read >= 70)
+                            {
+                                uint16_t num_sections = 0;
+                                memcpy(&num_sections, pe_sig + 6, 2);
+                                uint16_t opt_hdr_size = 0;
+                                memcpy(&opt_hdr_size, pe_sig + 20, 2);
+
+                                ea_t sect_table_ea = pe_hdr_ea + 24 + opt_hdr_size;
+                                for (int si = 0; si < num_sections && si < 96; si++)
+                                {
+                                    uint8_t sect_hdr[40] = {};
+                                    ea_t sect_ea = sect_table_ea + si * 40;
+                                    ssize_t sect_read = get_bytes(sect_hdr, 40, sect_ea);
+                                    if (sect_read < 40) break;
+
+                                    char sect_name[9] = {};
+                                    memcpy(sect_name, sect_hdr, 8);
+                                    std::string sname = sect_name;
+                                    bool is_packed = false;
+                                    for (const char* aida_sect : kAidaSectionNames)
+                                    {
+                                        if (sname == aida_sect)
+                                        {
+                                            is_packed = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (is_packed)
+                                    {
+                                        uint32_t sect_raw_addr = 0;
+                                        memcpy(&sect_raw_addr, sect_hdr + 20, 4);
+                                        uint32_t sect_raw_size = 0;
+                                        memcpy(&sect_raw_size, sect_hdr + 16, 4);
+
+                                        if (sect_raw_size >= 8 && sect_raw_addr > 0)
+                                        {
+                                            ea_t data_ea = image_base + sect_raw_addr;
+                                            uint8_t scan_buf[256] = {};
+                                            ssize_t to_scan = (ssize_t)sect_raw_size;
+                                            if (to_scan > (ssize_t)sizeof(scan_buf))
+                                                to_scan = (ssize_t)sizeof(scan_buf);
+                                            ssize_t data_read = get_bytes(scan_buf, to_scan, data_ea);
+                                            if (data_read > 0)
+                                            {
+                                                for (ssize_t off = 0; off + 4 <= data_read; off += 8)
+                                                {
+                                                    uint32_t magic_val = 0;
+                                                    memcpy(&magic_val, scan_buf + off, 4);
+                                                    if (magic_val == kPackedMagic || magic_val == kAuxMagic)
+                                                    {
+                                                        watermark_match = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (watermark_match) break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        char input_path[QMAXPATH] = {};
+        get_input_file_path(input_path, sizeof(input_path));
+        if (input_path[0] != '\0')
+        {
+            std::string path_str = input_path;
+            std::transform(path_str.begin(), path_str.end(),
+                path_str.begin(),
+                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            std::size_t sep = path_str.find_last_of("\\/");
+            std::string base_name = (sep == std::string::npos) ? path_str : path_str.substr(sep + 1);
+            for (const char* pattern : kAidaBinaryNames)
+            {
+                if (base_name.find(pattern) != std::string::npos)
+                {
+                    if (watermark_match || hash_match)
+                        return true;
+                    break;
+                }
+            }
+        }
+
+        {
+            auto& id = self_identity();
+            std::lock_guard<std::mutex> lk(id.mtx);
+
+            if (id.initialized && id.has_md5)
+            {
+                uchar target_md5[16] = {};
+                if (retrieve_input_file_md5(target_md5)
+                    && memcmp(id.md5, target_md5, 16) == 0)
+                {
+                    hash_match = true;
+                }
+            }
+            if (!hash_match && id.initialized && id.has_sha256)
+            {
+                uchar target_sha[32] = {};
+                if (retrieve_input_file_sha256(target_sha)
+                    && memcmp(id.sha256, target_sha, 32) == 0)
+                {
+                    hash_match = true;
+                }
+            }
+        }
+
+        return watermark_match || hash_match;
+    }
     {
         func_t* pfn = get_func(ea);
         if (pfn == nullptr)

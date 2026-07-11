@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -22,7 +23,10 @@
 #include "pe_parser.hpp"
 #include "standalone_driver.hpp"
 #include "symbol_store.hpp"
+#include "../analysis/workspace/analysis_workspace.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../infra/executor.hpp"
+#include "../session/analysis_session.hpp"
 
 namespace symbol_classifier {
 
@@ -159,6 +163,221 @@ namespace symbol_classifier {
 			case kind_t::unknown:          return "unknown";
 		}
 		return "unknown";
+	}
+
+	inline aida::analysis::workspace_result_t<aida::analysis::address_t>
+	normalize_workspace_address(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		using namespace aida::analysis;
+		if (!workspace) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::target_not_found,
+				"Symbol classification requires an explicit workspace",
+				"symbol_classifier.address"));
+		}
+		if (address.architecture != architecture_id_t::unknown &&
+			address.architecture != workspace->identity().architecture()) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::unsupported_address_space,
+				"Symbol address architecture does not match the workspace",
+				"symbol_classifier.address"));
+		}
+		auto image = workspace->image();
+		address_t result = address;
+		result.architecture = workspace->identity().architecture();
+		result.mode = image ? image->architecture_mode() : address.mode;
+		if (workspace->target_kind() == target_kind_t::live_snapshot) {
+			const auto& module = workspace->identity().module();
+			if (!module || module->size == 0 ||
+				module->base > UINT64_MAX - module->size) {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::target_stale,
+					"Live symbol workspace has no valid module range",
+					"symbol_classifier.address"));
+			}
+			if (address.space == address_space_id_t::relative_virtual) {
+				if (address.value >= module->size ||
+					module->base > UINT64_MAX - address.value) {
+					return workspace_result_t<address_t>::failure(make_workspace_error(
+						workspace_error_code_t::out_of_range,
+						"Live symbol RVA is outside the captured module",
+						"symbol_classifier.address"));
+				}
+				result.value = module->base + address.value;
+			} else if (address.space == address_space_id_t::virtual_address ||
+				address.space == address_space_id_t::live_virtual) {
+				if (address.value < module->base ||
+					address.value - module->base >= module->size) {
+					return workspace_result_t<address_t>::failure(make_workspace_error(
+						workspace_error_code_t::out_of_range,
+						"Live symbol address is outside the captured module",
+						"symbol_classifier.address"));
+				}
+			} else {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::unsupported_address_space,
+					"Live symbol classification requires a virtual address",
+					"symbol_classifier.address"));
+			}
+			result.space = address_space_id_t::live_virtual;
+			return workspace_result_t<address_t>::success(result);
+		}
+		if (!image) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::malformed_pe,
+				"Static symbol classification requires a normalized image",
+				"symbol_classifier.address"));
+		}
+		if (address.space == address_space_id_t::relative_virtual) {
+			if (address.value >= image->image_size()) {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::out_of_range,
+					"Symbol RVA is outside the normalized image",
+					"symbol_classifier.address"));
+			}
+			result.space = address_space_id_t::relative_virtual;
+		} else if (address.space == address_space_id_t::file_offset) {
+			auto rva = image->file_offset_to_rva(address.value);
+			if (!rva) return workspace_result_t<address_t>::failure(rva.error());
+			result.space = address_space_id_t::relative_virtual;
+			result.value = rva.value();
+		} else if (address.space == address_space_id_t::virtual_address) {
+			if (address.value < image->image_base() ||
+				address.value - image->image_base() >= image->image_size()) {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::out_of_range,
+					"Symbol address is outside the normalized image",
+					"symbol_classifier.address"));
+			}
+			result.space = address_space_id_t::relative_virtual;
+			result.value = address.value - image->image_base();
+		} else {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::unsupported_address_space,
+				"Symbol address space is unsupported", "symbol_classifier.address"));
+		}
+		return workspace_result_t<address_t>::success(result);
+	}
+
+	inline kind_t classify(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		using namespace aida::analysis;
+		auto normalized = normalize_workspace_address(workspace, address);
+		if (!normalized) return kind_t::unknown;
+		auto publication = workspace->analysis_publication();
+		auto snapshot = publication &&
+			publication->binary_id == workspace->identity().binary_id() &&
+			publication->generation == workspace->generation()
+			? publication->snapshot : nullptr;
+		if (snapshot) {
+			for (const auto& symbol : snapshot->symbols) {
+				if (symbol.address.space != normalized.value().space ||
+					symbol.address.value != normalized.value().value)
+					continue;
+				switch (symbol.kind) {
+				case symbol_kind_t::function:
+				case symbol_kind_t::export_symbol:
+				case symbol_kind_t::debug_symbol:
+					return kind_t::regular_function;
+				case symbol_kind_t::import_symbol: return kind_t::external_import;
+				case symbol_kind_t::data: return kind_t::data;
+				case symbol_kind_t::type_symbol: return kind_t::typelib_type;
+				case symbol_kind_t::metadata: return kind_t::label;
+				}
+			}
+			for (const auto& string : snapshot->strings) {
+				if (string.address.space != normalized.value().space ||
+					normalized.value().value < string.address.value ||
+					normalized.value().value - string.address.value >= string.byte_length)
+					continue;
+				return string.encoding == string_encoding_t::utf16_le
+					? kind_t::string_unicode : kind_t::string_ascii;
+			}
+			for (const auto& function : snapshot->functions) {
+				if (function.start.space != normalized.value().space ||
+					normalized.value().value < function.start.value ||
+					normalized.value().value >= function.end.value)
+					continue;
+				if (normalized.value().value == function.start.value)
+					return function.thunk ? kind_t::jump_thunk : kind_t::regular_function;
+				return kind_t::instruction;
+			}
+			for (const auto& instruction : snapshot->instructions) {
+				if (instruction.address.space == normalized.value().space &&
+					instruction.address.value == normalized.value().value)
+					return kind_t::instruction;
+			}
+		}
+		auto image = workspace->image();
+		if (auto symbols = analysis_session::symbols_for_workspace(workspace)) {
+			auto symbol_address = normalized.value();
+			if (symbol_address.space == address_space_id_t::relative_virtual) {
+				if (image && image->image_base() <= UINT64_MAX - symbol_address.value) {
+					symbol_address.space = address_space_id_t::virtual_address;
+					symbol_address.value += image->image_base();
+				}
+			} else if (symbol_address.space == address_space_id_t::virtual_address &&
+				workspace->target_kind() == target_kind_t::live_snapshot) {
+				symbol_address.space = address_space_id_t::live_virtual;
+			}
+			if (auto symbol = symbols->symbol_snapshot_exact(symbol_address))
+				return symbol->is_function ? kind_t::regular_function : kind_t::data;
+		}
+		if (!image) return kind_t::unknown;
+		if (normalized.value().space == address_space_id_t::relative_virtual &&
+			normalized.value().value == image->entry_rva())
+			return kind_t::entry_point;
+		for (const auto& entry : image->imports()) {
+			if (normalized.value().space == address_space_id_t::relative_virtual &&
+				normalized.value().value == entry.iat_rva)
+				return kind_t::imp_function;
+		}
+		if (normalized.value().space != address_space_id_t::relative_virtual)
+			return kind_t::unknown;
+		const auto* section = image->section_for_rva(normalized.value().value);
+		if (!section) return kind_t::unknown;
+		std::string name = section->name;
+		std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+			return static_cast<char>(std::tolower(value));
+		});
+		if (name == ".text" || section->executable) return kind_t::section_text;
+		if (name == ".rdata") return kind_t::section_rdata;
+		if (name == ".data") return kind_t::section_data;
+		if (name == ".bss") return kind_t::section_bss;
+		if (name == ".rsrc") return kind_t::section_rsrc;
+		return section->writable ? kind_t::data : kind_t::section_other;
+	}
+
+	inline const char* classify_name(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		return kind_name(classify(workspace, address));
+	}
+
+	inline bool lookup_import_by_iat(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address,
+		std::string& module_name, std::string& function_name)
+	{
+		module_name.clear();
+		function_name.clear();
+		auto normalized = normalize_workspace_address(workspace, address);
+		auto image = workspace ? workspace->image() : nullptr;
+		if (!normalized || !image) return false;
+		for (const auto& entry : image->imports()) {
+			if (normalized.value().space != aida::analysis::address_space_id_t::relative_virtual ||
+				normalized.value().value != entry.iat_rva) continue;
+			module_name = entry.library;
+			if (entry.name) function_name = *entry.name;
+			else if (entry.ordinal) function_name = "Ordinal#" + std::to_string(*entry.ordinal);
+			return !function_name.empty();
+		}
+		return false;
 	}
 
 	namespace detail {
@@ -591,24 +810,38 @@ namespace symbol_classifier {
 			}
 		}
 
+		inline std::optional<symbol_store::module_symbols_t>
+		live_module_symbols(const std::string& module_name) {
+			const uint32_t pid = driver_bridge::attached_pid();
+			if (pid == 0) return std::nullopt;
+			auto workspace = aida::analysis::workspace_registry().find_by_pid(pid);
+			if (workspace) {
+				auto symbols = analysis_session::symbols_for_workspace(workspace);
+				if (symbols) return symbols->module_snapshot(module_name);
+			}
+			std::lock_guard<std::mutex> lock(symbol_store::g_state.mutex);
+			auto found = symbol_store::g_state.modules.find(module_name);
+			if (found == symbol_store::g_state.modules.end() ||
+				found->second.pdb.symbols.size() > 4 * 1024 * 1024)
+				return std::nullopt;
+			return found->second;
+		}
+
 		inline void apply_pdb_symbols(std::shared_ptr<module_entry_t>& mod) {
 			if (!mod) return;
 			std::vector<std::pair<uint64_t, kind_t>> updates;
-			{
-				std::lock_guard<std::mutex> lk_store(symbol_store::g_state.mutex);
-				auto it = symbol_store::g_state.modules.find(mod->name);
-				if (it == symbol_store::g_state.modules.end()) return;
-				const auto& ms = it->second;
-				if (!ms.pdb.loaded) return;
-				updates.reserve(ms.pdb.symbols.size());
-				for (const auto& sym : ms.pdb.symbols) {
+			if (auto module = live_module_symbols(mod->name);
+				module && module->pdb.loaded) {
+				updates.reserve(module->pdb.symbols.size());
+				for (const auto& sym : module->pdb.symbols) {
 					if (!sym.is_function) continue;
+					if (mod->base > UINT64_MAX - sym.rva) continue;
 					uint64_t va = mod->base + sym.rva;
-					if (va < mod->base || va >= mod->base + mod->size) continue;
+					if (va < mod->base || va - mod->base >= mod->size) continue;
 					kind_t k = is_library_name(sym.name) ? kind_t::library_function : kind_t::regular_function;
 					updates.emplace_back(va, k);
 				}
-			}
+			} else return;
 
 			std::lock_guard<std::mutex> lk(mod->apply_lock);
 			auto cur = std::atomic_load(&mod->address_kind);
@@ -631,12 +864,9 @@ namespace symbol_classifier {
 			std::vector<std::pair<uint32_t, struct_binding_t>> binding_updates;
 			std::vector<std::pair<std::string, std::vector<std::pair<int64_t, std::string>>>> enum_updates;
 			std::vector<std::pair<uint64_t, kind_t>> address_updates;
-			{
-				std::lock_guard<std::mutex> lk_store(symbol_store::g_state.mutex);
-				auto it = symbol_store::g_state.modules.find(mod->name);
-				if (it == symbol_store::g_state.modules.end()) return;
-				const auto& ms = it->second;
-				if (!ms.pdb.loaded) return;
+			if (auto module = live_module_symbols(mod->name);
+				module && module->pdb.loaded) {
+				const auto& ms = *module;
 
 				binding_updates.reserve(ms.pdb.structs.size());
 				for (const auto& sd : ms.pdb.structs) {
@@ -680,7 +910,7 @@ namespace symbol_classifier {
 					}
 					enum_updates.emplace_back(ed.name, std::move(entries));
 				}
-			}
+			} else return;
 
 			std::lock_guard<std::mutex> lk(mod->apply_lock);
 

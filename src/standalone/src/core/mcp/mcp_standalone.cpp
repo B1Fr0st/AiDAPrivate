@@ -14,6 +14,7 @@
 #include "standalone_license.hpp"
 #include "../anti-tamper/mcp_posture.hpp"
 #include "../anti-tamper/state.hpp"
+#include "../anti-tamper/self_guard.hpp"
 #include "arc/arc.h"
 #include "zydis_disasm.hpp"
 #include "sandbox.hpp"
@@ -22,6 +23,7 @@
 #include "../network/burp/camoufox_bridge.hpp"
 #include "../runtime/manual_map_tls.hpp"
 #include "../session/analysis_session.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../tools/command_sessions.hpp"
 #include "../ui/ui_thread_dispatcher.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -45,6 +47,7 @@
 #include <limits>
 #include <memory>
 #include <map>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 #include "../diagnostics/metadata_ring.hpp"
@@ -56,9 +59,11 @@
 namespace mcp_standalone
 {
 static std::string json_dump_safe(const json& j, int indent = -1);
+static std::string sanitize_utf8(const std::string& input);
 
 namespace
 {
+    static std::uint64_t mcp_now_ms();
     std::atomic<bool> g_ide_lifecycle_ready{false};
     constexpr std::uint64_t kMcpDefaultToolTimeoutMs = 45000;
     constexpr std::uint64_t kMcpMinToolTimeoutMs = 500;
@@ -72,6 +77,14 @@ namespace
     constexpr std::uint64_t kMcpPolicyLockLogEveryMs = 500;
     constexpr std::size_t kMcpMaxBatchItems = 4096;
     constexpr std::size_t kMcpPayloadMaxLength = 64u * 1024u * 1024u;
+    constexpr std::size_t kMcpValidationTextMaxBytes = 384;
+    constexpr std::size_t kMcpValidationErrorCodeMaxBytes = 96;
+    constexpr std::size_t kMcpValidationJsonMaxDepth = 6;
+    constexpr std::size_t kMcpValidationJsonMaxEntries = 16;
+    constexpr std::size_t kMcpValidationJsonMaxNodes = 64;
+    constexpr std::size_t kMcpValidationDataMaxBytes = 768;
+    constexpr std::size_t kMcpValidationDetailsMaxBytes = 768;
+    constexpr std::size_t kMcpValidationFailureDetailsMaxBytes = 2048;
     constexpr std::size_t kSseMaxQueuedEvents = 4096;
     constexpr DWORD kSseSessionMaxAgeMs = 60u * 60u * 1000u;
     std::atomic<std::uint64_t> g_http_request_seq{0};
@@ -89,6 +102,311 @@ namespace
     thread_local std::string tls_current_call_request_id;
     thread_local std::string tls_current_call_tool_name;
     thread_local std::uint64_t tls_current_call_deadline_ms = 0;
+    std::mutex g_pre_dispatch_validation_hook_mtx;
+    tool_validation_hook_t g_pre_dispatch_validation_hook;
+    thread_local std::size_t tls_pre_dispatch_validation_depth = 0;
+
+    class scoped_pre_dispatch_validation_t
+    {
+    public:
+        explicit scoped_pre_dispatch_validation_t(bool active)
+            : active_(active)
+        {
+            if (active_)
+                ++tls_pre_dispatch_validation_depth;
+        }
+
+        ~scoped_pre_dispatch_validation_t()
+        {
+            if (active_)
+                --tls_pre_dispatch_validation_depth;
+        }
+
+        scoped_pre_dispatch_validation_t(const scoped_pre_dispatch_validation_t&) = delete;
+        scoped_pre_dispatch_validation_t& operator=(const scoped_pre_dispatch_validation_t&) = delete;
+
+    private:
+        bool active_ = false;
+    };
+
+    static bool pre_dispatch_validation_active()
+    {
+        return tls_pre_dispatch_validation_depth != 0;
+    }
+
+    static std::string normalize_validation_text(const std::string& value,
+                                                 const char* fallback,
+                                                 std::size_t maximum)
+    {
+        const std::size_t source_limit = maximum / 3;
+        std::string normalized = sanitize_utf8(value.substr(0, source_limit));
+        return normalized.empty() ? std::string(fallback) : normalized;
+    }
+
+    static std::string normalize_validation_error_code(const std::string& value)
+    {
+        std::string normalized;
+        normalized.reserve(std::min(value.size(), kMcpValidationErrorCodeMaxBytes));
+        for (const unsigned char ch : value) {
+            if (normalized.size() == kMcpValidationErrorCodeMaxBytes)
+                break;
+            if (std::isalnum(ch))
+                normalized.push_back(static_cast<char>(std::toupper(ch)));
+            else if (ch == '_' || ch == '-')
+                normalized.push_back('_');
+        }
+        return normalized.empty() ? std::string("MCP_TOOL_INPUT_VALIDATION_FAILED") : normalized;
+    }
+
+    static json normalize_validation_json_node(const json& value,
+                                               std::size_t& remaining_nodes,
+                                               std::size_t depth)
+    {
+        json normalized;
+        if (remaining_nodes == 0) {
+            normalized = json{{"truncated", true}, {"reason", "node_limit"}};
+        } else if (depth >= kMcpValidationJsonMaxDepth) {
+            normalized = json{{"truncated", true}, {"reason", "depth_limit"}};
+        } else {
+            --remaining_nodes;
+            if (value.is_object()) {
+                normalized = json::object();
+                std::size_t emitted = 0;
+                for (auto it = value.begin(); it != value.end(); ++it) {
+                    if (emitted == kMcpValidationJsonMaxEntries) {
+                        normalized["truncated"] = true;
+                        break;
+                    }
+                    normalized[normalize_validation_text(it.key(), "field", 96)] =
+                        normalize_validation_json_node(it.value(), remaining_nodes, depth + 1);
+                    ++emitted;
+                }
+            } else if (value.is_array()) {
+                normalized = json::array();
+                std::size_t emitted = 0;
+                for (const auto& element : value) {
+                    if (emitted == kMcpValidationJsonMaxEntries) {
+                        normalized.push_back(json{{"truncated", true}});
+                        break;
+                    }
+                    normalized.push_back(normalize_validation_json_node(element, remaining_nodes, depth + 1));
+                    ++emitted;
+                }
+            } else if (value.is_string()) {
+                normalized = normalize_validation_text(value.get_ref<const std::string&>(), "", kMcpValidationTextMaxBytes);
+            } else if (value.is_boolean() || value.is_number() || value.is_null()) {
+                normalized = value;
+            } else {
+                normalized = json{{"truncated", true}, {"reason", "unsupported_value"}};
+            }
+        }
+        return normalized;
+    }
+
+    static json normalize_validation_json(const json& value,
+                                          std::size_t maximum_bytes)
+    {
+        std::size_t remaining_nodes = kMcpValidationJsonMaxNodes;
+        json normalized = normalize_validation_json_node(value, remaining_nodes, 0);
+        try {
+            if (normalized.dump().size() <= maximum_bytes)
+                return normalized;
+        } catch (...) {
+        }
+        return json{{"truncated", true}, {"reason", "size_limit"}};
+    }
+
+    static tool_result_t validation_failure_result(const tool_def_t& tool,
+                                                   const char* reason,
+                                                   const char* text,
+                                                   const char* code)
+    {
+        return tool_result_t::error(
+            text,
+            code,
+            json{{"tool", normalize_validation_text(tool.name, "unknown", 128)},
+                 {"reason", reason},
+                 {"disposition", "not_started"}});
+    }
+
+    static tool_result_t normalize_validation_rejection(const tool_def_t& tool,
+                                                        const tool_result_t& result)
+    {
+        const json data = normalize_validation_json(result.data, kMcpValidationDataMaxBytes);
+        const json details = normalize_validation_json(result.error_details, kMcpValidationDetailsMaxBytes);
+        json envelope = {
+            {"tool", normalize_validation_text(tool.name, "unknown", 128)},
+            {"reason", "validator_rejected"},
+            {"disposition", "not_started"},
+            {"validator_data", data},
+            {"validator_details", details}
+        };
+        envelope = normalize_validation_json(envelope, kMcpValidationFailureDetailsMaxBytes);
+        return {false,
+                normalize_validation_text(result.text, "Tool input validation failed.", kMcpValidationTextMaxBytes),
+                data,
+                normalize_validation_error_code(result.error_code),
+                envelope};
+    }
+
+    static bool validation_cancelled_or_expired(const tool_def_t& tool,
+                                                tool_result_t* failure)
+    {
+        const std::uint64_t deadline = current_call_deadline_ms();
+        if (deadline != 0 && mcp_now_ms() >= deadline) {
+            if (failure) {
+                *failure = validation_failure_result(
+                    tool,
+                    "deadline_exceeded",
+                    "Tool input validation deadline expired before dispatch.",
+                    "MCP_TOOL_INPUT_VALIDATION_DEADLINE_EXCEEDED");
+            }
+            return true;
+        }
+        if (current_call_cancelled()) {
+            if (failure) {
+                *failure = validation_failure_result(
+                    tool,
+                    "cancelled",
+                    "Tool input validation was cancelled before dispatch.",
+                    "MCP_TOOL_INPUT_VALIDATION_CANCELLED");
+            }
+            return true;
+        }
+        return false;
+    }
+
+    static bool supplied_tool_arguments_are_non_object(const json& params)
+    {
+        return params.is_object() && params.contains("arguments") && !params["arguments"].is_object();
+    }
+
+    static tool_result_t non_object_tool_arguments_failure()
+    {
+        return tool_result_t::error(
+            "Tool arguments must be a JSON object.",
+            "MCP_TOOL_ARGUMENTS_MUST_BE_OBJECT",
+            json{{"reason", "arguments_must_be_object"}, {"disposition", "not_started"}});
+    }
+
+    static bool validate_pre_dispatch_tool_input(const tool_def_t& tool,
+                                                  const json& arguments,
+                                                  tool_result_t* failure,
+                                                  bool* hook_invoked = nullptr)
+    {
+        if (hook_invoked)
+            *hook_invoked = false;
+        if (tool.input_schema.is_null())
+            return true;
+
+        if (validation_cancelled_or_expired(tool, failure))
+            return false;
+
+        tool_validation_hook_t hook;
+        {
+            std::lock_guard<std::mutex> lk(g_pre_dispatch_validation_hook_mtx);
+            hook = g_pre_dispatch_validation_hook;
+        }
+        if (!hook) {
+            if (failure) {
+                *failure = validation_failure_result(
+                    tool,
+                    "validator_unavailable",
+                    "Tool input validation is unavailable.",
+                    "MCP_TOOL_INPUT_VALIDATION_UNAVAILABLE");
+            }
+            return false;
+        }
+        if (validation_cancelled_or_expired(tool, failure))
+            return false;
+        if (hook_invoked)
+            *hook_invoked = true;
+
+        try {
+            tool_result_t result = hook(tool, arguments);
+            if (validation_cancelled_or_expired(tool, failure))
+                return false;
+            if (result.success) {
+                self_guard::self_guard_context_t sg_ctx;
+                sg_ctx.tool_name = tool.name;
+                if (arguments.is_object()) {
+                    if (arguments.contains("pid")) {
+                        const auto& pid_val = arguments["pid"];
+                        if (pid_val.is_number_unsigned()) {
+                            sg_ctx.has_pid = true;
+                            sg_ctx.target_pid = static_cast<uint32_t>(pid_val.get<uint64_t>());
+                        } else if (pid_val.is_number_integer()) {
+                            const int64_t signed_pid = pid_val.get<int64_t>();
+                            if (signed_pid >= 0) {
+                                sg_ctx.has_pid = true;
+                                sg_ctx.target_pid = static_cast<uint32_t>(signed_pid);
+                            }
+                        } else if (pid_val.is_string()) {
+                            try {
+                                const auto parsed = std::stoull(pid_val.get<std::string>());
+                                if (parsed != 0 && parsed <= 0xFFFFFFFFull) {
+                                    sg_ctx.has_pid = true;
+                                    sg_ctx.target_pid = static_cast<uint32_t>(parsed);
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                    if (arguments.contains("address")) {
+                        const auto& addr_val = arguments["address"];
+                        if (addr_val.is_string()) {
+                            try {
+                                const std::string addr_str = addr_val.get<std::string>();
+                                sg_ctx.target_address = std::stoull(addr_str, nullptr, 0);
+                                sg_ctx.has_address = true;
+                            } catch (...) {}
+                        } else if (addr_val.is_number_unsigned()) {
+                            sg_ctx.target_address = addr_val.get<uint64_t>();
+                            sg_ctx.has_address = true;
+                        } else if (addr_val.is_number_integer()) {
+                            sg_ctx.target_address = static_cast<uint64_t>(addr_val.get<int64_t>());
+                            sg_ctx.has_address = true;
+                        }
+                    }
+                    if (arguments.contains("path")) {
+                        const auto& path_val = arguments["path"];
+                        if (path_val.is_string()) {
+                            sg_ctx.has_binary_path = true;
+                            sg_ctx.target_binary_path = path_val.get<std::string>();
+                        }
+                    }
+                    if (arguments.contains("binary_path")) {
+                        const auto& bp_val = arguments["binary_path"];
+                        if (bp_val.is_string()) {
+                            sg_ctx.has_binary_path = true;
+                            sg_ctx.target_binary_path = bp_val.get<std::string>();
+                        }
+                    }
+                    if (arguments.contains("binary_id")) {
+                        const auto& bid_val = arguments["binary_id"];
+                        if (bid_val.is_string())
+                            sg_ctx.target_binary_id = bid_val.get<std::string>();
+                    }
+                }
+                auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+                if (guard_result != self_guard::self_guard_result_t::allow) {
+                    self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+                }
+                return true;
+            }
+            if (failure)
+                *failure = normalize_validation_rejection(tool, result);
+            return false;
+        } catch (...) {
+            if (failure) {
+                *failure = validation_failure_result(
+                    tool,
+                    "validator_exception",
+                    "Tool input validation failed.",
+                    "MCP_TOOL_INPUT_VALIDATION_FAILED");
+            }
+            return false;
+        }
+    }
 
     struct mcp_route_identity_t
     {
@@ -3530,6 +3848,12 @@ static void require_mcp_runtime_authorized(const char* where)
 void set_ide_lifecycle_ready(bool ready) noexcept
 {
     g_ide_lifecycle_ready.store(ready, std::memory_order_release);
+}
+
+void set_pre_dispatch_validation_hook(tool_validation_hook_t hook)
+{
+    std::lock_guard<std::mutex> lk(g_pre_dispatch_validation_hook_mtx);
+    g_pre_dispatch_validation_hook = std::move(hook);
 }
 
 bool lifecycle_authorized(std::string* reason)
@@ -8360,11 +8684,11 @@ static std::string policy_lane_class_name(const std::string& tool_name, const ch
 {
     (void)tool_name;
     const std::string l = lower_ascii(lane ? lane : "");
-    if (l == "shared_active" || l == "shared_target_probe" || l == "shared_explicit_no_switch" || l == "shared_target_reject")
+    if (l == "shared_active")
         return "shared_active_session_read";
     if (l == "exclusive_session_manager")
         return "exclusive_session_manager";
-    if (l == "exclusive_mutating" || l == "exclusive_target_switch")
+    if (l == "exclusive_mutating")
         return "exclusive_mutating";
     if (l == "independent_unlocked" || l == "self_contained_unlocked")
         return "independent_read_only";
@@ -8400,9 +8724,9 @@ static std::string policy_conflict_rule_for_lane(const char* lane)
         return "no_active_session_lock";
     if (l.rfind("exclusive_domain_", 0) == 0 || l == "exclusive_independent_mutating")
         return "bounded_domain_mutex_no_ui_wait";
-    if (l == "shared_active" || l == "shared_target_probe" || l == "shared_explicit_no_switch" || l == "shared_target_reject")
+    if (l == "shared_active")
         return "bounded_wait_on_exclusive_owner_no_expired_steal";
-    if (l == "exclusive_session_manager" || l == "exclusive_mutating" || l == "exclusive_target_switch")
+    if (l == "exclusive_session_manager" || l == "exclusive_mutating")
         return "bounded_wait_signal_stale_owner_no_expired_steal";
     return "bounded_policy_wait_no_expired_steal";
 }
@@ -8829,7 +9153,7 @@ static bool tool_args_select_session_target(const json& args)
     if (!args.is_object())
         return false;
     static const char* const keys[] = {
-        "binary_id", "session_id", "file_path", "target_pid", "process_id", "pid"
+        "binary_id", "session_id", "bin_name", "file_path", "target_pid", "process_id", "pid"
     };
     for (const char* key : keys) {
         if (args.contains(key) && !args[key].is_null())
@@ -8872,97 +9196,255 @@ static const json& target_resolution_args_for_tool(const tool_def_t& tool, const
     return storage;
 }
 
-struct target_probe_t
+struct workspace_resolution_t
 {
-    bool ok = true;
-    bool resolved = false;
-    size_t active_idx = static_cast<size_t>(-1);
-    size_t target_idx = static_cast<size_t>(-1);
-    std::string resolved_id;
-    std::uint32_t pid = 0;
-    std::string err;
+    std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+    std::string code;
+    std::string message;
+    json details = json::object();
 };
 
-static target_probe_t probe_target_without_switch(const json& args)
+static std::mutex& workspace_policy_map_mutex()
 {
-    target_probe_t probe;
-    probe.active_idx = analysis_session::active_session_idx();
+    static std::mutex value;
+    return value;
+}
 
-    if (args.is_null() || !args.is_object())
-        return probe;
+static std::map<std::string, std::weak_ptr<std::shared_timed_mutex>>& workspace_policy_map()
+{
+    static std::map<std::string, std::weak_ptr<std::shared_timed_mutex>> value;
+    return value;
+}
 
-    std::string binary_id;
-    if (args.contains("binary_id") && args["binary_id"].is_string()) {
-        binary_id = args["binary_id"].get<std::string>();
-    } else if (args.contains("session_id") && args["session_id"].is_string()) {
-        binary_id = args["session_id"].get<std::string>();
+static std::shared_ptr<std::shared_timed_mutex> workspace_policy_mutex(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+{
+    const std::string key = workspace->identity().binary_id().to_hex();
+    std::lock_guard<std::mutex> lock(workspace_policy_map_mutex());
+    auto& policies = workspace_policy_map();
+    if (policies.size() > 256) {
+        for (auto iterator = policies.begin(); iterator != policies.end();) {
+            if (iterator->second.expired())
+                iterator = policies.erase(iterator);
+            else
+                ++iterator;
+        }
+    }
+    auto& weak = policies[key];
+    auto value = weak.lock();
+    if (!value) {
+        value = std::make_shared<std::shared_timed_mutex>();
+        weak = value;
+    }
+    return value;
+}
+
+static bool parse_workspace_pid(const json& value, std::uint32_t& pid)
+{
+    std::uint64_t parsed = 0;
+    if (value.is_number_unsigned()) {
+        parsed = value.get<std::uint64_t>();
+    } else if (value.is_number_integer()) {
+        const std::int64_t signed_value = value.get<std::int64_t>();
+        if (signed_value <= 0)
+            return false;
+        parsed = static_cast<std::uint64_t>(signed_value);
+    } else if (value.is_string()) {
+        const std::string text = value.get<std::string>();
+        if (text.empty())
+            return false;
+        try {
+            std::size_t consumed = 0;
+            parsed = std::stoull(text, &consumed, 0);
+            if (consumed != text.size())
+                return false;
+        } catch (...) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    if (parsed == 0 || parsed > std::numeric_limits<std::uint32_t>::max())
+        return false;
+    pid = static_cast<std::uint32_t>(parsed);
+    return true;
+}
+
+static workspace_resolution_t workspace_resolution_error(
+    const aida::analysis::workspace_error_t& error)
+{
+    workspace_resolution_t result;
+    result.code = error.stable_code();
+    result.message = error.message;
+    result.details["phase"] = error.phase;
+    if (error.offset)
+        result.details["offset"] = *error.offset;
+    if (error.size)
+        result.details["size"] = *error.size;
+    for (const auto& detail : error.details)
+        result.details[detail.first] = detail.second;
+    return result;
+}
+
+static workspace_resolution_t resolve_workspace_direct(const json& args)
+{
+    using namespace aida::analysis;
+    target_selector_t selector;
+    const bool object = args.is_object();
+    const bool has_binary = object && args.contains("binary_id") && !args["binary_id"].is_null();
+    const bool has_session = object && args.contains("session_id") && !args["session_id"].is_null();
+    const bool has_name = object && args.contains("bin_name") && !args["bin_name"].is_null();
+    const bool has_path = object && args.contains("file_path") && !args["file_path"].is_null();
+    const unsigned pid_alias_count = object
+        ? static_cast<unsigned>(args.contains("pid") && !args["pid"].is_null()) +
+          static_cast<unsigned>(args.contains("target_pid") && !args["target_pid"].is_null()) +
+          static_cast<unsigned>(args.contains("process_id") && !args["process_id"].is_null())
+        : 0;
+    const bool has_pid = object && ((args.contains("pid") && !args["pid"].is_null()) ||
+        (args.contains("target_pid") && !args["target_pid"].is_null()) ||
+        (args.contains("process_id") && !args["process_id"].is_null()));
+    const unsigned selector_count = static_cast<unsigned>(has_binary || has_session) +
+                                    static_cast<unsigned>(has_name || has_path) +
+                                    static_cast<unsigned>(has_pid);
+    if (selector_count > 1 || pid_alias_count > 1 ||
+        (has_binary && has_session) || (has_name && has_path)) {
+        return workspace_resolution_error(make_workspace_error(
+            workspace_error_code_t::target_conflict,
+            "only one workspace selector may be supplied", "mcp_workspace_resolve"));
     }
 
-    std::string file_path;
-    if (binary_id.empty() && args.contains("file_path") && args["file_path"].is_string())
-        file_path = args["file_path"].get<std::string>();
-
-    uint32_t target_pid = 0;
-    if (binary_id.empty() && file_path.empty()) {
-        for (const char* key : {"target_pid", "process_id", "pid"}) {
-            if (!args.contains(key))
+    if (has_binary || has_session) {
+        const char* field = has_binary ? "binary_id" : "session_id";
+        if (!args[field].is_string()) {
+            return workspace_resolution_error(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                std::string(field) + " must be a string", "mcp_workspace_resolve"));
+        }
+        const std::string text = args[field].get<std::string>();
+        if (auto parsed = binary_id_t::from_hex(text)) {
+            selector.binary_id = *parsed;
+        } else {
+            auto workspace = analysis_session::workspace_for_session_id(text);
+            if (workspace)
+                return {std::move(workspace), {}, {}, json::object()};
+            return workspace_resolution_error(make_workspace_error(
+                workspace_error_code_t::target_not_found,
+                "workspace binary/session identity was not found", "mcp_workspace_resolve"));
+        }
+    } else if (has_path) {
+        if (!args["file_path"].is_string()) {
+            return workspace_resolution_error(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "file_path must be a string", "mcp_workspace_resolve"));
+        }
+        auto normalized_path = normalize_utf8_path(args["file_path"].get<std::string>(), false);
+        if (!normalized_path)
+            return workspace_resolution_error(normalized_path.error());
+        const std::string expected_path = normalize_target_name(normalized_path.value());
+        std::vector<std::shared_ptr<analysis_workspace_t>> matches;
+        for (const auto& workspace : workspace_registry().list()) {
+            if (!workspace || workspace->closing() || workspace->closed())
                 continue;
-            const auto& v = args[key];
-            if (v.is_number_unsigned()) {
-                target_pid = static_cast<uint32_t>(v.get<uint64_t>());
-            } else if (v.is_number_integer()) {
-                int64_t s = v.get<int64_t>();
-                if (s > 0)
-                    target_pid = static_cast<uint32_t>(s);
-            } else if (v.is_string()) {
-                std::string s = v.get<std::string>();
-                if (!s.empty()) {
-                    try { target_pid = static_cast<uint32_t>(std::stoul(s, nullptr, 0)); }
-                    catch (...) { target_pid = 0; }
-                }
-            }
-            if (target_pid != 0)
-                break;
+            if (normalize_target_name(workspace->identity().normalized_source_path()) == expected_path)
+                matches.push_back(workspace);
         }
+        if (matches.size() == 1)
+            return {std::move(matches.front()), {}, {}, json::object()};
+        if (matches.empty()) {
+            return workspace_resolution_error(make_workspace_error(
+                workspace_error_code_t::target_not_found,
+                "file path target was not found", "mcp_workspace_resolve"));
+        }
+        auto error = make_workspace_error(
+            workspace_error_code_t::target_ambiguous,
+            "file path selector matches more than one workspace", "mcp_workspace_resolve");
+        error.details.emplace_back("candidate_count", std::to_string(matches.size()));
+        return workspace_resolution_error(error);
+    } else if (has_name) {
+        if (!args["bin_name"].is_string()) {
+            return workspace_resolution_error(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "bin_name must be a string", "mcp_workspace_resolve"));
+        }
+        selector.bin_name = args["bin_name"].get<std::string>();
+    } else if (has_pid) {
+        std::uint32_t pid = 0;
+        const char* pid_field = args.contains("pid") && !args["pid"].is_null() ? "pid" :
+            (args.contains("target_pid") && !args["target_pid"].is_null() ? "target_pid" : "process_id");
+        if (!parse_workspace_pid(args[pid_field], pid)) {
+            return workspace_resolution_error(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "pid must be a positive 32-bit process id", "mcp_workspace_resolve"));
+        }
+        selector.pid = pid;
     }
 
-    size_t resolved_idx = static_cast<size_t>(-1);
-    if (!binary_id.empty()) {
-        size_t idx = 0;
-        if (analysis_session::find_session_by_id(binary_id, &idx)) {
-            resolved_idx = idx;
-        } else {
-            probe.ok = false;
-            probe.err = "binary_id '" + binary_id + "' not found in active sessions";
-            diag::log_tagged_fmt("mcp_standalone",
-                "probe_target binary_id='%s' not_found",
-                binary_id.c_str());
-            return probe;
-        }
-    } else if (!file_path.empty()) {
-        size_t idx = 0;
-        if (analysis_session::find_session_by_path(file_path, &idx)) {
-            resolved_idx = idx;
-        } else {
-            probe.ok = false;
-            probe.err = "file_path '" + file_path + "' not found in active sessions";
-            return probe;
-        }
-    } else if (target_pid != 0) {
-        size_t idx = 0;
-        if (analysis_session::find_session_by_pid(target_pid, &idx))
-            resolved_idx = idx;
+    target_resolution_options_t options;
+    options.allow_unique_substring = has_name;
+    options.require_selector_when_multiple = true;
+    auto resolved = workspace_registry().resolve(selector, options);
+    if (!resolved)
+        return workspace_resolution_error(resolved.error());
+    return {resolved.take_value(), {}, {}, json::object()};
+}
+
+static const char* workspace_kind_name(aida::analysis::target_kind_t kind)
+{
+    return kind == aida::analysis::target_kind_t::live_snapshot ? "live" : "static";
+}
+
+static json workspace_provenance(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+{
+    const auto& identity = workspace->identity();
+    const auto progress = workspace->progress();
+    bool snapshot_stale = false;
+    if (identity.target_kind() == aida::analysis::target_kind_t::live_snapshot) {
+        const auto provider = std::dynamic_pointer_cast<const aida::analysis::live_snapshot_provider_t>(
+            workspace->provider_handle());
+        snapshot_stale = !provider || !provider->validate_current_identity();
     }
+    json result;
+    result["binary_id"] = identity.binary_id().to_hex();
+    result["bin_name"] = identity.bin_name();
+    result["kind"] = workspace_kind_name(identity.target_kind());
+    result["pid"] = identity.process()
+        ? json(identity.process()->pid)
+        : json(nullptr);
+    result["address_space"] = identity.target_kind() == aida::analysis::target_kind_t::live_snapshot
+        ? "live_virtual"
+        : "virtual_address";
+    result["generation"] = workspace->generation();
+    result["analysis_revision"] = workspace->analysis_revision();
+    result["overlay_revision"] = workspace->overlay_revision();
+    result["readiness"] = static_cast<unsigned>(progress.readiness);
+    result["snapshot_stale"] = snapshot_stale;
+    result["analysis_error"] = progress.error.has_value();
+    return result;
+}
 
-    if (resolved_idx == static_cast<size_t>(-1))
-        return probe;
-
-    probe.resolved = true;
-    probe.target_idx = resolved_idx;
-    auto sum = analysis_session::summarize_session_at(resolved_idx);
-    probe.resolved_id = sum.id;
-    probe.pid = sum.pid;
-    return probe;
+static tool_result_t add_workspace_provenance(
+    tool_result_t result,
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+{
+    if (!result.success) {
+        if (!result.error_details.is_object())
+            result.error_details = json::object();
+        if (!result.error_details.contains("_meta") || !result.error_details["_meta"].is_object())
+            result.error_details["_meta"] = json::object();
+        result.error_details["_meta"]["aida"] = workspace_provenance(workspace);
+        return result;
+    }
+    if (!result.data.is_object()) {
+        json wrapped;
+        wrapped["result"] = result.data.is_null() ? json(result.text) : result.data;
+        result.data = std::move(wrapped);
+    }
+    if (!result.data.contains("_meta") || !result.data["_meta"].is_object())
+        result.data["_meta"] = json::object();
+    result.data["_meta"]["aida"] = workspace_provenance(workspace);
+    result.text = result.data.dump(2);
+    return result;
 }
 
 static bool tool_args_have_explicit_pid(const json& args)
@@ -8976,30 +9458,6 @@ static bool tool_args_have_explicit_pid(const json& args)
     return false;
 }
 
-static json add_process_id_for_handler_if_supported(const tool_def_t& tool, const json& arguments, std::uint32_t pid, bool* added)
-{
-    if (added)
-        *added = false;
-    if (pid == 0 || !arguments.is_object())
-        return arguments;
-    if (tool_args_have_explicit_pid(arguments))
-        return arguments;
-    const char* key = nullptr;
-    if (tool_declares_param_named(tool, "process_id"))
-        key = "process_id";
-    else if (tool_declares_param_named(tool, "target_pid"))
-        key = "target_pid";
-    else if (tool_declares_param_named(tool, "pid"))
-        key = "pid";
-    if (!key)
-        return arguments;
-    json copy = arguments;
-    copy[key] = pid;
-    if (added)
-        *added = true;
-    return copy;
-}
-
 static bool is_analysis_session_management_tool(const std::string& name)
 {
     return name.rfind("sessions_", 0) == 0;
@@ -9008,6 +9466,7 @@ static bool is_analysis_session_management_tool(const std::string& name)
 static bool is_active_session_independent_tool(const std::string& name)
 {
     if (name == "get_tool_descriptions" ||
+        name == "list_instances" ||
         name == "vm_bridge_manage" ||
         name == "list_processes" ||
         name == "disassemble_file" ||
@@ -12057,6 +12516,116 @@ static tool_result_t invoke_tool_with_registry_scope(const tool_def_t& tool,
     return tr;
 }
 
+static tool_result_t invoke_workspace_tool(
+    const tool_def_t& tool,
+    const json& arguments,
+    tool_invocation_metrics_t* metrics,
+    bool trusted_thread_suspension_tool)
+{
+    workspace_resolution_t resolution = resolve_workspace_direct(arguments);
+    if (!resolution.workspace) {
+        if (metrics)
+            metrics->resolved_target = false;
+        return tool_result_t::error(
+            resolution.message.empty() ? std::string("Unable to resolve workspace target") : resolution.message,
+            resolution.code.empty() ? std::string("TARGET_NOT_FOUND") : resolution.code,
+            resolution.details);
+    }
+    if (metrics)
+        metrics->resolved_target = true;
+    auto workspace_mutex = workspace_policy_mutex(resolution.workspace);
+    const std::string lane = tool.read_only ? "workspace_shared" : "workspace_exclusive";
+    const auto invoke = [&](const json& params) {
+        const std::uint64_t wait_started = static_cast<std::uint64_t>(GetTickCount64());
+        const auto wait_failure = [&]() -> std::optional<tool_result_t> {
+            const std::uint64_t deadline = current_call_deadline_ms();
+            const bool deadline_exceeded = deadline != 0 &&
+                static_cast<std::uint64_t>(GetTickCount64()) >= deadline;
+            if (!deadline_exceeded && !current_call_cancelled()) return std::nullopt;
+            const std::uint64_t wait_ms = static_cast<std::uint64_t>(GetTickCount64()) - wait_started;
+            set_tool_metrics_lane(metrics, lane, wait_ms);
+            return add_workspace_provenance(tool_result_t::error(
+                deadline_exceeded ? "Workspace policy-lock deadline expired before dispatch" :
+                    "Workspace request was cancelled before dispatch",
+                deadline_exceeded ? "DEADLINE_EXCEEDED" : "CANCELLED",
+                json{{"disposition", "not_started"}, {"lock_wait_ms", wait_ms},
+                    {"lane", lane}}), resolution.workspace);
+        };
+        if (auto failure = wait_failure()) return std::move(*failure);
+        workspace_request_context_t context;
+        context.workspace = resolution.workspace;
+        context.kind = resolution.workspace->target_kind();
+        context.binary_id = resolution.workspace->identity().binary_id();
+        if (resolution.workspace->identity().process())
+            context.pid = resolution.workspace->identity().process()->pid;
+        context.analysis_revision = resolution.workspace->analysis_revision();
+        context.overlay_revision = resolution.workspace->overlay_revision();
+        context.cancellation = current_cancel_token();
+        context.deadline_ms = current_call_deadline_ms();
+        context.diagnostic_id = current_call_diag_id();
+        context.request_id = current_call_request_id();
+        context.tool_name = current_call_tool_name();
+        tool_result_t result;
+        if (tool.read_only) {
+            std::shared_lock<std::shared_timed_mutex> lock(*workspace_mutex, std::defer_lock);
+            while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
+                if (auto failure = wait_failure()) return std::move(*failure);
+                if (resolution.workspace->closing() || resolution.workspace->closed())
+                    return add_workspace_provenance(tool_result_t::error(
+                        "Workspace closed while waiting for shared policy access",
+                        "TARGET_CLOSED", json{{"disposition", "not_started"}, {"lane", lane}}),
+                        resolution.workspace);
+            }
+            if (auto failure = wait_failure()) return std::move(*failure);
+            if (resolution.workspace->closing() || resolution.workspace->closed())
+                return add_workspace_provenance(tool_result_t::error(
+                    "Workspace closed before shared handler dispatch", "TARGET_CLOSED",
+                    json{{"disposition", "not_started"}, {"lane", lane}}),
+                    resolution.workspace);
+            set_tool_metrics_lane(metrics, lane,
+                static_cast<std::uint64_t>(GetTickCount64()) - wait_started);
+            result = tool.workspace_handler(params, context);
+        } else {
+            std::unique_lock<std::shared_timed_mutex> lock(*workspace_mutex, std::defer_lock);
+            while (!lock.try_lock_for(std::chrono::milliseconds(10))) {
+                if (auto failure = wait_failure()) return std::move(*failure);
+                if (resolution.workspace->closing() || resolution.workspace->closed())
+                    return add_workspace_provenance(tool_result_t::error(
+                        "Workspace closed while waiting for exclusive policy access",
+                        "TARGET_CLOSED", json{{"disposition", "not_started"}, {"lane", lane}}),
+                        resolution.workspace);
+            }
+            if (auto failure = wait_failure()) return std::move(*failure);
+            if (resolution.workspace->closing() || resolution.workspace->closed())
+                return add_workspace_provenance(tool_result_t::error(
+                    "Workspace closed before exclusive handler dispatch", "TARGET_CLOSED",
+                    json{{"disposition", "not_started"}, {"lane", lane}}),
+                    resolution.workspace);
+            set_tool_metrics_lane(metrics, lane,
+                static_cast<std::uint64_t>(GetTickCount64()) - wait_started);
+            result = tool.workspace_handler(params, context);
+        }
+        return add_workspace_provenance(std::move(result), resolution.workspace);
+    };
+    set_tool_metrics_lane(metrics, lane, 0);
+    diag::log_tagged_fmt("mcp_srv",
+        "tool_policy_lane tool='%s' lane=%s read_only=%d binary_id='%s' ui_thread_blocking_wait=0",
+        tool.name.c_str(), lane.c_str(), tool.read_only ? 1 : 0,
+        resolution.workspace->identity().binary_id().to_hex().c_str());
+    return invoke_tool_with_registry_scope(
+        tool, arguments, invoke, metrics, lane, trusted_thread_suspension_tool);
+}
+
+static tool_result_t target_scope_error_result(
+    const target_scope_t& scope,
+    const std::string& fallback)
+{
+    return tool_result_t::error(
+        scope.err.empty() ? fallback : scope.err,
+        scope.error_code.empty() ? std::string("TARGET_NOT_FOUND") : scope.error_code,
+        scope.error_details.is_object() ? scope.error_details : json::object());
+}
+
 static tool_result_t invoke_tool_with_concurrency_policy(
     const tool_def_t& tool,
     const json& arguments,
@@ -12071,6 +12640,9 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     const std::string domain = infer_tool_domain(tool.name);
     const bool driver_bridge_tool = is_driver_bridge_dependent_tool(tool);
     const bool trusted_thread_suspension_tool = driver_bridge_tool || (!session_manager && !session_independent);
+
+    if (tool.workspace_handler)
+        return invoke_workspace_tool(tool, arguments, metrics, trusted_thread_suspension_tool);
 
     if (session_independent && tool.read_only && !session_manager) {
         set_tool_metrics_lane(metrics, "independent_unlocked", 0);
@@ -12104,6 +12676,21 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             explicit_target ? 1 : 0,
             static_cast<unsigned long long>(wait_ms));
         return invoke_tool_with_registry_scope(tool, arguments, handler, metrics, lane, trusted_thread_suspension_tool);
+    }
+
+    if (explicit_target && !session_manager) {
+        set_tool_metrics_lane(metrics, "explicit_target_workspace_handler_required", 0);
+        diag::log_tagged_fmt("mcp_srv",
+            "tool_policy_lane tool='%s' lane=explicit_target_workspace_handler_required read_only=%d explicit_target=1 disposition=not_started",
+            tool.name.c_str(),
+            tool.read_only ? 1 : 0);
+        return tool_result_t::error(
+            "Explicit workspace targets require a workspace_handler; migrate this tool before targeting a workspace.",
+            "TARGET_WORKSPACE_HANDLER_REQUIRED",
+            json{{"tool", tool.name},
+                 {"target_routing", "workspace_handler_required"},
+                 {"migration", "workspace_handler"},
+                 {"disposition", "not_started"}});
     }
 
     if (!session_manager && !session_independent && !explicit_target && !tool_args_have_explicit_pid(arguments)) {
@@ -12148,7 +12735,7 @@ static tool_result_t invoke_tool_with_concurrency_policy(
             target_scope_t scope = resolve_target(target_arguments, &scope_err);
             if (!scope.ok) {
                 owner_guard.set_phase("target_resolve_failed");
-                return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+                return target_scope_error_result(scope, "Unable to resolve target session");
             }
             if (metrics)
                 metrics->resolved_target = true;
@@ -12182,113 +12769,20 @@ static tool_result_t invoke_tool_with_concurrency_policy(
         target_scope_t scope = resolve_target(target_arguments, &scope_err);
         if (!scope.ok) {
             owner_guard.set_phase("target_resolve_failed");
-            return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
+            return target_scope_error_result(scope, "Unable to resolve target session");
         }
         if (metrics)
             metrics->resolved_target = true;
         return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "shared_active", trusted_thread_suspension_tool, &owner_guard);
     }
 
-    target_probe_t probe;
-    std::uint64_t probe_wait_ms = 0;
-    {
-        const std::uint64_t owner_token = active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u;
-        const std::uint64_t owner_deadline = current_call_deadline_ms();
-        const policy_lock_wait_t wait = acquire_policy_shared_lock(active_session_lease_lock(), tool.name, "shared_target_probe", true, owner_token);
-        if (wait.status != policy_lock_status_t::acquired) {
-            set_tool_metrics_lane(metrics, "shared_target_probe", wait.wait_ms);
-            return policy_lock_error_result(tool.name, "shared_target_probe", wait);
-        }
-        active_session_owner_guard_t owner_guard(tool, target_arguments, "shared_target_probe", false, true, true, owner_token, owner_deadline, true);
-        owner_guard.set_phase("target_probe");
-        probe_wait_ms = wait.wait_ms;
-        probe = probe_target_without_switch(target_arguments);
-        if (!probe.ok) {
-            set_tool_metrics_lane(metrics, "shared_target_reject", probe_wait_ms);
-            owner_guard.set_lane("shared_target_reject");
-            owner_guard.set_phase("target_probe_failed");
-            diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lane tool='%s' lane=shared_target_reject lane_class=%s tool_class=%s conflict_policy=%s read_only=1 explicit_target=1 lock_wait_ms=%llu ui_thread_blocking_wait=0 err='%.160s'",
-                tool.name.c_str(),
-                policy_lane_class_name(tool.name, "shared_target_reject").c_str(),
-                policy_tool_class_name(tool.name).c_str(),
-                policy_conflict_rule_for_lane("shared_target_reject").c_str(),
-                static_cast<unsigned long long>(probe_wait_ms),
-                probe.err.c_str());
-            return tool_result_t::error(probe.err.empty() ? std::string("Unable to resolve target session") : probe.err);
-        }
-        if (!probe.resolved || probe.target_idx == probe.active_idx) {
-            set_tool_metrics_lane(metrics, "shared_explicit_no_switch", probe_wait_ms);
-            owner_guard.set_lane("shared_explicit_no_switch");
-            diag::log_tagged_fmt("mcp_srv",
-                "tool_policy_lane tool='%s' lane=shared_explicit_no_switch lane_class=%s tool_class=%s conflict_policy=%s read_only=1 resolved=%d active_idx=%llu target_idx=%llu lock_wait_ms=%llu ui_thread_blocking_wait=0",
-                tool.name.c_str(),
-                policy_lane_class_name(tool.name, "shared_explicit_no_switch").c_str(),
-                policy_tool_class_name(tool.name).c_str(),
-                policy_conflict_rule_for_lane("shared_explicit_no_switch").c_str(),
-                probe.resolved ? 1 : 0,
-                static_cast<unsigned long long>(probe.active_idx),
-                static_cast<unsigned long long>(probe.target_idx),
-                static_cast<unsigned long long>(probe_wait_ms));
-            owner_guard.set_phase("target_resolve");
-            std::string scope_err;
-            target_scope_t scope = resolve_target(target_arguments, &scope_err);
-            if (!scope.ok) {
-                owner_guard.set_phase("target_resolve_failed");
-                return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
-            }
-            if (metrics)
-                metrics->resolved_target = true;
-            bool added_pid = false;
-            json handler_arguments = add_process_id_for_handler_if_supported(tool, arguments, probe.pid, &added_pid);
-            if (probe.resolved && probe.pid != 0 && (tool_args_have_explicit_pid(arguments) || added_pid)) {
-                diag::log_tagged_fmt("mcp_srv",
-                    "tool_policy_lock_held_for_handler tool='%s' lane=shared_explicit_no_switch pid=%u added_pid=%d lock_wait_ms=%llu",
-                    tool.name.c_str(),
-                    probe.pid,
-                    added_pid ? 1 : 0,
-                    static_cast<unsigned long long>(probe_wait_ms));
-            }
-            return invoke_tool_handler_guarded(tool.name,
-                handler_arguments,
-                handler,
-                metrics,
-                "shared_explicit_no_switch",
-                trusted_thread_suspension_tool,
-                &owner_guard);
-        }
-    }
-
-    const std::uint64_t owner_token = active_session_owner_token_source().fetch_add(1u, std::memory_order_acq_rel) + 1u;
-    const std::uint64_t owner_deadline = current_call_deadline_ms();
-    const policy_lock_wait_t wait = acquire_policy_unique_lock(active_session_lease_lock(), tool.name, "exclusive_target_switch", true, true, owner_token);
-    if (wait.status != policy_lock_status_t::acquired) {
-        set_tool_metrics_lane(metrics, "exclusive_target_switch", probe_wait_ms + wait.wait_ms);
-        return policy_lock_error_result(tool.name, "exclusive_target_switch", wait);
-    }
-    const std::uint64_t wait_ms = wait.wait_ms;
-    set_tool_metrics_lane(metrics, "exclusive_target_switch", probe_wait_ms + wait_ms);
-    diag::log_tagged_fmt("mcp_srv",
-        "tool_policy_lane tool='%s' lane=exclusive_target_switch lane_class=%s tool_class=%s conflict_policy=%s read_only=1 active_idx=%llu target_idx=%llu probe_wait_ms=%llu lock_wait_ms=%llu ui_thread_blocking_wait=0",
-        tool.name.c_str(),
-        policy_lane_class_name(tool.name, "exclusive_target_switch").c_str(),
-        policy_tool_class_name(tool.name).c_str(),
-        policy_conflict_rule_for_lane("exclusive_target_switch").c_str(),
-        static_cast<unsigned long long>(probe.active_idx),
-        static_cast<unsigned long long>(probe.target_idx),
-        static_cast<unsigned long long>(probe_wait_ms),
-        static_cast<unsigned long long>(wait_ms));
-    active_session_owner_guard_t owner_guard(tool, target_arguments, "exclusive_target_switch", true, true, true, owner_token, owner_deadline, true);
-    owner_guard.set_phase("target_resolve");
-    std::string scope_err;
-    target_scope_t scope = resolve_target(target_arguments, &scope_err);
-    if (!scope.ok) {
-        owner_guard.set_phase("target_resolve_failed");
-        return tool_result_t::error(scope_err.empty() ? std::string("Unable to resolve target session") : scope_err);
-    }
-    if (metrics)
-        metrics->resolved_target = true;
-    return invoke_tool_handler_guarded(tool.name, arguments, handler, metrics, "exclusive_target_switch", trusted_thread_suspension_tool, &owner_guard);
+    return tool_result_t::error(
+        "Explicit workspace targets require a workspace_handler; migrate this tool before targeting a workspace.",
+        "TARGET_WORKSPACE_HANDLER_REQUIRED",
+        json{{"tool", tool.name},
+             {"target_routing", "workspace_handler_required"},
+             {"migration", "workspace_handler"},
+             {"disposition", "not_started"}});
 }
 
 bool server_t::register_tool(tool_def_t tool)
@@ -12298,20 +12792,50 @@ bool server_t::register_tool(tool_def_t tool)
     else if (is_standalone_internal_only_tool_name(tool.name))
         tool.visibility = tool_visibility_t::internal_only;
 
+    if (!tool.input_schema.is_null() && !tool.input_schema.is_object()) {
+        diag::log_tagged_fmt("mcp_srv",
+            "register_tool rejected name='%s' reason=input_schema_not_object",
+            tool.name.c_str());
+        return false;
+    }
+
     bool already_has_binary_id = false;
     for (const auto& p : tool.params) {
         if (p.name == "binary_id") { already_has_binary_id = true; break; }
     }
     bool is_targetless_tool = tool.name.rfind("sessions_", 0) == 0 ||
+                              tool.name == "list_instances" ||
                               tool.name == "get_tool_descriptions" ||
                               is_camoufox_browser_tool_name(tool.name);
     if (!already_has_binary_id && !is_targetless_tool) {
         tool.params.push_back(tool_param_t{
             "binary_id",
             "string",
-            "Optional session id to target (returned by `sessions_manage` action=list). When omitted the active session is used.",
+            tool.workspace_handler
+                ? "Optional immutable workspace binary id. When all selectors are omitted exactly one open workspace must exist; otherwise TARGET_REQUIRED is returned."
+                : "Optional session id to target (returned by `sessions_manage` action=list). When omitted the active session is used.",
             false
         });
+    }
+    if (tool.workspace_handler) {
+        bool has_bin_name = false;
+        bool has_pid = false;
+        for (const auto& param : tool.params) {
+            has_bin_name = has_bin_name || param.name == "bin_name";
+            has_pid = has_pid || param.name == "pid";
+        }
+        if (!has_bin_name) {
+            tool.params.push_back(tool_param_t{
+                "bin_name", "string",
+                "Optional exact workspace name or unique substring. Mutually exclusive with binary_id and pid.",
+                false});
+        }
+        if (!has_pid) {
+            tool.params.push_back(tool_param_t{
+                "pid", "integer",
+                "Optional positive live target PID. Mutually exclusive with binary_id and bin_name.",
+                false});
+        }
     }
     std::lock_guard<std::mutex> lk(_tools_mtx);
     auto dup = std::find_if(_tools.begin(), _tools.end(), [&](const tool_def_t& existing) {
@@ -12334,6 +12858,36 @@ bool server_t::register_tool(tool_def_t tool)
     }
     _tools.push_back(std::move(tool));
     return true;
+}
+
+bool server_t::register_tool(
+    tool_def_t tool,
+    std::function<tool_result_t(
+        const json&,
+        const std::shared_ptr<aida::analysis::analysis_workspace_t>&)> handler)
+{
+    if (!handler)
+        return false;
+    tool.workspace_handler = [handler = std::move(handler)](
+        const json& params,
+        const workspace_request_context_t& context) {
+        return handler(params, context.workspace);
+    };
+    tool.handler = {};
+    return register_tool(std::move(tool));
+}
+
+bool server_t::register_tool(
+    tool_def_t tool,
+    std::function<tool_result_t(
+        const json&,
+        const workspace_request_context_t&)> handler)
+{
+    if (!handler)
+        return false;
+    tool.workspace_handler = std::move(handler);
+    tool.handler = {};
+    return register_tool(std::move(tool));
 }
 
 tool_result_t server_t::call_registered_tool(const std::string& name, const json& arguments, bool external_visible_only)
@@ -12389,11 +12943,22 @@ tool_result_t server_t::call_registered_tool(const std::string& name, const json
         record_tool_audit_event(name, arguments, "rejected", false, details, tr.text, call_begin, diag_id, request_id);
         return tr;
     }
-    if (!handler_copy) {
+    if (!handler_copy && !found.workspace_handler) {
         json details = rejection_details("handler_missing", name);
         auto tr = tool_result_t::error("Tool has no handler: " + name, "MCP_TOOL_HANDLER_MISSING", details);
         record_tool_audit_event(name, arguments, "rejected", false, details, tr.text, call_begin, diag_id, request_id);
         return tr;
+    }
+    tool_result_t validation_failure;
+    if (!validate_pre_dispatch_tool_input(found, arguments, &validation_failure)) {
+        json details = {
+            {"code", validation_failure.error_code},
+            {"message", validation_failure.text},
+            {"details", validation_failure.error_details},
+            {"disposition", "not_started"}
+        };
+        record_tool_audit_event(name, arguments, "rejected", false, details, validation_failure.text, call_begin, diag_id, request_id);
+        return validation_failure;
     }
     tool_invocation_metrics_t metrics;
     metrics.lane = predicted_tool_lane(found, arguments);
@@ -12941,7 +13506,12 @@ json server_t::make_error(const json& id, int code, const std::string& msg)
 
 json server_t::tool_schema(const tool_def_t& tool, bool compact) const
 {
-    json input_schema = build_input_schema(tool);
+    json generated_input_schema;
+    const json* input_schema = &tool.input_schema;
+    if (input_schema->is_null()) {
+        generated_input_schema = build_input_schema(tool);
+        input_schema = &generated_input_schema;
+    }
     json annotations;
     annotations["title"]           = snake_to_title(tool.name);
     annotations["readOnlyHint"]    = tool.read_only;
@@ -12953,7 +13523,7 @@ json server_t::tool_schema(const tool_def_t& tool, bool compact) const
         json t;
         t["name"]        = tool.name;
         t["description"] = tool.description;
-        t["inputSchema"] = input_schema;
+        t["inputSchema"] = *input_schema;
         t["read_only"]   = tool.read_only;
         t["visibility"]  = visibility_name(tool.visibility);
         const std::string domain = infer_tool_domain(tool.name);
@@ -12969,7 +13539,7 @@ json server_t::tool_schema(const tool_def_t& tool, bool compact) const
     json t;
     t["name"]        = tool.name;
     t["description"] = tool.description;
-    t["inputSchema"] = input_schema;
+    t["inputSchema"] = *input_schema;
     t["annotations"] = annotations;
     t["read_only"]   = tool.read_only;
     t["visibility"]  = visibility_name(tool.visibility);
@@ -13256,7 +13826,11 @@ tool_result_t server_t::describe_tools(const json& params)
             result += tool.description + "\n";
         result += std::string("Read-only: ") + (tool.read_only ? "true" : "false") + "\n";
         if (include_schema) {
-            if (tool.params.empty()) {
+            if (!tool.input_schema.is_null()) {
+                result += "Input schema:\n```json\n";
+                result += tool.input_schema.dump(2);
+                result += "\n```\n";
+            } else if (tool.params.empty()) {
                 result += "Parameters: none\n";
             } else {
                 result += "Parameters:\n";
@@ -13384,6 +13958,27 @@ json server_t::handle_tools_call(const json& id, const json& params)
         return make_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
     }
 
+    if (supplied_tool_arguments_are_non_object(params)) {
+        const std::string rejected_tool_name = params["name"].get<std::string>();
+        const tool_result_t validation_failure = non_object_tool_arguments_failure();
+        json err = make_error(id, JSONRPC_INVALID_PARAMS, validation_failure.text);
+        err["error"]["data"] = structured_tool_error(validation_failure);
+        err["error"]["data"]["tool"] = rejected_tool_name;
+        err["error"]["data"]["diagnostic_id"] = diag_id;
+        err["error"]["data"]["request_id"] = request_id;
+        err["error"]["data"]["disposition"] = "not_started";
+        record_tool_audit_event(rejected_tool_name,
+            params["arguments"],
+            "rejected",
+            false,
+            err["error"],
+            validation_failure.text,
+            call_begin,
+            diag_id,
+            request_id);
+        return err;
+    }
+
     const std::string early_name = params["name"].get<std::string>();
     diag::log_tagged_fmt("mcp_srv",
         "handle_tools_call seq=%llu diag_id=%s request_id='%s' tool='%s'",
@@ -13422,8 +14017,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
     }
 
     std::string tool_name = early_name;
-    json arguments = params.contains("arguments") && params["arguments"].is_object()
-                   ? params["arguments"] : json::object();
+    json arguments = params.contains("arguments") ? params["arguments"] : json::object();
     const std::string payload_shape = payload_shape_summary(arguments);
     const std::uint32_t target_pid = target_pid_from_args(arguments);
     const tool_timeout_resolution_t timeout_resolution = resolve_tool_timeout(tool_name, arguments);
@@ -13475,7 +14069,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
         record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "unknown_tool"}}, "Unknown tool: " + tool_name, call_begin, diag_id, request_id);
         return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
     }
-    if (!handler_copy) {
+    if (!handler_copy && !found.workspace_handler) {
         validation_status = "handler_missing";
         diag::log_tagged_fmt("mcp_srv",
             "tool_call_validation_failed seq=%llu diag_id=%s tool='%s' reason=handler_missing",
@@ -13484,6 +14078,28 @@ json server_t::handle_tools_call(const json& id, const json& params)
             tool_name.c_str());
         record_tool_audit_event(tool_name, arguments, "failed", false, json{{"reason", "handler_missing"}}, "Tool has no handler: " + tool_name, call_begin, diag_id, request_id);
         return make_error(id, JSONRPC_INTERNAL_ERROR, "Tool has no handler: " + tool_name);
+    }
+
+    if (!pre_dispatch_validation_active()) {
+        tool_result_t validation_failure;
+        if (!validate_pre_dispatch_tool_input(found, arguments, &validation_failure)) {
+            validation_status = "schema_rejected";
+            diag::log_tagged_fmt("mcp_srv",
+                "tool_call_validation_failed seq=%llu diag_id=%s tool='%s' reason=schema_validation",
+                static_cast<unsigned long long>(seq),
+                diag_id.c_str(),
+                tool_name.c_str());
+            json err = make_error(id,
+                JSONRPC_INVALID_PARAMS,
+                validation_failure.text.empty() ? std::string("Tool input validation failed.") : validation_failure.text);
+            err["error"]["data"] = structured_tool_error(validation_failure);
+            err["error"]["data"]["tool"] = tool_name;
+            err["error"]["data"]["diagnostic_id"] = diag_id;
+            err["error"]["data"]["request_id"] = request_id;
+            err["error"]["data"]["disposition"] = "not_started";
+            record_tool_audit_event(tool_name, arguments, "rejected", false, err["error"], validation_failure.text, call_begin, diag_id, request_id);
+            return err;
+        }
     }
 
     if (is_driver_bridge_dependent_tool(found)) {
@@ -14470,6 +15086,81 @@ json server_t::route_request(const json& msg)
         if (params.contains("arguments"))
             routed_payload_shape = payload_shape_summary(params["arguments"]);
     }
+    if (method == "tools/call" && supplied_tool_arguments_are_non_object(params)) {
+        const json& rejected_arguments = params["arguments"];
+        const tool_result_t validation_failure = non_object_tool_arguments_failure();
+        const std::string validation_request_id = request_id_string(id);
+        const std::string validation_diag_id = "mcp-validation-" + validation_request_id;
+        json err = make_error(id, JSONRPC_INVALID_PARAMS, validation_failure.text);
+        err["error"]["data"] = structured_tool_error(validation_failure);
+        err["error"]["data"]["tool"] = routed_tool_name.empty() ? std::string("<unknown>") : routed_tool_name;
+        err["error"]["data"]["diagnostic_id"] = validation_diag_id;
+        err["error"]["data"]["request_id"] = validation_request_id;
+        err["error"]["data"]["disposition"] = "not_started";
+        record_tool_audit_event(routed_tool_name.empty() ? std::string("<unknown>") : routed_tool_name,
+            rejected_arguments,
+            "rejected",
+            false,
+            err["error"],
+            validation_failure.text,
+            mcp_now_ms(),
+            validation_diag_id,
+            validation_request_id);
+        return is_notification ? json() : err;
+    }
+    bool pre_dispatch_validated_here = false;
+    if (method == "tools/call" && !routed_tool_name.empty() &&
+        !pre_dispatch_validation_active()) {
+        tool_def_t validation_tool;
+        bool validation_tool_found = false;
+        {
+            std::lock_guard<std::mutex> lk(_tools_mtx);
+            for (const auto& tool : _tools) {
+                if (tool.name == routed_tool_name && is_external_mcp_tool(tool)) {
+                    validation_tool = tool;
+                    validation_tool_found = true;
+                    break;
+                }
+            }
+        }
+        if (validation_tool_found && !validation_tool.input_schema.is_null()) {
+            const std::uint64_t validation_gate = standalone_license::inline_gate_check(
+                standalone_license::gate_mcp_tool_exec);
+            if (standalone_license::verify_tool_runtime(
+                    standalone_license::gate_mcp_tool_exec,
+                    validation_gate,
+                    routed_tool_name)) {
+                const json routed_arguments = params.contains("arguments")
+                    ? params["arguments"] : json::object();
+                tool_result_t validation_failure;
+                bool hook_invoked = false;
+                if (!validate_pre_dispatch_tool_input(validation_tool, routed_arguments, &validation_failure, &hook_invoked)) {
+                    const std::string validation_request_id = request_id_string(id);
+                    const std::string validation_diag_id = "mcp-validation-" + validation_request_id;
+                    json err = make_error(id,
+                        JSONRPC_INVALID_PARAMS,
+                        validation_failure.text.empty() ? std::string("Tool input validation failed.") : validation_failure.text);
+                    err["error"]["data"] = structured_tool_error(validation_failure);
+                    err["error"]["data"]["tool"] = routed_tool_name;
+                    err["error"]["data"]["diagnostic_id"] = validation_diag_id;
+                    err["error"]["data"]["request_id"] = validation_request_id;
+                    err["error"]["data"]["disposition"] = "not_started";
+                    record_tool_audit_event(routed_tool_name,
+                        routed_arguments,
+                        "rejected",
+                        false,
+                        err["error"],
+                        validation_failure.text,
+                        mcp_now_ms(),
+                        validation_diag_id,
+                        validation_request_id);
+                    return is_notification ? json() : err;
+                }
+                pre_dispatch_validated_here = hook_invoked;
+            }
+        }
+    }
+    scoped_pre_dispatch_validation_t validation_scope(pre_dispatch_validated_here);
     std::shared_ptr<mcp_reserved_lane_scope_t> route_reserved_lane;
     const bool route_uses_reserved_lane = mcp_reserved_jsonrpc_method(method) || (method == "tools/call" && routed_tool_name == "cancel_command");
     if (route_uses_reserved_lane && !tls_reserved_control_lane) {
@@ -14601,12 +15292,102 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
         state->reservations.resize(batch_size);
         std::atomic<std::size_t> overload_count{0};
         const mcp_route_identity_t batch_identity = tls_route_identity;
-        std::size_t reserved_control_batch_items = 0;
-        for (const auto& item : parsed) {
-            if (mcp_jsonrpc_item_uses_reserved_lane(item))
-                ++reserved_control_batch_items;
+        std::vector<json> batch_prevalidation_errors(batch_size);
+        std::vector<unsigned char> batch_prevalidation_failed(batch_size, 0);
+        std::vector<unsigned char> batch_prevalidated(batch_size, 0);
+        auto reject_batch_prevalidation = [&](std::size_t index,
+                                              const json& item,
+                                              const std::string& tool_name,
+                                              const json& arguments,
+                                              const tool_result_t& validation_failure) {
+            batch_prevalidation_failed[index] = 1;
+            const json item_id = item.contains("id") ? item["id"] : json(nullptr);
+            const std::string validation_request_id = request_id_string(item_id);
+            const std::string validation_diag_id = "mcp-batch-validation-" + std::to_string(batch_id) + "-" + std::to_string(index);
+            json error_data = structured_tool_error(validation_failure);
+            error_data["tool"] = tool_name;
+            error_data["diagnostic_id"] = validation_diag_id;
+            error_data["request_id"] = validation_request_id;
+            error_data["batch_id"] = batch_id;
+            error_data["batch_index"] = index;
+            error_data["disposition"] = "not_started";
+            record_tool_audit_event(tool_name,
+                arguments,
+                "rejected",
+                false,
+                error_data,
+                validation_failure.text,
+                mcp_now_ms(),
+                validation_diag_id,
+                validation_request_id);
+            if (item.contains("id")) {
+                json err = self->make_error(item_id,
+                    JSONRPC_INVALID_PARAMS,
+                    validation_failure.text.empty() ? std::string("Tool input validation failed.") : validation_failure.text);
+                err["error"]["data"] = std::move(error_data);
+                batch_prevalidation_errors[index] = std::move(err);
+            }
+        };
+        for (std::size_t i = 0; i < batch_size; ++i) {
+            const json& item = parsed[i];
+            if (!item.is_object() || item.value("method", std::string()) != "tools/call" ||
+                !item.contains("params") || !item["params"].is_object())
+                continue;
+            const json& call_params = item["params"];
+            if (!call_params.contains("name") || !call_params["name"].is_string())
+                continue;
+            const std::string tool_name = call_params["name"].get<std::string>();
+            if (supplied_tool_arguments_are_non_object(call_params)) {
+                reject_batch_prevalidation(i,
+                    item,
+                    tool_name,
+                    call_params["arguments"],
+                    non_object_tool_arguments_failure());
+                continue;
+            }
+            tool_def_t validation_tool;
+            bool validation_tool_found = false;
+            {
+                std::lock_guard<std::mutex> lk(self->_tools_mtx);
+                for (const auto& tool : self->_tools) {
+                    if (tool.name == tool_name && is_external_mcp_tool(tool)) {
+                        validation_tool = tool;
+                        validation_tool_found = true;
+                        break;
+                    }
+                }
+            }
+            if (!validation_tool_found)
+                continue;
+            if (validation_tool.input_schema.is_null())
+                continue;
+            const std::uint64_t validation_gate = standalone_license::inline_gate_check(
+                standalone_license::gate_mcp_tool_exec);
+            if (!standalone_license::verify_tool_runtime(
+                    standalone_license::gate_mcp_tool_exec,
+                    validation_gate,
+                    tool_name))
+                continue;
+            const json arguments = call_params.contains("arguments") ? call_params["arguments"] : json::object();
+            tool_result_t validation_failure;
+            bool hook_invoked = false;
+            if (validate_pre_dispatch_tool_input(validation_tool, arguments, &validation_failure, &hook_invoked)) {
+                batch_prevalidated[i] = hook_invoked ? 1 : 0;
+                continue;
+            }
+
+            reject_batch_prevalidation(i, item, tool_name, arguments, validation_failure);
         }
-        const std::size_t reservable_batch_items = batch_size > reserved_control_batch_items ? batch_size - reserved_control_batch_items : 0;
+        std::size_t reserved_control_batch_items = 0;
+        std::size_t reservable_batch_items = 0;
+        for (std::size_t i = 0; i < batch_size; ++i) {
+            if (batch_prevalidation_failed[i])
+                continue;
+            if (mcp_jsonrpc_item_uses_reserved_lane(parsed[i]))
+                ++reserved_control_batch_items;
+            else
+                ++reservable_batch_items;
+        }
         mcp_batch_reservation_result_t batch_reservation;
         try {
             batch_reservation = reserve_mcp_batch_children(batch_identity.principal_id, reservable_batch_items);
@@ -14620,6 +15401,11 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
             g_mcp_batch_children_rejected.fetch_add(batch_size, std::memory_order_acq_rel);
             json responses = json::array();
             for (std::size_t i = 0; i < batch_size; ++i) {
+                if (batch_prevalidation_failed[i]) {
+                    if (!batch_prevalidation_errors[i].is_null())
+                        responses.push_back(std::move(batch_prevalidation_errors[i]));
+                    continue;
+                }
                 const json& item = parsed[i];
                 json item_id = item.is_object() && item.contains("id") ? item["id"] : json(nullptr);
                 json err = self->make_error(item_id, -32074, "JSON-RPC batch reservation failed; item was not started.");
@@ -14644,6 +15430,11 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
             g_mcp_batch_children_rejected.fetch_add(batch_size, std::memory_order_acq_rel);
             json responses = json::array();
             for (std::size_t i = 0; i < batch_size; ++i) {
+                if (batch_prevalidation_failed[i]) {
+                    if (!batch_prevalidation_errors[i].is_null())
+                        responses.push_back(std::move(batch_prevalidation_errors[i]));
+                    continue;
+                }
                 const json& item = parsed[i];
                 json item_id = item.is_object() && item.contains("id") ? item["id"] : json(nullptr);
                 json err = self->make_error(item_id, -32074, "JSON-RPC batch reservation failed; item was not started.");
@@ -14773,7 +15564,8 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
         auto execute_item = [self, complete_item, log_batch_reject, make_batch_not_started_error, batch_id, batch_size, batch_identity, batch_start](std::size_t index,
                                                                                                                                        json item,
                                                                                                                                        std::shared_ptr<mcp_batch_child_reservation_t> reservation,
-                                                                                                                                       json capacity_data) {
+                                                                                                                                       json capacity_data,
+                                                                                                                                       bool pre_dispatch_validated) {
             scoped_mcp_route_identity_t route_identity(batch_identity);
             const json item_id = item.is_object() && item.contains("id") ? item["id"] : json(nullptr);
             const std::string item_method = item.is_object() ? item.value("method", std::string()) : std::string("invalid");
@@ -14804,6 +15596,7 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
                 return;
             }
             scoped_mcp_batch_child_admission_t batch_child_admission(batch_id, index, batch_size, reservation);
+            scoped_pre_dispatch_validation_t validation_scope(pre_dispatch_validated);
             try {
                 json response = self->route_request(item);
                 complete_item(index, std::move(response));
@@ -14828,7 +15621,16 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
         auto& executor = mcp_batch_executor();
         std::size_t reservation_cursor = 0;
         for (std::size_t i = 0; i < batch_size; ++i) {
+            if (batch_prevalidation_failed[i]) {
+                const json& rejected_item = parsed[i];
+                const std::string rejected_method = rejected_item.is_object() ? rejected_item.value("method", std::string()) : std::string("invalid");
+                const std::string rejected_tool = rejected_item.is_object() && rejected_item.value("method", std::string()) == "tools/call" && rejected_item.contains("params") && rejected_item["params"].is_object() && rejected_item["params"].contains("name") && rejected_item["params"]["name"].is_string() ? rejected_item["params"]["name"].get<std::string>() : std::string();
+                log_batch_reject("schema_validation", i, rejected_method, rejected_tool, "schema_validation_failed", "pre_dispatch_validation", 0, 0, 0, false);
+                complete_item(i, std::move(batch_prevalidation_errors[i]));
+                continue;
+            }
             json item = parsed[i];
+            const bool item_prevalidated = batch_prevalidated[i] != 0;
             const bool item_reserved_control = mcp_jsonrpc_item_uses_reserved_lane(item);
             auto meta = make_executor_task_meta();
             std::shared_ptr<mcp_batch_child_reservation_t> reservation;
@@ -14978,6 +15780,7 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
                 capacity_diag::scoped_activity_t batch_capacity_activity(batch_capacity_prediction, mcp_now_ms());
                 {
                     scoped_reserved_lane_tls_t reserved_lane_tls(reserved_scope);
+                    scoped_pre_dispatch_validation_t validation_scope(item_prevalidated);
                     try {
                         scoped_mcp_route_identity_t route_identity(batch_identity);
                         json response = self->route_request(item);
@@ -15017,9 +15820,9 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
                 continue;
             }
             log_batch_admit("child_pre_enqueue", i, item_method, item_tool, reservation);
-            if (!executor.enqueue([execute_item, i, item = std::move(item), batch_capacity_prediction, reservation, batch_capacity_data]() mutable {
+            if (!executor.enqueue([execute_item, i, item = std::move(item), batch_capacity_prediction, reservation, batch_capacity_data, item_prevalidated]() mutable {
                 capacity_diag::scoped_activity_t batch_capacity_activity(batch_capacity_prediction, mcp_now_ms());
-                execute_item(i, std::move(item), reservation, std::move(batch_capacity_data));
+                execute_item(i, std::move(item), reservation, std::move(batch_capacity_data), item_prevalidated);
             }, meta)) {
                 reservation->cancel();
                 reservation->release("enqueue_rejected");
@@ -16220,6 +17023,26 @@ void server_t::server_thread_func(int port)
             return;
         }
 
+        tool_result_t validation_failure;
+        if (!validate_pre_dispatch_tool_input(found, arguments, &validation_failure)) {
+            json error = structured_tool_error(validation_failure);
+            error["tool"] = tool_name;
+            error["diagnostic_id"] = api_diag_id;
+            error["request_id"] = api_request_id;
+            error["disposition"] = "not_started";
+            json body = {
+                {"success", false},
+                {"output", sanitize_utf8(validation_failure.text.empty() ? std::string("Tool input validation failed.") : validation_failure.text)},
+                {"error", error}
+            };
+            if (!validation_failure.error_code.empty())
+                body["error_code"] = validation_failure.error_code;
+            record_tool_audit_event(tool_name, arguments, "rejected", false, body, validation_failure.text, api_call_begin, api_diag_id, api_request_id);
+            res.status = 400;
+            res.set_content(json_dump_safe(body, 2), "application/json");
+            return;
+        }
+
         tool_invocation_metrics_t api_metrics;
         api_metrics.lane = predicted_tool_lane(found, arguments);
         const tool_timeout_resolution_t api_timeout_resolution = resolve_tool_timeout(tool_name, arguments);
@@ -17080,162 +17903,50 @@ void server_t::write_client_configs() const
 }
 
 
-target_scope_t::target_scope_t(target_scope_t&& other) noexcept
-    : ok(other.ok),
-      swapped(other.swapped),
-      resolved(other.resolved),
-      prev_active_idx(other.prev_active_idx),
-      target_idx(other.target_idx),
-      resolved_id(std::move(other.resolved_id)),
-      err(std::move(other.err))
-{
-    other.ok = false;
-    other.swapped = false;
-    other.resolved = false;
-    other.prev_active_idx = static_cast<size_t>(-1);
-    other.target_idx = static_cast<size_t>(-1);
-}
-
-target_scope_t& target_scope_t::operator=(target_scope_t&& other) noexcept
-{
-    if (this != &other) {
-        ok = other.ok;
-        swapped = other.swapped;
-        resolved = other.resolved;
-        prev_active_idx = other.prev_active_idx;
-        target_idx = other.target_idx;
-        resolved_id = std::move(other.resolved_id);
-        err = std::move(other.err);
-        other.ok = false;
-        other.swapped = false;
-        other.resolved = false;
-        other.prev_active_idx = static_cast<size_t>(-1);
-        other.target_idx = static_cast<size_t>(-1);
-    }
-    return *this;
-}
-
-target_scope_t::~target_scope_t()
-{
-    if (!ok) return;
-    if (!swapped) return;
-    if (prev_active_idx == static_cast<size_t>(-1)) return;
-    if (prev_active_idx >= analysis_session::session_count()) return;
-    (void)analysis_session::switch_session(prev_active_idx);
-    diag::log_tagged_fmt("mcp_standalone",
-        "target_scope_restore restored_idx=%llu",
-        static_cast<unsigned long long>(prev_active_idx));
-}
-
 target_scope_t resolve_target(const json& args, std::string* out_err)
 {
     target_scope_t scope;
+    const bool explicit_selector = tool_args_select_session_target(args);
+    workspace_resolution_t resolution;
+    if (explicit_selector) {
+        resolution = resolve_workspace_direct(args);
+    } else {
+        resolution.workspace = analysis_session::active_workspace();
+        if (!resolution.workspace)
+            resolution.workspace = aida::analysis::workspace_registry().selected_for_ui();
+        if (!resolution.workspace) {
+            resolution.code = "TARGET_NOT_FOUND";
+            resolution.message = "No active target workspace is available";
+            resolution.details = json{{"ui_selection_changed", false}};
+        }
+    }
+    if (!resolution.workspace) {
+        scope.err = resolution.message.empty()
+            ? std::string("Unable to resolve target workspace")
+            : resolution.message;
+        scope.error_code = resolution.code.empty() ? "TARGET_NOT_FOUND" : resolution.code;
+        scope.error_details = resolution.details;
+        if (out_err)
+            *out_err = scope.err;
+        return scope;
+    }
+
     scope.ok = true;
-    scope.resolved = false;
-
-    if (args.is_null() || !args.is_object()) {
-        return scope;
-    }
-
-    std::string binary_id;
-    if (args.contains("binary_id") && args["binary_id"].is_string()) {
-        binary_id = args["binary_id"].get<std::string>();
-    } else if (args.contains("session_id") && args["session_id"].is_string()) {
-        binary_id = args["session_id"].get<std::string>();
-    }
-
-    std::string file_path;
-    if (binary_id.empty() && args.contains("file_path") && args["file_path"].is_string()) {
-        file_path = args["file_path"].get<std::string>();
-    }
-
-    uint32_t target_pid = 0;
-    if (binary_id.empty() && file_path.empty()) {
-        for (const char* key : {"target_pid", "process_id", "pid"}) {
-            if (!args.contains(key)) continue;
-            const auto& v = args[key];
-            if (v.is_number_unsigned()) {
-                target_pid = static_cast<uint32_t>(v.get<uint64_t>());
-            } else if (v.is_number_integer()) {
-                int64_t s = v.get<int64_t>();
-                if (s > 0) target_pid = static_cast<uint32_t>(s);
-            } else if (v.is_string()) {
-                std::string s = v.get<std::string>();
-                if (!s.empty()) {
-                    try { target_pid = static_cast<uint32_t>(std::stoul(s, nullptr, 0)); }
-                    catch (...) { target_pid = 0; }
-                }
-            }
-            if (target_pid != 0) break;
-        }
-    }
-
-    size_t resolved_idx = static_cast<size_t>(-1);
-    if (!binary_id.empty()) {
-        size_t idx = 0;
-        if (analysis_session::find_session_by_id(binary_id, &idx)) {
-            resolved_idx = idx;
-        } else {
-            scope.ok = false;
-            scope.err = "binary_id '" + binary_id + "' not found in active sessions";
-            if (out_err) *out_err = scope.err;
-            diag::log_tagged_fmt("mcp_standalone",
-                "resolve_target binary_id='%s' not_found", binary_id.c_str());
-            return scope;
-        }
-    } else if (!file_path.empty()) {
-        size_t idx = 0;
-        if (analysis_session::find_session_by_path(file_path, &idx)) {
-            resolved_idx = idx;
-        } else {
-            scope.ok = false;
-            scope.err = "file_path '" + file_path + "' not found in active sessions";
-            if (out_err) *out_err = scope.err;
-            return scope;
-        }
-    } else if (target_pid != 0) {
-        size_t idx = 0;
-        if (analysis_session::find_session_by_pid(target_pid, &idx)) {
-            resolved_idx = idx;
-        }
-    }
-
-    if (resolved_idx == static_cast<size_t>(-1)) {
-        return scope;
-    }
-
-    size_t cur = analysis_session::active_session_idx();
-    scope.prev_active_idx = cur;
-    scope.target_idx = resolved_idx;
     scope.resolved = true;
-
-    auto sum = analysis_session::summarize_session_at(resolved_idx);
-    scope.resolved_id = sum.id;
-
-    if (cur == resolved_idx) {
-        diag::log_tagged_fmt("mcp_standalone",
-            "resolve_target id='%s' idx=%llu already_active",
-            scope.resolved_id.c_str(),
-            static_cast<unsigned long long>(resolved_idx));
-        return scope;
+    scope.workspace = std::move(resolution.workspace);
+    scope.resolved_id = scope.workspace->identity().binary_id().to_hex();
+    const auto sessions = analysis_session::list_session_summaries();
+    for (std::size_t index = 0; index < sessions.size(); ++index) {
+        if (sessions[index].binary_id == scope.resolved_id || sessions[index].id == scope.resolved_id) {
+            scope.target_idx = index;
+            break;
+        }
     }
-
-    if (!analysis_session::switch_session(resolved_idx)) {
-        scope.ok = false;
-        scope.err = std::string("switch_session failed: ") + analysis_session::last_error();
-        if (out_err) *out_err = scope.err;
-        diag::log_tagged_fmt("mcp_standalone",
-            "resolve_target switch_failed target_idx=%llu err='%s'",
-            static_cast<unsigned long long>(resolved_idx), scope.err.c_str());
-        return scope;
-    }
-
-    scope.swapped = true;
     diag::log_tagged_fmt("mcp_standalone",
-        "resolve_target id='%s' resolved_idx=%llu swapped=1 prev_idx=%llu",
+        "resolve_target binary_id='%s' target_idx=%llu explicit_selector=%d ui_selection_changed=0",
         scope.resolved_id.c_str(),
-        static_cast<unsigned long long>(resolved_idx),
-        static_cast<unsigned long long>(cur));
+        static_cast<unsigned long long>(scope.target_idx),
+        explicit_selector ? 1 : 0);
     return scope;
 }
 

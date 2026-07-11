@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -19,13 +20,15 @@
 #include <utility>
 #include <vector>
 
-#include "functions_panel.hpp"
 #include "pe_parser.hpp"
-#include "rename_store.hpp"
 #include "standalone_driver.hpp"
 #include "symbol_classifier.hpp"
 #include "symbol_store.hpp"
 #include "zydis_disasm.hpp"
+#include "../analysis/workspace/live_snapshot_provider.hpp"
+#include "../analysis/workspace/overlay_journal.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
+#include "../session/analysis_session.hpp"
 
 #include "../../helpers/diag_log.hpp"
 #include "../anti-tamper/webhook.hpp"
@@ -62,6 +65,751 @@ namespace function_index {
 		directive_kind_t kind = directive_kind_t::none;
 		uint8_t          value = 0;
 	};
+
+	inline aida::analysis::workspace_result_t<aida::analysis::address_t>
+	normalize_workspace_address(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		using namespace aida::analysis;
+		if (!workspace) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::target_not_found,
+				"Function query requires an explicit workspace",
+				"function_index.address"));
+		}
+		if (address.architecture != architecture_id_t::unknown &&
+			address.architecture != workspace->identity().architecture()) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::unsupported_address_space,
+				"Function query architecture does not match the workspace",
+				"function_index.address"));
+		}
+		auto image = workspace->image();
+		address_t normalized = address;
+		normalized.architecture = workspace->identity().architecture();
+		normalized.mode = image ? image->architecture_mode() : address.mode;
+		if (workspace->target_kind() == target_kind_t::live_snapshot) {
+			const auto& module = workspace->identity().module();
+			if (!module || module->size == 0 ||
+				module->base > UINT64_MAX - module->size) {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::target_stale,
+					"Live function workspace has no valid module range",
+					"function_index.address"));
+			}
+			if (address.space == address_space_id_t::relative_virtual) {
+				if (module->base > UINT64_MAX - address.value ||
+					address.value >= module->size) {
+					return workspace_result_t<address_t>::failure(make_workspace_error(
+						workspace_error_code_t::out_of_range,
+						"Live function RVA is outside the captured module",
+						"function_index.address"));
+				}
+				normalized.value = module->base + address.value;
+			} else if (address.space == address_space_id_t::virtual_address ||
+				address.space == address_space_id_t::live_virtual) {
+				if (address.value < module->base ||
+					address.value - module->base >= module->size) {
+					return workspace_result_t<address_t>::failure(make_workspace_error(
+						workspace_error_code_t::out_of_range,
+						"Live function address is outside the captured module",
+						"function_index.address"));
+				}
+			} else {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::unsupported_address_space,
+					"Live function query requires a virtual address",
+					"function_index.address"));
+			}
+			normalized.space = address_space_id_t::live_virtual;
+			return workspace_result_t<address_t>::success(normalized);
+		}
+		if (!image) {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::malformed_pe,
+				"Static function query requires a normalized image",
+				"function_index.address"));
+		}
+		if (address.space == address_space_id_t::relative_virtual) {
+			if (address.value >= image->image_size()) {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::out_of_range,
+					"Function RVA is outside the normalized image",
+					"function_index.address"));
+			}
+			normalized.space = address_space_id_t::relative_virtual;
+		} else if (address.space == address_space_id_t::file_offset) {
+			auto rva = image->file_offset_to_rva(address.value);
+			if (!rva) return workspace_result_t<address_t>::failure(rva.error());
+			normalized.space = address_space_id_t::relative_virtual;
+			normalized.value = rva.value();
+		} else if (address.space == address_space_id_t::virtual_address) {
+			if (address.value < image->image_base() ||
+				address.value - image->image_base() >= image->image_size()) {
+				return workspace_result_t<address_t>::failure(make_workspace_error(
+					workspace_error_code_t::out_of_range,
+					"Function address is outside the normalized image",
+					"function_index.address"));
+			}
+			normalized.space = address_space_id_t::relative_virtual;
+			normalized.value = address.value - image->image_base();
+		}
+		else {
+			return workspace_result_t<address_t>::failure(make_workspace_error(
+				workspace_error_code_t::unsupported_address_space,
+				"Function query address space is unsupported",
+				"function_index.address"));
+		}
+		return workspace_result_t<address_t>::success(normalized);
+	}
+
+	inline uint64_t workspace_display_address(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		using namespace aida::analysis;
+		if (!workspace) return 0;
+		if (address.space == address_space_id_t::virtual_address ||
+			address.space == address_space_id_t::live_virtual)
+			return address.value;
+		const auto image = workspace->image();
+		if (!image) return 0;
+		uint64_t rva = 0;
+		if (address.space == address_space_id_t::relative_virtual) {
+			rva = address.value;
+		} else if (address.space == address_space_id_t::file_offset) {
+			auto translated = image->file_offset_to_rva(address.value);
+			if (!translated) return 0;
+			rva = translated.value();
+		} else {
+			return 0;
+		}
+		if (rva >= image->image_size() || image->image_base() > UINT64_MAX - rva)
+			return 0;
+		return image->image_base() + rva;
+	}
+
+	inline aida::analysis::architecture_mode_t workspace_architecture_mode(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+	{
+		if (!workspace) return aida::analysis::architecture_mode_t::unknown;
+		if (const auto image = workspace->image()) return image->architecture_mode();
+		switch (workspace->identity().architecture()) {
+		case aida::analysis::architecture_id_t::x86:
+			return aida::analysis::architecture_mode_t::x86_32;
+		case aida::analysis::architecture_id_t::x86_64:
+			return aida::analysis::architecture_mode_t::x86_64;
+		default:
+			return aida::analysis::architecture_mode_t::unknown;
+		}
+	}
+
+	struct workspace_name_snapshot_t {
+		std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+		std::shared_ptr<const aida::analysis::analysis_publication_t> publication;
+		std::shared_ptr<symbol_store::workspace_state_t> debug_symbols;
+		std::vector<std::pair<aida::analysis::address_t, std::string>> overlay_names;
+	};
+
+	inline workspace_name_snapshot_t workspace_name_snapshot(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+	{
+		using namespace aida::analysis;
+		workspace_name_snapshot_t output;
+		output.workspace = workspace;
+		if (!workspace) return output;
+		output.publication = workspace->analysis_publication();
+		if (output.publication &&
+			(output.publication->binary_id != workspace->identity().binary_id() ||
+			 output.publication->generation != workspace->generation()))
+			output.publication.reset();
+		output.debug_symbols = analysis_session::symbols_for_workspace(workspace);
+		if (auto overlay = workspace->overlay()) {
+			const auto snapshot = overlay->snapshot();
+			if (snapshot.revision == workspace->overlay_revision()) {
+				output.overlay_names.reserve(snapshot.items.size());
+				for (const auto& item : snapshot.items) {
+					const auto& operation = item.second;
+					if (operation.kind != overlay_operation_kind_t::name ||
+						operation.name.empty())
+						continue;
+					auto normalized = normalize_workspace_address(workspace,
+						operation.address);
+					if (!normalized) continue;
+					output.overlay_names.emplace_back(normalized.take_value(),
+						operation.name);
+				}
+				std::sort(output.overlay_names.begin(), output.overlay_names.end(),
+					[](const auto& left, const auto& right) {
+						if (left.first != right.first) return left.first < right.first;
+						return left.second < right.second;
+					});
+				output.overlay_names.erase(std::unique(output.overlay_names.begin(),
+					output.overlay_names.end(), [](const auto& left, const auto& right) {
+						return left.first == right.first;
+					}), output.overlay_names.end());
+			}
+		}
+		return output;
+	}
+
+	inline std::string resolve_workspace_name_exact(
+		const workspace_name_snapshot_t& names,
+		const aida::analysis::address_t& address)
+	{
+		auto normalized = normalize_workspace_address(names.workspace, address);
+		if (!normalized) return {};
+		auto overlay = std::lower_bound(names.overlay_names.begin(),
+			names.overlay_names.end(), normalized.value(),
+			[](const auto& item, const auto& value) { return item.first < value; });
+		if (overlay != names.overlay_names.end() &&
+			overlay->first == normalized.value())
+			return overlay->second;
+		if (names.debug_symbols) {
+			const uint64_t display = workspace_display_address(names.workspace,
+				normalized.value());
+			if (display != 0) {
+				auto query = normalized.value();
+				query.space = names.workspace->target_kind() ==
+					aida::analysis::target_kind_t::live_snapshot
+					? aida::analysis::address_space_id_t::live_virtual
+					: aida::analysis::address_space_id_t::virtual_address;
+				query.value = display;
+				auto resolved = names.debug_symbols->resolve_exact(query);
+				if (!resolved.empty()) return resolved;
+			}
+		}
+		if (names.publication && names.publication->snapshot &&
+			names.publication->generation == names.workspace->generation()) {
+			for (const auto& symbol : names.publication->snapshot->symbols) {
+				if (symbol.address.space == normalized.value().space &&
+					symbol.address.value == normalized.value().value &&
+					!symbol.name.empty())
+					return symbol.name;
+			}
+		}
+		return {};
+	}
+
+	inline std::string resolve_workspace_name_nearest(
+		const workspace_name_snapshot_t& names,
+		const aida::analysis::address_t& address,
+		uint64_t maximum_distance = 0x10000)
+	{
+		auto exact = resolve_workspace_name_exact(names, address);
+		if (!exact.empty()) return exact;
+		auto normalized = normalize_workspace_address(names.workspace, address);
+		if (!normalized) return {};
+		auto overlay = std::upper_bound(names.overlay_names.begin(),
+			names.overlay_names.end(), normalized.value(),
+			[](const auto& value, const auto& item) { return value < item.first; });
+		if (overlay != names.overlay_names.begin()) {
+			--overlay;
+			if (overlay->first.space == normalized.value().space &&
+				overlay->first.value <= normalized.value().value) {
+				const uint64_t distance = normalized.value().value - overlay->first.value;
+				if (distance < maximum_distance) {
+					if (distance == 0) return overlay->second;
+					char suffix[32]{};
+					std::snprintf(suffix, sizeof(suffix), "+0x%llX",
+						static_cast<unsigned long long>(distance));
+					if (overlay->second.size() <= (1u << 20) - std::strlen(suffix))
+						return overlay->second + suffix;
+				}
+			}
+		}
+		if (!names.debug_symbols) return {};
+		const uint64_t display = workspace_display_address(names.workspace,
+			normalized.value());
+		if (display == 0) return {};
+		auto query = normalized.value();
+		query.space = names.workspace->target_kind() ==
+			aida::analysis::target_kind_t::live_snapshot
+			? aida::analysis::address_space_id_t::live_virtual
+			: aida::analysis::address_space_id_t::virtual_address;
+		query.value = display;
+		return names.debug_symbols->resolve_nearest(query, maximum_distance);
+	}
+
+	inline std::string synthetic_name(
+		const workspace_name_snapshot_t& names,
+		const aida::analysis::address_t& address)
+	{
+		auto normalized = normalize_workspace_address(names.workspace, address);
+		if (!normalized) return {};
+		auto resolved = resolve_workspace_name_exact(names, normalized.value());
+		if (!resolved.empty()) return resolved;
+		char text[32]{};
+		const uint64_t display = workspace_display_address(names.workspace,
+			normalized.value());
+		std::snprintf(text, sizeof(text), "sub_%llX",
+			static_cast<unsigned long long>(display != 0
+				? display : normalized.value().value));
+		return text;
+	}
+
+	inline std::shared_ptr<aida::analysis::analysis_workspace_t>
+	legacy_live_workspace()
+	{
+		const uint32_t pid = driver_bridge::attached_pid();
+		return pid == 0 ? nullptr : aida::analysis::workspace_registry().find_by_pid(pid);
+	}
+
+	inline std::string resolve_live_debugger_name_exact(uint64_t address)
+	{
+		auto workspace = legacy_live_workspace();
+		if (workspace) {
+			aida::analysis::address_t query;
+			query.space = aida::analysis::address_space_id_t::live_virtual;
+			query.value = address;
+			query.architecture = workspace->identity().architecture();
+			query.mode = workspace_architecture_mode(workspace);
+			auto names = workspace_name_snapshot(workspace);
+			auto resolved = resolve_workspace_name_exact(names, query);
+			if (!resolved.empty()) return resolved;
+		}
+		return driver_bridge::attached_pid() == 0
+			? std::string() : symbol_store::resolve_symbol_exact(address);
+	}
+
+	inline std::string resolve_live_debugger_name_nearest(uint64_t address)
+	{
+		auto workspace = legacy_live_workspace();
+		if (workspace) {
+			aida::analysis::address_t query;
+			query.space = aida::analysis::address_space_id_t::live_virtual;
+			query.value = address;
+			query.architecture = workspace->identity().architecture();
+			query.mode = workspace_architecture_mode(workspace);
+			auto names = workspace_name_snapshot(workspace);
+			auto resolved = resolve_workspace_name_nearest(names, query);
+			if (!resolved.empty()) return resolved;
+		}
+		return driver_bridge::attached_pid() == 0
+			? std::string() : symbol_store::resolve_symbol(address);
+	}
+
+	inline std::optional<symbol_store::module_symbols_t>
+	legacy_live_module_symbols(const std::string& module_name)
+	{
+		auto workspace = legacy_live_workspace();
+		if (workspace) {
+			auto symbols = analysis_session::symbols_for_workspace(workspace);
+			if (symbols) return symbols->module_snapshot(module_name);
+		}
+		if (driver_bridge::attached_pid() == 0) return std::nullopt;
+		std::lock_guard<std::mutex> lock(symbol_store::g_state.mutex);
+		auto found = symbol_store::g_state.modules.find(module_name);
+		if (found == symbol_store::g_state.modules.end() ||
+			found->second.pdb.symbols.size() > 4 * 1024 * 1024)
+			return std::nullopt;
+		return found->second;
+	}
+
+	inline aida::analysis::workspace_result_t<
+		std::vector<aida::analysis::function_record_t>>
+	workspace_functions(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		size_t offset = 0, size_t count = 1000)
+	{
+		using namespace aida::analysis;
+		if (!workspace) {
+			return workspace_result_t<std::vector<function_record_t>>::failure(
+				make_workspace_error(workspace_error_code_t::target_not_found,
+					"Function query requires an explicit workspace",
+					"function_index.snapshot"));
+		}
+		if (workspace->target_kind() == target_kind_t::live_snapshot) {
+			return workspace_result_t<std::vector<function_record_t>>::failure(
+				make_workspace_error(
+					workspace_error_code_t::live_target_bulk_analysis_unsupported,
+					"A live target has no whole-module function index",
+					"function_index.snapshot"));
+		}
+		if (count > 100000) {
+			return workspace_result_t<std::vector<function_record_t>>::failure(
+				make_workspace_error(workspace_error_code_t::limit_exceeded,
+					"Function page exceeds 100000 records",
+					"function_index.snapshot"));
+		}
+		auto publication = workspace->analysis_publication();
+		if (!publication || !publication->snapshot) {
+			return workspace_result_t<std::vector<function_record_t>>::failure(
+				make_workspace_error(workspace_error_code_t::analysis_in_progress,
+					"Function index is not published yet",
+					"function_index.snapshot"));
+		}
+		const auto& source = publication->snapshot->functions;
+		if (offset > source.size()) offset = source.size();
+		const size_t available = source.size() - offset;
+		const size_t take = (std::min)(available, count);
+		std::vector<function_record_t> result;
+		result.reserve(take);
+		result.insert(result.end(), source.begin() + static_cast<std::ptrdiff_t>(offset),
+			source.begin() + static_cast<std::ptrdiff_t>(offset + take));
+		return workspace_result_t<std::vector<function_record_t>>::success(
+			std::move(result));
+	}
+
+	inline aida::analysis::workspace_result_t<aida::analysis::function_record_t>
+	workspace_function_for(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		using namespace aida::analysis;
+		auto normalized = normalize_workspace_address(workspace, address);
+		if (!normalized)
+			return workspace_result_t<function_record_t>::failure(normalized.error());
+		auto snapshot = workspace->snapshot();
+		if (!snapshot) {
+			return workspace_result_t<function_record_t>::failure(make_workspace_error(
+				workspace_error_code_t::analysis_in_progress,
+				"Function index is not published yet", "function_index.lookup"));
+		}
+		for (const auto& function : snapshot->functions) {
+			if (function.start.space != normalized.value().space) continue;
+			if (normalized.value().value >= function.start.value &&
+				normalized.value().value < function.end.value)
+				return workspace_result_t<function_record_t>::success(function);
+		}
+		auto error = make_workspace_error(workspace_error_code_t::target_not_found,
+			"Address is not inside a published function", "function_index.lookup");
+		error.address = normalized.value();
+		return workspace_result_t<function_record_t>::failure(std::move(error));
+	}
+
+	inline std::string synthetic_name(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		auto normalized = normalize_workspace_address(workspace, address);
+		if (!normalized) return {};
+		auto names = workspace_name_snapshot(workspace);
+		return synthetic_name(names, normalized.value());
+	}
+
+	inline bool func_extent(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address,
+		aida::analysis::address_t* out_start,
+		aida::analysis::address_t* out_end)
+	{
+		auto function = workspace_function_for(workspace, address);
+		if (!function) return false;
+		if (out_start) *out_start = function.value().start;
+		if (out_end) *out_end = function.value().end;
+		return true;
+	}
+
+	struct live_function_capture_t {
+		std::shared_ptr<const aida::analysis::live_snapshot_provider_t> provider;
+		std::shared_ptr<const aida::analysis::analysis_snapshot_t> snapshot;
+		aida::analysis::address_t requested;
+		aida::analysis::address_t function_start;
+		aida::analysis::address_t function_end;
+		aida::analysis::live_snapshot_metadata_t metadata;
+		aida::analysis::fact_provenance_t provenance =
+			aida::analysis::fact_provenance_t::unknown;
+		uint64_t provider_origin_va = 0;
+		uint8_t confidence = 0;
+	};
+
+	inline aida::analysis::workspace_result_t<live_function_capture_t>
+	capture_live_function_range(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& requested,
+		const aida::analysis::address_t& function_start,
+		const aida::analysis::address_t& function_end,
+		aida::analysis::fact_provenance_t provenance,
+		uint8_t confidence,
+		uint64_t maximum_capture_size = 64ULL * 1024ULL * 1024ULL,
+		const aida::analysis::cancellation_token_t& cancel = {})
+	{
+		using namespace aida::analysis;
+		auto fail = [](workspace_error_code_t code, std::string message) {
+			auto error = make_workspace_error(code, std::move(message),
+				"function_index.live_capture");
+			error.cancellation = code == workspace_error_code_t::cancelled;
+			error.deadline = code == workspace_error_code_t::deadline_exceeded;
+			return workspace_result_t<live_function_capture_t>::failure(
+				std::move(error));
+		};
+		if (!workspace || workspace->target_kind() != target_kind_t::live_snapshot)
+			return fail(workspace_error_code_t::invalid_argument,
+				"Live function capture requires an explicit live workspace");
+		if (workspace->closing() || workspace->closed())
+			return fail(workspace_error_code_t::workspace_closing,
+				"Live function workspace is closing");
+		if (workspace->cancellation_token().stop_requested())
+			return fail(workspace_error_code_t::cancelled,
+				"Live function workspace cancellation was requested");
+		const auto captured_binary_id = workspace->identity().binary_id();
+		const uint64_t captured_generation = workspace->generation();
+		const uint64_t captured_analysis_revision = workspace->analysis_revision();
+		const uint64_t captured_overlay_revision = workspace->overlay_revision();
+		if (cancel.stop_requested()) {
+			auto error = make_workspace_error(
+				cancel.deadline_exceeded()
+					? workspace_error_code_t::deadline_exceeded
+					: workspace_error_code_t::cancelled,
+				cancel.deadline_exceeded()
+					? "Live function capture deadline expired"
+					: "Live function capture was cancelled",
+				"function_index.live_capture");
+			error.deadline = cancel.deadline_exceeded();
+			error.cancellation = !error.deadline;
+			return workspace_result_t<live_function_capture_t>::failure(
+				std::move(error));
+		}
+		auto normalized_requested = normalize_workspace_address(workspace, requested);
+		auto normalized_start = normalize_workspace_address(workspace, function_start);
+		auto normalized_end = normalize_workspace_address(workspace, function_end);
+		if (!normalized_requested)
+			return workspace_result_t<live_function_capture_t>::failure(
+				normalized_requested.error());
+		if (!normalized_start)
+			return workspace_result_t<live_function_capture_t>::failure(
+				normalized_start.error());
+		if (!normalized_end)
+			return workspace_result_t<live_function_capture_t>::failure(
+				normalized_end.error());
+		if (normalized_end.value().value <= normalized_start.value().value ||
+			normalized_requested.value().value < normalized_start.value().value ||
+			normalized_requested.value().value >= normalized_end.value().value) {
+			return fail(workspace_error_code_t::out_of_range,
+				"Requested address is outside the proven live function range");
+		}
+		constexpr uint64_t kHardMaximumCapture = 64ULL * 1024ULL * 1024ULL;
+		if (maximum_capture_size == 0 || maximum_capture_size > kHardMaximumCapture)
+			return fail(workspace_error_code_t::limit_exceeded,
+				"Live function capture budget is invalid");
+		const uint64_t capture_size = normalized_end.value().value -
+			normalized_start.value().value;
+		if (capture_size == 0 || capture_size > maximum_capture_size)
+			return fail(workspace_error_code_t::limit_exceeded,
+				"Live function range exceeds the capture budget");
+		auto original = std::dynamic_pointer_cast<const live_snapshot_provider_t>(
+			workspace->provider_handle());
+		if (!original)
+			return fail(workspace_error_code_t::provider_unavailable,
+				"Live workspace has no immutable driver snapshot provider");
+		auto current_identity = original->validate_current_identity();
+		if (!current_identity)
+			return workspace_result_t<live_function_capture_t>::failure(
+				current_identity.error());
+		const auto original_metadata = original->metadata();
+		if (original_metadata.process.pid == GetCurrentProcessId())
+			return fail(workspace_error_code_t::self_target_refused,
+				"AiDA cannot capture its own process");
+		if (!workspace->identity().process() || !workspace->identity().module() ||
+			!(original_metadata.process == *workspace->identity().process()) ||
+			!(original_metadata.module == *workspace->identity().module()))
+			return fail(workspace_error_code_t::integrity_failure,
+				"Live snapshot identity does not match its workspace");
+		live_snapshot_request_t request;
+		request.pid = original_metadata.process.pid;
+		request.module_base = original_metadata.module.base;
+		request.module_size = original_metadata.module.size;
+		request.module_name = original_metadata.module.normalized_name;
+		request.module_path = original_metadata.module.normalized_path;
+		request.capture_address = normalized_start.value();
+		request.capture_size = capture_size;
+		request.maximum_capture_size = maximum_capture_size;
+		auto captured = live_snapshot_provider_t::capture(request, cancel);
+		if (!captured)
+			return workspace_result_t<live_function_capture_t>::failure(
+				captured.error());
+		auto original_still_current = original->validate_current_identity();
+		if (!original_still_current)
+			return workspace_result_t<live_function_capture_t>::failure(
+				original_still_current.error());
+		const auto captured_metadata = captured.value()->metadata();
+		if (!(captured_metadata.process == original_metadata.process) ||
+			!(captured_metadata.module == original_metadata.module)) {
+			return fail(workspace_error_code_t::target_stale,
+				"Live process or module identity changed during function capture");
+		}
+		if (workspace->closing() || workspace->closed() ||
+			workspace->cancellation_token().stop_requested())
+			return fail(workspace_error_code_t::cancelled,
+				"Live function workspace was cancelled during capture");
+		if (workspace->identity().binary_id() != captured_binary_id ||
+			workspace->generation() != captured_generation)
+			return fail(workspace_error_code_t::stale_generation,
+				"Live function workspace generation changed during capture");
+		if (workspace->analysis_revision() != captured_analysis_revision ||
+			workspace->overlay_revision() != captured_overlay_revision)
+			return fail(workspace_error_code_t::revision_conflict,
+				"Live function workspace revision changed during capture");
+		auto ephemeral = std::make_shared<analysis_snapshot_t>();
+		ephemeral->generation = captured_generation;
+		ephemeral->analysis_revision = captured_analysis_revision;
+		ephemeral->overlay_revision = captured_overlay_revision;
+		ephemeral->baseline_complete = false;
+		function_record_t function;
+		function.id = normalized_start.value().value == 0
+			? 1 : normalized_start.value().value;
+		function.start = normalized_start.value();
+		function.end = normalized_end.value();
+		function.provenance = provenance;
+		function.confidence = confidence;
+		ephemeral->functions.push_back(function);
+		live_function_capture_t result;
+		result.provider = captured.take_value();
+		result.snapshot = std::move(ephemeral);
+		result.requested = normalized_requested.take_value();
+		result.function_start = normalized_start.take_value();
+		result.function_end = normalized_end.take_value();
+		result.metadata = result.provider->metadata();
+		result.provenance = provenance;
+		result.provider_origin_va = result.function_start.value;
+		result.confidence = confidence;
+		return workspace_result_t<live_function_capture_t>::success(
+			std::move(result));
+	}
+
+	inline aida::analysis::workspace_result_t<live_function_capture_t>
+	capture_live_function_from_unwind(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& requested,
+		uint64_t maximum_capture_size = 64ULL * 1024ULL * 1024ULL,
+		const aida::analysis::cancellation_token_t& cancel = {})
+	{
+		using namespace aida::analysis;
+		if (!workspace || workspace->target_kind() != target_kind_t::live_snapshot) {
+			return workspace_result_t<live_function_capture_t>::failure(
+				make_workspace_error(workspace_error_code_t::invalid_argument,
+					"Unwind-backed capture requires an explicit live workspace",
+					"function_index.live_unwind"));
+		}
+		if (workspace->identity().architecture() != architecture_id_t::x86_64) {
+			return workspace_result_t<live_function_capture_t>::failure(
+				make_workspace_error(workspace_error_code_t::unsupported_pe_arch,
+					"Unwind-backed live capture currently requires x86-64 PE metadata",
+					"function_index.live_unwind"));
+		}
+		auto normalized = normalize_workspace_address(workspace, requested);
+		if (!normalized)
+			return workspace_result_t<live_function_capture_t>::failure(
+				normalized.error());
+		auto original = std::dynamic_pointer_cast<const live_snapshot_provider_t>(
+			workspace->provider_handle());
+		if (!original) {
+			return workspace_result_t<live_function_capture_t>::failure(
+				make_workspace_error(workspace_error_code_t::provider_unavailable,
+					"Live workspace has no immutable header snapshot",
+					"function_index.live_unwind"));
+		}
+		auto identity = original->validate_current_identity();
+		if (!identity)
+			return workspace_result_t<live_function_capture_t>::failure(
+				identity.error());
+		const auto metadata = original->metadata();
+		pe_parser::parse_options_t options;
+		options.include_imports_exports = false;
+		auto deadline = cancel.deadline();
+		if (deadline) options.deadline = &*deadline;
+		pe_parser::pe_info_t pe;
+		if (!pe_parser::parse_live(metadata.process.pid, metadata.module.base,
+			pe, options)) {
+			return workspace_result_t<live_function_capture_t>::failure(
+				make_workspace_error(cancel.stop_requested()
+						? (cancel.deadline_exceeded()
+							? workspace_error_code_t::deadline_exceeded
+							: workspace_error_code_t::cancelled)
+						: workspace_error_code_t::malformed_pe,
+					cancel.stop_requested()
+						? "Live unwind lookup was cancelled"
+						: "Live PE metadata could not be parsed",
+					"function_index.live_unwind"));
+		}
+		auto runtime = pe_parser::find_live_runtime_function(
+			metadata.process.pid, metadata.module.base, pe,
+			normalized.value().value, cancel);
+		if (!runtime)
+			return workspace_result_t<live_function_capture_t>::failure(
+				runtime.error());
+		if (!runtime.value()) {
+			return workspace_result_t<live_function_capture_t>::failure(
+				make_workspace_error(workspace_error_code_t::decode_failure,
+					"FUNCTION_BOUNDS_UNCERTAIN: no unwind function contains the requested address",
+					"function_index.live_unwind"));
+		}
+		uint64_t start_va = 0;
+		uint64_t end_va = 0;
+		if (metadata.module.base > UINT64_MAX - runtime.value()->begin_rva ||
+			metadata.module.base > UINT64_MAX - runtime.value()->end_rva) {
+			return workspace_result_t<live_function_capture_t>::failure(
+				make_workspace_error(workspace_error_code_t::range_overflow,
+					"Unwind function virtual range overflowed",
+					"function_index.live_unwind"));
+		}
+		start_va = metadata.module.base + runtime.value()->begin_rva;
+		end_va = metadata.module.base + runtime.value()->end_rva;
+		address_t start{address_space_id_t::live_virtual, start_va,
+			architecture_id_t::x86_64, architecture_mode_t::x86_64};
+		address_t end{address_space_id_t::live_virtual, end_va,
+			architecture_id_t::x86_64, architecture_mode_t::x86_64};
+		return capture_live_function_range(workspace, normalized.value(), start,
+			end, fact_provenance_t::unwind_metadata, 255,
+			maximum_capture_size, cancel);
+	}
+
+	inline std::vector<aida::analysis::address_t> call_targets_for(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		std::vector<aida::analysis::address_t> targets;
+		auto function = workspace_function_for(workspace, address);
+		auto snapshot = workspace ? workspace->snapshot() : nullptr;
+		if (!function || !snapshot) return targets;
+		for (const auto& edge : snapshot->edges) {
+			if (edge.kind != aida::analysis::edge_kind_t::call &&
+				edge.kind != aida::analysis::edge_kind_t::tail_call)
+				continue;
+			if (edge.source.space != function.value().start.space ||
+				edge.source.value < function.value().start.value ||
+				edge.source.value >= function.value().end.value)
+				continue;
+			targets.push_back(edge.target);
+		}
+		std::sort(targets.begin(), targets.end());
+		targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+		return targets;
+	}
+
+	inline std::string iat_symbol_at(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		auto normalized = normalize_workspace_address(workspace, address);
+		auto image = workspace ? workspace->image() : nullptr;
+		if (!normalized || !image) return {};
+		for (const auto& entry : image->imports()) {
+			if (normalized.value().space != aida::analysis::address_space_id_t::relative_virtual ||
+				entry.iat_rva != normalized.value().value) continue;
+			if (entry.name) return *entry.name;
+			if (entry.ordinal) return "Ordinal#" + std::to_string(*entry.ordinal);
+		}
+		return {};
+	}
+
+	inline std::string data_symbol_at(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		auto normalized = normalize_workspace_address(workspace, address);
+		auto snapshot = workspace ? workspace->snapshot() : nullptr;
+		if (!normalized || !snapshot) return {};
+		for (const auto& symbol : snapshot->symbols) {
+			if (symbol.address.space == normalized.value().space &&
+				symbol.address.value == normalized.value().value &&
+				symbol.kind != aida::analysis::symbol_kind_t::function)
+				return symbol.name;
+		}
+		return {};
+	}
 
 	namespace detail {
 
@@ -192,11 +940,6 @@ namespace function_index {
 			uint16_t                                                       cached_characteristics = 0;
 			std::atomic<uint32_t>                                          bounds_state{static_cast<uint32_t>(bounds_state_t::idle)};
 			std::atomic<uint64_t>                                          built_seq{0};
-			std::shared_ptr<functions_panel::detail::disk_pe_view_t>       static_pe_cached_view;
-			std::string                                                    static_pe_cached_path;
-			std::atomic<uint32_t>                                          static_bulk_pending{0};
-			std::atomic<uint64_t>                                          static_bulk_last_progress_ns{0};
-			std::atomic<bool>                                              deep_static_requested{false};
 		};
 
 		inline std::mutex& holder_swap_mtx() {
@@ -209,61 +952,11 @@ namespace function_index {
 			return h;
 		}
 
-		inline std::atomic<uint64_t>& cache_holder_generation() {
-			static std::atomic<uint64_t> g{1};
-			return g;
-		}
-
-		inline std::vector<std::shared_ptr<cache_t>>& retired_cache_snapshots() {
-			static std::vector<std::shared_ptr<cache_t>> snapshots;
-			return snapshots;
-		}
-
-		inline void retain_cache_snapshot_locked(const std::shared_ptr<cache_t>& snap) {
-			if (snap) retired_cache_snapshots().push_back(snap);
-		}
-
-		inline std::atomic<uint64_t>& cache_lifecycle_log_counter() {
-			static std::atomic<uint64_t> n{0};
-			return n;
-		}
-
-		inline bool should_log_cache_lifecycle() {
-			uint64_t n = cache_lifecycle_log_counter().fetch_add(1, std::memory_order_relaxed) + 1;
-			return n <= 64 || (n % 65536) == 0;
-		}
-
-		inline std::shared_ptr<cache_t> active_cache_snapshot() {
-			std::lock_guard<std::mutex> lk(holder_swap_mtx());
-			auto& holder = cache_holder_sp();
-			if (should_log_cache_lifecycle()) {
-				diag::log_tagged_critical_fmt("fn_index_cache",
-					"active_cache_snapshot pre_copy tid=%lu holder_raw=%p",
-					static_cast<unsigned long>(GetCurrentThreadId()), holder.get());
-			}
-			auto snap = holder;
-			if (should_log_cache_lifecycle()) {
-				diag::log_tagged_critical_fmt("fn_index_cache",
-					"active_cache_snapshot post_copy tid=%lu snap_raw=%p",
-					static_cast<unsigned long>(GetCurrentThreadId()), snap.get());
-			}
-			return snap;
-		}
-
 		inline cache_t& cache() {
 			std::lock_guard<std::mutex> lk(holder_swap_mtx());
 			auto& holder = cache_holder_sp();
 			if (!holder) {
 				holder = std::make_shared<cache_t>();
-				cache_holder_generation().fetch_add(1, std::memory_order_acq_rel);
-			}
-			if (should_log_cache_lifecycle()) {
-				diag::log_tagged_critical_fmt("fn_index_cache",
-					"cache access tid=%lu gen=%llu active_raw=%p retired=%zu",
-					static_cast<unsigned long>(GetCurrentThreadId()),
-					static_cast<unsigned long long>(cache_holder_generation().load(std::memory_order_acquire)),
-					holder.get(),
-					retired_cache_snapshots().size());
 			}
 			return *holder;
 		}
@@ -312,9 +1005,7 @@ namespace function_index {
 		}
 
 		inline std::string resolve_display_name(uint64_t addr) {
-			std::string rn = rename_store::get(addr);
-			if (!rn.empty()) return rn;
-			std::string sym = symbol_store::resolve_symbol_exact(addr);
+			std::string sym = resolve_live_debugger_name_exact(addr);
 			if (!sym.empty()) return strip_module_prefix(sym);
 			return make_synthetic_sub(addr);
 		}
@@ -488,38 +1179,56 @@ namespace function_index {
 		}
 
 		inline bool static_pe_active() {
-			if (!g_disasm.file.loaded) return false;
-			if (g_disasm.file.path.empty()) return false;
-			if (g_disasm.file.path.compare(0, 7, "live://") == 0) return false;
-			if (g_disasm.file.image_base == 0) return false;
-			return true;
-		}
-
-		inline bool fetch_static_module(uint64_t& out_base, uint32_t& out_size,
-			std::string& out_name)
-		{
-			if (!static_pe_active()) return false;
-			uint64_t img_sz = static_analysis::total_image_size(g_disasm.file);
-			if (img_sz == 0) return false;
-			if (img_sz > 0xFFFFFFFFull) img_sz = 0xFFFFFFFFull;
-			out_base = g_disasm.file.image_base;
-			out_size = static_cast<uint32_t>(img_sz);
-			out_name = g_disasm.file.filename.empty()
-				? g_disasm.file.path
-				: g_disasm.file.filename;
-			return true;
+			auto workspace = aida::analysis::workspace_registry().selected_for_ui();
+			return workspace &&
+				workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
+				workspace->image() && !workspace->closing() && !workspace->closed();
 		}
 
 		inline bool read_routed_bytes(uint64_t va, size_t len, std::vector<uint8_t>& out) {
-			if (driver_bridge::attached_pid() != 0) {
-				if (driver_bridge::read_memory(va, len, out) && !out.empty()) return true;
-				if (g_disasm.file.loaded && !g_disasm.file.sections.empty()) {
-					return static_analysis::read_bytes_from_pe(g_disasm.file, va, len, out);
-				}
+			out.clear();
+			if (driver_bridge::attached_pid() == 0 || len == 0 || len > 64 * 1024 * 1024)
 				return false;
+			return driver_bridge::read_memory(va, len, out) && out.size() == len;
+		}
+
+		inline bool read_live_runtime_function_table(uint64_t module_base,
+			const pe_parser::pe_info_t& pe, std::vector<uint64_t>& starts,
+			std::vector<uint32_t>& sizes)
+		{
+			starts.clear();
+			sizes.clear();
+			if (!pe.is_64bit || pe.exception_dir_rva == 0 ||
+				pe.exception_dir_size == 0)
+				return true;
+			constexpr uint32_t kEntrySize = 12;
+			constexpr uint64_t kMaximumEntries = 4ULL * 1024ULL * 1024ULL;
+			if (pe.exception_dir_size % kEntrySize != 0 ||
+				pe.exception_dir_rva >= pe.size_of_image ||
+				pe.exception_dir_size > pe.size_of_image - pe.exception_dir_rva)
+				return false;
+			const uint64_t count = pe.exception_dir_size / kEntrySize;
+			if (count == 0 || count > kMaximumEntries ||
+				module_base > UINT64_MAX - pe.exception_dir_rva)
+				return false;
+			std::vector<uint8_t> table;
+			if (!read_routed_bytes(module_base + pe.exception_dir_rva,
+				pe.exception_dir_size, table))
+				return false;
+			starts.reserve(static_cast<size_t>(count));
+			sizes.reserve(static_cast<size_t>(count));
+			for (uint64_t index = 0; index < count; ++index) {
+				uint32_t begin = 0;
+				uint32_t end = 0;
+				std::memcpy(&begin, table.data() + index * kEntrySize, sizeof(begin));
+				std::memcpy(&end, table.data() + index * kEntrySize + 4, sizeof(end));
+				if (begin >= end || end > pe.size_of_image ||
+					module_base > UINT64_MAX - begin)
+					return false;
+				starts.push_back(module_base + begin);
+				sizes.push_back(end - begin);
 			}
-			if (!g_disasm.file.loaded) return false;
-			return static_analysis::read_bytes_from_pe(g_disasm.file, va, len, out);
+			return true;
 		}
 
 		inline std::string section_name_for_va(const pe_parser::pe_info_t& pe,
@@ -839,12 +1548,12 @@ namespace function_index {
 
 		inline bool target_is_noreturn(uint64_t target_va, uint64_t iat_va) {
 			if (target_va != 0) {
-				std::string sym = symbol_store::resolve_symbol_exact(target_va);
+				std::string sym = resolve_live_debugger_name_exact(target_va);
 				if (!sym.empty()) {
 					std::string stripped = strip_module_prefix(sym);
 					if (name_is_noreturn(stripped)) return true;
 				}
-				std::string near_sym = symbol_store::resolve_symbol(target_va);
+				std::string near_sym = resolve_live_debugger_name_nearest(target_va);
 				if (!near_sym.empty()) {
 					std::string stripped = strip_module_prefix(near_sym);
 					if (name_is_noreturn(stripped)) return true;
@@ -856,7 +1565,7 @@ namespace function_index {
 					std::string stripped = strip_module_prefix(iat_imp);
 					if (name_is_noreturn(stripped)) return true;
 				}
-				std::string iat_sym = symbol_store::resolve_symbol_exact(iat_va);
+				std::string iat_sym = resolve_live_debugger_name_exact(iat_va);
 				if (!iat_sym.empty()) {
 					std::string stripped = strip_module_prefix(iat_sym);
 					if (stripped.size() >= 6 && stripped.compare(0, 6, "__imp_") == 0) {
@@ -864,7 +1573,7 @@ namespace function_index {
 					}
 					if (name_is_noreturn(stripped)) return true;
 				}
-				std::string iat_near = symbol_store::resolve_symbol(iat_va);
+				std::string iat_near = resolve_live_debugger_name_nearest(iat_va);
 				if (!iat_near.empty()) {
 					std::string stripped = strip_module_prefix(iat_near);
 					if (stripped.size() >= 6 && stripped.compare(0, 6, "__imp_") == 0) {
@@ -917,8 +1626,7 @@ namespace function_index {
 		}
 
 		inline bool entry_naming_should_skip(uint64_t va) {
-			if (!rename_store::get(va).empty()) return true;
-			if (!symbol_store::resolve_symbol_exact(va).empty()) return true;
+			if (!resolve_live_debugger_name_exact(va).empty()) return true;
 			return false;
 		}
 
@@ -970,9 +1678,9 @@ namespace function_index {
 						continue;
 					}
 					if (!c.by_start.count(t)) continue;
-					std::string nm = symbol_store::resolve_symbol_exact(t);
+					std::string nm = resolve_live_debugger_name_exact(t);
 					if (nm.empty()) {
-						std::string near_sym = symbol_store::resolve_symbol(t);
+						std::string near_sym = resolve_live_debugger_name_nearest(t);
 						if (!near_sym.empty()) {
 							std::string s = strip_module_prefix(near_sym);
 							if (s.find("CRT") != std::string::npos
@@ -1031,28 +1739,27 @@ namespace function_index {
 		}
 
 		inline bool is_pdb_function_at(const std::string& module_name, uint64_t va) {
-			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-			auto it = symbol_store::g_state.modules.find(module_name);
-			if (it == symbol_store::g_state.modules.end()) return false;
-			if (!it->second.pdb.loaded) return false;
-			if (va < it->second.base) return false;
-			uint64_t rva = va - it->second.base;
-			auto sit = it->second.pdb.symbol_by_rva.find(rva);
-			if (sit == it->second.pdb.symbol_by_rva.end()) return false;
-			return it->second.pdb.symbols[sit->second].is_function;
+			auto module = legacy_live_module_symbols(module_name);
+			if (!module || !module->pdb.loaded || va < module->base ||
+				va - module->base >= module->size)
+				return false;
+			const uint64_t rva = va - module->base;
+			auto symbol = module->pdb.symbol_by_rva.find(rva);
+			return symbol != module->pdb.symbol_by_rva.end() &&
+				symbol->second < module->pdb.symbols.size() &&
+				module->pdb.symbols[symbol->second].is_function;
 		}
 
 		inline void populate_pdb_symbols_into(std::unordered_map<uint64_t, data_symbol_entry_t>& out,
 			const std::string& module_name)
 		{
-			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-			auto it = symbol_store::g_state.modules.find(module_name);
-			if (it == symbol_store::g_state.modules.end()) return;
-			if (!it->second.pdb.loaded) return;
-			uint64_t base = it->second.base;
-			for (const auto& sym : it->second.pdb.symbols) {
+			auto module = legacy_live_module_symbols(module_name);
+			if (!module || !module->pdb.loaded) return;
+			const uint64_t base = module->base;
+			for (const auto& sym : module->pdb.symbols) {
 				if (sym.name.empty()) continue;
 				if (sym.rva == 0) continue;
+				if (base > UINT64_MAX - sym.rva) continue;
 				uint64_t va = base + sym.rva;
 				data_symbol_entry_t e;
 				e.name = sym.name;
@@ -1140,7 +1847,7 @@ namespace function_index {
 
 			std::vector<uint64_t> rf_starts;
 			std::vector<uint32_t> rf_sizes;
-			functions_panel::detail::read_runtime_function_table(module_base, pe,
+			read_live_runtime_function_table(module_base, pe,
 				rf_starts, rf_sizes);
 
 			std::unordered_map<uint64_t, uint32_t> size_lookup;
@@ -1169,17 +1876,15 @@ namespace function_index {
 				candidates.push_back(exp.address);
 			}
 
-			{
-				std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-				auto it = symbol_store::g_state.modules.find(module_name);
-				if (it != symbol_store::g_state.modules.end() && it->second.pdb.loaded) {
-					for (const auto& sym : it->second.pdb.symbols) {
-						if (!sym.is_function) continue;
-						if (sym.rva == 0) continue;
-						uint64_t va = it->second.base + sym.rva;
-						if (va < module_base || va >= module_base + module_size) continue;
-						candidates.push_back(va);
-					}
+			if (auto module = legacy_live_module_symbols(module_name);
+				module && module->pdb.loaded) {
+				for (const auto& sym : module->pdb.symbols) {
+					if (!sym.is_function || sym.rva == 0 ||
+						module->base > UINT64_MAX - sym.rva)
+						continue;
+					const uint64_t va = module->base + sym.rva;
+					if (va < module_base || va - module_base >= module_size) continue;
+					candidates.push_back(va);
 				}
 			}
 
@@ -1274,269 +1979,6 @@ namespace function_index {
 			apply_entry_point_naming_locked(c, pe);
 		}
 
-		inline void rebuild_bounds_index_static(const std::string& module_name)
-		{
-			if (!static_pe_active()) {
-				cache_t& c = cache();
-				std::unique_lock<std::shared_mutex> lk(c.mutex);
-				c.by_start.clear();
-				c.status_by_start.clear();
-				c.addr_to_func_start.clear();
-				c.sorted_starts.clear();
-				c.synthetic_names.clear();
-				c.align_runs_by_start.clear();
-				c.align_run_starts.clear();
-				c.iat_lookup.clear();
-				c.data_symbol_lookup.clear();
-				c.text_blob.clear();
-				c.text_blob_va = 0;
-				c.cached_module_base = 0;
-				c.cached_module_size = 0;
-				c.cached_module_name = module_name;
-				c.cached_entry_point = 0;
-				c.cached_subsystem = 0;
-				c.cached_characteristics = 0;
-				return;
-			}
-
-			const std::string disk_path = g_disasm.file.path;
-			uint64_t module_base = g_disasm.file.image_base;
-			uint32_t module_size = 0;
-			uint64_t img_sz = static_analysis::total_image_size(g_disasm.file);
-			if (img_sz > 0xFFFFFFFFull) img_sz = 0xFFFFFFFFull;
-			module_size = static_cast<uint32_t>(img_sz);
-
-			std::shared_ptr<functions_panel::detail::disk_pe_view_t> view_ptr;
-			{
-				cache_t& cc = cache();
-				std::shared_lock<std::shared_mutex> lk(cc.mutex);
-				if (cc.static_pe_cached_view
-					&& cc.static_pe_cached_path == disk_path)
-				{
-					view_ptr = cc.static_pe_cached_view;
-				}
-			}
-			if (!view_ptr) {
-				auto fresh = std::make_shared<functions_panel::detail::disk_pe_view_t>();
-				if (!functions_panel::detail::disk_read_whole_file(disk_path, fresh->raw)
-					|| !functions_panel::detail::disk_parse_pe(*fresh))
-				{
-					cache_t& c = cache();
-					std::unique_lock<std::shared_mutex> lk(c.mutex);
-					c.by_start.clear();
-					c.status_by_start.clear();
-					c.addr_to_func_start.clear();
-					c.sorted_starts.clear();
-					c.synthetic_names.clear();
-					c.align_runs_by_start.clear();
-					c.align_run_starts.clear();
-					c.iat_lookup.clear();
-					c.data_symbol_lookup.clear();
-					c.text_blob.clear();
-					c.text_blob_va = 0;
-					c.cached_module_base = module_base;
-					c.cached_module_size = module_size;
-					c.cached_module_name = module_name;
-					c.cached_entry_point = 0;
-					c.cached_subsystem = 0;
-					c.cached_characteristics = 0;
-					return;
-				}
-				view_ptr = fresh;
-				{
-					cache_t& cc = cache();
-					std::unique_lock<std::shared_mutex> lk(cc.mutex);
-					cc.static_pe_cached_view = view_ptr;
-					cc.static_pe_cached_path = disk_path;
-				}
-			}
-			functions_panel::detail::disk_pe_view_t& v = *view_ptr;
-
-			if (v.size_of_image != 0) {
-				module_size = v.size_of_image;
-			}
-
-			functions_panel::detail::trigger_disk_pdb_auto_load(disk_path, module_name,
-				v.image_base, v.size_of_image);
-
-			std::unordered_map<uint64_t, uint32_t> size_lookup;
-			std::vector<uint64_t> rf_starts;
-			functions_panel::detail::disk_parse_pdata(v, size_lookup, rf_starts);
-
-			std::unordered_map<uint64_t, std::string> export_lookup;
-			functions_panel::detail::disk_parse_exports(v, export_lookup);
-
-			std::vector<pe_parser::import_entry_t> import_entries;
-			functions_panel::detail::disk_parse_imports(v, import_entries);
-
-			pe_parser::pe_info_t pe;
-			pe.image_base = v.image_base;
-			pe.entry_point = (v.entry_rva != 0) ? (v.image_base + v.entry_rva) : 0;
-			pe.size_of_image = v.size_of_image;
-			pe.is_64bit = v.is_pe32_plus;
-			pe.export_dir_rva = v.export_dir_rva;
-			pe.export_dir_size = v.export_dir_size;
-			pe.import_dir_rva = v.import_dir_rva;
-			pe.import_dir_size = v.import_dir_size;
-			pe.sections.reserve(v.sections.size());
-			for (const auto& s : v.sections) {
-				pe_parser::section_info_t si;
-				si.name = s.name;
-				si.virtual_address = s.virtual_address;
-				si.virtual_size = (s.virtual_size != 0) ? s.virtual_size : s.raw_size;
-				si.raw_size = s.raw_size;
-				si.characteristics = s.characteristics;
-				pe.sections.push_back(std::move(si));
-			}
-			pe.exports.reserve(export_lookup.size());
-			for (const auto& kv : export_lookup) {
-				if (kv.first < v.image_base) continue;
-				pe_parser::export_entry_t e;
-				e.address = kv.first;
-				uint64_t rva64 = kv.first - v.image_base;
-				if (rva64 > 0xFFFFFFFFull) continue;
-				e.rva = static_cast<uint32_t>(rva64);
-				e.name = kv.second;
-				e.is_forwarded = false;
-				pe.exports.push_back(std::move(e));
-			}
-			pe.imports = std::move(import_entries);
-			pe.subsystem = 0;
-			pe.characteristics = 0;
-			{
-				const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(v.raw.data());
-				uint32_t pe_off = static_cast<uint32_t>(dos->e_lfanew);
-				if (v.is_pe32_plus
-					&& pe_off + sizeof(IMAGE_NT_HEADERS64) <= v.raw.size())
-				{
-					const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
-						v.raw.data() + pe_off);
-					pe.subsystem = nt64->OptionalHeader.Subsystem;
-					pe.characteristics = nt64->FileHeader.Characteristics;
-				}
-				else if (!v.is_pe32_plus
-					&& pe_off + sizeof(IMAGE_NT_HEADERS32) <= v.raw.size())
-				{
-					const auto* nt32 = reinterpret_cast<const IMAGE_NT_HEADERS32*>(
-						v.raw.data() + pe_off);
-					pe.subsystem = nt32->OptionalHeader.Subsystem;
-					pe.characteristics = nt32->FileHeader.Characteristics;
-				}
-			}
-
-			std::vector<uint64_t> candidates;
-			candidates.reserve(rf_starts.size() + pe.exports.size() + 64);
-			for (uint64_t va : rf_starts) {
-				if (va >= module_base && va < module_base + module_size) {
-					candidates.push_back(va);
-				}
-			}
-			for (const auto& exp : pe.exports) {
-				if (exp.is_forwarded || exp.address == 0) continue;
-				if (exp.address < module_base) continue;
-				if (exp.address >= module_base + module_size) continue;
-				candidates.push_back(exp.address);
-			}
-
-			{
-				std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-				auto it = symbol_store::g_state.modules.find(module_name);
-				if (it != symbol_store::g_state.modules.end() && it->second.pdb.loaded) {
-					for (const auto& sym : it->second.pdb.symbols) {
-						if (!sym.is_function) continue;
-						if (sym.rva == 0) continue;
-						uint64_t va = it->second.base + sym.rva;
-						if (va < module_base || va >= module_base + module_size) continue;
-						candidates.push_back(va);
-					}
-				}
-			}
-
-			if (pe.entry_point >= module_base && pe.entry_point < module_base + module_size) {
-				candidates.push_back(pe.entry_point);
-			}
-
-			std::sort(candidates.begin(), candidates.end());
-			candidates.erase(std::unique(candidates.begin(), candidates.end()),
-				candidates.end());
-
-			std::unordered_map<uint64_t, func_record_t>                  by_start;
-			std::unordered_map<uint64_t, std::shared_ptr<func_status_t>> status_by_start;
-			std::unordered_map<uint64_t, std::string>                    synthetic_names;
-			std::vector<uint64_t>                                        sorted_starts;
-			by_start.reserve(candidates.size());
-			status_by_start.reserve(candidates.size());
-			synthetic_names.reserve(candidates.size());
-			sorted_starts.reserve(candidates.size());
-
-			for (size_t i = 0; i < candidates.size(); ++i) {
-				uint64_t start = candidates[i];
-				uint64_t next = (i + 1 < candidates.size())
-					? candidates[i + 1]
-					: (module_base + module_size);
-
-				uint32_t pdata_size = 0;
-				auto sit = size_lookup.find(start);
-				if (sit != size_lookup.end()) {
-					pdata_size = sit->second;
-				}
-
-				uint64_t end = start + (pdata_size > 0 ? pdata_size : 1);
-				if (end > next) end = next;
-				if (end <= start) end = start + 1;
-				if (end > module_base + module_size) end = module_base + module_size;
-
-				func_record_t r;
-				r.start = start;
-				r.end = end;
-				r.section = section_name_for_va(pe, module_base, start);
-				r.display_name = resolve_display_name(start);
-				r.last_insn_addr = start;
-				synthetic_names.emplace(start, r.display_name);
-				by_start.emplace(start, std::move(r));
-				status_by_start.emplace(start, std::make_shared<func_status_t>());
-				sorted_starts.push_back(start);
-			}
-
-			std::unordered_map<uint64_t, uint64_t> addr_to_func_start;
-			addr_to_func_start.reserve(by_start.size());
-			for (const auto& kv : by_start) {
-				addr_to_func_start.emplace(kv.first, kv.first);
-			}
-
-			std::vector<uint8_t> text_blob;
-			uint64_t             text_blob_va = 0;
-			for (const auto& sec : g_disasm.file.sections) {
-				if (!sec.is_executable) continue;
-				if (sec.bytes.empty()) continue;
-				text_blob = sec.bytes;
-				text_blob_va = sec.va;
-				break;
-			}
-
-			cache_t& c = cache();
-			std::unique_lock<std::shared_mutex> lk(c.mutex);
-			c.by_start = std::move(by_start);
-			c.status_by_start = std::move(status_by_start);
-			c.addr_to_func_start = std::move(addr_to_func_start);
-			c.sorted_starts = std::move(sorted_starts);
-			c.synthetic_names = std::move(synthetic_names);
-			c.text_blob = std::move(text_blob);
-			c.text_blob_va = text_blob_va;
-			c.align_runs_by_start.clear();
-			c.align_run_starts.clear();
-			c.cached_module_base = module_base;
-			c.cached_module_size = module_size;
-			c.cached_module_name = module_name;
-			c.cached_entry_point = pe.entry_point;
-			c.cached_subsystem = pe.subsystem;
-			c.cached_characteristics = static_cast<uint16_t>(pe.characteristics);
-			populate_iat_from_imports_locked(c, pe.imports);
-			populate_data_symbols_locked(c, pe, module_name);
-			rebuild_align_runs_locked(c);
-			apply_entry_point_naming_locked(c, pe);
-		}
-
 		inline uint64_t lookup_function_start_for_addr(uint64_t addr) {
 			cache_t& c = cache();
 			std::shared_lock<std::shared_mutex> lk(c.mutex);
@@ -1554,13 +1996,12 @@ namespace function_index {
 		inline uint32_t pdb_var_size_hint(const std::string& module_name,
 			const std::string& sym_name)
 		{
-			std::lock_guard<std::mutex> lk(symbol_store::g_state.mutex);
-			auto it = symbol_store::g_state.modules.find(module_name);
-			if (it == symbol_store::g_state.modules.end()) return 0;
-			if (!it->second.pdb.loaded) return 0;
-			auto nit = it->second.pdb.symbol_by_name.find(sym_name);
-			if (nit == it->second.pdb.symbol_by_name.end()) return 0;
-			const auto& sym = it->second.pdb.symbols[nit->second];
+			auto module = legacy_live_module_symbols(module_name);
+			if (!module || !module->pdb.loaded) return 0;
+			auto nit = module->pdb.symbol_by_name.find(sym_name);
+			if (nit == module->pdb.symbol_by_name.end() ||
+				nit->second >= module->pdb.symbols.size()) return 0;
+			const auto& sym = module->pdb.symbols[nit->second];
 			return sym.size;
 		}
 
@@ -1668,12 +2109,10 @@ namespace function_index {
 		}
 
 		inline std::string lookup_thunk_target_name(uint64_t target_va, uint64_t iat_va) {
-			std::string rn = rename_store::get(target_va);
-			if (!rn.empty()) return rn;
-			std::string sym = symbol_store::resolve_symbol_exact(target_va);
+			std::string sym = resolve_live_debugger_name_exact(target_va);
 			if (!sym.empty()) return strip_module_prefix(sym);
 			if (iat_va != 0) {
-				std::string iat_sym = symbol_store::resolve_symbol_exact(iat_va);
+				std::string iat_sym = resolve_live_debugger_name_exact(iat_va);
 				if (!iat_sym.empty()) {
 					std::string s = strip_module_prefix(iat_sym);
 					if (!s.empty() && s.compare(0, 4, "__imp") == 0) {
@@ -1684,10 +2123,10 @@ namespace function_index {
 					}
 					return s;
 				}
-				std::string iat_near = symbol_store::resolve_symbol(iat_va);
+				std::string iat_near = resolve_live_debugger_name_nearest(iat_va);
 				if (!iat_near.empty()) return strip_module_prefix(iat_near);
 			}
-			std::string near_sym = symbol_store::resolve_symbol(target_va);
+			std::string near_sym = resolve_live_debugger_name_nearest(target_va);
 			if (!near_sym.empty()) return strip_module_prefix(near_sym);
 			char buf[40];
 			std::snprintf(buf, sizeof(buf), "sub_%llX",
@@ -2137,8 +2576,13 @@ namespace function_index {
 			if (!read_routed_bytes(r.start, span, bytes)) return;
 			if (bytes.empty()) return;
 
-			zydis_detail::ensure_init();
-			ZydisDecoder& dec = g_disasm.file.is_64bit ? zydis_detail::decoder64() : zydis_detail::decoder32();
+			auto& decoder_contexts = zydis_detail::contexts();
+			if (!decoder_contexts.ready) return;
+			auto workspace = aida::analysis::workspace_registry().selected_for_ui();
+			const bool is_64_bit = workspace && workspace->identity().architecture() ==
+				aida::analysis::architecture_id_t::x86_64;
+			ZydisDecoder& dec = is_64_bit
+				? decoder_contexts.decoder64 : decoder_contexts.decoder32;
 
 			std::unordered_map<int64_t, var_slot_t> var_map;
 			std::unordered_set<uint64_t> branch_targets;
@@ -2343,7 +2787,7 @@ namespace function_index {
 									r.noreturn_call_addrs.insert(va);
 								}
 								if (sp.have_chkstk_pending) {
-									std::string near_name = symbol_store::resolve_symbol(tgt);
+									std::string near_name = resolve_live_debugger_name_nearest(tgt);
 									if (!near_name.empty()
 										&& near_name.find("chkstk") != std::string::npos)
 									{
@@ -2404,7 +2848,7 @@ namespace function_index {
 								&& pins.mnemonic == ZYDIS_MNEMONIC_MOV
 								&& is_rsp_family(dst.mem.base)
 								&& dst.mem.index == ZYDIS_REGISTER_NONE
-								&& dst.mem.disp.size != 0
+								&& dst.mem.disp.has_displacement
 								&& !sp.sp_failed)
 							{
 								int64_t pdisp = dst.mem.disp.value;
@@ -2530,7 +2974,7 @@ namespace function_index {
 							|| base == ZYDIS_REGISTER_EBP
 							|| base == ZYDIS_REGISTER_BP);
 						if (is_bp && op.mem.index == ZYDIS_REGISTER_NONE
-							&& op.mem.disp.size != 0)
+							&& op.mem.disp.has_displacement)
 						{
 							int64_t disp = op.mem.disp.value;
 							uint32_t sz = operand_size_bytes(op, ins);
@@ -2552,7 +2996,7 @@ namespace function_index {
 
 						if (!sp.sp_failed && is_rsp_family(base)
 							&& op.mem.index == ZYDIS_REGISTER_NONE
-							&& op.mem.disp.size != 0)
+							&& op.mem.disp.has_displacement)
 						{
 							int64_t disp = op.mem.disp.value;
 							int64_t entry_relative = sp.sp_delta + disp;
@@ -3020,8 +3464,7 @@ namespace function_index {
 					it->second.is_library = snapshot.is_library;
 					std::string final_name = snapshot.display_name;
 					if (it->second.is_thunk
-						&& rename_store::get(func_start).empty()
-						&& symbol_store::resolve_symbol_exact(func_start).empty()
+						&& resolve_live_debugger_name_exact(func_start).empty()
 						&& !it->second.thunk_target_name.empty())
 					{
 						final_name = std::string("j_") + it->second.thunk_target_name;
@@ -3033,88 +3476,10 @@ namespace function_index {
 				status->state.store(static_cast<uint32_t>(func_state_t::built),
 					std::memory_order_release);
 				c.built_seq.fetch_add(1u, std::memory_order_acq_rel);
-				uint32_t prev_pending = c.static_bulk_pending.load(std::memory_order_acquire);
-				if (prev_pending > 0u) {
-					c.static_bulk_pending.fetch_sub(1u, std::memory_order_acq_rel);
-					uint64_t now_ns_v = static_cast<uint64_t>(
-						std::chrono::duration_cast<std::chrono::nanoseconds>(
-							std::chrono::steady_clock::now().time_since_epoch()).count());
-					c.static_bulk_last_progress_ns.store(now_ns_v,
-						std::memory_order_release);
-				}
 			};
 			if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 				status->state.store(static_cast<uint32_t>(func_state_t::failed),
 					std::memory_order_release);
-				cache_t& c = cache();
-				uint32_t prev_pending = c.static_bulk_pending.load(std::memory_order_acquire);
-				if (prev_pending > 0u) {
-					c.static_bulk_pending.fetch_sub(1u, std::memory_order_acq_rel);
-					uint64_t now_ns_v = static_cast<uint64_t>(
-						std::chrono::duration_cast<std::chrono::nanoseconds>(
-							std::chrono::steady_clock::now().time_since_epoch()).count());
-					c.static_bulk_last_progress_ns.store(now_ns_v,
-						std::memory_order_release);
-				}
-			}
-		}
-
-		struct bulk_dispatch_state_t {
-			std::shared_ptr<std::vector<std::pair<uint64_t,
-				std::shared_ptr<func_status_t>>>> targets;
-			std::shared_ptr<std::string>         mod_name;
-			std::atomic<size_t>                  cursor{0};
-			std::atomic<size_t>                  in_flight{0};
-		};
-
-		inline void post_bulk_chunk(std::shared_ptr<bulk_dispatch_state_t> state);
-
-		inline void post_bulk_chunk(std::shared_ptr<bulk_dispatch_state_t> state) {
-			if (!state || !state->targets) return;
-			constexpr size_t kChunkSize = 256;
-			const size_t total = state->targets->size();
-			size_t start = state->cursor.fetch_add(kChunkSize, std::memory_order_acq_rel);
-			if (start >= total) return;
-			size_t end = start + kChunkSize;
-			if (end > total) end = total;
-			state->in_flight.fetch_add(end - start, std::memory_order_acq_rel);
-			for (size_t i = start; i < end; ++i) {
-				auto& kv = (*state->targets)[i];
-				auto status = kv.second;
-				uint64_t func_start = kv.first;
-				auto state_ref = state;
-				aida::infra::executor::submission_t sub;
-				sub.owner_subsystem = "disasm";
-				sub.label = "disasm.function_index.bulk_schedule_function";
-				sub.thread_class = "bounded_task";
-				sub.domain = aida::infra::executor::domain_t::feature_worker;
-				sub.priority = 2;
-				sub.body = [func_start, status, state_ref]() {
-					schedule_function_build(func_start, status, *state_ref->mod_name);
-					size_t left = state_ref->in_flight.fetch_sub(1u,
-						std::memory_order_acq_rel) - 1u;
-					if (left == 0) {
-						aida::infra::executor::submission_t next_sub;
-						next_sub.owner_subsystem = "disasm";
-						next_sub.label = "disasm.function_index.bulk_next_chunk";
-						next_sub.thread_class = "bounded_task";
-						next_sub.domain = aida::infra::executor::domain_t::feature_worker;
-						next_sub.priority = 2;
-						next_sub.body = [state_ref]() {
-							post_bulk_chunk(state_ref);
-						};
-						if (!aida::infra::executor::submit(std::move(next_sub)).submitted)
-							post_bulk_chunk(state_ref);
-					}
-				};
-				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-					status->state.store(static_cast<uint32_t>(func_state_t::failed),
-						std::memory_order_release);
-					size_t left = state_ref->in_flight.fetch_sub(1u,
-						std::memory_order_acq_rel) - 1u;
-					if (left == 0)
-						post_bulk_chunk(state_ref);
-				}
 			}
 		}
 
@@ -3140,8 +3505,7 @@ namespace function_index {
 			sub.body = []() {
 				cache_t& c2 = cache();
 				bool live = (driver_bridge::attached_pid() != 0);
-				bool static_loaded = static_pe_active();
-				if (!live && !static_loaded) {
+				if (!live) {
 					c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::idle),
 						std::memory_order_release);
 					return;
@@ -3151,24 +3515,13 @@ namespace function_index {
 				uint32_t size = 0;
 				std::string name;
 				uint64_t pid_token = 0;
-				if (live) {
-					if (!fetch_active_module(base, size, name)) {
-						c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
-							std::memory_order_release);
-						return;
-					}
-					pid_token = static_cast<uint64_t>(driver_bridge::attached_pid())
-						^ (static_cast<uint64_t>(size) << 32);
+				if (!fetch_active_module(base, size, name)) {
+					c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
+						std::memory_order_release);
+					return;
 				}
-				else {
-					if (!fetch_static_module(base, size, name)) {
-						c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
-							std::memory_order_release);
-						return;
-					}
-					pid_token = std::hash<std::string>{}(g_disasm.file.path)
-						^ (static_cast<uint64_t>(g_disasm.file.image_base) << 32);
-				}
+				pid_token = static_cast<uint64_t>(driver_bridge::attached_pid())
+					^ (static_cast<uint64_t>(size) << 32);
 
 				bool same = false;
 				{
@@ -3187,12 +3540,7 @@ namespace function_index {
 				const uint64_t t_rebuild_start_ns = static_cast<uint64_t>(
 					std::chrono::duration_cast<std::chrono::nanoseconds>(
 						std::chrono::steady_clock::now().time_since_epoch()).count());
-				if (live) {
-					rebuild_bounds_index(base, size, name);
-				}
-				else {
-					rebuild_bounds_index_static(name);
-				}
+				rebuild_bounds_index(base, size, name);
 				const uint64_t t_rebuild_end_ns = static_cast<uint64_t>(
 					std::chrono::duration_cast<std::chrono::nanoseconds>(
 						std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -3218,55 +3566,6 @@ namespace function_index {
 				}
 				c2.bounds_state.store(static_cast<uint32_t>(bounds_state_t::ready),
 					std::memory_order_release);
-
-				bool bulk_allowed = live
-					|| (static_pe_active() && c2.deep_static_requested.load(std::memory_order_acquire));
-
-				if (bulk_allowed) {
-					auto all_targets = std::make_shared<
-						std::vector<std::pair<uint64_t, std::shared_ptr<func_status_t>>>>();
-					std::string mod_name;
-					{
-						std::shared_lock<std::shared_mutex> lk(c2.mutex);
-						mod_name = c2.cached_module_name;
-						all_targets->reserve(c2.sorted_starts.size());
-						for (uint64_t start : c2.sorted_starts) {
-							auto sit = c2.status_by_start.find(start);
-							if (sit == c2.status_by_start.end() || !sit->second) continue;
-							uint32_t st = sit->second->state.load(std::memory_order_acquire);
-							if (st != static_cast<uint32_t>(func_state_t::idle)) continue;
-							all_targets->emplace_back(start, sit->second);
-						}
-					}
-					char log_extra[160];
-					std::snprintf(log_extra, sizeof(log_extra),
-						"live=%d deep=%d targets=%zu name=%s",
-						live ? 1 : 0,
-						c2.deep_static_requested.load(std::memory_order_acquire) ? 1 : 0,
-						all_targets->size(),
-						mod_name.c_str());
-					diag::log_tagged("function_index", log_extra);
-					anti_tamper::webhook::write_log("function_index", log_extra);
-					if (!all_targets->empty()) {
-						c2.static_bulk_pending.store(static_cast<uint32_t>(all_targets->size()),
-							std::memory_order_release);
-						c2.static_bulk_last_progress_ns.store(0ull,
-							std::memory_order_release);
-						auto state = std::make_shared<bulk_dispatch_state_t>();
-						state->targets = all_targets;
-						state->mod_name = std::make_shared<std::string>(std::move(mod_name));
-						post_bulk_chunk(state);
-					}
-				} else {
-					char log_extra[160];
-					std::snprintf(log_extra, sizeof(log_extra),
-						"bulk_skipped live=%d deep=%d static=%d",
-						live ? 1 : 0,
-						c2.deep_static_requested.load(std::memory_order_acquire) ? 1 : 0,
-						static_pe_active() ? 1 : 0);
-					diag::log_tagged("function_index", log_extra);
-					anti_tamper::webhook::write_log("function_index", log_extra);
-				}
 			};
 			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 				c.bounds_state.store(static_cast<uint32_t>(bounds_state_t::failed),
@@ -3295,14 +3594,9 @@ namespace function_index {
 				c.cached_entry_point = 0;
 				c.cached_subsystem = 0;
 				c.cached_characteristics = 0;
-				c.static_pe_cached_view.reset();
-				c.static_pe_cached_path.clear();
 			}
 			c.bounds_state.store(static_cast<uint32_t>(bounds_state_t::idle),
 				std::memory_order_release);
-			c.static_bulk_pending.store(0u, std::memory_order_release);
-			c.static_bulk_last_progress_ns.store(0ull, std::memory_order_release);
-			c.deep_static_requested.store(false, std::memory_order_release);
 
 			cached_module_table_t& t = cached_module_table();
 			{
@@ -3316,8 +3610,8 @@ namespace function_index {
 	}
 
 	inline std::string synthetic_name(uint64_t addr) {
-		std::string rn = rename_store::get(addr);
-		if (!rn.empty()) return rn;
+		std::string name = resolve_live_debugger_name_exact(addr);
+		if (!name.empty()) return detail::strip_module_prefix(name);
 
 		detail::cache_t& c = detail::cache();
 		std::shared_lock<std::shared_mutex> lk(c.mutex);
@@ -3370,183 +3664,92 @@ namespace function_index {
 		return !out_name.empty();
 	}
 
-	inline void on_attach_changed() {
-		detail::reset_all();
-	}
-
-	inline void on_file_loaded() {
-		detail::reset_all();
-		if (detail::static_pe_active()) {
-			detail::schedule_bounds_rebuild();
-		}
-	}
-
-	inline bool deep_static_analysis_requested() {
-		detail::cache_t& c = detail::cache();
-		return c.deep_static_requested.load(std::memory_order_acquire);
-	}
-
-	inline void request_deep_static_analysis() {
-		detail::cache_t& c = detail::cache();
-		bool prev = c.deep_static_requested.exchange(true, std::memory_order_acq_rel);
-		diag::log_tagged_fmt("function_index",
-			"request_deep_static_analysis prev=%d static_active=%d",
-			prev ? 1 : 0,
-			detail::static_pe_active() ? 1 : 0);
-		anti_tamper::webhook::write_log("function_index",
-			"request_deep_static_analysis");
-		if (!detail::static_pe_active()) return;
-		uint32_t bs = c.bounds_state.load(std::memory_order_acquire);
-		if (bs == static_cast<uint32_t>(detail::bounds_state_t::ready)) {
-			auto all_targets = std::make_shared<
-				std::vector<std::pair<uint64_t, std::shared_ptr<detail::func_status_t>>>>();
-			std::string mod_name;
-			{
-				std::shared_lock<std::shared_mutex> lk(c.mutex);
-				mod_name = c.cached_module_name;
-				all_targets->reserve(c.sorted_starts.size());
-				for (uint64_t start : c.sorted_starts) {
-					auto sit = c.status_by_start.find(start);
-					if (sit == c.status_by_start.end() || !sit->second) continue;
-					uint32_t st = sit->second->state.load(std::memory_order_acquire);
-					if (st != static_cast<uint32_t>(detail::func_state_t::idle)) continue;
-					all_targets->emplace_back(start, sit->second);
-				}
-			}
-			if (!all_targets->empty()) {
-				c.static_bulk_pending.store(static_cast<uint32_t>(all_targets->size()),
-					std::memory_order_release);
-				c.static_bulk_last_progress_ns.store(0ull, std::memory_order_release);
-				auto disp = std::make_shared<detail::bulk_dispatch_state_t>();
-				disp->targets = all_targets;
-				disp->mod_name = std::make_shared<std::string>(std::move(mod_name));
-				detail::post_bulk_chunk(disp);
-			}
-			return;
-		}
-		detail::schedule_bounds_rebuild();
-	}
-
-	inline void clear_deep_static_request() {
-		detail::cache_t& c = detail::cache();
-		c.deep_static_requested.store(false, std::memory_order_release);
-	}
-
 	inline bool static_bulk_in_progress() {
-		detail::cache_t& c = detail::cache();
-		return c.static_bulk_pending.load(std::memory_order_acquire) > 0u;
-	}
-
-	inline uint64_t static_bulk_last_progress_ns() {
-		detail::cache_t& c = detail::cache();
-		return c.static_bulk_last_progress_ns.load(std::memory_order_acquire);
-	}
-
-	inline void warm_range(uint64_t lo_addr, uint64_t hi_addr) {
-		if (lo_addr >= hi_addr) return;
-		bool live = (driver_bridge::attached_pid() != 0);
-		bool static_loaded = detail::static_pe_active();
-		if (!live && !static_loaded) return;
-
-		detail::cache_t& c = detail::cache();
-		uint32_t bs = c.bounds_state.load(std::memory_order_acquire);
-
-		if (bs == static_cast<uint32_t>(detail::bounds_state_t::idle)
-			|| bs == static_cast<uint32_t>(detail::bounds_state_t::failed))
-		{
-			detail::schedule_bounds_rebuild();
-			return;
+		for (const auto& workspace : aida::analysis::workspace_registry().list()) {
+			if (!workspace || workspace->target_kind() !=
+				aida::analysis::target_kind_t::static_file ||
+				workspace->closing() || workspace->closed())
+				continue;
+			const auto progress = workspace->progress();
+			if (progress.readiness == aida::analysis::workspace_readiness_t::analyzing ||
+				progress.readiness == aida::analysis::workspace_readiness_t::cancelling)
+				return true;
 		}
+		return false;
+	}
 
-		if (bs != static_cast<uint32_t>(detail::bounds_state_t::ready)) return;
-
-		std::vector<std::pair<uint64_t, std::shared_ptr<detail::func_status_t>>> targets;
-		std::string mod_name;
-		{
-			std::shared_lock<std::shared_mutex> lk(c.mutex);
-			if (c.sorted_starts.empty()) return;
-			mod_name = c.cached_module_name;
-			auto lo_it = std::lower_bound(c.sorted_starts.begin(),
-				c.sorted_starts.end(), lo_addr);
-			if (lo_it != c.sorted_starts.begin()) {
-				auto prev = lo_it;
-				--prev;
-				auto rit = c.by_start.find(*prev);
-				if (rit != c.by_start.end() && rit->second.end > lo_addr) {
-					auto sit = c.status_by_start.find(*prev);
-					if (sit != c.status_by_start.end()) {
-						targets.emplace_back(*prev, sit->second);
-					}
+	inline std::vector<injection_row_t> rows_before(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::analysis::address_t& address)
+	{
+		using namespace aida::analysis;
+		std::vector<injection_row_t> rows;
+		auto normalized = normalize_workspace_address(workspace, address);
+		if (!normalized || !workspace) return rows;
+		auto publication = workspace->analysis_publication();
+		if (!publication || !publication->snapshot ||
+			publication->generation != workspace->generation())
+			return rows;
+		const function_record_t* function = nullptr;
+		for (const auto& candidate : publication->snapshot->functions) {
+			if (candidate.start.space == normalized.value().space &&
+				candidate.start.value == normalized.value().value) {
+				function = &candidate;
+				break;
+			}
+		}
+		if (!function) return rows;
+		const uint64_t display_address = workspace_display_address(
+			workspace, function->start);
+		const uint64_t row_address = display_address != 0
+			? display_address : function->start.value;
+		const auto names = workspace_name_snapshot(workspace);
+		std::string display_name = resolve_workspace_name_exact(names, function->start);
+		std::string signature;
+		if (auto overlay = workspace->overlay()) {
+			const auto overlay_snapshot = overlay->snapshot();
+			if (overlay_snapshot.revision == workspace->overlay_revision()) {
+				for (const auto& item : overlay_snapshot.items) {
+					const auto& operation = item.second;
+					auto operation_address = normalize_workspace_address(
+						workspace, operation.address);
+					if (!operation_address ||
+						operation_address.value().space != function->start.space ||
+						operation_address.value().value != function->start.value)
+						continue;
+					if (operation.kind == overlay_operation_kind_t::type_application &&
+						signature.empty() && !operation.signature.empty())
+						signature = operation.signature;
 				}
 			}
-			auto hi_it = std::upper_bound(c.sorted_starts.begin(),
-				c.sorted_starts.end(), hi_addr);
-			for (auto it = lo_it; it != hi_it; ++it) {
-				auto sit = c.status_by_start.find(*it);
-				if (sit != c.status_by_start.end()) {
-					targets.emplace_back(*it, sit->second);
-				}
-			}
 		}
-
-		for (auto& kv : targets) {
-			if (!kv.second) continue;
-			uint32_t st = kv.second->state.load(std::memory_order_acquire);
-			if (st != static_cast<uint32_t>(detail::func_state_t::idle)) continue;
-			detail::schedule_function_build(kv.first, kv.second, mod_name);
+		if (display_name.empty())
+			display_name = synthetic_name(workspace, function->start);
+		rows.push_back(injection_row_t{injection_t::function_banner,
+			"; =============== S U B R O U T I N E =======================================",
+			row_address});
+		rows.push_back(injection_row_t{injection_t::spacer_line, {}, row_address});
+		rows.push_back(injection_row_t{injection_t::spacer_line, {}, row_address});
+		std::string attributes;
+		if (function->noreturn) attributes = "noreturn";
+		if (function->thunk) {
+			if (!attributes.empty()) attributes += ' ';
+			attributes += "thunk";
 		}
-	}
-
-	inline std::vector<injection_row_t> rows_before(uint64_t addr) {
-		detail::cache_t& c = detail::cache();
-		std::vector<injection_row_t> out;
-		{
-			std::shared_lock<std::shared_mutex> lk(c.mutex);
-			if (c.sorted_starts.empty()) return out;
-			auto sit = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), addr);
-			if (sit == c.sorted_starts.begin()) return out;
-			--sit;
-			uint64_t func_start = *sit;
-			if (addr != func_start) return out;
-			auto it = c.by_start.find(func_start);
-			if (it == c.by_start.end()) return out;
-			auto stit = c.status_by_start.find(func_start);
-			if (stit == c.status_by_start.end() || !stit->second) return out;
-			if (stit->second->state.load(std::memory_order_acquire)
-				!= static_cast<uint32_t>(detail::func_state_t::built))
-			{
-				return out;
-			}
-			out = it->second.before_first_insn;
+		if (!attributes.empty()) {
+			rows.push_back(injection_row_t{injection_t::attributes_line,
+				"; Attributes: " + attributes, row_address});
+			rows.push_back(injection_row_t{injection_t::spacer_line, {}, row_address});
 		}
-		return out;
-	}
-
-	inline std::vector<injection_row_t> rows_after(uint64_t addr) {
-		detail::cache_t& c = detail::cache();
-		std::vector<injection_row_t> out;
-		{
-			std::shared_lock<std::shared_mutex> lk(c.mutex);
-			if (c.sorted_starts.empty()) return out;
-			auto sit = std::upper_bound(c.sorted_starts.begin(), c.sorted_starts.end(), addr);
-			if (sit == c.sorted_starts.begin()) return out;
-			--sit;
-			uint64_t func_start = *sit;
-			auto it = c.by_start.find(func_start);
-			if (it == c.by_start.end()) return out;
-			const auto& rec = it->second;
-			if (addr < rec.start || addr >= rec.end) return out;
-			auto stit = c.status_by_start.find(func_start);
-			if (stit == c.status_by_start.end() || !stit->second) return out;
-			if (stit->second->state.load(std::memory_order_acquire)
-				!= static_cast<uint32_t>(detail::func_state_t::built))
-			{
-				return out;
-			}
-			if (addr != rec.last_insn_addr) return out;
-			out = rec.after_last_insn;
+		if (!signature.empty()) {
+			rows.push_back(injection_row_t{injection_t::prototype_line,
+				signature, row_address});
+			rows.push_back(injection_row_t{injection_t::spacer_line, {}, row_address});
 		}
-		return out;
+		rows.push_back(injection_row_t{injection_t::proc_header,
+			detail::pad_right(display_name, 16) + "proc near", row_address});
+		rows.push_back(injection_row_t{injection_t::spacer_line, {}, row_address});
+		return rows;
 	}
 
 	inline std::string inline_label_at(uint64_t addr) {
@@ -3918,48 +4121,6 @@ namespace function_index {
 		auto it = c.by_start.find(func_start);
 		if (it == c.by_start.end()) return false;
 		return it->second.is_library;
-	}
-
-	inline std::shared_ptr<detail::cache_t> detach_snapshot() {
-		auto new_cache = std::make_shared<detail::cache_t>();
-		std::shared_ptr<detail::cache_t> out;
-		{
-			std::lock_guard<std::mutex> swap_lk(detail::holder_swap_mtx());
-			diag::log_tagged_critical_fmt("fn_index_cache",
-				"detach_snapshot pre_swap tid=%lu old_raw=%p new_raw=%p",
-				static_cast<unsigned long>(GetCurrentThreadId()),
-				detail::cache_holder_sp().get(),
-				new_cache.get());
-			out = detail::cache_holder_sp();
-			detail::retain_cache_snapshot_locked(out);
-			detail::cache_holder_sp() = new_cache;
-			uint64_t gen = detail::cache_holder_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
-			diag::log_tagged_critical_fmt("fn_index_cache",
-				"detach_snapshot post_swap tid=%lu gen=%llu detached_raw=%p active_raw=%p",
-				static_cast<unsigned long>(GetCurrentThreadId()),
-				static_cast<unsigned long long>(gen),
-				out.get(),
-				detail::cache_holder_sp().get());
-		}
-		return out;
-	}
-
-	inline void attach_snapshot(std::shared_ptr<detail::cache_t> snap) {
-		if (!snap) snap = std::make_shared<detail::cache_t>();
-		std::lock_guard<std::mutex> swap_lk(detail::holder_swap_mtx());
-		diag::log_tagged_critical_fmt("fn_index_cache",
-			"attach_snapshot pre_swap tid=%lu old_raw=%p incoming_raw=%p",
-			static_cast<unsigned long>(GetCurrentThreadId()),
-			detail::cache_holder_sp().get(),
-			snap.get());
-		detail::retain_cache_snapshot_locked(detail::cache_holder_sp());
-		detail::cache_holder_sp() = std::move(snap);
-		uint64_t gen = detail::cache_holder_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
-		diag::log_tagged_critical_fmt("fn_index_cache",
-			"attach_snapshot post_swap tid=%lu gen=%llu active_raw=%p",
-			static_cast<unsigned long>(GetCurrentThreadId()),
-			static_cast<unsigned long long>(gen),
-			detail::cache_holder_sp().get());
 	}
 
 }

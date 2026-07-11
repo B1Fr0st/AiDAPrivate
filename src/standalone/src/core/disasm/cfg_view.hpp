@@ -42,8 +42,6 @@
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
 
-extern DisasmState g_disasm;
-
 namespace cfg_view {
 
 struct instruction_line_t {
@@ -107,6 +105,8 @@ struct cfg_state_t {
 inline cfg_state_t g_state;
 
 inline void build_cfg(uint64_t entry_address);
+inline void build_cfg(const disasm_view::workspace_context_t& context,
+                      uint64_t entry_address);
 
 namespace detail {
 
@@ -137,9 +137,9 @@ inline float estimate_text_width_for_cfg(const std::string& text, float font_siz
 	return estimate_text_width_for_cfg(text.c_str(), font_size);
 }
 
-inline bool safe_decode_for_cfg(const uint8_t* code, int avail, uint64_t va, AsmInstr& out)
+inline bool safe_decode_for_cfg(const uint8_t* code, int avail, uint64_t va,
+                               bool is_64bit, AsmInstr& out)
 {
-	const bool is_64bit = g_disasm.file.is_64bit;
 #if defined(_MSC_VER)
 	__try {
 		out = zydis_decode_one(code, avail, va, is_64bit);
@@ -351,22 +351,23 @@ inline float render_colored_insn(ImDrawList* dl, float x, float y,
 	return cur_x;
 }
 
-inline std::string resolve_branch_symbol_for_cfg(uint64_t target)
+inline std::string resolve_branch_symbol_for_cfg(
+	const disasm_view::workspace_context_t& context, uint64_t target)
 {
 	if (target == 0) return std::string();
-	std::string sym = symbol_store::resolve_symbol_exact(target);
-	if (!sym.empty()) {
-		auto bang = sym.find('!');
-		if (bang != std::string::npos) sym = sym.substr(bang + 1);
-		return sym;
-	}
-	sym = symbol_store::resolve_symbol(target);
+	const auto address = disasm_view::typed_address(context, target);
+	std::string sym = address ? disasm_view::resolve_name(context, *address) : std::string();
 	if (!sym.empty()) {
 		auto bang = sym.find('!');
 		if (bang != std::string::npos) sym = sym.substr(bang + 1);
 		return sym;
 	}
 	return std::string();
+}
+
+inline std::string resolve_branch_symbol_for_cfg(uint64_t target)
+{
+	return resolve_branch_symbol_for_cfg(disasm_view::capture_selected_workspace(), target);
 }
 
 inline ImU32 injection_color_for_kind(function_index::injection_t kind)
@@ -392,12 +393,17 @@ inline ImU32 injection_color_for_kind(function_index::injection_t kind)
 	}
 }
 
-inline std::string substitute_branch_operand(const std::string& ops, uint64_t target)
+inline std::string substitute_branch_operand(
+	const disasm_view::workspace_context_t& context,
+	const std::string& ops, uint64_t target)
 {
 	if (target == 0) return ops;
-	std::string sym = resolve_branch_symbol_for_cfg(target);
+	std::string sym = resolve_branch_symbol_for_cfg(context, target);
 	if (sym.empty()) return ops;
-	symbol_classifier::kind_t k = symbol_classifier::classify(target);
+	const auto address = disasm_view::typed_address(context, target);
+	symbol_classifier::kind_t k = address
+		? symbol_classifier::classify(context.workspace, *address)
+		: symbol_classifier::kind_t::unknown;
 	if (k == symbol_classifier::kind_t::external_import) {
 		if (sym.compare(0, 6, "__imp_") != 0)
 			sym = "__imp_" + sym;
@@ -471,7 +477,8 @@ inline void center_on_address(uint64_t addr)
 	}
 }
 
-inline void build_cfg(uint64_t entry_address)
+inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
+                      uint64_t entry_address)
 {
 	detail::ensure_pdb_subscription();
 
@@ -481,8 +488,11 @@ inline void build_cfg(uint64_t entry_address)
 		return;
 	}
 
+	const uint32_t target_pid = workspace_context.workspace &&
+		workspace_context.workspace->identity().process()
+		? workspace_context.workspace->identity().process()->pid : 0;
 	diag::log_tagged_fmt("cfg", "build_cfg START entry=0x%llX pid=%u",
-		static_cast<unsigned long long>(entry_address), driver_bridge::attached_pid());
+		static_cast<unsigned long long>(entry_address), target_pid);
 
 	g_state.building.store(true);
 	{
@@ -497,7 +507,7 @@ inline void build_cfg(uint64_t entry_address)
 		sub.thread_class = "bounded_task";
 		sub.domain = aida::infra::executor::domain_t::feature_worker;
 		sub.priority = 2;
-		sub.body = [entry_address]() {
+		sub.body = [entry_address, workspace_context]() {
 		try {
 		struct build_guard_t {
 			~build_guard_t()
@@ -513,11 +523,17 @@ inline void build_cfg(uint64_t entry_address)
 		std::vector<uint8_t> mem;
 		bool have_data = false;
 
-		if (driver_bridge::attached_pid() != 0)
+		if (workspace_context) {
+			const auto address = disasm_view::typed_address(workspace_context, entry_address);
+			if (address) {
+				auto bytes = disasm_view::read_bytes(workspace_context, *address, max_bytes);
+				if (bytes) {
+					mem = bytes.take_value();
+					have_data = !mem.empty();
+				}
+			}
+		} else if (driver_bridge::attached_pid() != 0) {
 			have_data = driver_bridge::read_memory(entry_address, max_bytes, mem);
-
-		if (!have_data || mem.empty()) {
-			have_data = static_analysis::read_bytes_from_pe(g_disasm.file, entry_address, max_bytes, mem);
 		}
 
 		if (mem.empty()) {
@@ -547,7 +563,9 @@ inline void build_cfg(uint64_t entry_address)
 			if (avail > 15) avail = 15;
 			uint64_t va = entry_address + pos;
 			AsmInstr ins = {};
-			if (!detail::safe_decode_for_cfg(data + pos, avail, va, ins)) {
+			const bool is_64bit = !workspace_context.image ||
+				workspace_context.image->architecture() == aida::analysis::architecture_id_t::x86_64;
+			if (!detail::safe_decode_for_cfg(data + pos, avail, va, is_64bit, ins)) {
 				diag::log_tagged_fmt("cfg", "build_cfg decode_seh addr=0x%llX",
 					static_cast<unsigned long long>(va));
 			}
@@ -616,7 +634,8 @@ inline void build_cfg(uint64_t entry_address)
 			line.addr = d.ins.addr;
 			std::string ops_text = d.ins.ops;
 			if ((d.ins.is_branch || d.ins.is_call) && d.ins.branch_target != 0) {
-				ops_text = detail::substitute_branch_operand(ops_text, d.ins.branch_target);
+				ops_text = detail::substitute_branch_operand(
+					workspace_context, ops_text, d.ins.branch_target);
 			}
 			line.text.reserve(std::strlen(d.ins.mnem) + 1 + ops_text.size());
 			line.text.assign(d.ins.mnem);
@@ -659,7 +678,7 @@ inline void build_cfg(uint64_t entry_address)
 			}
 		}
 
-		{
+		if (!workspace_context) {
 			auto& bps = debugger_engine::g_state.breakpoints;
 			std::lock_guard<std::mutex> bp_lk(debugger_engine::g_state.bp_mutex);
 			for (auto& b : blocks) {
@@ -687,8 +706,15 @@ inline void build_cfg(uint64_t entry_address)
 		std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
 		for (int bi = 0; bi < static_cast<int>(blocks.size()); ++bi) {
 			if (!blocks[bi].is_entry) continue;
-			std::vector<function_index::injection_row_t> rows =
-				function_index::rows_before(blocks[bi].start_addr);
+			std::vector<function_index::injection_row_t> rows;
+			if (workspace_context) {
+				const auto address = disasm_view::typed_address(
+					workspace_context, blocks[bi].start_addr);
+				if (address) {
+					rows = function_index::rows_before(
+						workspace_context.workspace, *address);
+				}
+			}
 			if (!rows.empty()) {
 				char log_buf[160];
 				std::snprintf(log_buf, sizeof(log_buf),
@@ -738,9 +764,11 @@ inline void build_cfg(uint64_t entry_address)
 				? "ENTRY"
 				: (blocks[i].successors.empty() && !blocks[i].is_entry ? "EXIT" : "BLOCK");
 			if (blocks[i].is_entry) {
-				std::string fname = detail::resolve_branch_symbol_for_cfg(entry_address);
+				std::string fname = detail::resolve_branch_symbol_for_cfg(
+					workspace_context, entry_address);
 				if (fname.empty() && entry_address != blocks[i].start_addr)
-					fname = detail::resolve_branch_symbol_for_cfg(blocks[i].start_addr);
+					fname = detail::resolve_branch_symbol_for_cfg(
+						workspace_context, blocks[i].start_addr);
 				if (!fname.empty()) {
 					size_t avail = sizeof(header_buf) - 12;
 					std::string fn_short = fname.size() > avail
@@ -850,6 +878,11 @@ inline void build_cfg(uint64_t entry_address)
 	}
 }
 
+inline void build_cfg(uint64_t entry_address)
+{
+	build_cfg(disasm_view::capture_selected_workspace(), entry_address);
+}
+
 inline bool handle_view_keys(float view_width, float view_height)
 {
 	if (g_state.fit_request && g_state.built && !g_state.graph.nodes.empty()) {
@@ -880,7 +913,7 @@ inline bool handle_view_keys(float view_width, float view_height)
 			: g_state.entry_addr;
 		globals::ui::active_center_view = center_view_t::disassembly;
 		if (back_addr != 0)
-			disasm_view::goto_address(back_addr, g_disasm);
+			disasm_view::goto_address(back_addr, disasm_view::capture_selected_workspace());
 		return true;
 	}
 	if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
@@ -889,7 +922,7 @@ inline bool handle_view_keys(float view_width, float view_height)
 			: g_state.entry_addr;
 		globals::ui::active_center_view = center_view_t::disassembly;
 		if (back_addr != 0)
-			disasm_view::goto_address(back_addr, g_disasm);
+			disasm_view::goto_address(back_addr, disasm_view::capture_selected_workspace());
 		return true;
 	}
 	if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
@@ -1432,7 +1465,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 				g_state.last_cursor_addr = go_addr;
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(go_addr, g_disasm);
+				disasm_view::goto_address(go_addr, disasm_view::capture_selected_workspace());
 			}
 			if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)
 				&& in_body && hovered_line_idx >= 0)
@@ -1544,7 +1577,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ImGui::MenuItem("Go to in disassembly", "Dbl-Click", false, ctx_addr != 0)) {
 			g_state.last_cursor_addr = ctx_addr;
 			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(ctx_addr, g_disasm);
+			disasm_view::goto_address(ctx_addr, disasm_view::capture_selected_workspace());
 		}
 		ImGui::Separator();
 		if (ImGui::MenuItem("Select all in block", "Ctrl+A", false,
@@ -1818,6 +1851,256 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	dl->PopClipRect();
+}
+
+struct workspace_graph_view_state_t {
+	std::size_t block_page = 0;
+	float pan_x = 0.0f;
+	float pan_y = 0.0f;
+	float zoom = 1.0f;
+	std::optional<aida::analysis::entity_id_t> selected_block;
+};
+
+inline std::mutex& workspace_graph_registry_mutex()
+{
+	static std::mutex value;
+	return value;
+}
+
+inline std::unordered_map<aida::analysis::binary_id_t,
+	std::shared_ptr<workspace_graph_view_state_t>,
+	aida::analysis::binary_id_hash_t>& workspace_graph_registry()
+{
+	static std::unordered_map<aida::analysis::binary_id_t,
+		std::shared_ptr<workspace_graph_view_state_t>,
+		aida::analysis::binary_id_hash_t> value;
+	return value;
+}
+
+inline std::shared_ptr<workspace_graph_view_state_t> workspace_graph_state(
+	const disasm_view::workspace_context_t& context)
+{
+	if (!context.workspace)
+		return {};
+	std::lock_guard<std::mutex> lock(workspace_graph_registry_mutex());
+	auto& registry = workspace_graph_registry();
+	const auto id = context.workspace->identity().binary_id();
+	auto found = registry.find(id);
+	if (found != registry.end())
+		return found->second;
+	auto created = std::make_shared<workspace_graph_view_state_t>();
+	registry.emplace(id, created);
+	return created;
+}
+
+inline const aida::analysis::function_record_t* workspace_graph_function(
+	const disasm_view::workspace_context_t& context)
+{
+	if (!context.publication || !context.publication->snapshot ||
+		context.publication->snapshot->functions.empty())
+		return nullptr;
+	const auto& functions = context.publication->snapshot->functions;
+	const auto selection = context.workspace->view_state().selection;
+	if (!selection)
+		return &functions.front();
+	auto found = std::upper_bound(functions.begin(), functions.end(), *selection,
+		[](const aida::analysis::address_t& address,
+		   const aida::analysis::function_record_t& function) {
+			return address < function.start;
+		});
+	if (found == functions.begin())
+		return &functions.front();
+	--found;
+	if (found->start.space == selection->space &&
+		selection->value >= found->start.value && selection->value < found->end.value)
+		return &*found;
+	return &functions.front();
+}
+
+inline void render(float pos_x, float pos_y, float width, float height,
+	float alpha, float, float, float,
+	const disasm_view::workspace_context_t& context)
+{
+	if (!context || !context.publication || !context.publication->snapshot) {
+		ImGui::BeginChild("##workspace_cfg_empty", ImVec2(width, height), false);
+		ImGui::TextUnformatted("A workspace CFG is not available at this readiness level.");
+		ImGui::EndChild();
+		return;
+	}
+	const auto* function = workspace_graph_function(context);
+	if (!function) {
+		ImGui::BeginChild("##workspace_cfg_no_function", ImVec2(width, height), false);
+		ImGui::TextUnformatted("No recovered function contains the current selection.");
+		ImGui::EndChild();
+		return;
+	}
+	auto view = workspace_graph_state(context);
+	if (!view)
+		return;
+	const auto& snapshot = *context.publication->snapshot;
+	const std::size_t first = function->first_block;
+	const std::size_t available = first <= snapshot.blocks.size()
+		? snapshot.blocks.size() - first : 0;
+	const std::size_t total = (std::min)(static_cast<std::size_t>(function->block_count), available);
+	constexpr std::size_t blocks_per_page = 256;
+	const std::size_t page_count = total == 0 ? 1 : (total + blocks_per_page - 1) / blocks_per_page;
+	if (view->block_page >= page_count)
+		view->block_page = page_count - 1;
+	const std::size_t page_begin = view->block_page * blocks_per_page;
+	const std::size_t page_end = (std::min)(total, page_begin + blocks_per_page);
+	const std::string id = context.workspace->identity().binary_id().to_hex();
+	ImGui::PushID(id.c_str());
+	ImGui::BeginChild("##workspace_cfg", ImVec2(width, height), false);
+	const auto function_address = disasm_view::runtime_address(context, function->start).value_or(
+		function->start.value);
+	const std::string function_name = disasm_view::resolve_name(context, function->start);
+	ImGui::Text("%s  0x%016llX  %zu blocks",
+		function_name.empty() ? "Recovered function" : function_name.c_str(),
+		static_cast<unsigned long long>(function_address), total);
+	ImGui::SameLine();
+	if (ImGui::Button("Disassembly")) {
+		disasm_view::goto_address(function_address, context);
+		globals::ui::active_center_view = center_view_t::disassembly;
+	}
+	if (page_count > 1) {
+		ImGui::SameLine();
+		if (ImGui::Button("Previous") && view->block_page != 0)
+			--view->block_page;
+		ImGui::SameLine();
+		ImGui::Text("Page %zu / %zu", view->block_page + 1, page_count);
+		ImGui::SameLine();
+		if (ImGui::Button("Next") && view->block_page + 1 < page_count)
+			++view->block_page;
+	}
+	ImGui::Separator();
+	ImGui::BeginChild("##workspace_cfg_canvas", ImVec2(0.0f, 0.0f), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	ImDrawList* draw = ImGui::GetWindowDrawList();
+	const ImVec2 canvas = ImGui::GetWindowPos();
+	const ImVec2 canvas_size = ImGui::GetWindowSize();
+	if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+		view->pan_x += ImGui::GetIO().MouseDelta.x;
+		view->pan_y += ImGui::GetIO().MouseDelta.y;
+	}
+	if (ImGui::IsWindowHovered()) {
+		const float wheel = ImGui::GetIO().MouseWheel;
+		if (wheel != 0.0f)
+			view->zoom = (std::clamp)(view->zoom + wheel * 0.08f, 0.55f, 1.8f);
+	}
+	const auto& theme = aida::ui::resolved();
+	const ImU32 edge_color = aida::ui::with_alpha(theme.text_dim, alpha * 0.8f);
+	const ImU32 call_color = aida::ui::with_alpha(theme.info, alpha);
+	const float node_width = 330.0f * view->zoom;
+	const float column_gap = 90.0f * view->zoom;
+	const float row_gap = 58.0f * view->zoom;
+	const int columns = (std::max)(1, static_cast<int>(canvas_size.x /
+		(node_width + column_gap)));
+	std::unordered_map<aida::analysis::entity_id_t, ImVec2> node_centers;
+	for (std::size_t local = page_begin; local < page_end; ++local) {
+		const auto& block = snapshot.blocks[first + local];
+		const std::size_t shown = (std::min)(static_cast<std::size_t>(block.instruction_count),
+			static_cast<std::size_t>(12));
+		const float node_height = (52.0f + static_cast<float>(shown) * 18.0f) * view->zoom;
+		const std::size_t page_local = local - page_begin;
+		const int column = static_cast<int>(page_local % static_cast<std::size_t>(columns));
+		const int row = static_cast<int>(page_local / static_cast<std::size_t>(columns));
+		const ImVec2 top_left(canvas.x + 20.0f + view->pan_x +
+			static_cast<float>(column) * (node_width + column_gap),
+			canvas.y + 20.0f + view->pan_y + static_cast<float>(row) *
+			(300.0f * view->zoom + row_gap));
+		const ImVec2 bottom_right(top_left.x + node_width, top_left.y + node_height);
+		node_centers[block.id] = ImVec2((top_left.x + bottom_right.x) * 0.5f,
+			(top_left.y + bottom_right.y) * 0.5f);
+	}
+	for (const auto& edge : snapshot.edges) {
+		auto source = node_centers.find(edge.source_entity);
+		if (source == node_centers.end() || !edge.target_entity)
+			continue;
+		auto target = node_centers.find(*edge.target_entity);
+		if (target == node_centers.end())
+			continue;
+		const ImU32 color = edge.kind == aida::analysis::edge_kind_t::call
+			? call_color : edge_color;
+		draw->AddBezierCubic(source->second,
+			ImVec2(source->second.x, (source->second.y + target->second.y) * 0.5f),
+			ImVec2(target->second.x, (source->second.y + target->second.y) * 0.5f),
+			target->second, color, 1.5f * view->zoom);
+	}
+	for (std::size_t local = page_begin; local < page_end; ++local) {
+		const auto& block = snapshot.blocks[first + local];
+		const std::size_t shown = (std::min)(static_cast<std::size_t>(block.instruction_count),
+			static_cast<std::size_t>(12));
+		const float node_height = (52.0f + static_cast<float>(shown) * 18.0f) * view->zoom;
+		const std::size_t page_local = local - page_begin;
+		const int column = static_cast<int>(page_local % static_cast<std::size_t>(columns));
+		const int row = static_cast<int>(page_local / static_cast<std::size_t>(columns));
+		const ImVec2 top_left(canvas.x + 20.0f + view->pan_x +
+			static_cast<float>(column) * (node_width + column_gap),
+			canvas.y + 20.0f + view->pan_y + static_cast<float>(row) *
+			(300.0f * view->zoom + row_gap));
+		const ImVec2 bottom_right(top_left.x + node_width, top_left.y + node_height);
+		const bool selected = view->selected_block && *view->selected_block == block.id;
+		draw->AddRectFilled(top_left, bottom_right,
+			aida::ui::with_alpha(selected ? theme.accent_dim : theme.panel_bg, alpha),
+			7.0f * view->zoom);
+		draw->AddRect(top_left, bottom_right,
+			aida::ui::with_alpha(selected ? theme.accent_u32 : theme.border_subtle, alpha),
+			7.0f * view->zoom, 0, selected ? 2.0f : 1.0f);
+		const auto block_address = disasm_view::runtime_address(context, block.start).value_or(
+			block.start.value);
+		char header[96]{};
+		std::snprintf(header, sizeof(header), "loc_%llX  confidence %u",
+			static_cast<unsigned long long>(block_address),
+			static_cast<unsigned>(block.confidence));
+		draw->AddText(ImVec2(top_left.x + 10.0f, top_left.y + 8.0f),
+			aida::ui::with_alpha(theme.text_primary, alpha), header);
+		const std::size_t instruction_begin = block.first_instruction;
+		const std::size_t instruction_end = (std::min)(snapshot.instructions.size(),
+			instruction_begin + shown);
+		disasm_view::request_format_range(context, instruction_begin, instruction_end);
+		float text_y = top_left.y + 30.0f * view->zoom;
+		for (std::size_t index = instruction_begin; index < instruction_end; ++index) {
+			const auto& instruction = snapshot.instructions[index];
+			const auto formatted = disasm_view::formatted_instruction(context, instruction.id);
+			const auto address = disasm_view::runtime_address(context, instruction.address).value_or(
+				instruction.address.value);
+			char prefix[32]{};
+			std::snprintf(prefix, sizeof(prefix), "%llX",
+				static_cast<unsigned long long>(address));
+			draw->AddText(ImVec2(top_left.x + 10.0f, text_y),
+				aida::ui::with_alpha(theme.text_dim, alpha), prefix);
+			draw->AddText(ImVec2(top_left.x + 92.0f * view->zoom, text_y),
+				aida::ui::with_alpha(theme.text_primary, alpha),
+				formatted ? formatted->text.c_str() : "Formatting...");
+			text_y += 18.0f * view->zoom;
+		}
+		ImGui::SetCursorScreenPos(top_left);
+		ImGui::PushID(static_cast<int>(block.id & 0x7FFFFFFF));
+		if (ImGui::InvisibleButton("##workspace_cfg_node",
+			ImVec2(node_width, node_height))) {
+			view->selected_block = block.id;
+			disasm_view::goto_address(block_address, context);
+			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+				globals::ui::active_center_view = center_view_t::disassembly;
+		}
+		if (ImGui::BeginPopupContextItem("##workspace_cfg_actions")) {
+			if (ImGui::MenuItem("Go to disassembly")) {
+				disasm_view::goto_address(block_address, context);
+				globals::ui::active_center_view = center_view_t::disassembly;
+			}
+			if (ImGui::MenuItem("Copy block address")) {
+				char address[32]{};
+				std::snprintf(address, sizeof(address), "%016llX",
+					static_cast<unsigned long long>(block_address));
+				ImGui::SetClipboardText(address);
+			}
+			ImGui::EndPopup();
+		}
+		ImGui::PopID();
+	}
+	ImGui::EndChild();
+	ImGui::EndChild();
+	ImGui::PopID();
 }
 
 }

@@ -8,8 +8,10 @@
 #include <bitset>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef AIDA_STANDALONE
 #include <Zydis/Zydis.h>
@@ -339,6 +341,65 @@ namespace vm_compiler {
             emit_raw(result_reg);
         }
 
+        void emit_vm_entangle(uint8_t vm_index, uint32_t child_bc_offset,
+                              uint32_t child_bc_len, uint8_t result_reg)
+        {
+            emit_opcode(virtualizer::detail::OP_VM_ENTANGLE);
+            emit_raw(vm_index);
+            emit_u32(child_bc_offset);
+            emit_u32(child_bc_len);
+            emit_raw(result_reg);
+        }
+
+        void emit_junk_add(uint8_t reg_a, uint8_t reg_b)
+        {
+            emit_opcode(virtualizer::detail::OP_JUNK_ADD);
+            emit_raw(reg_a);
+            emit_raw(reg_b);
+        }
+
+        void emit_junk_mul(uint8_t reg_a, uint8_t reg_b)
+        {
+            emit_opcode(virtualizer::detail::OP_JUNK_MUL);
+            emit_raw(reg_a);
+            emit_raw(reg_b);
+        }
+
+        void emit_junk_mem(uint8_t addr_reg, uint8_t off_reg)
+        {
+            emit_opcode(virtualizer::detail::OP_JUNK_MEM);
+            emit_raw(addr_reg);
+            emit_raw(off_reg);
+        }
+
+        void emit_junk_xor(uint8_t reg_a, uint8_t reg_b)
+        {
+            emit_opcode(virtualizer::detail::OP_JUNK_XOR);
+            emit_raw(reg_a);
+            emit_raw(reg_b);
+        }
+
+        void emit_load_reg_entangled(uint8_t vm_index, uint8_t src_reg, uint8_t dst_reg)
+        {
+            uint8_t packed = static_cast<uint8_t>((vm_index << 6) | (src_reg & 0x0F));
+            emit_opcode(virtualizer::detail::OP_LOAD_REG);
+            emit_raw(packed);
+            emit_raw(dst_reg);
+        }
+
+        void emit_store_reg_entangled(uint8_t vm_index, uint8_t dst_reg, uint8_t src_reg)
+        {
+            uint8_t packed = static_cast<uint8_t>((vm_index << 6) | (dst_reg & 0x0F));
+            emit_opcode(virtualizer::detail::OP_STORE_REG);
+            emit_raw(packed);
+            emit_raw(src_reg);
+        }
+
+        void emit_sync_barrier()
+        {
+            emit_opcode(virtualizer::detail::OP_NOP);
+        }
+
         void emit_load_imm8(uint8_t dst_reg, uint8_t value)
         {
             emit_opcode(virtualizer::detail::OP_LOAD_IMM8);
@@ -639,7 +700,7 @@ namespace vm_compiler {
             for (uint32_t i = 0; i < count; ++i)
             {
                 rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-                uint8_t choice = static_cast<uint8_t>(rng >> 33) % 5;
+                uint8_t choice = static_cast<uint8_t>(rng >> 33) % 9;
                 switch (choice)
                 {
                 case 0: emit_nop(); break;
@@ -651,6 +712,14 @@ namespace vm_compiler {
                 case 3: emit_not(static_cast<uint8_t>((rng >> 4) % 4) + 10,
                                  static_cast<uint8_t>((rng >> 8) % 4) + 10); break;
                 case 4: emit_rdtsc(static_cast<uint8_t>((rng >> 28) % 4) + 10); break;
+                case 5: emit_junk_add(static_cast<uint8_t>((rng >> 16) % 10),
+                                      static_cast<uint8_t>((rng >> 24) % 10)); break;
+                case 6: emit_junk_mul(static_cast<uint8_t>((rng >> 8) % 10),
+                                      static_cast<uint8_t>((rng >> 20) % 10)); break;
+                case 7: emit_junk_mem(static_cast<uint8_t>((rng >> 12) % 10),
+                                      static_cast<uint8_t>((rng >> 28) % 10)); break;
+                case 8: emit_junk_xor(static_cast<uint8_t>((rng >> 16) % 10),
+                                      static_cast<uint8_t>((rng >> 24) % 10)); break;
                 }
             }
         }
@@ -667,6 +736,15 @@ namespace vm_compiler {
             if (m_fixups.empty())
                 return m_bytecode;
 
+            std::unordered_map<uint32_t, uint32_t> label_ref_count;
+            for (auto& fix : m_fixups)
+                label_ref_count[fix.label_id]++;
+
+            for (auto& kv : label_ref_count)
+            {
+                if (kv.second >= 2)
+                    m_merge_points.insert(kv.first);
+            }
 
             for (auto& fix : m_fixups)
             {
@@ -674,11 +752,9 @@ namespace vm_compiler {
                 if (fix.label_id < m_labels.size())
                     target = m_labels[fix.label_id];
 
-
                 if (fix.offset + 4 <= m_raw_log.size())
                     memcpy(&m_raw_log[fix.offset], &target, 4);
             }
-
 
             m_bytecode.clear();
             m_rolling_key = m_initial_key;
@@ -687,6 +763,24 @@ namespace vm_compiler {
                 m_bytecode.push_back(detail::encrypt_byte(m_stream, b));
 
             return m_bytecode;
+        }
+
+        bool is_merge_point(uint32_t label_id) const
+        {
+            return m_merge_points.count(label_id) > 0;
+        }
+
+        uint32_t merge_point_count() const
+        {
+            return static_cast<uint32_t>(m_merge_points.size());
+        }
+
+        void emit_irreducible_branch(uint32_t cond_label, uint32_t merge_label)
+        {
+            emit_jz_label(cond_label);
+            emit_jmp_label(merge_label);
+            bind_label(cond_label);
+            emit_jmp_label(merge_label);
         }
 
     private:
@@ -705,6 +799,7 @@ namespace vm_compiler {
 
         std::vector<uint32_t> m_labels;
         std::vector<fixup_t>  m_fixups;
+        std::unordered_set<uint32_t> m_merge_points;
 
         void emit_opcode(uint8_t raw_opcode)
         {
@@ -891,6 +986,94 @@ namespace vm_compiler {
         prog.emit_halt();
 
         return prog.finalize();
+    }
+
+
+    inline std::vector<uint8_t> build_timing_canary_program(
+        uint64_t initial_key,
+        const uint8_t opcode_map[256])
+    {
+        program_t prog;
+        prog.set_key(initial_key);
+        prog.set_opcode_map(opcode_map);
+
+        auto label_collect = prog.create_label();
+        auto label_fail    = prog.create_label();
+        auto label_ok      = prog.create_label();
+
+        prog.emit_vm_enter();
+        prog.emit_junk(4);
+
+        prog.emit_load_imm(0, 0);
+        prog.emit_load_imm(1, 256);
+        prog.emit_load_imm(2, 0);
+        prog.emit_rdtsc(3);
+
+        prog.bind_label(label_collect);
+        prog.emit_rdtsc(4);
+        prog.emit_sub(5, 4, 3);
+        prog.emit_add(0, 0, 5);
+        prog.emit_load_reg(3, 4);
+        prog.emit_load_imm(6, 1);
+        prog.emit_add(2, 2, 6);
+        prog.emit_cmp(2, 1);
+        prog.emit_jl_label(label_collect);
+
+        prog.emit_load_reg(7, 0);
+        prog.emit_load_imm(6, 256);
+        prog.emit_div(7, 6);
+
+        prog.emit_load_imm(8, 10);
+        prog.emit_cmp(7, 8);
+        prog.emit_jl_label(label_fail);
+        prog.emit_load_imm(8, 10000);
+        prog.emit_cmp(7, 8);
+        prog.emit_jg_label(label_fail);
+
+        prog.bind_label(label_ok);
+        prog.emit_load_imm(0, 1);
+        prog.emit_vm_exit();
+        prog.emit_halt();
+
+        prog.bind_label(label_fail);
+        prog.emit_load_imm(0, 0);
+        prog.emit_vm_exit();
+        prog.emit_halt();
+
+        return prog.finalize();
+    }
+
+
+    inline std::pair<std::vector<uint8_t>, std::vector<uint8_t>>
+    build_entangled_anti_emu_programs(
+        uint64_t key_a, uint64_t key_b,
+        const uint8_t opcode_map_a[256],
+        const uint8_t opcode_map_b[256])
+    {
+        program_t prog_a;
+        prog_a.set_key(key_a);
+        prog_a.set_opcode_map(opcode_map_a);
+
+        prog_a.emit_vm_enter();
+        prog_a.emit_load_imm(14, 0x9E3779B97F4A7C15ULL);
+        prog_a.emit_load_imm(15, 0x6A09E667F3BCC908ULL);
+        prog_a.emit_hash(0, 14);
+        prog_a.emit_hash(0, 15);
+        prog_a.emit_vm_exit();
+        prog_a.emit_halt();
+
+        program_t prog_b;
+        prog_b.set_key(key_b);
+        prog_b.set_opcode_map(opcode_map_b);
+
+        prog_b.emit_vm_enter();
+        prog_b.emit_load_imm(14, 0xDEADBEEFDEADBEEFULL);
+        prog_b.emit_load_imm(15, 0xCAFEBABECAFEBABEULL);
+        prog_b.emit_junk(8);
+        prog_b.emit_vm_exit();
+        prog_b.emit_halt();
+
+        return { prog_a.finalize(), prog_b.finalize() };
     }
 
 #ifdef AIDA_STANDALONE
@@ -1502,7 +1685,7 @@ namespace x86_lifter {
                     } else {
                         uint8_t base_reg = zydis_reg_to_vreg(di.ops[1].mem.base);
                         prog.emit_load_reg(dst, base_reg);
-                        if (di.ops[1].mem.disp.size > 0 && di.ops[1].mem.disp.value != 0) {
+                        if (di.ops[1].mem.disp.has_displacement != ZYAN_FALSE && di.ops[1].mem.disp.value != 0) {
                             int64_t disp = di.ops[1].mem.disp.value;
                             prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(disp));
                             prog.emit_add(dst, dst, VREG_SCRATCH1);
@@ -1578,7 +1761,7 @@ namespace x86_lifter {
                 } else {
                     uint8_t base_reg = zydis_reg_to_vreg(di.ops[1].mem.base);
                     prog.emit_load_reg(VREG_SCRATCH0, base_reg);
-                    if (di.ops[1].mem.disp.size > 0 && di.ops[1].mem.disp.value != 0) {
+                    if (di.ops[1].mem.disp.has_displacement != ZYAN_FALSE && di.ops[1].mem.disp.value != 0) {
                         prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(di.ops[1].mem.disp.value));
                         prog.emit_add(VREG_SCRATCH0, VREG_SCRATCH0, VREG_SCRATCH1);
                     }
@@ -1602,7 +1785,7 @@ namespace x86_lifter {
                 } else {
                     uint8_t base_reg = zydis_reg_to_vreg(di.ops[0].mem.base);
                     prog.emit_load_reg(VREG_SCRATCH0, base_reg);
-                    if (di.ops[0].mem.disp.size > 0 && di.ops[0].mem.disp.value != 0) {
+                    if (di.ops[0].mem.disp.has_displacement != ZYAN_FALSE && di.ops[0].mem.disp.value != 0) {
                         prog.emit_load_imm(VREG_SCRATCH1, static_cast<uint64_t>(di.ops[0].mem.disp.value));
                         prog.emit_add(VREG_SCRATCH0, VREG_SCRATCH0, VREG_SCRATCH1);
                     }

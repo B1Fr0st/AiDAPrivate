@@ -23,8 +23,6 @@
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 
-extern DisasmState g_disasm;
-
 namespace seh_view {
 
 struct seh_entry_t {
@@ -545,7 +543,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					g_ui.selected,
 					static_cast<unsigned long long>(snapshot[g_ui.selected].handler_addr));
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(snapshot[g_ui.selected].handler_addr, g_disasm);
+				disasm_view::goto_address(snapshot[g_ui.selected].handler_addr,
+					disasm_view::capture_selected_workspace());
 			}
 			if (ImGui::MenuItem("Copy Address")) {
 				char abuf[24];

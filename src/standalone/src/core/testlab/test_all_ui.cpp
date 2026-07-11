@@ -725,7 +725,6 @@ struct ui_state_guard_t {
     bool code_active = code_editor::active;
     bool code_dirty = code_editor::dirty;
     float code_scroll_y = code_editor::scroll_y;
-    hex_view::state_t hex_state = hex_view::g_state;
     std::array<std::deque<std::string>, static_cast<std::size_t>(bottom_tab_t::COUNT)> log_lines;
     std::array<bool, static_cast<std::size_t>(bottom_tab_t::COUNT)> log_auto_scroll;
     std::array<bool, static_cast<std::size_t>(bottom_tab_t::COUNT)> log_select_all;
@@ -810,7 +809,6 @@ struct ui_state_guard_t {
         code_editor::scroll_y = code_scroll_y;
         file_tabs::tabs = tabs;
         file_tabs::active_tab = active_tab;
-        hex_view::g_state = hex_state;
         code_editor_widget::cancel_agent_edit();
         {
             std::lock_guard<std::mutex> log_lk(output_log::mutex);
@@ -943,12 +941,12 @@ static void test_file_browser_directory_and_routes(HANDLE hf, std::atomic<int>& 
         && image_view::is_image_extension(".ppm")
         && !image_view::is_image_extension(".exe")
         && !image_view::is_image_extension(".bin");
-    hex_view::load_from_file(binary.string(), 0, 4);
-    bool binary_route_seed_ok = std::filesystem::exists(binary, ec) && !ec
-        && hex_view::g_state.active
-        && hex_view::g_state.data.size() == 4
-        && hex_view::g_state.source_name == binary.filename().string()
-        && hex_view::last_error().empty();
+    auto hex_ctx = disasm_view::capture_selected_workspace();
+    hex_view::activate(hex_ctx);
+    bool binary_route_seed_ok = std::filesystem::exists(binary, ec) && !ec && hex_ctx.workspace
+        && hex_view::active(hex_ctx)
+        && hex_view::source_name(hex_ctx) == hex_ctx.workspace->identity().bin_name()
+        && hex_view::last_error(hex_ctx).empty();
     std::string current_after = file_browser::current_dir;
     std::size_t entries_after = file_browser::entries.size();
 
@@ -968,10 +966,10 @@ static void test_file_browser_directory_and_routes(HANDLE hf, std::atomic<int>& 
             toggle_ok ? 1 : 0,
             route_class_ok ? 1 : 0,
             binary_route_seed_ok ? 1 : 0,
-            hex_view::g_state.active ? 1 : 0,
-            hex_view::g_state.data.size(),
-            hex_view::g_state.source_name.c_str(),
-            hex_view::last_error().c_str(),
+            hex_view::active(hex_ctx) ? 1 : 0,
+            hex_ctx.workspace ? static_cast<std::size_t>(hex_ctx.workspace->provider().size()) : 0,
+            hex_view::source_name(hex_ctx).c_str(),
+            hex_view::last_error(hex_ctx).c_str(),
             current_after.c_str(),
             entries_after);
     }
@@ -1052,8 +1050,8 @@ static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& p
     network_view_state_guard_t network_guard;
     burp_detail_state_guard_t burp_guard;
     auto scan_hub_before = scan_hub_view::g_state;
-    auto analysis_hub_before = analysis_hub_view::g_state;
-    auto types_hub_before = types_hub_view::g_state;
+    const auto analysis_hub_before = analysis_hub_view::active_sub_tab();
+    const auto types_hub_before = types_hub_view::active_sub_tab();
     auto debugger_before = debugger_view::g_ui;
     auto aob_before = aob_view::g_state;
     int symbolic_tab_before = symbolic_view::active_tab();
@@ -1517,8 +1515,8 @@ static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& p
         && globals::ui::command_palette_buf[0] == '\0';
 
     scan_hub_view::g_state = scan_hub_before;
-    analysis_hub_view::g_state = analysis_hub_before;
-    types_hub_view::g_state = types_hub_before;
+    analysis_hub_view::set_sub_tab(analysis_hub_before);
+    types_hub_view::set_sub_tab(types_hub_before);
     debugger_view::g_ui = debugger_before;
     aob_view::g_state = aob_before;
     symbolic_view::set_active_tab(symbolic_tab_before);

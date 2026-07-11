@@ -32,6 +32,7 @@ namespace ida_utils
 
     std::string get_binary_metadata();
     bool is_self_target_database();
+    bool idb_is_aida_binary();
     void compute_self_identity();
     bool get_self_sha256(uint8_t out[32]);
     std::string get_imports_for_function(ea_t ea);

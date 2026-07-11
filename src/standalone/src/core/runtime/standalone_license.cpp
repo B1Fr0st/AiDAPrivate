@@ -6044,6 +6044,64 @@ namespace
             }
 
             attach_standalone_capsule_proof(body, action, key, hwid, session_token, nonce);
+
+            if (action == "heartbeat")
+            {
+                std::string build_id = get_build_id();
+                body["build_id"] = build_id;
+
+                const uint32_t hb_count = body.value("heartbeat_count", 0);
+                const std::string hb_nonce = body.value("heartbeat_nonce", std::string());
+                std::string canonical_payload = std::string(key)
+                    + "|" + session_token
+                    + "|" + hb_nonce
+                    + "|" + std::to_string(hb_count)
+                    + "|" + build_id;
+
+                std::string srv_nonce_str = settings.license_server_nonce;
+                std::vector<uint8_t> srv_nonce_bytes;
+                if (!srv_nonce_str.empty() && srv_nonce_str.size() >= 32)
+                {
+                    srv_nonce_bytes.reserve(srv_nonce_str.size() / 2);
+                    for (size_t i = 0; i + 1 < srv_nonce_str.size(); i += 2)
+                    {
+                        auto hex_val = [](char c) -> uint8_t {
+                            if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+                            if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+                            if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+                            return 0;
+                        };
+                        srv_nonce_bytes.push_back(
+                            static_cast<uint8_t>((hex_val(srv_nonce_str[i]) << 4) | hex_val(srv_nonce_str[i + 1])));
+                    }
+                }
+
+                if (!srv_nonce_bytes.empty() && srv_nonce_bytes.size() >= 16)
+                {
+                    uint8_t integrity_hmac[32] = {};
+                    bool hmac_ok = compute_integrity_gated_hmac(
+                        reinterpret_cast<const uint8_t*>(canonical_payload.data()),
+                        canonical_payload.size(),
+                        srv_nonce_bytes.data(), srv_nonce_bytes.size(),
+                        integrity_hmac);
+
+                    if (hmac_ok)
+                    {
+                        static const char hexd[] = "0123456789abcdef";
+                        char hmac_hex[65] = {};
+                        for (int i = 0; i < 32; ++i)
+                        {
+                            hmac_hex[i * 2]     = hexd[(integrity_hmac[i] >> 4) & 0xF];
+                            hmac_hex[i * 2 + 1] = hexd[integrity_hmac[i] & 0xF];
+                        }
+                        hmac_hex[64] = '\0';
+                        body["integrity_hmac"] = std::string(hmac_hex);
+                    }
+                    SecureZeroMemory(integrity_hmac, sizeof(integrity_hmac));
+                }
+                SecureZeroMemory(srv_nonce_bytes.data(), srv_nonce_bytes.size());
+            }
+
             std::string body_str = body.dump();
 
             if (call_validation_endpoint_once(action, key, hwid, session_token, nonce,
@@ -6068,6 +6126,61 @@ namespace
                 body["req_ts_ms"] = retry_req_ts_ms;
                 body["req_seq"] = std::to_string(retry_req_seq);
                 attach_standalone_capsule_proof(body, action, key, hwid, session_token, nonce);
+
+                if (action == "heartbeat" && body.contains("integrity_hmac"))
+                {
+                    body.erase("integrity_hmac");
+                    const std::string build_id = body.value("build_id", std::string());
+                    const uint32_t hb_count = body.value("heartbeat_count", 0);
+                    const std::string hb_nonce = body.value("heartbeat_nonce", std::string());
+                    std::string canonical_payload = std::string(key)
+                        + "|" + session_token
+                        + "|" + hb_nonce
+                        + "|" + std::to_string(hb_count)
+                        + "|" + build_id;
+
+                    std::string srv_nonce_str = settings.license_server_nonce;
+                    std::vector<uint8_t> srv_nonce_bytes;
+                    if (!srv_nonce_str.empty() && srv_nonce_str.size() >= 32)
+                    {
+                        srv_nonce_bytes.reserve(srv_nonce_str.size() / 2);
+                        for (size_t i = 0; i + 1 < srv_nonce_str.size(); i += 2)
+                        {
+                            auto hex_val = [](char c) -> uint8_t {
+                                if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+                                if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+                                if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+                                return 0;
+                            };
+                            srv_nonce_bytes.push_back(
+                                static_cast<uint8_t>((hex_val(srv_nonce_str[i]) << 4) | hex_val(srv_nonce_str[i + 1])));
+                        }
+                    }
+
+                    if (!srv_nonce_bytes.empty() && srv_nonce_bytes.size() >= 16)
+                    {
+                        uint8_t integrity_hmac[32] = {};
+                        if (compute_integrity_gated_hmac(
+                                reinterpret_cast<const uint8_t*>(canonical_payload.data()),
+                                canonical_payload.size(),
+                                srv_nonce_bytes.data(), srv_nonce_bytes.size(),
+                                integrity_hmac))
+                        {
+                            static const char hexd[] = "0123456789abcdef";
+                            char hmac_hex[65] = {};
+                            for (int i = 0; i < 32; ++i)
+                            {
+                                hmac_hex[i * 2]     = hexd[(integrity_hmac[i] >> 4) & 0xF];
+                                hmac_hex[i * 2 + 1] = hexd[integrity_hmac[i] & 0xF];
+                            }
+                            hmac_hex[64] = '\0';
+                            body["integrity_hmac"] = std::string(hmac_hex);
+                        }
+                        SecureZeroMemory(integrity_hmac, sizeof(integrity_hmac));
+                    }
+                    SecureZeroMemory(srv_nonce_bytes.data(), srv_nonce_bytes.size());
+                }
+
                 body_str = body.dump();
                 lic_log_fmt("heartbeat_retry_replay_fields req_seq=%llu req_ts_ms=%lld",
                     static_cast<unsigned long long>(retry_req_seq),
@@ -11210,5 +11323,71 @@ namespace standalone_license
             ok ? 1 : 0,
             completion_observed ? 1 : 0);
         return ok;
+    }
+
+    bool compute_integrity_gated_hmac(
+        const uint8_t* heartbeat_payload, size_t payload_len,
+        const uint8_t* server_nonce, size_t nonce_len,
+        uint8_t hmac_out[32])
+    {
+        if (!heartbeat_payload || payload_len == 0 || !server_nonce || nonce_len == 0 || !hmac_out)
+            return false;
+
+        uint8_t integrity_hash[32] = {};
+        if (!anti_tamper::integrity::get_current_text_sha256(integrity_hash))
+            return false;
+
+        uint8_t prk[32] = {};
+        anti_tamper::integrity::sha256::hmac(server_nonce, nonce_len,
+            integrity_hash, 32, prk);
+
+        static const uint8_t info[] = "aida_license_integrity_v1";
+        const size_t info_len = sizeof(info) - 1;
+        uint8_t session_key[32] = {};
+        anti_tamper::integrity::sha256::hkdf_expand(
+            prk, 32, info, info_len, session_key, 32);
+
+        anti_tamper::integrity::sha256::hmac(
+            session_key, 32, heartbeat_payload, payload_len, hmac_out);
+
+        SecureZeroMemory(integrity_hash, sizeof(integrity_hash));
+        SecureZeroMemory(prk, sizeof(prk));
+        SecureZeroMemory(session_key, sizeof(session_key));
+        return true;
+    }
+
+    std::string get_build_id()
+    {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) return "unknown";
+
+        char path[MAX_PATH] = {};
+        if (GetModuleFileNameA(mod, path, sizeof(path)) == 0)
+            return "unknown";
+
+        const auto* base = reinterpret_cast<const uint8_t*>(mod);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return "unknown";
+
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+            return "unknown";
+
+        uint8_t hash[32] = {};
+        if (!anti_tamper::integrity::sha256::hash(
+                reinterpret_cast<const void*>(nt),
+                sizeof(IMAGE_NT_HEADERS64), hash))
+            return "unknown";
+
+        static const char hexd[] = "0123456789abcdef";
+        std::string result;
+        result.reserve(16);
+        for (int i = 0; i < 8; ++i)
+        {
+            result.push_back(hexd[(hash[i] >> 4) & 0xF]);
+            result.push_back(hexd[hash[i] & 0xF]);
+        }
+        return result;
     }
 }

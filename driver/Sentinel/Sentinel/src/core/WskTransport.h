@@ -9,6 +9,7 @@
 #include "peer_attest.h"
 #include "ProcessNotify.h"
 #include "BridgeV2.h"
+#include "Heartbeat.h"
 
 namespace wsk_transport
 {
@@ -1949,7 +1950,22 @@ namespace wsk_transport
         }
         append_str("\"hvci\":"); append_dec(hvci ? 1 : 0); append_char(',');
         append_str("\"build\":"); append_dec(nt_build); append_char(',');
-        append_str("\"missed\":"); append_dec(static_cast<ULONG>(missed));
+        append_str("\"missed\":"); append_dec(static_cast<ULONG>(missed)); append_char(',');
+        append_str("\"dma\":\"");
+        {
+            UINT8 dma_state[8] = {};
+            dma_state[0] = static_cast<UINT8>(_InterlockedCompareExchange(&heartbeat::g_dma_tier1_refused, 0, 0));
+            dma_state[1] = static_cast<UINT8>(_InterlockedCompareExchange(&heartbeat::g_dma_tier2_bsod_armed, 0, 0));
+            dma_state[2] = static_cast<UINT8>(_InterlockedCompareExchange(&heartbeat::g_dma_canary_count, 0, 0));
+            ULONG canary_hits_val = static_cast<ULONG>(_InterlockedCompareExchange(&heartbeat::g_dma_canary_hits, 0, 0));
+            dma_state[3] = static_cast<UINT8>(canary_hits_val & 0xFF);
+            dma_state[4] = static_cast<UINT8>((canary_hits_val >> 8) & 0xFF);
+            dma_state[5] = static_cast<UINT8>(_InterlockedCompareExchange(&heartbeat::g_dma_pcie_unknown_count, 0, 0));
+            dma_state[6] = static_cast<UINT8>(_InterlockedCompareExchange(&heartbeat::g_dma_ept_anomaly, 0, 0));
+            dma_state[7] = 0;
+            append_hex_buf(dma_state, 8);
+        }
+        append_str("\"");
         append_char('}');
 
         *out_len = static_cast<ULONG>(len);
@@ -2157,6 +2173,454 @@ namespace wsk_transport
         due.QuadPart = -static_cast<LONGLONG>(interval) * 10000LL;
         KeSetTimer(&g_heartbeat_timer, due, &g_heartbeat_dpc);
         SN_LOG("wsk_transport::start_heartbeat_timer: timer armed, interval=%lums", interval);
+    }
+
+    struct dma_report_state_t {
+        volatile LONG queued;
+        volatile LONG cmd;
+        volatile LONG param;
+    };
+
+    inline dma_report_state_t g_dma_report = {};
+    inline WORK_QUEUE_ITEM    g_dma_report_work_item = {};
+
+    static void build_dma_report_payload(UINT8* buf, ULONG buf_size, ULONG* out_len,
+        const UINT8 heartbeat_subkey[32], ULONG cmd, ULONG param)
+    {
+        if (!buf || buf_size < 1024) { *out_len = 0; return; }
+
+        UINT8 nonce[8];
+        kernel_crypto::gen_random(nonce, sizeof(nonce));
+        UINT64 nonce_val = *reinterpret_cast<UINT64*>(nonce);
+
+        UINT8 code_hmac[32] = {};
+        if (integrity::g_code_base && integrity::g_code_size > 0)
+        {
+            kernel_crypto::hmac_sha256(heartbeat_subkey, 32,
+                reinterpret_cast<const UINT8*>(const_cast<PVOID>(integrity::g_code_base)),
+                integrity::g_code_size, code_hmac);
+        }
+
+        LONGLONG seq = _InterlockedIncrement64(&g_msg_seq);
+        LARGE_INTEGER perf;
+        KeQueryPerformanceCounter(&perf);
+
+        volatile ULONG* nt_build_ptr = reinterpret_cast<volatile ULONG*>(0xFFFFF78000000260ULL);
+        ULONG nt_build = 0;
+        __try { nt_build = *nt_build_ptr & 0xFFFF; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        int len = 0;
+        const char* fmt = "POST /api/sentinel/dma-report HTTP/1.1\r\n"
+                          "Host: aidapro.net\r\n"
+                          "Content-Type: application/json\r\n"
+                          "X-Sentinel-Token: ";
+        while (fmt[len] && len < (int)buf_size - 1) { buf[len] = fmt[len]; ++len; }
+
+        auto append_char = [&](char c) { if (len < (int)buf_size - 1) buf[len++] = c; };
+        auto append_str = [&](const char* s) { while (*s && len < (int)buf_size - 1) buf[len++] = *s++; };
+        auto append_hex_buf = [&](const UINT8* data, ULONG sz) {
+            for (ULONG i = 0; i < sz && len < (int)buf_size - 2; ++i)
+            {
+                static const char* digits = "0123456789abcdef";
+                buf[len++] = digits[(data[i] >> 4) & 0xF];
+                buf[len++] = digits[data[i] & 0xF];
+            }
+        };
+        auto append_hex = [&](UINT64 val) {
+            char hex[17]; int pos = 16; hex[16] = 0;
+            for (int i = 0; i < 16; ++i) { hex[--pos] = "0123456789abcdef"[val & 0xF]; val >>= 4; }
+            append_str(hex);
+        };
+        auto append_dec = [&](ULONG val) {
+            char dec[12]; int pos = 0;
+            if (val == 0) { append_char('0'); return; }
+            while (val > 0 && pos < 10) { dec[pos++] = '0' + (val % 10); val /= 10; }
+            for (int i = pos - 1; i >= 0; --i) append_char(dec[i]);
+        };
+        auto append_dec_ll = [&](LONGLONG val) {
+            char dec[24]; int pos = 0;
+            if (val == 0) { append_char('0'); return; }
+            ULONGLONG uv = (val < 0) ? (ULONGLONG)(-val) : (ULONGLONG)val;
+            while (uv > 0 && pos < 22) { dec[pos++] = '0' + (uv % 10); uv /= 10; }
+            for (int i = pos - 1; i >= 0; --i) append_char(dec[i]);
+        };
+
+        UINT8 token_input[96] = {};
+        ULONG ti = 0;
+        for (int i = 7; i >= 0; --i) token_input[ti++] = static_cast<UINT8>((seq >> (i * 8)) & 0xFF);
+        for (int i = 7; i >= 0; --i) token_input[ti++] = static_cast<UINT8>((nonce_val >> (i * 8)) & 0xFF);
+        RtlCopyMemory(token_input + ti, code_hmac, 16); ti += 16;
+        UINT8 tok[32] = {};
+        kernel_crypto::hmac_sha256(heartbeat_subkey, 32, token_input, ti, tok);
+        append_hex_buf(tok, 16);
+        append_str("\r\n\r\n");
+
+        append_char('{');
+        append_str("\"cmd\":\""); append_hex(static_cast<UINT64>(cmd)); append_str("\",");
+        append_str("\"param\":\""); append_hex(static_cast<UINT64>(param)); append_str("\",");
+        append_str("\"n\":\""); append_hex(nonce_val); append_str("\",");
+        append_str("\"seq\":"); append_dec_ll(seq); append_char(',');
+        append_str("\"qpc\":"); append_dec(static_cast<ULONG>(perf.LowPart)); append_char(',');
+        append_str("\"crc\":\""); append_hex_buf(code_hmac, 32); append_str("\",");
+        append_str("\"build\":"); append_dec(nt_build);
+        append_char('}');
+
+        *out_len = static_cast<ULONG>(len);
+    }
+
+    static void NTAPI dma_report_work_thread(PVOID)
+    {
+        SN_LOG("dma_report_work_thread: ENTRY wsk_ready=%u",
+            (UINT32)g_wsk_ready);
+
+        ULONG dma_cmd = static_cast<ULONG>(_InterlockedCompareExchange(&g_dma_report.cmd, 0, 0));
+        ULONG dma_param = static_cast<ULONG>(_InterlockedCompareExchange(&g_dma_report.param, 0, 0));
+
+        if (!g_wsk_ready)
+        {
+            SN_LOG("dma_report_work_thread: SKIP - wsk not ready");
+            goto dma_done;
+        }
+
+        {
+            PWSK_SOCKET sock = create_tcp_socket();
+            if (!sock)
+            {
+                SN_LOG("dma_report_work_thread: FAIL - create_tcp_socket_failed");
+                goto dma_done;
+            }
+
+            ULONG server_ip = get_server_ip();
+            NTSTATUS st = connect_socket(sock, server_ip, SERVER_PORT);
+            if (!NT_SUCCESS(st))
+            {
+                SN_LOG("dma_report_work_thread: FAIL - connect_socket_failed status=0x%08lx", st);
+                close_socket(sock);
+                goto dma_done;
+            }
+
+            tls13_session_t* sess = static_cast<tls13_session_t*>(
+                ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(tls13_session_t), WSK_POOL_TAG));
+            if (!sess)
+            {
+                SN_LOG("dma_report_work_thread: FAIL - session_alloc_failed size=%lu", (ULONG)sizeof(tls13_session_t));
+                close_socket(sock);
+                goto dma_done;
+            }
+            RtlZeroMemory(sess, sizeof(*sess));
+
+            st = tls13_handshake(sock, sess);
+            if (!NT_SUCCESS(st) || !sess->spki_matched)
+            {
+                SN_LOG("dma_report_work_thread: FAIL - tls13_handshake status=0x%08lx spki=%u",
+                    st, (UINT32)sess->spki_matched);
+                RtlSecureZeroMemory(sess, sizeof(*sess));
+                ExFreePoolWithTag(sess, WSK_POOL_TAG);
+                close_socket(sock);
+                goto dma_done;
+            }
+
+            UINT8 hb_subkey[32] = {};
+            if (!witness_key::derive_subkey("sentinel/hb/v1", hb_subkey))
+            {
+                SN_LOG("dma_report_work_thread: FAIL - witness_key_derive_subkey_failed");
+                RtlSecureZeroMemory(sess, sizeof(*sess));
+                ExFreePoolWithTag(sess, WSK_POOL_TAG);
+                close_socket(sock);
+                goto dma_done;
+            }
+
+            ULONG payload_len = 0;
+            build_dma_report_payload(sess->scratch_payload, sizeof(sess->scratch_payload),
+                &payload_len, hb_subkey, dma_cmd, dma_param);
+            RtlSecureZeroMemory(hb_subkey, sizeof(hb_subkey));
+
+            if (payload_len > 0)
+            {
+                st = tls13_send_record(sock, TLS_CONTENT_APPLICATION_DATA,
+                    sess->scratch_payload, payload_len, sess, TRUE);
+                SN_LOG("dma_report_work_thread: send_record status=0x%08lx len=%lu cmd=0x%lx param=0x%lx",
+                    st, payload_len, dma_cmd, dma_param);
+            }
+            else
+            {
+                SN_LOG("dma_report_work_thread: FAIL - build_dma_report_payload returned zero");
+            }
+
+            RtlSecureZeroMemory(sess, sizeof(*sess));
+            ExFreePoolWithTag(sess, WSK_POOL_TAG);
+            close_socket(sock);
+        }
+
+    dma_done:
+        _PsTerminateSystemThread(STATUS_SUCCESS);
+    }
+
+    static VOID NTAPI dma_report_work_item_callback(PVOID)
+    {
+        SN_LOG("wsk_transport::dma_report_work_item_callback: ENTRY");
+
+        HANDLE thread_handle = nullptr;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, nullptr, OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+        NTSTATUS st = _PsCreateSystemThread(
+            &thread_handle, THREAD_ALL_ACCESS, &oa,
+            nullptr, nullptr, dma_report_work_thread, nullptr);
+        if (NT_SUCCESS(st) && thread_handle)
+            _ZwClose(thread_handle);
+        else
+            SN_LOG("wsk_transport::dma_report_work_item_callback: PsCreateSystemThread FAILED status=0x%08lx", st);
+
+        _InterlockedExchange(&g_dma_report.queued, 0);
+    }
+
+    __forceinline void queue_dma_report(ULONG cmd, ULONG param)
+    {
+        _InterlockedExchange(&g_dma_report.cmd, static_cast<LONG>(cmd));
+        _InterlockedExchange(&g_dma_report.param, static_cast<LONG>(param));
+        if (_InterlockedCompareExchange(&g_dma_report.queued, 1, 0) == 0)
+        {
+            ExInitializeWorkItem(&g_dma_report_work_item, dma_report_work_item_callback, nullptr);
+            _ExQueueWorkItem(&g_dma_report_work_item, DelayedWorkQueue);
+        }
+        SN_LOG("wsk_transport::queue_dma_report: cmd=0x%lx param=0x%lx queued=%ld",
+            cmd, param, _InterlockedCompareExchange(&g_dma_report.queued, 0, 0));
+    }
+
+    struct attest_report_state_t {
+        volatile LONG queued;
+        UINT8 payload[136];
+    };
+
+    inline attest_report_state_t g_attest_report = {};
+    inline WORK_QUEUE_ITEM       g_attest_report_work_item = {};
+
+    static void build_attest_payload(UINT8* buf, ULONG buf_size, ULONG* out_len,
+        const UINT8 heartbeat_subkey[32],
+        const UINT8* attest_raw, ULONG attest_raw_size)
+    {
+        if (!buf || buf_size < 2048 || !out_len || !attest_raw || attest_raw_size != 136) {
+            if (out_len) *out_len = 0;
+            return;
+        }
+
+        UINT8 nonce[8];
+        kernel_crypto::gen_random(nonce, sizeof(nonce));
+        UINT64 nonce_val = *reinterpret_cast<UINT64*>(nonce);
+
+        LONGLONG seq = _InterlockedIncrement64(&g_msg_seq);
+        LARGE_INTEGER perf;
+        KeQueryPerformanceCounter(&perf);
+
+        volatile ULONG* nt_build_ptr = reinterpret_cast<volatile ULONG*>(0xFFFFF78000000260ULL);
+        ULONG nt_build = 0;
+        __try { nt_build = *nt_build_ptr & 0xFFFF; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        int len = 0;
+        const char* fmt = "POST /api/sentinel/integrity-attest HTTP/1.1\r\n"
+                          "Host: aidapro.net\r\n"
+                          "Content-Type: application/json\r\n"
+                          "X-Sentinel-Token: ";
+        while (fmt[len] && len < (int)buf_size - 1) { buf[len] = fmt[len]; ++len; }
+
+        auto append_char = [&](char c) { if (len < (int)buf_size - 1) buf[len++] = c; };
+        auto append_str = [&](const char* s) { while (*s && len < (int)buf_size - 1) buf[len++] = *s++; };
+        auto append_hex_buf = [&](const UINT8* data, ULONG sz) {
+            for (ULONG i = 0; i < sz && len < (int)buf_size - 2; ++i)
+            {
+                static const char* digits = "0123456789abcdef";
+                buf[len++] = digits[(data[i] >> 4) & 0xF];
+                buf[len++] = digits[data[i] & 0xF];
+            }
+        };
+        auto append_hex = [&](UINT64 val) {
+            char hex[17]; int pos = 16; hex[16] = 0;
+            for (int i = 0; i < 16; ++i) { hex[--pos] = "0123456789abcdef"[val & 0xF]; val >>= 4; }
+            append_str(hex);
+        };
+        auto append_dec = [&](ULONG val) {
+            char dec[12]; int pos = 0;
+            if (val == 0) { append_char('0'); return; }
+            while (val > 0 && pos < 10) { dec[pos++] = '0' + (val % 10); val /= 10; }
+            for (int i = pos - 1; i >= 0; --i) append_char(dec[i]);
+        };
+        auto append_dec_ll = [&](LONGLONG val) {
+            char dec[24]; int pos = 0;
+            if (val == 0) { append_char('0'); return; }
+            ULONGLONG uv = (val < 0) ? (ULONGLONG)(-val) : (ULONGLONG)val;
+            while (uv > 0 && pos < 22) { dec[pos++] = '0' + (uv % 10); uv /= 10; }
+            for (int i = pos - 1; i >= 0; --i) append_char(dec[i]);
+        };
+
+        const UINT8* p = attest_raw;
+        UINT8 code_hmac[32] = {};
+        kernel_crypto::hmac_sha256(heartbeat_subkey, 32, attest_raw, attest_raw_size, code_hmac);
+
+        UINT8 token_input[96] = {};
+        ULONG ti = 0;
+        for (int i = 7; i >= 0; --i) token_input[ti++] = static_cast<UINT8>((seq >> (i * 8)) & 0xFF);
+        for (int i = 7; i >= 0; --i) token_input[ti++] = static_cast<UINT8>((nonce_val >> (i * 8)) & 0xFF);
+        RtlCopyMemory(token_input + ti, code_hmac, 16); ti += 16;
+        UINT8 tok[32] = {};
+        kernel_crypto::hmac_sha256(heartbeat_subkey, 32, token_input, ti, tok);
+        append_hex_buf(tok, 16);
+        append_str("\r\n\r\n");
+
+        append_char('{');
+        append_str("\"nonce\":\""); append_hex_buf(p + 0, 16); append_str("\",");
+        append_str("\"usermode_code_hash\":\""); append_hex_buf(p + 16, 32); append_str("\",");
+        append_str("\"timestamp\":"); append_dec_ll(static_cast<LONGLONG>(*reinterpret_cast<const UINT64*>(p + 48))); append_char(',');
+        append_str("\"hardware_id\":\""); append_hex_buf(p + 56, 32); append_str("\",");
+        append_str("\"build_id\":\""); append_hex_buf(p + 88, 16); append_str("\",");
+        append_str("\"hmac\":\""); append_hex_buf(p + 104, 32); append_str("\",");
+        append_str("\"n\":\""); append_hex(nonce_val); append_str("\",");
+        append_str("\"seq\":"); append_dec_ll(seq); append_char(',');
+        append_str("\"qpc\":"); append_dec(static_cast<ULONG>(perf.LowPart)); append_char(',');
+        append_str("\"build\":"); append_dec(nt_build);
+        append_char('}');
+
+        *out_len = static_cast<ULONG>(len);
+        RtlSecureZeroMemory(code_hmac, sizeof(code_hmac));
+    }
+
+    static void NTAPI attest_report_work_thread(PVOID)
+    {
+        SN_LOG("attest_report_work_thread: ENTRY wsk_ready=%u",
+            (UINT32)g_wsk_ready);
+
+        UINT8 attest_raw[136];
+        RtlCopyMemory(attest_raw, g_attest_report.payload, 136);
+        _InterlockedExchange(&g_attest_report.queued, 0);
+
+        if (!g_wsk_ready)
+        {
+            SN_LOG("attest_report_work_thread: SKIP - wsk not ready");
+            RtlSecureZeroMemory(attest_raw, sizeof(attest_raw));
+            goto attest_done;
+        }
+
+        {
+            PWSK_SOCKET sock = create_tcp_socket();
+            if (!sock)
+            {
+                SN_LOG("attest_report_work_thread: FAIL - create_tcp_socket_failed");
+                RtlSecureZeroMemory(attest_raw, sizeof(attest_raw));
+                goto attest_done;
+            }
+
+            ULONG server_ip = get_server_ip();
+            NTSTATUS st = connect_socket(sock, server_ip, SERVER_PORT);
+            if (!NT_SUCCESS(st))
+            {
+                SN_LOG("attest_report_work_thread: FAIL - connect_socket_failed status=0x%08lx", st);
+                close_socket(sock);
+                RtlSecureZeroMemory(attest_raw, sizeof(attest_raw));
+                goto attest_done;
+            }
+
+            tls13_session_t* sess = static_cast<tls13_session_t*>(
+                ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(tls13_session_t), WSK_POOL_TAG));
+            if (!sess)
+            {
+                SN_LOG("attest_report_work_thread: FAIL - session_alloc_failed size=%lu", (ULONG)sizeof(tls13_session_t));
+                close_socket(sock);
+                RtlSecureZeroMemory(attest_raw, sizeof(attest_raw));
+                goto attest_done;
+            }
+            RtlZeroMemory(sess, sizeof(*sess));
+
+            st = tls13_handshake(sock, sess);
+            if (!NT_SUCCESS(st) || !sess->spki_matched)
+            {
+                SN_LOG("attest_report_work_thread: FAIL - tls13_handshake status=0x%08lx spki=%u",
+                    st, (UINT32)sess->spki_matched);
+                RtlSecureZeroMemory(sess, sizeof(*sess));
+                ExFreePoolWithTag(sess, WSK_POOL_TAG);
+                close_socket(sock);
+                RtlSecureZeroMemory(attest_raw, sizeof(attest_raw));
+                goto attest_done;
+            }
+
+            UINT8 hb_subkey[32] = {};
+            if (!witness_key::derive_subkey("sentinel/hb/v1", hb_subkey))
+            {
+                SN_LOG("attest_report_work_thread: FAIL - witness_key_derive_subkey_failed");
+                RtlSecureZeroMemory(sess, sizeof(*sess));
+                ExFreePoolWithTag(sess, WSK_POOL_TAG);
+                close_socket(sock);
+                RtlSecureZeroMemory(attest_raw, sizeof(attest_raw));
+                RtlSecureZeroMemory(hb_subkey, sizeof(hb_subkey));
+                goto attest_done;
+            }
+
+            ULONG payload_len = 0;
+            build_attest_payload(sess->scratch_payload, sizeof(sess->scratch_payload),
+                &payload_len, hb_subkey, attest_raw, 136);
+            RtlSecureZeroMemory(hb_subkey, sizeof(hb_subkey));
+            RtlSecureZeroMemory(attest_raw, sizeof(attest_raw));
+
+            if (payload_len > 0)
+            {
+                st = tls13_send_record(sock, TLS_CONTENT_APPLICATION_DATA,
+                    sess->scratch_payload, payload_len, sess, TRUE);
+                SN_LOG("attest_report_work_thread: send_record status=0x%08lx len=%lu", st, payload_len);
+
+                if (NT_SUCCESS(st))
+                {
+                    ULONG resp_len = 0;
+                    UINT8 type = 0;
+                    NTSTATUS rst = tls13_recv_record(sock, &type, sess->scratch_resp,
+                        sizeof(sess->scratch_resp), &resp_len, sess, TRUE);
+                    SN_LOG("attest_report_work_thread: recv_record status=0x%08lx type=0x%02X resp_len=%lu",
+                        rst, (UINT32)type, resp_len);
+                }
+            }
+            else
+            {
+                SN_LOG("attest_report_work_thread: FAIL - build_attest_payload returned zero");
+            }
+
+            RtlSecureZeroMemory(sess, sizeof(*sess));
+            ExFreePoolWithTag(sess, WSK_POOL_TAG);
+            close_socket(sock);
+        }
+
+    attest_done:
+        _PsTerminateSystemThread(STATUS_SUCCESS);
+    }
+
+    static VOID NTAPI attest_report_work_item_callback(PVOID)
+    {
+        SN_LOG("wsk_transport::attest_report_work_item_callback: ENTRY");
+
+        HANDLE thread_handle = nullptr;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, nullptr, OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+        NTSTATUS st = _PsCreateSystemThread(
+            &thread_handle, THREAD_ALL_ACCESS, &oa,
+            nullptr, nullptr, attest_report_work_thread, nullptr);
+        if (NT_SUCCESS(st) && thread_handle)
+            _ZwClose(thread_handle);
+        else
+            SN_LOG("wsk_transport::attest_report_work_item_callback: PsCreateSystemThread FAILED status=0x%08lx", st);
+    }
+
+    __forceinline void send_attestation(const void* attest_data, ULONG attest_size)
+    {
+        if (!attest_data || attest_size != 136) {
+            SN_LOG("wsk_transport::send_attestation: invalid size=%lu expected=136", attest_size);
+            return;
+        }
+        RtlCopyMemory(g_attest_report.payload, attest_data, 136);
+        if (_InterlockedCompareExchange(&g_attest_report.queued, 1, 0) == 0)
+        {
+            ExInitializeWorkItem(&g_attest_report_work_item, attest_report_work_item_callback, nullptr);
+            _ExQueueWorkItem(&g_attest_report_work_item, DelayedWorkQueue);
+        }
+        SN_LOG("wsk_transport::send_attestation: queued=%ld",
+            _InterlockedCompareExchange(&g_attest_report.queued, 0, 0));
     }
 
     __forceinline void shutdown()

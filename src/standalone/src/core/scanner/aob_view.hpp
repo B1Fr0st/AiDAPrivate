@@ -1,7 +1,11 @@
 #pragma once
 
 #include <cstdio>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <unordered_map>
 
 #include "imgui.h"
 #include "aob_generator.hpp"
@@ -43,6 +47,30 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline std::mutex& workspace_view_states_mutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
+
+inline std::unordered_map<std::string, std::shared_ptr<state_t>>& workspace_view_states()
+{
+	static std::unordered_map<std::string, std::shared_ptr<state_t>> states;
+	return states;
+}
+
+inline std::shared_ptr<state_t> view_state_for(const disasm_view::workspace_context_t& context)
+{
+	if (!context.workspace) return {};
+	const std::string key = context.workspace->identity().binary_id().to_hex();
+	std::lock_guard<std::mutex> lock(workspace_view_states_mutex());
+	auto& state = workspace_view_states()[key];
+	if (!state) {
+		state = std::make_shared<state_t>();
+	}
+	return state;
+}
 
 namespace detail {
 
@@ -136,22 +164,34 @@ inline void render_format_segmented(float x, float y, float& width_used, format_
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
-                   float alpha, float, float, float)
+                   float alpha, float, float, float,
+				   const disasm_view::workspace_context_t& context)
 {
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##aob_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 
+	const auto view_state = view_state_for(context);
+	const auto generator_state = aob_generator::state_for(context);
+	if (!view_state || !generator_state) {
+		aida::ui::empty_state::config_t config;
+		config.glyph = aida::ui::empty_state::glyph_t::binary_file;
+		config.title = "No analysis target";
+		config.body = "Open a binary or attach a live target to generate signatures.";
+		aida::ui::empty_state::render(ImGui::GetWindowPos(), ImGui::GetWindowSize(), config);
+		ImGui::EndChild();
+		return;
+	}
 	{
 		std::string pending_clip;
-		if (aob_generator::take_pending_clipboard(pending_clip)) {
+		if (aob_generator::take_pending_clipboard(generator_state, pending_clip)) {
 			ImGui::SetClipboardText(pending_clip.c_str());
 		}
 	}
 
 	auto* dl = ImGui::GetWindowDrawList();
-	auto& st = g_state;
-	auto& gen = aob_generator::g_state;
+	auto& st = *view_state;
+	auto& gen = *generator_state;
 
 	ImVec2 wp = ImGui::GetWindowPos();
 	float ox = wp.x;
@@ -192,8 +232,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	cy += 22.f;
 
 	{
-		bool live = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
-		bool pe = g_disasm.file.loaded && !g_disasm.file.sections.empty();
+		const bool live = context.workspace->target_kind() ==
+			aida::analysis::target_kind_t::live_snapshot;
+		const bool pe = context.workspace->target_kind() ==
+			aida::analysis::target_kind_t::static_file && static_cast<bool>(context.image);
 		if (!live && !pe) {
 			ui_anim::render_inline_callout(dl, cx, cy, left_w - 24.f, 22.f,
 				"Generate needs a live process attach or an open PE.",
@@ -292,10 +334,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				diag::log_tagged_fmt("aob",
 					"view generate dispatching addr=0x%llX count=%d",
 					static_cast<unsigned long long>(addr), gen.instruction_count);
-				aob_generator::generate_from_address(addr, gen.instruction_count, gen.auto_wildcard);
+				aob_generator::generate_from_address(context, addr, gen.instruction_count, gen.auto_wildcard);
 			} else {
-				bool live = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
-				bool pe = g_disasm.file.loaded && !g_disasm.file.sections.empty();
+				const bool live = context.workspace->target_kind() ==
+					aida::analysis::target_kind_t::live_snapshot;
+				const bool pe = context.workspace->target_kind() ==
+					aida::analysis::target_kind_t::static_file && static_cast<bool>(context.image);
 				diag::log_tagged_fmt("aob",
 					"view generate refused parse_failed input='%s' live=%d pe=%d",
 					gen.address_input, live ? 1 : 0, pe ? 1 : 0);
@@ -320,18 +364,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Regenerate", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), generating, nullptr, generating)) {
-			aob_generator::regenerate_last();
+			aob_generator::regenerate_last(context, generator_state);
 		}
 		run_x = ImGui::GetItemRectMax().x + btn_gap;
 
 		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Save", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md)) {
-			aob_generator::save_current();
+			aob_generator::save_current(generator_state);
 		}
 		run_x = ImGui::GetItemRectMax().x + btn_gap;
 
-		bool attached_live = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+		const auto process = context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
+			? context.workspace->identity().process() : std::nullopt;
+		const std::uint32_t live_pid = process ? process->pid : 0;
+		bool attached_live = driver_bridge::is_loaded() && live_pid != 0;
 		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Optimize", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !attached_live)) {
@@ -348,12 +395,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			sub.thread_class = "scanner_sweep";
 			sub.domain = aida::infra::executor::domain_t::long_running;
 			sub.priority = 2;
-			sub.target_pid = driver_bridge::attached_pid();
-			sub.body = [to_optimize]() mutable {
-				aob_generator::optimize_signature(to_optimize);
-				std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
-				if (aob_generator::g_state.current.id == to_optimize.id)
-					aob_generator::g_state.current = std::move(to_optimize);
+			sub.target_pid = live_pid;
+			sub.body = [live_pid, to_optimize, generator_state]() mutable {
+				aob_generator::optimize_signature(live_pid, to_optimize);
+				std::lock_guard<std::mutex> lk(generator_state->mutex);
+				if (generator_state->current.id == to_optimize.id)
+					generator_state->current = std::move(to_optimize);
 			};
 			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 				diag::log_tagged("aob", "optimize worker_queue_rejected");
@@ -535,7 +582,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.json";
 					free(appdata);
 					diag::log_tagged_fmt("aob", "export_json path='%s'", path.c_str());
-					aob_generator::export_signatures_json(path);
+					aob_generator::export_signatures_json(generator_state, path);
 				}
 			}
 			bx += 110.f;
@@ -550,7 +597,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (appdata) {
 					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.yar";
 					free(appdata);
-					aob_generator::export_signatures_yara(path);
+					aob_generator::export_signatures_yara(generator_state, path);
 				}
 			}
 			bx += 110.f;
@@ -564,14 +611,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (appdata) {
 					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\signatures.hpp";
 					free(appdata);
-					aob_generator::export_signatures_header(path);
+					aob_generator::export_signatures_header(generator_state, path);
 				}
 			}
 			cy += 30.f;
 
 			bx = cx;
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
-			bool attached_cmp = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+			const auto compare_process =
+				context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
+				? context.workspace->identity().process() : std::nullopt;
+			const std::uint32_t compare_pid = compare_process ? compare_process->pid : 0;
+			bool attached_cmp = driver_bridge::is_loaded() && compare_pid != 0;
 			if (aida::ui::button("Compare", aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !attached_cmp)) {
 				std::vector<aob_generator::signature_t> sigs_copy;
@@ -587,11 +638,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				sub.thread_class = "scanner_sweep";
 				sub.domain = aida::infra::executor::domain_t::long_running;
 				sub.priority = 2;
-				sub.target_pid = driver_bridge::attached_pid();
-				sub.body = [sigs_copy]() mutable {
-					auto results = aob_generator::compare_signatures_against_process(sigs_copy);
-					std::lock_guard<std::mutex> lk(aob_generator::g_state.mutex);
-					auto& saved = aob_generator::g_state.saved_signatures;
+				sub.target_pid = compare_pid;
+				sub.body = [compare_pid, sigs_copy, generator_state]() mutable {
+					auto results = aob_generator::compare_signatures_against_process(compare_pid, sigs_copy);
+					std::lock_guard<std::mutex> lk(generator_state->mutex);
+					auto& saved = generator_state->saved_signatures;
 					for (size_t ri = 0; ri < results.size() && ri < saved.size() && ri < sigs_copy.size(); ++ri) {
 						if (saved[ri].id != sigs_copy[ri].id) continue;
 						saved[ri].unique = results[ri].still_found;
@@ -607,14 +658,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Save Disk", aida::ui::button_kind_t::ghost,
 					aida::ui::size_t_::sm)) {
-				aob_generator::save_signatures_to_disk();
+				aob_generator::save_signatures_to_disk(context, generator_state);
 			}
 			bx += 96.f;
 
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Load Disk", aida::ui::button_kind_t::ghost,
 					aida::ui::size_t_::sm)) {
-				aob_generator::load_signatures_from_disk();
+				aob_generator::load_signatures_from_disk(context, generator_state);
 			}
 		}
 	} else {
@@ -744,12 +795,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			auto& csig = saved_copy[static_cast<size_t>(ctx_saved_idx)];
 			if (ImGui::MenuItem("Open in Disassembly")) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(csig.address, g_disasm);
+				disasm_view::goto_address(csig.address, context);
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob saved ctx open_disasm");
 			}
 			if (ImGui::MenuItem("Open in Hex")) {
-				hex_view::read_from_process(csig.address, 256);
+				if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
+					hex_view::read_from_process(context, csig.address, 256);
+				} else if (const auto address = disasm_view::typed_address(context, csig.address)) {
+					auto bytes = disasm_view::read_bytes(context, *address, 256);
+					if (bytes) hex_view::set_data(context, bytes.value(), csig.address,
+						context.workspace->identity().bin_name());
+				}
 				globals::ui::active_center_view = center_view_t::hex_view;
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob saved ctx open_hex");
@@ -824,6 +881,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	ImGui::EndChild();
+}
+
+inline void render(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b)
+{
+	render(pos_x, pos_y, width, height, alpha, accent_r, accent_g, accent_b,
+		disasm_view::capture_selected_workspace());
 }
 
 }

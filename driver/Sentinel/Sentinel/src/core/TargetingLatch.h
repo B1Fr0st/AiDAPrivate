@@ -12,6 +12,8 @@ namespace targeting_latch {
     constexpr ULONG RE_REASON_DEBUG_PORT_TRAP   = 0x0000AB04u;
     constexpr ULONG RE_REASON_DMA_CANARY        = 0x00005E43u;
     constexpr ULONG RE_REASON_TEXT_WRITABLE     = 0x0000D7ECu;
+    constexpr ULONG RE_REASON_HEADER_RESTORE     = 0x0000D7EDu;
+    constexpr ULONG RE_REASON_TEXT_PAGE_ACCESSED = 0x0000D7EEu;
 
     inline volatile LONG   g_targeting_confirmed = 0;
     inline KTIMER          g_latch_timer = {};

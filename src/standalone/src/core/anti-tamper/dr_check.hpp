@@ -6,11 +6,11 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <mutex>
 #include <string>
 
 #include "../runtime/reason_ids.hpp"
 #include "webhook.hpp"
+#include "syscall.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -22,29 +22,15 @@ namespace dr_check {
 
 namespace detail {
 
-    using nt_get_context_thread_fn = LONG(NTAPI*)(HANDLE, PCONTEXT);
-
-    inline nt_get_context_thread_fn& resolved_fn()
+    inline bool query_thread_debug_registers(CONTEXT& ctx)
     {
-        static nt_get_context_thread_fn f = nullptr;
-        return f;
-    }
-
-    inline std::once_flag& resolve_once_flag()
-    {
-        static std::once_flag o;
-        return o;
-    }
-
-    inline void resolve_fn_once()
-    {
-        std::call_once(resolve_once_flag(), []() {
-            HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-            if (!nt)
-                return;
-            FARPROC p = GetProcAddress(nt, "NtGetContextThread");
-            resolved_fn() = reinterpret_cast<nt_get_context_thread_fn>(p);
-        });
+        if (!syscall::is_initialized())
+            return false;
+        ctx = {};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        NTSTATUS status = syscall::NtQueryInformationThread()(
+            GetCurrentThread(), 0x16, &ctx, sizeof(ctx), nullptr);
+        return status >= 0;
     }
 
     inline std::atomic<uint32_t>& gate_counter_for_slot(uint32_t slot_id)
@@ -78,14 +64,9 @@ namespace detail {
 
 inline bool any_hw_breakpoint_set()
 {
-    detail::resolve_fn_once();
-    auto fn = detail::resolved_fn();
-    if (!fn) return false;
-
     CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    LONG status = fn(GetCurrentThread(), &ctx);
-    if (status < 0) return false;
+    if (!detail::query_thread_debug_registers(ctx))
+        return false;
 
     if ((ctx.Dr0 | ctx.Dr1 | ctx.Dr2 | ctx.Dr3) != 0)
         return true;

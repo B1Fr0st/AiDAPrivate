@@ -85,8 +85,61 @@ typedef struct _RTL_PROCESS_MODULES {
 } RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
 
 typedef enum _SYSTEM_INFORMATION_CLASS_INTERNAL {
-    SystemModuleInformationInternal = 11
+    SystemModuleInformationInternal = 11,
+    SystemProcessInformationInternal = 5,
+    SystemHandleInformationInternal = 16
 } SYSTEM_INFORMATION_CLASS_INTERNAL;
+
+typedef struct _SYSTEM_PROCESS_INFORMATION_ENTRY {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+} SYSTEM_PROCESS_INFORMATION_ENTRY, *PSYSTEM_PROCESS_INFORMATION_ENTRY;
+
+typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_X {
+    ULONG UniqueProcessId;
+    UCHAR ObjectTypeIndex;
+    UCHAR HandleAttributes;
+    USHORT HandleValue;
+    PVOID Object;
+    ULONG GrantedAccess;
+} SYSTEM_HANDLE_TABLE_ENTRY_INFO_X, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO_X;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION_X {
+    ULONG NumberOfHandles;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO_X Handles[1];
+} SYSTEM_HANDLE_INFORMATION_X, *PSYSTEM_HANDLE_INFORMATION_X;
+
+typedef struct _UM_PEB_LDR_DATA_X {
+    ULONG Length;
+    UCHAR Initialized;
+    PVOID SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+} UM_PEB_LDR_DATA_X, *PUM_PEB_LDR_DATA_X;
+
+typedef struct _UM_LDR_DATA_TABLE_ENTRY_X {
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    ULONG Padding;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+} UM_LDR_DATA_TABLE_ENTRY_X, *PUM_LDR_DATA_TABLE_ENTRY_X;
+
+constexpr ULONG_PTR AIDA_WATERMARK_MAGIC = 0xA1DA71A5u;
+constexpr ULONG_PTR AIDA_WATERMARK_OPT_HDR_OFFSET = 0x70;
+constexpr ULONG BUGCHECK_MODULE_CROSSCHECK = 0xA1DA0001u;
 
 extern "C" NTSTATUS NTAPI ZwQuerySystemInformation(
     _In_ SYSTEM_INFORMATION_CLASS_INTERNAL SystemInformationClass,
@@ -283,6 +336,11 @@ inline NTSTATUS           (NTAPI* _PsRemoveLoadImageNotifyRoutine)  (PLOAD_IMAGE
 inline NTSTATUS           (NTAPI* _ZwTerminateProcess)              (HANDLE, NTSTATUS);
 inline NTSTATUS           (NTAPI* _ZwOpenProcess)                   (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
 
+inline VOID               (NTAPI* _KeStackAttachProcess)            (PRKPROCESS, PKAPC_STATE);
+inline VOID               (NTAPI* _KeUnstackDetachProcess)          (PKAPC_STATE);
+inline NTSTATUS           (NTAPI* _ObQueryNameString)               (PVOID, POBJECT_NAME_INFORMATION, ULONG, PULONG);
+inline PPEB               (NTAPI* _PsGetProcessPeb)                 (PEPROCESS);
+
 inline POBJECT_TYPE*       _IoDriverObjectType_ptr = nullptr;
 
 
@@ -370,6 +428,11 @@ inline bool SetupFunctions() {
     *(PVOID*)&_ZwTerminateProcess              = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwTerminateProcess"));
     *(PVOID*)&_ZwOpenProcess                   = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenProcess"));
 
+    *(PVOID*)&_KeStackAttachProcess            = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeStackAttachProcess"));
+    *(PVOID*)&_KeUnstackDetachProcess          = GetProcAddress(kernelBase, (PCHAR)skCrypt("KeUnstackDetachProcess"));
+    *(PVOID*)&_ObQueryNameString               = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObQueryNameString"));
+    *(PVOID*)&_PsGetProcessPeb                 = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessPeb"));
+
     _IoDriverObjectType_ptr = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDriverObjectType"));
 
     SN_LOG("SetupFunctions: kernelBase=%p", kernelBase);
@@ -389,6 +452,8 @@ inline bool SetupFunctions() {
     SN_LOG("SetupFunctions: _PsSetCreateProcessNotifyRoutine=%p _PsSetCreateProcessNotifyRoutineEx=%p", _PsSetCreateProcessNotifyRoutine, _PsSetCreateProcessNotifyRoutineEx);
     SN_LOG("SetupFunctions: _PsSetLoadImageNotifyRoutine=%p _PsRemoveLoadImageNotifyRoutine=%p", _PsSetLoadImageNotifyRoutine, _PsRemoveLoadImageNotifyRoutine);
     SN_LOG("SetupFunctions: _ZwTerminateProcess=%p _ZwOpenProcess=%p _IoDriverObjectType_ptr=%p", _ZwTerminateProcess, _ZwOpenProcess, _IoDriverObjectType_ptr);
+    SN_LOG("SetupFunctions: _KeStackAttachProcess=%p _KeUnstackDetachProcess=%p _ObQueryNameString=%p _PsGetProcessPeb=%p",
+        _KeStackAttachProcess, _KeUnstackDetachProcess, _ObQueryNameString, _PsGetProcessPeb);
 
     if (!_MmIsAddressValid || !_MmCopyMemory ||
         !_IoAllocateMdl || !_IoFreeMdl || !_MmBuildMdlForNonPagedPool ||

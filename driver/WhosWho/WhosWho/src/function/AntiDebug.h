@@ -5,7 +5,11 @@
 #include <function/CoreSecurity.h>
 #include "KernelLayout.h"
 #include "SentinelBridge.h"
+#include "KernelCrypto.h"
 #include "impl/AntiDumpKernel.h"
+
+extern "C" NTSTATUS NTAPI ZwQueryInformationProcess(
+    HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
 
 #ifndef YieldProcessor
 #define YieldProcessor() _mm_pause()
@@ -29,6 +33,10 @@
 
 namespace anti_debug {
 
+    namespace process_guard_fwd {
+        void register_re_tool_pid(HANDLE pid);
+    }
+
     constexpr UINT32 DETECT_NONE             = 0x00000000u;
     constexpr UINT32 DETECT_KERNEL_DEBUGGER  = 0x00000001u;
     constexpr UINT32 DETECT_HYPERVISOR       = 0x00000002u;
@@ -41,6 +49,216 @@ namespace anti_debug {
     inline volatile UINT32 g_detection_flags = DETECT_NONE;
     inline volatile UINT64 g_last_check_tsc = 0;
     inline volatile LONG g_check_lock = 0;
+
+    inline UINT8 g_re_tool_hashes[16][32] = {};
+    inline volatile LONG g_re_tool_hash_count = 0;
+    inline KSPIN_LOCK g_re_tool_hash_lock = {};
+    inline volatile LONG g_re_tool_hash_lock_init = 0;
+
+    __forceinline void ensure_re_tool_hash_lock() {
+        if (_InterlockedCompareExchange(&g_re_tool_hash_lock_init, 1, 0) == 0) {
+            KeInitializeSpinLock(&g_re_tool_hash_lock);
+        }
+    }
+
+    __forceinline void update_re_tool_hashes(const UINT8* hashes, ULONG count) {
+        if (!hashes || count == 0) return;
+        if (count > 16) count = 16;
+        ensure_re_tool_hash_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_re_tool_hash_lock, &old_irql);
+        RtlSecureZeroMemory(g_re_tool_hashes, sizeof(g_re_tool_hashes));
+        RtlCopyMemory(g_re_tool_hashes, hashes, count * 32);
+        _InterlockedExchange(&g_re_tool_hash_count, static_cast<LONG>(count));
+        KeReleaseSpinLock(&g_re_tool_hash_lock, old_irql);
+        WW_LOG("[ADBG] re_tool_hashes_updated count=%lu", count);
+    }
+
+    __forceinline bool match_re_tool_hash(const UINT8 hash[32]) {
+        if (!hash) return false;
+        ensure_re_tool_hash_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_re_tool_hash_lock, &old_irql);
+        bool matched = false;
+        LONG count = g_re_tool_hash_count;
+        if (count > 16) count = 16;
+        for (LONG i = 0; i < count; ++i) {
+            const UINT8* entry = g_re_tool_hashes[i];
+            bool same = true;
+            for (int j = 0; j < 32; ++j) {
+                if (entry[j] != hash[j]) { same = false; break; }
+            }
+            if (same) { matched = true; break; }
+        }
+        KeReleaseSpinLock(&g_re_tool_hash_lock, old_irql);
+        return matched;
+    }
+
+    __forceinline NTSTATUS compute_file_sha256(
+        PCUNICODE_STRING image_path,
+        UINT8 out_hash[32])
+    {
+        if (!image_path || !image_path->Buffer || image_path->Length == 0 || !out_hash)
+            return STATUS_INVALID_PARAMETER;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        UNICODE_STRING local_path;
+        local_path.Length = image_path->Length;
+        local_path.MaximumLength = image_path->Length;
+        local_path.Buffer = image_path->Buffer;
+
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &local_path,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+        IO_STATUS_BLOCK iosb;
+        HANDLE hFile = nullptr;
+        NTSTATUS status = ZwCreateFile(
+            &hFile,
+            FILE_READ_DATA | SYNCHRONIZE,
+            &oa, &iosb, nullptr,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+            nullptr, 0);
+
+        if (!NT_SUCCESS(status) || !hFile) {
+            return status;
+        }
+
+        kernel_crypto::sha256_ctx_t ctx;
+        kernel_crypto::sha256_init(&ctx);
+
+        constexpr ULONG READ_CHUNK = 65536;
+        PUCHAR chunk = static_cast<PUCHAR>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, READ_CHUNK, 'HASH'));
+        if (!chunk) {
+            ZwClose(hFile);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        LARGE_INTEGER offset = {};
+        for (;;) {
+            IO_STATUS_BLOCK read_iosb;
+            status = ZwReadFile(
+                hFile, nullptr, nullptr, nullptr,
+                &read_iosb, chunk, READ_CHUNK, &offset, nullptr);
+
+            if (!NT_SUCCESS(status) && status != STATUS_END_OF_FILE) {
+                ExFreePoolWithTag(chunk, 'HASH');
+                ZwClose(hFile);
+                return status;
+            }
+
+            ULONG bytes_read = static_cast<ULONG>(read_iosb.Information);
+            if (bytes_read == 0)
+                break;
+
+            kernel_crypto::sha256_update(&ctx, chunk, bytes_read);
+            offset.QuadPart += bytes_read;
+
+            if (status == STATUS_END_OF_FILE || bytes_read < READ_CHUNK)
+                break;
+        }
+
+        kernel_crypto::sha256_final(&ctx, out_hash);
+        RtlSecureZeroMemory(&ctx, sizeof(ctx));
+        ExFreePoolWithTag(chunk, 'HASH');
+        ZwClose(hFile);
+        return STATUS_SUCCESS;
+    }
+
+    __forceinline NTSTATUS get_process_image_path(
+        HANDLE pid,
+        UNICODE_STRING* out_path,
+        WCHAR* path_buffer,
+        USHORT buffer_capacity_bytes)
+    {
+        if (!pid || !out_path || !path_buffer || buffer_capacity_bytes == 0)
+            return STATUS_INVALID_PARAMETER;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId(pid, &process);
+        if (!NT_SUCCESS(status) || !process)
+            return status;
+
+        HANDLE hProc = nullptr;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, nullptr, OBJ_KERNEL_HANDLE, nullptr, nullptr);
+        CLIENT_ID cid = {};
+        cid.UniqueProcess = pid;
+
+        status = _ZwOpenProcess
+            ? _ZwOpenProcess(&hProc, PROCESS_QUERY_LIMITED_INFORMATION, &oa, &cid)
+            : STATUS_NOT_SUPPORTED;
+
+        if (!NT_SUCCESS(status) || !hProc) {
+            ObDereferenceObject(process);
+            return status;
+        }
+
+        ULONG return_len = 0;
+        constexpr ULONG ProcessImageFileName = 27;
+        status = ZwQueryInformationProcess(
+            hProc,
+            static_cast<PROCESSINFOCLASS>(ProcessImageFileName),
+            path_buffer,
+            buffer_capacity_bytes,
+            &return_len);
+
+        _ZwClose(hProc);
+        ObDereferenceObject(process);
+
+        if (!NT_SUCCESS(status) || return_len == 0)
+            return status;
+
+        struct PROCESS_IMAGE_NAME_INFO {
+            USHORT NameLength;
+            WCHAR Name[1];
+        };
+        auto* name_info = reinterpret_cast<PROCESS_IMAGE_NAME_INFO*>(path_buffer);
+        USHORT name_bytes = name_info->NameLength;
+        if (name_bytes == 0 || name_bytes > buffer_capacity_bytes - sizeof(USHORT))
+            return STATUS_BUFFER_TOO_SMALL;
+
+        USHORT copy_chars = name_bytes / sizeof(WCHAR);
+        if (copy_chars > 0) {
+            RtlMoveMemory(path_buffer, name_info->Name, name_bytes);
+        }
+        out_path->Length = name_bytes;
+        out_path->MaximumLength = name_bytes;
+        out_path->Buffer = path_buffer;
+        return STATUS_SUCCESS;
+    }
+
+    __forceinline bool is_pid_re_tool_by_hash(HANDLE pid) {
+        if (!pid) return false;
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return false;
+
+        WCHAR path_buf[520] = {};
+        UNICODE_STRING image_path = {};
+        NTSTATUS status = get_process_image_path(pid, &image_path, path_buf, sizeof(path_buf) - sizeof(WCHAR));
+        if (!NT_SUCCESS(status))
+            return false;
+
+        UINT8 file_hash[32] = {};
+        status = compute_file_sha256(&image_path, file_hash);
+        if (!NT_SUCCESS(status))
+            return false;
+
+        bool matched = match_re_tool_hash(file_hash);
+        if (matched) {
+            WW_LOG("[ADBG] hash_match pid=%llu", reinterpret_cast<UINT64>(pid));
+        }
+        RtlSecureZeroMemory(file_hash, sizeof(file_hash));
+        return matched;
+    }
 
     constexpr UINT64 CHECK_INTERVAL_TSC = 300000000ULL;
 
@@ -571,16 +789,6 @@ namespace anti_debug {
             return STATUS_INVALID_DEVICE_STATE;
         }
 
-        const char* debugger_names[] = {
-            "x64dbg.exe", "x32dbg.exe", "windbg.exe",
-            "ollydbg.exe", "ida.exe", "ida64.exe",
-            "idaq.exe", "idaq64.exe", "dnspy.exe",
-            "cheatengine", "ce.exe", "processhacker",
-            "apimonitor", "scylla", "titanhide",
-            "hyperdbg.exe", "radare2.exe"
-        };
-        constexpr int num_names = sizeof(debugger_names) / sizeof(debugger_names[0]);
-
         ULONG required_length = 0;
         NTSTATUS status = ZwQuerySystemInformation(
             ADBG_SYSTEM_PROCESS_INFORMATION_CLASS,
@@ -639,39 +847,45 @@ namespace anti_debug {
         PUCHAR end = cursor + buffer_length;
         ULONG scanned = 0;
         ULONG lookup_misses = 0;
+        LONG hash_count = g_re_tool_hash_count;
 
         while (cursor + sizeof(ADBG_SYSTEM_PROCESS_INFORMATION) <= end && scanned < 131072) {
             auto info = reinterpret_cast<PADBG_SYSTEM_PROCESS_INFORMATION>(cursor);
             ++scanned;
 
             if (info->UniqueProcessId != nullptr) {
-                PEPROCESS process = nullptr;
-                NTSTATUS lookup_status = PsLookupProcessByProcessId(info->UniqueProcessId, &process);
-                if (NT_SUCCESS(lookup_status) && process) {
-                    bool matched = false;
-                    UCHAR* image_name = PsGetProcessImageFileName(process);
-                    if (image_name) {
-                        if (image_file_name_is_supported_ida_host(image_name)) {
-                            WW_LOG("[ADBG] supported_ida_host_ignored pid=%llu image=%.15s",
-                                (UINT64)(ULONG_PTR)info->UniqueProcessId,
-                                image_name);
-                            ObDereferenceObject(process);
-                            continue;
-                        }
-                        for (int n = 0; n < num_names; ++n) {
-                            if (image_file_name_matches_ascii_prefix(image_name, debugger_names[n])) {
-                                *out_debugger_pid = (UINT64)(ULONG_PTR)info->UniqueProcessId;
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    ObDereferenceObject(process);
-                    if (matched) {
+                HANDLE current_pid = info->UniqueProcessId;
+                if (reinterpret_cast<UINT64>(current_pid) <= 4) {
+                    if (info->NextEntryOffset == 0) break;
+                    cursor += info->NextEntryOffset;
+                    continue;
+                }
+
+                if (hash_count > 0) {
+                    bool hash_matched = is_pid_re_tool_by_hash(current_pid);
+                    if (hash_matched) {
+                        process_guard_fwd::register_re_tool_pid(current_pid);
+                        *out_debugger_pid = (UINT64)(ULONG_PTR)current_pid;
                         ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
-                        WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X result=hit scanned=%lu lookup_misses=%lu pid=%llu", STATUS_SUCCESS, scanned, lookup_misses, *out_debugger_pid);
+                        WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X result=hash_hit scanned=%lu lookup_misses=%lu pid=%llu",
+                            STATUS_SUCCESS, scanned, lookup_misses, *out_debugger_pid);
                         return STATUS_SUCCESS;
                     }
+                }
+
+                PEPROCESS process = nullptr;
+                NTSTATUS lookup_status = PsLookupProcessByProcessId(current_pid, &process);
+                if (NT_SUCCESS(lookup_status) && process) {
+                    UCHAR* image_name = PsGetProcessImageFileName(process);
+                    if (image_name && image_file_name_is_supported_ida_host(image_name)) {
+                        WW_LOG("[ADBG] supported_ida_host_ignored pid=%llu image=%.15s",
+                            (UINT64)(ULONG_PTR)current_pid, image_name);
+                        ObDereferenceObject(process);
+                        if (info->NextEntryOffset == 0) break;
+                        cursor += info->NextEntryOffset;
+                        continue;
+                    }
+                    ObDereferenceObject(process);
                 } else {
                     ++lookup_misses;
                 }
@@ -690,7 +904,139 @@ namespace anti_debug {
         }
 
         ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
+
+        HANDLE client_pid = caller_validation::g_registered_client_pid;
+        if (client_pid) {
+            NTSTATUS dbg_status = check_debug_object_handles_targeting_pid(
+                static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(client_pid)));
+            if (NT_SUCCESS(dbg_status)) {
+                WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X result=debug_object_hit scanned=%lu",
+                    STATUS_SUCCESS, scanned);
+                *out_debugger_pid = 0;
+                return STATUS_SUCCESS;
+            }
+        }
+
         WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X result=none scanned=%lu lookup_misses=%lu", STATUS_NOT_FOUND, scanned, lookup_misses);
+        return STATUS_NOT_FOUND;
+    }
+
+    inline NTSTATUS check_debug_object_handles_targeting_pid(UINT32 target_pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+        if (!target_pid)
+            return STATUS_INVALID_PARAMETER;
+
+        struct HANDLE_ENTRY_D {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct HANDLE_INFO_EX_D {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            HANDLE_ENTRY_D Handles[1];
+        };
+
+        constexpr ULONG POOL_TAG_DOBJ = 'DOBJ';
+        constexpr SYSTEM_INFORMATION_CLASS_INTERNAL HandleInfoClass =
+            static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(64);
+
+        ULONG buffer_size = 0x100000;
+        ULONG return_length = 0;
+        PVOID hbuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, buffer_size, POOL_TAG_DOBJ);
+        if (!hbuf) return STATUS_INSUFFICIENT_RESOURCES;
+
+        NTSTATUS hstatus = ZwQuerySystemInformation(
+            HandleInfoClass, hbuf, buffer_size, &return_length);
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (hstatus != STATUS_INFO_LENGTH_MISMATCH &&
+                hstatus != STATUS_BUFFER_TOO_SMALL &&
+                hstatus != STATUS_BUFFER_OVERFLOW)
+                break;
+            ExFreePoolWithTag(hbuf, POOL_TAG_DOBJ);
+            buffer_size = return_length > buffer_size
+                ? return_length + 0x10000
+                : buffer_size * 2;
+            hbuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, buffer_size, POOL_TAG_DOBJ);
+            if (!hbuf) return STATUS_INSUFFICIENT_RESOURCES;
+            return_length = 0;
+            hstatus = ZwQuerySystemInformation(
+                HandleInfoClass, hbuf, buffer_size, &return_length);
+        }
+
+        if (!NT_SUCCESS(hstatus)) {
+            ExFreePoolWithTag(hbuf, POOL_TAG_DOBJ);
+            return hstatus;
+        }
+
+        auto* info = reinterpret_cast<HANDLE_INFO_EX_D*>(hbuf);
+        UINT32 debug_handle_count = 0;
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
+            const auto& h = info->Handles[i];
+            if (!h.Object) continue;
+
+            POBJECT_TYPE obj_type = nullptr;
+            __try {
+                if (_ObGetObjectType)
+                    obj_type = _ObGetObjectType(h.Object);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+
+            if (!obj_type) continue;
+
+            const WCHAR* type_name = nullptr;
+            __try {
+                type_name = reinterpret_cast<const WCHAR*>(obj_type->Name.Buffer);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+
+            bool is_debug_object = false;
+            if (type_name && obj_type->Name.Length >= sizeof(WCHAR) * 11) {
+                const WCHAR debug_str[] = L"DebugObject";
+                bool match = true;
+                for (int c = 0; c < 11; ++c) {
+                    if (type_name[c] != debug_str[c]) { match = false; break; }
+                }
+                is_debug_object = match;
+            }
+
+            if (!is_debug_object) continue;
+
+            UINT32 holder_pid = static_cast<UINT32>(h.UniqueProcessId);
+            if (holder_pid == target_pid) continue;
+
+            debug_handle_count++;
+
+            WW_LOG("[ADBG] debug_object_handle holder_pid=%u handle=0x%llx target_pid=%u",
+                holder_pid,
+                static_cast<UINT64>(h.HandleValue),
+                target_pid);
+        }
+
+        ExFreePoolWithTag(hbuf, POOL_TAG_DOBJ);
+
+        if (debug_handle_count > 0) {
+            WW_LOG("[ADBG] debug_object_detected target_pid=%u handles=%u",
+                target_pid, debug_handle_count);
+#ifndef AIDA_DEV_MODE
+            KeBugCheckEx(0xA1DA0005,
+                static_cast<ULONG_PTR>(target_pid),
+                static_cast<ULONG_PTR>(debug_handle_count),
+                0, 0);
+#endif
+            return STATUS_SUCCESS;
+        }
 
         return STATUS_NOT_FOUND;
     }
@@ -901,6 +1247,9 @@ namespace anti_debug {
                     pid,
                     static_cast<unsigned long long>(debug_port_offset),
                     port_tag);
+#ifndef AIDA_DEV_MODE
+                KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)port_value, 0, 0);
+#endif
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             status = STATUS_UNSUCCESSFUL;
@@ -979,6 +1328,252 @@ namespace anti_debug {
         ObDereferenceObject(process);
         return status;
     }
+
+    inline NTSTATUS enumerate_foreign_thread_handles(UINT32 target_pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+        if (!_PsLookupThreadByThreadId || !_PsGetThreadId || !_ObGetObjectType ||
+            !_PsGetContextThread || !_PsSetContextThread)
+            return STATUS_NOT_SUPPORTED;
+        if (!PsThreadType || !*PsThreadType)
+            return STATUS_NOT_SUPPORTED;
+
+        if (target_pid == 0)
+            return STATUS_INVALID_PARAMETER;
+
+        struct HANDLE_ENTRY_T {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct HANDLE_INFO_EX_T {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            HANDLE_ENTRY_T Handles[1];
+        };
+
+        constexpr ULONG POOL_TAG_FTHE = 'FTHE';
+        constexpr SYSTEM_INFORMATION_CLASS_INTERNAL HandleInfoClass =
+            static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(64);
+        constexpr ACCESS_MASK HOSTILE_THREAD_CTX =
+            THREAD_GET_CONTEXT | THREAD_SET_CONTEXT;
+
+        ULONG buffer_size = 0x100000;
+        ULONG return_length = 0;
+        PVOID buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, buffer_size, POOL_TAG_FTHE);
+        if (!buffer)
+            return STATUS_INSUFFICIENT_RESOURCES;
+
+        NTSTATUS status = ZwQuerySystemInformation(
+            HandleInfoClass, buffer, buffer_size, &return_length);
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (status != STATUS_INFO_LENGTH_MISMATCH &&
+                status != STATUS_BUFFER_TOO_SMALL &&
+                status != STATUS_BUFFER_OVERFLOW)
+                break;
+            ExFreePoolWithTag(buffer, POOL_TAG_FTHE);
+            buffer_size = return_length > buffer_size
+                ? return_length + 0x10000
+                : buffer_size * 2;
+            buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, buffer_size, POOL_TAG_FTHE);
+            if (!buffer)
+                return STATUS_INSUFFICIENT_RESOURCES;
+            return_length = 0;
+            status = ZwQuerySystemInformation(
+                HandleInfoClass, buffer, buffer_size, &return_length);
+        }
+
+        if (!NT_SUCCESS(status)) {
+            ExFreePoolWithTag(buffer, POOL_TAG_FTHE);
+            WW_LOG("[CONT-ADBG] foreign_thread_enum_query_failed status=0x%08X", status);
+            return status;
+        }
+
+        auto* info = reinterpret_cast<HANDLE_INFO_EX_T*>(buffer);
+        POBJECT_TYPE thread_type = *PsThreadType;
+        UINT32 foreign_count = 0;
+        UINT32 dr_cleared = 0;
+        UINT32 hidden = 0;
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
+            const auto& h = info->Handles[i];
+
+            if (static_cast<UINT32>(h.UniqueProcessId) == target_pid)
+                continue;
+            if (!h.Object)
+                continue;
+            if ((h.GrantedAccess & HOSTILE_THREAD_CTX) == 0)
+                continue;
+
+            __try {
+                if (_ObGetObjectType(h.Object) != thread_type)
+                    continue;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+
+            PETHREAD thread = static_cast<PETHREAD>(h.Object);
+            PEPROCESS thread_owner = nullptr;
+            __try {
+                thread_owner = IoThreadToProcess(thread);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+
+            if (!thread_owner)
+                continue;
+
+            HANDLE owner_pid = PsGetProcessId(thread_owner);
+            if (static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(owner_pid)) != target_pid)
+                continue;
+
+            ++foreign_count;
+
+            HANDLE tid = nullptr;
+            __try {
+                tid = _PsGetThreadId(thread);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                tid = nullptr;
+            }
+
+            WW_LOG("[CONT-ADBG] foreign_thread_handle foreign_pid=%llu tid=%llu access=0x%08X target_pid=%u",
+                (UINT64)h.UniqueProcessId,
+                (UINT64)(ULONG_PTR)tid,
+                (ULONG)h.GrantedAccess,
+                target_pid);
+
+            __try {
+                CONTEXT ctx = {};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                NTSTATUS ctx_st = _PsGetContextThread(thread, &ctx, KernelMode);
+                if (NT_SUCCESS(ctx_st)) {
+                    BOOLEAN need_clear = (ctx.Dr0 != 0 || ctx.Dr1 != 0 ||
+                                          ctx.Dr2 != 0 || ctx.Dr3 != 0 ||
+                                          (ctx.Dr7 & 0xFF) != 0);
+                    if (need_clear) {
+                        ctx.Dr0 = 0;
+                        ctx.Dr1 = 0;
+                        ctx.Dr2 = 0;
+                        ctx.Dr3 = 0;
+                        ctx.Dr6 = 0;
+                        ctx.Dr7 = 0x400;
+                        ctx_st = _PsSetContextThread(thread, &ctx, KernelMode);
+                        if (NT_SUCCESS(ctx_st)) {
+                            ++dr_cleared;
+                            WW_LOG("[CONT-ADBG] foreign_thread_dr_cleared tid=%llu target_pid=%u foreign_pid=%llu",
+                                (UINT64)(ULONG_PTR)tid, target_pid,
+                                (UINT64)h.UniqueProcessId);
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                WW_LOG("[CONT-ADBG] foreign_thread_dr_clear_exception tid=%llu",
+                    (UINT64)(ULONG_PTR)tid);
+            }
+
+            __try {
+                NTSTATUS hide_st = hide_thread_object_from_debugger(thread);
+                if (NT_SUCCESS(hide_st))
+                    ++hidden;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
+
+        ExFreePoolWithTag(buffer, POOL_TAG_FTHE);
+
+        if (foreign_count > 0) {
+            WW_LOG("[CONT-ADBG] foreign_thread_enum_complete target_pid=%u foreign_handles=%u dr_cleared=%u threads_hidden=%u",
+                target_pid, foreign_count, dr_cleared, hidden);
+        }
+
+        return STATUS_SUCCESS;
+    }
+
+    inline NTSTATUS scan_text_for_int3(PEPROCESS process, UINT64 module_base,
+        UINT64 exception_dir_va, DWORD exception_dir_size, UINT64* hit_rva)
+    {
+        if (!process || module_base == 0 || exception_dir_va == 0 ||
+            exception_dir_size == 0 || !hit_rva)
+            return STATUS_INVALID_PARAMETER;
+
+        *hit_rva = 0;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        if (!_KeStackAttachProcess || !_KeUnstackDetachProcess || !_MmIsAddressValid)
+            return STATUS_NOT_SUPPORTED;
+
+        struct _RF {
+            DWORD BeginAddress;
+            DWORD EndAddress;
+            DWORD UnwindData;
+        };
+
+        const DWORD runtime_function_size = sizeof(_RF);
+        const DWORD func_count = exception_dir_size / runtime_function_size;
+        if (func_count == 0)
+            return STATUS_INVALID_PARAMETER;
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        NTSTATUS status = STATUS_SUCCESS;
+
+        __try {
+            const UINT8* mod_base_ptr = reinterpret_cast<const UINT8*>(module_base);
+            const _RF* rf_base = reinterpret_cast<const _RF*>(
+                mod_base_ptr + exception_dir_va);
+
+            if (!_MmIsAddressValid((PVOID)rf_base)) {
+                status = STATUS_ACCESS_VIOLATION;
+            } else {
+                for (DWORD i = 0; i < func_count; ++i) {
+                    const _RF* rf = rf_base + i;
+
+                    if (!_MmIsAddressValid((PVOID)rf))
+                        continue;
+
+                    DWORD begin_addr = rf->BeginAddress;
+                    if (begin_addr == 0)
+                        continue;
+
+                    const UINT8* entry_ptr = mod_base_ptr + begin_addr;
+
+                    if (!_MmIsAddressValid((PVOID)entry_ptr))
+                        continue;
+
+                    const UINT8 first_byte = *entry_ptr;
+
+                    if (first_byte == 0xCC) {
+                        *hit_rva = static_cast<UINT64>(begin_addr);
+                        WW_LOG("[ADBG] int3_detected rva=0x%X module_base=0x%llX func_index=%lu",
+                            begin_addr,
+                            static_cast<unsigned long long>(module_base),
+                            i);
+#ifndef AIDA_DEV_MODE
+                        KeBugCheckEx(0xA1DA0002, (ULONG_PTR)begin_addr, 0xCC, 0, 0);
+#endif
+                        status = STATUS_DEBUGGER_INACTIVE;
+                        break;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+
+        return status;
+    }
 }
 
 namespace continuous_anti_debug {
@@ -992,7 +1587,7 @@ namespace continuous_anti_debug {
     inline WORK_QUEUE_ITEM g_work_item = {};
     inline volatile LONG   g_work_item_queued = 0;
 
-    constexpr LONG TIMER_PERIOD_MS = 5000;
+    constexpr LONG TIMER_PERIOD_MS = 2000;
 
     inline VOID NTAPI work_item_callback(PVOID)
     {
@@ -1027,6 +1622,64 @@ namespace continuous_anti_debug {
             anti_debug::clear_debug_objects(pid);
             WW_LOG("[CONT-ADBG] cycle=%llu calling inspect_instrumentation_callback_eprocess pid=%u", cycle, pid);
             anti_debug::clear_instrumentation_callback_eprocess(pid);
+
+            if (_PsGetProcessSectionBaseAddress && _KeStackAttachProcess &&
+                _KeUnstackDetachProcess && _MmIsAddressValid) {
+                PEPROCESS scan_proc = nullptr;
+                NTSTATUS lookup_st = PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)pid, &scan_proc);
+                if (NT_SUCCESS(lookup_st) && scan_proc) {
+                    PVOID section_base = _PsGetProcessSectionBaseAddress(scan_proc);
+                    if (section_base) {
+                        UINT64 mod_base = reinterpret_cast<UINT64>(section_base);
+                        UINT64 exc_dir_va = 0;
+                        DWORD exc_dir_size = 0;
+
+                        KAPC_STATE pe_apc;
+                        _KeStackAttachProcess(scan_proc, &pe_apc);
+                        __try {
+                            const UINT8* base_ptr = reinterpret_cast<const UINT8*>(mod_base);
+                            if (_MmIsAddressValid((PVOID)base_ptr)) {
+                                const IMAGE_DOS_HEADER* dos =
+                                    reinterpret_cast<const IMAGE_DOS_HEADER*>(base_ptr);
+                                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                                    LONG e_lfanew = dos->e_lfanew;
+                                    if (e_lfanew > 0 && e_lfanew < 0x100000) {
+                                        const IMAGE_NT_HEADERS64* nt =
+                                            reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+                                                base_ptr + e_lfanew);
+                                        if (_MmIsAddressValid((PVOID)nt) &&
+                                            nt->Signature == IMAGE_NT_SIGNATURE &&
+                                            nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                                            if (nt->OptionalHeader.NumberOfRvaAndSizes >
+                                                IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+                                                exc_dir_va = nt->OptionalHeader.DataDirectory[
+                                                    IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+                                                exc_dir_size = nt->OptionalHeader.DataDirectory[
+                                                    IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            exc_dir_va = 0;
+                            exc_dir_size = 0;
+                        }
+                        _KeUnstackDetachProcess(&pe_apc);
+
+                        if (exc_dir_va != 0 && exc_dir_size != 0) {
+                            UINT64 hit_rva = 0;
+                            NTSTATUS scan_st = anti_debug::scan_text_for_int3(
+                                scan_proc, mod_base, exc_dir_va, exc_dir_size, &hit_rva);
+                            WW_LOG("[CONT-ADBG] int3_scan cycle=%llu pid=%u status=0x%08X hit_rva=0x%llX",
+                                cycle, pid, (ULONG)scan_st,
+                                static_cast<unsigned long long>(hit_rva));
+                        }
+                    }
+                    ObDereferenceObject(scan_proc);
+                }
+            }
         }
 
         if ((cycle % 5) == 0) {
@@ -1046,8 +1699,12 @@ namespace continuous_anti_debug {
                                 whoswho_kernel_layout::build_number());
                         } else {
                             ULONG_PTR* debug_port_ptr = (ULONG_PTR*)((UINT8*)target_proc + debug_port_offset);
-                            if (_MmIsAddressValid(debug_port_ptr) && *debug_port_ptr != 0)
+                            if (_MmIsAddressValid(debug_port_ptr) && *debug_port_ptr != 0) {
                                 target_being_debugged = TRUE;
+#ifndef AIDA_DEV_MODE
+                                KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)*debug_port_ptr, 0, 0);
+#endif
+                            }
                         }
                     } __except (EXCEPTION_EXECUTE_HANDLER) {}
                     ObDereferenceObject(target_proc);
@@ -1083,6 +1740,7 @@ namespace continuous_anti_debug {
 
         if ((cycle % 4) == 0) {
             anti_debug::hide_all_process_threads(pid);
+            anti_debug::enumerate_foreign_thread_handles(pid);
         }
 
         _InterlockedExchange(&g_work_item_queued, 0);
@@ -1161,5 +1819,451 @@ namespace continuous_anti_debug {
                 _InterlockedCompareExchange(&g_work_item_queued, 0, 0),
                 static_cast<ULONG>(KeGetCurrentIrql()));
         }
+    }
+}
+
+namespace process_hide {
+
+    typedef NTSTATUS (NTAPI* fn_NtQuerySystemInfo)(
+        SYSTEM_INFORMATION_CLASS_INTERNAL, PVOID, ULONG, PULONG);
+
+    inline volatile LONG g_installed = 0;
+    inline fn_NtQuerySystemInfo g_original = nullptr;
+    inline LONG g_saved_entry = 0;
+    inline ULONG g_ssn = 0xFFFFFFFFu;
+
+    __forceinline void disable_write_protect()
+    {
+        ULONG_PTR cr0 = __readcr0();
+        cr0 &= ~(1ULL << 16);
+        __writecr0(cr0);
+    }
+
+    __forceinline void enable_write_protect()
+    {
+        ULONG_PTR cr0 = __readcr0();
+        cr0 |= (1ULL << 16);
+        __writecr0(cr0);
+    }
+
+    NTSTATUS NTAPI hooked_query_system_info(
+        SYSTEM_INFORMATION_CLASS_INTERNAL SystemInformationClass,
+        PVOID SystemInformation,
+        ULONG SystemInformationLength,
+        PULONG ReturnLength)
+    {
+        if (!g_original)
+            return STATUS_PROCEDURE_NOT_FOUND;
+
+        NTSTATUS status = STATUS_SUCCESS;
+        __try {
+            status = g_original(SystemInformationClass, SystemInformation,
+                                SystemInformationLength, ReturnLength);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return (NTSTATUS)GetExceptionCode();
+        }
+
+        if (!NT_SUCCESS(status) || !SystemInformation)
+            return status;
+
+        KPROCESSOR_MODE prev_mode = ExGetPreviousMode();
+        if (prev_mode != UserMode)
+            return status;
+
+        HANDLE client_pid = caller_validation::g_registered_client_pid;
+        if (!client_pid)
+            return status;
+
+        HANDLE caller_pid = PsGetCurrentProcessId();
+        if (caller_pid == client_pid)
+            return status;
+
+        if (SystemInformationClass == static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(5)) {
+            PUCHAR cursor = static_cast<PUCHAR>(SystemInformation);
+            PUCHAR buffer_end = cursor + SystemInformationLength;
+            PUCHAR prev_entry = nullptr;
+            ULONG prev_offset_accum = 0;
+
+            __try {
+                while (cursor + sizeof(anti_debug::ADBG_SYSTEM_PROCESS_INFORMATION) <= buffer_end) {
+                    auto info = reinterpret_cast<anti_debug::PADBG_SYSTEM_PROCESS_INFORMATION>(cursor);
+
+                    if (info->UniqueProcessId == client_pid) {
+                        if (prev_entry) {
+                            if (info->NextEntryOffset == 0) {
+                                reinterpret_cast<anti_debug::PADBG_SYSTEM_PROCESS_INFORMATION>(prev_entry)->NextEntryOffset = 0;
+                            } else {
+                                ULONG new_offset = prev_offset_accum + info->NextEntryOffset;
+                                reinterpret_cast<anti_debug::PADBG_SYSTEM_PROCESS_INFORMATION>(prev_entry)->NextEntryOffset = new_offset;
+                            }
+                        } else {
+                            if (info->NextEntryOffset != 0 &&
+                                cursor + info->NextEntryOffset + sizeof(anti_debug::ADBG_SYSTEM_PROCESS_INFORMATION) <= buffer_end) {
+                                ULONG remaining = static_cast<ULONG>(buffer_end - (cursor + info->NextEntryOffset));
+                                RtlCopyMemory(cursor, cursor + info->NextEntryOffset, remaining);
+                                if (ReturnLength && *ReturnLength >= info->NextEntryOffset)
+                                    *ReturnLength -= info->NextEntryOffset;
+                            } else {
+                                info->UniqueProcessId = nullptr;
+                                info->ImageName.Length = 0;
+                                info->ImageName.MaximumLength = 0;
+                                info->ImageName.Buffer = nullptr;
+                                info->NextEntryOffset = 0;
+                            }
+                        }
+                        WW_LOG("[PHIDE] filtered pid=%llu from SystemProcessInformation caller_pid=%llu",
+                            reinterpret_cast<UINT64>(client_pid),
+                            reinterpret_cast<UINT64>(caller_pid));
+                        break;
+                    }
+
+                    if (info->NextEntryOffset == 0)
+                        break;
+                    prev_entry = cursor;
+                    prev_offset_accum = info->NextEntryOffset;
+                    cursor += info->NextEntryOffset;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return status;
+            }
+        }
+        else if (SystemInformationClass == static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(37)) {
+            __try {
+                HANDLE queried_pid = *reinterpret_cast<HANDLE*>(SystemInformation);
+                if (queried_pid == client_pid) {
+                    WW_LOG("[PHIDE] filtered pid=%llu from SystemProcessIdInformation caller_pid=%llu",
+                        reinterpret_cast<UINT64>(client_pid),
+                        reinterpret_cast<UINT64>(caller_pid));
+                    return STATUS_NOT_FOUND;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return status;
+            }
+        }
+
+        return status;
+    }
+
+    inline NTSTATUS install()
+    {
+        if (_InterlockedCompareExchange(&g_installed, 1, 0) != 0)
+            return STATUS_ALREADY_REGISTERED;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+
+        if (!ssdt_resolver::find_ssdt() || !ssdt_resolver::g_ssdt) {
+            WW_LOG("[PHIDE] install failed: ssdt not found");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        ssdt_resolver::ntdll_lookup_result_t ntdll{};
+        if (!ssdt_resolver::locate_current_ntdll(&ntdll)) {
+            WW_LOG("[PHIDE] install failed: ntdll not found reason=%s", ntdll.reason);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        CHAR query_name[] = { 'N','t','Q','u','e','r','y','S','y','s','t','e','m','I','n','f','o','r','m','a','t','i','o','n',0 };
+        PVOID stub = GetProcAddress(ntdll.ntdll_base, query_name);
+        if (!stub) {
+            WW_LOG("[PHIDE] install failed: NtQuerySystemInformation export not found");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        PUCHAR bytes = static_cast<PUCHAR>(stub);
+        if (bytes[0] != 0x4C || bytes[1] != 0x8B || bytes[2] != 0xD1 || bytes[3] != 0xB8) {
+            WW_LOG("[PHIDE] install failed: unexpected ntdll stub bytes");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        g_ssn = *reinterpret_cast<PULONG>(&bytes[4]);
+        if (g_ssn >= static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit)) {
+            WW_LOG("[PHIDE] install failed: ssn=%lu out of range limit=%lu",
+                g_ssn, static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit));
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        g_saved_entry = ssdt_resolver::g_ssdt->ServiceTable[g_ssn];
+        g_original = reinterpret_cast<fn_NtQuerySystemInfo>(
+            ssdt_resolver::get_ssdt_entry(g_ssn));
+
+        if (!g_original) {
+            WW_LOG("[PHIDE] install failed: original function is null");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        ULONG_PTR hook_addr = reinterpret_cast<ULONG_PTR>(&hooked_query_system_info);
+        ULONG_PTR table_base = reinterpret_cast<ULONG_PTR>(ssdt_resolver::g_ssdt->ServiceTable);
+        LONG64 offset = static_cast<LONG64>(hook_addr - table_base);
+
+        if (offset > 0x07FFFFFFLL || offset < -0x08000000LL) {
+            WW_LOG("[PHIDE] install failed: hook offset out of range offset=%lld table=%p hook=%p",
+                offset, reinterpret_cast<PVOID>(table_base), reinterpret_cast<PVOID>(hook_addr));
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        LONG new_entry = static_cast<LONG>((offset << 4) | (g_saved_entry & 0xF));
+
+        disable_write_protect();
+        ssdt_resolver::g_ssdt->ServiceTable[g_ssn] = new_entry;
+        enable_write_protect();
+
+        WW_LOG("[PHIDE] installed ssn=%lu table=%p original=%p hook=%p offset=%lld saved=0x%08lX new=0x%08lX",
+            g_ssn,
+            reinterpret_cast<PVOID>(table_base),
+            reinterpret_cast<PVOID>(g_original),
+            reinterpret_cast<PVOID>(hook_addr),
+            offset,
+            static_cast<ULONG>(g_saved_entry),
+            static_cast<ULONG>(new_entry));
+
+        return STATUS_SUCCESS;
+    }
+
+    inline void uninstall()
+    {
+        if (_InterlockedCompareExchange(&g_installed, 0, 1) != 1)
+            return;
+
+        if (g_ssn == 0xFFFFFFFFu || !ssdt_resolver::g_ssdt)
+            return;
+
+        disable_write_protect();
+        ssdt_resolver::g_ssdt->ServiceTable[g_ssn] = g_saved_entry;
+        enable_write_protect();
+
+        WW_LOG("[PHIDE] uninstalled ssn=%lu restored=0x%08lX", g_ssn, static_cast<ULONG>(g_saved_entry));
+    }
+}
+
+namespace context_guard {
+
+    typedef ssdt_resolver::fn_NtGetContextThread fn_NtGetContextThread_t;
+    typedef ssdt_resolver::fn_NtSetContextThread fn_NtSetContextThread_t;
+
+    inline volatile LONG g_installed = 0;
+    inline fn_NtGetContextThread_t g_orig_NtGetContextThread = nullptr;
+    inline fn_NtSetContextThread_t g_orig_NtSetContextThread = nullptr;
+    inline ULONG g_get_ssn = 0xFFFFFFFFu;
+    inline ULONG g_set_ssn = 0xFFFFFFFFu;
+    inline LONG g_get_saved_entry = 0;
+    inline LONG g_set_saved_entry = 0;
+
+    __forceinline void disable_write_protect()
+    {
+        ULONG_PTR cr0 = __readcr0();
+        cr0 &= ~(1ULL << 16);
+        __writecr0(cr0);
+    }
+
+    __forceinline void enable_write_protect()
+    {
+        ULONG_PTR cr0 = __readcr0();
+        cr0 |= (1ULL << 16);
+        __writecr0(cr0);
+    }
+
+    NTSTATUS NTAPI hooked_NtGetContextThread(HANDLE thread_handle, PCONTEXT ctx)
+    {
+        if (g_orig_NtGetContextThread &&
+            ExGetPreviousMode() == UserMode &&
+            caller_validation::g_registered_client_pid != nullptr) {
+
+            HANDLE caller_pid = PsGetCurrentProcessId();
+            if (caller_pid != caller_validation::g_registered_client_pid) {
+                PETHREAD thread = nullptr;
+                NTSTATUS lookup = PsLookupThreadByThreadId(thread_handle, &thread);
+                if (NT_SUCCESS(lookup) && thread) {
+                    PEPROCESS owner_proc = IoThreadToProcess(thread);
+                    HANDLE owner_pid = PsGetProcessId(owner_proc);
+                    ObDereferenceObject(thread);
+                    if (owner_pid == caller_validation::g_registered_client_pid) {
+                        WW_LOG("[CTXGUARD] blocked NtGetContextThread caller_pid=%llu target_pid=%llu",
+                            (UINT64)(ULONG_PTR)caller_pid,
+                            (UINT64)(ULONG_PTR)owner_pid);
+                        return STATUS_ACCESS_DENIED;
+                    }
+                }
+            }
+        }
+
+        if (!g_orig_NtGetContextThread)
+            return STATUS_PROCEDURE_NOT_FOUND;
+
+        return g_orig_NtGetContextThread(thread_handle, ctx);
+    }
+
+    NTSTATUS NTAPI hooked_NtSetContextThread(HANDLE thread_handle, PCONTEXT ctx)
+    {
+        if (g_orig_NtSetContextThread &&
+            ExGetPreviousMode() == UserMode &&
+            caller_validation::g_registered_client_pid != nullptr) {
+
+            HANDLE caller_pid = PsGetCurrentProcessId();
+            if (caller_pid != caller_validation::g_registered_client_pid) {
+                PETHREAD thread = nullptr;
+                NTSTATUS lookup = PsLookupThreadByThreadId(thread_handle, &thread);
+                if (NT_SUCCESS(lookup) && thread) {
+                    PEPROCESS owner_proc = IoThreadToProcess(thread);
+                    HANDLE owner_pid = PsGetProcessId(owner_proc);
+                    ObDereferenceObject(thread);
+                    if (owner_pid == caller_validation::g_registered_client_pid) {
+                        WW_LOG("[CTXGUARD] blocked NtSetContextThread caller_pid=%llu target_pid=%llu",
+                            (UINT64)(ULONG_PTR)caller_pid,
+                            (UINT64)(ULONG_PTR)owner_pid);
+                        return STATUS_ACCESS_DENIED;
+                    }
+                }
+            }
+        }
+
+        if (!g_orig_NtSetContextThread)
+            return STATUS_PROCEDURE_NOT_FOUND;
+
+        return g_orig_NtSetContextThread(thread_handle, ctx);
+    }
+
+    __forceinline NTSTATUS install()
+    {
+        if (_InterlockedCompareExchange(&g_installed, 1, 0) != 0)
+            return STATUS_ALREADY_REGISTERED;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+
+        if (!ssdt_resolver::find_ssdt() || !ssdt_resolver::g_ssdt) {
+            WW_LOG("[CTXGUARD] install failed: ssdt not found");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        ssdt_resolver::ntdll_lookup_result_t ntdll{};
+        if (!ssdt_resolver::locate_current_ntdll(&ntdll)) {
+            WW_LOG("[CTXGUARD] install failed: ntdll not found reason=%s", ntdll.reason);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        CHAR get_name[] = { 'N','t','G','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
+        CHAR set_name[] = { 'N','t','S','e','t','C','o','n','t','e','x','t','T','h','r','e','a','d',0 };
+        PUCHAR get_stub = static_cast<PUCHAR>(GetProcAddress(ntdll.ntdll_base, get_name));
+        PUCHAR set_stub = static_cast<PUCHAR>(GetProcAddress(ntdll.ntdll_base, set_name));
+
+        if (!get_stub || !set_stub) {
+            WW_LOG("[CTXGUARD] install failed: ntdll export missing get=%p set=%p", get_stub, set_stub);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        if (get_stub[0] != 0x4C || get_stub[1] != 0x8B || get_stub[2] != 0xD1 || get_stub[3] != 0xB8 ||
+            set_stub[0] != 0x4C || set_stub[1] != 0x8B || set_stub[2] != 0xD1 || set_stub[3] != 0xB8) {
+            WW_LOG("[CTXGUARD] install failed: unexpected stub bytes");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        g_get_ssn = *reinterpret_cast<PULONG>(&get_stub[4]);
+        g_set_ssn = *reinterpret_cast<PULONG>(&set_stub[4]);
+
+        if (g_get_ssn >= static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit) ||
+            g_set_ssn >= static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit)) {
+            WW_LOG("[CTXGUARD] install failed: ssn out of range get=%lu set=%lu limit=%lu",
+                g_get_ssn, g_set_ssn, static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit));
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        g_get_saved_entry = ssdt_resolver::g_ssdt->ServiceTable[g_get_ssn];
+        g_set_saved_entry = ssdt_resolver::g_ssdt->ServiceTable[g_set_ssn];
+
+        g_orig_NtGetContextThread = reinterpret_cast<fn_NtGetContextThread_t>(
+            ssdt_resolver::get_ssdt_entry(g_get_ssn));
+        g_orig_NtSetContextThread = reinterpret_cast<fn_NtSetContextThread_t>(
+            ssdt_resolver::get_ssdt_entry(g_set_ssn));
+
+        if (!g_orig_NtGetContextThread || !g_orig_NtSetContextThread) {
+            WW_LOG("[CTXGUARD] install failed: original function null get=%p set=%p",
+                g_orig_NtGetContextThread, g_orig_NtSetContextThread);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        ULONG_PTR table_base = reinterpret_cast<ULONG_PTR>(ssdt_resolver::g_ssdt->ServiceTable);
+
+        ULONG_PTR get_hook_addr = reinterpret_cast<ULONG_PTR>(&hooked_NtGetContextThread);
+        LONG64 get_offset = static_cast<LONG64>(get_hook_addr - table_base);
+        if (get_offset > 0x07FFFFFFLL || get_offset < -0x08000000LL) {
+            WW_LOG("[CTXGUARD] install failed: get hook offset out of range offset=%lld", get_offset);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+        LONG get_new_entry = static_cast<LONG>((get_offset << 4) | (g_get_saved_entry & 0xF));
+
+        ULONG_PTR set_hook_addr = reinterpret_cast<ULONG_PTR>(&hooked_NtSetContextThread);
+        LONG64 set_offset = static_cast<LONG64>(set_hook_addr - table_base);
+        if (set_offset > 0x07FFFFFFLL || set_offset < -0x08000000LL) {
+            WW_LOG("[CTXGUARD] install failed: set hook offset out of range offset=%lld", set_offset);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+        LONG set_new_entry = static_cast<LONG>((set_offset << 4) | (g_set_saved_entry & 0xF));
+
+        disable_write_protect();
+        ssdt_resolver::g_ssdt->ServiceTable[g_get_ssn] = get_new_entry;
+        ssdt_resolver::g_ssdt->ServiceTable[g_set_ssn] = set_new_entry;
+        enable_write_protect();
+
+        WW_LOG("[CTXGUARD] installed get_ssn=%lu set_ssn=%lu table=%p get_orig=%p get_hook=%p set_orig=%p set_hook=%p get_saved=0x%08lX get_new=0x%08lX set_saved=0x%08lX set_new=0x%08lX",
+            g_get_ssn, g_set_ssn,
+            reinterpret_cast<PVOID>(table_base),
+            reinterpret_cast<PVOID>(g_orig_NtGetContextThread),
+            reinterpret_cast<PVOID>(get_hook_addr),
+            reinterpret_cast<PVOID>(g_orig_NtSetContextThread),
+            reinterpret_cast<PVOID>(set_hook_addr),
+            static_cast<ULONG>(g_get_saved_entry),
+            static_cast<ULONG>(get_new_entry),
+            static_cast<ULONG>(g_set_saved_entry),
+            static_cast<ULONG>(set_new_entry));
+
+        return STATUS_SUCCESS;
+    }
+
+    __forceinline void uninstall()
+    {
+        if (_InterlockedCompareExchange(&g_installed, 0, 1) != 1)
+            return;
+
+        if (!ssdt_resolver::g_ssdt)
+            return;
+
+        disable_write_protect();
+        if (g_get_ssn != 0xFFFFFFFFu)
+            ssdt_resolver::g_ssdt->ServiceTable[g_get_ssn] = g_get_saved_entry;
+        if (g_set_ssn != 0xFFFFFFFFu)
+            ssdt_resolver::g_ssdt->ServiceTable[g_set_ssn] = g_set_saved_entry;
+        enable_write_protect();
+
+        WW_LOG("[CTXGUARD] uninstalled get_ssn=%lu set_ssn=%lu get_restored=0x%08lX set_restored=0x%08lX",
+            g_get_ssn, g_set_ssn,
+            static_cast<ULONG>(g_get_saved_entry),
+            static_cast<ULONG>(g_set_saved_entry));
+
+        g_orig_NtGetContextThread = nullptr;
+        g_orig_NtSetContextThread = nullptr;
+        g_get_ssn = 0xFFFFFFFFu;
+        g_set_ssn = 0xFFFFFFFFu;
+        g_get_saved_entry = 0;
+        g_set_saved_entry = 0;
     }
 }

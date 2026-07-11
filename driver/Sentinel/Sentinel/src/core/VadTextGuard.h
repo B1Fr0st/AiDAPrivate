@@ -134,4 +134,110 @@ namespace vad_text_guard {
     cleanup:
         _ObfDereferenceObject(proc);
     }
+
+    __forceinline void check_with_content(HANDLE client_pid)
+    {
+        check(client_pid);
+
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            integrity::verify_usermode_from_kernel(client_pid);
+        }
+    }
+
+    __forceinline void check_header_region_intact(HANDLE client_pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
+        if (!client_pid)
+            return;
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId(client_pid, &proc);
+        if (!NT_SUCCESS(st) || !proc)
+            return;
+
+        __try {
+            PVOID base = _PsGetProcessSectionBaseAddress(proc);
+            if (!base || !_MmIsAddressValid(base))
+                goto cleanup;
+
+            UINT16 dos_magic = 0;
+            __try {
+                dos_magic = *reinterpret_cast<volatile UINT16*>(base);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { dos_magic = 0xFFFF; }
+
+            if (dos_magic == 0x5A4D) {
+                targeting_latch::latch_targeting(
+                    targeting_latch::RE_REASON_HEADER_RESTORE,
+                    reinterpret_cast<UINT64>(base),
+                    0x5A4D,
+                    0, 0
+                );
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    cleanup:
+        _ObfDereferenceObject(proc);
+    }
+
+    __forceinline void monitor_text_page_access(HANDLE client_pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
+
+        UINT64 text_base = g_text_base;
+        UINT64 text_size = g_text_size;
+        if (!text_base || !text_size || !client_pid)
+            return;
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId(client_pid, &proc);
+        if (!NT_SUCCESS(st) || !proc)
+            return;
+
+        __try {
+            KAPC_STATE apc;
+            _KeStackAttachProcess(proc, &apc);
+
+            UINT64 tsc = __rdtsc();
+            DWORD page_size = 4096;
+            UINT32 total_pages = static_cast<UINT32>(text_size / page_size);
+            if (total_pages == 0) goto detach;
+
+            UINT32 check_count = total_pages < 16 ? total_pages : 16;
+            for (UINT32 i = 0; i < check_count; ++i) {
+                tsc = tsc * 6364136223846793005ULL + 1442695040888963407ULL;
+                UINT32 page_idx = static_cast<UINT32>(tsc >> 33) % total_pages;
+                UINT64 page_addr = text_base + page_idx * page_size;
+
+                MEMORY_BASIC_INFORMATION mbi{};
+                SIZE_T ret_len = 0;
+                NTSTATUS qst = _ZwQueryVirtualMemory(
+                    ZwCurrentProcess(),
+                    reinterpret_cast<PVOID>(page_addr),
+                    MemoryWorkingSetExInformation,
+                    &mbi,
+                    sizeof(mbi),
+                    &ret_len);
+
+                if (NT_SUCCESS(qst) && (mbi.Protect & PAGE_GUARD) == 0) {
+                    DWORD prot = mbi.Protect & 0xFF;
+                    if (prot != PAGE_EXECUTE_READ && prot != PAGE_NOACCESS) {
+                        targeting_latch::latch_targeting(
+                            targeting_latch::RE_REASON_TEXT_PAGE_ACCESSED,
+                            page_addr,
+                            prot,
+                            page_idx, 0
+                        );
+                        break;
+                    }
+                }
+            }
+
+        detach:
+            _KeUnstackDetachProcess(&apc);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        _ObfDereferenceObject(proc);
+    }
 }

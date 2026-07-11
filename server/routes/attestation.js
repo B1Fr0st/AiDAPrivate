@@ -13,8 +13,43 @@ const PROOF_REPLAY_WINDOW = 600;
 const MAX_HISTORY_RECORDS = 256;
 const REVOCATION_TRIP_COUNT = 3;
 const KNOWN_ATTEST_NONCES = new Map();
+const TEMPLATE_GRACE_PERIOD_SEC = 2592000;
+
+async function checkAttestationTemplateVersion(licenseKey, body) {
+    const clientTemplateVersion = typeof body.template_version === 'string' ? body.template_version.trim() : '';
+    if (!clientTemplateVersion) return { ok: true };
+
+    let activeTemplate = null;
+    try {
+        const { rows } = await pool.query(
+            'SELECT version, uploaded_at FROM build_templates WHERE is_active = true LIMIT 1'
+        );
+        if (rows.length > 0) activeTemplate = rows[0];
+    } catch (err) {
+        if (err && err.code === '42P01') return { ok: true };
+        return { ok: true };
+    }
+
+    if (!activeTemplate) return { ok: true };
+
+    const activeVersion = String(activeTemplate.version || '').trim();
+    if (!activeVersion || activeVersion === clientTemplateVersion) return { ok: true };
+
+    const uploadedAt = Number(activeTemplate.uploaded_at || 0);
+    const now = Math.floor(Date.now() / 1000);
+    const ageSec = uploadedAt > 0 ? (now - uploadedAt) : 0;
+
+    if (ageSec < TEMPLATE_GRACE_PERIOD_SEC) {
+        return { ok: true, logging: { template_old: true, client_version: clientTemplateVersion, active_version: activeVersion, age_sec: ageSec } };
+    }
+
+    return { ok: false, reason: 'template_update_required', client_version: clientTemplateVersion, active_version: activeVersion, age_sec: ageSec };
+}
 
 const PCR_LENGTH_HEX = 64;
+const TIMESTAMP_FRESHNESS_SECONDS = 300;
+const BUILD_ID_HEX_LENGTH = 32;
+const USERMODE_CODE_HASH_HEX_LENGTH = 64;
 
 const ATTESTATION_HMAC_LABEL = 'aida/attest/v1';
 const ATTESTATION_HMAC_SECRET = process.env.ATTESTATION_HMAC_SECRET
@@ -31,6 +66,14 @@ function isHexString(value, length) {
     return typeof value === 'string'
         && (length == null || value.length === length)
         && /^[a-fA-F0-9]+$/.test(value);
+}
+
+function timingSafeHexCompare(aHex, bHex) {
+    if (typeof aHex !== 'string' || typeof bHex !== 'string') return false;
+    if (aHex.length !== bHex.length) return false;
+    const a = Buffer.from(aHex, 'utf8');
+    const b = Buffer.from(bHex, 'utf8');
+    return crypto.timingSafeEqual(a, b);
 }
 
 function generateNonce() {
@@ -73,6 +116,37 @@ function createTablesIfNeeded() {
         );
         CREATE INDEX IF NOT EXISTS idx_attest_nonces_lic ON attestation_nonces (license_key);
         CREATE INDEX IF NOT EXISTS idx_attest_nonces_expires ON attestation_nonces (expires_at);
+        CREATE TABLE IF NOT EXISTS dma_state_log (
+            hwid_hash         VARCHAR(64) PRIMARY KEY,
+            license_key       TEXT,
+            dma_state_hex     TEXT        NOT NULL DEFAULT '',
+            tier1_refused     BOOLEAN     NOT NULL DEFAULT false,
+            tier2_bsod_armed  BOOLEAN     NOT NULL DEFAULT false,
+            canary_count      INTEGER     NOT NULL DEFAULT 0,
+            canary_hits       INTEGER     NOT NULL DEFAULT 0,
+            pcie_unknown      INTEGER     NOT NULL DEFAULT 0,
+            ept_anomaly       BOOLEAN     NOT NULL DEFAULT false,
+            updated_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_dma_state_hwid ON dma_state_log(hwid_hash);
+        CREATE TABLE IF NOT EXISTS attestation_records (
+            id                  SERIAL      PRIMARY KEY,
+            hwid_hash           VARCHAR(64) NOT NULL,
+            nonce               VARCHAR(64) NOT NULL,
+            usermode_code_hash  VARCHAR(64) NOT NULL,
+            build_id            VARCHAR(32) NOT NULL,
+            timestamp           BIGINT      NOT NULL,
+            created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_attest_records_hwid ON attestation_records(hwid_hash);
+        CREATE INDEX IF NOT EXISTS idx_attest_records_nonce ON attestation_records(nonce);
+        CREATE INDEX IF NOT EXISTS idx_attest_records_build ON attestation_records(build_id);
+        CREATE TABLE IF NOT EXISTS builds (
+            build_id            VARCHAR(32) PRIMARY KEY,
+            expected_text_sha256 VARCHAR(64) NOT NULL,
+            retired             BOOLEAN     NOT NULL DEFAULT false,
+            created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
     `);
 }
 
@@ -129,6 +203,44 @@ async function trackAnomaly(licenseKey, reason, details, currentRow) {
     return shouldRevoke;
 }
 
+async function getBuildExpectedHash(buildId) {
+    if (!buildId || typeof buildId !== 'string') return null;
+    try {
+        const { rows } = await pool.query(
+            'SELECT expected_text_sha256, retired FROM builds WHERE build_id = $1',
+            [buildId]
+        );
+        if (rows.length === 0) return null;
+        const row = rows[0];
+        const hash = typeof row.expected_text_sha256 === 'string'
+            ? row.expected_text_sha256.trim().toLowerCase() : '';
+        if (!/^[0-9a-f]{64}$/.test(hash)) return null;
+        return { hash, retired: !!row.retired };
+    } catch (err) {
+        console.warn('[attestation] getBuildExpectedHash failed:',
+            err && err.message ? err.message : err);
+        return null;
+    }
+}
+
+async function killSessionForViolation(licenseKey, reason) {
+    if (!licenseKey) return;
+    try {
+        const nowSec = Math.floor(Date.now() / 1000);
+        await pool.query(
+            'UPDATE sessions SET kill_flag = true, force_violation = true WHERE license_key = $1',
+            [licenseKey]
+        );
+        await pool.query(
+            'UPDATE licenses SET active = false, revoked_reason = $1, revoked_at = $2 WHERE key = $3',
+            [reason, nowSec, licenseKey]
+        );
+    } catch (err) {
+        console.warn('[attestation] killSessionForViolation failed:',
+            err && err.message ? err.message : err);
+    }
+}
+
 router.post('/nonce', async (req, res) => {
     try {
         const { license_key } = req.body || {};
@@ -169,6 +281,62 @@ router.post('/nonce', async (req, res) => {
     }
 });
 
+async function processDmaState(licenseKey, hwid, dmaStateHex) {
+    if (!dmaStateHex || typeof dmaStateHex !== 'string') return null;
+    const cleaned = dmaStateHex.trim().toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(cleaned)) return null;
+    const bytes = Buffer.from(cleaned, 'hex');
+    if (bytes.length < 8) return null;
+
+    const tier1Refused = bytes[0] !== 0;
+    const tier2BsodArmed = bytes[1] !== 0;
+    const canaryCount = bytes[2];
+    const canaryHits = bytes[3];
+    const pcieUnknown = bytes[4];
+    const eptAnomaly = bytes[5] !== 0;
+
+    await pool.query(
+        `INSERT INTO dma_state_log
+            (hwid_hash, license_key, dma_state_hex, tier1_refused, tier2_bsod_armed,
+             canary_count, canary_hits, pcie_unknown, ept_anomaly, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+         ON CONFLICT (hwid_hash) DO UPDATE SET
+            license_key       = EXCLUDED.license_key,
+            dma_state_hex     = EXCLUDED.dma_state_hex,
+            tier1_refused     = EXCLUDED.tier1_refused,
+            tier2_bsod_armed  = EXCLUDED.tier2_bsod_armed,
+            canary_count      = EXCLUDED.canary_count,
+            canary_hits       = EXCLUDED.canary_hits,
+            pcie_unknown      = EXCLUDED.pcie_unknown,
+            ept_anomaly       = EXCLUDED.ept_anomaly,
+            updated_at        = NOW()`,
+        [hwid.slice(0, 64), licenseKey, cleaned, tier1Refused, tier2BsodArmed,
+         canaryCount, canaryHits, pcieUnknown, eptAnomaly]
+    );
+
+    const attackIndicated = canaryHits > 0 || eptAnomaly || pcieUnknown >= 2;
+    const noBsodTriggered = !tier2BsodArmed;
+
+    if (attackIndicated && noBsodTriggered) {
+        const now = Math.floor(Date.now() / 1000);
+        const reasonParts = [];
+        if (canaryHits > 0) reasonParts.push(`canary_hits=${canaryHits}`);
+        if (eptAnomaly) reasonParts.push('ept_anomaly');
+        if (pcieUnknown >= 2) reasonParts.push(`pcie_unknown=${pcieUnknown}`);
+        await pool.query(
+            `UPDATE licenses
+                SET flagged = true,
+                    flagged_reason = $1,
+                    flagged_at = $2,
+                    flagged_score = 0.8
+              WHERE key = $3`,
+            [`dma_state_attestation:${reasonParts.join(':')}`, now, licenseKey]
+        );
+    }
+
+    return { tier1Refused, tier2BsodArmed, canaryCount, canaryHits, pcieUnknown, eptAnomaly };
+}
+
 router.post('/verify', async (req, res) => {
     try {
         const body = req.body || {};
@@ -178,6 +346,11 @@ router.post('/verify', async (req, res) => {
         const tpmQuote = body.tpm_attest_quote;
         const tpmSig = body.tpm_attest_signature;
         const qpcSequence = body.qpc_sequence;
+        const dmaState = body.dma_state;
+        const usermodeCodeHash = body.usermode_code_hash;
+        const buildId = body.build_id;
+        const clientTimestamp = body.timestamp;
+        const clientAttestHmac = body.attest_hmac;
 
         if (typeof license_key !== 'string' || !isHexString(nonce, 64)) {
             return res.status(400).json({ status: 'error', reason: 'invalid_request' });
@@ -201,6 +374,11 @@ router.post('/verify', async (req, res) => {
         );
         if (licRows.length === 0 || !licRows[0].active) {
             return res.status(401).json({ status: 'error', reason: 'license_invalid' });
+        }
+
+        const templateResult = await checkAttestationTemplateVersion(license_key, body);
+        if (!templateResult.ok) {
+            return res.status(426).json({ status: 'error', reason: templateResult.reason || 'template_update_required' });
         }
 
         const { rows: nonceRows } = await pool.query(
@@ -297,10 +475,88 @@ router.post('/verify', async (req, res) => {
             if (now - ts > PROOF_REPLAY_WINDOW) KNOWN_ATTEST_NONCES.delete(k);
         }
 
+        let buildValidationResult = null;
+
+        if (typeof clientTimestamp !== 'undefined' && clientTimestamp !== null) {
+            const tsValue = typeof clientTimestamp === 'number'
+                ? clientTimestamp
+                : parseInt(clientTimestamp, 10);
+            if (!Number.isFinite(tsValue) || Math.abs(now - tsValue) > TIMESTAMP_FRESHNESS_SECONDS) {
+                await trackAnomaly(license_key, 'timestamp_stale',
+                    { server_time: now, client_time: tsValue }, state);
+                return res.status(400).json({ status: 'error', reason: 'timestamp_stale' });
+            }
+        }
+
+        if (typeof buildId === 'string' && buildId.length > 0) {
+            if (!isHexString(buildId, BUILD_ID_HEX_LENGTH)) {
+                return res.status(400).json({ status: 'error', reason: 'invalid_build_id' });
+            }
+            if (!isHexString(usermodeCodeHash, USERMODE_CODE_HASH_HEX_LENGTH)) {
+                return res.status(400).json({ status: 'error', reason: 'invalid_usermode_code_hash' });
+            }
+
+            if (typeof clientAttestHmac === 'string' && clientAttestHmac.length > 0 && ATTESTATION_HMAC_SECRET) {
+                const attestCanonical = `${license_key}|${nonce}|${usermodeCodeHash}|${buildId}|${hwid}|${clientTimestamp || ''}`;
+                const expectedAttestHmac = hmacAttest(attestCanonical);
+                if (!timingSafeHexCompare(expectedAttestHmac, clientAttestHmac)) {
+                    await trackAnomaly(license_key, 'attestation_hmac_invalid',
+                        { build_id: buildId }, state);
+                    return res.status(401).json({ status: 'error', reason: 'attestation_hmac_invalid' });
+                }
+            }
+
+            const buildInfo = await getBuildExpectedHash(buildId);
+            if (!buildInfo) {
+                await trackAnomaly(license_key, 'unknown_build_version',
+                    { build_id: buildId }, state);
+                return res.status(400).json({ status: 'error', reason: 'unknown_build_version' });
+            }
+
+            const usermodeHashNormalized = usermodeCodeHash.trim().toLowerCase();
+            if (!timingSafeHexCompare(usermodeHashNormalized, buildInfo.hash)) {
+                await trackAnomaly(license_key, 'integrity_violation',
+                    { expected: buildInfo.hash, observed: usermodeHashNormalized, build_id: buildId }, state);
+                await killSessionForViolation(license_key, 'integrity_violation');
+                return res.status(403).json({ status: 'error', reason: 'integrity_violation' });
+            }
+
+            buildValidationResult = {
+                build_id: buildId,
+                verified: true,
+                retired: buildInfo.retired,
+            };
+
+            const hwidHash = crypto.createHash('sha256')
+                .update(String(hwid || ''), 'utf8')
+                .digest('hex');
+            const recordTimestamp = (typeof clientTimestamp === 'number' && Number.isFinite(clientTimestamp))
+                ? Math.floor(clientTimestamp)
+                : (typeof clientTimestamp === 'string' && /^[0-9]+$/.test(clientTimestamp)
+                    ? parseInt(clientTimestamp, 10)
+                    : now);
+
+            await pool.query(
+                `INSERT INTO attestation_records
+                    (hwid_hash, nonce, usermode_code_hash, build_id, timestamp)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [hwidHash, nonce, usermodeHashNormalized, buildId, recordTimestamp]
+            );
+        }
+
         await pool.query(
             `UPDATE attestation_state SET last_code_hash = $1, updated_at = $2 WHERE license_key = $3`,
             [code_hash, now, license_key]
         );
+
+        let dmaStateResult = null;
+        if (typeof dmaState === 'string' && dmaState.length > 0) {
+            try {
+                dmaStateResult = await processDmaState(license_key, hwid, dmaState);
+            } catch (dmaErr) {
+                console.warn('[attestation] dma_state processing failed:', dmaErr && dmaErr.message ? dmaErr.message : dmaErr);
+            }
+        }
 
         const tpmQuoteAccepted = typeof tpmQuote === 'string'
             && tpmQuote.length >= 64
@@ -318,6 +574,9 @@ router.post('/verify', async (req, res) => {
             tpm_quote_accepted: tpmQuoteAccepted,
             digest: expectedDigest,
             hmac: hmacAttest(`${license_key}|${nonce}|${code_hash}|${expectedDigest}`),
+            dma_state_recorded: dmaStateResult !== null,
+            dma_attack_flagged: dmaStateResult !== null && (dmaStateResult.canaryHits > 0 || dmaStateResult.eptAnomaly || dmaStateResult.pcieUnknown >= 2) && !dmaStateResult.tier2BsodArmed,
+            build_validation: buildValidationResult,
         };
 
         return res.json(canonicalResponse.buildEnvelope(responsePayload));

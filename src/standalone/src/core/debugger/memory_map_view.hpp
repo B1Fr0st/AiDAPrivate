@@ -38,8 +38,6 @@
 #include "../helpers/win32_dialog.hpp"
 #include "../anti-tamper/webhook.hpp"
 
-extern DisasmState g_disasm;
-
 namespace memory_map_view {
 
 struct stat_counter_t {
@@ -876,11 +874,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (req == 0) {
 					toast_notification::push("Region has zero size.", toast_notification::toast_type_t::error);
 				}
-				else if (hex_view::read_from_process(r.base, req)) {
-					globals::ui::active_center_view = center_view_t::hex_view;
-				}
 				else {
-					toast_notification::push("Failed to read region for hex view.", toast_notification::toast_type_t::error);
+					const auto context = disasm_view::capture_selected_workspace();
+					if (hex_view::read_live_memory(context, r.base, req)) {
+						globals::ui::active_center_view = center_view_t::hex_view;
+					}
+					else {
+						toast_notification::push("Failed to read region for hex view.", toast_notification::toast_type_t::error);
+					}
 				}
 			}
 			else {
@@ -895,7 +896,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					"memmap_go_disasm base=0x%llx",
 					static_cast<unsigned long long>(r.base));
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(r.base, g_disasm);
+				disasm_view::goto_address(r.base,
+					disasm_view::capture_selected_workspace());
 			}
 			else {
 				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);

@@ -458,6 +458,113 @@ namespace pe_header
         return true;
     }
 
+    inline bool erase_export_directory()
+    {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) {
+            webhook::write_log("anti_dump", "erase_export: GetModuleHandle null");
+            return false;
+        }
+
+        auto* base = reinterpret_cast<uint8_t*>(mod);
+        auto* nt = safe_resolve_self_nt(base, "erase_export");
+        if (!nt) return false;
+
+        if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) {
+            webhook::write_log("anti_dump", "erase_export: no export directory");
+            return true;
+        }
+
+        auto& export_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (export_dir.VirtualAddress == 0 || export_dir.Size == 0) {
+            webhook::write_log("anti_dump", "erase_export: empty export dir");
+            return true;
+        }
+
+        auto* export_va = base + export_dir.VirtualAddress;
+        DWORD export_size = export_dir.Size;
+
+        {
+            char buf[160];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "erase_export_pre: rva=0x%X size=0x%X va=0x%llX",
+                export_dir.VirtualAddress, export_size,
+                reinterpret_cast<uint64_t>(export_va));
+            webhook::write_log("anti_dump", buf);
+        }
+
+        DWORD old_prot = 0;
+        if (!VirtualProtect(export_va, export_size, PAGE_READWRITE, &old_prot)) {
+            webhook::write_log("anti_dump", "erase_export: VirtualProtect failed");
+            return false;
+        }
+
+        RtlSecureZeroMemory(export_va, export_size);
+
+        DWORD nt_old_prot = 0;
+        if (VirtualProtect(nt, sizeof(IMAGE_NT_HEADERS64), PAGE_READWRITE, &nt_old_prot)) {
+            export_dir.VirtualAddress = 0;
+            export_dir.Size = 0;
+            VirtualProtect(nt, sizeof(IMAGE_NT_HEADERS64), nt_old_prot, &nt_old_prot);
+        }
+
+        VirtualProtect(export_va, export_size, old_prot, &old_prot);
+        FlushInstructionCache(GetCurrentProcess(), export_va, export_size);
+
+        webhook::write_log("anti_dump", "erase_export_post: zeroed");
+        return true;
+    }
+
+    struct header_verify_result_t {
+        bool dos_zeroed;
+        bool nt_zeroed;
+        bool sections_zeroed;
+        bool export_zeroed;
+    };
+
+    inline header_verify_result_t verify_headers_zeroed()
+    {
+        header_verify_result_t result{false, false, false, false};
+
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) return result;
+
+        auto* base = reinterpret_cast<uint8_t*>(mod);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+
+        __try {
+            result.dos_zeroed = (dos->e_magic == 0 || dos->e_magic == IMAGE_DOS_SIGNATURE);
+
+            LONG e_lfanew = dos->e_lfanew;
+            if (e_lfanew <= 0 || static_cast<uint32_t>(e_lfanew) > 0x10000u)
+                return result;
+
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + e_lfanew);
+            result.nt_zeroed = (nt->Signature == 0 || nt->Signature == IMAGE_NT_SIGNATURE);
+
+            auto* sec = IMAGE_FIRST_SECTION(nt);
+            WORD num = nt->FileHeader.NumberOfSections;
+            bool all_sections_zero = true;
+            for (WORD i = 0; i < num; ++i) {
+                if (sec[i].VirtualAddress != 0 || sec[i].Misc.VirtualSize != 0) {
+                    all_sections_zero = false;
+                    break;
+                }
+            }
+            result.sections_zeroed = all_sections_zero;
+
+            if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+                auto& ed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+                result.export_zeroed = (ed.VirtualAddress == 0 && ed.Size == 0);
+            } else {
+                result.export_zeroed = true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        return result;
+    }
+
     inline bool inject_fake_sections()
     {
         HMODULE mod = GetModuleHandleW(nullptr);
@@ -575,25 +682,28 @@ namespace module_stealth
         entry->Blink = entry;
     }
 
-    inline bool hide_from_peb()
+    inline int scrub_peb_ldr_entry(HMODULE self_module)
     {
+        if (!self_module) return 0;
+
         auto* peb = reinterpret_cast<PEB*>(__readgsqword(0x60));
-        if (!peb || !peb->Ldr) return false;
+        if (!peb || !peb->Ldr) return 0;
 
         auto* ldr = reinterpret_cast<_PEB_LDR_DATA_FULL*>(peb->Ldr);
-        HMODULE our_mod = GetModuleHandleW(nullptr);
-        if (!our_mod) return false;
-
         auto* head = &ldr->InLoadOrderModuleList;
-        if (!pointer_writable(head, sizeof(LIST_ENTRY))) return false;
+        if (!pointer_writable(head, sizeof(LIST_ENTRY))) return 0;
         auto* cur = head->Flink;
 
+        int unlinked = 0;
         while (cur != head)
         {
-            if (!pointer_writable(cur, sizeof(LIST_ENTRY))) return false;
+            if (!pointer_writable(cur, sizeof(LIST_ENTRY))) return unlinked;
             auto* entry = CONTAINING_RECORD(cur, _LDR_DATA_TABLE_ENTRY_FULL, InLoadOrderLinks);
-            if (!pointer_writable(entry, sizeof(_LDR_DATA_TABLE_ENTRY_FULL))) return false;
-            if (entry->DllBase == our_mod)
+            if (!pointer_writable(entry, sizeof(_LDR_DATA_TABLE_ENTRY_FULL))) return unlinked;
+
+            auto* next = cur->Flink;
+
+            if (entry->DllBase == self_module)
             {
                 unlink_entry(&entry->InLoadOrderLinks);
                 unlink_entry(&entry->InMemoryOrderLinks);
@@ -618,11 +728,19 @@ namespace module_stealth
                 entry->EntryPoint = nullptr;
                 entry->SizeOfImage = 0;
 
-                return true;
+                ++unlinked;
             }
-            cur = cur->Flink;
+
+            cur = next;
         }
-        return false;
+        return unlinked;
+    }
+
+    inline bool hide_from_peb()
+    {
+        HMODULE our_mod = GetModuleHandleW(nullptr);
+        if (!our_mod) return false;
+        return scrub_peb_ldr_entry(our_mod) != 0;
     }
 
 }
@@ -2450,6 +2568,11 @@ inline void seal_handles()
 inline void hide_module()
 {
     module_stealth::hide_from_peb();
+}
+
+inline int scrub_peb_ldr_entry(HMODULE self_module)
+{
+    return module_stealth::scrub_peb_ldr_entry(self_module);
 }
 
 inline void shutdown()

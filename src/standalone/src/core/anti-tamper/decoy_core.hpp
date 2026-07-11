@@ -23,6 +23,57 @@ namespace ai_deception {
 namespace decoy_core {
 
     static constexpr size_t k_payload_size = 65536;
+    static constexpr uint32_t CANARY_TOTAL_SIZE = 52;
+    static constexpr uint32_t CANARY_DATA_SIZE  = 48;
+    static constexpr uint32_t CANARY_CRC_SIZE   = 4;
+
+    inline uint32_t canary_crc32_ieee(const uint8_t* data, size_t len) noexcept
+    {
+        uint32_t crc = 0xFFFFFFFFu;
+        for (size_t i = 0; i < len; ++i)
+        {
+            crc ^= data[i];
+            for (int j = 0; j < 8; ++j)
+            {
+                uint32_t mask = -(crc & 1u);
+                crc = (crc >> 1) ^ (0xEDB88320u & mask);
+            }
+        }
+        return ~crc;
+    }
+
+    enum class canary_verify_result_t : uint8_t {
+        INTACT     = 0,
+        CORRUPTION = 1,
+        PATCHED    = 2,
+    };
+
+    inline canary_verify_result_t verify_canary_integrity(
+        const uint8_t* canary, const uint8_t* baseline, size_t len) noexcept
+    {
+        if (len < CANARY_TOTAL_SIZE) return canary_verify_result_t::CORRUPTION;
+
+        uint32_t stored_crc;
+        std::memcpy(&stored_crc, canary + CANARY_DATA_SIZE, CANARY_CRC_SIZE);
+        uint32_t computed_crc = canary_crc32_ieee(canary, CANARY_DATA_SIZE);
+
+        if (computed_crc != stored_crc)
+            return canary_verify_result_t::CORRUPTION;
+
+        if (std::memcmp(canary, baseline, CANARY_DATA_SIZE) != 0)
+            return canary_verify_result_t::PATCHED;
+
+        return canary_verify_result_t::INTACT;
+    }
+
+    inline void compute_canary_crc_field(uint8_t* canary) noexcept
+    {
+        uint32_t crc = canary_crc32_ieee(canary, CANARY_DATA_SIZE);
+        canary[48] = static_cast<uint8_t>(crc & 0xFFu);
+        canary[49] = static_cast<uint8_t>((crc >> 8) & 0xFFu);
+        canary[50] = static_cast<uint8_t>((crc >> 16) & 0xFFu);
+        canary[51] = static_cast<uint8_t>((crc >> 24) & 0xFFu);
+    }
 
     alignas(16) static constexpr uint8_t kDecoyCoreKey[16] = {
         0x5A, 0x3C, 0x91, 0x17, 0xBE, 0x04, 0x4F, 0x22,
@@ -485,6 +536,22 @@ inline void enable_decoy_mode() noexcept
 inline bool is_decoy_mode_active() noexcept
 {
     return decoy_core::is_decoy_mode_active();
+}
+
+inline uint32_t canary_crc32(const uint8_t* data, size_t len) noexcept
+{
+    return decoy_core::canary_crc32_ieee(data, len);
+}
+
+inline decoy_core::canary_verify_result_t verify_canary(
+    const uint8_t* canary, const uint8_t* baseline, size_t len) noexcept
+{
+    return decoy_core::verify_canary_integrity(canary, baseline, len);
+}
+
+inline void compute_canary_crc(uint8_t* canary) noexcept
+{
+    decoy_core::compute_canary_crc_field(canary);
 }
 
 }

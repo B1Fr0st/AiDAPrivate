@@ -18,6 +18,19 @@
 namespace anti_tamper {
 namespace state {
 
+#pragma pack(push, 1)
+struct reloc_mask_entry_t
+{
+    uint32_t offset;
+    uint32_t size;
+    uint32_t reloc_type;
+    uint32_t _pad;
+    uint8_t  original_value[8];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(reloc_mask_entry_t) == 24, "reloc_mask_entry_t must be 24 bytes packed");
+
 struct code_snapshot_t
 {
     uint64_t text_base = 0;
@@ -109,6 +122,15 @@ struct runtime_t
     std::atomic<int64_t>  decoy_honeypot_trip_ms{0};
     std::atomic<bool>     decoy_degrade_active{false};
     std::atomic<uint32_t> decoy_honeypot_count{0};
+
+    struct honeypot_state_t {
+        std::atomic<uint32_t> corruption_count{0};
+        std::atomic<uint32_t> bsod_count{0};
+    };
+    honeypot_state_t honeypot;
+
+    std::vector<reloc_mask_entry_t> reloc_mask_table;
+    uint64_t preferred_image_base = 0;
 };
 
 inline runtime_t& get()

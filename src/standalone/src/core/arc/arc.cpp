@@ -6,13 +6,13 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <intrin.h>
-#include <wmmintrin.h>
 #include <nmmintrin.h>
 #include <winhttp.h>
 #include <bcrypt.h>
 
 #include "anti-tamper/cff.hpp"
 #include "arc_build_seed.hpp"
+#include "anti-tamper/wb_crypto.hpp"
 #include "obfuscation.hpp"
 #include "shared/hardware_id/hardware_id_v2.hpp"
 
@@ -522,74 +522,6 @@ uint64_t driver_region_crc_hash_seh(const void* data, size_t len, bool& ok)
     return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
 }
 
-__forceinline __m128i aes_128_key_assist(__m128i t1, __m128i t2)
-{
-    t2 = _mm_shuffle_epi32(t2, 0xFF);
-    __m128i t3 = _mm_slli_si128(t1, 4);
-    t1 = _mm_xor_si128(t1, t3);
-    t3 = _mm_slli_si128(t3, 4);
-    t1 = _mm_xor_si128(t1, t3);
-    t3 = _mm_slli_si128(t3, 4);
-    t1 = _mm_xor_si128(t1, t3);
-    return _mm_xor_si128(t1, t2);
-}
-
-void aes_128_expand_key(__m128i key, __m128i rk[11])
-{
-    rk[0] = key;
-    rk[1]  = aes_128_key_assist(rk[0],  _mm_aeskeygenassist_si128(rk[0],  0x01));
-    rk[2]  = aes_128_key_assist(rk[1],  _mm_aeskeygenassist_si128(rk[1],  0x02));
-    rk[3]  = aes_128_key_assist(rk[2],  _mm_aeskeygenassist_si128(rk[2],  0x04));
-    rk[4]  = aes_128_key_assist(rk[3],  _mm_aeskeygenassist_si128(rk[3],  0x08));
-    rk[5]  = aes_128_key_assist(rk[4],  _mm_aeskeygenassist_si128(rk[4],  0x10));
-    rk[6]  = aes_128_key_assist(rk[5],  _mm_aeskeygenassist_si128(rk[5],  0x20));
-    rk[7]  = aes_128_key_assist(rk[6],  _mm_aeskeygenassist_si128(rk[6],  0x40));
-    rk[8]  = aes_128_key_assist(rk[7],  _mm_aeskeygenassist_si128(rk[7],  0x80));
-    rk[9]  = aes_128_key_assist(rk[8],  _mm_aeskeygenassist_si128(rk[8],  0x1B));
-    rk[10] = aes_128_key_assist(rk[9],  _mm_aeskeygenassist_si128(rk[9],  0x36));
-}
-
-__forceinline __m128i aes_encrypt_block(__m128i block, const __m128i rk[11])
-{
-    block = _mm_xor_si128(block, rk[0]);
-    block = _mm_aesenc_si128(block, rk[1]);
-    block = _mm_aesenc_si128(block, rk[2]);
-    block = _mm_aesenc_si128(block, rk[3]);
-    block = _mm_aesenc_si128(block, rk[4]);
-    block = _mm_aesenc_si128(block, rk[5]);
-    block = _mm_aesenc_si128(block, rk[6]);
-    block = _mm_aesenc_si128(block, rk[7]);
-    block = _mm_aesenc_si128(block, rk[8]);
-    block = _mm_aesenc_si128(block, rk[9]);
-    block = _mm_aesenclast_si128(block, rk[10]);
-    return block;
-}
-
-void aes_ctr_crypt(uint8_t* buf, size_t size, __m128i key, __m128i nonce)
-{
-    __m128i rk[11];
-    aes_128_expand_key(key, rk);
-    __m128i counter = nonce;
-    const __m128i one = _mm_set_epi64x(0, 1);
-    size_t full = size / 16;
-    auto* blks = reinterpret_cast<__m128i*>(buf);
-    for (size_t i = 0; i < full; ++i)
-    {
-        blks[i] = _mm_xor_si128(blks[i], aes_encrypt_block(counter, rk));
-        counter = _mm_add_epi64(counter, one);
-    }
-    size_t tail_off = full * 16;
-    size_t tail_len = size - tail_off;
-    if (tail_len > 0)
-    {
-        alignas(16) uint8_t ks[16];
-        _mm_store_si128(reinterpret_cast<__m128i*>(ks), aes_encrypt_block(counter, rk));
-        for (size_t j = 0; j < tail_len; ++j)
-            buf[tail_off + j] ^= ks[j];
-    }
-    SecureZeroMemory(rk, sizeof(rk));
-}
-
 bool aes_gcm_decrypt_ni(const uint8_t* ct, size_t ct_len,
     const uint8_t* key32, const uint8_t* iv12, const uint8_t* tag16,
     uint8_t* pt)
@@ -956,15 +888,15 @@ void encrypt_session_blob(session_data_t* plain, encrypted_session_t* enc)
     static_assert(sizeof(session_data_t) <= sizeof(enc->blob), "session too large");
     memcpy(enc->blob, plain, sizeof(session_data_t));
     uint64_t key = enc->rolling_key ^ enc->xor_mask ^ __rdtsc();
-    __m128i aes_key = _mm_set_epi64x(
-        static_cast<long long>(key),
-        static_cast<long long>(key ^ 0xA1DA'CAFE'BABE'C0DEull));
     enc->rolling_key = key;
-    __m128i nonce = _mm_set_epi64x(
-        static_cast<long long>(enc->xor_mask),
-        static_cast<long long>(key));
-    aes_ctr_crypt(enc->blob, sizeof(session_data_t), aes_key, nonce);
+    uint8_t iv[16];
+    std::memcpy(iv, &key, 8);
+    std::memcpy(iv + 8, &enc->xor_mask, 8);
+    for (int i = 0; i < 8; ++i)
+        iv[i] ^= static_cast<uint8_t>((enc->xor_mask >> (i * 8)) & 0xFFull);
+    anti_tamper::wb_crypto::ctr_crypt(enc->blob, enc->blob, sizeof(session_data_t), iv);
     enc->valid = true;
+    SecureZeroMemory(iv, sizeof(iv));
 }
 
 bool decrypt_session_blob(encrypted_session_t* enc, session_data_t* out)
@@ -973,33 +905,31 @@ bool decrypt_session_blob(encrypted_session_t* enc, session_data_t* out)
 
     bool result = false;
     uint64_t prev_key = 0;
-    __m128i crypt_key = _mm_setzero_si128();
-    __m128i nonce = _mm_setzero_si128();
-    alignas(16) uint8_t tmp[sizeof(session_data_t)];
+    uint8_t iv[16] = {};
+    alignas(8) uint8_t tmp[sizeof(session_data_t)];
 
     CFF_BEGIN(dec_session_cff)
     CFF_STATE(dec_session_cff, 0)
     {
         prev_key = enc->rolling_key;
-        crypt_key = _mm_set_epi64x(
-            static_cast<long long>(prev_key),
-            static_cast<long long>(prev_key ^ 0xA1DA'CAFE'BABE'C0DEull));
-        nonce = _mm_set_epi64x(
-            static_cast<long long>(enc->xor_mask),
-            static_cast<long long>(prev_key));
+        std::memcpy(iv, &prev_key, 8);
+        std::memcpy(iv + 8, &enc->xor_mask, 8);
+        for (int i = 0; i < 8; ++i)
+            iv[i] ^= static_cast<uint8_t>((enc->xor_mask >> (i * 8)) & 0xFFull);
         CFF_GOTO(dec_session_cff, 1);
     }
     CFF_STATE(dec_session_cff, 1)
     {
-        memcpy(tmp, enc->blob, sizeof(session_data_t));
-        aes_ctr_crypt(tmp, sizeof(session_data_t), crypt_key, nonce);
-        memcpy(out, tmp, sizeof(session_data_t));
+        std::memcpy(tmp, enc->blob, sizeof(session_data_t));
+        anti_tamper::wb_crypto::ctr_crypt(tmp, tmp, sizeof(session_data_t), iv);
+        std::memcpy(out, tmp, sizeof(session_data_t));
         SecureZeroMemory(tmp, sizeof(tmp));
         result = true;
         CFF_EXIT(dec_session_cff);
     }
     CFF_END(dec_session_cff)
 
+    SecureZeroMemory(iv, sizeof(iv));
     return result;
 }
 

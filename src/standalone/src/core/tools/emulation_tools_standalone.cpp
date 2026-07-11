@@ -11,6 +11,7 @@
 #include "pro.h"
 #include "../runtime/diagnostic_exception_scope.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../anti-tamper/self_guard.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -170,6 +171,21 @@ tool_result_t disassemble_zydis(const json& params)
         return chk;
     }
 
+    {
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "disassemble_zydis";
+        const std::uint32_t attached_pid = driver_bridge::attached_pid();
+        if (attached_pid != 0) {
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = attached_pid;
+        }
+        sg_ctx.has_address = true;
+        sg_ctx.target_address = *addr;
+        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+        if (sg_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+    }
+
     std::uint32_t size = params.value("size", 256);
     if (size > 65536)
     {
@@ -307,6 +323,18 @@ tool_result_t driver_snapshot_and_emulate(const json& params)
     auto addr = sa_parse_address(params.value("address", std::string()));
     if (!addr)
         return tool_result_t::error(OBFSTR("Invalid start address. Provide 'address' for emulation entry point."));
+
+    {
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "driver_snapshot_and_emulate";
+        sg_ctx.has_pid = true;
+        sg_ctx.target_pid = pid;
+        sg_ctx.has_address = true;
+        sg_ctx.target_address = *addr;
+        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+        if (sg_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+    }
 
     emulation::emulation_config_t config;
     config.start_address     = *addr;
@@ -490,6 +518,21 @@ tool_result_t trace_execution_unicorn(const json& params)
         return chk;
     }
 
+    {
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "trace_execution_unicorn";
+        const std::uint32_t attached_pid = driver_bridge::attached_pid();
+        if (attached_pid != 0) {
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = attached_pid;
+        }
+        sg_ctx.has_address = true;
+        sg_ctx.target_address = *addr;
+        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+        if (sg_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+    }
+
     const bool kernel_mode = is_kernel_address(*addr);
 
     std::uint32_t size = params.value("size", 4096);
@@ -654,6 +697,21 @@ tool_result_t analyze_vm_handler(const json& params)
 
     auto chk = check_driver_for_address(*addr);
     if (!chk.success) return chk;
+
+    {
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "analyze_vm_handler";
+        const std::uint32_t attached_pid = driver_bridge::attached_pid();
+        if (attached_pid != 0) {
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = attached_pid;
+        }
+        sg_ctx.has_address = true;
+        sg_ctx.target_address = *addr;
+        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+        if (sg_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+    }
 
     const bool kernel_mode = is_kernel_address(*addr);
 
@@ -999,6 +1057,21 @@ tool_result_t emulate_multi_trace(const json& params)
 
     auto chk = check_driver_for_address(*addr);
     if (!chk.success) return chk;
+
+    {
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "emulate_multi_trace";
+        const std::uint32_t attached_pid = driver_bridge::attached_pid();
+        if (attached_pid != 0) {
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = attached_pid;
+        }
+        sg_ctx.has_address = true;
+        sg_ctx.target_address = *addr;
+        auto sg_result = self_guard::invoke_self_guard(sg_ctx);
+        if (sg_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
+    }
 
     const bool kernel_mode = is_kernel_address(*addr);
 

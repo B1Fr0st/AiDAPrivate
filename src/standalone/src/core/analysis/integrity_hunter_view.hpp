@@ -5,7 +5,6 @@
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
-#include "decompiler_engine.hpp"
 #include "pseudocode_view.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "disasm_view.hpp"
@@ -14,8 +13,6 @@
 #include <cstdio>
 #include <string>
 #include <vector>
-
-extern DisasmState g_disasm;
 
 namespace integrity_hunter_view {
 
@@ -36,6 +33,7 @@ inline local_state_t s_state;
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+	const auto workspace_context = disasm_view::capture_selected_workspace();
 	ImGui::BeginChild("##integrity_hunter_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	auto* dl = ImGui::GetWindowDrawList();
@@ -340,16 +338,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			if (ImGui::MenuItem("Go to Disassembly")) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(sel_node.reader_rip, g_disasm);
+				disasm_view::goto_address(sel_node.reader_rip, workspace_context);
 			}
 
 			if (ImGui::MenuItem("Decompile Reader")) {
-				uint64_t entry = disasm_view::enclosing_function_start(sel_node.reader_rip, g_disasm.file);
+				uint64_t entry = disasm_view::enclosing_function_start(sel_node.reader_rip, workspace_context);
 				if (entry == 0) entry = sel_node.reader_rip;
 				diag::log_tagged_critical_fmt("dec_ui", "integrity_reader_dispatched addr=0x%llX entry=0x%llX",
 					static_cast<unsigned long long>(sel_node.reader_rip),
 					static_cast<unsigned long long>(entry));
-				pseudocode_view::request_decompile(entry, &g_disasm.file);
+				pseudocode_view::request_decompile(workspace_context, entry, false);
 			}
 		}
 		ImGui::EndPopup();

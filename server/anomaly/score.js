@@ -11,6 +11,7 @@ const MIN_BASELINE_SAMPLES = parseInt(process.env.ANOMALY_MIN_SAMPLES || '32', 1
 const MIN_REVOKE_BASELINE_SAMPLES = parseInt(process.env.ANOMALY_REVOKE_MIN_SAMPLES || '1000', 10);
 const CADENCE_SLOW_GRACE_MS = parseInt(process.env.ANOMALY_CADENCE_SLOW_GRACE_MS || '300000', 10);
 const CADENCE_FAST_AUTOMATION_RATIO = parseFloat(process.env.ANOMALY_CADENCE_FAST_RATIO || '0.25');
+const BEHAVIORAL_COSINE_DIVERGENT_THRESHOLD = parseFloat(process.env.BEHAVIORAL_COSINE_THRESHOLD || '0.30');
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || '';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
@@ -369,6 +370,29 @@ function syntheticHash(s) {
     return crypto.createHash('sha256').update(String(s || '')).digest('hex').slice(0, 16);
 }
 
+function checkBehavioralThreshold(cosineSimilarity) {
+    if (!Number.isFinite(cosineSimilarity)) return { action: 'observe', reason: 'invalid_cosine' };
+    if (cosineSimilarity < BEHAVIORAL_COSINE_DIVERGENT_THRESHOLD) {
+        return { action: 'revoke', reason: 'behavioral_divergence', cosine: cosineSimilarity, threshold: BEHAVIORAL_COSINE_DIVERGENT_THRESHOLD };
+    }
+    return { action: 'observe', reason: 'behavioral_normal', cosine: cosineSimilarity };
+}
+
+function checkGeoThreshold(speedKmh) {
+    if (!Number.isFinite(speedKmh)) return { action: 'observe', reason: 'invalid_speed' };
+    if (speedKmh > 900) {
+        return { action: 'flag', reason: 'geo_impossible', speed: speedKmh, threshold: 900 };
+    }
+    return { action: 'observe', reason: 'geo_possible', speed: speedKmh };
+}
+
+function checkHwidRateThreshold(countPerMin) {
+    if (!Number.isFinite(countPerMin)) return { action: 'observe', reason: 'invalid_count' };
+    if (countPerMin > 240) return { action: 'kill', reason: 'hwid_rate_kill', count: countPerMin, threshold: 240 };
+    if (countPerMin > 120) return { action: 'flag', reason: 'hwid_rate_flag', count: countPerMin, threshold: 120 };
+    return { action: 'observe', reason: 'hwid_rate_normal', count: countPerMin };
+}
+
 module.exports = {
     AnomalyScoringEngine,
     getDefaultEngine,
@@ -378,6 +402,9 @@ module.exports = {
     sendDiscordAnomalyAlert,
     sendSlackAnomalyAlert,
     syntheticHash,
+    checkBehavioralThreshold,
+    checkGeoThreshold,
+    checkHwidRateThreshold,
     FLAG_THRESHOLD,
     REVOKE_THRESHOLD,
     REVOKE_SUSTAINED_THRESHOLD,
@@ -385,5 +412,6 @@ module.exports = {
     MIN_REVOKE_BASELINE_SAMPLES,
     CADENCE_SLOW_GRACE_MS,
     CADENCE_FAST_AUTOMATION_RATIO,
+    BEHAVIORAL_COSINE_DIVERGENT_THRESHOLD,
     METRIC_NAMES,
 };

@@ -10,6 +10,7 @@
 #include "transforms.hpp"
 #include "stub.hpp"
 #include "payload_blob_base.hpp"
+#include "personalize.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <new>
 #include <string>
 #include <vector>
@@ -70,6 +72,10 @@ struct config_t {
     char     secondary_host[64] = {0};
     bool     primary_host_provided   = false;
     bool     secondary_host_provided = false;
+    bool     template_mode           = false;
+    bool     personalize             = false;
+    std::string template_metadata_path;
+    std::string customer_uuid;
 };
 
 inline stub::payload_blob_view_t select_payload_blob() {
@@ -137,6 +143,12 @@ static void print_usage(std::FILE* out) {
         "  --pin-secondary <hex64>     SHA-256(SPKI) of the backup auth server cert, hex (64 chars)\n"
         "  --primary-host <utf8>       Override default primary auth hostname (<= 63 chars, alnum/./-/_)\n"
         "  --secondary-host <utf8>     Override default secondary auth hostname (<= 63 chars, alnum/./-/_)\n"
+        "\n"
+        "Personalize Mode:\n"
+        "  --template-mode             Run in template mode (produce template binary + metadata JSON)\n"
+        "  --personalize               Run in personalize mode (patch template binary with per-customer data)\n"
+        "  --template-metadata <path>  Path to template_metadata.json (required for --personalize)\n"
+        "  --customer-uuid <hex32>     32 hex chars (128-bit customer UUID, required for --personalize)\n"
         "\n"
         "Control:\n"
         "  --seed <u64>                Deterministic seed for RNG\n"
@@ -408,6 +420,27 @@ inline config_t parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             cfg.matryoshka_layers = static_cast<uint32_t>(v);
+        } else if (arg == "--template-mode") {
+            cfg.template_mode = true;
+        } else if (arg == "--personalize") {
+            cfg.personalize = true;
+        } else if (arg == "--template-metadata") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --template-metadata requires a value\n");
+                std::exit(1);
+            }
+            cfg.template_metadata_path = argv[++i];
+        } else if (arg == "--customer-uuid") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Error: --customer-uuid requires a value\n");
+                std::exit(1);
+            }
+            std::string uuid_str = argv[++i];
+            if (uuid_str.size() != 32) {
+                std::fprintf(stderr, "Error: --customer-uuid must be 32 hex chars (128-bit UUID)\n");
+                std::exit(1);
+            }
+            cfg.customer_uuid = uuid_str;
         } else {
             std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
             print_usage(stderr);
@@ -454,6 +487,16 @@ inline config_t parse_args(int argc, char** argv) {
         std::fprintf(stderr, "Error: --input and --output are required\n");
         print_usage(stderr);
         std::exit(1);
+    }
+    if (cfg.personalize) {
+        if (cfg.template_metadata_path.empty()) {
+            std::fprintf(stderr, "Error: --personalize requires --template-metadata <path>\n");
+            std::exit(1);
+        }
+        if (cfg.customer_uuid.empty()) {
+            std::fprintf(stderr, "Error: --personalize requires --customer-uuid <hex32>\n");
+            std::exit(1);
+        }
     }
     return cfg;
 }
@@ -1141,6 +1184,15 @@ inline bool validate_protected_metadata(const pe_file::pe_image_t& pe,
 }
 
 inline int run(const config_t& cfg) {
+    if (cfg.personalize) {
+        return personalize::run_personalize_pipeline(
+            cfg.input_path,
+            cfg.output_path,
+            cfg.template_metadata_path,
+            cfg.customer_uuid,
+            nullptr);
+    }
+
     pe_file::pe_image_t pe;
     uint64_t input_size = 0;
     try {
@@ -1578,6 +1630,124 @@ inline int run(const config_t& cfg) {
                          import_detail.c_str());
             return 3;
         }
+    }
+
+    if (cfg.template_mode) {
+        if (cfg.verbose) {
+            std::fprintf(stdout, "[+] template mode: zeroing watermark, placing key slots, generating watermark sites\n");
+        }
+
+        if (!protector::tm_zero_template_watermark(pe, result.packed_section_rva, result.layout)) {
+            std::fprintf(stderr, "[!] template mode: failed to zero watermark in aux block\n");
+            return 3;
+        }
+
+        protector::tm_key_slot_info_t key_slots = protector::tm_place_key_slots(
+            pe, result.packed_section_rva, result.layout);
+
+        if (cfg.verbose) {
+            std::fprintf(stdout, "[+] template key slots: wb_aes=0x%08X arc=0x%08X drv=0x%08X total=%u\n",
+                         key_slots.wb_aes_tables_offset,
+                         key_slots.arc_page_keys_offset,
+                         key_slots.driver_keys_offset,
+                         protector::kTmKeySlotTotalSize);
+        }
+
+        protector::tm_watermark_site_collection_t wm_sites = protector::tm_generate_watermark_sites(
+            pe, result.packed_section_rva, result.layout, result.seed_used);
+
+        if (cfg.verbose) {
+            std::fprintf(stdout, "[+] template watermark sites: %zu generated (target %u)\n",
+                         wm_sites.sites.size(), protector::kTmWatermarkTargetSites);
+        }
+
+        try {
+            pe_file::recalculate_headers(pe);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[!] template mode: header recalculation error: %s\n", e.what());
+            return 3;
+        }
+
+        protector::tm_finalize_watermark_offsets(pe, result.packed_section_rva, wm_sites);
+
+        try {
+            pe_file::write(pe, cfg.output_path);
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr, "[!] out of memory writing template binary\n");
+            return 4;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[!] template write error: %s\n", e.what());
+            return 4;
+        }
+
+        uint8_t template_hash[32] = {0};
+        {
+            std::ifstream tfile(cfg.output_path, std::ios::binary | std::ios::ate);
+            if (!tfile.is_open()) {
+                std::fprintf(stderr, "[!] template mode: cannot reopen output for hashing\n");
+                return 4;
+            }
+            auto fsize = static_cast<size_t>(tfile.tellg());
+            tfile.seekg(0, std::ios::beg);
+            std::vector<uint8_t> fbuf(fsize);
+            tfile.read(reinterpret_cast<char*>(fbuf.data()), static_cast<std::streamsize>(fsize));
+            tfile.close();
+            protector::sha256_detail::sha256(fbuf.data(), fbuf.size(), template_hash);
+        }
+
+        std::string template_version = "v3.0.0-template";
+        std::string metadata_json = protector::tm_serialize_template_metadata(
+            pe, result, wm_sites, template_version, template_hash, key_slots);
+
+        std::string metadata_path = cfg.output_path + ".metadata.json";
+        {
+            std::ofstream mfile(metadata_path, std::ios::binary | std::ios::trunc);
+            if (!mfile.is_open()) {
+                std::fprintf(stderr, "[!] template mode: cannot write metadata JSON to %s\n",
+                             metadata_path.c_str());
+                return 4;
+            }
+            mfile.write(metadata_json.data(), static_cast<std::streamsize>(metadata_json.size()));
+            mfile.close();
+        }
+
+        if (cfg.verbose) {
+            std::fprintf(stdout, "[+] template metadata: %s (%zu bytes)\n",
+                         metadata_path.c_str(), metadata_json.size());
+            std::fprintf(stdout, "[+] template hash: sha256:");
+            for (int i = 0; i < 32; ++i) {
+                std::fprintf(stdout, "%02x", template_hash[i]);
+            }
+            std::fprintf(stdout, "\n");
+        }
+
+        {
+            std::string verify_detail;
+            if (!protector::tm_verify_template(pe, result.packed_section_rva, result.layout,
+                                             wm_sites, key_slots, verify_detail)) {
+                std::fprintf(stderr, "[!] template verification FAILED: %s\n",
+                             verify_detail.c_str());
+                return 3;
+            }
+            if (cfg.verbose) {
+                std::fprintf(stdout, "[+] template verification: %s\n",
+                             verify_detail.c_str());
+            }
+        }
+
+        if (cfg.verbose) {
+            uint64_t output_size = 0;
+            std::error_code ec;
+            auto sz = std::filesystem::file_size(cfg.output_path, ec);
+            if (!ec) {
+                output_size = static_cast<uint64_t>(sz);
+            }
+            std::fprintf(stdout, "[+] template binary written: %s (%llu bytes)\n",
+                         cfg.output_path.c_str(),
+                         static_cast<unsigned long long>(output_size));
+        }
+
+        return 0;
     }
 
     try {

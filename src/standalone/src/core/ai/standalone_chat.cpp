@@ -73,8 +73,6 @@
 
 using json = nlohmann::json;
 
-extern DisasmState g_disasm;
-
 mcp_client::manager_t s_mcp_client_mgr;
 
 
@@ -888,6 +886,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
 {
     std::string prompt;
     prompt.reserve(16384);
+    const auto prompt_workspace = analysis_session::active_workspace();
 
     aida::agent::initialize();
     const aida::agent::agent_info_t* agent = aida::agent::active_agent();
@@ -943,7 +942,7 @@ std::string build_system_prompt(bool force_xml_fallback = false)
     if (agent != nullptr && !agent->hidden &&
         (agent->mode == aida::agent::agent_info_t::mode_t::primary ||
          agent->mode == aida::agent::agent_info_t::mode_t::all)) {
-        std::string injected = aida::binary_map::auto_inject_text(4096);
+        std::string injected = aida::binary_map::auto_inject_text(prompt_workspace, 4096);
         if (!injected.empty()) {
             prompt += "## Binary Map (auto-generated)\n";
             prompt += injected;
@@ -2270,8 +2269,10 @@ void persist_workspace_state()
     if (code_editor::active && !code_editor::filepath.empty()) {
         g_sa_settings.workspace.last_active_path = code_editor::filepath;
         g_sa_settings.workspace.active_view = "editor";
-    } else if (g_disasm.file.loaded && !g_disasm.file.path.empty()) {
-        g_sa_settings.workspace.last_active_path = g_disasm.file.path;
+    } else if (const auto workspace = analysis_session::active_workspace();
+               workspace && !workspace->identity().normalized_source_path().empty()) {
+        g_sa_settings.workspace.last_active_path =
+            workspace->identity().normalized_source_path();
         g_sa_settings.workspace.active_view = "disasm";
     }
 }

@@ -13,9 +13,13 @@
 #include "webhook.hpp"
 #include "syscall.hpp"
 #include "obfuscation_macros.hpp"
+#include "obfuscation.hpp"
 #include "integrity.hpp"
 #include "standalone_license.hpp"
 #include "standalone_driver.hpp"
+#include "wbaes.hpp"
+#include "key_pipeline.hpp"
+#include "../settings/standalone_settings.hpp"
 #include "../runtime/reason_ids.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../../../../libs/cpp-httplib/httplib.h"
@@ -26,6 +30,12 @@
 #endif
 
 namespace anti_tamper {
+
+inline std::atomic<bool> g_dma_key_scrub_requested{false};
+
+constexpr uint32_t BRIDGE_CMD_DMA_KEY_SCRUB     = 0x0000B001u;
+constexpr uint32_t BRIDGE_CMD_DMA_BSOD          = 0x0000B003u;
+constexpr uint32_t BRIDGE_CMD_DMA_ATTACK_REPORT = 0x0000B004u;
 
 inline uint32_t get_tamper_response_level()
 {
@@ -94,9 +104,9 @@ namespace enforcement_detail {
     inline std::string get_payload_host()
     {
 #ifdef AIDA_LOCAL_LICENSE_SERVER
-        return "http://localhost:3001";
+        return OBFSTR("http://localhost:3001");
 #else
-        return "https://aidapro.net";
+        return OBFSTR("https://aidapro.net");
 #endif
     }
 
@@ -469,7 +479,7 @@ namespace enforcement_detail {
             })();
 
             std::string body_str = body.dump();
-            cli.Post("/api/license/violation", body_str, "application/json");
+            cli.Post(OBFSTR("/api/license/violation").c_str(), body_str, "application/json");
         } catch (...) {}
     }
 
@@ -636,35 +646,158 @@ namespace enforcement_detail {
             static_cast<unsigned long long>(after.expected_hash));
     }
 
+    inline void scrub_session_keys()
+    {
+        integrity::detail::s_siphash_k0_obf.store(0, std::memory_order_release);
+        integrity::detail::s_siphash_k1_obf.store(0, std::memory_order_release);
+        integrity::detail::s_siphash_xor_mask.store(0, std::memory_order_release);
+        integrity::detail::s_keys_initialized.store(false, std::memory_order_release);
+        integrity::detail::s_session_secret_lo.store(0, std::memory_order_release);
+        integrity::detail::s_session_secret_hi.store(0, std::memory_order_release);
+        integrity::detail::s_self_chain_seed.store(0, std::memory_order_release);
+        integrity::detail::s_self_chain_anchor.store(0, std::memory_order_release);
+        integrity::detail::s_text_chain_anchor.store(0, std::memory_order_release);
+        diag::log_tagged_critical("dma_scrub", "session_keys_zeroed");
+    }
+
+    inline void scrub_wb_aes_tables()
+    {
+        key_pipeline::detail_kp::s_kat_passed().store(false, std::memory_order_release);
+
+        SIZE_T total_zeroed = 0;
+        PROCESS_HEAP_ENTRY entry{};
+        entry.lpData = nullptr;
+        const SIZE_T target_size = sizeof(anti_tamper::wbaes::white_box_table_t);
+
+        __try {
+            while (HeapWalk(GetProcessHeap(), &entry)) {
+                if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) && entry.cbData >= target_size) {
+                    SecureZeroMemory(entry.lpData, entry.cbData);
+                    total_zeroed += entry.cbData;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            diag::log_tagged_critical("dma_scrub", "wb_aes_heap_walk_seh_exception");
+        }
+
+        diag::log_tagged_critical_fmt("dma_scrub",
+            "wb_aes_tables_scrubbed target_size=%zu total_zeroed=%zu",
+            target_size,
+            total_zeroed);
+    }
+
+    inline void scrub_arc_keys()
+    {
+        standalone_license::invalidate_for_enforcement("dma_key_scrub");
+        diag::log_tagged_critical("dma_scrub", "arc_keys_scrubbed");
+    }
+
+    inline void scrub_provider_keys()
+    {
+        auto& s = g_sa_settings;
+        if (!s.gemini_api_key.empty()) { SecureZeroMemory(&s.gemini_api_key[0], s.gemini_api_key.size()); s.gemini_api_key.clear(); }
+        if (!s.openai_api_key.empty()) { SecureZeroMemory(&s.openai_api_key[0], s.openai_api_key.size()); s.openai_api_key.clear(); }
+        if (!s.openrouter_api_key.empty()) { SecureZeroMemory(&s.openrouter_api_key[0], s.openrouter_api_key.size()); s.openrouter_api_key.clear(); }
+        if (!s.anthropic_api_key.empty()) { SecureZeroMemory(&s.anthropic_api_key[0], s.anthropic_api_key.size()); s.anthropic_api_key.clear(); }
+        if (!s.local_llm_api_key.empty()) { SecureZeroMemory(&s.local_llm_api_key[0], s.local_llm_api_key.size()); s.local_llm_api_key.clear(); }
+        if (!s.license_key.empty()) { SecureZeroMemory(&s.license_key[0], s.license_key.size()); s.license_key.clear(); }
+        if (!s.license_key_seed.empty()) { SecureZeroMemory(&s.license_key_seed[0], s.license_key_seed.size()); s.license_key_seed.clear(); }
+        if (!s.license_bind_proof.empty()) { SecureZeroMemory(&s.license_bind_proof[0], s.license_bind_proof.size()); s.license_bind_proof.clear(); }
+        if (!s.license_auth_hmac_key_b64.empty()) { SecureZeroMemory(&s.license_auth_hmac_key_b64[0], s.license_auth_hmac_key_b64.size()); s.license_auth_hmac_key_b64.clear(); }
+        if (!s.license_session_token.empty()) { SecureZeroMemory(&s.license_session_token[0], s.license_session_token.size()); s.license_session_token.clear(); }
+        if (!s.license_server_nonce.empty()) { SecureZeroMemory(&s.license_server_nonce[0], s.license_server_nonce.size()); s.license_server_nonce.clear(); }
+        if (!s.license_client_nonce.empty()) { SecureZeroMemory(&s.license_client_nonce[0], s.license_client_nonce.size()); s.license_client_nonce.clear(); }
+
+        for (auto& profile : s.provider_profiles) {
+            if (!profile.api_key.empty()) { SecureZeroMemory(&profile.api_key[0], profile.api_key.size()); profile.api_key.clear(); }
+            if (!profile.aws_access_key.empty()) { SecureZeroMemory(&profile.aws_access_key[0], profile.aws_access_key.size()); profile.aws_access_key.clear(); }
+            if (!profile.aws_secret_key.empty()) { SecureZeroMemory(&profile.aws_secret_key[0], profile.aws_secret_key.size()); profile.aws_secret_key.clear(); }
+            if (!profile.aws_session_token.empty()) { SecureZeroMemory(&profile.aws_session_token[0], profile.aws_session_token.size()); profile.aws_session_token.clear(); }
+        }
+
+        for (auto& srv : s.mcp_client_servers) {
+            if (!srv.api_key.empty()) { SecureZeroMemory(&srv.api_key[0], srv.api_key.size()); srv.api_key.clear(); }
+        }
+
+        diag::log_tagged_critical("dma_scrub", "provider_keys_scrubbed");
+    }
+
+    inline void trigger_dma_bsod(uint32_t detection_type, uint64_t reason_id)
+    {
+        diag::log_tagged_critical_fmt("dma_defense",
+            "trigger_dma_bsod_entry detection_type=0x%08X reason_id=0x%016llX pid=%lu",
+            detection_type,
+            static_cast<unsigned long long>(reason_id),
+            static_cast<unsigned long>(GetCurrentProcessId()));
+
+        scrub_session_keys();
+        scrub_wb_aes_tables();
+        scrub_arc_keys();
+        scrub_provider_keys();
+
+        diag::log_tagged_critical("dma_defense", "trigger_dma_bsod_keys_scrubbed_sending_dmct");
+
+        anti_tamper::g_dma_key_scrub_requested.store(true, std::memory_order_release);
+
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+        {
+            driver_bridge::trigger_dma_countermeasure(2u, static_cast<uint32_t>(reason_id));
+        }
+
+        try {
+            std::string host = get_payload_host();
+            httplib::Client cli(host);
+            cli.set_address_family(AF_INET);
+            cli.set_connection_timeout(3);
+            cli.set_read_timeout(3);
+            cli.enable_server_certificate_verification(true);
+
+            nlohmann::json body;
+            body["session_token"] = standalone_license::get_session_token();
+            body["detection_type"] = detection_type;
+            body["reason_id_hex"] = ([reason_id]() {
+                char tmp[20];
+                _snprintf_s(tmp, sizeof(tmp), _TRUNCATE,
+                    "0x%016llX", static_cast<unsigned long long>(reason_id));
+                return std::string(tmp);
+            })();
+            body["tier"] = 2;
+            body["tsc"] = __rdtsc();
+
+            std::string body_str = body.dump();
+            cli.Post(OBFSTR("/api/sentinel/dma-report").c_str(), body_str, "application/json");
+        } catch (...) {}
+
+        diag::log_tagged_critical("dma_defense", "trigger_dma_bsod_dmct_sent_kernel_will_bsod");
+    }
+
     inline void graduated_enforcement(uint64_t reason_id = 0)
     {
         if (destructive_enforcement_suppressed()) {
-            log_destructive_enforcement_suppressed("graduated_enforcement", reason_id);
+            log_destructive_enforcement_suppressed("two_tier_enforcement", reason_id);
             return;
         }
-        int round = g_corruption_round.fetch_add(1) + 1;
-        uint32_t level = anti_tamper::get_tamper_response_level();
-        if (level == 0) level = 2;
 
         {
             char dbg[160];
             _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "graduated_enforcement round=%d level=%u reason_id=0x%016llX",
-                round, level,
+                "two_tier_enforcement reason_id=0x%016llX",
                 static_cast<unsigned long long>(reason_id));
-            webhook::write_log("enforce", dbg);
+            webhook::write_log_critical("enforce", dbg);
         }
 
-        disarm_self_dll_protection_before_text_mutation(reason_id, round);
-
-        seh_graduated_enforcement_round(round, reason_id, level);
-
-        DWORD seh_post = seh_violation_post(round, reason_id);
-        if (seh_post != 0) {
-            char dbg[64];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE, "violation_post_seh=0x%08X", seh_post);
-            webhook::write_log("enforce", dbg);
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+        {
+            auto& rt = state::get();
+            diag::log_tagged_critical_fmt("enforce",
+                "two_tier_kernel_bsod reason=0x0002 text_hash=0x%016llX",
+                static_cast<unsigned long long>(rt.code_snap.text_hash));
+            driver_bridge::trigger_kernel_bsod(
+                0x0002u,
+                rt.code_snap.text_hash);
         }
+
+        execute_all_kill_paths();
     }
 
 }
@@ -774,75 +907,12 @@ namespace enforcement {
         return static_cast<int64_t>(ui.QuadPart / 10000ULL);
     }
 
-    inline int64_t degrade_delay_ms()
-    {
-        char buf[32] = {};
-        DWORD n = GetEnvironmentVariableA("AIDA_DECOY_DEGRADE_MS", buf, 31);
-        if (n > 0 && n < 31)
-        {
-            int64_t v = _atoi64(buf);
-            if (v > 0 && v < 24LL * 3600LL * 1000LL)
-                return v;
-        }
-        return 10LL * 60LL * 1000LL;
-    }
-
-    inline void degrade_mode()
-    {
-        auto& rt = state::get();
-        bool was = rt.decoy_degrade_active.exchange(true);
-        if (was) return;
-
-        webhook::write_log("decoy", "degrade_mode_active");
-
-        rt.license_pending_activation.store(true, std::memory_order_release);
-        rt.activation_hardening_done.store(false, std::memory_order_release);
-    }
-
-    inline bool is_degraded()
-    {
-        return state::get().decoy_degrade_active.load(std::memory_order_acquire);
-    }
-
-    inline void trip_honeypot_silent()
-    {
-        auto& rt = state::get();
-        bool was = rt.decoy_honeypot_tripped.exchange(true);
-        rt.decoy_honeypot_count.fetch_add(1, std::memory_order_relaxed);
-        if (was) return;
-        rt.decoy_honeypot_trip_ms.store(now_ms(), std::memory_order_release);
-        webhook::write_log("decoy", "honeypot_tripped_silent");
-    }
-
-    inline void poll_decoy_degrade()
-    {
-        auto& rt = state::get();
-        if (!rt.decoy_honeypot_tripped.load(std::memory_order_acquire))
-            return;
-        if (rt.decoy_degrade_active.load(std::memory_order_acquire))
-            return;
-        int64_t trip = rt.decoy_honeypot_trip_ms.load(std::memory_order_acquire);
-        if (trip == 0) return;
-        int64_t elapsed = now_ms() - trip;
-        if (elapsed >= degrade_delay_ms())
-            degrade_mode();
-    }
-
 }
 
 inline void enforcement_tick()
 {
     auto& rt = state::get();
-
-    enforcement::poll_decoy_degrade();
-
-    if (!rt.violation_latched.load())
-        return;
-
-    int current_round = enforcement_detail::g_corruption_round.load();
-    if (current_round > 0 && current_round < 3) {
-        enforcement_detail::graduated_enforcement(0);
-    }
+    (void)rt;
 }
 
 }

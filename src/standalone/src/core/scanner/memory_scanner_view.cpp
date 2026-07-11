@@ -34,8 +34,6 @@
 #include <cinttypes>
 #include <unordered_set>
 
-extern DisasmState g_disasm;
-
 namespace memory_scanner_view {
 
 namespace {
@@ -2193,8 +2191,9 @@ void process_result_context_menu() {
 			diag_logf("ctx_result open_hex addr=0x%llX",
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
-				hex_view::read_from_process(ctx_addr, 256);
-				globals::ui::active_center_view = center_view_t::hex_view;
+				const auto context = disasm_view::capture_selected_workspace();
+				if (hex_view::read_live_memory(context, ctx_addr, 256))
+					globals::ui::active_center_view = center_view_t::hex_view;
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] memory_scanner ctx open_hex");
 			}
@@ -2204,7 +2203,8 @@ void process_result_context_menu() {
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(ctx_addr, g_disasm);
+				disasm_view::goto_address(ctx_addr,
+					disasm_view::capture_selected_workspace());
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] memory_scanner ctx open_disasm");
 			}
@@ -2289,8 +2289,9 @@ void process_address_context_menu() {
 			diag_logf("ctx_addr open_hex addr=0x%llX",
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
-				hex_view::read_from_process(ctx_addr, 256);
-				globals::ui::active_center_view = center_view_t::hex_view;
+				const auto context = disasm_view::capture_selected_workspace();
+				if (hex_view::read_live_memory(context, ctx_addr, 256))
+					globals::ui::active_center_view = center_view_t::hex_view;
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] address_list ctx open_hex");
 			}
@@ -2300,7 +2301,8 @@ void process_address_context_menu() {
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(ctx_addr, g_disasm);
+				disasm_view::goto_address(ctx_addr,
+					disasm_view::capture_selected_workspace());
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] address_list ctx open_disasm");
 			}

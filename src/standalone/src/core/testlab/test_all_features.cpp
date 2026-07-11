@@ -26,9 +26,11 @@
 #include "../scanner/memory_scanner.hpp"
 #include "../scanner/aob_generator.hpp"
 #include "../disasm/cfg_view.hpp"
-#include "../disasm/decompiler_engine.hpp"
+#include "../disasm/disasm_view.hpp"
 #include "../disasm/pseudocode_view.hpp"
 #include "../disasm/zydis_disasm.hpp"
+#include "../analysis/workspace/decompiler_service.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../analysis/pdb_default_skip.hpp"
@@ -3629,36 +3631,272 @@ namespace test_all_features {
 
 		void drain_decompiler_runtime(HANDLE hf, const char* reason) {
 			set_stepf("decompiler drain: %s", reason ? reason : "unspecified");
-			const bool before_decompiling = decompiler_engine::g_state.decompiling.load(std::memory_order_acquire);
-			const bool before_batch = decompiler_engine::g_state.batch_running.load(std::memory_order_acquire);
-			const bool before_next = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire);
-			const int before_tabs = pseudocode_view::tab_count();
+			const std::uint32_t target_pid = current_target_pid();
+			const std::uint32_t attached_pid = driver_bridge::attached_pid();
+			const bool driver_attached = g_driver_attached.load(std::memory_order_acquire);
 			log_msg(hf, "decompiler-drain",
-				"BEGIN -- %s decompiling=%d batch=%d next_pending=%d tabs=%d",
+				"BEGIN -- %s target_pid=%u driver_attached=%d attached_pid=%u",
 				reason ? reason : "unspecified",
-				before_decompiling ? 1 : 0,
-				before_batch ? 1 : 0,
-				before_next ? 1 : 0,
-				before_tabs);
+				target_pid,
+				driver_attached ? 1 : 0,
+				attached_pid);
 
-			pseudocode_view::cancel_active_decompile();
-			const bool idle = decompiler_engine::wait_for_idle(12000, 25);
-			const int tabs_after_wait = pseudocode_view::tab_count();
-			if (idle) {
-				pseudocode_view::close_all_tabs();
-			} else {
+			if (cancelled()) {
+				log_msg(hf, "decompiler-drain",
+					"CANCELLED -- target_pid=%u resolution=cancelled_before_resolution",
+					target_pid);
+				return;
+			}
+			if (target_pid == 0) {
+				log_msg(hf, "decompiler-drain",
+					"SKIP -- target_pid=0 resolution=target_pid_unavailable");
+				return;
+			}
+			if (target_pid == static_cast<std::uint32_t>(GetCurrentProcessId())) {
 				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u resolution=SELF_TARGET_REFUSED",
+					target_pid);
+				return;
+			}
+			if (!driver_attached || attached_pid != target_pid) {
+				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u resolution=driver_target_identity_mismatch driver_attached=%d attached_pid=%u",
+					target_pid,
+					driver_attached ? 1 : 0,
+					attached_pid);
+				return;
 			}
 
+			auto query_creation_time = [](std::uint32_t pid,
+				std::uint64_t& creation_time,
+				DWORD& exit_code,
+				DWORD& error) noexcept {
+				creation_time = 0;
+				exit_code = 0;
+				error = ERROR_SUCCESS;
+				HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+					FALSE, static_cast<DWORD>(pid));
+				if (!process) {
+					error = GetLastError();
+					return false;
+				}
+				const bool status_ok = GetExitCodeProcess(process, &exit_code) != FALSE;
+				if (!status_ok) {
+					error = GetLastError();
+					CloseHandle(process);
+					return false;
+				}
+				if (exit_code != STILL_ACTIVE) {
+					error = ERROR_PROCESS_ABORTED;
+					CloseHandle(process);
+					return false;
+				}
+				FILETIME created{};
+				FILETIME exited{};
+				FILETIME kernel{};
+				FILETIME user{};
+				if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+					error = GetLastError();
+					CloseHandle(process);
+					return false;
+				}
+				ULARGE_INTEGER value{};
+				value.LowPart = created.dwLowDateTime;
+				value.HighPart = created.dwHighDateTime;
+				creation_time = value.QuadPart;
+				CloseHandle(process);
+				return creation_time != 0;
+			};
+
+			std::uint64_t target_creation_time = 0;
+			DWORD target_exit_code = 0;
+			DWORD target_identity_error = ERROR_SUCCESS;
+			if (!query_creation_time(target_pid, target_creation_time,
+				target_exit_code, target_identity_error)) {
+				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u resolution=process_identity_unavailable exit_code=%lu gle=%lu",
+					target_pid,
+					static_cast<unsigned long>(target_exit_code),
+					static_cast<unsigned long>(target_identity_error));
+				return;
+			}
+
+			aida::analysis::target_selector_t selector;
+			selector.pid = target_pid;
+			selector.process_creation_time_100ns = target_creation_time;
+			auto resolved = aida::analysis::workspace_registry().resolve(selector);
+			if (!resolved) {
+				const auto& error = resolved.error();
+				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u creation_time=%llu resolution=%s phase=%s message=%s",
+					target_pid,
+					static_cast<unsigned long long>(target_creation_time),
+					error.stable_code().c_str(),
+					error.phase.c_str(),
+					error.message.c_str());
+				return;
+			}
+			auto target_workspace = resolved.take_value();
+			if (!target_workspace) {
+				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u resolution=null_workspace",
+					target_pid);
+				return;
+			}
+
+			const auto& target_process = target_workspace->identity().process();
+			const std::string binary_id = target_workspace->identity().binary_id().to_hex();
+			if (target_workspace->target_kind() != aida::analysis::target_kind_t::live_snapshot ||
+				!target_process || target_process->pid != target_pid ||
+				target_process->creation_time_100ns != target_creation_time) {
+				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u binary_id=%s resolution=workspace_identity_mismatch",
+					target_pid,
+					binary_id.c_str());
+				return;
+			}
+			if (target_workspace->closing() || target_workspace->closed()) {
+				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u binary_id=%s resolution=workspace_closing closing=%d closed=%d",
+					target_pid,
+					binary_id.c_str(),
+					target_workspace->closing() ? 1 : 0,
+					target_workspace->closed() ? 1 : 0);
+				return;
+			}
+
+			auto target_context = disasm_view::capture_workspace(target_workspace);
+			if (!target_context.workspace || target_context.workspace != target_workspace) {
+				g_suspect.fetch_add(1);
+				log_msg(hf, "decompiler-drain",
+					"SUSPECT -- target_pid=%u binary_id=%s resolution=workspace_closed_during_capture",
+					target_pid,
+					binary_id.c_str());
+				return;
+			}
+
+			const auto target_service = target_workspace->decompiler();
+			const auto before_snapshot = target_service
+				? target_service->snapshot()
+				: aida::analysis::decompiler_service_snapshot_t{};
+			const int before_tabs = pseudocode_view::tab_count(target_context);
 			log_msg(hf, "decompiler-drain",
-				"%s -- idle=%d tabs_after_wait=%d tabs_final=%d decompiling=%d batch=%d next_pending=%d",
-				idle ? "PASS" : "SUSPECT",
+				"STATE -- target_pid=%u creation_time=%llu binary_id=%s service=%d accepting=%d active=%zu tabs=%d",
+				target_pid,
+				static_cast<unsigned long long>(target_creation_time),
+				binary_id.c_str(),
+				target_service ? 1 : 0,
+				before_snapshot.accepting ? 1 : 0,
+				before_snapshot.active_contexts,
+				before_tabs);
+
+			pseudocode_view::close_all_tabs(target_context);
+			const int tabs_after_cancel = pseudocode_view::tab_count(target_context);
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+			const auto wait_started = std::chrono::steady_clock::now();
+			std::size_t target_active = before_snapshot.active_contexts;
+			bool wait_cancelled = false;
+			bool observed_closing = false;
+			bool observed_closed = false;
+			bool service_detached = false;
+			bool service_replaced = false;
+			std::uint32_t consecutive_idle_samples = 0;
+			while (target_service) {
+				if (cancelled()) {
+					wait_cancelled = true;
+					break;
+				}
+				target_active = target_service->snapshot().active_contexts;
+				if (target_active == 0) {
+					++consecutive_idle_samples;
+					if (consecutive_idle_samples >= 2)
+						break;
+				} else {
+					consecutive_idle_samples = 0;
+				}
+				if (std::chrono::steady_clock::now() >= deadline)
+					break;
+				Sleep(25);
+				observed_closing = observed_closing || target_workspace->closing();
+				observed_closed = observed_closed || target_workspace->closed();
+				const auto current_service = target_workspace->decompiler();
+				service_detached = service_detached ||
+					(target_service && !current_service);
+				service_replaced = service_replaced ||
+					(current_service && current_service.get() != target_service.get());
+			}
+			observed_closing = observed_closing || target_workspace->closing();
+			observed_closed = observed_closed || target_workspace->closed();
+			const auto final_service = target_workspace->decompiler();
+			service_detached = service_detached ||
+				(target_service && !final_service);
+			service_replaced = service_replaced ||
+				(final_service && target_service && final_service.get() != target_service.get());
+			const bool service_appeared = !target_service && final_service;
+			if (target_service)
+				target_active = target_service->snapshot().active_contexts;
+			const bool idle = !target_service || target_active == 0;
+			const bool timed_out = !idle && !wait_cancelled &&
+				std::chrono::steady_clock::now() >= deadline;
+			const int final_tabs = pseudocode_view::tab_count(target_context);
+			std::uint64_t final_creation_time = 0;
+			DWORD final_exit_code = 0;
+			DWORD final_identity_error = ERROR_SUCCESS;
+			const bool process_identity_current = query_creation_time(target_pid,
+				final_creation_time, final_exit_code, final_identity_error) &&
+				final_creation_time == target_creation_time;
+			const bool driver_identity_current =
+				current_target_pid() == target_pid &&
+				g_driver_attached.load(std::memory_order_acquire) &&
+				driver_bridge::attached_pid() == target_pid;
+			const bool detached_without_close = service_detached &&
+				!observed_closing && !observed_closed;
+			const bool suspect = !wait_cancelled &&
+				(!idle || timed_out || service_replaced || service_appeared ||
+					detached_without_close || observed_closing || observed_closed ||
+					tabs_after_cancel != 0 || final_tabs != 0 ||
+					!process_identity_current || !driver_identity_current);
+			if (suspect)
+				g_suspect.fetch_add(1);
+			const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - wait_started).count();
+			const char* disposition = suspect
+				? "SUSPECT"
+				: wait_cancelled
+					? "CANCELLED"
+					: target_service
+						? "PASS"
+						: "PASS_NO_SERVICE";
+			log_msg(hf, "decompiler-drain",
+				"%s -- target_pid=%u creation_time=%llu binary_id=%s idle=%d cancelled=%d timed_out=%d waited_ms=%lld closing=%d closed=%d service_detached=%d service_replaced=%d service_appeared=%d tabs_before=%d tabs_after_cancel=%d tabs_final=%d active_target=%zu process_identity_current=%d driver_identity_current=%d exit_code=%lu gle=%lu",
+				disposition,
+				target_pid,
+				static_cast<unsigned long long>(target_creation_time),
+				binary_id.c_str(),
 				idle ? 1 : 0,
-				tabs_after_wait,
-				pseudocode_view::tab_count(),
-				decompiler_engine::g_state.decompiling.load(std::memory_order_acquire) ? 1 : 0,
-				decompiler_engine::g_state.batch_running.load(std::memory_order_acquire) ? 1 : 0,
-				decompiler_engine::g_state.next_pending.load(std::memory_order_acquire) ? 1 : 0);
+				wait_cancelled ? 1 : 0,
+				timed_out ? 1 : 0,
+				static_cast<long long>(waited_ms),
+				observed_closing ? 1 : 0,
+				observed_closed ? 1 : 0,
+				service_detached ? 1 : 0,
+				service_replaced ? 1 : 0,
+				service_appeared ? 1 : 0,
+				before_tabs,
+				tabs_after_cancel,
+				final_tabs,
+				target_active,
+				process_identity_current ? 1 : 0,
+				driver_identity_current ? 1 : 0,
+				static_cast<unsigned long>(final_exit_code),
+				static_cast<unsigned long>(final_identity_error));
 		}
 
 

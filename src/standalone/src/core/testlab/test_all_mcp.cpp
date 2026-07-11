@@ -7,6 +7,8 @@
 #include "test_all_features.hpp"
 
 #include "../mcp/mcp_standalone.hpp"
+#include "../mcp/ida_compat_schemas.hpp"
+#include "../mcp/schema_validator.hpp"
 #include "../ai/standalone_chat.hpp"
 #include "../analysis/decrypt_oracle.hpp"
 #include "../analysis/fuzzer_engine.hpp"
@@ -16,13 +18,15 @@
 #include "../analysis/struct_recon_engine.hpp"
 #include "../analysis/symbol_store.hpp"
 #include "../analysis/stealth_engine.hpp"
-#include "../analysis/xref_db.hpp"
 #include "../analysis/xref_engine.hpp"
+#include "../analysis/workspace/overlay_journal.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../re/re_common.hpp"
 #include "../re/dx_hook.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../debugger/page_guard_engine.hpp"
 #include "../disasm/disasm_view.hpp"
+#include "../disasm/function_index.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../network/burp/issue.hpp"
 #include "../network/burp/burp_events.hpp"
@@ -77,14 +81,13 @@
 #include <new>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
-
-extern DisasmState g_disasm;
 
 namespace test_all_features {
 
@@ -168,7 +171,7 @@ namespace {
     bool (*g_mcp_cancelled_fn)() = nullptr;
     std::atomic<bool> g_mcp_coverage_audit_started{false};
     std::atomic<bool> g_mcp_coverage_audit_completed{false};
-    constexpr int k_mcp_planned_tool_tests = 514;
+    constexpr int k_mcp_planned_tool_tests = 556;
     constexpr int k_expected_destructive_schema_only_exemptions = 6;
     constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 75000;
     constexpr DWORD k_camoufox_dependency_probe_timeout_ms = 9000;
@@ -1432,6 +1435,9 @@ namespace {
             name.rfind("scanner_", 0) == 0 ||
             name.rfind("memory_", 0) == 0 ||
             name == "decompile_function" ||
+            name == "disasm_get_instruction" ||
+            name == "disasm_get_function_bounds" ||
+            name == "disasm_get_function_disassembly" ||
             name == "scan_crypto_constants" ||
                         name == "generate_aob_signature" ||
             name == "reconstruct_struct" ||
@@ -1446,6 +1452,16 @@ namespace {
             name == "emulate_multi_trace" ||
             name == "symbolic_execution" ||
             name == "taint_trace_register";
+    }
+
+    bool tool_uses_static_workspace_target(const std::string& name) {
+        return name == "analysis_query" ||
+            name == "disasm_list_functions" ||
+            name == "get_xrefs" ||
+            name == "disasm_annotations_manage" ||
+            name == "disasm_get_section_info" ||
+            name == "disasm_search_bytes" ||
+            name == "disasm_get_strings";
     }
 
     bool json_u64_field(const mcp_standalone::json& j, const char* key, uint64_t& out) {
@@ -1558,6 +1574,14 @@ namespace {
         if (args.contains("target_pid") || args.contains("process_id") || args.contains("pid"))
             return;
         args["target_pid"] = g_mcp_target_pid;
+    }
+
+    void add_static_workspace_id_if_needed(const std::string& name, mcp_standalone::json& args) {
+        if (!tool_uses_static_workspace_target(name) || g_mcp_session_binary_id.empty() ||
+            !args.is_object() || args.contains("binary_id") || args.contains("bin_name") ||
+            args.contains("pid") || args.contains("target_pid") || args.contains("process_id"))
+            return;
+        args["binary_id"] = g_mcp_session_binary_id;
     }
 
     void add_target_tid_if_zero(mcp_standalone::json& args) {
@@ -10470,6 +10494,7 @@ namespace {
         set_progress_step(step);
 
         add_target_pid_if_needed(tool_name_s, call_args);
+        add_static_workspace_id_if_needed(tool_name_s, call_args);
         add_target_tid_if_zero(call_args);
         const bool live_target_required = tool_uses_live_target(tool_name_s);
         const bool target_context_may_change = tool_may_change_target(tool_name_s);
@@ -11099,6 +11124,7 @@ namespace {
             set_progress_step(step);
 
             add_target_pid_if_needed(tool_name_s, call_args);
+            add_static_workspace_id_if_needed(tool_name_s, call_args);
             add_target_tid_if_zero(call_args);
             const bool live_target_required = tool_uses_live_target(tool_name_s);
             const bool target_context_may_change = tool_may_change_target(tool_name_s);
@@ -12940,53 +12966,25 @@ namespace {
     }
 
 
-    uint64_t g_mcp_xref_from_addr = 0x0000000141DA3000ULL;
-    uint64_t g_mcp_xref_to_addr = 0x0000000141DA3010ULL;
-
-    void seed_mcp_xref_db_fixture() {
-        xref_db::module_index_t mod;
-        mod.name = "aida_mcp_xref_fixture";
-        mod.base = g_mcp_xref_from_addr & ~0xFFFULL;
-        mod.size = 0x1000;
-        mod.timestamp = static_cast<uint64_t>(
-            std::chrono::system_clock::now().time_since_epoch().count());
-        mod.total_xrefs = 1;
-        mod.built = true;
-
-        xref_db::xref_entry_t entry;
-        entry.from_addr = g_mcp_xref_from_addr;
-        entry.to_addr = g_mcp_xref_to_addr;
-        entry.type = xref_engine::xref_type_t::call;
-        entry.disasm_text = "call aida_mcp_xref_target";
-        mod.to_index[g_mcp_xref_to_addr].push_back(entry);
-        mod.from_index[g_mcp_xref_from_addr].push_back(entry);
-
-        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-        xref_db::g_state.modules[mod.name] = std::move(mod);
-    }
-
-    void seed_mcp_xref_to_region_fixture(uint64_t target_addr, uint64_t from_addr, const char* module_name, const char* text) {
-        if (target_addr == 0 || from_addr == 0)
-            return;
-        xref_db::module_index_t mod;
-        mod.name = module_name && *module_name ? module_name : "aida_mcp_region_xref_fixture";
-        mod.base = from_addr & ~0xFFFULL;
-        mod.size = 0x2000;
-        mod.timestamp = static_cast<uint64_t>(
-            std::chrono::system_clock::now().time_since_epoch().count());
-        mod.total_xrefs = 1;
-        mod.built = true;
-
-        xref_db::xref_entry_t entry;
-        entry.from_addr = from_addr;
-        entry.to_addr = target_addr;
-        entry.type = xref_engine::xref_type_t::data_ref;
-        entry.disasm_text = text && *text ? text : "lea rcx, [aida_mcp_fixture_string]";
-        mod.to_index[target_addr].push_back(entry);
-        mod.from_index[from_addr].push_back(entry);
-
-        std::lock_guard<std::mutex> lk(xref_db::g_state.mutex);
-        xref_db::g_state.modules[mod.name] = std::move(mod);
+    bool get_workspace_xref_args(bool to, mcp_standalone::json& args) {
+        for (const auto& workspace : aida::analysis::workspace_registry().list()) {
+            if (!workspace || workspace->target_kind() != aida::analysis::target_kind_t::static_file)
+                continue;
+            const auto snapshot = workspace->snapshot();
+            if (!snapshot)
+                continue;
+            for (const auto& xref : snapshot->xrefs) {
+                const auto address = function_index::workspace_display_address(
+                    workspace, to ? xref.target : xref.source);
+                if (address == 0)
+                    continue;
+                args["binary_id"] = workspace->identity().binary_id().to_hex();
+                args["address"] = hex_u64(address);
+                args["direction"] = to ? "to" : "from";
+                return true;
+            }
+        }
+        return false;
     }
 
     std::string get_indexed_disasm_function_addr(HANDLE hf, const char* tag) {
@@ -13027,26 +13025,28 @@ namespace {
 
     std::string get_static_disasm_instruction_addr(HANDLE hf, const char* tag) {
         for (int i = 0; i < 50; ++i) {
-            if (g_disasm.file.loaded && !g_disasm.file.instrs.empty()) {
-                for (const auto& ins : g_disasm.file.instrs) {
-                    if (ins.addr != 0) {
-                        log_msg(hf, tag, "static disasm instruction fixture addr=0x%016llX instrs=%zu image_base=0x%016llX filename=%s",
-                            static_cast<unsigned long long>(ins.addr),
-                            g_disasm.file.instrs.size(),
-                            static_cast<unsigned long long>(g_disasm.file.image_base),
-                            g_disasm.file.filename.c_str());
-                        return hex_u64(ins.addr);
+            for (const auto& workspace : aida::analysis::workspace_registry().list()) {
+                if (!workspace || workspace->target_kind() != aida::analysis::target_kind_t::static_file)
+                    continue;
+                const auto snapshot = workspace->snapshot();
+                if (!snapshot || snapshot->instructions.empty())
+                    continue;
+                for (const auto& instruction : snapshot->instructions) {
+                    const uint64_t address = function_index::workspace_display_address(
+                        workspace, instruction.address);
+                    if (address != 0) {
+                        log_msg(hf, tag, "static workspace instruction fixture addr=0x%016llX instrs=%zu binary_id=%s file=%s",
+                            static_cast<unsigned long long>(address), snapshot->instructions.size(),
+                            workspace->identity().binary_id().to_hex().c_str(),
+                            workspace->identity().bin_name().c_str());
+                        return hex_u64(address);
                     }
                 }
             }
             Sleep(50);
         }
-        log_msg(hf, tag, "FAIL -- static disasm fixture unavailable loaded=%d instrs=%zu sections=%zu image_base=0x%016llX file=%s",
-            g_disasm.file.loaded ? 1 : 0,
-            g_disasm.file.instrs.size(),
-            g_disasm.file.sections.size(),
-            static_cast<unsigned long long>(g_disasm.file.image_base),
-            g_disasm.file.filename.c_str());
+        log_msg(hf, tag, "FAIL -- static workspace instruction fixture unavailable workspaces=%zu",
+            aida::analysis::workspace_registry().list().size());
         return {};
     }
 
@@ -20508,6 +20508,7 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
     }
 
     void test_mcp_tool_schemas(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
         const char* tag = "mcp.tool_schemas";
         auto* srv = get_server();
         if (!srv) {
@@ -20515,29 +20516,96 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             failed.fetch_add(1);
             return;
         }
-        const auto& tools = srv->get_tools();
-        int valid = 0;
-        int invalid = 0;
-        int hidden = 0;
-        for (const auto& t : tools) {
-            if (t.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
-                ++hidden;
-                continue;
+        try {
+            const auto& tools = srv->get_tools();
+            int valid = 0;
+            int hidden = 0;
+            std::map<std::string, const mcp_standalone::tool_def_t*> by_name;
+            for (const auto& tool : tools) {
+                if (tool.visibility == mcp_standalone::tool_visibility_t::ide_chat_only) {
+                    ++hidden;
+                    continue;
+                }
+                if (tool.name.empty() || tool.description.empty() ||
+                    (!tool.handler && !tool.workspace_handler))
+                    throw std::runtime_error("general MCP definition is incomplete: " + tool.name);
+                if (!by_name.emplace(tool.name, &tool).second)
+                    throw std::runtime_error("duplicate MCP definition: " + tool.name);
+                ++valid;
             }
-            bool ok = !t.name.empty() && !t.description.empty() && t.handler;
-            if (ok) ++valid;
-            else {
-                ++invalid;
-                log_msg(hf, tag, "  invalid schema: name=\"%s\" desc_empty=%d handler=%s",
-                    t.name.c_str(), (int)t.description.empty(),
-                    t.handler ? "present" : "null");
+
+            const auto validator = mcp_standalone::ida_compat::schema_validator_status();
+            if (!validator.valid)
+                throw std::runtime_error("IDA schema validator unavailable: " + validator.summary());
+            const auto read_only_names = mcp_standalone::ida_compat::get_read_only_tool_names();
+            const auto mutation_names = mcp_standalone::ida_compat::get_mutation_tool_names();
+            if (read_only_names.size() != 27 || mutation_names.size() != 15)
+                throw std::runtime_error("IDA compatibility inventory must contain 27 read-only and 15 mutation registrations");
+            std::set<std::string> required(read_only_names.begin(), read_only_names.end());
+            required.insert(mutation_names.begin(), mutation_names.end());
+            if (required.size() != 42 || required.count("list_instances") != 1 ||
+                required.count("calculator") != 1 || required.count("calculate") != 1 ||
+                required.count("py_eval") != 0)
+                throw std::runtime_error("IDA compatibility inventory identity mismatch");
+
+            for (const auto& name : required) {
+                const auto found = by_name.find(name);
+                const auto* schema = mcp_standalone::ida_compat::find_schema(name);
+                if (found == by_name.end() || !schema)
+                    throw std::runtime_error("missing IDA compatibility registration: " + name);
+                const auto& tool = *found->second;
+                const bool mutation = std::find(mutation_names.begin(), mutation_names.end(), name) !=
+                    mutation_names.end();
+                const bool target_dependent = mcp_standalone::ida_compat::is_target_dependent_tool(name);
+                if (tool.input_schema != *schema || tool.read_only == mutation ||
+                    tool.visibility != mcp_standalone::tool_visibility_t::external_visible ||
+                    static_cast<bool>(tool.workspace_handler) != target_dependent ||
+                    static_cast<bool>(tool.handler) == target_dependent)
+                    throw std::runtime_error("IDA compatibility schema/classification mismatch: " + name);
+                const auto rejection = srv->call_registered_tool(name,
+                    mcp_standalone::json{{"unexpected", true}}, true);
+                if (rejection.success || rejection.error_code != "MCP_TOOL_INPUT_SCHEMA_INVALID")
+                    throw std::runtime_error("IDA pre-dispatch schema validation did not reject: " + name);
             }
-        }
-        if (invalid == 0) {
-            log_msg(hf, tag, "PASS -- all %d general MCP tool schemas valid (name, desc, handler present; ide_chat_only_hidden=%d)", valid, hidden);
+            if (by_name.count("py_eval") != 0 || by_name.at("infer_types")->read_only ||
+                by_name.at("analyze_funcs")->read_only)
+                throw std::runtime_error("excluded tool or mutation classification mismatch");
+
+            const auto conversion = srv->call_registered_tool("int_convert",
+                mcp_standalone::json{{"value", "2A"}, {"from_format", "hex"},
+                                     {"to_format", "decimal"}}, true);
+            if (!conversion.success || conversion.data.value("output", std::string()) != "42")
+                throw std::runtime_error("int_convert production handler failed");
+            const mcp_standalone::json calculation = {
+                {"expression", "(1 << 65) + 3"}, {"format", "decimal"}
+            };
+            const auto calculator = srv->call_registered_tool("calculator", calculation, true);
+            const auto calculate = srv->call_registered_tool("calculate", calculation, true);
+            if (!calculator.success || !calculate.success || calculator.data != calculate.data ||
+                calculator.data.value("value", std::string()) != "36893488147419103235")
+                throw std::runtime_error("calculator alias production handlers diverged");
+            const auto scalar = srv->call_registered_tool("calculator", mcp_standalone::json{
+                {"items", mcp_standalone::json{{"id", "scalar"},
+                                                {"expression", "6 * 7"},
+                                                {"format", "decimal"}}}
+            }, true);
+            if (!scalar.success || scalar.data.value("count", 0u) != 1 ||
+                !scalar.data["results"].is_array() || scalar.data["results"].size() != 1 ||
+                scalar.data["results"][0].value("id", std::string()) != "scalar" ||
+                !scalar.data["results"][0].value("success", false))
+                throw std::runtime_error("calculator scalar item normalization failed");
+            const auto instances = srv->call_registered_tool("list_instances",
+                mcp_standalone::json::object(), true);
+            if (!instances.success || !instances.data.contains("instances") ||
+                !instances.data["instances"].is_array())
+                throw std::runtime_error("list_instances production handler failed");
+
+            log_msg(hf, tag,
+                "PASS -- general=%d hidden=%d ida_read_only=%zu ida_mutation=%zu exact_schemas=42 handler_smoke=int_convert,list_instances,calculator,calculate",
+                valid, hidden, read_only_names.size(), mutation_names.size());
             passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- %d/%d general MCP tool schemas invalid ide_chat_only_hidden=%d", invalid, valid + invalid, hidden);
+        } catch (const std::exception& ex) {
+            log_msg(hf, tag, "FAIL -- %s", ex.what());
             failed.fetch_add(1);
         }
     }
@@ -20615,19 +20683,32 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 {"jsonrpc", "2.0"},
                 {"id", 2},
                 {"method", "tools/list"},
-                {"params", mcp_standalone::json::object()}
+                {"params", {{"detail", "full"}}}
             };
             auto list_resp = mcp_standalone::json::parse(mcp_standalone::handle_body(srv, list_req.dump()));
             if (!list_resp.contains("result") || !list_resp["result"].contains("tools") ||
-                !list_resp["result"]["tools"].is_array()) {
+                !list_resp["result"]["tools"].is_array() ||
+                list_resp["result"]["_meta"].value("aidaToolListMode", std::string()) != "full") {
                 log_msg(hf, tag, "FAIL -- tools/list response missing result.tools array");
                 failed.fetch_add(1);
                 return;
             }
+            std::map<std::string, mcp_standalone::json> listed_tools;
             for (const auto& tool : list_resp["result"]["tools"]) {
                 if (!tool.contains("name") || !tool["name"].is_string())
                     continue;
                 const std::string listed_name = tool["name"].get<std::string>();
+                if (!listed_tools.emplace(listed_name, tool).second) {
+                    log_msg(hf, tag, "FAIL -- tools/list returned duplicate tool \"%s\"",
+                        listed_name.c_str());
+                    failed.fetch_add(1);
+                    return;
+                }
+                if (listed_name == "py_eval") {
+                    log_msg(hf, tag, "FAIL -- tools/list exposed excluded py_eval");
+                    failed.fetch_add(1);
+                    return;
+                }
                 if (is_ai_related_mcp_tool(listed_name)) {
                     log_msg(hf, tag, "FAIL -- tools/list exposed internal AI/workflow tool \"%s\"",
                         listed_name.c_str());
@@ -20638,6 +20719,35 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                     tool["description"].get<std::string>().empty()) {
                     log_msg(hf, tag, "FAIL -- tools/list exposed tool \"%s\" without a description",
                         listed_name.c_str());
+                    failed.fetch_add(1);
+                    return;
+                }
+            }
+
+            const auto ida_read_only = mcp_standalone::ida_compat::get_read_only_tool_names();
+            const auto ida_mutations = mcp_standalone::ida_compat::get_mutation_tool_names();
+            auto verify_listed_contract = [&](const std::string& name, bool read_only) {
+                const auto found = listed_tools.find(name);
+                const auto* schema = mcp_standalone::ida_compat::find_schema(name);
+                return found != listed_tools.end() && schema &&
+                    found->second.value("read_only", !read_only) == read_only &&
+                    found->second.value("visibility", std::string()) == "external_visible" &&
+                    found->second.contains("inputSchema") && found->second["inputSchema"] == *schema &&
+                    found->second["annotations"].value("readOnlyHint", !read_only) == read_only &&
+                    found->second["annotations"].value("destructiveHint", read_only) == !read_only;
+            };
+            for (const auto& name : ida_read_only) {
+                if (!verify_listed_contract(name, true)) {
+                    log_msg(hf, tag, "FAIL -- tools/list IDA read-only contract mismatch tool=%s",
+                        name.c_str());
+                    failed.fetch_add(1);
+                    return;
+                }
+            }
+            for (const auto& name : ida_mutations) {
+                if (!verify_listed_contract(name, false)) {
+                    log_msg(hf, tag, "FAIL -- tools/list IDA mutation contract mismatch tool=%s",
+                        name.c_str());
                     failed.fetch_add(1);
                     return;
                 }
@@ -20676,8 +20786,15 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
 
             std::set<std::string> resources_seen;
             for (const auto& res : resources_resp["result"]["resources"]) {
-                if (res.contains("uri") && res["uri"].is_string())
-                    resources_seen.insert(res["uri"].get<std::string>());
+                if (res.contains("uri") && res["uri"].is_string()) {
+                    const std::string uri = res["uri"].get<std::string>();
+                    if (uri.rfind("ida://", 0) == 0) {
+                        log_msg(hf, tag, "FAIL -- resources/list exposed excluded URI %s", uri.c_str());
+                        failed.fetch_add(1);
+                        return;
+                    }
+                    resources_seen.insert(uri);
+                }
             }
 
             const char* required_resources[] = {
@@ -22299,6 +22416,7 @@ void test_tool_driver_set_hw_breakpoint(HANDLE hf, std::atomic<int>& passed, std
 
         mcp_standalone::json call_args = args.is_null() ? mcp_standalone::json::object() : args;
         add_target_pid_if_needed(tool_name_s, call_args);
+        add_static_workspace_id_if_needed(tool_name_s, call_args);
         const std::string args_preview = compact_json(call_args);
         log_msg(hf, tag, "START -- \"%s\" seq=%d direct=1 target_pid=%u attached_pid=%u args=%s",
             tool_name ? tool_name : "<null>",
@@ -24534,7 +24652,6 @@ void test_tool_scanner_struct_manage_define(HANDLE hf, std::atomic<int>& passed,
             record_precondition_skipped_tool("auto_decrypt_strings", failed);
             return;
         }
-        seed_mcp_xref_to_region_fixture(addr, addr + 0x40, "aida_mcp_decrypt_xref_fixture", "lea rcx, [AIDA_MCP_DECRYPT_FIXTURE]");
         mcp_standalone::json args;
         args["region_address"] = hex_u64(addr);
         args["region_size"] = 128;
@@ -25883,18 +26000,22 @@ void test_tool_disasm_get_instruction(HANDLE hf, std::atomic<int>& passed, std::
     }
 
     void test_tool_get_xrefs_to(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        seed_mcp_xref_db_fixture();
         mcp_standalone::json args;
-        args["address"] = hex_u64(g_mcp_xref_to_addr);
-        args["direction"] = "to";
+        if (!get_workspace_xref_args(true, args)) {
+            log_msg(hf, "mcp.get_xrefs.to", "SKIP -- no analyzed workspace cross-reference fixture is available");
+            record_precondition_skipped_tool("get_xrefs", failed);
+            return;
+        }
         test_tool_call(hf, "mcp.get_xrefs.to", get_server(), "get_xrefs", args, passed, failed, skipped);
     }
 
     void test_tool_get_xrefs_from(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        seed_mcp_xref_db_fixture();
         mcp_standalone::json args;
-        args["address"] = hex_u64(g_mcp_xref_from_addr);
-        args["direction"] = "from";
+        if (!get_workspace_xref_args(false, args)) {
+            log_msg(hf, "mcp.get_xrefs.from", "SKIP -- no analyzed workspace cross-reference fixture is available");
+            record_precondition_skipped_tool("get_xrefs", failed);
+            return;
+        }
         test_tool_call(hf, "mcp.get_xrefs.from", get_server(), "get_xrefs", args, passed, failed, skipped);
     }
 
@@ -25956,6 +26077,37 @@ void test_tool_sessions_manage_list(HANDLE hf, std::atomic<int>& passed, std::at
         }
     }
 
+    void test_tool_list_instances(HANDLE hf, std::atomic<int>& passed,
+                                  std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::tool_result_t result;
+        auto status = test_tool_call(hf, "mcp.list_instances", get_server(), "list_instances",
+            mcp_standalone::json::object(), passed, failed, skipped, false, &result);
+        if (status != mcp_tool_call_status_t::passed)
+            return;
+        const bool envelope = result.data.is_object() && result.data.contains("instances") &&
+            result.data["instances"].is_array() && result.data.contains("count") &&
+            result.data["count"].is_number_integer() && result.data.contains("default_pid") &&
+            (result.data["default_pid"].is_null() || result.data["default_pid"].is_number_integer());
+        if (!envelope) {
+            log_msg(hf, "mcp.list_instances", "FAIL -- incompatible list_instances envelope data=%s",
+                compact_json(result.data, 1200).c_str());
+            convert_last_pass_to_fixture_failure("list_instances", passed, failed);
+            return;
+        }
+        for (const auto& instance : result.data["instances"]) {
+            for (const char* field : {"pid", "binary", "host", "port", "idb_path", "backend"}) {
+                if (!instance.contains(field)) {
+                    log_msg(hf, "mcp.list_instances", "FAIL -- instance missing field=%s data=%s",
+                        field, compact_json(instance, 800).c_str());
+                    convert_last_pass_to_fixture_failure("list_instances", passed, failed);
+                    return;
+                }
+            }
+        }
+        log_msg(hf, "mcp.list_instances", "INSTANCE-PROOF -- count=%zu default_pid=%s",
+            result.data["instances"].size(), compact_json(result.data["default_pid"], 64).c_str());
+    }
+
     void test_tool_sessions_manage_get_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         log_msg(hf, "mcp.sessions_manage.get_active", "VERIFY-INPUT -- fixture_session_id=%s target_pid=%u attached_pid=%u",
             g_mcp_session_binary_id.empty() ? "<empty>" : g_mcp_session_binary_id.c_str(),
@@ -26004,10 +26156,255 @@ void test_tool_sessions_manage_open_file(HANDLE hf, std::atomic<int>& passed, st
         }
     }
 
+    void test_ida_compatibility_handler_surface(HANDLE hf, std::atomic<int>& passed,
+                                                std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tag = "mcp.ida_compatibility_handlers";
+        const std::vector<std::string> read_tools = {
+            "lookup_funcs", "int_convert", "list_funcs", "list_globals", "imports", "decompile",
+            "disasm", "xrefs_to", "xrefs_to_field", "callees", "get_bytes", "get_int",
+            "get_string", "get_global_value", "stack_frame", "read_struct", "search_structs",
+            "find_regex", "find_bytes", "find_insns", "find", "basic_blocks", "export_funcs",
+            "callgraph"
+        };
+        const std::vector<std::string> mutation_tools = {
+            "add_bookmark", "set_comments", "patch_asm", "declare_type", "define_func",
+            "define_code", "undefine", "declare_stack", "delete_stack", "set_type",
+            "infer_types", "analyze_funcs", "rename", "patch", "put_int"
+        };
+        std::vector<std::string> terminal_tools = read_tools;
+        terminal_tools.insert(terminal_tools.end(), mutation_tools.begin(), mutation_tools.end());
+        terminal_tools.push_back("calculator");
+        terminal_tools.push_back("calculate");
+
+        auto* server = get_server();
+        auto terminal = [&](const std::string& tool, bool ok, const std::string& reason) {
+            g_invoked_tools.insert(tool);
+            record_tool_status(tool, ok ? mcp_tool_call_status_t::functional_pass :
+                                          mcp_tool_call_status_t::failed);
+            if (ok) {
+                log_msg(hf, tag, "PASS -- tool=%s evidence=%s", tool.c_str(), reason.c_str());
+                passed.fetch_add(1);
+            } else {
+                log_msg(hf, tag, "FAIL -- tool=%s reason=%s", tool.c_str(), reason.c_str());
+                failed.fetch_add(1);
+            }
+        };
+        if (!server) {
+            for (const auto& tool : terminal_tools)
+                terminal(tool, false, "server unavailable");
+            return;
+        }
+
+        std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+        for (const auto& candidate : aida::analysis::workspace_registry().list()) {
+            if (candidate && candidate->identity().binary_id().to_hex() == g_mcp_session_binary_id) {
+                workspace = candidate;
+                break;
+            }
+        }
+        if (!workspace || !workspace->snapshot() || !workspace->normalized_image() ||
+            !workspace->overlay() || workspace->snapshot()->functions.empty() ||
+            workspace->snapshot()->instructions.empty()) {
+            for (const auto& tool : terminal_tools)
+                terminal(tool, false, "analyzed static workspace fixture unavailable");
+            return;
+        }
+
+        const auto snapshot = workspace->snapshot();
+        const auto& function = snapshot->functions.front();
+        const auto& instruction = snapshot->instructions.front();
+        const std::uint64_t function_va = function_index::workspace_display_address(workspace, function.start);
+        const std::uint64_t string_va = snapshot->strings.empty()
+            ? function_va
+            : function_index::workspace_display_address(workspace, snapshot->strings.front().address);
+        if (function_va == 0 || string_va == 0 || function.end.value <= function.start.value) {
+            for (const auto& tool : terminal_tools)
+                terminal(tool, false, "workspace fixture lacks display-address/function-range identity");
+            return;
+        }
+        const std::string selector = workspace->identity().normalized_source_path();
+        const std::string function_address = hex_u64(function_va);
+        const std::string string_address = hex_u64(string_va);
+        const std::string function_rva = hex_u64(function.start.value);
+        const std::string function_end_rva = hex_u64(function.end.value);
+        const std::string mnemonic_id = std::to_string(instruction.mnemonic_id);
+
+        aida::analysis::overlay_transaction_request_t setup_request;
+        aida::analysis::overlay_operation_t declaration;
+        declaration.kind = aida::analysis::overlay_operation_kind_t::type_declaration;
+        declaration.name = "McpCompatibilityHarnessRecord";
+        declaration.type = "struct McpCompatibilityHarnessRecord { uint32_t marker; uint16_t flags; };";
+        declaration.text = declaration.type;
+        setup_request.operations.push_back(declaration);
+        aida::analysis::overlay_operation_t application;
+        application.kind = aida::analysis::overlay_operation_kind_t::type_application;
+        application.address = function.start;
+        application.type = declaration.name;
+        setup_request.operations.push_back(application);
+        const auto setup = workspace->overlay()->transact(setup_request);
+        const bool setup_committed = setup.has_value() && setup.value().committed;
+
+        struct read_case_t {
+            std::string tool;
+            mcp_standalone::json arguments;
+            std::string field;
+        };
+        std::vector<read_case_t> read_cases = {
+            {"lookup_funcs", {{"addresses", function_address}}, "items"},
+            {"int_convert", {{"value", "2A"}, {"from_format", "hex"}, {"to_format", "decimal"}}, "output"},
+            {"list_funcs", {{"offset", 0}, {"limit", 2}}, "functions"},
+            {"list_globals", {{"offset", 0}, {"limit", 2}}, "globals"},
+            {"imports", {{"offset", 0}, {"limit", 2}}, "imports"},
+            {"decompile", {{"address", function_address}, {"use_cache", false}}, "pseudocode"},
+            {"disasm", {{"address", function_address}, {"max_instructions", 8}}, "instructions"},
+            {"xrefs_to", {{"address", function_address}, {"limit", 2}, {"kind", "all"}}, "xrefs"},
+            {"xrefs_to_field", {{"struct_name", declaration.name}, {"field_name", "marker"}, {"limit", 2}}, "xrefs"},
+            {"callees", {{"address", function_address}, {"include_indirect", true}}, "callees"},
+            {"get_bytes", {{"address", function_address}, {"size", 8}, {"hex", true}}, "hex"},
+            {"get_int", {{"address", function_address}, {"size", 4}, {"signed", false}, {"endian", "little"}}, "value"},
+            {"get_string", {{"address", string_address}, {"max_length", 64}, {"encoding", "auto"}}, "value"},
+            {"get_global_value", {{"address", function_address}, {"size", 4}, {"as_type", "hex"}}, "value"},
+            {"stack_frame", {{"address", function_address}, {"include_saved_regs", true}}, "slots"},
+            {"read_struct", {{"address", function_address}, {"struct_name", declaration.name}, {"max_depth", 2}}, "fields"},
+            {"search_structs", {{"name", declaration.name}, {"offset", 0}, {"limit", 2}}, "structs"},
+            {"find_regex", {{"pattern", ".*"}, {"scope", "all"}, {"offset", 0}, {"limit", 2}}, "results"},
+            {"find_bytes", {{"hex_pattern", "00"}, {"offset", 0}, {"limit", 2}}, "results"},
+            {"find_insns", {{"mnemonic", mnemonic_id}, {"offset", 0}, {"limit", 2}}, "results"},
+            {"find", {{"query", "sub_"}, {"kind", "all"}, {"offset", 0}, {"limit", 2}}, "results"},
+            {"basic_blocks", {{"address", function_address}, {"include_instructions", true}}, "blocks"},
+            {"export_funcs", {{"offset", 0}, {"limit", 2}}, "exports"},
+            {"callgraph", {{"address", function_address}, {"depth", 1}, {"direction", "both"}, {"limit", 8}}, "nodes"}
+        };
+        for (auto& test : read_cases) {
+            if (mcp_standalone::ida_compat::is_target_dependent_tool(test.tool))
+                test.arguments["bin_name"] = selector;
+            const auto result = server->call_registered_tool(test.tool, test.arguments, true);
+            const bool target_dependent = mcp_standalone::ida_compat::is_target_dependent_tool(test.tool);
+            const bool target_identity_ok = !target_dependent ||
+                (result.data.contains("_meta") && result.data["_meta"].is_object() &&
+                 result.data["_meta"].contains("aida") && result.data["_meta"]["aida"].is_object() &&
+                 result.data["_meta"]["aida"].value("binary_id", std::string()) ==
+                    workspace->identity().binary_id().to_hex());
+            const bool ok = result.success && result.data.is_object() &&
+                result.data.contains(test.field) && result.data.dump().size() <= (1U << 20) &&
+                target_identity_ok;
+            terminal(test.tool, ok, ok ? "production workspace handler returned bounded target-bound data" :
+                (result.error_code + ":" + compact_text(result.text, 240)));
+        }
+
+        struct mutation_case_t {
+            std::string tool;
+            mcp_standalone::json arguments;
+        };
+        std::vector<mutation_case_t> mutation_cases = {
+            {"add_bookmark", {{"address", function_rva}, {"name", "mcp_testlab_bookmark"}, {"comment", "dry run"}}},
+            {"set_comments", {{"items", mcp_standalone::json{{"address", function_rva}, {"comment", "dry run"}}}}},
+            {"patch_asm", {{"address", function_rva}, {"assembly", "nop"}}},
+            {"declare_type", {{"name", "McpTestLabDryRunRecord"}, {"definition", "struct McpTestLabDryRunRecord { uint32_t value; };"}}},
+            {"define_func", {{"address", function_rva}, {"end", function_end_rva}}},
+            {"define_code", {{"address", function_rva}, {"size", 1}}},
+            {"undefine", {{"address", function_rva}, {"size", 1}}},
+            {"declare_stack", {{"address", function_rva}, {"items", mcp_standalone::json{{"offset", -8}, {"name", "local_value"}, {"type", "uint64_t"}, {"size", 8}}}}},
+            {"delete_stack", {{"address", function_rva}, {"offsets", -8}}},
+            {"set_type", {{"address", function_rva}, {"type", "uint32_t"}}},
+            {"infer_types", {{"items", function_rva}}},
+            {"analyze_funcs", {{"items", function_rva}}},
+            {"rename", {{"address", function_rva}, {"name", "mcp_testlab_entry"}}},
+            {"patch", {{"address", function_rva}, {"hex_string", "90"}}},
+            {"put_int", {{"address", function_rva}, {"value", "0"}, {"size", 1}, {"endian", "little"}}}
+        };
+        const auto before_dry_runs = workspace->overlay()->snapshot();
+        for (auto& test : mutation_cases) {
+            test.arguments["bin_name"] = selector;
+            test.arguments["aida_tx"] = mcp_standalone::json{{"dry_run", true}};
+            const auto result = server->call_registered_tool(test.tool, test.arguments, true);
+            const bool ok = result.success && result.data.is_object() &&
+                result.data.value("dry_run", false) && !result.data.value("committed", true) &&
+                result.data.contains("items") && result.data["items"].is_array() &&
+                !result.data["items"].empty();
+            terminal(test.tool, ok, ok ? "production mutation handler completed a reversible dry run" :
+                (result.error_code + ":" + compact_text(result.text, 240)));
+        }
+        const auto after_dry_runs = workspace->overlay()->snapshot();
+        if (after_dry_runs.revision != before_dry_runs.revision ||
+            after_dry_runs.items.size() != before_dry_runs.items.size()) {
+            log_msg(hf, tag, "FAIL -- mutation dry runs changed overlay state before_revision=%llu after_revision=%llu before_items=%zu after_items=%zu",
+                static_cast<unsigned long long>(before_dry_runs.revision),
+                static_cast<unsigned long long>(after_dry_runs.revision),
+                before_dry_runs.items.size(), after_dry_runs.items.size());
+            failed.fetch_add(1);
+        }
+
+        const mcp_standalone::json calculation = {
+            {"expression", "(1 << 65) + 3"}, {"format", "decimal"}
+        };
+        const auto calculate = server->call_registered_tool("calculate", calculation, true);
+        terminal("calculate", calculate.success &&
+            calculate.data.value("value", std::string()) == "36893488147419103235",
+            calculate.success ? "retained arbitrary-precision calculator handler returned the exact value" :
+                (calculate.error_code + ":" + compact_text(calculate.text, 240)));
+        const auto calculator = server->call_registered_tool("calculator", mcp_standalone::json{
+            {"items", mcp_standalone::json{{"id", "scalar"},
+                                            {"expression", "6 * 7"},
+                                            {"format", "decimal"}}}
+        }, true);
+        const bool calculator_ok = calculator.success && calculator.data.value("count", 0u) == 1 &&
+            calculator.data.contains("results") && calculator.data["results"].is_array() &&
+            calculator.data["results"].size() == 1 &&
+            calculator.data["results"][0].value("id", std::string()) == "scalar" &&
+            calculator.data["results"][0].value("success", false);
+        terminal("calculator", calculator_ok,
+            calculator_ok ? "calculator scalar-item normalization reached the production handler" :
+                (calculator.error_code + ":" + compact_text(calculator.text, 240)));
+
+        if (setup_committed) {
+            const auto setup_snapshot = workspace->overlay()->snapshot();
+            const auto undone = workspace->overlay()->undo(setup_snapshot.revision);
+            if (!undone.has_value() || !undone.value().committed) {
+                log_msg(hf, tag, "FAIL -- compatibility fixture overlay undo failed");
+                failed.fetch_add(1);
+            }
+        } else {
+            const std::string setup_code = setup.has_value() ? "NOT_COMMITTED" : setup.error().stable_code();
+            const std::string setup_message = setup.has_value()
+                ? "transaction was not committed" : setup.error().message;
+            log_msg(hf, tag, "FAIL -- compatibility type fixture transaction failed code=%s message=%s",
+                setup_code.c_str(), setup_message.c_str());
+            failed.fetch_add(1);
+        }
+    }
+
     void test_tool_sessions_manage_attach_pid(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "mcp.sessions_manage.attach_pid";
+        auto rejects_invalid_pid = [&](const mcp_standalone::json& pid, const char* label) {
+            mcp_standalone::json probe{{"action", "attach_pid"}, {"pid", pid}};
+            const auto timed = invoke_tool_bounded(get_server(), "sessions_manage", probe,
+                tool_timeout_ms("sessions_manage"));
+            const bool rejected = !timed.timed_out && timed.result.found &&
+                !timed.result.threw && !timed.result.success;
+            log_msg(hf, tag,
+                "GUARD -- case=%s rejected=%d timeout=%d found=%d threw=%d success=%d text=%s data=%s",
+                label,
+                rejected ? 1 : 0,
+                timed.timed_out ? 1 : 0,
+                timed.result.found ? 1 : 0,
+                timed.result.threw ? 1 : 0,
+                timed.result.success ? 1 : 0,
+                compact_text(timed.result.text, 400).c_str(),
+                compact_json(timed.result.data, 600).c_str());
+            return rejected;
+        };
+        if (!rejects_invalid_pid(mcp_standalone::json(4294967296ULL), "uint32_overflow") ||
+            !rejects_invalid_pid(mcp_standalone::json("123junk"), "trailing_characters")) {
+            log_msg(hf, tag, "FAIL -- sessions_manage accepted or failed to deterministically reject a hostile PID");
+            record_tool_status("sessions_manage", mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return;
+        }
         mcp_standalone::json args;
         args["pid"] = g_mcp_target_pid != 0 ? g_mcp_target_pid : GetCurrentProcessId();
-        test_tool_action_call(hf, "mcp.sessions_manage.attach_pid", "sessions_manage", "attach_pid", args, passed, failed, skipped);
+        test_tool_action_call(hf, tag, "sessions_manage", "attach_pid", args, passed, failed, skipped);
     }
 
     void test_tool_sessions_manage_close(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -35062,6 +35459,8 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_symbolic_execution_slice_function(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_symbolic_execution_solve_path(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_taint_trace_register(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_sessions_manage_open_file(hf, passed, failed, skipped);
+    if (!cancelled()) test_ida_compatibility_handler_surface(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_decompile_function(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_analysis_query_imports(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_analysis_query_exports(hf, passed, failed, skipped);
@@ -35071,7 +35470,6 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_analysis_query_binary_map_overview(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_analysis_query_xref_db_stats(hf, passed, failed, skipped);
 
-    if (!cancelled()) test_tool_sessions_manage_open_file(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_instruction(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_function_bounds(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_disasm_get_function_disassembly(hf, passed, failed, skipped);
@@ -35086,6 +35484,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_disasm_get_strings(hf, passed, failed, skipped);
 
     if (!cancelled()) test_tool_sessions_manage_list(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_list_instances(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_sessions_manage_get_active(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_sessions_manage_attach_pid(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_sessions_manage_close(hf, passed, failed, skipped);

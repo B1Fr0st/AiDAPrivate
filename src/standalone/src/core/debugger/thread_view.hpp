@@ -18,8 +18,6 @@
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 
-extern DisasmState g_disasm;
-
 namespace thread_view {
 
 struct thread_entry_t {
@@ -404,7 +402,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 			if (ImGui::MenuItem("Go to RIP in Disasm")) {
 				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(snapshot[g_ui.context_idx].rip, g_disasm);
+				disasm_view::goto_address(snapshot[g_ui.context_idx].rip,
+					disasm_view::capture_selected_workspace());
 			}
 		}
 		ImGui::EndPopup();

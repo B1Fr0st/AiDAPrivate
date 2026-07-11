@@ -16,6 +16,7 @@
 
 #include <array>
 #include <bitset>
+#include <ctime>
 
 #include <openssl/evp.h>
 
@@ -156,6 +157,19 @@ namespace detail
         taint_sever_cell_t* taint_ring;
         uint32_t taint_ring_size;
         uint32_t taint_seq;
+
+        struct vm_entangled_state_t* entangled;
+        struct handler_hash_table_t* hash_table;
+        uint8_t* scratch_buffer;
+        uint8_t* discard_buffer;
+        uint64_t invocation_key;
+        bool entangled_active;
+        uint8_t active_vm_index;
+        uint32_t entangled_switch_counter;
+        uint64_t cached_nonce;
+        uint64_t nonce_timestamp;
+        bool opcode_table_encrypted;
+        uint8_t saved_opcode_map[256];
     };
 
     struct vm_program_t
@@ -221,6 +235,11 @@ namespace detail
         OP_JNB     = 0x33,
         OP_JNBE    = 0x34,
         OP_VM_SPAWN = 0x35,
+        OP_VM_ENTANGLE = 0x36,
+        OP_JUNK_ADD = 0x37,
+        OP_JUNK_MUL = 0x38,
+        OP_JUNK_MEM = 0x39,
+        OP_JUNK_XOR = 0x3A,
         OP_MAX
     };
 
@@ -603,6 +622,413 @@ namespace detail
         }
     }
 
+    inline uint64_t derive_invocation_key()
+    {
+        uint64_t tsc = __rdtsc();
+        DWORD pid = GetCurrentProcessId();
+        DWORD tid = GetCurrentThreadId();
+        uint64_t server_nonce = g_server_poly_seed;
+        uint64_t build_seed = g_build_seed;
+
+        uint8_t input[32];
+        memcpy(input, &tsc, 8);
+        memcpy(input + 8, &pid, 4);
+        memcpy(input + 12, &tid, 4);
+        memcpy(input + 16, &server_nonce, 8);
+        memcpy(input + 24, &build_seed, 8);
+
+        uint8_t digest[32];
+        sha256_oneshot(input, 32, digest);
+
+        uint64_t key;
+        memcpy(&key, digest, 8);
+        uint64_t key2;
+        memcpy(&key2, digest + 8, 8);
+        key ^= _rotl64(key2, 23);
+
+        SecureZeroMemory(input, 32);
+        SecureZeroMemory(digest, 32);
+        return key;
+    }
+
+    inline void aes256_key_expansion(const uint8_t key[32], __m128i ks[15])
+    {
+        ks[0] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key));
+        ks[1] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key + 16));
+
+        const __m128i shuf_mask = _mm_set_epi32(0x0b0a090d, 0x0f0e0d0c, 0x0b0a090d, 0x0f0e0d0c);
+
+        auto key_expand_round = [&](int round, uint8_t rcon) {
+            __m128i temp = ks[round - 1];
+            __m128i shuffled = _mm_shuffle_epi32(temp, 0xFF);
+            shuffled = _mm_shuffle_epi8(shuffled, shuf_mask);
+            __m128i rcon_vec = _mm_set_epi8(static_cast<int8_t>(rcon), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            shuffled = _mm_xor_si128(shuffled, rcon_vec);
+            ks[round] = _mm_xor_si128(ks[round - 2], shuffled);
+        };
+
+        auto key_expand_even = [&](int round) {
+            __m128i temp = ks[round - 1];
+            __m128i shuffled = _mm_shuffle_epi32(temp, 0xAA);
+            shuffled = _mm_shuffle_epi8(shuffled, shuf_mask);
+            ks[round] = _mm_xor_si128(ks[round - 2], shuffled);
+        };
+
+        key_expand_round(2, 0x01);
+        key_expand_even(3);
+        key_expand_round(4, 0x02);
+        key_expand_even(5);
+        key_expand_round(6, 0x04);
+        key_expand_even(7);
+        key_expand_round(8, 0x08);
+        key_expand_even(9);
+        key_expand_round(10, 0x10);
+        key_expand_even(11);
+        key_expand_round(12, 0x20);
+        key_expand_even(13);
+        key_expand_round(14, 0x40);
+    }
+
+    inline __m128i aes256_encrypt_block(__m128i block, const __m128i ks[15])
+    {
+        __m128i state = _mm_xor_si128(block, ks[0]);
+        for (int i = 1; i < 14; ++i)
+        {
+            state = _mm_aesenc_si128(state, ks[i]);
+        }
+        state = _mm_aesenclast_si128(state, ks[14]);
+        return state;
+    }
+
+    inline void encrypt_opcode_table_aes(uint8_t opcode_map[256], uint64_t key, bool encrypt_dir)
+    {
+        const cpu_caps_t& caps = get_cpu_caps();
+        bool has_aesni = (caps.cpuid1_ecx & (1u << 25)) != 0;
+
+        if (!has_aesni)
+        {
+            for (int i = 0; i < 256; ++i)
+            {
+                uint8_t kb = static_cast<uint8_t>((key >> ((i & 7) * 8)) & 0xFF);
+                if (encrypt_dir)
+                    opcode_map[i] ^= kb;
+                else
+                    opcode_map[i] ^= kb;
+            }
+            return;
+        }
+
+        uint8_t aes_key[32];
+        memcpy(aes_key, &key, 8);
+        uint8_t prk_input[16];
+        memcpy(prk_input, &key, 8);
+        memcpy(prk_input + 8, &key, 8);
+        uint8_t prk[32];
+        hmac_sha256(reinterpret_cast<const uint8_t*>(prk_input), 16,
+                    reinterpret_cast<const uint8_t*>(prk_input), 16, prk);
+        static const uint8_t info[12] = {
+            'a','i','d','a','_','o','p','t','b','l','_','v'
+        };
+        hkdf_expand_sha256(prk, info, 12, aes_key, 32);
+
+        uint8_t iv[16] = {};
+        memcpy(iv, &key, 8);
+        memcpy(iv + 8, &key, 8);
+
+        __m128i key_schedule[15];
+        aes256_key_expansion(aes_key, key_schedule);
+
+        __m128i counter = _mm_loadu_si128(reinterpret_cast<__m128i*>(iv));
+        for (int i = 0; i < 16; ++i)
+        {
+            __m128i block = _mm_xor_si128(counter, _mm_set_epi64x(0, i));
+            __m128i keystream = aes256_encrypt_block(block, key_schedule);
+            __m128i pt = _mm_loadu_si128(reinterpret_cast<__m128i*>(opcode_map + i * 16));
+            __m128i ct = _mm_xor_si128(pt, keystream);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(opcode_map + i * 16), ct);
+        }
+
+        SecureZeroMemory(aes_key, 32);
+        SecureZeroMemory(key_schedule, sizeof(key_schedule));
+        SecureZeroMemory(prk, 32);
+        SecureZeroMemory(iv, 16);
+    }
+
+    inline uint64_t derive_entry_key(uint32_t entry_index, uint64_t table_seed)
+    {
+        uint64_t k = table_seed ^ (static_cast<uint64_t>(entry_index) * 0x9E3779B97F4A7C15ULL);
+        k ^= k >> 30;
+        k *= 0xBF58476D1CE4E5B9ULL;
+        k ^= k >> 27;
+        k *= 0x94D049BB133111EBULL;
+        k ^= k >> 31;
+        return k;
+    }
+
+    inline uint32_t opcode_hash(uint8_t opcode, uint64_t table_seed)
+    {
+        uint64_t h = table_seed ^ (static_cast<uint64_t>(opcode) * 0x9E3779B97F4A7C15ULL);
+        h ^= h >> 33;
+        h *= 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 33;
+        h *= 0xC4CEB9FE1A85EC53ULL;
+        h ^= h >> 33;
+        return static_cast<uint32_t>(h);
+    }
+
+    inline handler_hash_table_t* build_hash_table(handler_pool_t& pool, uint64_t table_seed)
+    {
+        auto* ht = new handler_hash_table_t{};
+        memset(ht, 0, sizeof(*ht));
+        ht->table_seed = table_seed;
+        ht->entry_count = 256;
+        ht->generation = pool.generation;
+        ht->scattered = false;
+        ht->contiguous = nullptr;
+        for (int i = 0; i < 4; ++i) ht->blocks[i] = nullptr;
+        for (int i = 0; i < 64; ++i) ht->bucket_heads[i] = 0xFFFFFFFFu;
+
+        bool all_blocks_ok = true;
+        for (int b = 0; b < 4; ++b)
+        {
+            ht->blocks[b] = static_cast<handler_hash_entry_t*>(
+                VirtualAlloc(nullptr, 64 * sizeof(handler_hash_entry_t),
+                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            if (!ht->blocks[b])
+            {
+                all_blocks_ok = false;
+                break;
+            }
+            memset(ht->blocks[b], 0, 64 * sizeof(handler_hash_entry_t));
+
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(ht->blocks[b], &mbi, sizeof(mbi)) == 0 ||
+                mbi.State != MEM_COMMIT ||
+                !(mbi.Protect & (PAGE_READWRITE | PAGE_READONLY |
+                                 PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+            {
+                all_blocks_ok = false;
+                break;
+            }
+        }
+
+        if (!all_blocks_ok)
+        {
+            for (int b = 0; b < 4; ++b)
+            {
+                if (ht->blocks[b])
+                {
+                    VirtualFree(ht->blocks[b], 0, MEM_RELEASE);
+                    ht->blocks[b] = nullptr;
+                }
+            }
+
+            ht->contiguous = static_cast<handler_hash_entry_t*>(
+                VirtualAlloc(nullptr, 256 * sizeof(handler_hash_entry_t),
+                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            if (!ht->contiguous)
+            {
+                ht->contiguous = static_cast<handler_hash_entry_t*>(
+                    new handler_hash_entry_t[256]());
+                memset(ht->contiguous, 0, 256 * sizeof(handler_hash_entry_t));
+            }
+            ht->scattered = false;
+        }
+        else
+        {
+            ht->scattered = true;
+        }
+
+        auto get_entry = [&](uint32_t idx) -> handler_hash_entry_t& {
+            if (ht->scattered)
+                return ht->blocks[idx / 64][idx % 64];
+            else
+                return ht->contiguous[idx];
+        };
+
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+            handler_hash_entry_t& e = get_entry(i);
+            e.fn = pool.dispatch_table[i];
+            e.entry_key = derive_entry_key(i, table_seed);
+            e.opcode_hash = opcode_hash(static_cast<uint8_t>(i), table_seed);
+            e.next_entry = 0xFFFFFFFFu;
+
+            uint64_t encrypted_fn = reinterpret_cast<uint64_t>(e.fn) ^ e.entry_key;
+            e.fn = reinterpret_cast<handler_fn>(encrypted_fn);
+
+            uint32_t bucket = (static_cast<uint32_t>(i) * 0x9E3779B9u) & 0x3F;
+            if (ht->bucket_heads[bucket] == 0xFFFFFFFFu)
+            {
+                ht->bucket_heads[bucket] = i;
+            }
+            else
+            {
+                uint32_t walk = ht->bucket_heads[bucket];
+                while (get_entry(walk).next_entry != 0xFFFFFFFFu)
+                    walk = get_entry(walk).next_entry;
+                get_entry(walk).next_entry = i;
+            }
+        }
+
+        return ht;
+    }
+
+    inline void destroy_hash_table(handler_hash_table_t* ht)
+    {
+        if (!ht) return;
+        if (ht->scattered)
+        {
+            for (int b = 0; b < 4; ++b)
+            {
+                if (ht->blocks[b])
+                {
+                    volatile uint8_t* p = reinterpret_cast<volatile uint8_t*>(ht->blocks[b]);
+                    for (size_t i = 0; i < 64 * sizeof(handler_hash_entry_t); ++i)
+                        p[i] = 0;
+                    VirtualFree(ht->blocks[b], 0, MEM_RELEASE);
+                }
+            }
+        }
+        else
+        {
+            if (ht->contiguous)
+            {
+                volatile uint8_t* p = reinterpret_cast<volatile uint8_t*>(ht->contiguous);
+                for (size_t i = 0; i < 256 * sizeof(handler_hash_entry_t); ++i)
+                    p[i] = 0;
+                VirtualFree(ht->contiguous, 0, MEM_RELEASE);
+            }
+        }
+        SecureZeroMemory(ht, sizeof(*ht));
+        delete ht;
+    }
+
+    inline handler_fn resolve_dispatch_hash(vm_state_t& vm, uint8_t opcode)
+    {
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
+        if (!vm.hash_table || vm.hash_table->generation != pool.generation)
+        {
+            if (vm.hash_table) destroy_hash_table(vm.hash_table);
+            uint64_t ht_seed = derive_invocation_key();
+            vm.hash_table = build_hash_table(pool, ht_seed);
+        }
+
+        handler_hash_table_t& ht = *vm.hash_table;
+        uint32_t bucket = (static_cast<uint32_t>(opcode) * 0x9E3779B9u) & 0x3F;
+        uint32_t idx = ht.bucket_heads[bucket];
+        uint32_t target_hash = opcode_hash(opcode, ht.table_seed);
+
+        auto get_entry = [&](uint32_t i) -> handler_hash_entry_t& {
+            if (ht.scattered)
+                return ht.blocks[i / 64][i % 64];
+            else
+                return ht.contiguous[i];
+        };
+
+        while (idx != 0xFFFFFFFFu)
+        {
+            handler_hash_entry_t& e = get_entry(idx);
+            if (e.opcode_hash == target_hash)
+            {
+                uint64_t key = derive_entry_key(idx, ht.table_seed);
+                uint64_t decrypted_fn = reinterpret_cast<uint64_t>(e.fn) ^ key;
+                return reinterpret_cast<handler_fn>(decrypted_fn);
+            }
+            idx = e.next_entry;
+        }
+
+        return pool.dispatch_table[opcode];
+    }
+
+    inline void init_entangled_state(vm_entangled_state_t* es, uint64_t seed)
+    {
+        memset(es, 0, sizeof(*es));
+        InitializeSRWLock(&es->lock);
+        es->shared_rolling_key = seed ^ 0x6A09E667F3BCC908ULL;
+        es->shared_handler_chain = seed ^ 0xBB67AE8584CAA73BULL;
+        es->active_vm_mask = 0x7;
+        es->sync_counter = 0;
+        es->shared_vflags = 0;
+        es->integrity_failed = false;
+
+        uint64_t state = seed;
+        for (int i = 0; i < 48; ++i)
+        {
+            xorshift_advance(state);
+            es->shared_regs[i] = state;
+        }
+
+        uint8_t digest[32];
+        sha256_oneshot(reinterpret_cast<const uint8_t*>(es), 416, digest);
+        memcpy(es->stored_hmac, digest, 32);
+        es->stored_crc32 = _mm_crc32_u32(0, static_cast<uint32_t>(seed));
+        for (int i = 0; i < 48; ++i)
+        {
+            uint32_t lo = static_cast<uint32_t>(es->shared_regs[i]);
+            uint32_t hi = static_cast<uint32_t>(es->shared_regs[i] >> 32);
+            es->stored_crc32 = _mm_crc32_u32(es->stored_crc32, lo);
+            es->stored_crc32 = _mm_crc32_u32(es->stored_crc32, hi);
+        }
+
+        SecureZeroMemory(digest, 32);
+    }
+
+    inline bool verify_entangled_state(vm_entangled_state_t* es)
+    {
+        if (!es) return false;
+        if (es->integrity_failed) return false;
+
+        uint32_t computed_crc = _mm_crc32_u32(0, static_cast<uint32_t>(es->shared_rolling_key));
+        for (int i = 0; i < 48; ++i)
+        {
+            uint32_t lo = static_cast<uint32_t>(es->shared_regs[i]);
+            uint32_t hi = static_cast<uint32_t>(es->shared_regs[i] >> 32);
+            computed_crc = _mm_crc32_u32(computed_crc, lo);
+            computed_crc = _mm_crc32_u32(computed_crc, hi);
+        }
+        if (computed_crc != es->stored_crc32)
+        {
+            es->integrity_failed = true;
+            return false;
+        }
+
+        return true;
+    }
+
+    inline void entangled_state_fallback(vm_state_t& vm)
+    {
+        if (!vm.entangled) return;
+        vm.entangled->active_vm_mask = 0x1;
+        vm.entangled->integrity_failed = true;
+        for (int i = 0; i < 16; ++i)
+        {
+            uint64_t val = vm.entangled->shared_regs[i];
+            write_vreg(vm, static_cast<uint8_t>(i), val);
+        }
+        vm.entangled_active = false;
+    }
+
+    inline void init_scratch_buffers(vm_state_t& vm)
+    {
+        vm.scratch_buffer = static_cast<uint8_t*>(
+            VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (vm.scratch_buffer)
+        {
+            uint64_t rng = __rdtsc() ^ GetCurrentProcessId();
+            for (int i = 0; i < 4096; ++i)
+            {
+                rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                vm.scratch_buffer[i] = static_cast<uint8_t>(rng >> 33);
+            }
+        }
+
+        vm.discard_buffer = static_cast<uint8_t*>(
+            VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (vm.discard_buffer)
+            memset(vm.discard_buffer, 0, 4096);
+    }
+
     inline uint64_t secure_seed()
     {
         uint8_t buf[32];
@@ -669,6 +1095,50 @@ namespace detail
         handler_set_t    handler_set;
     };
 
+    struct vm_entangled_state_t
+    {
+        uint64_t shared_regs[48];
+        uint64_t shared_rolling_key;
+        uint64_t shared_handler_chain;
+        uint32_t active_vm_mask;
+        uint32_t sync_counter;
+        uint8_t  shared_vflags;
+        uint8_t  pad[7];
+        SRWLOCK  lock;
+        uint32_t stored_crc32;
+        uint8_t  stored_hmac[32];
+        bool     integrity_failed;
+        uint8_t  ent_pad[3];
+    };
+
+    static_assert(sizeof(vm_entangled_state_t) >= 424,
+        "vm_entangled_state_t must be at least 424 bytes");
+
+    struct handler_hash_entry_t
+    {
+        handler_fn  fn;
+        uint32_t    next_entry;
+        uint32_t    opcode_hash;
+        uint64_t    entry_key;
+    };
+
+    static_assert(sizeof(handler_hash_entry_t) == 24,
+        "handler_hash_entry_t must be 24 bytes");
+
+    struct handler_hash_table_t
+    {
+        handler_hash_entry_t* blocks[4];
+        uint32_t bucket_heads[64];
+        uint64_t table_seed;
+        uint32_t entry_count;
+        uint32_t generation;
+        bool     scattered;
+        uint8_t  ht_pad[7];
+        handler_hash_entry_t* contiguous;
+    };
+
+    inline uint64_t g_build_seed = 0x9E3779B97F4A7C15ULL ^ 0x428A2F98D728AE22ULL;
+
     inline handler_pool_t g_default_pool{};
 
     inline auto& g_handler_pool    = g_default_pool.slots;
@@ -699,6 +1169,17 @@ namespace detail
     inline void init_vm(vm_state_t& vm, uint64_t seed);
     inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size);
     inline void destroy_vm(vm_state_t& vm);
+    inline void init_vm(vm_state_t& vm, uint64_t seed, handler_pool_t* pool);
+    inline handler_hash_table_t* build_hash_table(handler_pool_t& pool, uint64_t table_seed);
+    inline void destroy_hash_table(handler_hash_table_t* ht);
+    inline bool verify_entangled_state(vm_entangled_state_t* es);
+    inline void entangled_state_fallback(vm_state_t& vm);
+    inline uint64_t derive_invocation_key();
+    inline void aes256_key_expansion(const uint8_t key[32], __m128i ks[15]);
+    inline __m128i aes256_encrypt_block(__m128i block, const __m128i ks[15]);
+    inline void encrypt_opcode_table_aes(uint8_t opcode_map[256], uint64_t key, bool encrypt_dir);
+    inline void init_entangled_state(vm_entangled_state_t* es, uint64_t seed);
+    inline void init_scratch_buffers(vm_state_t& vm);
 
     inline uint64_t xorshift_advance(uint64_t& state)
     {
@@ -1468,7 +1949,7 @@ namespace detail
         uintptr_t dispatch_lo = reinterpret_cast<uintptr_t>(&pool.dispatch_table[0]);
         uintptr_t dispatch_hi = dispatch_lo + sizeof(pool.dispatch_table);
 
-        auto in_range = [&](uint64_t addr) -> bool {
+        auto in_critical_range = [&](uint64_t addr) -> bool {
             if (addr == 0) return false;
             if (addr >= pool_lo && addr < pool_hi) return true;
             if (addr >= dispatch_lo && addr < dispatch_hi) return true;
@@ -1476,10 +1957,46 @@ namespace detail
                 uintptr_t fn = reinterpret_cast<uintptr_t>(pool.slots[i].fn);
                 if (addr >= fn && addr < fn + 256) return true;
             }
+            uintptr_t map_lo = reinterpret_cast<uintptr_t>(&vm.opcode_map[0]);
+            uintptr_t map_hi = map_lo + 256;
+            if (addr >= map_lo && addr < map_hi) return true;
+            uintptr_t reg_lo = reinterpret_cast<uintptr_t>(&vm.regs[0]);
+            uintptr_t reg_hi = reg_lo + sizeof(vm.regs);
+            if (addr >= reg_lo && addr < reg_hi) return true;
+            if (vm.hash_table) {
+                if (vm.hash_table->scattered) {
+                    for (int b = 0; b < 4; ++b) {
+                        if (vm.hash_table->blocks[b]) {
+                            uintptr_t blk = reinterpret_cast<uintptr_t>(vm.hash_table->blocks[b]);
+                            if (addr >= blk && addr < blk + 64 * sizeof(handler_hash_entry_t))
+                                return true;
+                        }
+                    }
+                } else if (vm.hash_table->contiguous) {
+                    uintptr_t blk = reinterpret_cast<uintptr_t>(vm.hash_table->contiguous);
+                    if (addr >= blk && addr < blk + 256 * sizeof(handler_hash_entry_t))
+                        return true;
+                }
+            }
+            if (vm.scratch_buffer) {
+                uintptr_t sb = reinterpret_cast<uintptr_t>(vm.scratch_buffer);
+                if (addr >= sb && addr < sb + 4096) return true;
+            }
+            if (vm.discard_buffer) {
+                uintptr_t db = reinterpret_cast<uintptr_t>(vm.discard_buffer);
+                if (addr >= db && addr < db + 4096) return true;
+            }
+            if (vm.entangled) {
+                uintptr_t es = reinterpret_cast<uintptr_t>(vm.entangled);
+                if (addr >= es && addr < es + sizeof(vm_entangled_state_t))
+                    return true;
+            }
             return false;
         };
 
-        if (in_range(dr0) || in_range(dr1) || in_range(dr2) || in_range(dr3)) {
+        if (in_critical_range(dr0) || in_critical_range(dr1) ||
+            in_critical_range(dr2) || in_critical_range(dr3))
+        {
             vm.rolling_key ^= 0xDEADDEADDEADDEADULL;
             vm.handler_chain_key = 0;
             for (int i = 0; i < 16; ++i) vm.regs[i] ^= __rdtsc();
@@ -1487,6 +2004,17 @@ namespace detail
         }
 
         return (dr0 != 0 || dr1 != 0 || dr2 != 0 || dr3 != 0);
+    }
+
+    __forceinline bool vm_check_trap_flag()
+    {
+        uint64_t rflags = 0;
+        __try {
+            rflags = __readeflags();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return true;
+        }
+        return (rflags & 0x100) != 0;
     }
 
     __forceinline void regenerate_handlers(vm_state_t& vm)
@@ -1884,6 +2412,17 @@ namespace detail
                 vm.halted = true;
                 return;
             }
+            if (vm_check_trap_flag())
+            {
+                uint64_t poison = __rdtsc();
+                for (int i = 0; i < 16; ++i)
+                    vm.regs[i] ^= poison;
+                vm.rolling_key ^= poison;
+                vm.handler_chain_key ^= _rotl64(poison, 17);
+                write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+                vm.halted = true;
+                return;
+            }
             encrypt_context(vm);
         }
 
@@ -1901,6 +2440,61 @@ namespace detail
             decrypt_context(vm);
             shuffle_registers(vm);
             encrypt_context(vm);
+        }
+
+        if (vm.entangled_active && vm.entangled)
+        {
+            ++vm.entangled_switch_counter;
+            if (vm.entangled_switch_counter >= (CONTEXT_SHUFFLE_INTERVAL / 3))
+            {
+                vm.entangled_switch_counter = 0;
+                decrypt_context(vm);
+                if (!verify_entangled_state(vm.entangled))
+                {
+                    entangled_state_fallback(vm);
+                }
+                else
+                {
+                    AcquireSRWLockExclusive(&vm.entangled->lock);
+                    uint8_t cur_vm = vm.active_vm_index;
+                    for (int i = 0; i < 16; ++i)
+                        vm.entangled->shared_regs[cur_vm * 16 + i] = read_vreg(vm, static_cast<uint8_t>(i));
+                    vm.entangled->shared_rolling_key = vm.rolling_key;
+                    vm.entangled->shared_handler_chain = vm.handler_chain_key;
+                    uint8_t next_vm = (cur_vm + 1) % 3;
+                    if (vm.entangled->active_vm_mask & (1u << next_vm))
+                    {
+                        vm.active_vm_index = next_vm;
+                        for (int i = 0; i < 16; ++i)
+                            write_vreg(vm, static_cast<uint8_t>(i), vm.entangled->shared_regs[next_vm * 16 + i]);
+                        vm.rolling_key = vm.entangled->shared_rolling_key;
+                        vm.handler_chain_key = vm.entangled->shared_handler_chain;
+                    }
+                    vm.entangled->sync_counter++;
+                    ReleaseSRWLockExclusive(&vm.entangled->lock);
+                }
+                encrypt_context(vm);
+            }
+
+            if (vm.insn_count > 0 && (vm.insn_count % HANDLER_REGEN_INTERVAL) == 0)
+            {
+                decrypt_context(vm);
+                AcquireSRWLockShared(&vm.entangled->lock);
+                uint8_t digest[32];
+                hmac_sha256(reinterpret_cast<const uint8_t*>(vm.entangled), 416,
+                            reinterpret_cast<const uint8_t*>(vm.entangled), 416, digest);
+                if (memcmp(digest, vm.entangled->stored_hmac, 32) != 0)
+                {
+                    ReleaseSRWLockShared(&vm.entangled->lock);
+                    entangled_state_fallback(vm);
+                }
+                else
+                {
+                    ReleaseSRWLockShared(&vm.entangled->lock);
+                }
+                SecureZeroMemory(digest, 32);
+                encrypt_context(vm);
+            }
         }
 
 
@@ -2997,6 +3591,602 @@ namespace detail
         dispatch_next(vm, bc, bc_size);
     }
 
+    inline CRITICAL_SECTION g_smc_cs;
+    inline volatile LONG g_smc_cs_init = 0;
+    __forceinline void ensure_smc_cs_init()
+    {
+        if (InterlockedCompareExchange(&g_smc_cs_init, 1, 0) == 0)
+            InitializeCriticalSection(&g_smc_cs);
+    }
+    inline volatile uint8_t g_smc_form_selectors[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    __forceinline uint8_t smc_modify_form(uint8_t handler_idx, uint8_t* handler_code, uint32_t offset)
+    {
+        ensure_smc_cs_init();
+        EnterCriticalSection(&g_smc_cs);
+        uint8_t new_form = static_cast<uint8_t>(__rdtsc() & 0x03);
+        DWORD old_prot = 0;
+        bool ok = false;
+        if (VirtualProtect(handler_code + offset, 1, PAGE_EXECUTE_READWRITE, &old_prot))
+        {
+            InterlockedExchange8(reinterpret_cast<volatile CHAR*>(handler_code + offset),
+                                 static_cast<CHAR>(new_form));
+            FlushInstructionCache(GetCurrentProcess(), handler_code + offset, 1);
+            uint8_t readback = handler_code[offset];
+            if (readback == new_form)
+            {
+                g_smc_form_selectors[handler_idx] = new_form;
+                ok = true;
+            }
+            VirtualProtect(handler_code + offset, 1, old_prot, &old_prot);
+        }
+        LeaveCriticalSection(&g_smc_cs);
+        return ok ? new_form : g_smc_form_selectors[handler_idx];
+    }
+
+    VM_HANDLER(h_junk_add)
+    {
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t entropy = handler_entropy_bit(vm, 0x40);
+        uint64_t result = mba_add(va, vb, entropy);
+
+        uint64_t env = __rdtsc() ^ vm.context_entropy;
+        if ((env & 0xFF) == 0x42)
+            write_vreg(vm, 13, result);
+        else
+            write_vreg(vm, 14, result);
+
+        uint64_t discard_addr = read_vreg(vm, 15);
+        if (discard_addr && vm.discard_buffer)
+        {
+            uint32_t doff = static_cast<uint32_t>(discard_addr & 0xFFF);
+            if (doff + 8 <= 4096)
+                memcpy(vm.discard_buffer + doff, &result, 8);
+        }
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_junk_mul)
+    {
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t result = micro_mul(va, vb);
+
+        uint64_t env = __rdtsc() ^ vm.context_entropy;
+        if ((env & 0xFF) == 0x42)
+            write_vreg(vm, 13, result);
+        else
+            write_vreg(vm, 14, result);
+
+        uint64_t discard_addr = read_vreg(vm, 15);
+        if (discard_addr && vm.discard_buffer)
+        {
+            uint32_t doff = static_cast<uint32_t>(discard_addr & 0xFFF);
+            if (doff + 8 <= 4096)
+                memcpy(vm.discard_buffer + doff, &result, 8);
+        }
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_junk_mem)
+    {
+        uint8_t addr_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t off_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t offset = read_vreg(vm, off_reg);
+        uint64_t result = 0;
+
+        if (vm.scratch_buffer)
+        {
+            uint32_t soff = static_cast<uint32_t>(offset & 0xFFF);
+            if (soff + 8 <= 4096)
+                memcpy(&result, vm.scratch_buffer + soff, 8);
+        }
+
+        uint64_t env = __rdtsc() ^ vm.context_entropy;
+        if ((env & 0xFF) == 0x42)
+            write_vreg(vm, 13, result);
+        else
+            write_vreg(vm, 14, result);
+
+        if (vm.discard_buffer)
+        {
+            uint32_t doff = static_cast<uint32_t>((offset ^ 0xDEAD) & 0xFFF);
+            if (doff + 8 <= 4096)
+                memcpy(vm.discard_buffer + doff, &result, 8);
+        }
+        (void)addr_reg;
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_junk_xor)
+    {
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t entropy = handler_entropy_bit(vm, 0x41);
+        uint64_t result = mba_xor(va, vb, entropy);
+
+        uint64_t env = __rdtsc() ^ vm.context_entropy;
+        if ((env & 0xFF) == 0x42)
+            write_vreg(vm, 13, result);
+        else
+            write_vreg(vm, 14, result);
+
+        uint64_t discard_addr = read_vreg(vm, 15);
+        if (discard_addr && vm.discard_buffer)
+        {
+            uint32_t doff = static_cast<uint32_t>(discard_addr & 0xFFF);
+            if (doff + 8 <= 4096)
+                memcpy(vm.discard_buffer + doff, &result, 8);
+        }
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_load_reg_entangled)
+    {
+        uint8_t packed = fetch_byte(vm, bc, bc_size);
+        uint8_t vm_index = (packed >> 6) & 0x03;
+        uint8_t reg = packed & 0x0F;
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+
+        if (!vm.entangled || !vm.entangled_active || vm_index > 2)
+        {
+            write_vreg(vm, dst, read_vreg(vm, reg));
+            dispatch_next(vm, bc, bc_size);
+            return;
+        }
+
+        AcquireSRWLockShared(&vm.entangled->lock);
+        if (!verify_entangled_state(vm.entangled))
+        {
+            ReleaseSRWLockShared(&vm.entangled->lock);
+            entangled_state_fallback(vm);
+            write_vreg(vm, dst, read_vreg(vm, reg));
+            dispatch_next(vm, bc, bc_size);
+            return;
+        }
+        uint64_t val = vm.entangled->shared_regs[vm_index * 16 + reg];
+        ReleaseSRWLockShared(&vm.entangled->lock);
+
+        write_vreg(vm, dst, val);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_store_reg_entangled)
+    {
+        uint8_t packed = fetch_byte(vm, bc, bc_size);
+        uint8_t vm_index = (packed >> 6) & 0x03;
+        uint8_t reg = packed & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t val = read_vreg(vm, src);
+
+        write_vreg(vm, reg, val);
+
+        if (!vm.entangled || !vm.entangled_active || vm_index > 2)
+        {
+            dispatch_next(vm, bc, bc_size);
+            return;
+        }
+
+        AcquireSRWLockExclusive(&vm.entangled->lock);
+        if (!verify_entangled_state(vm.entangled))
+        {
+            ReleaseSRWLockExclusive(&vm.entangled->lock);
+            entangled_state_fallback(vm);
+            dispatch_next(vm, bc, bc_size);
+            return;
+        }
+        vm.entangled->shared_regs[vm_index * 16 + reg] = val;
+        vm.entangled->sync_counter++;
+        ReleaseSRWLockExclusive(&vm.entangled->lock);
+
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_add_entangled)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t packed = fetch_byte(vm, bc, bc_size);
+        uint8_t vm_index = (packed >> 6) & 0x03;
+        uint8_t b_reg = packed & 0x0F;
+
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb;
+
+        if (vm.entangled && vm.entangled_active && vm_index <= 2)
+        {
+            AcquireSRWLockShared(&vm.entangled->lock);
+            if (!verify_entangled_state(vm.entangled))
+            {
+                ReleaseSRWLockShared(&vm.entangled->lock);
+                entangled_state_fallback(vm);
+                vb = read_vreg(vm, b_reg);
+            }
+            else
+            {
+                vb = vm.entangled->shared_regs[vm_index * 16 + b_reg];
+                ReleaseSRWLockShared(&vm.entangled->lock);
+            }
+        }
+        else
+        {
+            vb = read_vreg(vm, b_reg);
+        }
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x42);
+        uint64_t result = mba_add(va, vb, entropy);
+        result = triton_break_inject(vm, result, 0x42);
+        write_vreg(vm, dst, result);
+
+        if (vm.entangled && vm.entangled_active && vm_index <= 2)
+        {
+            AcquireSRWLockExclusive(&vm.entangled->lock);
+            vm.entangled->shared_regs[vm.active_vm_index * 16 + dst] = result;
+            vm.entangled->sync_counter++;
+            ReleaseSRWLockExclusive(&vm.entangled->lock);
+        }
+
+        update_flags_add(vm, va, vb, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_xor_entangled)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t packed = fetch_byte(vm, bc, bc_size);
+        uint8_t vm_index = (packed >> 6) & 0x03;
+        uint8_t b_reg = packed & 0x0F;
+
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb;
+
+        if (vm.entangled && vm.entangled_active && vm_index <= 2)
+        {
+            AcquireSRWLockShared(&vm.entangled->lock);
+            if (!verify_entangled_state(vm.entangled))
+            {
+                ReleaseSRWLockShared(&vm.entangled->lock);
+                entangled_state_fallback(vm);
+                vb = read_vreg(vm, b_reg);
+            }
+            else
+            {
+                vb = vm.entangled->shared_regs[vm_index * 16 + b_reg];
+                ReleaseSRWLockShared(&vm.entangled->lock);
+            }
+        }
+        else
+        {
+            vb = read_vreg(vm, b_reg);
+        }
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x43);
+        uint64_t result = mba_xor(va, vb, entropy);
+        result = triton_break_inject(vm, result, 0x43);
+        write_vreg(vm, dst, result);
+
+        if (vm.entangled && vm.entangled_active && vm_index <= 2)
+        {
+            AcquireSRWLockExclusive(&vm.entangled->lock);
+            vm.entangled->shared_regs[vm.active_vm_index * 16 + dst] = result;
+            vm.entangled->sync_counter++;
+            ReleaseSRWLockExclusive(&vm.entangled->lock);
+        }
+
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_sync_barrier)
+    {
+        if (vm.entangled && vm.entangled_active)
+        {
+            AcquireSRWLockExclusive(&vm.entangled->lock);
+            uint8_t cur_vm = vm.active_vm_index;
+            for (int i = 0; i < 16; ++i)
+                vm.entangled->shared_regs[cur_vm * 16 + i] = read_vreg(vm, static_cast<uint8_t>(i));
+            vm.entangled->shared_rolling_key = vm.rolling_key;
+            vm.entangled->shared_handler_chain = vm.handler_chain_key;
+            vm.entangled->sync_counter++;
+
+            uint32_t computed_crc = _mm_crc32_u32(0, static_cast<uint32_t>(vm.entangled->shared_rolling_key));
+            for (int i = 0; i < 48; ++i)
+            {
+                uint32_t lo = static_cast<uint32_t>(vm.entangled->shared_regs[i]);
+                uint32_t hi = static_cast<uint32_t>(vm.entangled->shared_regs[i] >> 32);
+                computed_crc = _mm_crc32_u32(computed_crc, lo);
+                computed_crc = _mm_crc32_u32(computed_crc, hi);
+            }
+            vm.entangled->stored_crc32 = computed_crc;
+            ReleaseSRWLockExclusive(&vm.entangled->lock);
+        }
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_xor_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_xor_smc);
+        uint8_t new_form = smc_modify_form(0, handler_code, 0);
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x50);
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = mba_xor(va, vb, entropy); break;
+        case 1: result = (va | vb) - (va & vb); break;
+        case 2: result = (va & ~vb) | (~va & vb); break;
+        default: result = va ^ vb; break;
+        }
+        result = triton_break_inject(vm, result, 0x50);
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_add_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_add_smc);
+        uint8_t new_form = smc_modify_form(1, handler_code, 0);
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x51);
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = mba_add(va, vb, entropy); break;
+        case 1: result = (va ^ vb) + ((va & vb) << 1); break;
+        case 2: result = (va | vb) + (va & vb); break;
+        default: result = va + vb; break;
+        }
+        result = triton_break_inject(vm, result, 0x51);
+        write_vreg(vm, dst, result);
+        update_flags_add(vm, va, vb, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_sub_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_sub_smc);
+        uint8_t new_form = smc_modify_form(2, handler_code, 0);
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x52);
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = mba_sub(va, vb, entropy); break;
+        case 1: result = va + ((~vb) + 1); break;
+        case 2: result = va + mba_add(~vb, 1, entropy); break;
+        default: result = va - vb; break;
+        }
+        result = triton_break_inject(vm, result, 0x52);
+        write_vreg(vm, dst, result);
+        update_flags_sub(vm, va, vb, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_nand_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_nand_smc);
+        uint8_t new_form = smc_modify_form(3, handler_code, 0);
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x53);
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = mba_nand(va, vb, entropy); break;
+        case 1: result = ~(va & vb); break;
+        case 2: result = mba_not(mba_and(va, vb, entropy), entropy ^ 0xA5); break;
+        default: result = ~(va & vb); break;
+        }
+        result = triton_break_inject(vm, result, 0x53);
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_nor_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_nor_smc);
+        uint8_t new_form = smc_modify_form(4, handler_code, 0);
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x54);
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = mba_nor(va, vb, entropy); break;
+        case 1: result = ~(va | vb); break;
+        case 2: result = mba_not(mba_or(va, vb, entropy), entropy ^ 0x5A); break;
+        default: result = ~(va | vb); break;
+        }
+        result = triton_break_inject(vm, result, 0x54);
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_not_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t va = read_vreg(vm, src);
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_not_smc);
+        uint8_t new_form = smc_modify_form(5, handler_code, 0);
+
+        uint64_t entropy = handler_entropy_bit(vm, 0x55);
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = mba_not(va, entropy); break;
+        case 1: result = va ^ 0xFFFFFFFFFFFFFFFFULL; break;
+        case 2: result = (0 - va) - 1; break;
+        default: result = ~va; break;
+        }
+        result = triton_break_inject(vm, result, 0x55);
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_shl_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t amt_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t val = read_vreg(vm, src);
+        uint8_t amt = static_cast<uint8_t>(read_vreg(vm, amt_reg)) & 0x3F;
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_shl_smc);
+        uint8_t new_form = smc_modify_form(6, handler_code, 0);
+
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = val << amt; break;
+        case 1: {
+            result = 0;
+            for (uint8_t i = 0; i < amt; ++i)
+                result = micro_add(result, val);
+            break;
+        }
+        case 2: result = _rotl64(val, 0) << amt; break;
+        default: result = val << amt; break;
+        }
+        write_vreg(vm, dst, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_shr_smc)
+    {
+        uint8_t dst = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t src = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t amt_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t val = read_vreg(vm, src);
+        uint8_t amt = static_cast<uint8_t>(read_vreg(vm, amt_reg)) & 0x3F;
+
+        uint8_t* handler_code = reinterpret_cast<uint8_t*>(&h_shr_smc);
+        uint8_t new_form = smc_modify_form(7, handler_code, 0);
+
+        uint64_t result;
+        switch (new_form) {
+        case 0: result = val >> amt; break;
+        case 1: {
+            uint64_t mask = (amt >= 64) ? 0 : (0xFFFFFFFFFFFFFFFFULL >> amt);
+            result = (val >> amt) & mask;
+            break;
+        }
+        case 2: {
+            result = 0;
+            for (int i = 63; i >= static_cast<int>(amt); --i)
+                result |= ((val >> i) & 1) << (i - amt);
+            break;
+        }
+        default: result = val >> amt; break;
+        }
+        write_vreg(vm, dst, result);
+        update_flags_logic(vm, result);
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_vm_entangle)
+    {
+        if (g_vm_depth >= MAX_VM_DEPTH) {
+            vm.halted = true;
+            write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+            return;
+        }
+
+        uint8_t  vm_index    = fetch_byte(vm, bc, bc_size) & 0x03;
+        uint32_t child_bc_offset = fetch_u32(vm, bc, bc_size);
+        uint32_t child_bc_len    = fetch_u32(vm, bc, bc_size);
+        uint8_t  result_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+
+        if (child_bc_offset + child_bc_len > bc_size) {
+            vm.halted = true;
+            return;
+        }
+
+        if (!vm.entangled) {
+            vm.entangled = static_cast<vm_entangled_state_t*>(
+                VirtualAlloc(nullptr, sizeof(vm_entangled_state_t),
+                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            if (!vm.entangled) {
+                write_vreg(vm, result_reg, 0);
+                dispatch_next(vm, bc, bc_size);
+                return;
+            }
+            uint64_t ent_seed = vm.rolling_key ^ vm.handler_chain_key ^ secure_seed();
+            init_entangled_state(vm.entangled, ent_seed);
+            vm.entangled_active = true;
+            vm.active_vm_index = 0;
+        }
+
+        uint64_t child_seed = vm.rolling_key ^ vm.handler_chain_key
+            ^ secure_seed()
+            ^ (static_cast<uint64_t>(vm_index) * 0x9E3779B97F4A7C15ULL);
+
+        vm_state_t child;
+        init_vm(child, child_seed);
+        child.entangled = vm.entangled;
+        child.entangled_active = true;
+        child.active_vm_index = vm_index;
+
+        AcquireSRWLockExclusive(&vm.entangled->lock);
+        for (int i = 0; i < 8; ++i)
+            write_vreg(child, static_cast<uint8_t>(i), read_vreg(vm, static_cast<uint8_t>(i)));
+        for (int i = 0; i < 16; ++i)
+            vm.entangled->shared_regs[vm_index * 16 + i] = read_vreg(child, static_cast<uint8_t>(i));
+        ReleaseSRWLockExclusive(&vm.entangled->lock);
+
+        g_vm_depth++;
+        uint64_t result = vm_execute(child, bc + child_bc_offset, child_bc_len);
+        g_vm_depth--;
+
+        write_vreg(vm, result_reg, result);
+
+        AcquireSRWLockExclusive(&vm.entangled->lock);
+        for (int i = 0; i < 16; ++i)
+            vm.entangled->shared_regs[vm_index * 16 + i] = read_vreg(child, static_cast<uint8_t>(i));
+        vm.entangled->sync_counter++;
+        ReleaseSRWLockExclusive(&vm.entangled->lock);
+
+        if (child.stack)
+            RtlSecureZeroMemory(child.stack, child.stack_size);
+        destroy_vm(child);
+
+        dispatch_next(vm, bc, bc_size);
+    }
+
 
     __forceinline bool verify_environment(vm_state_t& vm)
     {
@@ -3068,6 +4258,18 @@ namespace detail
             { h_pop,       h_pop_v2  },
             { h_load_mem_v2,  h_load_mem_v2 },
             { h_store_mem_v2, h_store_mem_v2 },
+            { h_xor,       h_xor_smc  },
+            { h_add,       h_add_smc  },
+            { h_sub,       h_sub_smc  },
+            { h_nand,      h_nand_smc },
+            { h_nor,       h_nor_smc  },
+            { h_not,       h_not_smc  },
+            { h_shl,       h_shl_smc  },
+            { h_shr,       h_shr_smc  },
+            { h_load_reg,  h_load_reg_entangled },
+            { h_store_reg, h_store_reg_entangled },
+            { h_add,       h_add_entangled },
+            { h_xor,       h_xor_entangled },
         };
         constexpr int num_pairs = sizeof(pairs) / sizeof(pairs[0]);
 
@@ -3193,53 +4395,75 @@ namespace detail
         if (!pool.handler_set.initialized || pool.handler_set.set_generation != pool.generation)
             build_handler_set(pool);
 
-        uint64_t hkey = pool.handler_set.dispatch_hmac_key[0]
-                      ^ pool.handler_set.dispatch_hmac_key[1]
-                      ^ pool.handler_set.dispatch_hmac_key[2]
-                      ^ pool.handler_set.dispatch_hmac_key[3];
+        handler_fn candidate = nullptr;
 
-        uint64_t mac_in = static_cast<uint64_t>(opcode) * 0x9E3779B97F4A7C15ULL;
-        mac_in ^= vm.rolling_key * 0xBF58476D1CE4E5B9ULL;
-        mac_in ^= vm.context_entropy * 0x94D049BB133111EBULL;
-        mac_in ^= hkey;
-        mac_in ^= pool.handler_set.dispatch_xor_table[opcode];
+        if (vm.hash_table && vm.hash_table->generation == pool.generation)
+        {
+            candidate = resolve_dispatch_hash(vm, opcode);
+        }
 
-        mac_in ^= mac_in >> 33;
-        mac_in *= 0xFF51AFD7ED558CCDULL;
-        mac_in ^= mac_in >> 33;
-        mac_in *= 0xC4CEB9FE1A85EC53ULL;
-        mac_in ^= mac_in >> 33;
+        if (!candidate)
+        {
+            uint64_t hkey = pool.handler_set.dispatch_hmac_key[0]
+                          ^ pool.handler_set.dispatch_hmac_key[1]
+                          ^ pool.handler_set.dispatch_hmac_key[2]
+                          ^ pool.handler_set.dispatch_hmac_key[3];
 
-        if (!verify_environment(vm))
-            return pool.dispatch_table[opcode];
+            uint64_t mac_in = static_cast<uint64_t>(opcode) * 0x9E3779B97F4A7C15ULL;
+            mac_in ^= vm.rolling_key * 0xBF58476D1CE4E5B9ULL;
+            mac_in ^= vm.context_entropy * 0x94D049BB133111EBULL;
+            mac_in ^= hkey;
+            mac_in ^= pool.handler_set.dispatch_xor_table[opcode];
 
-        uint8_t variant_count = pool.handler_set.variant_count[opcode];
-        if (variant_count == 0 || !pool.poly_initialized)
-            return pool.dispatch_table[opcode];
+            mac_in ^= mac_in >> 33;
+            mac_in *= 0xFF51AFD7ED558CCDULL;
+            mac_in ^= mac_in >> 33;
+            mac_in *= 0xC4CEB9FE1A85EC53ULL;
+            mac_in ^= mac_in >> 33;
 
-        uint8_t safe_count = (variant_count > 4) ? 4 : variant_count;
-        uint8_t pick = static_cast<uint8_t>(mac_in % safe_count);
-        uint8_t order_idx = pool.handler_set.variant_order[opcode][pick];
+            if (!verify_environment(vm))
+                return pool.dispatch_table[opcode];
 
-        auto& entry = pool.poly_table[opcode];
-        if (order_idx >= entry.count) order_idx = 0;
+            uint8_t variant_count = pool.handler_set.variant_count[opcode];
+            if (variant_count == 0 || !pool.poly_initialized)
+                return pool.dispatch_table[opcode];
 
-        handler_fn target = entry.variants[order_idx];
+            uint8_t safe_count = (variant_count > 4) ? 4 : variant_count;
+            uint8_t pick = static_cast<uint8_t>(mac_in % safe_count);
+            uint8_t order_idx = pool.handler_set.variant_order[opcode][pick];
 
-        uint64_t z = internal_opaque_zero(mac_in ^ hkey);
-        uintptr_t obfuscated = reinterpret_cast<uintptr_t>(target);
-        obfuscated ^= static_cast<uintptr_t>(z);
+            auto& entry = pool.poly_table[opcode];
+            if (order_idx >= entry.count) order_idx = 0;
 
-        uint8_t lookup_key = static_cast<uint8_t>((mac_in >> 8) & 0x3F);
-        uint64_t uf_val = pool.handler_set.uf_table[lookup_key];
-        uint64_t uf_zero = uf_val ^ uf_val;
-        obfuscated ^= static_cast<uintptr_t>(uf_zero);
+            candidate = entry.variants[order_idx];
 
-        pool.handler_set.crc_accumulator =
-            _mm_crc32_u32(pool.handler_set.crc_accumulator, opcode) ^
-            (static_cast<uint32_t>(mac_in) & 0x00FFFFFFu);
+            uint64_t z = internal_opaque_zero(mac_in ^ hkey);
+            uintptr_t obfuscated = reinterpret_cast<uintptr_t>(candidate);
+            obfuscated ^= static_cast<uintptr_t>(z);
 
-        return reinterpret_cast<handler_fn>(obfuscated);
+            uint8_t lookup_key = static_cast<uint8_t>((mac_in >> 8) & 0x3F);
+            uint64_t uf_val = pool.handler_set.uf_table[lookup_key];
+            uint64_t uf_zero = uf_val ^ uf_val;
+            obfuscated ^= static_cast<uintptr_t>(uf_zero);
+
+            pool.handler_set.crc_accumulator =
+                _mm_crc32_u32(pool.handler_set.crc_accumulator, opcode) ^
+                (static_cast<uint32_t>(mac_in) & 0x00FFFFFFu);
+
+            return reinterpret_cast<handler_fn>(obfuscated);
+        }
+
+        uint64_t rax = reinterpret_cast<uint64_t>(candidate);
+        rax ^= vm.rolling_key * 0x9E3779B97F4A7C15ULL;
+        rax = _rotl64(rax, static_cast<int>((vm.context_entropy >> 8) & 0x3F));
+        rax ^= vm.handler_chain_key;
+        rax = _byteswap_uint64(rax);
+        rax ^= vm.handler_chain_key;
+        rax = _byteswap_uint64(rax);
+        rax = _rotr64(rax, static_cast<int>((vm.context_entropy >> 16) & 0x3F));
+        rax ^= vm.rolling_key * 0x9E3779B97F4A7C15ULL;
+
+        return reinterpret_cast<handler_fn>(rax);
     }
 
     __forceinline handler_fn select_handler(vm_state_t& vm, uint8_t opcode)
@@ -3307,6 +4531,11 @@ namespace detail
         base_handlers[OP_JNB]       = h_jnb;
         base_handlers[OP_JNBE]      = h_jnbe;
         base_handlers[OP_VM_SPAWN]  = h_vm_spawn;
+        base_handlers[OP_VM_ENTANGLE] = h_vm_entangle;
+        base_handlers[OP_JUNK_ADD]  = h_junk_add;
+        base_handlers[OP_JUNK_MUL]  = h_junk_mul;
+        base_handlers[OP_JUNK_MEM]  = h_junk_mem;
+        base_handlers[OP_JUNK_XOR]  = h_junk_xor;
 
         handler_fn variant_table[] = {
             h_nand_v2, h_xor_v2, h_hash_v2, h_cmp_v2,
@@ -3315,7 +4544,11 @@ namespace detail
             h_shr_v2,  h_shr_v3, h_rol_v2,  h_ror_v2,
             h_not_v2,  h_not_v3, h_mul_v2,  h_push_v2,
             h_pop_v2,  h_add_v2, h_sub_v2,  h_store_mem_v2,
-            h_nor_v2
+            h_nor_v2,
+            h_xor_smc, h_add_smc, h_sub_smc, h_nand_smc,
+            h_nor_smc, h_not_smc, h_shl_smc, h_shr_smc,
+            h_load_reg_entangled, h_store_reg_entangled,
+            h_add_entangled, h_xor_entangled
         };
         uint8_t variant_ops[] = {
             OP_NAND, OP_XOR, OP_HASH, OP_CMP,
@@ -3324,7 +4557,11 @@ namespace detail
             OP_SHR,  OP_SHR, OP_ROL,  OP_ROR,
             OP_NOT,  OP_NOT, OP_MUL,  OP_PUSH,
             OP_POP,  OP_ADD, OP_SUB,  OP_STORE_MEM,
-            OP_NOR
+            OP_NOR,
+            OP_XOR,  OP_ADD,  OP_SUB,  OP_NAND,
+            OP_NOR,  OP_NOT,  OP_SHL,  OP_SHR,
+            OP_LOAD_REG, OP_STORE_REG,
+            OP_ADD, OP_XOR
         };
         constexpr int num_variants = sizeof(variant_ops) / sizeof(variant_ops[0]);
 
@@ -3414,6 +4651,17 @@ namespace detail
         std::lock_guard<std::recursive_mutex> guard(vm_execution_mutex());
 
         memset(&vm, 0, sizeof(vm));
+        vm.entangled = nullptr;
+        vm.hash_table = nullptr;
+        vm.scratch_buffer = nullptr;
+        vm.discard_buffer = nullptr;
+        vm.invocation_key = 0;
+        vm.entangled_active = false;
+        vm.active_vm_index = 0;
+        vm.entangled_switch_counter = 0;
+        vm.cached_nonce = 0;
+        vm.nonce_timestamp = 0;
+        vm.opcode_table_encrypted = false;
         vm.stack_size = 4096;
         vm.stack = new uint8_t[vm.stack_size];
         memset(vm.stack, 0, vm.stack_size);
@@ -3427,7 +4675,6 @@ namespace detail
         vm.context_entropy = secure_seed() ^ seed;
         vm.shuffle_counter = 0;
         cipher_stream_init(vm.stream, vm.rolling_key);
-
 
         vm.continuation.next_handler = 0;
         vm.continuation.chain_nonce  = seed ^ 0x3C6EF372FE94F82BULL;
@@ -3473,8 +4720,24 @@ namespace detail
         vm.pool->handler_set.initialized = false;
         build_handler_set(*vm.pool);
 
+        init_scratch_buffers(vm);
+
+        vm.invocation_key = derive_invocation_key();
+        memcpy(vm.saved_opcode_map, vm.opcode_map, 256);
+
+        if (g_server_poly_seed != 0)
+        {
+            vm.cached_nonce = g_server_poly_seed;
+            vm.nonce_timestamp = static_cast<uint64_t>(time(nullptr));
+        }
+
+        vm.hash_table = build_hash_table(*vm.pool, vm.invocation_key);
+
         bind_to_environment(vm);
         shuffle_registers(vm);
+
+        encrypt_opcode_table_aes(vm.opcode_map, vm.invocation_key, true);
+        vm.opcode_table_encrypted = true;
     }
 
     inline void init_vm(vm_state_t& vm, uint64_t seed)
@@ -3519,11 +4782,49 @@ namespace detail
         vm.taint_ring = nullptr;
         vm.taint_ring_size = 0;
         vm.taint_seq = 0;
+
+        if (vm.scratch_buffer)
+        {
+            volatile uint8_t* p = vm.scratch_buffer;
+            for (int i = 0; i < 4096; ++i) p[i] = 0;
+            VirtualFree(vm.scratch_buffer, 0, MEM_RELEASE);
+            vm.scratch_buffer = nullptr;
+        }
+        if (vm.discard_buffer)
+        {
+            volatile uint8_t* p = vm.discard_buffer;
+            for (int i = 0; i < 4096; ++i) p[i] = 0;
+            VirtualFree(vm.discard_buffer, 0, MEM_RELEASE);
+            vm.discard_buffer = nullptr;
+        }
+        if (vm.hash_table)
+        {
+            destroy_hash_table(vm.hash_table);
+            vm.hash_table = nullptr;
+        }
+        if (vm.entangled)
+        {
+            volatile uint8_t* p = reinterpret_cast<volatile uint8_t*>(vm.entangled);
+            for (size_t i = 0; i < sizeof(vm_entangled_state_t); ++i) p[i] = 0;
+            VirtualFree(vm.entangled, 0, MEM_RELEASE);
+            vm.entangled = nullptr;
+        }
+        vm.entangled_active = false;
+        vm.active_vm_index = 0;
+        vm.entangled_switch_counter = 0;
+        vm.invocation_key = 0;
+        vm.opcode_table_encrypted = false;
     }
 
     inline uint64_t vm_execute(vm_state_t& vm, const uint8_t* bytecode, uint32_t bc_size)
     {
         std::lock_guard<std::recursive_mutex> guard(vm_execution_mutex());
+
+        if (vm.opcode_table_encrypted)
+        {
+            encrypt_opcode_table_aes(vm.opcode_map, vm.invocation_key, false);
+            vm.opcode_table_encrypted = false;
+        }
 
         if (dag_active(vm))
         {
@@ -3549,6 +4850,7 @@ namespace detail
         vm.anti_emu_handler_t0 = 0;
         vm.anti_emu_window_count = 0;
         vm.last_op_result = 0;
+        vm.entangled_switch_counter = 0;
 
 
         dispatch_next(vm, bytecode, bc_size);
@@ -3556,7 +4858,14 @@ namespace detail
 
         decrypt_context(vm);
 
-        return read_vreg(vm, 0);
+        uint64_t result = read_vreg(vm, 0);
+
+        uint64_t new_key = derive_invocation_key() ^ __rdtsc();
+        encrypt_opcode_table_aes(vm.opcode_map, new_key, true);
+        vm.invocation_key = new_key;
+        vm.opcode_table_encrypted = true;
+
+        return result;
     }
 
     inline uint64_t vm_execute_program(vm_state_t& vm, const vm_program_t& program)
@@ -3686,6 +4995,11 @@ namespace detail
         case OP_JNB:        return 4;
         case OP_JNBE:       return 4;
         case OP_VM_SPAWN:   return 1 + 4 + 4 + 1;
+        case OP_VM_ENTANGLE: return 1 + 4 + 4 + 1;
+        case OP_JUNK_ADD:   return 2;
+        case OP_JUNK_MUL:   return 2;
+        case OP_JUNK_MEM:   return 2;
+        case OP_JUNK_XOR:   return 2;
         default:            return 0;
         }
     }
@@ -3878,6 +5192,130 @@ namespace detail
         SecureZeroMemory(&stream, sizeof(stream));
         return nodes;
     }
+
+    inline void emit_overlap_preamble(std::vector<uint8_t>& code, uint64_t& rng_state)
+    {
+        xorshift_advance(rng_state);
+        uint8_t pattern = static_cast<uint8_t>(rng_state & 0x03);
+
+        switch (pattern)
+        {
+        case 0:
+            code.push_back(0xEB);
+            code.push_back(0x05);
+            code.push_back(0x48);
+            code.push_back(0x89);
+            code.push_back(0x5C);
+            code.push_back(0x24);
+            code.push_back(0x08);
+            break;
+        case 1:
+            code.push_back(0xEB);
+            code.push_back(0x03);
+            code.push_back(0x48);
+            code.push_back(0x89);
+            code.push_back(0xC3);
+            break;
+        case 2:
+            code.push_back(0xEB);
+            code.push_back(0x06);
+            code.push_back(0x48);
+            code.push_back(0x83);
+            code.push_back(0xEC);
+            code.push_back(0x28);
+            code.push_back(0x48);
+            code.push_back(0x89);
+            break;
+        case 3:
+        default:
+            code.push_back(0xEB);
+            code.push_back(0x04);
+            code.push_back(0x48);
+            code.push_back(0x89);
+            code.push_back(0x6C);
+            code.push_back(0x24);
+            break;
+        }
+    }
+
+    struct handler_poly_descriptor_t
+    {
+        uint32_t opcode;
+        uint32_t variant_index;
+        uint32_t instruction_substitution_id;
+        uint32_t register_allocation_id;
+        uint32_t block_ordering_id;
+        uint32_t nop_sled_id;
+        uint32_t mba_form_id;
+        uint64_t build_seed_fragment;
+    };
+
+    inline bool load_polymorphic_handler_table(
+        handler_pool_t& pool,
+        const uint8_t* encrypted_blob, uint32_t blob_size,
+        uint64_t build_seed)
+    {
+        if (!encrypted_blob || blob_size < sizeof(handler_poly_descriptor_t))
+            return false;
+
+        uint8_t decrypt_key[32];
+        memcpy(decrypt_key, &build_seed, 8);
+        static const uint8_t info[12] = {
+            'a','i','d','a','_','p','o','l','y','_','v','1'
+        };
+        uint8_t prk[32];
+        hmac_sha256(decrypt_key, 32, decrypt_key, 8, prk);
+        hkdf_expand_sha256(prk, info, 12, decrypt_key, 32);
+
+        uint32_t desc_count = blob_size / static_cast<uint32_t>(sizeof(handler_poly_descriptor_t));
+        if (desc_count == 0 || desc_count > 256)
+        {
+            SecureZeroMemory(prk, 32);
+            SecureZeroMemory(decrypt_key, 32);
+            return false;
+        }
+
+        for (uint32_t i = 0; i < desc_count; ++i)
+        {
+            handler_poly_descriptor_t desc;
+            memcpy(&desc, encrypted_blob + i * sizeof(desc), sizeof(desc));
+
+            for (size_t j = 0; j < sizeof(desc); ++j)
+                reinterpret_cast<uint8_t*>(&desc)[j] ^=
+                    decrypt_key[j % 32];
+
+            if (desc.opcode < 256 && desc.variant_index < 4)
+            {
+                auto& entry = pool.poly_table[desc.opcode];
+                if (entry.count < 4 && entry.variants[0])
+                {
+                    pool.handler_set.variant_order[desc.opcode][entry.count] =
+                        static_cast<uint8_t>(desc.variant_index);
+                    pool.handler_set.variant_count[desc.opcode] =
+                        static_cast<uint8_t>(entry.count + 1);
+                }
+            }
+        }
+
+        SecureZeroMemory(prk, 32);
+        SecureZeroMemory(decrypt_key, 32);
+        return true;
+    }
+
+    inline uint32_t compute_poly_variant_count(uint64_t build_seed, uint8_t opcode)
+    {
+        uint64_t state = build_seed ^ (static_cast<uint64_t>(opcode) * 0x9E3779B97F4A7C15ULL);
+        xorshift_advance(state);
+        uint32_t instr_sub = static_cast<uint32_t>(state % 5);
+        xorshift_advance(state);
+        uint32_t reg_alloc = static_cast<uint32_t>(state % 6);
+        xorshift_advance(state);
+        uint32_t nop_sled = static_cast<uint32_t>(state % 4);
+        xorshift_advance(state);
+        uint32_t block_order = static_cast<uint32_t>(state % 24);
+        return instr_sub * reg_alloc * nop_sled * block_order;
+    }
+
 
 }
 

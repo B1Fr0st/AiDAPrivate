@@ -11,8 +11,6 @@
 #include "../editor/hex_view.hpp"
 #include "disasm_view.hpp"
 #include "standalone_driver.hpp"
-#include "zydis_disasm.hpp"
-#include "function_index.hpp"
 #include "event_bus.hpp"
 #include "toast_notification.hpp"
 #include "ui/theme.hpp"
@@ -40,14 +38,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-extern DisasmState g_disasm;
 
 namespace aida {
 namespace binary_map_view {
@@ -161,12 +159,37 @@ namespace binary_map_view {
 		uint64_t                                change_protect_size = 0;
 		int                                     change_protect_choice = 0;
 		uint32_t                                change_protect_old = 0;
+		std::weak_ptr<aida::analysis::analysis_workspace_t> workspace;
+		std::string                             binary_id;
+		std::uint64_t                           workspace_generation = 0;
 	};
 
-	inline view_state_t& state()
+	inline std::mutex& workspace_states_mutex()
 	{
-		static view_state_t s;
-		return s;
+		static std::mutex mutex;
+		return mutex;
+	}
+
+	inline std::unordered_map<std::string, std::shared_ptr<view_state_t>>& workspace_states()
+	{
+		static std::unordered_map<std::string, std::shared_ptr<view_state_t>> states;
+		return states;
+	}
+
+	inline std::shared_ptr<view_state_t> state_for(
+		const disasm_view::workspace_context_t& context)
+	{
+		if (!context.workspace) return {};
+		const std::string key = context.workspace->identity().binary_id().to_hex();
+		std::lock_guard<std::mutex> lock(workspace_states_mutex());
+		auto& state = workspace_states()[key];
+		if (!state || state->workspace.lock() != context.workspace) {
+			state = std::make_shared<view_state_t>();
+			state->workspace = context.workspace;
+			state->binary_id = key;
+			state->workspace_generation = context.workspace->generation();
+		}
+		return state;
 	}
 
 	namespace detail {
@@ -362,22 +385,30 @@ namespace binary_map_view {
 			}
 		}
 
-		inline bool live_available()
+		inline bool live_available(const view_state_t& state)
 		{
+			const auto workspace = state.workspace.lock();
+			const auto process = workspace ? workspace->identity().process() :
+				std::optional<aida::analysis::process_identity_t>{};
 			return driver_bridge::is_loaded()
-				&& driver_bridge::attached_pid() != 0
+				&& workspace
+				&& workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
+				&& process && process->pid != 0
 				&& driver_bridge::can_read_memory();
 		}
 
-		inline bool static_available()
+		inline bool static_available(const view_state_t& state)
 		{
-			return function_index::detail::static_pe_active();
+			const auto workspace = state.workspace.lock();
+			return workspace &&
+				workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
+				workspace->image() && !workspace->closing() && !workspace->closed();
 		}
 
-		inline active_mode_t resolve_active_mode(display_mode_t pref)
+		inline active_mode_t resolve_active_mode(const view_state_t& state, display_mode_t pref)
 		{
-			const bool live = live_available();
-			const bool stat = static_available();
+			const bool live = live_available(state);
+			const bool stat = static_available(state);
 			if (pref == display_mode_t::live_only)   return live ? active_mode_t::live_process : active_mode_t::none;
 			if (pref == display_mode_t::static_only) return stat ? active_mode_t::pe_static : active_mode_t::none;
 			if (live && stat) return active_mode_t::merged;
@@ -423,6 +454,12 @@ namespace binary_map_view {
 
 		inline void perform_refresh(view_state_t& s)
 		{
+			const auto workspace = s.workspace.lock();
+			if (!workspace || workspace->target_kind() != aida::analysis::target_kind_t::static_file) {
+				std::lock_guard<std::mutex> lock(s.mutex);
+				s.last_error = "Static binary map requires an explicit static workspace.";
+				return;
+			}
 			if (s.refreshing.exchange(true)) {
 				diag::log_tagged_fmt("binary_map",
 					"refresh SKIPPED already_in_flight");
@@ -448,14 +485,14 @@ namespace binary_map_view {
 			sub.thread_class = "bounded_task";
 			sub.domain = aida::infra::executor::domain_t::diagnostics;
 			sub.priority = 3;
-			sub.body = [&s, opts_copy]() {
+			sub.body = [&s, workspace, opts_copy]() {
 				const auto start_clock = std::chrono::steady_clock::now();
-				binary_map::clear_cache();
+				binary_map::clear_cache(workspace);
 
 				binary_map::map_t fresh;
-				const bool ok = binary_map::generate(opts_copy, fresh);
+				const bool ok = binary_map::generate(workspace, opts_copy, fresh);
 				std::string err_copy;
-				if (!ok) err_copy = binary_map::last_error();
+				if (!ok) err_copy = "Workspace binary-map generation failed.";
 
 				size_t f = 0, g_count = 0, i = 0, e = 0, sec = 0;
 				std::string mod;
@@ -506,11 +543,14 @@ namespace binary_map_view {
 
 		inline void perform_live_refresh(view_state_t& s)
 		{
-			if (!live_available()) {
+			const auto workspace = s.workspace.lock();
+			const auto process = workspace ? workspace->identity().process() :
+				std::optional<aida::analysis::process_identity_t>{};
+			if (!live_available(s) || !process) {
 				diag::log_tagged_fmt("binary_map",
 					"live_refresh SKIPPED driver_loaded=%d attached_pid=%u",
 					driver_bridge::is_loaded() ? 1 : 0,
-					static_cast<unsigned>(driver_bridge::attached_pid()));
+					process ? static_cast<unsigned>(process->pid) : 0u);
 				return;
 			}
 			if (s.live_refreshing.exchange(true)) {
@@ -521,7 +561,7 @@ namespace binary_map_view {
 
 			diag::log_tagged_fmt("binary_map",
 				"live_refresh START pid=%u",
-				static_cast<unsigned>(driver_bridge::attached_pid()));
+				static_cast<unsigned>(process->pid));
 
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "analysis";
@@ -529,18 +569,18 @@ namespace binary_map_view {
 			sub.thread_class = "bounded_task";
 			sub.domain = aida::infra::executor::domain_t::diagnostics;
 			sub.priority = 3;
-			sub.body = [&s]() {
+			sub.target_pid = process->pid;
+			sub.body = [&s, workspace, pid = process->pid]() {
 				const auto start_clock = std::chrono::steady_clock::now();
 
-				const uint32_t pid = driver_bridge::attached_pid();
-				auto regions_raw = driver_bridge::enumerate_memory_regions(8192);
-				auto modules     = driver_bridge::enumerate_modules();
-				auto threads     = driver_bridge::enumerate_threads();
-				const std::string proc_name = driver_bridge::attached_process_name();
+				auto regions_raw = driver_bridge::enumerate_memory_regions_for(pid, 8192);
+				auto modules     = driver_bridge::enumerate_modules_for(pid);
+				auto threads     = driver_bridge::enumerate_threads_for(pid);
+				const std::string proc_name = workspace->identity().bin_name();
 
 				driver_bridge::peb_info_t peb{};
 				uint64_t process_heap = 0;
-				if (driver_bridge::read_peb(peb)) {
+				if (driver_bridge::read_peb_for(pid, peb)) {
 					process_heap = peb.process_heap;
 				}
 
@@ -575,14 +615,15 @@ namespace binary_map_view {
 
 					if (r.is_image && !r.module_name.empty()) {
 						r.section_name.clear();
-						if (function_index::detail::static_pe_active()
-							&& g_disasm.file.image_base != 0
-							&& r.base >= g_disasm.file.image_base
-							&& r.base < g_disasm.file.image_base + 0x10000000ull)
-						{
-							for (const auto& sec : g_disasm.file.sections) {
-								if (r.base >= sec.va && r.base < sec.va + sec.bytes.size()) {
-									r.section_name = "static_section";
+						if (const auto image = workspace->image()) {
+							for (const auto& section : image->sections()) {
+								const std::uint64_t section_start = image->image_base() +
+									section.virtual_address;
+								const std::uint64_t section_size = (std::max)(
+									static_cast<std::uint64_t>(section.virtual_size),
+									static_cast<std::uint64_t>(section.raw_size));
+								if (r.base >= section_start && r.base - section_start < section_size) {
+									r.section_name = section.name;
 									break;
 								}
 							}
@@ -645,14 +686,22 @@ namespace binary_map_view {
 			}
 		}
 
-		inline void ensure_subscriptions(view_state_t& s)
+		inline void ensure_subscriptions(const std::shared_ptr<view_state_t>& state_handle)
 		{
+			if (!state_handle) return;
+			auto& s = *state_handle;
+			const std::weak_ptr<view_state_t> weak_state = state_handle;
+			const std::weak_ptr<aida::analysis::analysis_workspace_t> weak_workspace = s.workspace;
 			if (!s.subscription_binary.valid()) {
 				s.subscription_binary = aida::events::subscribe(
 					aida::events::event_binary_loaded,
-					[](const aida::events::binary_loaded_t& payload)
+					[weak_state, weak_workspace](const aida::events::binary_loaded_t& payload)
 					{
-						view_state_t& vs = state();
+						auto state = weak_state.lock();
+						auto workspace = weak_workspace.lock();
+						if (!state || !workspace || workspace->identity().normalized_source_path() !=
+							payload.binary_path) return;
+						auto& vs = *state;
 						vs.refresh_requested.store(true);
 						vs.live_refresh_requested.store(true);
 						bool identity_changed = false;
@@ -688,9 +737,13 @@ namespace binary_map_view {
 			if (!s.subscription_proc_created.valid()) {
 				s.subscription_proc_created = aida::events::subscribe(
 					aida::events::event_process_created,
-					[](const aida::events::process_created_t& payload)
+					[weak_state, weak_workspace](const aida::events::process_created_t& payload)
 					{
-						view_state_t& vs = state();
+						auto state = weak_state.lock();
+						auto workspace = weak_workspace.lock();
+						if (!state || !workspace || !workspace->identity().process() ||
+							workspace->identity().process()->pid != payload.process_id) return;
+						auto& vs = *state;
 						vs.live_refresh_requested.store(true);
 						diag::log_tagged_fmt("binary_map",
 							"event_process_created pid=%u image='%s' -> live_refresh_requested",
@@ -701,9 +754,13 @@ namespace binary_map_view {
 			if (!s.subscription_proc_exited.valid()) {
 				s.subscription_proc_exited = aida::events::subscribe(
 					aida::events::event_process_exited,
-					[](const aida::events::process_exited_t& payload)
+					[weak_state, weak_workspace](const aida::events::process_exited_t& payload)
 					{
-						view_state_t& vs = state();
+						auto state = weak_state.lock();
+						auto workspace = weak_workspace.lock();
+						if (!state || !workspace || !workspace->identity().process() ||
+							workspace->identity().process()->pid != payload.process_id) return;
+						auto& vs = *state;
 						{
 							std::lock_guard<std::mutex> g(vs.mutex);
 							vs.live = live_snapshot_t{};
@@ -717,21 +774,31 @@ namespace binary_map_view {
 			}
 		}
 
-		inline void jump_to_address(uint64_t va)
+		inline void jump_to_address(view_state_t& state, uint64_t va)
 		{
 			if (va == 0) {
 				diag::log_tagged_fmt("binary_map",
 					"jump_to_address SKIPPED va=0x0");
 				return;
 			}
+			const auto context = disasm_view::capture_workspace(state.workspace.lock());
+			if (!context) return;
 			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(va, g_disasm);
+			disasm_view::goto_address(va, context);
 			diag::log_tagged_fmt("binary_map",
 				"jump_to_disasm va=0x%llX",
 				static_cast<unsigned long long>(va));
 		}
 
-		inline void jump_to_hex(uint64_t va, size_t size)
+		inline void set_function_pinned(view_state_t& state, uint64_t va, bool pinned)
+		{
+			const auto workspace = state.workspace.lock();
+			if (!workspace) return;
+			if (pinned) binary_map::pin_function(workspace, va);
+			else binary_map::unpin_function(workspace, va);
+		}
+
+		inline void jump_to_hex(view_state_t& state, uint64_t va, size_t size)
 		{
 			if (va == 0) {
 				diag::log_tagged_fmt("binary_map",
@@ -742,22 +809,27 @@ namespace binary_map_view {
 			const size_t kMaxHex = 1u * 1024u * 1024u;
 			if (size > kMaxHex) size = kMaxHex;
 
-			const bool live_ok = driver_bridge::is_loaded()
-				&& driver_bridge::can_read_memory()
-				&& driver_bridge::attached_pid() != 0;
+			const auto context = disasm_view::capture_workspace(state.workspace.lock());
+			if (!context) return;
+			const bool live_ok = context.workspace->target_kind() ==
+				aida::analysis::target_kind_t::live_snapshot;
 			bool used_static = false;
 			bool ok = false;
 			if (live_ok) {
-				ok = hex_view::read_from_process(va, size);
+				ok = hex_view::read_from_process(context, va, size);
 			}
 			if (!ok) {
-				std::vector<uint8_t> blob;
-				if (static_analysis::read_bytes_from_pe(g_disasm.file, va, size, blob)
-					&& !blob.empty()) {
+				const auto address = disasm_view::typed_address(context, va);
+				auto blob = address ? disasm_view::read_bytes(context, *address, size) :
+					aida::analysis::workspace_result_t<std::vector<std::uint8_t>>::failure(
+						aida::analysis::make_workspace_error(
+							aida::analysis::workspace_error_code_t::out_of_range,
+							"Address is outside the selected workspace", "binary_map.hex"));
+				if (blob && !blob.value().empty()) {
 					char label[96];
 					std::snprintf(label, sizeof(label), "Static @ %016llX",
 						static_cast<unsigned long long>(va));
-					hex_view::set_data(blob, va, label);
+					hex_view::set_data(context, blob.value(), va, label);
 					ok = true;
 					used_static = true;
 				}
@@ -778,7 +850,8 @@ namespace binary_map_view {
 			}
 		}
 
-		inline bool dump_region_to_disk(uint64_t base, uint64_t size, const std::string& kind_label)
+		inline bool dump_region_to_disk(view_state_t& state, uint64_t base, uint64_t size,
+			const std::string& kind_label)
 		{
 			if (size == 0) {
 				toast_notification::push("Region has zero size",
@@ -819,6 +892,9 @@ namespace binary_map_view {
 					static_cast<unsigned long long>(size));
 				return false;
 			}
+			const auto context = disasm_view::capture_workspace(state.workspace.lock());
+			if (!context) return false;
+			const std::string output_path = path_buf;
 
 			diag::log_tagged_critical_fmt("binary_map",
 				"dump_region START base=0x%llX size=%llu path='%s'",
@@ -826,51 +902,46 @@ namespace binary_map_view {
 				static_cast<unsigned long long>(size),
 				path_buf);
 
-			std::vector<uint8_t> buf;
-			const bool ok_read = driver_bridge::read_memory(base, static_cast<size_t>(size), buf);
-
-			if (!ok_read || buf.empty()) {
-				if (g_disasm.file.loaded && !g_disasm.file.sections.empty()) {
-					std::vector<uint8_t> static_buf;
-					if (static_analysis::read_bytes_from_pe(g_disasm.file, base,
-							static_cast<size_t>(size), static_buf) && !static_buf.empty())
-					{
-						buf = std::move(static_buf);
-					}
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "analysis";
+			submission.label = "analysis.binary_map.dump_region";
+			submission.thread_class = "bounded_task";
+			submission.domain = aida::infra::executor::domain_t::feature_worker;
+			submission.priority = 2;
+			submission.target_pid = context.workspace->identity().process()
+				? context.workspace->identity().process()->pid : 0;
+			submission.body = [context, base, size, output_path]() {
+				std::vector<uint8_t> buffer;
+				if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot &&
+					context.workspace->identity().process()) {
+					driver_bridge::read_memory_for(context.workspace->identity().process()->pid,
+						base, static_cast<size_t>(size), buffer);
+				} else if (const auto address = disasm_view::typed_address(context, base)) {
+					auto bytes = disasm_view::read_bytes(context, *address, static_cast<size_t>(size));
+					if (bytes) buffer = std::move(bytes.value());
 				}
-			}
-
-			if (buf.empty()) {
-				diag::log_tagged_fmt("binary_map",
-					"dump_region FAILED_read base=0x%llX size=%llu",
-					static_cast<unsigned long long>(base),
-					static_cast<unsigned long long>(size));
-				toast_notification::push("Failed to read region for dump",
-					toast_notification::toast_type_t::error, 3.0f);
-				return false;
-			}
-
-			std::ofstream ofs(path_buf, std::ios::binary | std::ios::trunc);
-			if (!ofs.is_open()) {
-				diag::log_tagged_fmt("binary_map",
-					"dump_region FAILED_open path='%s'", path_buf);
-				toast_notification::push("Failed to open dump file for writing",
-					toast_notification::toast_type_t::error, 3.0f);
-				return false;
-			}
-			ofs.write(reinterpret_cast<const char*>(buf.data()),
-				static_cast<std::streamsize>(buf.size()));
-			ofs.close();
-
-			diag::log_tagged_critical_fmt("binary_map",
-				"dump_region DONE bytes=%zu path='%s'",
-				buf.size(), path_buf);
-
-			char msg[MAX_PATH + 64];
-			std::snprintf(msg, sizeof(msg), "Dumped %llu bytes to %s",
-				static_cast<unsigned long long>(buf.size()), path_buf);
-			toast_notification::push(msg, toast_notification::toast_type_t::info, 3.5f);
-			return true;
+				if (buffer.empty()) {
+					toast_notification::push("Failed to read region for dump",
+						toast_notification::toast_type_t::error, 3.0f);
+					return;
+				}
+				std::ofstream stream(output_path, std::ios::binary | std::ios::trunc);
+				if (!stream.is_open()) {
+					toast_notification::push("Failed to open dump file for writing",
+						toast_notification::toast_type_t::error, 3.0f);
+					return;
+				}
+				stream.write(reinterpret_cast<const char*>(buffer.data()),
+					static_cast<std::streamsize>(buffer.size()));
+				stream.close();
+				diag::log_tagged_critical_fmt("binary_map",
+					"dump_region DONE bytes=%zu path='%s'", buffer.size(), output_path.c_str());
+				char message[MAX_PATH + 64];
+				std::snprintf(message, sizeof(message), "Dumped %llu bytes to %s",
+					static_cast<unsigned long long>(buffer.size()), output_path.c_str());
+				toast_notification::push(message, toast_notification::toast_type_t::info, 3.5f);
+			};
+			return aida::infra::executor::submit(std::move(submission)).submitted;
 		}
 
 		inline std::string make_function_chat_payload(const binary_map::map_function_t& f)
@@ -989,7 +1060,7 @@ namespace binary_map_view {
 
 		inline void render_section_strip(ImDrawList* dl, ImVec2 origin, float width,
 			const std::vector<binary_map::map_section_t>& sections,
-			uint64_t image_size, float alpha, float anim_time)
+			uint64_t image_size, float alpha, float anim_time, view_state_t& state)
 		{
 			if (sections.empty()) {
 				const auto& t = aida::ui::resolved();
@@ -1112,7 +1183,7 @@ namespace binary_map_view {
 						static_cast<unsigned long long>(s.size),
 						section_perm_string(s).c_str(),
 						static_cast<double>(section_entropy_normalized(s)));
-					detail::jump_to_address(s.va);
+					detail::jump_to_address(state, s.va);
 				}
 				if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
 					diag::log_tagged_fmt("binary_map",
@@ -1120,7 +1191,7 @@ namespace binary_map_view {
 						s.name.c_str(),
 						static_cast<unsigned long long>(s.va),
 						static_cast<unsigned long long>(s.size));
-					detail::jump_to_hex(s.va, static_cast<size_t>(s.size));
+					detail::jump_to_hex(state, s.va, static_cast<size_t>(s.size));
 				}
 				ImGui::PopID();
 
@@ -1314,7 +1385,7 @@ namespace binary_map_view {
 						"heatmap_double_click name='%s' va=0x%llX",
 						fn.name.c_str(),
 						static_cast<unsigned long long>(fn.va));
-					jump_to_address(fn.va);
+					jump_to_address(vs, fn.va);
 				}
 				if (right_clicked) {
 					diag::log_tagged_fmt("binary_map",
@@ -1328,12 +1399,12 @@ namespace binary_map_view {
 					if (ImGui::MenuItem("Jump to disassembly")) {
 						const uint64_t va_local = fn.va;
 						ImGui::CloseCurrentPopup();
-						jump_to_address(va_local);
+						jump_to_address(vs, va_local);
 					}
 					if (ImGui::MenuItem("Open in hex view")) {
 						const uint64_t va_local = fn.va;
 						ImGui::CloseCurrentPopup();
-						jump_to_hex(va_local, 0x400);
+						jump_to_hex(vs, va_local, 0x400);
 					}
 					ImGui::EndPopup();
 				}
@@ -1549,7 +1620,7 @@ namespace binary_map_view {
 					diag::log_tagged_fmt("binary_map",
 						"canvas_double_click base=0x%llX -> jump_to_disasm",
 						static_cast<unsigned long long>(hr.base));
-					jump_to_address(hr.base);
+					jump_to_address(vs, hr.base);
 				}
 			}
 
@@ -1623,9 +1694,10 @@ namespace binary_map_view {
 
 	}
 
-	inline void initialize()
+	inline void initialize(const std::shared_ptr<view_state_t>& state_handle)
 	{
-		view_state_t& s = state();
+		if (!state_handle) return;
+		view_state_t& s = *state_handle;
 		std::lock_guard<std::mutex> g(s.mutex);
 		if (s.initialized) return;
 		s.opts.max_functions = 200;
@@ -1638,7 +1710,7 @@ namespace binary_map_view {
 		s.canvas_target_zoom = 1.f;
 		s.canvas_offset_norm = 0.0;
 		s.canvas_target_offset_norm = 0.0;
-		detail::ensure_subscriptions(s);
+		detail::ensure_subscriptions(state_handle);
 		s.initialized = true;
 		diag::log_tagged_fmt("binary_map",
 			"view_initialize max_functions=%d max_globals=%d max_chars=%zu include_imp=%d include_exp=%d",
@@ -1646,9 +1718,21 @@ namespace binary_map_view {
 			s.opts.include_imports ? 1 : 0, s.opts.include_exports ? 1 : 0);
 	}
 
+	inline void initialize()
+	{
+		initialize(state_for(disasm_view::capture_selected_workspace()));
+	}
+
 	inline void shutdown()
 	{
-		view_state_t& s = state();
+		std::vector<std::shared_ptr<view_state_t>> states;
+		{
+			std::lock_guard<std::mutex> lock(workspace_states_mutex());
+			for (const auto& entry : workspace_states()) states.push_back(entry.second);
+		}
+		for (const auto& handle : states) {
+			if (!handle) continue;
+			view_state_t& s = *handle;
 		std::lock_guard<std::mutex> g(s.mutex);
 		if (s.subscription_binary.valid()) {
 			aida::events::unsubscribe(s.subscription_binary);
@@ -1669,19 +1753,25 @@ namespace binary_map_view {
 		s.has_map.store(false);
 		s.live = live_snapshot_t{};
 		s.initialized = false;
+		}
+		std::lock_guard<std::mutex> lock(workspace_states_mutex());
+		workspace_states().clear();
 	}
 
-	inline const std::string& last_error()
+	inline std::string last_error()
 	{
-		view_state_t& s = state();
-		std::lock_guard<std::mutex> g(s.mutex);
-		return s.last_error;
+		auto selected = state_for(disasm_view::capture_selected_workspace());
+		if (!selected) return "No selected workspace";
+		std::lock_guard<std::mutex> g(selected->mutex);
+		return selected->last_error;
 	}
 
 	inline void refresh()
 	{
-		state().refresh_requested.store(true);
-		state().live_refresh_requested.store(true);
+		auto state = state_for(disasm_view::capture_selected_workspace());
+		if (!state) return;
+		state->refresh_requested.store(true);
+		state->live_refresh_requested.store(true);
 	}
 
 	namespace detail {
@@ -1701,7 +1791,7 @@ namespace binary_map_view {
 
 			float strip_top = panel_y + 24.f;
 			render_section_strip(dl, ImVec2(panel_x, strip_top), panel_w,
-				sections_copy, image_size, a, s.row_anim_time);
+				sections_copy, image_size, a, s.row_anim_time, s);
 
 			float heat_top = strip_top + 38.f + 44.f;
 			{
@@ -1830,12 +1920,26 @@ namespace binary_map_view {
 	}
 
 	inline void render(int x, int y, float w, float h,
-		float anim, float anim_x, float anim_y, float anim_z)
+		float anim, float anim_x, float anim_y, float anim_z,
+		const disasm_view::workspace_context_t& context)
 	{
-		view_state_t& s = state();
-		if (!s.initialized) initialize();
+		auto state_handle = state_for(context);
+		if (!state_handle) {
+			ImGui::BeginChild("##binary_map_view", ImVec2(w, h), false,
+				ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+				ImGuiWindowFlags_NoBackground);
+			ImVec2 position = ImGui::GetWindowPos();
+			aida::ui::no_target_overlay::render(position, ImVec2(w, h),
+				"No binary or process",
+				"Open a file or attach to a process to inspect its binary map.", anim,
+				aida::ui::empty_state::glyph_t::binary_file);
+			ImGui::EndChild();
+			return;
+		}
+		view_state_t& s = *state_handle;
+		if (!s.initialized) initialize(state_handle);
 
-		const active_mode_t resolved_mode = detail::resolve_active_mode(s.mode_pref);
+		const active_mode_t resolved_mode = detail::resolve_active_mode(s, s.mode_pref);
 		const int prev_mode = s.active_mode_atomic.exchange(static_cast<int>(resolved_mode));
 		if (prev_mode != static_cast<int>(resolved_mode)) {
 			diag::log_tagged_fmt("binary_map",
@@ -1843,8 +1947,8 @@ namespace binary_map_view {
 				prev_mode,
 				static_cast<int>(resolved_mode),
 				static_cast<int>(s.mode_pref),
-				detail::live_available() ? 1 : 0,
-				detail::static_available() ? 1 : 0);
+				detail::live_available(s) ? 1 : 0,
+				detail::static_available(s) ? 1 : 0);
 		}
 
 		const bool want_static = (resolved_mode == active_mode_t::pe_static)
@@ -1866,16 +1970,6 @@ namespace binary_map_view {
 
 		ImGui::BeginChild("##binary_map_view", ImVec2(w, h), false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
-
-		if (!analysis_session::has_active_target() && !detail::live_available()) {
-			ImVec2 wp = ImGui::GetWindowPos();
-			aida::ui::no_target_overlay::render(wp, ImVec2(w, h),
-				"No binary or process",
-				"The Binary Map shows PE sections, functions, imports/exports for a static binary, and every mapped region for a live process. Open a file, attach to a running process, or launch a binary to begin.",
-				a, aida::ui::empty_state::glyph_t::binary_file);
-			ImGui::EndChild();
-			return;
-		}
 
 		const float kBmMinPanelW = 720.f;
 		if (w < kBmMinPanelW) {
@@ -2546,7 +2640,7 @@ namespace binary_map_view {
 				diag::log_tagged_fmt("binary_map",
 					"region_row_double_click base=0x%llX",
 					static_cast<unsigned long long>(r.base));
-				detail::jump_to_address(r.base);
+				detail::jump_to_address(s, r.base);
 			}
 			if (right_clicked) {
 				s.live_selected_base.store(r.base);
@@ -2560,13 +2654,13 @@ namespace binary_map_view {
 				if (ImGui::MenuItem("Jump to disassembly")) {
 					const uint64_t va_local = r.base;
 					ImGui::CloseCurrentPopup();
-					detail::jump_to_address(va_local);
+					detail::jump_to_address(s, va_local);
 				}
 				if (ImGui::MenuItem("Open in hex view")) {
 					const uint64_t va_local = r.base;
 					const uint64_t sz_local = r.size;
 					ImGui::CloseCurrentPopup();
-					detail::jump_to_hex(va_local,
+					detail::jump_to_hex(s, va_local,
 						sz_local > 0x100000ULL ? 0x100000u : static_cast<size_t>(sz_local));
 				}
 				if (ImGui::MenuItem("Dump region")) {
@@ -2574,7 +2668,7 @@ namespace binary_map_view {
 					const uint64_t sz_local = r.size;
 					const std::string klabel = detail::region_kind_label(r);
 					ImGui::CloseCurrentPopup();
-					detail::dump_region_to_disk(va_local, sz_local, klabel);
+					detail::dump_region_to_disk(s, va_local, sz_local, klabel);
 				}
 				if (ImGui::MenuItem("Change protection")) {
 					s.change_protect_addr = r.base;
@@ -2681,7 +2775,7 @@ namespace binary_map_view {
 						s.live_selected_base.store(m.base);
 					}
 					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
-						detail::jump_to_address(m.base);
+						detail::jump_to_address(s, m.base);
 					}
 					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
 						ImGui::OpenPopup("##bm_mod_ctx");
@@ -2690,12 +2784,12 @@ namespace binary_map_view {
 						if (ImGui::MenuItem("Jump to disassembly")) {
 							const uint64_t v = m.base;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(v);
+							detail::jump_to_address(s, v);
 						}
 						if (ImGui::MenuItem("Open in hex view")) {
 							const uint64_t v = m.base;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(v, 0x400);
+							detail::jump_to_hex(s, v, 0x400);
 						}
 						if (ImGui::MenuItem("Copy module name")) {
 							ImGui::SetClipboardText(m.name.c_str());
@@ -2798,14 +2892,14 @@ namespace binary_map_view {
 							static_cast<unsigned long long>(sec.va),
 							static_cast<unsigned long long>(sec.size),
 							p.c_str());
-						detail::jump_to_address(sec.va);
+						detail::jump_to_address(s, sec.va);
 					}
 					if (double_clicked) {
 						diag::log_tagged_fmt("binary_map",
 							"section_row_double_click name='%s' va=0x%llX (jump_to_hex)",
 							sec.name.c_str(),
 							static_cast<unsigned long long>(sec.va));
-						detail::jump_to_hex(sec.va, static_cast<size_t>(sec.size));
+						detail::jump_to_hex(s, sec.va, static_cast<size_t>(sec.size));
 					}
 					if (right_clicked) {
 						ImGui::OpenPopup("##bm_sec_ctx");
@@ -2814,20 +2908,20 @@ namespace binary_map_view {
 						if (ImGui::MenuItem("Jump to disassembly")) {
 							const uint64_t va_local = sec.va;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(va_local);
+							detail::jump_to_address(s, va_local);
 						}
 						if (ImGui::MenuItem("Open in hex view")) {
 							const uint64_t va_local = sec.va;
 							const size_t sz_local = static_cast<size_t>(sec.size);
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(va_local, sz_local);
+							detail::jump_to_hex(s, va_local, sz_local);
 						}
 						if (ImGui::MenuItem("Dump section")) {
 							const uint64_t va_local = sec.va;
 							const uint64_t sz_local = sec.size;
 							const std::string klabel = sec.name.empty() ? std::string("section") : sec.name;
 							ImGui::CloseCurrentPopup();
-							detail::dump_region_to_disk(va_local, sz_local, klabel);
+							detail::dump_region_to_disk(s, va_local, sz_local, klabel);
 						}
 						if (ImGui::MenuItem("Copy section name")) {
 							ImGui::SetClipboardText(sec.name.c_str());
@@ -2891,8 +2985,7 @@ namespace binary_map_view {
 					ImGui::PushID(static_cast<int>(idx));
 					if (ImGui::InvisibleButton("##bm_pin_btn", ImVec2(24.f, row_h))) {
 						const bool was_pinned = fn.pinned;
-						if (was_pinned) binary_map::unpin_function(fn.va);
-						else            binary_map::pin_function(fn.va);
+						detail::set_function_pinned(s, fn.va, !was_pinned);
 						flash.trigger();
 						refresh_after_pin = true;
 						diag::log_tagged_fmt("binary_map",
@@ -2966,7 +3059,7 @@ namespace binary_map_view {
 							"function_row_double_click name='%s' va=0x%llX",
 							fn.name.c_str(),
 							static_cast<unsigned long long>(fn.va));
-						detail::jump_to_address(fn.va);
+						detail::jump_to_address(s, fn.va);
 					}
 					if (ImGui::BeginPopup("##bm_fn_ctx")) {
 						if (ImGui::MenuItem("Copy summary to chat")) {
@@ -2975,20 +3068,19 @@ namespace binary_map_view {
 						}
 						if (ImGui::MenuItem(fn.pinned ? "Unpin" : "Pin")) {
 							const bool was_pinned = fn.pinned;
-							if (was_pinned) binary_map::unpin_function(fn.va);
-							else            binary_map::pin_function(fn.va);
+							detail::set_function_pinned(s, fn.va, !was_pinned);
 							flash.trigger();
 							refresh_after_pin = true;
 						}
 						if (ImGui::MenuItem("Jump to disassembly")) {
 							const uint64_t va = fn.va;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(va);
+							detail::jump_to_address(s, va);
 						}
 						if (ImGui::MenuItem("Open in hex view")) {
 							const uint64_t va = fn.va;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(va, 0x400);
+							detail::jump_to_hex(s, va, 0x400);
 						}
 						if (ImGui::MenuItem("Copy VA")) {
 							char vbuf[32];
@@ -3070,10 +3162,10 @@ namespace binary_map_view {
 							static_cast<unsigned long long>(gl.va),
 							gl.xref_count,
 							gl.writable ? 1 : 0);
-						detail::jump_to_hex(gl.va, 0x200);
+						detail::jump_to_hex(s, gl.va, 0x200);
 					}
 					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
-						detail::jump_to_address(gl.va);
+						detail::jump_to_address(s, gl.va);
 					}
 					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
 						ImGui::OpenPopup("##bm_gl_ctx");
@@ -3086,12 +3178,12 @@ namespace binary_map_view {
 						if (ImGui::MenuItem("Open in hex view")) {
 							const uint64_t va = gl.va;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(va, 0x200);
+							detail::jump_to_hex(s, va, 0x200);
 						}
 						if (ImGui::MenuItem("Jump to disassembly")) {
 							const uint64_t va = gl.va;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(va);
+							detail::jump_to_address(s, va);
 						}
 						if (ImGui::MenuItem("Copy VA")) {
 							char vbuf[32];
@@ -3296,7 +3388,7 @@ namespace binary_map_view {
 					}
 					if (clicked) {
 						if (resolved_va != 0) {
-							detail::jump_to_address(resolved_va);
+							detail::jump_to_address(s, resolved_va);
 						} else {
 							ImGui::SetClipboardText(ex.c_str());
 							toast_notification::push("Export name copied (no VA resolved)",
@@ -3310,7 +3402,7 @@ namespace binary_map_view {
 						if (resolved_va != 0 && ImGui::MenuItem("Jump to disassembly")) {
 							const uint64_t va_local = resolved_va;
 							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(va_local);
+							detail::jump_to_address(s, va_local);
 						}
 						if (ImGui::MenuItem("Copy export name")) {
 							ImGui::SetClipboardText(ex.c_str());
@@ -3391,7 +3483,8 @@ namespace binary_map_view {
 					static_cast<unsigned long long>(s.change_protect_addr),
 					static_cast<unsigned long long>(s.change_protect_size),
 					static_cast<unsigned>(new_protect));
-				const bool ok = driver_bridge::protect_memory(
+				const auto process = context.workspace->identity().process();
+				const bool ok = process && driver_bridge::protect_memory_for(process->pid,
 					s.change_protect_addr, s.change_protect_size, new_protect, &old_protect);
 				diag::log_tagged_critical_fmt("binary_map",
 					"change_protect_done addr=0x%llx ok=%d old=0x%X new=0x%X",
@@ -3428,14 +3521,15 @@ namespace binary_map_view {
 			if (want_static && !s.refreshing.load()) {
 				s.refresh_requested.store(true);
 			}
-			if (want_live && !s.live_refreshing.load() && detail::live_available()) {
+			if (want_live && !s.live_refreshing.load() && detail::live_available(s)) {
 				s.live_refresh_requested.store(true);
 			}
 			s.auto_refreshed_once = true;
 		}
 
-		if (want_live && detail::live_available() && !s.live_refreshing.load()) {
-			const uint32_t live_pid_attached = driver_bridge::attached_pid();
+		if (want_live && detail::live_available(s) && !s.live_refreshing.load()) {
+			const auto process = context.workspace->identity().process();
+			const uint32_t live_pid_attached = process ? process->pid : 0;
 			uint32_t cached_pid = 0;
 			size_t cached_regions = 0;
 			{
@@ -3452,6 +3546,13 @@ namespace binary_map_view {
 				s.live_refresh_requested.store(true);
 			}
 		}
+	}
+
+	inline void render(int x, int y, float w, float h,
+		float anim, float anim_x, float anim_y, float anim_z)
+	{
+		render(x, y, w, h, anim, anim_x, anim_y, anim_z,
+			disasm_view::capture_selected_workspace());
 	}
 
 }

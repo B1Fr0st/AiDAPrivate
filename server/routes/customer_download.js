@@ -199,12 +199,12 @@ async function ensureSchema() {
     return s_schemaPromise;
 }
 
-async function storeBotNonce(body) {
+async function storeBotNonce(body, action) {
     const nonce = String(body && body.nonce || '').trim().toLowerCase();
     await pool.query(
         `INSERT INTO bot_command_log (nonce_hex, action, discord_id, received_at, payload)
          VALUES ($1, $2, $3, $4, $5::jsonb)`,
-        [nonce, ACTION, String(body.discord_id || ''), nowSec(), JSON.stringify(body || {})]
+        [nonce, action || ACTION, String(body.discord_id || ''), nowSec(), JSON.stringify(body || {})]
     );
 }
 
@@ -392,6 +392,13 @@ router._internal = {
     redeemRequest,
     bootstrapDeliveryDescriptor,
     isUsableLicense,
+    parseDiscordId,
+    isHexNonce,
+    lookupSingleLicense,
+    storeBotNonce,
+    nowSec,
+    noStore,
+    EAUTH_BODY,
     _resetForTests: () => {
         s_schemaPromise = null;
         s_tokenKey = null;

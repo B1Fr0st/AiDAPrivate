@@ -1,8 +1,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include "standalone_driver.hpp"
+#include "standalone_driver_identity.hpp"
 #include "standalone_license.hpp"
 #include "anti-tamper/orchestrator.hpp"
 #include "anti-tamper/kernel_adbg_classifier.hpp"
+#include "anti-tamper/self_guard.hpp"
 #include "driver_loader.hpp"
 #include "toast_notification.hpp"
 #include "arc/arc.h"
@@ -32,6 +34,7 @@
 #include <deque>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -5698,6 +5701,19 @@ namespace driver_bridge
             return false;
         }
 
+        if (self_guard::is_self_or_child_pid(pid)) {
+            self_guard::self_guard_context_t sg_ctx;
+            sg_ctx.tool_name = "driver_attach";
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = pid;
+            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+            if (guard_result != self_guard::self_guard_result_t::allow) {
+                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+            }
+            diag::log_tagged_critical_fmt("driver", "attach_REJECTED_self_or_child_pid pid=%u", pid);
+            return false;
+        }
+
         {
             diag::log_tagged_critical("driver", "attach_pre_inline_gate_check");
             uint64_t gt = standalone_license::inline_gate_check(
@@ -5935,6 +5951,19 @@ namespace driver_bridge
             return false;
         if (pid == static_cast<uint32_t>(GetCurrentProcessId()))
             return false;
+
+        if (self_guard::is_self_or_child_pid(pid)) {
+            self_guard::self_guard_context_t sg_ctx;
+            sg_ctx.tool_name = "driver_attach_additional";
+            sg_ctx.has_pid = true;
+            sg_ctx.target_pid = pid;
+            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+            if (guard_result != self_guard::self_guard_result_t::allow) {
+                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+            }
+            diag::log_tagged_critical_fmt("driver", "attach_additional_REJECTED_self_or_child_pid pid=%u", pid);
+            return false;
+        }
 
         const DWORD caller_tid = GetCurrentThreadId();
         const ULONGLONG attach_additional_entry_tick = GetTickCount64();
@@ -8577,6 +8606,126 @@ namespace driver_bridge
         return bytes_written > 0;
     }
 
+    bool kernel_read_user_memory(uint64_t addr, void* out, size_t len)
+    {
+        if (!out || len == 0)
+            return false;
+
+        bool kernel_mode = false;
+        uint32_t current_pid = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+            current_pid = g_pid;
+        }
+        if (!kernel_mode) {
+            require_kernel_fail("kernel_read_user_memory");
+            return false;
+        }
+
+        size_t offset = 0;
+        while (offset < len) {
+            size_t chunk = (len - offset > 4096) ? 4096 : (len - offset);
+            if (!device->kernel_read_usermem(current_pid, addr + offset,
+                    static_cast<uint8_t*>(out) + offset, chunk)) {
+                diag::log_tagged_fmt("driver_bridge",
+                    "kernel_read_user_memory_failed addr=0x%llX offset=%zu chunk=%zu pid=%u",
+                    static_cast<unsigned long long>(addr),
+                    offset, chunk, current_pid);
+                return false;
+            }
+            offset += chunk;
+        }
+
+        clear_last_error_after_success("kernel_read_user_memory");
+        return true;
+    }
+
+    bool verify_cross_ring_evidence(const uint8_t* evidence_data, uint32_t evidence_size)
+    {
+        if (!evidence_data || evidence_size == 0)
+            return false;
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            require_kernel_fail("verify_cross_ring_evidence");
+            return false;
+        }
+
+        diag::log_tagged_fmt("driver_bridge",
+            "verify_cross_ring_evidence size=%u pid=%lu",
+            evidence_size, GetCurrentProcessId());
+
+        std::vector<uint8_t> io_buffer(evidence_data, evidence_data + evidence_size);
+        DWORD xrev_code = voyager::ioctl_codes::XREV();
+        uint32_t bytes_returned = 0;
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->send_ioctl_raw(xrev_code,
+            io_buffer.data(), evidence_size, bytes_returned);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+
+        if (!ok) {
+            diag::log_tagged_fmt("driver_bridge",
+                "verify_cross_ring_evidence_failed err=%lu size=%u ioctl=0x%08X",
+                static_cast<unsigned long>(err), evidence_size, xrev_code);
+            return false;
+        }
+
+        clear_last_error_after_success("verify_cross_ring_evidence");
+        return true;
+    }
+
+    bool verify_cross_ring_evidence(const cross_ring_evidence_t& evidence)
+    {
+        if (evidence.region_base == 0 || evidence.region_size == 0)
+            return false;
+
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            require_kernel_fail("verify_cross_ring_evidence_struct");
+            return false;
+        }
+
+        voyager::detail::cross_ring_evidence_abi_t raw{};
+        raw.detecting_checker_id = evidence.detecting_checker_id;
+        raw.target_checker_id = evidence.target_checker_id;
+        raw.region_base = evidence.region_base;
+        raw.region_size = evidence.region_size;
+        std::memcpy(raw.expected_hash, evidence.expected_hash, 32);
+        std::memcpy(raw.actual_hash, evidence.actual_hash, 32);
+        raw.modified_bytes_len = evidence.modified_bytes_len;
+        raw._pad = 0;
+        uint32_t copy_len = evidence.modified_bytes_len > 256 ? 256 : evidence.modified_bytes_len;
+        std::memcpy(raw.modified_bytes, evidence.modified_bytes, copy_len);
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->verify_cross_ring_evidence(raw);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+
+        if (!ok) {
+            diag::log_tagged_fmt("driver_bridge",
+                "verify_cross_ring_evidence_struct_failed err=%lu checker=%u target=%u region=0x%llX",
+                static_cast<unsigned long>(err),
+                evidence.detecting_checker_id,
+                evidence.target_checker_id,
+                static_cast<unsigned long long>(evidence.region_base));
+            SetLastError(err);
+            return false;
+        }
+
+        clear_last_error_after_success("verify_cross_ring_evidence_struct");
+        return true;
+    }
+
 
     uint64_t allocate_memory(size_t size)
     {
@@ -10734,6 +10883,363 @@ namespace driver_bridge
         return device->re_confirmed_usermode_bsod(raw);
     }
 
+    bool register_usermode_hash(uint64_t text_base, uint32_t text_size,
+                                uint64_t reloc_delta,
+                                const uint8_t sha256[32],
+                                const reloc_mask_entry_t* mask_entries,
+                                uint32_t mask_count)
+    {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            driver_critical_fmt("register_usermode_hash ok=0 reason=no_kernel elapsed_ms=%llu",
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            return false;
+        }
+
+        if (mask_count > voyager::detail::MAX_RELOC_MASK_ENTRIES_ABI) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        std::vector<voyager::detail::reloc_mask_entry_abi_t> abi_entries;
+        if (mask_count > 0 && mask_entries) {
+            abi_entries.resize(mask_count);
+            for (uint32_t i = 0; i < mask_count; i++) {
+                abi_entries[i].offset = mask_entries[i].offset;
+                abi_entries[i].size = mask_entries[i].size;
+                abi_entries[i].reloc_type = mask_entries[i].reloc_type;
+                abi_entries[i]._pad = 0;
+                std::memcpy(abi_entries[i].original_value, mask_entries[i].original_value, 8);
+            }
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->register_usermode_hash(
+            text_base, text_size, reloc_delta, sha256,
+            abi_entries.empty() ? nullptr : abi_entries.data(),
+            mask_count);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("register_usermode_hash ok=%d err=%lu base=0x%llX size=0x%X delta=0x%llX mask_count=%u elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(text_base),
+            text_size,
+            static_cast<unsigned long long>(reloc_delta),
+            mask_count,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        if (!ok) SetLastError(err);
+        return ok;
+    }
+
+    bool query_dma_protection_state(dma_protection_state_t& out)
+    {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        voyager::detail::dma_protection_state raw{};
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->query_dma_protection_state(raw);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("query_dma_protection_state_post ok=%d err=%lu elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        if (!ok) return false;
+
+        out.iommu.dmar_present = raw.iommu.dmar_present;
+        out.iommu.ivrs_present = raw.iommu.ivrs_present;
+        out.iommu.vtd_enabled = raw.iommu.vtd_enabled;
+        out.iommu.amd_vi_enabled = raw.iommu.amd_vi_enabled;
+        out.iommu.iommu_present = raw.iommu.iommu_present;
+        out.iommu.remapping_bypassed = raw.iommu.remapping_bypassed;
+        out.iommu.dmar_table_pa = raw.iommu.dmar_table_pa;
+        out.iommu.ivrs_table_pa = raw.iommu.ivrs_table_pa;
+        out.iommu.remapping_units = raw.iommu.remapping_units;
+        out.iommu.risk_level = raw.iommu.risk_level;
+        out.iommu.detection_timestamp = raw.iommu.detection_timestamp;
+        out.canary_count = raw.canary_count;
+        out.canary_hits = raw.canary_hits;
+        out.pcie_unknown_count = raw.pcie_unknown_count;
+        out.ept_anomaly_count = raw.ept_anomaly_count;
+        out.tier1_refused = raw.tier1_refused;
+        out.tier2_bsod_armed = raw.tier2_bsod_armed;
+        out.timestamp = raw.timestamp;
+        return true;
+    }
+
+    bool query_iommu_status(iommu_status_t& out)
+    {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        voyager::detail::iommu_status raw{};
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->query_iommu_status(raw);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("query_iommu_status_post ok=%d err=%lu risk=%u elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            raw.risk_level,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        if (!ok) return false;
+
+        out.dmar_present = raw.dmar_present;
+        out.ivrs_present = raw.ivrs_present;
+        out.vtd_enabled = raw.vtd_enabled;
+        out.amd_vi_enabled = raw.amd_vi_enabled;
+        out.iommu_present = raw.iommu_present;
+        out.remapping_bypassed = raw.remapping_bypassed;
+        out.dmar_table_pa = raw.dmar_table_pa;
+        out.ivrs_table_pa = raw.ivrs_table_pa;
+        out.remapping_units = raw.remapping_units;
+        out.risk_level = raw.risk_level;
+        out.detection_timestamp = raw.detection_timestamp;
+        return true;
+    }
+
+    bool enumerate_pcie_devices(pcie_enum_result_t& out)
+    {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        voyager::detail::pcie_enum_result raw{};
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->enumerate_pcie_devices(raw);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("enumerate_pcie_devices_post ok=%d err=%lu devices=%u unknown=%u elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            raw.device_count,
+            raw.unknown_count,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        if (!ok) return false;
+
+        out.device_count = raw.device_count;
+        out.unknown_count = raw.unknown_count;
+        for (std::size_t i = 0; i < MAX_PCIE_DEVICES && i < raw.device_count; ++i) {
+            const auto& src = raw.entries[i];
+            auto& dst = out.entries[i];
+            dst.vendor_id = src.vendor_id;
+            dst.device_id = src.device_id;
+            dst.class_code = src.class_code;
+            dst.bus = src.bus;
+            dst.device = src.device;
+            dst.function = src.function;
+            dst.header_type = src.header_type;
+            for (int j = 0; j < 6; ++j) dst.bar_pa[j] = src.bar_pa[j];
+            dst.bar_size = src.bar_size;
+            dst.flags = src.flags;
+            dst.whitelist_status = src.whitelist_status;
+        }
+        return true;
+    }
+
+    bool add_pcie_whitelist(uint16_t vendor_id, uint16_t device_id)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->add_pcie_whitelist(vendor_id, device_id);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("add_pcie_whitelist_post ok=%d err=%lu vid=0x%04X did=0x%04X",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned>(vendor_id),
+            static_cast<unsigned>(device_id));
+        return ok;
+    }
+
+    bool register_canary_poison(uint64_t va, uint64_t poison_signature)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->register_canary_poison(va, poison_signature);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("register_canary_poison_post ok=%d err=%lu va=0x%llX sig=0x%llX",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(va),
+            static_cast<unsigned long long>(poison_signature));
+        return ok;
+    }
+
+    bool protect_page_pte(uint64_t va)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->protect_page_pte(va);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("protect_page_pte_post ok=%d err=%lu va=0x%llX",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(va));
+        return ok;
+    }
+
+    bool unprotect_page_pte(uint64_t va)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->unprotect_page_pte(va);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("unprotect_page_pte_post ok=%d err=%lu va=0x%llX",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(va));
+        return ok;
+    }
+
+    bool check_ept_state(ept_check_result_t& out)
+    {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        voyager::detail::ept_check_result raw{};
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->check_ept_state(raw);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("check_ept_state_post ok=%d err=%lu ept=%d npte=%d hook=%d risk=%u elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            raw.ept_present ? 1 : 0,
+            raw.npte_present ? 1 : 0,
+            raw.ept_hook_detected ? 1 : 0,
+            raw.risk_level,
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+        if (!ok) return false;
+
+        out.ept_present = raw.ept_present;
+        out.npte_present = raw.npte_present;
+        out.ept_hook_detected = raw.ept_hook_detected;
+        out.vmm_present = raw.vmm_present;
+        out.ept_pointer_msr = raw.ept_pointer_msr;
+        out.npte_anomaly_count = raw.npte_anomaly_count;
+        out.risk_level = raw.risk_level;
+        out.detection_timestamp = raw.detection_timestamp;
+        return true;
+    }
+
+    bool trigger_dma_countermeasure(uint32_t action, uint32_t reason)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->trigger_dma_countermeasure(action, reason);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("trigger_dma_countermeasure_post ok=%d err=%lu action=%u reason=0x%08X",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            action,
+            reason);
+        return ok;
+    }
+
+    bool update_re_tool_hashes(const uint8_t* hashes, uint32_t count)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        if (!hashes || count == 0) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->update_re_tool_hashes(hashes, count);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("update_re_tool_hashes_post ok=%d err=%lu count=%u",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            count);
+        return ok;
+    }
+
     bool kernel_anti_debug_query(anti_debug_result_t& out)
     {
         const uint64_t started = static_cast<uint64_t>(GetTickCount64());
@@ -10901,6 +11407,47 @@ namespace driver_bridge
                 static_cast<unsigned long long>(debugger_pid),
                 static_cast<unsigned long long>(elapsed));
         }
+        if (!ok) SetLastError(err);
+        return ok;
+    }
+
+    bool kernel_anti_debug_scan_text(uint64_t module_base, uint64_t exception_dir_va,
+        uint32_t exception_dir_size, uint64_t* hit_rva)
+    {
+        const uint64_t started = static_cast<uint64_t>(GetTickCount64());
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            driver_critical_fmt("kernel_anti_debug_scan_text_post ok=0 err=%lu reason=no_kernel pid=%lu tid=%lu elapsed_ms=%llu",
+                static_cast<unsigned long>(GetLastError()),
+                GetCurrentProcessId(),
+                GetCurrentThreadId(),
+                static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - started));
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->kernel_anti_debug_scan_text(
+            module_base, exception_dir_va, exception_dir_size, hit_rva);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        if (!ok)
+        {
+            diag::log_tagged_fmt("driver",
+                "adbg_scan_text_failed err=%lu",
+                static_cast<unsigned long>(err));
+            SetLastError(err);
+        }
+        const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - started;
+        const uint64_t hit = hit_rva ? *hit_rva : 0;
+        driver_critical_fmt("kernel_anti_debug_scan_text_post ok=%d err=%lu module_base=0x%llX hit_rva=0x%llX elapsed_ms=%llu",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            static_cast<unsigned long long>(module_base),
+            static_cast<unsigned long long>(hit),
+            static_cast<unsigned long long>(elapsed));
         if (!ok) SetLastError(err);
         return ok;
     }
@@ -12153,4 +12700,266 @@ namespace driver_bridge
     {
         return g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
     }
+}
+
+namespace driver_bridge::identity {
+namespace {
+
+std::uint64_t filetime_to_u64(const FILETIME& value) noexcept
+{
+    ULARGE_INTEGER converted{};
+    converted.LowPart = value.dwLowDateTime;
+    converted.HighPart = value.dwHighDateTime;
+    return converted.QuadPart;
+}
+
+std::string normalize_identity_text(std::string value)
+{
+    std::replace(value.begin(), value.end(), '/', '\\');
+    for (char& character : value) {
+        if (character >= 'A' && character <= 'Z')
+            character = static_cast<char>(character - 'A' + 'a');
+    }
+    return value;
+}
+
+std::string module_filename(std::string value)
+{
+    const std::size_t separator = value.find_last_of("\\\\/");
+    if (separator != std::string::npos)
+        value.erase(0, separator + 1);
+    return value;
+}
+
+bool wide_path_to_utf8(const std::wstring& value, std::string& out)
+{
+    if (value.empty() || value.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+        return false;
+    const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (required <= 0)
+        return false;
+    out.resize(static_cast<std::size_t>(required));
+    return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+        static_cast<int>(value.size()), out.data(), required, nullptr, nullptr) == required;
+}
+
+bool capture_identity_impl(std::uint32_t pid, std::uint64_t preferred_module_base,
+                           live_target_identity_t& out, staleness_t& out_staleness,
+                           std::string& out_detail)
+{
+    out = {};
+    out_staleness = staleness_t::process_unavailable;
+    out_detail.clear();
+    if (pid == 0) {
+        out_detail = "TARGET_STALE: PID is zero";
+        return false;
+    }
+    if (pid == static_cast<std::uint32_t>(GetCurrentProcessId())) {
+        out_staleness = staleness_t::self_target_refused;
+        out_detail = "SELF_TARGET_REFUSED";
+        return false;
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (!process) {
+        out_detail = "TARGET_STALE: process query failed gle=" + std::to_string(GetLastError());
+        return false;
+    }
+    struct handle_guard_t {
+        HANDLE value = nullptr;
+        ~handle_guard_t() { if (value) CloseHandle(value); }
+    } process_guard{process};
+
+    DWORD exit_code = 0;
+    if (!GetExitCodeProcess(process, &exit_code)) {
+        out_detail = "TARGET_STALE: process status query failed gle=" +
+            std::to_string(GetLastError());
+        return false;
+    }
+    if (exit_code != STILL_ACTIVE) {
+        out_staleness = staleness_t::process_exited;
+        out_detail = "TARGET_STALE: process exited code=" + std::to_string(exit_code);
+        return false;
+    }
+
+    FILETIME creation{};
+    FILETIME exit{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) {
+        out_detail = "TARGET_STALE: process creation query failed gle=" +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    std::wstring process_path(32768, L'\0');
+    DWORD process_path_size = static_cast<DWORD>(process_path.size());
+    if (!QueryFullProcessImageNameW(process, 0, process_path.data(), &process_path_size) ||
+        process_path_size == 0) {
+        out_detail = "TARGET_STALE: process path query failed gle=" + std::to_string(GetLastError());
+        return false;
+    }
+    process_path.resize(process_path_size);
+    std::string process_path_utf8;
+    if (!wide_path_to_utf8(process_path, process_path_utf8)) {
+        out_detail = "TARGET_STALE: process path encoding failed gle=" + std::to_string(GetLastError());
+        return false;
+    }
+
+    std::vector<driver_bridge::module_info_t> modules;
+    HANDLE module_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                                       static_cast<DWORD>(pid));
+    if (module_snapshot == INVALID_HANDLE_VALUE) {
+        out_staleness = staleness_t::module_unavailable;
+        out_detail = "TARGET_STALE: target module snapshot failed gle=" +
+            std::to_string(GetLastError());
+        return false;
+    }
+    handle_guard_t module_snapshot_guard{module_snapshot};
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Module32FirstW(module_snapshot, &entry)) {
+        out_staleness = staleness_t::module_unavailable;
+        out_detail = "TARGET_STALE: target module list is unavailable gle=" +
+            std::to_string(GetLastError());
+        return false;
+    }
+    do {
+        std::string module_name;
+        std::string module_path;
+        if (!wide_path_to_utf8(entry.szModule, module_name) ||
+            !wide_path_to_utf8(entry.szExePath, module_path)) {
+            out_staleness = staleness_t::module_unavailable;
+            out_detail = "TARGET_STALE: target module identity encoding failed gle=" +
+                std::to_string(GetLastError());
+            return false;
+        }
+        driver_bridge::module_info_t module;
+        module.base = reinterpret_cast<std::uint64_t>(entry.modBaseAddr);
+        module.size = entry.modBaseSize;
+        module.name = std::move(module_name);
+        module.path = std::move(module_path);
+        modules.push_back(std::move(module));
+    } while (Module32NextW(module_snapshot, &entry));
+
+    const std::string normalized_process_path = normalize_identity_text(process_path_utf8);
+    const std::string expected_name = module_filename(normalized_process_path);
+    const driver_bridge::module_info_t* selected = nullptr;
+    if (preferred_module_base != 0) {
+        const auto it = std::find_if(modules.begin(), modules.end(),
+            [preferred_module_base](const driver_bridge::module_info_t& module) {
+                return module.base == preferred_module_base;
+            });
+        if (it != modules.end())
+            selected = &*it;
+    } else {
+        for (const auto& module : modules) {
+            const std::string normalized_module_path = normalize_identity_text(module.path);
+            const std::string normalized_module_name = normalize_identity_text(module.name);
+            if ((!normalized_module_path.empty() && normalized_module_path == normalized_process_path) ||
+                (!normalized_module_name.empty() && normalized_module_name == expected_name)) {
+                selected = &module;
+                break;
+            }
+        }
+        if (!selected) {
+            selected = &*std::min_element(modules.begin(), modules.end(),
+                [](const driver_bridge::module_info_t& left,
+                   const driver_bridge::module_info_t& right) {
+                    return left.base < right.base;
+                });
+        }
+    }
+
+    if (!selected || selected->base == 0 || selected->size == 0) {
+        out_staleness = staleness_t::module_unavailable;
+        out_detail = "TARGET_STALE: selected module is unavailable";
+        return false;
+    }
+    const std::string normalized_module_path = normalize_identity_text(selected->path);
+    std::string normalized_module_name = normalize_identity_text(selected->name);
+    if (normalized_module_name.empty())
+        normalized_module_name = module_filename(normalized_module_path);
+    if (normalized_module_name.empty() || normalized_module_path.empty()) {
+        out_staleness = staleness_t::module_unavailable;
+        out_detail = "TARGET_STALE: selected module identity is incomplete";
+        return false;
+    }
+
+    FILETIME observed_at{};
+    GetSystemTimeAsFileTime(&observed_at);
+    out.process.pid = pid;
+    out.process.creation_time_100ns = filetime_to_u64(creation);
+    out.process.normalized_process_path = normalized_process_path;
+    out.module.base = selected->base;
+    out.module.size = selected->size;
+    out.module.normalized_name = std::move(normalized_module_name);
+    out.module.normalized_path = normalized_module_path;
+    out.observed_at_100ns = filetime_to_u64(observed_at);
+    out_staleness = staleness_t::none;
+    return true;
+}
+
+}
+
+const char* staleness_code(staleness_t value) noexcept
+{
+    switch (value) {
+    case staleness_t::none: return "NONE";
+    case staleness_t::self_target_refused: return "SELF_TARGET_REFUSED";
+    case staleness_t::process_unavailable: return "TARGET_PROCESS_UNAVAILABLE";
+    case staleness_t::process_exited: return "TARGET_PROCESS_EXITED";
+    case staleness_t::process_identity_changed: return "TARGET_PROCESS_IDENTITY_CHANGED";
+    case staleness_t::module_unavailable: return "TARGET_MODULE_UNAVAILABLE";
+    case staleness_t::module_identity_changed: return "TARGET_MODULE_IDENTITY_CHANGED";
+    }
+    return "TARGET_IDENTITY_UNKNOWN";
+}
+
+bool capture_live_target_identity(std::uint32_t pid, std::uint64_t preferred_module_base,
+                                  live_target_identity_t& out, std::string* out_error)
+{
+    staleness_t staleness = staleness_t::process_unavailable;
+    std::string detail;
+    const bool captured = capture_identity_impl(pid, preferred_module_base, out, staleness, detail);
+    if (out_error)
+        *out_error = captured ? std::string{} : staleness_code(staleness) + ": " + detail;
+    return captured;
+}
+
+validation_result_t validate_live_target_identity(const live_target_identity_t& expected)
+{
+    validation_result_t result;
+    if (expected.process.pid == 0 || expected.module.base == 0 || expected.module.size == 0) {
+        result.staleness = staleness_t::process_identity_changed;
+        result.detail = "TARGET_STALE: expected live target identity is incomplete";
+        return result;
+    }
+    std::string detail;
+    if (!capture_identity_impl(expected.process.pid, expected.module.base, result.observed,
+                               result.staleness, detail)) {
+        result.detail = std::move(detail);
+        return result;
+    }
+    if (result.observed.process.pid != expected.process.pid ||
+        result.observed.process.creation_time_100ns != expected.process.creation_time_100ns ||
+        result.observed.process.normalized_process_path != expected.process.normalized_process_path) {
+        result.staleness = staleness_t::process_identity_changed;
+        result.detail = "TARGET_STALE: process creation identity changed";
+        return result;
+    }
+    if (result.observed.module.base != expected.module.base ||
+        result.observed.module.size != expected.module.size ||
+        result.observed.module.normalized_name != expected.module.normalized_name ||
+        result.observed.module.normalized_path != expected.module.normalized_path) {
+        result.staleness = staleness_t::module_identity_changed;
+        result.detail = "TARGET_STALE: module identity changed";
+        return result;
+    }
+    result.matches = true;
+    result.staleness = staleness_t::none;
+    return result;
+}
+
 }

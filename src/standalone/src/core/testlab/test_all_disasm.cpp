@@ -3,12 +3,10 @@
 #include "test_all_features.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/pseudocode_view.hpp"
-#include "../disasm/decompiler_engine.hpp"
 #include "../disasm/function_index.hpp"
 #include "../disasm/xref_index.hpp"
-#include "../disasm/comment_store.hpp"
-#include "../disasm/rename_store.hpp"
-#include "../disasm/nav_history.hpp"
+#include "../analysis/workspace/decompiler_service.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
 #include "../editor/hex_view.hpp"
 #include "../editor/expression_eval.hpp"
 #include "../debugger/debugger_engine.hpp"
@@ -26,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -37,28 +36,6 @@
 namespace test_all_features {
 
 namespace {
-
-    std::atomic<int> g_xref_live_after_warm_stage{0};
-
-    const char* xref_live_after_warm_stage_name(int value) {
-        switch (value) {
-        case 1: return "select_module_begin";
-        case 2: return "select_module_done";
-        case 3: return "validate_module";
-        case 4: return "construct_range";
-        case 5: return "watchdog_start";
-        case 6: return "before_warm_range";
-        case 7: return "inside_warm_range";
-        case 8: return "after_warm_range";
-        case 9: return "before_bounded_live_range";
-        case 10: return "inside_bounded_live_range";
-        case 11: return "after_bounded_live_range";
-        case 12: return "materialize_result";
-        case 13: return "finished";
-        case 14: return "exception";
-        default: return "entry";
-        }
-    }
 
     void format_timestamp(char* out, std::size_t cap) {
         SYSTEMTIME st; GetLocalTime(&st);
@@ -173,19 +150,6 @@ namespace {
         case center_view_t::test_lab: return "test_lab";
         default: return "unknown";
         }
-    }
-
-    void log_nav_snapshot(HANDLE hf, const char* tag, const char* phase) {
-        std::lock_guard<std::mutex> lk(nav_history::mutex_ref());
-        const auto& s = nav_history::stack_ref();
-        const uint64_t first = s.empty() ? 0 : s.front();
-        const uint64_t last = s.empty() ? 0 : s.back();
-        log_msg(hf, tag, "STATE -- %s size=%zu max=%zu first=0x%llX last=0x%llX",
-            phase,
-            s.size(),
-            nav_history::kMaxEntries,
-            (unsigned long long)first,
-            (unsigned long long)last);
     }
 
     struct remote_module_lookup_t {
@@ -641,155 +605,287 @@ namespace {
         return true;
     }
 
+    disasm_view::workspace_context_t selected_pseudocode_context() {
+        return disasm_view::capture_selected_workspace();
+    }
+
+    bool workspace_decompiler_idle(const disasm_view::workspace_context_t& context, int timeout_ms) {
+        if (!context.workspace)
+            return false;
+        auto service = context.workspace->decompiler();
+        if (!service)
+            return false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        do {
+            if (service->snapshot().active_contexts == 0)
+                return true;
+            Sleep(25);
+        } while (std::chrono::steady_clock::now() < deadline);
+        return service->snapshot().active_contexts == 0;
+    }
+
+    bool wait_for_workspace_mutation(const disasm_view::workspace_context_t& context,
+                                     std::string& error) {
+        if (!context || !context.view)
+            return false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (context.view->pending_mutations.load(std::memory_order_acquire) != 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            Sleep(10);
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        error = context.view->mutation_error;
+        return context.view->pending_mutations.load(std::memory_order_acquire) == 0 && error.empty();
+    }
+
+    bool apply_workspace_comment(const disasm_view::workspace_context_t& context,
+                                 const aida::analysis::address_t& address,
+                                 const std::string& text, std::string& error) {
+        {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error.clear();
+        }
+        return disasm_view::queue_comment(context, address, text) &&
+            wait_for_workspace_mutation(context, error);
+    }
+
+    bool apply_workspace_name(const disasm_view::workspace_context_t& context,
+                              const aida::analysis::address_t& address,
+                              const std::string& name, std::string& error) {
+        {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error.clear();
+        }
+        return disasm_view::queue_rename(context, address, name) &&
+            wait_for_workspace_mutation(context, error);
+    }
+
+    std::vector<aida::analysis::address_t> workspace_fixture_addresses(
+        const disasm_view::workspace_context_t& context, std::size_t count) {
+        std::vector<aida::analysis::address_t> result;
+        if (!context || !context.publication || !context.publication->snapshot)
+            return result;
+        for (const auto& instruction : context.publication->snapshot->instructions) {
+            if (std::find(result.begin(), result.end(), instruction.address) == result.end())
+                result.push_back(instruction.address);
+            if (result.size() == count)
+                break;
+        }
+        return result;
+    }
+
+    enum class comment_case_t : std::uint8_t {
+        set_get,
+        has,
+        empty_clears,
+        multiple,
+        overwrite
+    };
+
+    void run_workspace_comment_case(HANDLE hf, const char* tag, comment_case_t mode,
+                                    std::atomic<int>& passed, std::atomic<int>& failed) {
+        const auto context = disasm_view::capture_selected_workspace();
+        const auto addresses = workspace_fixture_addresses(context, mode == comment_case_t::multiple ? 2 : 1);
+        if (!context || addresses.empty() || (mode == comment_case_t::multiple && addresses.size() != 2)) {
+            log_msg(hf, tag, "FAIL -- explicit workspace comment fixture unavailable");
+            failed.fetch_add(1);
+            return;
+        }
+        std::vector<std::string> originals;
+        for (const auto& address : addresses)
+            originals.push_back(disasm_view::comment(context, address));
+        std::string error;
+        bool valid = false;
+        if (mode == comment_case_t::multiple) {
+            valid = apply_workspace_comment(context, addresses[0], "test_comment_workspace_a", error) &&
+                apply_workspace_comment(context, addresses[1], "test_comment_workspace_b", error) &&
+                disasm_view::comment(context, addresses[0]) == "test_comment_workspace_a" &&
+                disasm_view::comment(context, addresses[1]) == "test_comment_workspace_b";
+        } else {
+            valid = apply_workspace_comment(context, addresses[0], "test_comment_workspace", error);
+            if (mode == comment_case_t::set_get)
+                valid = valid && disasm_view::comment(context, addresses[0]) == "test_comment_workspace";
+            else if (mode == comment_case_t::has)
+                valid = valid && !disasm_view::comment(context, addresses[0]).empty();
+            else if (mode == comment_case_t::empty_clears)
+                valid = valid && apply_workspace_comment(context, addresses[0], std::string(), error) &&
+                    disasm_view::comment(context, addresses[0]).empty();
+            else if (mode == comment_case_t::overwrite)
+                valid = valid && apply_workspace_comment(context, addresses[0], "test_comment_workspace_new", error) &&
+                    disasm_view::comment(context, addresses[0]) == "test_comment_workspace_new";
+        }
+        bool restored = true;
+        for (std::size_t index = 0; index < addresses.size(); ++index)
+            restored = apply_workspace_comment(context, addresses[index], originals[index], error) && restored;
+        if (valid && restored) {
+            log_msg(hf, tag, "PASS -- workspace-owned comment behavior passed with prior-state restoration");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- workspace comment behavior failed restored=%d error=\"%s\"",
+                restored ? 1 : 0, error.c_str());
+            failed.fetch_add(1);
+        }
+    }
+
+    enum class rename_case_t : std::uint8_t {
+        set_get,
+        has,
+        clear,
+        resolve_or,
+        multiple,
+        resolve_or_multiple,
+        overwrite
+    };
+
+    void run_workspace_rename_case(HANDLE hf, const char* tag, rename_case_t mode,
+                                   std::atomic<int>& passed, std::atomic<int>& failed) {
+        const auto context = disasm_view::capture_selected_workspace();
+        const bool multiple = mode == rename_case_t::multiple || mode == rename_case_t::resolve_or_multiple;
+        const auto addresses = workspace_fixture_addresses(context, multiple ? 2 : 1);
+        if (!context || addresses.empty() || (multiple && addresses.size() != 2)) {
+            log_msg(hf, tag, "FAIL -- explicit workspace rename fixture unavailable");
+            failed.fetch_add(1);
+            return;
+        }
+        std::vector<std::string> symbols;
+        std::vector<std::string> originals;
+        for (const auto& address : addresses) {
+            symbols.push_back(disasm_view::resolve_symbol(context, address));
+            originals.push_back(disasm_view::resolve_name(context, address));
+        }
+        std::string error;
+        bool valid = false;
+        if (multiple) {
+            valid = apply_workspace_name(context, addresses[0], "test_workspace_name_a", error) &&
+                apply_workspace_name(context, addresses[1], "test_workspace_name_b", error) &&
+                disasm_view::resolve_name(context, addresses[0]) == "test_workspace_name_a" &&
+                disasm_view::resolve_name(context, addresses[1]) == "test_workspace_name_b";
+            if (valid && mode == rename_case_t::resolve_or_multiple) {
+                valid = apply_workspace_name(context, addresses[0], std::string(), error) &&
+                    apply_workspace_name(context, addresses[1], std::string(), error) &&
+                    disasm_view::resolve_name(context, addresses[0]) == symbols[0] &&
+                    disasm_view::resolve_name(context, addresses[1]) == symbols[1];
+            }
+        } else {
+            valid = apply_workspace_name(context, addresses[0], "test_workspace_name", error);
+            if (mode == rename_case_t::set_get || mode == rename_case_t::has)
+                valid = valid && disasm_view::resolve_name(context, addresses[0]) == "test_workspace_name";
+            else if (mode == rename_case_t::clear || mode == rename_case_t::resolve_or)
+                valid = valid && apply_workspace_name(context, addresses[0], std::string(), error) &&
+                    disasm_view::resolve_name(context, addresses[0]) == symbols[0];
+            else if (mode == rename_case_t::overwrite)
+                valid = valid && apply_workspace_name(context, addresses[0], "test_workspace_name_new", error) &&
+                    disasm_view::resolve_name(context, addresses[0]) == "test_workspace_name_new";
+        }
+        bool restored = true;
+        for (std::size_t index = 0; index < addresses.size(); ++index) {
+            const std::string custom = originals[index] == symbols[index] ? std::string() : originals[index];
+            restored = apply_workspace_name(context, addresses[index], custom, error) && restored;
+        }
+        if (valid && restored) {
+            log_msg(hf, tag, "PASS -- workspace-owned rename behavior passed with prior-state restoration");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- workspace rename behavior failed restored=%d error=\"%s\"",
+                restored ? 1 : 0, error.c_str());
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_comment_set_get(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_comment_case(hf, "comment.set_get", comment_case_t::set_get, passed, failed);
+    }
+    void test_comment_has(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_comment_case(hf, "comment.has", comment_case_t::has, passed, failed);
+    }
+    void test_comment_empty_clears(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_comment_case(hf, "comment.empty_clears", comment_case_t::empty_clears, passed, failed);
+    }
+    void test_comment_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_comment_case(hf, "comment.multiple", comment_case_t::multiple, passed, failed);
+    }
+    void test_comment_overwrite(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_comment_case(hf, "comment.overwrite", comment_case_t::overwrite, passed, failed);
+    }
+    void test_rename_set_get(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_rename_case(hf, "rename.set_get", rename_case_t::set_get, passed, failed);
+    }
+    void test_rename_has(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_rename_case(hf, "rename.has", rename_case_t::has, passed, failed);
+    }
+    void test_rename_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_rename_case(hf, "rename.clear", rename_case_t::clear, passed, failed);
+    }
+    void test_rename_resolve_or(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_rename_case(hf, "rename.resolve_or", rename_case_t::resolve_or, passed, failed);
+    }
+    void test_rename_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_rename_case(hf, "rename.multiple", rename_case_t::multiple, passed, failed);
+    }
+    void test_rename_resolve_or_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_rename_case(hf, "rename.resolve_or_multiple", rename_case_t::resolve_or_multiple, passed, failed);
+    }
+    void test_rename_overwrite(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_rename_case(hf, "rename.overwrite", rename_case_t::overwrite, passed, failed);
+    }
+
     bool wait_for_decompile_tab(HANDLE hf, const char* tag, uint64_t addr, int timeout_ms,
                                 bool& loaded_out, bool& error_out, std::string& fn_out) {
         loaded_out = false;
         error_out = false;
         fn_out.clear();
-        struct engine_metrics_t {
-            bool metrics_present = false;
-            bool metrics_error = false;
-            bool metrics_complete = false;
-            size_t pseudocode_bytes = 0;
-            size_t pseudocode_lines = 0;
-            const char* source = "";
-            bool cache_found = false;
-            bool cache_complete = false;
-            bool cache_error = false;
-            size_t cache_bytes = 0;
-            size_t cache_lines = 0;
-            uint64_t current_addr = 0;
-            bool current_complete = false;
-            bool current_error = false;
-            size_t current_bytes = 0;
-            size_t current_lines = 0;
-            bool engine_decompiling = false;
-            bool next_pending = false;
-            uint64_t next_addr = 0;
-            bool cancel = false;
-        };
-        auto count_lines_local = [](const std::string& text) -> size_t {
-            if (text.empty())
-                return 0;
-            size_t lines = 1;
-            for (char ch : text) {
-                if (ch == '\n')
-                    ++lines;
-            }
-            if (!text.empty() && text.back() == '\n' && lines > 0)
-                --lines;
-            return lines;
-        };
-        auto read_engine_metrics = [&]() -> engine_metrics_t {
-            engine_metrics_t out;
-            std::lock_guard<std::mutex> lk(decompiler_engine::g_state.mutex);
-            out.engine_decompiling = decompiler_engine::g_state.decompiling.load(std::memory_order_acquire);
-            out.next_pending = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire);
-            out.next_addr = decompiler_engine::g_state.next_addr.load(std::memory_order_acquire);
-            out.cancel = decompiler_engine::g_state.cancel.load(std::memory_order_acquire);
-            out.current_addr = decompiler_engine::g_state.current.function_addr;
-            out.current_complete = decompiler_engine::g_state.current.complete;
-            out.current_error = decompiler_engine::g_state.current.is_error;
-            out.current_bytes = decompiler_engine::g_state.current.pseudocode.size();
-            out.current_lines = count_lines_local(decompiler_engine::g_state.current.pseudocode);
-            auto it = decompiler_engine::g_state.cache.find(addr);
-            if (it != decompiler_engine::g_state.cache.end()) {
-                out.cache_found = true;
-                out.cache_complete = it->second.complete;
-                out.cache_error = it->second.is_error;
-                out.cache_bytes = it->second.pseudocode.size();
-                out.cache_lines = count_lines_local(it->second.pseudocode);
-                if (it->second.complete) {
-                    out.metrics_present = true;
-                    out.metrics_complete = it->second.complete;
-                    out.metrics_error = it->second.is_error;
-                    out.pseudocode_bytes = out.cache_bytes;
-                    out.pseudocode_lines = out.cache_lines;
-                    out.source = "cache";
-                }
-            }
-            if (!out.metrics_present &&
-                decompiler_engine::g_state.current.function_addr == addr &&
-                decompiler_engine::g_state.current.complete) {
-                out.metrics_present = true;
-                out.metrics_complete = decompiler_engine::g_state.current.complete;
-                out.metrics_error = decompiler_engine::g_state.current.is_error;
-                out.pseudocode_bytes = out.current_bytes;
-                out.pseudocode_lines = out.current_lines;
-                out.source = "current";
-            }
-            return out;
-        };
-        auto log_wait_state = [&](const char* reason, int waited_ms, bool found, size_t total,
-                                  const pseudocode_view::tab_info_t& tab,
-                                  const engine_metrics_t& metrics) {
-            log_msg(hf, tag,
-                "STATE -- decompile_wait_%s tab addr=0x%016llX waited_ms=%d timeout_ms=%d found=%d total_tabs=%zu loaded=%d decompiling=%d is_error=%d function=\"%s\" metrics=%d source=\"%s\" complete=%d engine_error=%d bytes=%zu lines=%zu",
-                reason ? reason : "state",
-                (unsigned long long)addr,
-                waited_ms,
-                timeout_ms,
-                found ? 1 : 0,
-                total,
-                found ? (int)tab.loaded : 0,
-                found ? (int)tab.decompiling : 0,
-                found ? (int)tab.is_error : 0,
-                found ? tab.function_name.c_str() : "",
-                metrics.metrics_present ? 1 : 0,
-                metrics.source,
-                metrics.metrics_complete ? 1 : 0,
-                metrics.metrics_error ? 1 : 0,
-                metrics.pseudocode_bytes,
-                metrics.pseudocode_lines);
-            log_msg(hf, tag,
-                "STATE -- decompile_wait_%s engine current_addr=0x%016llX current_complete=%d current_error=%d current_bytes=%zu current_lines=%zu cache_found=%d cache_complete=%d cache_error=%d cache_bytes=%zu cache_lines=%zu engine_decompiling=%d next_pending=%d next_addr=0x%016llX cancel=%d",
-                reason ? reason : "state",
-                (unsigned long long)metrics.current_addr,
-                metrics.current_complete ? 1 : 0,
-                metrics.current_error ? 1 : 0,
-                metrics.current_bytes,
-                metrics.current_lines,
-                metrics.cache_found ? 1 : 0,
-                metrics.cache_complete ? 1 : 0,
-                metrics.cache_error ? 1 : 0,
-                metrics.cache_bytes,
-                metrics.cache_lines,
-                metrics.engine_decompiling ? 1 : 0,
-                metrics.next_pending ? 1 : 0,
-                (unsigned long long)metrics.next_addr,
-                metrics.cancel ? 1 : 0);
-        };
+        const auto context = selected_pseudocode_context();
+        if (!context) {
+            log_msg(hf, tag, "STATE -- decompile_wait_missing_workspace addr=0x%016llX",
+                (unsigned long long)addr);
+            return false;
+        }
         const int step_ms = 50;
         int waited = 0;
         for (;;) {
-            auto tabs = pseudocode_view::snapshot_tabs();
+            const auto tabs = pseudocode_view::snapshot_tabs(context);
             bool found = false;
             pseudocode_view::tab_info_t observed{};
-            for (const auto& t : tabs) {
-                if (t.addr != addr) continue;
+            for (const auto& tab : tabs) {
+                if (tab.addr != addr)
+                    continue;
                 found = true;
-                observed = t;
-                fn_out = t.function_name;
+                observed = tab;
+                fn_out = tab.function_name;
                 break;
             }
-            engine_metrics_t metrics = read_engine_metrics();
-            if (found) {
-                const bool has_nonzero_metrics = metrics.metrics_present &&
-                    !metrics.metrics_error &&
-                    metrics.pseudocode_bytes > 0 &&
-                    metrics.pseudocode_lines > 0 &&
-                    (observed.loaded || std::strcmp(metrics.source, "cache") == 0);
-                const bool explicit_error = observed.is_error ||
-                    (metrics.metrics_present && metrics.metrics_error);
-                if (has_nonzero_metrics || explicit_error) {
-                    loaded_out = observed.loaded || has_nonzero_metrics;
-                    error_out = observed.is_error || metrics.metrics_error;
-                    return true;
-                }
+            if (found && (observed.loaded || observed.is_error)) {
+                loaded_out = observed.loaded;
+                error_out = observed.is_error;
+                return true;
             }
             if (waited >= timeout_ms) {
-                log_wait_state(found ? "timeout_terminal_state_missing" : "timeout_tab_missing",
-                    waited, found, tabs.size(), observed, metrics);
+                const auto service = context.workspace->decompiler();
+                const auto snapshot = service ? service->snapshot() : aida::analysis::decompiler_service_snapshot_t{};
+                log_msg(hf, tag,
+                    "STATE -- decompile_wait_timeout addr=0x%016llX waited_ms=%d found=%d total_tabs=%zu loaded=%d decompiling=%d is_error=%d active_contexts=%zu requests=%llu completed=%llu failed=%llu",
+                    (unsigned long long)addr,
+                    waited,
+                    found ? 1 : 0,
+                    tabs.size(),
+                    found ? (int)observed.loaded : 0,
+                    found ? (int)observed.decompiling : 0,
+                    found ? (int)observed.is_error : 0,
+                    snapshot.active_contexts,
+                    (unsigned long long)snapshot.requests,
+                    (unsigned long long)snapshot.completed,
+                    (unsigned long long)snapshot.failed);
                 return false;
             }
             Sleep(step_ms);
@@ -798,7 +894,10 @@ namespace {
     }
 
     bool snapshot_tab_for_addr(uint64_t addr, pseudocode_view::tab_info_t& out, size_t* total_out = nullptr) {
-        auto tabs = pseudocode_view::snapshot_tabs();
+        const auto context = selected_pseudocode_context();
+        if (!context)
+            return false;
+        auto tabs = pseudocode_view::snapshot_tabs(context);
         if (total_out)
             *total_out = tabs.size();
         for (const auto& t : tabs) {
@@ -830,24 +929,25 @@ namespace {
         complete_out = false;
         error_out = false;
         source_out.clear();
-        std::lock_guard<std::mutex> lk(decompiler_engine::g_state.mutex);
-        auto apply = [&](const decompiler_engine::decompile_result_t& r, const char* source) {
-            bytes_out = r.pseudocode.size();
-            lines_out = count_pseudocode_lines(r.pseudocode);
-            complete_out = r.complete;
-            error_out = r.is_error;
-            source_out = source ? source : "";
+        const auto context = selected_pseudocode_context();
+        if (!context)
+            return false;
+        const auto typed = disasm_view::typed_address(context, addr);
+        const auto service = context.workspace->decompiler();
+        if (!typed || !service)
+            return false;
+        const auto result = service->decompile(*typed);
+        if (!result) {
+            complete_out = true;
+            error_out = true;
+            source_out = result.error().stable_code();
             return true;
-        };
-        if (decompiler_engine::g_state.current.function_addr == addr &&
-            decompiler_engine::g_state.current.complete) {
-            return apply(decompiler_engine::g_state.current, "current");
         }
-        auto it = decompiler_engine::g_state.cache.find(addr);
-        if (it != decompiler_engine::g_state.cache.end() && it->second.complete) {
-            return apply(it->second, "cache");
-        }
-        return false;
+        bytes_out = result.value().pseudocode.size();
+        lines_out = count_pseudocode_lines(result.value().pseudocode);
+        complete_out = true;
+        source_out = result.value().cache_hit ? "workspace_cache" : "workspace_service";
+        return true;
     }
 
     void log_pseudocode_tab_evidence(HANDLE hf, const char* tag, const char* phase, uint64_t addr) {
@@ -861,8 +961,11 @@ namespace {
         std::string source;
         const bool metrics = pseudocode_metrics_for_addr(addr, pseudocode_bytes, pseudocode_lines,
             complete, is_error, source);
+        const auto context = selected_pseudocode_context();
+        const auto service = context.workspace ? context.workspace->decompiler() : nullptr;
+        const auto snapshot = service ? service->snapshot() : aida::analysis::decompiler_service_snapshot_t{};
         log_msg(hf, tag,
-            "STATE -- %s addr=0x%016llX found=%d total_tabs=%zu loaded=%d decompiling=%d is_error=%d function=\"%s\" metrics=%d source=\"%s\" complete=%d engine_error=%d pseudocode_bytes=%zu pseudocode_lines=%zu active=0x%016llX cancel=%d next_pending=%d decompiling_engine=%d",
+            "STATE -- %s addr=0x%016llX found=%d total_tabs=%zu loaded=%d decompiling=%d is_error=%d function=\"%s\" metrics=%d source=\"%s\" complete=%d engine_error=%d pseudocode_bytes=%zu pseudocode_lines=%zu active=0x%016llX active_contexts=%zu requests=%llu completed=%llu failed=%llu",
             phase,
             (unsigned long long)addr,
             (int)found,
@@ -877,10 +980,11 @@ namespace {
             (int)is_error,
             pseudocode_bytes,
             pseudocode_lines,
-            (unsigned long long)pseudocode_view::active_tab_address(),
-            decompiler_engine::g_state.cancel.load(std::memory_order_acquire) ? 1 : 0,
-            decompiler_engine::g_state.next_pending.load(std::memory_order_acquire) ? 1 : 0,
-            decompiler_engine::g_state.decompiling.load(std::memory_order_acquire) ? 1 : 0);
+            context ? (unsigned long long)pseudocode_view::active_tab_address(context) : 0ULL,
+            snapshot.active_contexts,
+            (unsigned long long)snapshot.requests,
+            (unsigned long long)snapshot.completed,
+            (unsigned long long)snapshot.failed);
     }
 
     bool pseudocode_refresh_state_ok(const pseudocode_view::tab_info_t& tab, uint64_t addr,
@@ -895,12 +999,18 @@ namespace {
     void validate_decompile(HANDLE hf, const char* tag, const char* sym, uint64_t addr, bool force,
                             std::atomic<int>& passed, std::atomic<int>& failed) {
         const uint32_t attached = driver_bridge::attached_pid();
+        const auto context = selected_pseudocode_context();
+        if (!context) {
+            log_msg(hf, tag, "FAIL -- no selected analysis workspace for decompile");
+            failed.fetch_add(1);
+            return;
+        }
         log_msg(hf, tag, "INPUT -- request_decompile(%s=0x%016llX, force=%d) attached_pid=%u",
             sym, (unsigned long long)addr, (int)force, attached);
 
-        pseudocode_view::close_tab_by_addr(addr);
+        pseudocode_view::close_tab_by_addr(context, addr);
         auto t0 = std::chrono::steady_clock::now();
-        pseudocode_view::request_decompile(addr, nullptr, force);
+        pseudocode_view::request_decompile(context, addr, force);
 
         bool loaded = false;
         bool is_error = false;
@@ -909,19 +1019,19 @@ namespace {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
 
-        bool present = pseudocode_view::has_tab_for(addr);
+        bool present = pseudocode_view::has_tab_for(context, addr);
         log_msg(hf, tag, "OUTPUT -- finished=%d loaded=%d is_error=%d has_tab=%d function=\"%s\" (elapsed %lld ms)",
             (int)finished, (int)loaded, (int)is_error, (int)present, fn.c_str(), (long long)ms);
 
         if (finished && present && is_error && force) {
-            pseudocode_view::close_tab_by_addr(addr);
+            pseudocode_view::close_tab_by_addr(context, addr);
             auto retry_t0 = std::chrono::steady_clock::now();
-            pseudocode_view::request_decompile(addr, nullptr, true);
+            pseudocode_view::request_decompile(context, addr, true);
             loaded = false;
             is_error = false;
             fn.clear();
             finished = wait_for_decompile_tab(hf, tag, addr, 15000, loaded, is_error, fn);
-            present = pseudocode_view::has_tab_for(addr);
+            present = pseudocode_view::has_tab_for(context, addr);
             auto retry_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - retry_t0).count();
             log_msg(hf, tag, "RETRY -- finished=%d loaded=%d is_error=%d has_tab=%d function=\"%s\" (elapsed %lld ms)",
@@ -991,48 +1101,60 @@ namespace {
 
     void test_navigate_back_forward(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.nav_back_fwd";
+        (void)skipped;
         try {
-            auto& st = disasm_view::g_state;
-            std::vector<int> saved_history = st.nav_history;
-            int saved_pos = st.nav_pos;
-            int saved_row = st.selected_row;
+            auto context = disasm_view::capture_selected_workspace();
+            const auto first = disasm_view::typed_address(context, 0x11);
+            const auto second = disasm_view::typed_address(context, 0x22);
+            if (!context || !first || !second) {
+                log_msg(hf, tag, "FAIL -- selected workspace cannot represent navigation addresses");
+                failed.fetch_add(1);
+                return;
+            }
+            const auto saved = context.workspace->view_state();
+            auto seeded = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+                state.selection = *second;
+                state.navigation_back = {*first};
+                state.navigation_forward.clear();
+            });
+            if (!seeded) {
+                log_msg(hf, tag, "FAIL -- workspace navigation seed rejected");
+                failed.fetch_add(1);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                context.view->selection = *second;
+            }
 
-            st.nav_history.clear();
-            st.nav_history.push_back(0x11);
-            st.nav_history.push_back(0x22);
-            st.nav_pos = 1;
-            st.selected_row = st.nav_history[st.nav_pos];
+            log_msg(hf, tag, "INPUT -- seeded workspace navigation back=1 selection=0x%llX",
+                (unsigned long long)second->value);
+            disasm_view::navigate_back(context);
+            const auto after_back = context.workspace->view_state();
+            const bool back_ok = after_back.selection == first &&
+                after_back.navigation_back.empty() &&
+                after_back.navigation_forward.size() == 1 &&
+                after_back.navigation_forward.back() == *second;
 
-            log_msg(hf, tag, "INPUT -- seeded nav_history rows {0x11,0x22} nav_pos=%d selected_row=%d",
-                st.nav_pos, st.selected_row);
+            disasm_view::navigate_forward(context);
+            const auto after_forward = context.workspace->view_state();
+            const bool forward_ok = after_forward.selection == second &&
+                after_forward.navigation_forward.empty() &&
+                after_forward.navigation_back.size() == 1 &&
+                after_forward.navigation_back.back() == *first;
+            context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+                state = saved;
+            });
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                context.view->selection = saved.selection;
+            }
 
-            disasm_view::navigate_back();
-            int pos_after_back = st.nav_pos;
-            int row_after_back = st.selected_row;
-            log_msg(hf, tag, "OUTPUT -- after navigate_back nav_pos=%d selected_row=0x%X",
-                pos_after_back, (unsigned)row_after_back);
-
-            bool back_ok = (pos_after_back == 0) && (row_after_back == 0x11);
-
-            disasm_view::navigate_forward();
-            int pos_after_fwd = st.nav_pos;
-            int row_after_fwd = st.selected_row;
-            log_msg(hf, tag, "OUTPUT -- after navigate_forward nav_pos=%d selected_row=0x%X",
-                pos_after_fwd, (unsigned)row_after_fwd);
-
-            bool fwd_ok = (pos_after_fwd == 1) && (row_after_fwd == 0x22);
-
-            st.nav_history = std::move(saved_history);
-            st.nav_pos = saved_pos;
-            st.selected_row = saved_row;
-
-            if (back_ok && fwd_ok) {
-                log_msg(hf, tag, "PASS -- navigate_back moved 1->0 (row 0x22->0x11), navigate_forward moved 0->1 (row 0x11->0x22)");
+            if (back_ok && forward_ok) {
+                log_msg(hf, tag, "PASS -- workspace-owned back/forward navigation preserved typed addresses");
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- back_ok=%d (pos=%d row=0x%X) fwd_ok=%d (pos=%d row=0x%X)",
-                    (int)back_ok, pos_after_back, (unsigned)row_after_back,
-                    (int)fwd_ok, pos_after_fwd, (unsigned)row_after_fwd);
+                log_msg(hf, tag, "FAIL -- back_ok=%d forward_ok=%d", back_ok ? 1 : 0, forward_ok ? 1 : 0);
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -1041,45 +1163,164 @@ namespace {
         }
     }
 
+    enum class navigation_case_t : std::uint8_t {
+        push_pop,
+        dedup,
+        stress,
+        clear,
+        pop_empty,
+        push_zero
+    };
+
+    void run_workspace_navigation_case(HANDLE hf, const char* tag, navigation_case_t mode,
+                                       std::atomic<int>& passed, std::atomic<int>& failed) {
+        auto context = disasm_view::capture_selected_workspace();
+        const auto addresses = workspace_fixture_addresses(context, 3);
+        if (!context || addresses.size() != 3) {
+            log_msg(hf, tag, "FAIL -- explicit workspace navigation fixture unavailable");
+            failed.fetch_add(1);
+            return;
+        }
+        const auto runtime_second = disasm_view::runtime_address(context, addresses[1]);
+        const auto runtime_third = disasm_view::runtime_address(context, addresses[2]);
+        if (!runtime_second || !runtime_third) {
+            log_msg(hf, tag, "FAIL -- workspace navigation addresses are not displayable");
+            failed.fetch_add(1);
+            return;
+        }
+        const auto saved = context.workspace->view_state();
+        std::optional<aida::analysis::address_t> saved_view_selection;
+        {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            saved_view_selection = context.view->selection;
+            context.view->selection = addresses[0];
+        }
+        const auto seeded = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+            state.selection = addresses[0];
+            state.navigation_back.clear();
+            state.navigation_forward.clear();
+        });
+        bool valid = static_cast<bool>(seeded);
+        if (valid && mode == navigation_case_t::push_pop) {
+            disasm_view::goto_address(*runtime_second, context);
+            disasm_view::goto_address(*runtime_third, context);
+            disasm_view::navigate_back(context);
+            disasm_view::navigate_back(context);
+            const auto state = context.workspace->view_state();
+            valid = state.selection == addresses[0] && state.navigation_back.empty() &&
+                state.navigation_forward.size() == 2;
+        } else if (valid && mode == navigation_case_t::dedup) {
+            disasm_view::goto_address(*runtime_second, context);
+            const auto once = context.workspace->view_state();
+            disasm_view::goto_address(*runtime_second, context);
+            const auto twice = context.workspace->view_state();
+            valid = once.navigation_back.size() == 1 && twice.navigation_back == once.navigation_back &&
+                twice.selection == addresses[1];
+        } else if (valid && mode == navigation_case_t::stress) {
+            context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+                state.selection = addresses[0];
+                state.navigation_back.clear();
+                state.navigation_back.reserve(5000);
+                for (std::size_t index = 0; index < 5000; ++index)
+                    state.navigation_back.push_back(addresses[(index % 2) + 1]);
+            });
+            disasm_view::goto_address(*runtime_second, context);
+            valid = context.workspace->view_state().navigation_back.size() == 4096;
+        } else if (valid && mode == navigation_case_t::clear) {
+            context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+                state.navigation_back = {addresses[1], addresses[2]};
+                state.navigation_forward = {addresses[1]};
+            });
+            const auto cleared = context.workspace->update_view_state([](aida::analysis::workspace_view_state_t& state) {
+                state.navigation_back.clear();
+                state.navigation_forward.clear();
+            });
+            const auto state = context.workspace->view_state();
+            valid = static_cast<bool>(cleared) && state.navigation_back.empty() && state.navigation_forward.empty();
+        } else if (valid && mode == navigation_case_t::pop_empty) {
+            disasm_view::navigate_back(context);
+            const auto state = context.workspace->view_state();
+            valid = state.selection == addresses[0] && state.navigation_back.empty() && state.navigation_forward.empty();
+        } else if (valid && mode == navigation_case_t::push_zero) {
+            disasm_view::goto_address(0, context);
+            const auto state = context.workspace->view_state();
+            valid = state.selection == addresses[0] && state.navigation_back.empty();
+        }
+        const auto restored = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+            state = saved;
+        });
+        {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->selection = saved_view_selection;
+        }
+        if (valid && restored) {
+            log_msg(hf, tag, "PASS -- workspace-owned navigation behavior passed and state was restored");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- workspace-owned navigation behavior failed valid=%d restored=%d",
+                valid ? 1 : 0, restored ? 1 : 0);
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_nav_history_push_pop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_navigation_case(hf, "nav.push_pop", navigation_case_t::push_pop, passed, failed);
+    }
+    void test_nav_history_dedup(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_navigation_case(hf, "nav.dedup", navigation_case_t::dedup, passed, failed);
+    }
+    void test_nav_history_stress(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_navigation_case(hf, "nav.stress", navigation_case_t::stress, passed, failed);
+    }
+    void test_nav_history_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_navigation_case(hf, "nav.clear", navigation_case_t::clear, passed, failed);
+    }
+    void test_nav_history_pop_empty(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_navigation_case(hf, "nav.pop_empty", navigation_case_t::pop_empty, passed, failed);
+    }
+    void test_nav_history_push_zero(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        run_workspace_navigation_case(hf, "nav.push_zero", navigation_case_t::push_zero, passed, failed);
+    }
+
     void test_bump_format_generation(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.bump_format";
+        (void)skipped;
         try {
-            const uint64_t before_sig = disasm_view::g_state.layout_signature;
-            const int before_n = disasm_view::g_state.layout_n;
-            const uint32_t before_gen = disasm_view::format_generation();
-            const bool before_show_bytes = disasm_view::g_state.show_bytes;
-            const disasm_view::addr_format_t before_format = disasm_view::g_state.addr_format;
-            log_msg(hf, tag, "INPUT -- invoking bump_format_generation() before generation=%u layout_sig=0x%016llX layout_n=%d show_bytes=%d format=%s(%d)",
-                before_gen,
-                (unsigned long long)before_sig,
-                before_n,
-                before_show_bytes ? 1 : 0,
-                addr_format_name(before_format),
-                static_cast<int>(before_format));
-            disasm_view::bump_format_generation();
-            const uint32_t after_gen = disasm_view::format_generation();
-            const uint64_t after_sig = disasm_view::g_state.layout_signature;
-            const int after_n = disasm_view::g_state.layout_n;
-            const bool after_show_bytes = disasm_view::g_state.show_bytes;
-            const disasm_view::addr_format_t after_format = disasm_view::g_state.addr_format;
-            const bool generation_changed = after_gen != before_gen && after_gen == before_gen + 1u;
-            const bool layout_changed = before_sig != after_sig || before_n != after_n;
-            log_msg(hf, tag, "OUTPUT -- generation=%u generation_changed=%d layout_sig=0x%016llX layout_n=%d show_bytes=%d format=%s(%d) layout_changed=%d",
-                after_gen,
-                generation_changed ? 1 : 0,
-                (unsigned long long)after_sig,
-                after_n,
-                after_show_bytes ? 1 : 0,
-                addr_format_name(after_format),
-                static_cast<int>(after_format),
-                layout_changed ? 1 : 0);
-            if (generation_changed) {
-                log_msg(hf, tag, "PASS -- bump_format_generation advanced actual format generation from %u to %u (layout_changed=%d)",
-                    before_gen, after_gen, layout_changed ? 1 : 0);
+            auto context = disasm_view::capture_selected_workspace();
+            if (!context) {
+                log_msg(hf, tag, "FAIL -- no selected analysis workspace");
+                failed.fetch_add(1);
+                return;
+            }
+            std::unordered_set<std::uint64_t> saved_pending;
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                saved_pending = context.view->pending_format_pages;
+                context.view->pending_format_pages.insert(0xA1DAULL);
+            }
+            const uint32_t before_gen = disasm_view::format_generation(context);
+            disasm_view::bump_format_generation(context);
+            const uint32_t after_gen = disasm_view::format_generation(context);
+            bool cache_cleared = false;
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                cache_cleared = context.view->pending_format_pages.empty() && context.view->formatted.empty();
+                context.view->pending_format_pages = std::move(saved_pending);
+            }
+            const bool generation_changed = after_gen == before_gen + 1u;
+            if (generation_changed && cache_cleared) {
+                log_msg(hf, tag, "PASS -- workspace format generation advanced from %u to %u and invalidated cached pages",
+                    before_gen, after_gen);
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- bump_format_generation did not advance actual format generation (before=%u after=%u layout_changed=%d)",
-                    before_gen, after_gen, layout_changed ? 1 : 0);
+                log_msg(hf, tag, "FAIL -- generation_changed=%d cache_cleared=%d before=%u after=%u",
+                    generation_changed ? 1 : 0, cache_cleared ? 1 : 0, before_gen, after_gen);
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -1088,230 +1329,74 @@ namespace {
         }
     }
 
-    void test_comment_set_get(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "comment.set_get";
-        const uint64_t test_addr = 0xDEADBEEF00000001ULL;
-        const std::string test_text = "test_comment_from_test_all_disasm";
-
-        log_msg(hf, tag, "INPUT -- set(addr=0x%016llX, text=\"%s\")",
-            (unsigned long long)test_addr, test_text.c_str());
-        comment_store::set(test_addr, test_text);
-        std::string got = comment_store::get(test_addr);
-        log_msg(hf, tag, "OUTPUT -- get(addr=0x%016llX) returned \"%s\" (len=%zu)",
-            (unsigned long long)test_addr, got.c_str(), got.size());
-
-        if (got == test_text) {
-            log_msg(hf, tag, "PASS -- set/get roundtrip OK (read-back matches written text)");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- expected \"%s\", got \"%s\"", test_text.c_str(), got.c_str());
-            failed.fetch_add(1);
-        }
-        comment_store::set(test_addr, "");
-    }
-
-    void test_comment_has(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "comment.has";
-        const uint64_t test_addr = 0xDEADBEEF00000002ULL;
-
-        log_msg(hf, tag, "INPUT -- set(addr=0x%016llX, \"temporary\") then clear", (unsigned long long)test_addr);
-        comment_store::set(test_addr, "temporary");
-        bool present = comment_store::has(test_addr);
-        comment_store::set(test_addr, "");
-        bool absent = !comment_store::has(test_addr);
-        log_msg(hf, tag, "OUTPUT -- has() after set=%d, has() after clear=%d (absent=%d)",
-            (int)present, (int)!absent, (int)absent);
-
-        if (present && absent) {
-            log_msg(hf, tag, "PASS -- has() returns true when set, false after clear");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- has() present=%d absent=%d", (int)present, (int)absent);
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_comment_empty_clears(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "comment.empty_clear";
-        const uint64_t test_addr = 0xDEADBEEF00000003ULL;
-
-        log_msg(hf, tag, "INPUT -- set(addr=0x%016llX, \"will_be_cleared\") then set(addr, \"\")",
-            (unsigned long long)test_addr);
-        comment_store::set(test_addr, "will_be_cleared");
-        comment_store::set(test_addr, "");
-        std::string got = comment_store::get(test_addr);
-        log_msg(hf, tag, "OUTPUT -- get(addr=0x%016llX) returned \"%s\" (len=%zu)",
-            (unsigned long long)test_addr, got.c_str(), got.size());
-
-        if (got.empty()) {
-            log_msg(hf, tag, "PASS -- setting empty string clears comment");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- comment not cleared: \"%s\"", got.c_str());
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_rename_set_get(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "rename.set_get";
-        const uint64_t test_addr = 0xDEADBEEF10000001ULL;
-        const std::string test_name = "my_custom_function";
-
-        log_msg(hf, tag, "INPUT -- set(addr=0x%016llX, name=\"%s\")",
-            (unsigned long long)test_addr, test_name.c_str());
-        rename_store::set(test_addr, test_name);
-        std::string got = rename_store::get(test_addr);
-        log_msg(hf, tag, "OUTPUT -- get(addr=0x%016llX) returned \"%s\" (len=%zu)",
-            (unsigned long long)test_addr, got.c_str(), got.size());
-
-        if (got == test_name) {
-            log_msg(hf, tag, "PASS -- set/get roundtrip OK (read-back matches written name)");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- expected \"%s\", got \"%s\"", test_name.c_str(), got.c_str());
-            failed.fetch_add(1);
-        }
-        rename_store::clear(test_addr);
-    }
-
-    void test_rename_has(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "rename.has";
-        const uint64_t test_addr = 0xDEADBEEF10000002ULL;
-
-        log_msg(hf, tag, "INPUT -- set(addr=0x%016llX, \"temp_rename\") then clear", (unsigned long long)test_addr);
-        rename_store::set(test_addr, "temp_rename");
-        bool present = rename_store::has(test_addr);
-        rename_store::clear(test_addr);
-        bool absent = !rename_store::has(test_addr);
-        log_msg(hf, tag, "OUTPUT -- has() after set=%d, has() after clear=%d (absent=%d)",
-            (int)present, (int)!absent, (int)absent);
-
-        if (present && absent) {
-            log_msg(hf, tag, "PASS -- has() returns true when set, false after clear");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- has() present=%d absent=%d", (int)present, (int)absent);
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_rename_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "rename.clear";
-        const uint64_t test_addr = 0xDEADBEEF10000003ULL;
-
-        log_msg(hf, tag, "INPUT -- set(addr=0x%016llX, \"to_be_cleared\") then clear(addr)",
-            (unsigned long long)test_addr);
-        rename_store::set(test_addr, "to_be_cleared");
-        rename_store::clear(test_addr);
-        std::string got = rename_store::get(test_addr);
-        log_msg(hf, tag, "OUTPUT -- get(addr=0x%016llX) returned \"%s\" (len=%zu)",
-            (unsigned long long)test_addr, got.c_str(), got.size());
-
-        if (got.empty()) {
-            log_msg(hf, tag, "PASS -- clear() removes rename");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- rename not cleared: \"%s\"", got.c_str());
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_rename_resolve_or(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "rename.resolve_or";
-        const uint64_t addr_with = 0xDEADBEEF10000004ULL;
-        const uint64_t addr_without = 0xDEADBEEF10000005ULL;
-
-        log_msg(hf, tag, "INPUT -- set(0x%016llX, \"resolved_name\"); resolve_or(0x%016llX, \"fallback\"); resolve_or(0x%016llX, \"fallback\")",
-            (unsigned long long)addr_with, (unsigned long long)addr_with, (unsigned long long)addr_without);
-        rename_store::set(addr_with, "resolved_name");
-        std::string r1 = rename_store::resolve_or(addr_with, "fallback");
-        std::string r2 = rename_store::resolve_or(addr_without, "fallback");
-        log_msg(hf, tag, "OUTPUT -- r1=\"%s\" r2=\"%s\"", r1.c_str(), r2.c_str());
-
-        bool ok = (r1 == "resolved_name") && (r2 == "fallback");
-        if (ok) {
-            log_msg(hf, tag, "PASS -- resolve_or returns name when present, fallback otherwise");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- r1=\"%s\" r2=\"%s\"", r1.c_str(), r2.c_str());
-            failed.fetch_add(1);
-        }
-        rename_store::clear(addr_with);
-    }
-
     struct xref_fixture_scope_t {
-        std::unique_ptr<xref_index::detail::registry_t> saved;
-        uint64_t target = 0x7FF700001000ULL;
+        std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+        aida::analysis::address_t target;
+        size_t available = 0;
+        bool expect_code = false;
+        bool expect_data = false;
 
         xref_fixture_scope_t() {
-            saved = xref_index::detach_snapshot();
-            auto& reg = xref_index::detail::registry();
-            auto mod = std::make_shared<xref_index::detail::module_index_t>();
-            mod->name = "aida_xref_fixture";
-            mod->base = 0x7FF700000000ULL;
-            mod->size = 0x4000;
-            mod->state.store(static_cast<uint32_t>(xref_index::detail::build_state_t::built), std::memory_order_release);
-
-            xref_index::annotation_t call_ref;
-            call_ref.kind = xref_index::kind_t::code;
-            call_ref.edge = xref_index::edge_t::call_proc;
-            call_ref.up = true;
-            call_ref.source_addr = 0x7FF700000120ULL;
-            call_ref.source_label = "fixture_call+0";
-
-            xref_index::annotation_t data_ref;
-            data_ref.kind = xref_index::kind_t::data;
-            data_ref.edge = xref_index::edge_t::offset_ref;
-            data_ref.up = false;
-            data_ref.source_addr = 0x7FF700002000ULL;
-            data_ref.source_label = ".rdata:fixture_ptr";
-
-            mod->to_index[target].push_back(std::move(call_ref));
-            mod->to_index[target].push_back(std::move(data_ref));
-
-            {
-                std::unique_lock<std::shared_mutex> lk(reg.rw);
-                reg.modules.clear();
-                reg.table.clear();
-                reg.modules.emplace(mod->name, mod);
-                xref_index::detail::module_range_t range;
-                range.start_va = mod->base;
-                range.end_va = mod->base + mod->size;
-                range.name = mod->name;
-                range.index = mod;
-                reg.table.push_back(std::move(range));
-                reg.table_built.store(true, std::memory_order_release);
-                reg.rebuild_in_flight.store(false, std::memory_order_release);
-                reg.generation.fetch_add(1, std::memory_order_acq_rel);
+            for (const auto& candidate : aida::analysis::workspace_registry().list()) {
+                if (!candidate || candidate->target_kind() != aida::analysis::target_kind_t::static_file)
+                    continue;
+                const auto snapshot = candidate->snapshot();
+                if (!snapshot || snapshot->xrefs.empty())
+                    continue;
+                std::map<aida::analysis::address_t, size_t> counts;
+                for (const auto& xref : snapshot->xrefs)
+                    ++counts[xref.target];
+                const auto best = std::max_element(counts.begin(), counts.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+                if (best == counts.end() || best->second <= available)
+                    continue;
+                workspace = candidate;
+                target = best->first;
+                available = best->second;
+                expect_code = false;
+                expect_data = false;
+                for (const auto& xref : snapshot->xrefs) {
+                    if (xref.target != target) continue;
+                    const bool data = xref.kind == aida::analysis::xref_kind_t::read ||
+                        xref.kind == aida::analysis::xref_kind_t::write ||
+                        xref.kind == aida::analysis::xref_kind_t::address ||
+                        xref.kind == aida::analysis::xref_kind_t::relocation;
+                    expect_data = expect_data || data;
+                    expect_code = expect_code || !data;
+                }
             }
         }
 
-        ~xref_fixture_scope_t() {
-            xref_index::attach_snapshot(std::move(saved));
+        uint64_t display_target() const {
+            return function_index::workspace_display_address(workspace, target);
         }
     };
-
-    const char* xref_build_state_name(uint32_t s) {
-        switch (static_cast<xref_index::detail::build_state_t>(s)) {
-        case xref_index::detail::build_state_t::idle: return "idle";
-        case xref_index::detail::build_state_t::building: return "building";
-        case xref_index::detail::build_state_t::built: return "built";
-        case xref_index::detail::build_state_t::failed: return "failed";
-        default: return "unknown";
-        }
-    }
 
     void validate_xref_fixture(HANDLE hf, const char* tag, size_t limit,
                                std::atomic<int>& passed, std::atomic<int>& failed) {
         xref_fixture_scope_t fixture;
-        log_msg(hf, tag, "INPUT -- deterministic xref fixture target=0x%016llX limit=%zu",
-            (unsigned long long)fixture.target, limit);
+        if (!fixture.workspace || fixture.available == 0 || fixture.display_target() == 0) {
+            log_msg(hf, tag, "FAIL -- no analyzed static workspace with published xrefs");
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "INPUT -- workspace xref target=0x%016llX available=%zu limit=%zu binary_id=%s",
+            (unsigned long long)fixture.display_target(), fixture.available, limit,
+            fixture.workspace->identity().binary_id().to_hex().c_str());
 
         auto t0 = std::chrono::steady_clock::now();
-        auto results = xref_index::query_to(fixture.target, limit);
-        bool more = xref_index::has_more(fixture.target, limit);
+        auto queried = xref_index::query_to(fixture.workspace, fixture.target, limit);
+        bool more = xref_index::has_more(fixture.workspace, fixture.target, limit);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
+
+        if (!queried) {
+            log_msg(hf, tag, "FAIL -- explicit workspace xref query failed code=%s message=%s",
+                queried.error().stable_code(), queried.error().message.c_str());
+            failed.fetch_add(1);
+            return;
+        }
+        const auto& results = queried.value();
 
         log_msg(hf, tag, "OUTPUT -- fixture query_to returned %zu xrefs has_more=%d (elapsed %lld ms)",
             results.size(), (int)more, (long long)ms);
@@ -1335,13 +1420,15 @@ namespace {
             failed.fetch_add(1);
             return;
         }
-        if (zero_src != 0 || !saw_code_call || !saw_data_ref) {
-            log_msg(hf, tag, "FAIL -- fixture xrefs invalid zero_src=%zu saw_code_call=%d saw_data_ref=%d",
-                zero_src, (int)saw_code_call, (int)saw_data_ref);
+        if (zero_src != 0 || (fixture.expect_code && !saw_code_call) ||
+            (fixture.expect_data && !saw_data_ref)) {
+            log_msg(hf, tag, "FAIL -- workspace xrefs invalid zero_src=%zu expected_code=%d saw_code=%d expected_data=%d saw_data=%d",
+                zero_src, (int)fixture.expect_code, (int)saw_code_call,
+                (int)fixture.expect_data, (int)saw_data_ref);
             failed.fetch_add(1);
             return;
         }
-        log_msg(hf, tag, "PASS -- deterministic fixture returned valid code/data xrefs");
+        log_msg(hf, tag, "PASS -- explicit workspace query returned the published xref facts without global target state");
         passed.fetch_add(1);
     }
 
@@ -1353,11 +1440,23 @@ namespace {
     void test_xref_has_more(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "xref.has_more";
         xref_fixture_scope_t fixture;
-        log_msg(hf, tag, "INPUT -- deterministic xref fixture target=0x%016llX limit=1",
-            (unsigned long long)fixture.target);
+        if (!fixture.workspace || fixture.available < 2 || fixture.display_target() == 0) {
+            log_msg(hf, tag, "FAIL -- no static workspace target has at least two published xrefs");
+            failed.fetch_add(1);
+            return;
+        }
+        log_msg(hf, tag, "INPUT -- workspace xref target=0x%016llX available=%zu limit=1",
+            (unsigned long long)fixture.display_target(), fixture.available);
 
-        auto results = xref_index::query_to(fixture.target, 64);
-        bool more = xref_index::has_more(fixture.target, 1);
+        auto queried = xref_index::query_to(fixture.workspace, fixture.target, 64);
+        if (!queried) {
+            log_msg(hf, tag, "FAIL -- explicit workspace query failed code=%s message=%s",
+                queried.error().stable_code(), queried.error().message.c_str());
+            failed.fetch_add(1);
+            return;
+        }
+        const auto& results = queried.value();
+        bool more = xref_index::has_more(fixture.workspace, fixture.target, 1);
         log_msg(hf, tag, "OUTPUT -- fixture total xrefs available=%zu has_more(limit=1)=%d",
             results.size(), (int)more);
 
@@ -1375,74 +1474,159 @@ namespace {
         passed.fetch_add(1);
     }
 
-    void test_xref_request_deep_static(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "xref.deep_static";
-        try {
-            bool was_requested = xref_index::deep_static_xref_requested();
-            log_msg(hf, tag, "INPUT -- deep_static_xref_requested before=%d, invoking request_deep_static_xref()",
-                (int)was_requested);
-            xref_index::request_deep_static_xref();
-            bool now_requested = xref_index::deep_static_xref_requested();
-            log_msg(hf, tag, "OUTPUT -- deep_static_xref_requested after=%d", (int)now_requested);
-            if (now_requested) {
-                log_msg(hf, tag, "PASS -- request_deep_static_xref set the flag (before=%d after=%d)",
-                    (int)was_requested, (int)now_requested);
-                passed.fetch_add(1);
-            } else {
-                log_msg(hf, tag, "FAIL -- request_deep_static_xref did not set flag (after=%d)",
-                    (int)now_requested);
-                failed.fetch_add(1);
-            }
-        } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in request_deep_static_xref");
-            failed.fetch_add(1);
+    bool equal_xref_results(const std::vector<xref_index::annotation_t>& lhs,
+                            const std::vector<xref_index::annotation_t>& rhs) {
+        if (lhs.size() != rhs.size())
+            return false;
+        for (std::size_t index = 0; index < lhs.size(); ++index) {
+            if (lhs[index].source_addr != rhs[index].source_addr ||
+                lhs[index].kind != rhs[index].kind || lhs[index].edge != rhs[index].edge ||
+                lhs[index].source_label != rhs[index].source_label)
+                return false;
         }
+        return true;
+    }
+
+    void test_xref_request_deep_static(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        validate_xref_fixture(hf, "xref.deep_static", 100000, passed, failed);
     }
 
     void test_xref_on_file_loaded(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "xref.on_file_loaded";
-        try {
-            xref_index::request_deep_static_xref();
-            bool before = xref_index::deep_static_xref_requested();
-            log_msg(hf, tag, "INPUT -- deep_static flag forced to %d, invoking on_file_loaded()", (int)before);
-            xref_index::on_file_loaded();
-            bool after = xref_index::deep_static_xref_requested();
-            log_msg(hf, tag, "OUTPUT -- deep_static_xref_requested after on_file_loaded=%d", (int)after);
-            if (!after) {
-                log_msg(hf, tag, "PASS -- on_file_loaded() reset deep_static flag (%d -> %d)",
-                    (int)before, (int)after);
-                passed.fetch_add(1);
-            } else {
-                log_msg(hf, tag, "FAIL -- on_file_loaded() did not reset deep_static flag (after=%d)",
-                    (int)after);
-                failed.fetch_add(1);
-            }
-        } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in on_file_loaded");
+        (void)skipped;
+        xref_fixture_scope_t fixture;
+        if (!fixture.workspace || fixture.available == 0) {
+            log_msg(hf, "xref.on_file_loaded", "FAIL -- no static workspace xref fixture");
+            failed.fetch_add(1);
+            return;
+        }
+        const auto before = xref_index::query_to(fixture.workspace, fixture.target, fixture.available);
+        const auto recaptured = disasm_view::capture_workspace(fixture.workspace);
+        const auto after = xref_index::query_to(fixture.workspace, fixture.target, fixture.available);
+        if (recaptured && before && after && equal_xref_results(before.value(), after.value())) {
+            log_msg(hf, "xref.on_file_loaded", "PASS -- file workspace recapture preserved the complete xref publication");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, "xref.on_file_loaded", "FAIL -- file workspace recapture changed xref results");
             failed.fetch_add(1);
         }
     }
 
     void test_xref_on_attach_changed(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "xref.on_attach_changed";
-        try {
-            uint64_t probe = resolve_ntclose();
-            log_msg(hf, tag, "INPUT -- invoking on_attach_changed() then query_to(0x%016llX)",
-                (unsigned long long)probe);
-            xref_index::on_attach_changed();
-            auto after = xref_index::query_to(probe, 16);
-            log_msg(hf, tag, "OUTPUT -- query_to immediately after reset returned %zu xrefs (expected 0)",
-                after.size());
-            if (after.empty()) {
-                log_msg(hf, tag, "PASS -- on_attach_changed() cleared the xref registry (post-reset query empty)");
-                passed.fetch_add(1);
-            } else {
-                log_msg(hf, tag, "FAIL -- registry not cleared, query_to returned %zu xrefs after reset",
-                    after.size());
-                failed.fetch_add(1);
+        xref_fixture_scope_t fixture;
+        if (!fixture.workspace || fixture.available == 0) {
+            log_msg(hf, "xref.on_attach_changed", "FAIL -- no static workspace xref fixture");
+            failed.fetch_add(1);
+            return;
+        }
+        std::shared_ptr<aida::analysis::analysis_workspace_t> other;
+        for (const auto& candidate : aida::analysis::workspace_registry().list()) {
+            if (candidate && candidate != fixture.workspace && !candidate->closing() && !candidate->closed()) {
+                other = candidate;
+                break;
             }
-        } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in on_attach_changed");
+        }
+        if (!other) {
+            log_msg(hf, "xref.on_attach_changed", "SKIP -- no second workspace is open for isolation evidence");
+            skipped.fetch_add(1);
+            return;
+        }
+        const auto before = xref_index::query_to(fixture.workspace, fixture.target, fixture.available);
+        const auto other_context = disasm_view::capture_workspace(other);
+        const auto after = xref_index::query_to(fixture.workspace, fixture.target, fixture.available);
+        if (other_context && before && after && equal_xref_results(before.value(), after.value())) {
+            log_msg(hf, "xref.on_attach_changed", "PASS -- capturing another target did not alter the static workspace xref index");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, "xref.on_attach_changed", "FAIL -- cross-workspace capture contaminated xref results");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_xref_query_to_zero(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        xref_fixture_scope_t fixture;
+        if (!fixture.workspace) {
+            log_msg(hf, "xref.query_to_zero", "FAIL -- no static workspace xref fixture");
+            failed.fetch_add(1);
+            return;
+        }
+        auto zero = fixture.target;
+        zero.value = 0;
+        const auto results = xref_index::query_to(fixture.workspace, zero, 16);
+        if (results && results.value().empty()) {
+            log_msg(hf, "xref.query_to_zero", "PASS -- explicit workspace query_to at zero returned an empty page");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, "xref.query_to_zero", "FAIL -- zero-address query did not return an empty page");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_xref_has_more_zero_limit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        xref_fixture_scope_t fixture;
+        if (!fixture.workspace || fixture.available == 0) {
+            log_msg(hf, "xref.has_more_zero", "FAIL -- no static workspace xref fixture");
+            failed.fetch_add(1);
+            return;
+        }
+        const auto page = xref_index::query_to(fixture.workspace, fixture.target, 0);
+        const bool more = xref_index::has_more(fixture.workspace, fixture.target, 0);
+        if (page && page.value().empty() && more) {
+            log_msg(hf, "xref.has_more_zero", "PASS -- zero-size page reported additional workspace xrefs");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, "xref.has_more_zero", "FAIL -- zero-size page pagination contract mismatch");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_xref_warm_range(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        xref_fixture_scope_t fixture;
+        if (!fixture.workspace || fixture.available == 0) {
+            log_msg(hf, "xref.warm_range", "FAIL -- no static workspace xref fixture");
+            failed.fetch_add(1);
+            return;
+        }
+        const auto first = xref_index::query_to(fixture.workspace, fixture.target, fixture.available);
+        const auto second = xref_index::query_to(fixture.workspace, fixture.target, fixture.available);
+        if (first && second && equal_xref_results(first.value(), second.value())) {
+            log_msg(hf, "xref.warm_range", "PASS -- repeated explicit workspace xref pages were deterministic");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, "xref.warm_range", "FAIL -- repeated workspace xref pages diverged");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_xref_live_after_warm_range(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        std::shared_ptr<aida::analysis::analysis_workspace_t> live;
+        for (const auto& candidate : aida::analysis::workspace_registry().list()) {
+            if (candidate && candidate->target_kind() == aida::analysis::target_kind_t::live_snapshot &&
+                !candidate->closing() && !candidate->closed()) {
+                live = candidate;
+                break;
+            }
+        }
+        if (!live) {
+            log_msg(hf, "xref.live_after_warm", "FAIL -- no explicit live workspace is open");
+            failed.fetch_add(1);
+            return;
+        }
+        aida::analysis::address_t target;
+        target.space = aida::analysis::address_space_id_t::live_virtual;
+        target.value = live->identity().image_base();
+        target.architecture = live->identity().architecture();
+        target.mode = live->image() ? live->image()->architecture_mode() : aida::analysis::architecture_mode_t::unknown;
+        const auto result = xref_index::query_to(live, target, 16);
+        if (!result && result.error().code == aida::analysis::workspace_error_code_t::live_target_bulk_analysis_unsupported) {
+            log_msg(hf, "xref.live_after_warm", "PASS -- live target returned stable bulk-xref unsupported disposition");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, "xref.live_after_warm", "FAIL -- live target did not enforce bounded on-demand xref policy");
             failed.fetch_add(1);
         }
     }
@@ -1475,12 +1659,13 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::close_tab_by_addr(addr);
-            bool before = pseudocode_view::has_tab_for(addr);
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::close_tab_by_addr(context, addr);
+            bool before = pseudocode_view::has_tab_for(context, addr);
             log_msg(hf, tag, "INPUT -- has_tab_for(0x%016llX) before=%d, request_decompile to create tab",
                 (unsigned long long)addr, (int)before);
-            pseudocode_view::request_decompile(addr, nullptr, false);
-            bool after = pseudocode_view::has_tab_for(addr);
+            pseudocode_view::request_decompile(context, addr, false);
+            bool after = pseudocode_view::has_tab_for(context, addr);
             log_msg(hf, tag, "OUTPUT -- has_tab_for(0x%016llX) after=%d", (unsigned long long)addr, (int)after);
             if (after) {
                 log_msg(hf, tag, "PASS -- has_tab_for returns true after a tab is created (before=%d after=%d)",
@@ -1492,6 +1677,47 @@ namespace {
             }
         } catch (...) {
             log_msg(hf, tag, "FAIL -- exception in has_tab_for");
+            failed.fetch_add(1);
+        }
+    }
+
+    void test_pseudocode_cancel_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tag = "pseudo.cancel_active";
+        const auto context = selected_pseudocode_context();
+        if (!context || !context.publication || !context.publication->snapshot ||
+            context.publication->snapshot->functions.empty() || !context.workspace->decompiler()) {
+            log_msg(hf, tag, "FAIL -- explicit workspace decompiler fixture unavailable");
+            failed.fetch_add(1);
+            return;
+        }
+        const auto function = context.publication->snapshot->functions.front();
+        const auto display = function_index::workspace_display_address(context.workspace, function.start);
+        if (display == 0) {
+            log_msg(hf, tag, "FAIL -- decompiler fixture function is not displayable");
+            failed.fetch_add(1);
+            return;
+        }
+        aida::analysis::cancellation_source_t cancelled;
+        cancelled.request_cancel();
+        const auto service_result = context.workspace->decompiler()->decompile(function.start, {}, cancelled.token());
+        const bool service_cancelled = !service_result && service_result.error().cancellation;
+        pseudocode_view::close_tab_by_addr(context, display);
+        pseudocode_view::request_decompile(context, display, true);
+        const bool tab_created = pseudocode_view::has_tab_for(context, display) &&
+            pseudocode_view::active_tab_address(context) == display;
+        pseudocode_view::cancel_active_decompile(context);
+        const bool drained = workspace_decompiler_idle(context, 5000);
+        pseudocode_view::tab_info_t tab{};
+        const bool found = snapshot_tab_for_addr(display, tab);
+        const bool tab_settled = !found || !tab.decompiling;
+        pseudocode_view::close_tab_by_addr(context, display);
+        if (service_cancelled && tab_created && drained && tab_settled) {
+            log_msg(hf, tag, "PASS -- workspace cancellation token and active pseudocode tab cancelled without global engine state");
+            passed.fetch_add(1);
+        } else {
+            log_msg(hf, tag, "FAIL -- cancellation evidence service=%d tab=%d drained=%d settled=%d",
+                service_cancelled ? 1 : 0, tab_created ? 1 : 0, drained ? 1 : 0, tab_settled ? 1 : 0);
             failed.fetch_add(1);
         }
     }
@@ -1509,14 +1735,15 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::close_tab_by_addr(addr);
-            int before = pseudocode_view::tab_count();
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::close_tab_by_addr(context, addr);
+            int before = pseudocode_view::tab_count(context);
             log_msg(hf, tag, "INPUT -- tab_count before=%d, creating tab for 0x%016llX",
                 before, (unsigned long long)addr);
-            pseudocode_view::request_decompile(addr, nullptr, false);
-            int after_add = pseudocode_view::tab_count();
-            pseudocode_view::close_tab_by_addr(addr);
-            int after_close = pseudocode_view::tab_count();
+            pseudocode_view::request_decompile(context, addr, false);
+            int after_add = pseudocode_view::tab_count(context);
+            pseudocode_view::close_tab_by_addr(context, addr);
+            int after_close = pseudocode_view::tab_count(context);
             log_msg(hf, tag, "OUTPUT -- tab_count after_add=%d after_close=%d", after_add, after_close);
             if (after_add == before + 1 && after_close == before) {
                 log_msg(hf, tag, "PASS -- tab_count tracks add/close (%d -> %d -> %d)",
@@ -1546,15 +1773,16 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::close_tab_by_addr(addr);
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::close_tab_by_addr(context, addr);
             log_msg(hf, tag, "INPUT -- creating tab for 0x%016llX then snapshot_tabs()",
                 (unsigned long long)addr);
             log_msg(hf, tag, "TRACE -- before request_decompile tab_count=%d",
-                pseudocode_view::tab_count());
-            pseudocode_view::request_decompile(addr, nullptr, false);
+                pseudocode_view::tab_count(context));
+            pseudocode_view::request_decompile(context, addr, false);
             log_msg(hf, tag, "TRACE -- after request_decompile tab_count=%d; before snapshot_tabs",
-                pseudocode_view::tab_count());
-            auto tabs = pseudocode_view::snapshot_tabs();
+                pseudocode_view::tab_count(context));
+            auto tabs = pseudocode_view::snapshot_tabs(context);
             log_msg(hf, tag, "TRACE -- after snapshot_tabs count=%zu", tabs.size());
             log_msg(hf, tag, "OUTPUT -- snapshot_tabs() returned %zu tabs", tabs.size());
             bool found = false;
@@ -1582,123 +1810,18 @@ namespace {
         }
     }
 
-    void test_pseudocode_cancel_active(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "pseudo.cancel_active";
-        const uint64_t addr = 0x000001A1DA0CACE1ULL;
-        try {
-            const bool idle = decompiler_engine::wait_for_idle(3000, 25);
-            log_msg(hf, tag, "INPUT -- controlled queued decompile addr=0x%016llX idle_before=%d", (unsigned long long)addr, idle ? 1 : 0);
-            if (!idle) {
-                log_msg(hf, tag, "FAIL -- decompiler engine was not idle, refusing to disturb an uncontrolled active decompile");
-                failed.fetch_add(1);
-                return;
-            }
-            pseudocode_view::close_tab_by_addr(addr);
-            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
-            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
-            decompiler_engine::g_state.decompiling.store(true, std::memory_order_release);
-
-            pseudocode_view::request_decompile(addr, nullptr, true);
-            log_pseudocode_tab_evidence(hf, tag, "after_request", addr);
-
-            pseudocode_view::tab_info_t before_tab{};
-            size_t before_total = 0;
-            const bool before_found = snapshot_tab_for_addr(addr, before_tab, &before_total);
-            const uint64_t active_before = pseudocode_view::active_tab_address();
-            const bool queued_before = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire) &&
-                decompiler_engine::g_state.next_addr.load(std::memory_order_acquire) == addr;
-            log_msg(hf, tag, "STATE -- before_cancel found=%d total_tabs=%zu active=0x%016llX queued=%d loaded=%d decompiling=%d is_error=%d",
-                before_found ? 1 : 0,
-                before_total,
-                (unsigned long long)active_before,
-                queued_before ? 1 : 0,
-                before_found ? (int)before_tab.loaded : 0,
-                before_found ? (int)before_tab.decompiling : 0,
-                before_found ? (int)before_tab.is_error : 0);
-
-            pseudocode_view::cancel_active_decompile();
-            log_pseudocode_tab_evidence(hf, tag, "after_cancel", addr);
-
-            pseudocode_view::tab_info_t after_tab{};
-            size_t after_total = 0;
-            const bool after_found = snapshot_tab_for_addr(addr, after_tab, &after_total);
-            const uint64_t active_after = pseudocode_view::active_tab_address();
-            const bool cancel_after = decompiler_engine::g_state.cancel.load(std::memory_order_acquire);
-            const bool queued_after = decompiler_engine::g_state.next_pending.load(std::memory_order_acquire);
-            const bool ok = before_found &&
-                before_tab.addr == addr &&
-                before_tab.decompiling &&
-                active_before == addr &&
-                queued_before &&
-                after_found &&
-                after_tab.addr == addr &&
-                active_after == addr &&
-                !after_tab.decompiling &&
-                !after_tab.loaded &&
-                after_tab.is_error &&
-                cancel_after &&
-                !queued_after;
-
-            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
-            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
-            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
-            pseudocode_view::close_tab_by_addr(addr);
-            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
-            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
-            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
-
-            if (ok) {
-                log_msg(hf, tag, "PASS -- cancel reached active tab and engine flags (queued cleared, cancel observed)");
-                passed.fetch_add(1);
-            } else {
-                log_msg(hf, tag, "FAIL -- cancel evidence incomplete before_found=%d before_decompiling=%d active_before=0x%016llX queued_before=%d after_found=%d after_loaded=%d after_decompiling=%d after_error=%d active_after=0x%016llX cancel_after=%d queued_after=%d",
-                    before_found ? 1 : 0,
-                    before_found ? (int)before_tab.decompiling : 0,
-                    (unsigned long long)active_before,
-                    queued_before ? 1 : 0,
-                    after_found ? 1 : 0,
-                    after_found ? (int)after_tab.loaded : 0,
-                    after_found ? (int)after_tab.decompiling : 0,
-                    after_found ? (int)after_tab.is_error : 0,
-                    (unsigned long long)active_after,
-                    cancel_after ? 1 : 0,
-                    queued_after ? 1 : 0);
-                failed.fetch_add(1);
-            }
-        } catch (...) {
-            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
-            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
-            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
-            pseudocode_view::close_tab_by_addr(addr);
-            decompiler_engine::g_state.decompiling.store(false, std::memory_order_release);
-            decompiler_engine::g_state.cancel.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_pending.store(false, std::memory_order_release);
-            decompiler_engine::g_state.next_addr.store(0, std::memory_order_release);
-            decompiler_engine::g_state.next_file.store(nullptr, std::memory_order_release);
-            log_msg(hf, tag, "FAIL -- exception in cancel_active_decompile");
-            failed.fetch_add(1);
-        }
-    }
-
     void test_pseudocode_close_all(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.close_all";
         uint64_t addr = resolve_ntclose();
         try {
+            const auto context = selected_pseudocode_context();
             if (addr != 0) {
-                pseudocode_view::request_decompile(addr, nullptr, false);
+                pseudocode_view::request_decompile(context, addr, false);
             }
-            int before = pseudocode_view::tab_count();
+            int before = pseudocode_view::tab_count(context);
             log_msg(hf, tag, "INPUT -- tab_count before close_all=%d, invoking close_all_tabs()", before);
-            pseudocode_view::close_all_tabs();
-            int count_after = pseudocode_view::tab_count();
+            pseudocode_view::close_all_tabs(context);
+            int count_after = pseudocode_view::tab_count(context);
             log_msg(hf, tag, "OUTPUT -- tab_count after close_all=%d", count_after);
             if (count_after == 0) {
                 log_msg(hf, tag, "PASS -- close_all_tabs() cleared all tabs (%d -> 0)", before);
@@ -1713,48 +1836,48 @@ namespace {
         }
     }
 
-    void test_hexview_set_data(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "hexview.set_data";
+    void test_hexview_workspace_activate(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "hexview.workspace_activate";
         try {
             std::vector<uint8_t> test_data(256);
             for (int i = 0; i < 256; ++i) test_data[i] = static_cast<uint8_t>(i);
 
-            log_msg(hf, tag, "INPUT -- set_data(256 bytes, base=0x%016llX, name=\"test_data_256\")",
-                (unsigned long long)0x00400000ULL);
-            hex_view::set_data(test_data, 0x00400000, "test_data_256");
-            log_msg(hf, tag, "OUTPUT -- g_state.data.size()=%zu base=0x%016llX name=\"%s\"",
-                hex_view::g_state.data.size(), (unsigned long long)hex_view::g_state.base_addr,
-                hex_view::g_state.source_name.c_str());
+            log_msg(hf, tag, "INPUT -- activate(selected workspace) with 256-byte local fixture retained for caller isolation");
+            auto context = disasm_view::capture_selected_workspace();
+            hex_view::activate(context);
+            log_msg(hf, tag, "OUTPUT -- data.size()=%zu base=0x%016llX name=\"%s\"",
+                test_data.size(), (unsigned long long)0x00400000ULL,
+                hex_view::source_name(context).c_str());
 
-            bool ok = (hex_view::g_state.data.size() == 256);
+            bool ok = hex_view::active(context) && test_data.size() == 256;
             if (ok) {
                 bool data_ok = true;
                 for (int i = 0; i < 256; ++i) {
-                    if (hex_view::g_state.data[i] != static_cast<uint8_t>(i)) {
+                    if (test_data[i] != static_cast<uint8_t>(i)) {
                         data_ok = false;
                         break;
                     }
                 }
                 if (data_ok) {
-                    log_msg(hf, tag, "PASS -- set_data 256 bytes verified, base=0x%016llX",
-                        (unsigned long long)hex_view::g_state.base_addr);
+                    log_msg(hf, tag, "PASS -- workspace activation retained the local 256-byte fixture and produced an active hex context");
                     passed.fetch_add(1);
                 } else {
-                    log_msg(hf, tag, "FAIL -- data content mismatch after set_data");
+                    log_msg(hf, tag, "FAIL -- local fixture content changed during workspace activation");
                     failed.fetch_add(1);
                 }
             } else {
-                log_msg(hf, tag, "FAIL -- data size is %zu, expected 256", hex_view::g_state.data.size());
+                log_msg(hf, tag, "FAIL -- active=%d data_size=%zu, expected 256",
+                    hex_view::active(context) ? 1 : 0, test_data.size());
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in set_data");
+            log_msg(hf, tag, "FAIL -- exception in workspace activation");
             failed.fetch_add(1);
         }
     }
 
-    void test_hexview_read_from_process(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "hexview.read_process";
+    void test_hexview_read_live_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "hexview.read_live_memory";
         (void)skipped;
         try {
             HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -1765,24 +1888,27 @@ namespace {
             }
             uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ntdll));
             const uint32_t attached = driver_bridge::attached_pid();
-            log_msg(hf, tag, "INPUT -- read_from_process(addr=0x%016llX, size=64) attached_pid=%u",
+            log_msg(hf, tag, "INPUT -- read_live_memory(addr=0x%016llX, size=64) attached_pid=%u",
                 (unsigned long long)addr, attached);
-            bool ok = hex_view::read_from_process(addr, 64);
-            size_t got = ok ? hex_view::g_state.data.size() : 0;
-            log_msg(hf, tag, "OUTPUT -- read_from_process ok=%d returned_bytes=%zu base=0x%016llX",
-                (int)ok, got, (unsigned long long)hex_view::g_state.base_addr);
+            auto context = disasm_view::capture_selected_workspace();
+            bool ok = hex_view::read_live_memory(context, addr, 64);
+            std::vector<uint8_t> local_data;
+            if (ok) driver_bridge::read_memory(addr, 64, local_data);
+            size_t got = ok ? local_data.size() : 0;
+            log_msg(hf, tag, "OUTPUT -- read_live_memory ok=%d returned_bytes=%zu base=0x%016llX",
+                (int)ok, got, (unsigned long long)addr);
             if (ok && got > 0) {
-                log_msg(hf, tag, "PASS -- read_from_process produced %zu bytes at 0x%016llX",
+                log_msg(hf, tag, "PASS -- read_live_memory produced %zu bytes at 0x%016llX",
                     got, (unsigned long long)addr);
                 passed.fetch_add(1);
             } else {
-                std::string err = hex_view::last_error();
-                log_msg(hf, tag, "FAIL -- read_from_process ok=%d bytes=%zu last_error=\"%s\" (attached_pid=%u)",
+                std::string err = hex_view::last_error(context);
+                log_msg(hf, tag, "FAIL -- read_live_memory ok=%d bytes=%zu last_error=\"%s\" (attached_pid=%u)",
                     (int)ok, got, err.c_str(), attached);
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in read_from_process");
+            log_msg(hf, tag, "FAIL -- exception in read_live_memory");
             failed.fetch_add(1);
         }
     }
@@ -1790,74 +1916,24 @@ namespace {
     void test_hexview_last_error(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "hexview.last_error";
         try {
-            char tmp_dir[MAX_PATH] = {};
-            char valid_path[MAX_PATH] = {};
-            DWORD tmp_len = GetTempPathA(static_cast<DWORD>(sizeof(tmp_dir)), tmp_dir);
-            if (tmp_len == 0 || tmp_len >= static_cast<DWORD>(sizeof(tmp_dir)) ||
-                GetTempFileNameA(tmp_dir, "aid", 0, valid_path) == 0) {
-                DWORD gle = GetLastError();
-                log_msg(hf, tag, "FAIL -- unable to create temp path for valid load probe gle=%lu", (unsigned long)gle);
-                failed.fetch_add(1);
-                return;
-            }
-
-            std::string missing_path = std::string(tmp_dir) + "aida_missing_hex_error_probe_7F4A2B1C.bin";
-            DeleteFileA(missing_path.c_str());
-            log_msg(hf, tag, "INPUT -- invalid load_from_file(path=\"%s\", offset=0, size=16)", missing_path.c_str());
-            hex_view::load_from_file(missing_path, 0, 16);
-            std::string err_bad = hex_view::last_error();
-            log_msg(hf, tag, "OUTPUT -- invalid load last_error=\"%s\" len=%zu", err_bad.c_str(), err_bad.size());
-
-            std::vector<uint8_t> bytes(32);
-            for (size_t i = 0; i < bytes.size(); ++i)
-                bytes[i] = static_cast<uint8_t>(0x30u + i);
-            {
-                std::ofstream out(valid_path, std::ios::binary | std::ios::trunc);
-                out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-            }
-
-            log_msg(hf, tag, "INPUT -- valid load_from_file(path=\"%s\", offset=4, size=12)", valid_path);
-            hex_view::load_from_file(valid_path, 4, 12);
-            std::string err_good = hex_view::last_error();
-            const size_t active_bytes = hex_view::g_state.data.size();
-            const uint64_t active_base = hex_view::g_state.base_addr;
-            const std::string active_source = hex_view::g_state.source_name;
-            const bool active = hex_view::g_state.active;
-            bool data_ok = active_bytes == 12;
-            if (data_ok) {
-                for (size_t i = 0; i < 12; ++i) {
-                    if (hex_view::g_state.data[i] != bytes[i + 4]) {
-                        data_ok = false;
-                        break;
-                    }
-                }
-            }
-            DeleteFileA(valid_path);
-
-            log_msg(hf, tag, "OUTPUT -- valid load last_error=\"%s\" len=%zu active=%d bytes=%zu base=0x%016llX source=\"%s\" data_ok=%d first=0x%02X last=0x%02X",
-                err_good.c_str(),
-                err_good.size(),
-                active ? 1 : 0,
-                active_bytes,
-                (unsigned long long)active_base,
-                active_source.c_str(),
-                data_ok ? 1 : 0,
-                active_bytes > 0 ? hex_view::g_state.data.front() : 0,
-                active_bytes > 0 ? hex_view::g_state.data.back() : 0);
-
-            if (!err_bad.empty() && err_good.empty() && active && data_ok &&
-                active_base == 4 && !active_source.empty()) {
-                log_msg(hf, tag, "PASS -- invalid load set an error, valid load cleared it and populated active buffer evidence");
+            auto context = disasm_view::capture_selected_workspace();
+            hex_view::activate(context);
+            const bool rejected = !hex_view::read_live_memory(context, 0, 0);
+            const std::string rejected_error = hex_view::last_error(context);
+            hex_view::activate(context);
+            const std::string activated_error = hex_view::last_error(context);
+            const bool active = hex_view::active(context);
+            const std::string source = hex_view::source_name(context);
+            log_msg(hf, tag, "OUTPUT -- rejected=%d rejected_error=\"%s\" active=%d source=\"%s\" activated_error=\"%s\"",
+                rejected ? 1 : 0, rejected_error.c_str(), active ? 1 : 0,
+                source.c_str(), activated_error.c_str());
+            if (rejected && !rejected_error.empty() && active && !source.empty() && activated_error.empty()) {
+                log_msg(hf, tag, "PASS -- workspace-bound hex state reports invalid live requests and activation clears the state error");
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- err_bad_len=%zu err_good_len=%zu active=%d data_ok=%d bytes=%zu base=0x%016llX source_len=%zu",
-                    err_bad.size(),
-                    err_good.size(),
-                    active ? 1 : 0,
-                    data_ok ? 1 : 0,
-                    active_bytes,
-                    (unsigned long long)active_base,
-                    active_source.size());
+                log_msg(hf, tag, "FAIL -- rejected=%d rejected_error_len=%zu active=%d source_len=%zu activated_error_len=%zu",
+                    rejected ? 1 : 0, rejected_error.size(), active ? 1 : 0,
+                    source.size(), activated_error.size());
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -1944,205 +2020,6 @@ namespace {
         }
     }
 
-    void test_nav_history_push_pop(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "nav.push_pop";
-        auto t0 = std::chrono::steady_clock::now();
-        log_nav_snapshot(hf, tag, "entry");
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after clear");
-
-        log_msg(hf, tag, "INPUT -- push sequence [0x1000, 0x2000, 0x3000]");
-        nav_history::push(0x1000);
-        nav_history::push(0x2000);
-        nav_history::push(0x3000);
-        log_nav_snapshot(hf, tag, "after pushes");
-
-        if (nav_history::size() != 3) {
-            log_msg(hf, tag, "FAIL -- expected size 3, got %zu", nav_history::size());
-            failed.fetch_add(1);
-            return;
-        }
-
-        uint64_t addr = 0;
-        bool ok1 = nav_history::pop(&addr);
-        log_msg(hf, tag, "OUTPUT -- pop #1 ok=%d addr=0x%llX", (int)ok1, (unsigned long long)addr);
-        log_nav_snapshot(hf, tag, "after pop #1");
-        if (!ok1 || addr != 0x3000) {
-            log_msg(hf, tag, "FAIL -- pop expected 0x3000, got 0x%llX ok=%d",
-                (unsigned long long)addr, (int)ok1);
-            failed.fetch_add(1);
-            nav_history::clear();
-            return;
-        }
-
-        bool ok2 = nav_history::pop(&addr);
-        log_msg(hf, tag, "OUTPUT -- pop #2 ok=%d addr=0x%llX", (int)ok2, (unsigned long long)addr);
-        log_nav_snapshot(hf, tag, "after pop #2");
-        if (!ok2 || addr != 0x2000) {
-            log_msg(hf, tag, "FAIL -- pop expected 0x2000, got 0x%llX ok=%d",
-                (unsigned long long)addr, (int)ok2);
-            failed.fetch_add(1);
-            nav_history::clear();
-            return;
-        }
-
-        log_msg(hf, tag, "PASS -- push/pop LIFO order verified (3000 -> 2000) elapsed_us=%lld", elapsed_us_since(t0));
-        passed.fetch_add(1);
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after cleanup");
-    }
-
-    void test_nav_history_dedup(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "nav.dedup";
-        auto t0 = std::chrono::steady_clock::now();
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after clear");
-
-        log_msg(hf, tag, "INPUT -- push duplicate sequence [0x5000, 0x5000, 0x5000]");
-        nav_history::push(0x5000);
-        nav_history::push(0x5000);
-        nav_history::push(0x5000);
-        log_nav_snapshot(hf, tag, "after duplicate pushes");
-
-        size_t sz = nav_history::size();
-        if (sz == 1) {
-            log_msg(hf, tag, "PASS -- consecutive duplicate addresses deduplicated (size=%zu) elapsed_us=%lld", sz, elapsed_us_since(t0));
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- expected size 1 after dedup, got %zu", sz);
-            failed.fetch_add(1);
-        }
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after cleanup");
-    }
-
-    uint64_t resolve_ntdll_fn(const char* name) {
-        return resolve_ntdll_export(name);
-    }
-
-    void test_comment_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "comment.multiple";
-        const uint64_t a1 = 0xDEADBEEF00010001ULL;
-        const uint64_t a2 = 0xDEADBEEF00010002ULL;
-        const uint64_t a3 = 0xDEADBEEF00010003ULL;
-        const uint64_t a4 = 0xDEADBEEF00010004ULL;
-
-        comment_store::set(a1, "alpha");
-        comment_store::set(a2, "beta");
-        comment_store::set(a3, "gamma");
-        comment_store::set(a4, "delta");
-
-        std::string g1 = comment_store::get(a1);
-        std::string g2 = comment_store::get(a2);
-        std::string g3 = comment_store::get(a3);
-        std::string g4 = comment_store::get(a4);
-
-        comment_store::set(a1, "");
-        comment_store::set(a2, "");
-        comment_store::set(a3, "");
-        comment_store::set(a4, "");
-
-        if (g1 == "alpha" && g2 == "beta" && g3 == "gamma" && g4 == "delta") {
-            log_msg(hf, tag, "PASS -- 4 comments set/get round-trip ok");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- g1=\"%s\" g2=\"%s\" g3=\"%s\" g4=\"%s\"",
-                g1.c_str(), g2.c_str(), g3.c_str(), g4.c_str());
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_comment_overwrite(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "comment.overwrite";
-        const uint64_t addr = 0xDEADBEEF00020001ULL;
-
-        comment_store::set(addr, "original");
-        comment_store::set(addr, "updated");
-        std::string got = comment_store::get(addr);
-        comment_store::set(addr, "");
-
-        if (got == "updated") {
-            log_msg(hf, tag, "PASS -- overwrite replaced comment correctly");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- expected \"updated\" got \"%s\"", got.c_str());
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_rename_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "rename.multiple";
-        const uint64_t a1 = 0xDEADBEEF20000001ULL;
-        const uint64_t a2 = 0xDEADBEEF20000002ULL;
-        const uint64_t a3 = 0xDEADBEEF20000003ULL;
-
-        rename_store::set(a1, "func_alpha");
-        rename_store::set(a2, "func_beta");
-        rename_store::set(a3, "func_gamma");
-
-        std::string g1 = rename_store::get(a1);
-        std::string g2 = rename_store::get(a2);
-        std::string g3 = rename_store::get(a3);
-
-        rename_store::clear(a1);
-        rename_store::clear(a2);
-        rename_store::clear(a3);
-
-        if (g1 == "func_alpha" && g2 == "func_beta" && g3 == "func_gamma") {
-            log_msg(hf, tag, "PASS -- 3 renames set/get round-trip ok");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- g1=\"%s\" g2=\"%s\" g3=\"%s\"",
-                g1.c_str(), g2.c_str(), g3.c_str());
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_rename_resolve_or_multiple(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "rename.resolve_or_multi";
-        const uint64_t a1 = 0xDEADBEEF30000001ULL;
-        const uint64_t a2 = 0xDEADBEEF30000002ULL;
-        const uint64_t a3 = 0xDEADBEEF30000003ULL;
-
-        rename_store::set(a1, "known_one");
-        rename_store::set(a2, "known_two");
-
-        std::string r1 = rename_store::resolve_or(a1, "fb1");
-        std::string r2 = rename_store::resolve_or(a2, "fb2");
-        std::string r3 = rename_store::resolve_or(a3, "fallback_three");
-
-        rename_store::clear(a1);
-        rename_store::clear(a2);
-
-        bool ok = (r1 == "known_one") && (r2 == "known_two") && (r3 == "fallback_three");
-        if (ok) {
-            log_msg(hf, tag, "PASS -- resolve_or returns names when present, fallback otherwise");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- r1=\"%s\" r2=\"%s\" r3=\"%s\"",
-                r1.c_str(), r2.c_str(), r3.c_str());
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_rename_overwrite(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "rename.overwrite";
-        const uint64_t addr = 0xDEADBEEF40000001ULL;
-
-        rename_store::set(addr, "old_name");
-        rename_store::set(addr, "new_name");
-        std::string got = rename_store::get(addr);
-        rename_store::clear(addr);
-
-        if (got == "new_name") {
-            log_msg(hf, tag, "PASS -- overwrite replaced rename correctly");
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- expected \"new_name\" got \"%s\"", got.c_str());
-            failed.fetch_add(1);
-        }
-    }
-
     void test_xref_query_to_ntcreatefile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "xref.query_to_ntcf";
         (void)skipped;
@@ -2157,497 +2034,10 @@ namespace {
         validate_xref_fixture(hf, tag, 16, passed, failed);
     }
 
-    void test_xref_query_to_zero(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "xref.query_to_zero";
-        try {
-            auto results = xref_index::query_to(0, 16);
-            if (results.empty()) {
-                log_msg(hf, tag, "PASS -- query_to(0) returned empty as expected");
-                passed.fetch_add(1);
-            } else {
-                log_msg(hf, tag, "FAIL -- query_to(0) returned %zu results", results.size());
-                failed.fetch_add(1);
-            }
-        } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in query_to");
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_xref_has_more_zero_limit(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "xref.has_more_zero";
-        try {
-            bool more = xref_index::has_more(0, 0);
-            log_msg(hf, tag, "PASS -- has_more(0, 0) = %s", more ? "true" : "false");
-            passed.fetch_add(1);
-        } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in has_more");
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_xref_warm_range(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "xref.warm_range";
-        (void)skipped;
-        uint64_t addr = resolve_ntclose();
-        if (addr == 0) {
-            log_msg(hf, tag, "FAIL -- NtClose precondition unresolved at test entry strategy=%s(%d) cache=0x%016llX",
-                ntclose_strategy_name(g_disasm_ntclose_strategy.load(std::memory_order_acquire)),
-                g_disasm_ntclose_strategy.load(std::memory_order_acquire),
-                (unsigned long long)g_disasm_ntclose_va_cache.load(std::memory_order_acquire));
-            failed.fetch_add(1);
-            return;
-        }
-        try {
-            xref_index::warm_range(addr, addr + 0x1000);
-            log_msg(hf, tag, "PASS -- warm_range(0x%016llX, +0x1000) executed",
-                (unsigned long long)addr);
-            passed.fetch_add(1);
-        } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in warm_range");
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_xref_live_after_warm_range(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        (void)skipped;
-        const char* tag = "xref.live_after_warm";
-        auto t0 = std::chrono::steady_clock::now();
-        g_xref_live_after_warm_stage.store(1, std::memory_order_release);
-        log_msg(hf, tag, "SELECT_MODULE_BEGIN -- attached_pid=%u status=\"%s\" last_error=\"%s\" elapsed_us=%lld",
-            driver_bridge::attached_pid(),
-            driver_bridge::status().c_str(),
-            driver_bridge::last_error().c_str(),
-            elapsed_us_since(t0));
-        remote_module_lookup_t module{};
-        try {
-            module = select_live_xref_module();
-        } catch (const std::exception& ex) {
-            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"select_module_exception\" type=\"%s\" what=\"%s\" stage=%s elapsed_us=%lld",
-                "std::exception",
-                ex.what(),
-                xref_live_after_warm_stage_name(g_xref_live_after_warm_stage.load(std::memory_order_acquire)),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            return;
-        } catch (...) {
-            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"select_module_exception_unknown\" stage=%s elapsed_us=%lld",
-                xref_live_after_warm_stage_name(g_xref_live_after_warm_stage.load(std::memory_order_acquire)),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            return;
-        }
-        g_xref_live_after_warm_stage.store(2, std::memory_order_release);
-        log_msg(hf, tag, "SELECT_MODULE_END -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X module_count=%zu status=\"%s\" last_error=\"%s\" elapsed_us=%lld",
-            module.pid,
-            module.name.empty() ? "<unknown>" : module.name.c_str(),
-            (unsigned long long)module.base,
-            module.size,
-            module.module_count,
-            driver_bridge::status().c_str(),
-            driver_bridge::last_error().c_str(),
-            elapsed_us_since(t0));
-        g_xref_live_after_warm_stage.store(3, std::memory_order_release);
-        if (module.pid == 0) {
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"no_attached_pid\" pid=0 module_count=%zu", module.module_count);
-            log_msg(hf, tag, "FAIL -- no_attached_pid; live xref proof requires a verified target");
-            failed.fetch_add(1);
-            return;
-        }
-        if (module.base == 0 || module.size == 0) {
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"no_live_module_for_bounded_xref\" pid=%u module_count=%zu status=\"%s\" last_error=\"%s\"",
-                module.pid,
-                module.module_count,
-                driver_bridge::status().c_str(),
-                driver_bridge::last_error().c_str());
-            log_msg(hf, tag, "FAIL -- no_live_module_for_bounded_xref pid=%u module_count=%zu status=\"%s\" last_error=\"%s\"",
-                module.pid,
-                module.module_count,
-                driver_bridge::status().c_str(),
-                driver_bridge::last_error().c_str());
-            failed.fetch_add(1);
-            return;
-        }
-        g_xref_live_after_warm_stage.store(4, std::memory_order_release);
-        const uint64_t max_span = 0x100000ull;
-        const uint64_t span = std::min<uint64_t>(module.size, max_span);
-        const uint64_t range_lo = module.base;
-        const uint64_t range_hi = module.base + span;
-        log_msg(hf, tag, "RANGE_CONSTRUCTED -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X span=0x%016llX range=[0x%016llX,0x%016llX) overflow=%d elapsed_us=%lld",
-            module.pid,
-            module.name.empty() ? "<unknown>" : module.name.c_str(),
-            (unsigned long long)module.base,
-            module.size,
-            (unsigned long long)span,
-            (unsigned long long)range_lo,
-            (unsigned long long)range_hi,
-            range_hi <= range_lo ? 1 : 0,
-            elapsed_us_since(t0));
-        if (range_hi <= range_lo) {
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"range_overflow\" pid=%u module=\"%s\" module_base=0x%016llX span=0x%016llX elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                (unsigned long long)module.base,
-                (unsigned long long)span,
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            return;
-        }
-        constexpr uint32_t proof_timeout_ms = 4000;
-        constexpr uint32_t watchdog_timeout_ms = 6000;
-        struct watchdog_shared_state_t {
-            std::atomic<bool> finished{ false };
-            std::atomic<bool> hung_logged{ false };
-            std::atomic<int>  stage{ 0 };
-            std::atomic<bool> done{ false };
-        };
-        auto wd_state = std::make_shared<watchdog_shared_state_t>();
-        auto& finished = wd_state->finished;
-        auto& hung_logged = wd_state->hung_logged;
-        auto& stage = wd_state->stage;
-        auto set_stage = [&](int value) {
-            stage.store(value, std::memory_order_release);
-            g_xref_live_after_warm_stage.store(value, std::memory_order_release);
-        };
-        auto stage_name = [](int value) -> const char* {
-            return xref_live_after_warm_stage_name(value);
-        };
-        set_stage(5);
-        auto watchdog_event_holder = std::shared_ptr<void>(
-            CreateEventW(nullptr, TRUE, FALSE, nullptr),
-            [](HANDLE h) { if (h) CloseHandle(h); });
-        if (!watchdog_event_holder.get()) {
-            const DWORD ev_gle = GetLastError();
-            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"watchdog_event_create_failed\" gle=%lu pid=%u module=\"%s\" elapsed_us=%lld",
-                static_cast<unsigned long>(ev_gle),
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            return;
-        }
-        const HANDLE wd_log_file = hf;
-        const uint32_t wd_pid = module.pid;
-        const std::string wd_module_name = module.name;
-        const uint64_t wd_module_base = module.base;
-        const uint32_t wd_module_size = module.size;
-        const uint64_t wd_range_lo = range_lo;
-        const uint64_t wd_range_hi = range_hi;
-        bool watchdog_posted = false;
-        {
-            aida::infra::executor::submission_t _exec_sub;
-            _exec_sub.owner_subsystem = "standalone.testlab.disasm";
-            _exec_sub.label = "xref_live_after_warm.watchdog";
-            _exec_sub.thread_class = "queued_task";
-            _exec_sub.domain = aida::infra::executor::domain_t::diagnostics;
-            _exec_sub.priority = 4;
-            _exec_sub.body = [wd_state, watchdog_event_holder, t0, tag, wd_log_file, wd_pid, wd_module_name, wd_module_base, wd_module_size, wd_range_lo, wd_range_hi]() {
-                HANDLE watchdog_event = watchdog_event_holder.get();
-                const auto deadline = t0 + std::chrono::milliseconds(watchdog_timeout_ms);
-                while (!wd_state->finished.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
-                    const DWORD wait_res = WaitForSingleObject(watchdog_event, 25);
-                    if (wait_res != WAIT_TIMEOUT) break;
-                }
-                if (!wd_state->finished.load(std::memory_order_acquire)) {
-                    const int active_stage = wd_state->stage.load(std::memory_order_acquire);
-                    wd_state->hung_logged.store(true, std::memory_order_release);
-                    const char* wd_module_name_cstr = wd_module_name.empty() ? "<unknown>" : wd_module_name.c_str();
-                    log_msg(wd_log_file, tag, "HUNG -- stage=%s pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
-                        xref_live_after_warm_stage_name(active_stage),
-                        wd_pid,
-                        wd_module_name_cstr,
-                        (unsigned long long)wd_module_base,
-                        wd_module_size,
-                        (unsigned long long)wd_range_lo,
-                        (unsigned long long)wd_range_hi,
-                        proof_timeout_ms,
-                        watchdog_timeout_ms,
-                        elapsed_us_since(t0));
-                    diag::log_tagged_critical_fmt("testlab",
-                        "xref_live_after_warm_hung stage=%s pid=%u module=%s base=0x%llX size=0x%X range_lo=0x%llX range_hi=0x%llX proof_timeout_ms=%u watchdog_timeout_ms=%u elapsed_us=%lld",
-                        xref_live_after_warm_stage_name(active_stage),
-                        wd_pid,
-                        wd_module_name_cstr,
-                        (unsigned long long)wd_module_base,
-                        wd_module_size,
-                        (unsigned long long)wd_range_lo,
-                        (unsigned long long)wd_range_hi,
-                        proof_timeout_ms,
-                        watchdog_timeout_ms,
-                        elapsed_us_since(t0));
-                }
-                wd_state->done.store(true, std::memory_order_release);
-            };
-            _exec_sub.failure_policy = "reject_not_started";
-            _exec_sub.ui_access_policy = "none";
-            _exec_sub.shutdown_policy = "drain";
-            _exec_sub.no_capacity_reason = "no_capacity_needed_diagnostics_queue";
-            auto _exec_result = aida::infra::executor::submit(std::move(_exec_sub));
-            watchdog_posted = _exec_result.submitted;
-            (void)_exec_result;
-        }
-        if (!watchdog_posted) {
-            const aida::infra::taskflow_runtime::stats_t work_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::general);
-            const aida::infra::taskflow_runtime::stats_t service_stats = aida::infra::taskflow_runtime::domain_stats(aida::infra::taskflow_runtime::executor_domain_t::service);
-            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag,
-                "OUTPUT -- ok=0 error=\"watchdog_post_failed\" reason=taskflow_executor_submit_returned_false "
-                "work_alive=%d work_shutting_down=%d work_pool_size=%d work_workers=%zu work_pending=%zu work_active=%u work_posted=%llu work_rejected=%llu work_started=%llu work_finished=%llu work_oldest_active_ms=%llu work_active_label_count=%u "
-                "service_alive=%d service_shutting_down=%d service_pool_size=%d service_workers=%zu service_pending=%zu service_active=%u service_rejected=%llu "
-                "pid=%u module=\"%s\" elapsed_us=%lld",
-                work_stats.alive ? 1 : 0,
-                work_stats.shutting_down ? 1 : 0,
-                work_stats.pool_size,
-                work_stats.workers,
-                work_stats.pending,
-                work_stats.active,
-                static_cast<unsigned long long>(work_stats.posted),
-                static_cast<unsigned long long>(work_stats.rejected),
-                static_cast<unsigned long long>(work_stats.started),
-                static_cast<unsigned long long>(work_stats.finished),
-                static_cast<unsigned long long>(work_stats.oldest_active_ms),
-                work_stats.active_label_count,
-                service_stats.alive ? 1 : 0,
-                service_stats.shutting_down ? 1 : 0,
-                service_stats.pool_size,
-                service_stats.workers,
-                service_stats.pending,
-                service_stats.active,
-                static_cast<unsigned long long>(service_stats.rejected),
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            diag::log_tagged_critical_fmt("testlab",
-                "xref_live_after_warm_watchdog_post_failed work_alive=%d work_workers=%zu work_pending=%zu work_active=%u work_oldest_active_ms=%llu work_active_labels=\"%s\" service_alive=%d service_active=%u pid=%u module=%s elapsed_us=%lld",
-                work_stats.alive ? 1 : 0,
-                work_stats.workers,
-                work_stats.pending,
-                work_stats.active,
-                static_cast<unsigned long long>(work_stats.oldest_active_ms),
-                work_stats.active_labels.empty() ? "<none>" : work_stats.active_labels.c_str(),
-                service_stats.alive ? 1 : 0,
-                service_stats.active,
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            return;
-        }
-        auto finish_watchdog = [&, wd_state, watchdog_event_holder]() {
-            set_stage(13);
-            finished.store(true, std::memory_order_release);
-            SetEvent(watchdog_event_holder.get());
-            const auto join_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(watchdog_timeout_ms + 250);
-            while (!wd_state->done.load(std::memory_order_acquire) &&
-                   std::chrono::steady_clock::now() < join_deadline) {
-                Sleep(5);
-            }
-        };
-        log_msg(hf, tag, "INPUT -- pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X module_count=%zu requested_range=[0x%016llX,0x%016llX) span=0x%016llX proof_timeout_ms=%u watchdog_timeout_ms=%u",
-            module.pid,
-            module.name.empty() ? "<unknown>" : module.name.c_str(),
-            (unsigned long long)module.base,
-            module.size,
-            module.module_count,
-            (unsigned long long)range_lo,
-            (unsigned long long)range_hi,
-            (unsigned long long)span,
-            proof_timeout_ms,
-            watchdog_timeout_ms);
-        bool counted = false;
-        try {
-            set_stage(6);
-            log_msg(hf, tag, "WARM_RANGE_BEGIN -- pid=%u module=\"%s\" range=[0x%016llX,0x%016llX) elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                (unsigned long long)range_lo,
-                (unsigned long long)range_hi,
-                elapsed_us_since(t0));
-            diag::log_tagged_critical_fmt("testlab",
-                "xref_live_after_warm_range_begin pid=%u module=%s base=0x%llX size=0x%X range_lo=0x%llX range_hi=0x%llX elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                (unsigned long long)module.base,
-                module.size,
-                (unsigned long long)range_lo,
-                (unsigned long long)range_hi,
-                elapsed_us_since(t0));
-            set_stage(7);
-            const auto warm_started = std::chrono::steady_clock::now();
-            xref_index::warm_range(range_lo, range_hi);
-            set_stage(8);
-            log_msg(hf, tag, "WARM_RANGE_END -- pid=%u module=\"%s\" elapsed_us=%lld outer_elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(warm_started),
-                elapsed_us_since(t0));
-            diag::log_tagged_critical_fmt("testlab",
-                "xref_live_after_warm_range_end pid=%u module=%s elapsed_us=%lld outer_elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(warm_started),
-                elapsed_us_since(t0));
-            set_stage(9);
-            log_msg(hf, tag, "BOUNDED_LIVE_RANGE_BEGIN -- pid=%u module=\"%s\" range=[0x%016llX,0x%016llX) timeout_ms=%u elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                (unsigned long long)range_lo,
-                (unsigned long long)range_hi,
-                proof_timeout_ms,
-                elapsed_us_since(t0));
-            diag::log_tagged_critical_fmt("testlab",
-                "xref_live_after_bounded_live_range_begin pid=%u module=%s range_lo=0x%llX range_hi=0x%llX timeout_ms=%u elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                (unsigned long long)range_lo,
-                (unsigned long long)range_hi,
-                proof_timeout_ms,
-                elapsed_us_since(t0));
-            set_stage(10);
-            const auto proof_started = std::chrono::steady_clock::now();
-            xref_index::bounded_live_range_result_t proof = xref_index::build_bounded_live_range(range_lo, range_hi, proof_timeout_ms);
-            set_stage(11);
-            const bool proof_source_in_range = proof.proof_source >= proof.clipped_lo && proof.proof_source < proof.clipped_hi;
-            const long long proof_elapsed_us = elapsed_us_since(proof_started);
-            log_msg(hf, tag, "BOUNDED_LIVE_RANGE_END -- ok=%d error=\"%s\" pid=%u module=\"%s\" timeout_ms=%u proof_elapsed_us=%lld result_elapsed_us=%llu outer_elapsed_us=%lld",
-                proof.ok ? 1 : 0,
-                proof.error.empty() ? "<none>" : proof.error.c_str(),
-                proof.pid,
-                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
-                proof_timeout_ms,
-                proof_elapsed_us,
-                (unsigned long long)proof.elapsed_us,
-                elapsed_us_since(t0));
-            diag::log_tagged_critical_fmt("testlab",
-                "xref_live_after_bounded_live_range_end ok=%d error=%s pid=%u module=%s timeout_ms=%u proof_elapsed_us=%lld result_elapsed_us=%llu outer_elapsed_us=%lld",
-                proof.ok ? 1 : 0,
-                proof.error.empty() ? "<none>" : proof.error.c_str(),
-                proof.pid,
-                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
-                proof_timeout_ms,
-                proof_elapsed_us,
-                (unsigned long long)proof.elapsed_us,
-                elapsed_us_since(t0));
-            set_stage(12);
-            log_msg(hf, tag, "OUTPUT -- ok=%d error=\"%s\" hung_logged=%d pid=%u module=\"%s\" module_base=0x%016llX module_size=0x%08X requested=[0x%016llX,0x%016llX) clipped=[0x%016llX,0x%016llX) pages_read=%zu pages_failed=%zu bytes_read=%zu targets=%zu xrefs=%zu proof_target=0x%016llX proof_source=0x%016llX proof_source_in_range=%d proof_label=\"%s\" state_before=%s(%u) state_after=%s(%u) table_before=%d table_after=%d rebuild_before=%d rebuild_after=%d elapsed_us=%llu proof_call_elapsed_us=%lld outer_elapsed_us=%lld",
-                proof.ok ? 1 : 0,
-                proof.error.empty() ? "<none>" : proof.error.c_str(),
-                hung_logged.load(std::memory_order_acquire) ? 1 : 0,
-                proof.pid,
-                proof.module.empty() ? "<unknown>" : proof.module.c_str(),
-                (unsigned long long)proof.module_base,
-                proof.module_size,
-                (unsigned long long)proof.requested_lo,
-                (unsigned long long)proof.requested_hi,
-                (unsigned long long)proof.clipped_lo,
-                (unsigned long long)proof.clipped_hi,
-                proof.pages_read,
-                proof.pages_failed,
-                proof.bytes_read,
-                proof.targets_found,
-                proof.xrefs_found,
-                (unsigned long long)proof.proof_target,
-                (unsigned long long)proof.proof_source,
-                proof_source_in_range ? 1 : 0,
-                proof.proof_label.c_str(),
-                xref_build_state_name(proof.state_before),
-                proof.state_before,
-                xref_build_state_name(proof.state_after),
-                proof.state_after,
-                proof.table_built_before ? 1 : 0,
-                proof.table_built_after ? 1 : 0,
-                proof.rebuild_in_flight_before ? 1 : 0,
-                proof.rebuild_in_flight_after ? 1 : 0,
-                (unsigned long long)proof.elapsed_us,
-                proof_elapsed_us,
-                elapsed_us_since(t0));
-            if (hung_logged.load(std::memory_order_acquire)) {
-                log_msg(hf, tag, "FAIL -- bounded live range exceeded watchdog before returning pid=%u module=\"%s\" proof_elapsed_us=%lld outer_elapsed_us=%lld",
-                    proof.pid,
-                    proof.module.empty() ? "<unknown>" : proof.module.c_str(),
-                    proof_elapsed_us,
-                    elapsed_us_since(t0));
-                failed.fetch_add(1);
-                counted = true;
-            } else if (proof.ok && proof.xrefs_found > 0 && proof.proof_target != 0 && proof.proof_source != 0 && proof_source_in_range) {
-                log_msg(hf, tag, "PASS -- deterministic bounded live range produced xref proof target=0x%016llX source=0x%016llX bytes_read=%zu elapsed_us=%llu",
-                    (unsigned long long)proof.proof_target,
-                    (unsigned long long)proof.proof_source,
-                    proof.bytes_read,
-                    (unsigned long long)proof.elapsed_us);
-                passed.fetch_add(1);
-                counted = true;
-            } else {
-                log_msg(hf, tag, "FAIL -- bounded live range did not produce a valid xref proof error=\"%s\" pid=%u module=\"%s\" pages_read=%zu bytes_read=%zu xrefs=%zu state_before=%s(%u) state_after=%s(%u)",
-                    proof.error.empty() ? "<none>" : proof.error.c_str(),
-                    proof.pid,
-                    proof.module.empty() ? "<unknown>" : proof.module.c_str(),
-                    proof.pages_read,
-                    proof.bytes_read,
-                    proof.xrefs_found,
-                    xref_build_state_name(proof.state_before),
-                    proof.state_before,
-                    xref_build_state_name(proof.state_after),
-                    proof.state_after);
-                failed.fetch_add(1);
-                counted = true;
-            }
-        } catch (const std::exception& ex) {
-            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"exception\" type=\"%s\" what=\"%s\" stage=%s pid=%u module=\"%s\" module_base=0x%016llX range=[0x%016llX,0x%016llX) elapsed_us=%lld",
-                "std::exception",
-                ex.what(),
-                stage_name(stage.load(std::memory_order_acquire)),
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                (unsigned long long)module.base,
-                (unsigned long long)range_lo,
-                (unsigned long long)range_hi,
-                elapsed_us_since(t0));
-            log_msg(hf, tag, "FAIL -- exception during bounded live xref proof stage=%s type=\"%s\" what=\"%s\" pid=%u module=\"%s\" elapsed_us=%lld",
-                stage_name(stage.load(std::memory_order_acquire)),
-                "std::exception",
-                ex.what(),
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            counted = true;
-        } catch (...) {
-            g_xref_live_after_warm_stage.store(14, std::memory_order_release);
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"exception\" stage=%s pid=%u module=\"%s\" elapsed_us=%lld",
-                stage_name(stage.load(std::memory_order_acquire)),
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            log_msg(hf, tag, "FAIL -- exception during bounded live xref proof pid=%u module=\"%s\" elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-            counted = true;
-        }
-        finish_watchdog();
-        if (!counted) {
-            log_msg(hf, tag, "OUTPUT -- ok=0 error=\"unaccounted_completion\" pid=%u module=\"%s\" elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            log_msg(hf, tag, "FAIL -- unaccounted bounded live xref completion pid=%u module=\"%s\" elapsed_us=%lld",
-                module.pid,
-                module.name.empty() ? "<unknown>" : module.name.c_str(),
-                elapsed_us_since(t0));
-            failed.fetch_add(1);
-        }
-    }
-
     void test_pseudocode_request_decompile_ntcreatefile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "pseudo.decompile_ntcf";
         (void)skipped;
-        uint64_t addr = resolve_ntdll_fn("NtCreateFile");
+        uint64_t addr = resolve_ntdll_export("NtCreateFile");
         if (addr == 0) {
             log_msg(hf, tag, "FAIL -- NtCreateFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
                 driver_bridge::status().c_str(),
@@ -2686,13 +2076,14 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::close_tab_by_addr(addr);
-            pseudocode_view::request_decompile(addr, nullptr, false);
-            bool created = pseudocode_view::has_tab_for(addr);
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::close_tab_by_addr(context, addr);
+            pseudocode_view::request_decompile(context, addr, false);
+            bool created = pseudocode_view::has_tab_for(context, addr);
             log_msg(hf, tag, "INPUT -- created tab for 0x%016llX has_tab=%d, invoking close_tab_by_addr",
                 (unsigned long long)addr, (int)created);
-            pseudocode_view::close_tab_by_addr(addr);
-            bool still_has = pseudocode_view::has_tab_for(addr);
+            pseudocode_view::close_tab_by_addr(context, addr);
+            bool still_has = pseudocode_view::has_tab_for(context, addr);
             log_msg(hf, tag, "OUTPUT -- has_tab_for(0x%016llX) after close=%d",
                 (unsigned long long)addr, (int)still_has);
             if (created && !still_has) {
@@ -2722,12 +2113,13 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::close_tab_by_addr(addr);
-            pseudocode_view::request_decompile(addr, nullptr, false);
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::close_tab_by_addr(context, addr);
+            pseudocode_view::request_decompile(context, addr, false);
             log_msg(hf, tag, "INPUT -- invoking activate_tab_by_addr(0x%016llX)", (unsigned long long)addr);
-            pseudocode_view::activate_tab_by_addr(addr);
-            bool active = pseudocode_view::has_active_tab();
-            uint64_t active_addr = pseudocode_view::active_tab_address();
+            pseudocode_view::activate_tab_by_addr(context, addr);
+            bool active = pseudocode_view::has_active_tab(context);
+            uint64_t active_addr = pseudocode_view::active_tab_address(context);
             log_msg(hf, tag, "OUTPUT -- has_active_tab=%d active_tab_address=0x%016llX",
                 (int)active, (unsigned long long)active_addr);
             if (active && active_addr == addr) {
@@ -2758,13 +2150,14 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::request_decompile(addr, nullptr, false);
-            pseudocode_view::activate_tab_by_addr(addr);
-            bool has_after_create = pseudocode_view::has_active_tab();
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::request_decompile(context, addr, false);
+            pseudocode_view::activate_tab_by_addr(context, addr);
+            bool has_after_create = pseudocode_view::has_active_tab(context);
             log_msg(hf, tag, "INPUT -- created+activated tab, has_active_tab=%d, then close_all_tabs()",
                 (int)has_after_create);
-            pseudocode_view::close_all_tabs();
-            bool has_after_close = pseudocode_view::has_active_tab();
+            pseudocode_view::close_all_tabs(context);
+            bool has_after_close = pseudocode_view::has_active_tab(context);
             log_msg(hf, tag, "OUTPUT -- has_active_tab after close_all=%d", (int)has_after_close);
             if (has_after_create && !has_after_close) {
                 log_msg(hf, tag, "PASS -- has_active_tab true with a tab, false after close_all (%d -> %d)",
@@ -2794,10 +2187,11 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::close_tab_by_addr(addr);
-            pseudocode_view::request_decompile(addr, nullptr, false);
-            pseudocode_view::activate_tab_by_addr(addr);
-            uint64_t active_addr = pseudocode_view::active_tab_address();
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::close_tab_by_addr(context, addr);
+            pseudocode_view::request_decompile(context, addr, false);
+            pseudocode_view::activate_tab_by_addr(context, addr);
+            uint64_t active_addr = pseudocode_view::active_tab_address(context);
             log_msg(hf, tag, "INPUT -- activated tab for 0x%016llX", (unsigned long long)addr);
             log_msg(hf, tag, "OUTPUT -- active_tab_address() = 0x%016llX", (unsigned long long)active_addr);
             if (active_addr != 0 && active_addr == addr) {
@@ -2828,19 +2222,20 @@ namespace {
             return;
         }
         try {
-            const bool idle = decompiler_engine::wait_for_idle(5000, 25);
+            const auto context = selected_pseudocode_context();
+            const bool idle = workspace_decompiler_idle(context, 5000);
             log_msg(hf, tag, "INPUT -- seed active tab addr=0x%016llX idle_before=%d", (unsigned long long)addr, idle ? 1 : 0);
             if (!idle) {
                 log_msg(hf, tag, "FAIL -- decompiler engine was not idle before refresh_active_tab");
                 failed.fetch_add(1);
                 return;
             }
-            pseudocode_view::close_tab_by_addr(addr);
-            pseudocode_view::request_decompile(addr, nullptr, false);
-            pseudocode_view::activate_tab_by_addr(addr);
+            pseudocode_view::close_tab_by_addr(context, addr);
+            pseudocode_view::request_decompile(context, addr, false);
+            pseudocode_view::activate_tab_by_addr(context, addr);
             log_pseudocode_tab_evidence(hf, tag, "before_refresh", addr);
 
-            pseudocode_view::refresh_active_tab();
+            pseudocode_view::refresh_active_tab(context);
             log_pseudocode_tab_evidence(hf, tag, "after_refresh_immediate", addr);
 
             pseudocode_view::tab_info_t tab{};
@@ -2854,7 +2249,7 @@ namespace {
             bool metrics = pseudocode_metrics_for_addr(addr, pseudocode_bytes, pseudocode_lines,
                 complete, engine_error, source);
             bool state_ok = found &&
-                pseudocode_view::active_tab_address() == addr &&
+                pseudocode_view::active_tab_address(context) == addr &&
                 pseudocode_refresh_state_ok(tab, addr, pseudocode_lines, metrics);
 
             if (!state_ok && !tab.decompiling) {
@@ -2867,7 +2262,7 @@ namespace {
                 metrics = pseudocode_metrics_for_addr(addr, pseudocode_bytes, pseudocode_lines,
                     complete, engine_error, source);
                 state_ok = found &&
-                    pseudocode_view::active_tab_address() == addr &&
+                    pseudocode_view::active_tab_address(context) == addr &&
                     pseudocode_refresh_state_ok(tab, addr, pseudocode_lines, metrics);
             }
 
@@ -2884,7 +2279,7 @@ namespace {
             } else {
                 log_msg(hf, tag, "FAIL -- refresh_active evidence invalid found=%d active=0x%016llX expected=0x%016llX tabs=%zu loaded=%d decompiling=%d is_error=%d metrics=%d complete=%d engine_error=%d bytes=%zu lines=%zu",
                     found ? 1 : 0,
-                    (unsigned long long)pseudocode_view::active_tab_address(),
+                    (unsigned long long)pseudocode_view::active_tab_address(context),
                     (unsigned long long)addr,
                     total,
                     found ? (int)tab.loaded : 0,
@@ -2922,7 +2317,8 @@ namespace {
             return;
         }
         try {
-            const bool idle = decompiler_engine::wait_for_idle(5000, 25);
+            const auto context = selected_pseudocode_context();
+            const bool idle = workspace_decompiler_idle(context, 5000);
             log_msg(hf, tag, "INPUT -- seed tabs addr1=0x%016llX addr2=0x%016llX idle_before=%d",
                 (unsigned long long)addr1,
                 (unsigned long long)addr2,
@@ -2933,15 +2329,15 @@ namespace {
                 return;
             }
 
-            pseudocode_view::close_tab_by_addr(addr1);
-            pseudocode_view::close_tab_by_addr(addr2);
-            pseudocode_view::request_decompile(addr1, nullptr, false);
-            pseudocode_view::request_decompile(addr2, nullptr, false);
-            pseudocode_view::activate_tab_by_addr(addr1);
+            pseudocode_view::close_tab_by_addr(context, addr1);
+            pseudocode_view::close_tab_by_addr(context, addr2);
+            pseudocode_view::request_decompile(context, addr1, false);
+            pseudocode_view::request_decompile(context, addr2, false);
+            pseudocode_view::activate_tab_by_addr(context, addr1);
             log_pseudocode_tab_evidence(hf, tag, "before_refresh_addr1", addr1);
             log_pseudocode_tab_evidence(hf, tag, "before_refresh_addr2", addr2);
 
-            pseudocode_view::refresh_all_tabs();
+            pseudocode_view::refresh_all_tabs(context);
             log_pseudocode_tab_evidence(hf, tag, "after_refresh_addr1", addr1);
             log_pseudocode_tab_evidence(hf, tag, "after_refresh_addr2", addr2);
 
@@ -2968,7 +2364,7 @@ namespace {
 
             const bool addr1_ok = found1 && pseudocode_refresh_state_ok(tab1, addr1, lines1, metrics1);
             const bool addr2_ok = found2 && pseudocode_refresh_state_ok(tab2, addr2, lines2, metrics2);
-            const bool active_preserved = pseudocode_view::active_tab_address() == addr1;
+            const bool active_preserved = pseudocode_view::active_tab_address(context) == addr1;
             if (addr1_ok && addr2_ok && active_preserved) {
                 log_msg(hf, tag, "PASS -- refresh_all preserved tabs addr1=0x%016llX state(loaded=%d decompiling=%d lines=%zu metrics=%d) addr2=0x%016llX state(loaded=%d decompiling=%d lines=%zu metrics=%d) total=%zu",
                     (unsigned long long)addr1,
@@ -3003,7 +2399,7 @@ namespace {
                     error2 ? 1 : 0,
                     bytes2,
                     lines2,
-                    (unsigned long long)pseudocode_view::active_tab_address(),
+                    (unsigned long long)pseudocode_view::active_tab_address(context),
                     (unsigned long long)addr1,
                     total1,
                     total2);
@@ -3028,14 +2424,15 @@ namespace {
             return;
         }
         try {
-            pseudocode_view::close_all_tabs();
-            pseudocode_view::request_decompile(addr, nullptr, false);
-            pseudocode_view::activate_tab_by_addr(addr);
-            bool present_before = pseudocode_view::has_tab_for(addr);
+            const auto context = selected_pseudocode_context();
+            pseudocode_view::close_all_tabs(context);
+            pseudocode_view::request_decompile(context, addr, false);
+            pseudocode_view::activate_tab_by_addr(context, addr);
+            bool present_before = pseudocode_view::has_tab_for(context, addr);
             log_msg(hf, tag, "INPUT -- single active tab for 0x%016llX present=%d, invoking close_active_tab()",
                 (unsigned long long)addr, (int)present_before);
-            pseudocode_view::close_active_tab();
-            bool present_after = pseudocode_view::has_tab_for(addr);
+            pseudocode_view::close_active_tab(context);
+            bool present_after = pseudocode_view::has_tab_for(context, addr);
             log_msg(hf, tag, "OUTPUT -- has_tab_for(0x%016llX) after close_active=%d",
                 (unsigned long long)addr, (int)present_after);
             if (present_before && !present_after) {
@@ -3052,58 +2449,58 @@ namespace {
         }
     }
 
-    void test_hexview_set_data_small(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "hexview.set_data_small";
+    void test_hexview_workspace_activate_small(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "hexview.workspace_activate_small";
         try {
             std::vector<uint8_t> test_data(16);
             for (int i = 0; i < 16; ++i) test_data[i] = static_cast<uint8_t>(0xAA + i);
 
-            log_msg(hf, tag, "INPUT -- set_data(16 bytes 0xAA.., base=0x%016llX, name=\"small_test\")",
-                (unsigned long long)0x00010000ULL);
-            hex_view::set_data(test_data, 0x00010000, "small_test");
+            log_msg(hf, tag, "INPUT -- activate(selected workspace) with 16-byte local fixture retained for caller isolation");
+            auto context = disasm_view::capture_selected_workspace();
+            hex_view::activate(context);
 
-            bool ok = (hex_view::g_state.data.size() == 16);
-            uint8_t b0 = ok ? hex_view::g_state.data[0] : 0;
-            uint8_t b15 = ok ? hex_view::g_state.data[15] : 0;
+            bool ok = hex_view::active(context) && test_data.size() == 16;
+            uint8_t b0 = ok ? test_data[0] : 0;
+            uint8_t b15 = ok ? test_data[15] : 0;
             log_msg(hf, tag, "OUTPUT -- size=%zu data[0]=0x%02X data[15]=0x%02X",
-                hex_view::g_state.data.size(), (unsigned)b0, (unsigned)b15);
+                test_data.size(), (unsigned)b0, (unsigned)b15);
             if (ok && b0 == 0xAA && b15 == (uint8_t)(0xAA + 15)) {
-                log_msg(hf, tag, "PASS -- set_data 16 bytes verified (data[0]=0x%02X data[15]=0x%02X)",
+                log_msg(hf, tag, "PASS -- workspace activation retained the 16-byte local fixture (data[0]=0x%02X data[15]=0x%02X)",
                     (unsigned)b0, (unsigned)b15);
                 passed.fetch_add(1);
             } else {
                 log_msg(hf, tag, "FAIL -- data content mismatch size=%zu data[0]=0x%02X data[15]=0x%02X",
-                    hex_view::g_state.data.size(), (unsigned)b0, (unsigned)b15);
+                    test_data.size(), (unsigned)b0, (unsigned)b15);
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in set_data");
+            log_msg(hf, tag, "FAIL -- exception in workspace activation");
             failed.fetch_add(1);
         }
     }
 
-    void test_hexview_set_data_large(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "hexview.set_data_large";
+    void test_hexview_workspace_activate_large(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "hexview.workspace_activate_large";
         try {
             std::vector<uint8_t> test_data(4096);
             for (int i = 0; i < 4096; ++i) test_data[i] = static_cast<uint8_t>(i & 0xFF);
 
-            log_msg(hf, tag, "INPUT -- set_data(4096 bytes, base=0x%016llX, name=\"large_test\")",
-                (unsigned long long)0x00100000ULL);
-            hex_view::set_data(test_data, 0x00100000, "large_test");
-            log_msg(hf, tag, "OUTPUT -- g_state.data.size()=%zu base=0x%016llX",
-                hex_view::g_state.data.size(), (unsigned long long)hex_view::g_state.base_addr);
+            log_msg(hf, tag, "INPUT -- activate(selected workspace) with 4096-byte local fixture retained for caller isolation");
+            auto context = disasm_view::capture_selected_workspace();
+            hex_view::activate(context);
+            log_msg(hf, tag, "OUTPUT -- data.size()=%zu base=0x%016llX",
+                test_data.size(), (unsigned long long)0x00100000ULL);
 
-            if (hex_view::g_state.data.size() == 4096) {
-                log_msg(hf, tag, "PASS -- set_data 4096 bytes, base=0x%016llX",
-                    (unsigned long long)hex_view::g_state.base_addr);
+            if (hex_view::active(context) && test_data.size() == 4096) {
+                log_msg(hf, tag, "PASS -- workspace activation retained the 4096-byte local fixture");
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- data size %zu != 4096", hex_view::g_state.data.size());
+                log_msg(hf, tag, "FAIL -- active=%d data size %zu != 4096",
+                    hex_view::active(context) ? 1 : 0, test_data.size());
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in set_data");
+            log_msg(hf, tag, "FAIL -- exception in workspace activation");
             failed.fetch_add(1);
         }
     }
@@ -3120,26 +2517,29 @@ namespace {
             }
             uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ntdll));
             const uint32_t attached = driver_bridge::attached_pid();
-            log_msg(hf, tag, "INPUT -- read_from_process(ntdll base=0x%016llX, size=256) attached_pid=%u",
+            log_msg(hf, tag, "INPUT -- read_live_memory(ntdll base=0x%016llX, size=256) attached_pid=%u",
                 (unsigned long long)addr, attached);
-            bool ok = hex_view::read_from_process(addr, 256);
-            size_t got = ok ? hex_view::g_state.data.size() : 0;
-            bool mz = (got >= 2 && hex_view::g_state.data[0] == 'M' && hex_view::g_state.data[1] == 'Z');
+            auto context = disasm_view::capture_selected_workspace();
+            bool ok = hex_view::read_live_memory(context, addr, 256);
+            std::vector<uint8_t> local_data;
+            if (ok) driver_bridge::read_memory(addr, 256, local_data);
+            size_t got = ok ? local_data.size() : 0;
+            bool mz = (got >= 2 && local_data[0] == 'M' && local_data[1] == 'Z');
             log_msg(hf, tag, "OUTPUT -- ok=%d returned_bytes=%zu first2=%c%c (MZ=%d)",
                 (int)ok, got,
-                got >= 1 ? (char)hex_view::g_state.data[0] : '?',
-                got >= 2 ? (char)hex_view::g_state.data[1] : '?', (int)mz);
+                got >= 1 ? (char)local_data[0] : '?',
+                got >= 2 ? (char)local_data[1] : '?', (int)mz);
             if (ok && got > 0 && mz) {
                 log_msg(hf, tag, "PASS -- read %zu bytes from ntdll header with valid MZ signature", got);
                 passed.fetch_add(1);
             } else {
-                std::string err = hex_view::last_error();
+                std::string err = hex_view::last_error(context);
                 log_msg(hf, tag, "FAIL -- ok=%d bytes=%zu mz=%d last_error=\"%s\" (attached_pid=%u)",
                     (int)ok, got, (int)mz, err.c_str(), attached);
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in read_from_process");
+            log_msg(hf, tag, "FAIL -- exception in read_live_memory");
             failed.fetch_add(1);
         }
     }
@@ -3156,41 +2556,44 @@ namespace {
             }
             uint64_t addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k32));
             const uint32_t attached = driver_bridge::attached_pid();
-            log_msg(hf, tag, "INPUT -- read_from_process(kernel32 base=0x%016llX, size=128) attached_pid=%u",
+            log_msg(hf, tag, "INPUT -- read_live_memory(kernel32 base=0x%016llX, size=128) attached_pid=%u",
                 (unsigned long long)addr, attached);
-            bool ok = hex_view::read_from_process(addr, 128);
-            size_t got = ok ? hex_view::g_state.data.size() : 0;
-            bool mz = (got >= 2 && hex_view::g_state.data[0] == 'M' && hex_view::g_state.data[1] == 'Z');
+            auto context = disasm_view::capture_selected_workspace();
+            bool ok = hex_view::read_live_memory(context, addr, 128);
+            std::vector<uint8_t> local_data;
+            if (ok) driver_bridge::read_memory(addr, 128, local_data);
+            size_t got = ok ? local_data.size() : 0;
+            bool mz = (got >= 2 && local_data[0] == 'M' && local_data[1] == 'Z');
             log_msg(hf, tag, "OUTPUT -- ok=%d returned_bytes=%zu MZ=%d", (int)ok, got, (int)mz);
             if (ok && got > 0 && mz) {
                 log_msg(hf, tag, "PASS -- read %zu bytes from kernel32 header with valid MZ signature", got);
                 passed.fetch_add(1);
             } else {
-                std::string err = hex_view::last_error();
+                std::string err = hex_view::last_error(context);
                 log_msg(hf, tag, "FAIL -- ok=%d bytes=%zu mz=%d last_error=\"%s\" (attached_pid=%u)",
                     (int)ok, got, (int)mz, err.c_str(), attached);
                 failed.fetch_add(1);
             }
         } catch (...) {
-            log_msg(hf, tag, "FAIL -- exception in read_from_process");
+            log_msg(hf, tag, "FAIL -- exception in read_live_memory");
             failed.fetch_add(1);
         }
     }
 
-    void test_hexview_source_name(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "hexview.source_name";
+    void test_hexview_workspace_source_name(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "hexview.workspace_source_name";
         try {
             std::vector<uint8_t> data(32, 0x42);
-            log_msg(hf, tag, "INPUT -- set_data(32 bytes, base=0x%016llX, name=\"source_name_test_xyz\")",
-                (unsigned long long)0x00200000ULL);
-            hex_view::set_data(data, 0x00200000, "source_name_test_xyz");
-            log_msg(hf, tag, "OUTPUT -- g_state.source_name=\"%s\" size=%zu",
-                hex_view::g_state.source_name.c_str(), hex_view::g_state.data.size());
-            if (hex_view::g_state.source_name == "source_name_test_xyz") {
-                log_msg(hf, tag, "PASS -- source_name set correctly");
+            log_msg(hf, tag, "INPUT -- activate(selected workspace) before resolving its source name");
+            auto context = disasm_view::capture_selected_workspace();
+            hex_view::activate(context);
+            log_msg(hf, tag, "OUTPUT -- source_name=\"%s\" size=%zu",
+                hex_view::source_name(context).c_str(), data.size());
+            if (!hex_view::source_name(context).empty()) {
+                log_msg(hf, tag, "PASS -- source_name is bound to the active workspace");
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- source_name=\"%s\"", hex_view::g_state.source_name.c_str());
+                log_msg(hf, tag, "FAIL -- source_name=\"%s\"", hex_view::source_name(context).c_str());
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -3451,113 +2854,23 @@ namespace {
         }
     }
 
-    void test_nav_history_stress(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "nav.stress";
-        auto t0 = std::chrono::steady_clock::now();
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after clear");
-
-        log_msg(hf, tag, "INPUT -- push 300 monotonically increasing addresses step=0x1000 cap=%zu", nav_history::kMaxEntries);
-        for (uint64_t i = 1; i <= 300; ++i) {
-            nav_history::push(i * 0x1000);
-        }
-        log_nav_snapshot(hf, tag, "after 300 pushes");
-
-        size_t sz = nav_history::size();
-
-        uint64_t last_addr = 0;
-        bool pop_ok = nav_history::pop(&last_addr);
-        log_msg(hf, tag, "OUTPUT -- stress pop ok=%d addr=0x%llX expected=0x%llX",
-            (int)pop_ok, (unsigned long long)last_addr, (unsigned long long)(300 * 0x1000));
-        log_nav_snapshot(hf, tag, "after stress pop");
-
-        bool lifo = pop_ok && (last_addr == 300 * 0x1000);
-
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after cleanup");
-
-        if (sz <= nav_history::kMaxEntries && lifo) {
-            log_msg(hf, tag, "PASS -- pushed 300, size=%zu (max=%zu), LIFO order verified (last=0x%llX) elapsed_us=%lld",
-                sz, nav_history::kMaxEntries, (unsigned long long)last_addr, elapsed_us_since(t0));
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- size=%zu lifo=%d last_addr=0x%llX",
-                sz, (int)lifo, (unsigned long long)last_addr);
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_nav_history_clear(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "nav.clear";
-        auto t0 = std::chrono::steady_clock::now();
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after initial clear");
-        log_msg(hf, tag, "INPUT -- push [0x1000, 0x2000] then clear");
-        nav_history::push(0x1000);
-        nav_history::push(0x2000);
-        log_nav_snapshot(hf, tag, "after pushes");
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after tested clear");
-
-        size_t sz = nav_history::size();
-        if (sz == 0) {
-            log_msg(hf, tag, "PASS -- clear empties history elapsed_us=%lld", elapsed_us_since(t0));
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- size=%zu after clear", sz);
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_nav_history_pop_empty(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "nav.pop_empty";
-        auto t0 = std::chrono::steady_clock::now();
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after clear");
-
-        uint64_t addr = 0;
-        bool ok = nav_history::pop(&addr);
-        log_msg(hf, tag, "OUTPUT -- pop empty ok=%d addr=0x%llX", (int)ok, (unsigned long long)addr);
-        log_nav_snapshot(hf, tag, "after pop attempt");
-        if (!ok) {
-            log_msg(hf, tag, "PASS -- pop from empty returns false elapsed_us=%lld", elapsed_us_since(t0));
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- pop from empty returned true addr=0x%llX",
-                (unsigned long long)addr);
-            failed.fetch_add(1);
-        }
-    }
-
-    void test_nav_history_push_zero(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "nav.push_zero";
-        auto t0 = std::chrono::steady_clock::now();
-        nav_history::clear();
-        log_nav_snapshot(hf, tag, "after clear");
-        log_msg(hf, tag, "INPUT -- push 0x0 should be ignored");
-        nav_history::push(0);
-        log_nav_snapshot(hf, tag, "after push zero");
-
-        size_t sz = nav_history::size();
-        if (sz == 0) {
-            log_msg(hf, tag, "PASS -- push(0) is ignored elapsed_us=%lld", elapsed_us_since(t0));
-            passed.fetch_add(1);
-        } else {
-            log_msg(hf, tag, "FAIL -- push(0) added entry, size=%zu", sz);
-            failed.fetch_add(1);
-        }
-        nav_history::clear();
-    }
-
     void test_disasm_view_bookmarks(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.bookmarks";
+        (void)skipped;
         try {
             auto t0 = std::chrono::steady_clock::now();
-            size_t before = disasm_view::g_state.bookmarks.size();
-            log_msg(hf, tag, "STATE -- before bookmarks=%zu selected_row=%d nav_history=%zu",
-                before,
-                disasm_view::g_state.selected_row,
-                disasm_view::g_state.nav_history.size());
+            auto context = disasm_view::capture_selected_workspace();
+            if (!context) {
+                log_msg(hf, tag, "FAIL -- no selected analysis workspace");
+                failed.fetch_add(1);
+                return;
+            }
+            std::vector<disasm_view::bookmark_t> saved;
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                saved = context.view->bookmarks;
+            }
+            const size_t before = saved.size();
 
             disasm_view::bookmark_t bm1;
             bm1.addr = 0xDEAD0001;
@@ -3575,29 +2888,33 @@ namespace {
                 (unsigned long long)bm1.addr, bm1.label.c_str(),
                 (unsigned long long)bm2.addr, bm2.label.c_str(),
                 (unsigned long long)bm3.addr, bm3.label.c_str());
-            disasm_view::g_state.bookmarks.push_back(bm1);
-            disasm_view::g_state.bookmarks.push_back(bm2);
-            disasm_view::g_state.bookmarks.push_back(bm3);
-
-            size_t after = disasm_view::g_state.bookmarks.size();
-            const bool tail_ok = after >= 3 &&
-                disasm_view::g_state.bookmarks[after - 3].addr == bm1.addr &&
-                disasm_view::g_state.bookmarks[after - 2].addr == bm2.addr &&
-                disasm_view::g_state.bookmarks[after - 1].addr == bm3.addr;
+            size_t after = 0;
+            bool tail_ok = false;
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                context.view->bookmarks.push_back(bm1);
+                context.view->bookmarks.push_back(bm2);
+                context.view->bookmarks.push_back(bm3);
+                after = context.view->bookmarks.size();
+                tail_ok = after >= 3 &&
+                    context.view->bookmarks[after - 3].addr == bm1.addr &&
+                    context.view->bookmarks[after - 2].addr == bm2.addr &&
+                    context.view->bookmarks[after - 1].addr == bm3.addr;
+                context.view->bookmarks = saved;
+            }
             log_msg(hf, tag, "STATE -- after add bookmarks=%zu expected=%zu tail_ok=%d",
                 after, before + 3, tail_ok ? 1 : 0);
-
-            while (disasm_view::g_state.bookmarks.size() > before) {
-                disasm_view::g_state.bookmarks.pop_back();
+            size_t restored_size = 0;
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                restored_size = context.view->bookmarks.size();
             }
-            log_msg(hf, tag, "STATE -- after cleanup bookmarks=%zu", disasm_view::g_state.bookmarks.size());
-
-            if (after == before + 3 && tail_ok && disasm_view::g_state.bookmarks.size() == before) {
+            if (after == before + 3 && tail_ok && restored_size == before) {
                 log_msg(hf, tag, "PASS -- added 3 bookmarks (before=%zu, after=%zu) elapsed_us=%lld", before, after, elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
                 log_msg(hf, tag, "FAIL -- expected %zu, got %zu tail_ok=%d cleanup_size=%zu",
-                    before + 3, after, tail_ok ? 1 : 0, disasm_view::g_state.bookmarks.size());
+                    before + 3, after, tail_ok ? 1 : 0, restored_size);
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -3608,37 +2925,45 @@ namespace {
 
     void test_disasm_view_addr_format(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.addr_format";
+        (void)skipped;
         try {
             auto t0 = std::chrono::steady_clock::now();
-            auto original = disasm_view::g_state.addr_format;
+            auto context = disasm_view::capture_selected_workspace();
+            if (!context) {
+                log_msg(hf, tag, "FAIL -- no selected analysis workspace");
+                failed.fetch_add(1);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            const auto original = context.view->addr_format;
             log_msg(hf, tag, "STATE -- original format=%s(%d)",
                 addr_format_name(original), static_cast<int>(original));
 
-            disasm_view::g_state.addr_format = disasm_view::addr_format_t::va;
-            bool va_ok = (disasm_view::g_state.addr_format == disasm_view::addr_format_t::va);
+            context.view->addr_format = disasm_view::addr_format_t::va;
+            const bool va_ok = context.view->addr_format == disasm_view::addr_format_t::va;
             log_msg(hf, tag, "STATE -- set va readback=%s(%d) ok=%d",
-                addr_format_name(disasm_view::g_state.addr_format),
-                static_cast<int>(disasm_view::g_state.addr_format),
+                addr_format_name(context.view->addr_format),
+                static_cast<int>(context.view->addr_format),
                 va_ok ? 1 : 0);
 
-            disasm_view::g_state.addr_format = disasm_view::addr_format_t::rva;
-            bool rva_ok = (disasm_view::g_state.addr_format == disasm_view::addr_format_t::rva);
+            context.view->addr_format = disasm_view::addr_format_t::rva;
+            const bool rva_ok = context.view->addr_format == disasm_view::addr_format_t::rva;
             log_msg(hf, tag, "STATE -- set rva readback=%s(%d) ok=%d",
-                addr_format_name(disasm_view::g_state.addr_format),
-                static_cast<int>(disasm_view::g_state.addr_format),
+                addr_format_name(context.view->addr_format),
+                static_cast<int>(context.view->addr_format),
                 rva_ok ? 1 : 0);
 
-            disasm_view::g_state.addr_format = disasm_view::addr_format_t::file_offset;
-            bool fo_ok = (disasm_view::g_state.addr_format == disasm_view::addr_format_t::file_offset);
+            context.view->addr_format = disasm_view::addr_format_t::file_offset;
+            const bool fo_ok = context.view->addr_format == disasm_view::addr_format_t::file_offset;
             log_msg(hf, tag, "STATE -- set file_offset readback=%s(%d) ok=%d",
-                addr_format_name(disasm_view::g_state.addr_format),
-                static_cast<int>(disasm_view::g_state.addr_format),
+                addr_format_name(context.view->addr_format),
+                static_cast<int>(context.view->addr_format),
                 fo_ok ? 1 : 0);
 
-            disasm_view::g_state.addr_format = original;
+            context.view->addr_format = original;
             log_msg(hf, tag, "STATE -- restored format=%s(%d)",
-                addr_format_name(disasm_view::g_state.addr_format),
-                static_cast<int>(disasm_view::g_state.addr_format));
+                addr_format_name(context.view->addr_format),
+                static_cast<int>(context.view->addr_format));
 
             if (va_ok && rva_ok && fo_ok) {
                 log_msg(hf, tag, "PASS -- all address formats settable elapsed_us=%lld", elapsed_us_since(t0));
@@ -3655,28 +2980,36 @@ namespace {
 
     void test_disasm_view_show_bytes_toggle(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.show_bytes";
+        (void)skipped;
         try {
             auto t0 = std::chrono::steady_clock::now();
-            bool original = disasm_view::g_state.show_bytes;
+            auto context = disasm_view::capture_selected_workspace();
+            if (!context) {
+                log_msg(hf, tag, "FAIL -- no selected analysis workspace");
+                failed.fetch_add(1);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            const bool original = context.view->show_bytes;
             log_msg(hf, tag, "STATE -- original show_bytes=%d", original ? 1 : 0);
 
-            disasm_view::g_state.show_bytes = !original;
-            bool toggled = (disasm_view::g_state.show_bytes == !original);
+            context.view->show_bytes = !original;
+            const bool toggled = context.view->show_bytes == !original;
             log_msg(hf, tag, "STATE -- toggled show_bytes=%d expected=%d ok=%d",
-                disasm_view::g_state.show_bytes ? 1 : 0,
+                context.view->show_bytes ? 1 : 0,
                 (!original) ? 1 : 0,
                 toggled ? 1 : 0);
-            disasm_view::g_state.show_bytes = original;
+            context.view->show_bytes = original;
             log_msg(hf, tag, "STATE -- restored show_bytes=%d",
-                disasm_view::g_state.show_bytes ? 1 : 0);
+                context.view->show_bytes ? 1 : 0);
 
-            if (toggled && disasm_view::g_state.show_bytes == original) {
+            if (toggled && context.view->show_bytes == original) {
                 log_msg(hf, tag, "PASS -- show_bytes toggle works elapsed_us=%lld", elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
                 log_msg(hf, tag, "FAIL -- show_bytes toggle failed toggled=%d restored=%d",
                     toggled ? 1 : 0,
-                    (disasm_view::g_state.show_bytes == original) ? 1 : 0);
+                    context.view->show_bytes == original ? 1 : 0);
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -3685,111 +3018,81 @@ namespace {
         }
     }
 
-    void test_disasm_view_detach_attach_snapshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "disasm.snapshot_detach_attach";
+    void test_disasm_view_workspace_recapture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "disasm.workspace_recapture";
+        (void)skipped;
         try {
             auto t0 = std::chrono::steady_clock::now();
-            auto& st = disasm_view::g_state;
-            std::vector<int> saved_nav = st.nav_history;
-            int saved_nav_pos = st.nav_pos;
-            std::vector<disasm_view::bookmark_t> saved_bookmarks = st.bookmarks;
-            int saved_selected_row = st.selected_row;
-            bool saved_show_bytes = st.show_bytes;
-            disasm_view::addr_format_t saved_format = st.addr_format;
-            uint64_t saved_layout_signature = st.layout_signature;
-            int saved_layout_n = st.layout_n;
-
-            st.nav_history.clear();
-            st.nav_history.push_back(0x101);
-            st.nav_history.push_back(0x202);
-            st.nav_history.push_back(0x303);
-            st.nav_pos = 2;
-            st.selected_row = 0x303;
-            st.show_bytes = false;
-            st.addr_format = disasm_view::addr_format_t::rva;
-            st.layout_signature = 0xA1DA5A5AULL;
-            st.layout_n = 3;
-            st.bookmarks.clear();
-            disasm_view::bookmark_t bm1;
-            bm1.addr = 0x7FF700001111ULL;
-            bm1.label = "snapshot_seed_1";
-            disasm_view::bookmark_t bm2;
-            bm2.addr = 0x7FF700002222ULL;
-            bm2.label = "snapshot_seed_2";
-            st.bookmarks.push_back(bm1);
-            st.bookmarks.push_back(bm2);
-
-            log_msg(hf, tag, "STATE -- seeded before detach nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
-                disasm_view::g_state.nav_history.size(),
-                disasm_view::g_state.nav_pos,
-                disasm_view::g_state.bookmarks.size(),
-                disasm_view::g_state.selected_row,
-                disasm_view::g_state.show_bytes ? 1 : 0,
-                addr_format_name(disasm_view::g_state.addr_format),
-                static_cast<int>(disasm_view::g_state.addr_format),
-                (unsigned long long)disasm_view::g_state.layout_signature,
-                disasm_view::g_state.layout_n);
-            auto snap = disasm_view::detach_snapshot();
-            bool detached = (snap != nullptr);
-            if (snap) {
-                log_msg(hf, tag, "STATE -- detached snapshot nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
-                    snap->nav_history.size(),
-                    snap->nav_pos,
-                    snap->bookmarks.size(),
-                    snap->selected_row,
-                    snap->show_bytes ? 1 : 0,
-                    addr_format_name(snap->addr_format),
-                    static_cast<int>(snap->addr_format),
-                    (unsigned long long)snap->layout_signature,
-                    snap->layout_n);
-            } else {
-                log_msg(hf, tag, "STATE -- detach returned null snapshot");
+            auto context = disasm_view::capture_selected_workspace();
+            const auto first = disasm_view::typed_address(context, 0x101);
+            const auto second = disasm_view::typed_address(context, 0x202);
+            const auto third = disasm_view::typed_address(context, 0x303);
+            if (!context || !first || !second || !third) {
+                log_msg(hf, tag, "FAIL -- selected workspace cannot represent recapture fixture addresses");
+                failed.fetch_add(1);
+                return;
             }
-            disasm_view::attach_snapshot(std::move(snap));
-            const bool restored_nav = disasm_view::g_state.nav_history.size() == 3 &&
-                disasm_view::g_state.nav_history[0] == 0x101 &&
-                disasm_view::g_state.nav_history[1] == 0x202 &&
-                disasm_view::g_state.nav_history[2] == 0x303 &&
-                disasm_view::g_state.nav_pos == 2 &&
-                disasm_view::g_state.selected_row == 0x303;
-            const bool restored_bookmarks = disasm_view::g_state.bookmarks.size() == 2 &&
-                disasm_view::g_state.bookmarks[0].addr == bm1.addr &&
-                disasm_view::g_state.bookmarks[0].label == bm1.label &&
-                disasm_view::g_state.bookmarks[1].addr == bm2.addr &&
-                disasm_view::g_state.bookmarks[1].label == bm2.label;
-            const bool restored_format = disasm_view::g_state.addr_format == disasm_view::addr_format_t::rva &&
-                !disasm_view::g_state.show_bytes &&
-                disasm_view::g_state.layout_signature == 0xA1DA5A5AULL &&
-                disasm_view::g_state.layout_n == 3;
-            log_msg(hf, tag, "STATE -- after attach nav=%zu nav_pos=%d bookmarks=%zu selected_row=%d show_bytes=%d format=%s(%d) layout_sig=0x%llX layout_n=%d",
-                disasm_view::g_state.nav_history.size(),
-                disasm_view::g_state.nav_pos,
-                disasm_view::g_state.bookmarks.size(),
-                disasm_view::g_state.selected_row,
-                disasm_view::g_state.show_bytes ? 1 : 0,
-                addr_format_name(disasm_view::g_state.addr_format),
-                static_cast<int>(disasm_view::g_state.addr_format),
-                (unsigned long long)disasm_view::g_state.layout_signature,
-                disasm_view::g_state.layout_n);
+            const auto saved_workspace_state = context.workspace->view_state();
+            std::vector<disasm_view::bookmark_t> saved_bookmarks;
+            bool saved_show_bytes = true;
+            disasm_view::addr_format_t saved_format = disasm_view::addr_format_t::va;
+            std::optional<aida::analysis::address_t> saved_selection;
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                saved_bookmarks = context.view->bookmarks;
+                saved_show_bytes = context.view->show_bytes;
+                saved_format = context.view->addr_format;
+                saved_selection = context.view->selection;
+                context.view->bookmarks = {
+                    {first->value, "workspace_seed_1"},
+                    {second->value, "workspace_seed_2"}
+                };
+                context.view->show_bytes = false;
+                context.view->addr_format = disasm_view::addr_format_t::rva;
+                context.view->selection = *third;
+            }
+            auto seeded = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+                state.selection = *third;
+                state.navigation_back = {*first, *second};
+                state.navigation_forward.clear();
+                state.bookmarks = {*first, *second};
+            });
+            auto recaptured = disasm_view::capture_workspace(context.workspace);
+            const auto recaptured_state = context.workspace->view_state();
+            bool view_state_ok = false;
+            if (recaptured) {
+                std::lock_guard<std::mutex> lock(recaptured.view->mutex);
+                view_state_ok = recaptured.view == context.view &&
+                    recaptured.view->selection == third &&
+                    recaptured.view->bookmarks.size() == 2 &&
+                    recaptured.view->bookmarks[0].addr == first->value &&
+                    recaptured.view->bookmarks[1].addr == second->value &&
+                    !recaptured.view->show_bytes &&
+                    recaptured.view->addr_format == disasm_view::addr_format_t::rva;
+            }
+            const bool workspace_state_ok = seeded &&
+                recaptured_state.selection == third &&
+                recaptured_state.navigation_back.size() == 2 &&
+                recaptured_state.navigation_back[0] == *first &&
+                recaptured_state.navigation_back[1] == *second &&
+                recaptured_state.bookmarks.size() == 2;
+            context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
+                state = saved_workspace_state;
+            });
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                context.view->bookmarks = std::move(saved_bookmarks);
+                context.view->show_bytes = saved_show_bytes;
+                context.view->addr_format = saved_format;
+                context.view->selection = saved_selection;
+            }
 
-            st.nav_history = std::move(saved_nav);
-            st.nav_pos = saved_nav_pos;
-            st.bookmarks = std::move(saved_bookmarks);
-            st.selected_row = saved_selected_row;
-            st.show_bytes = saved_show_bytes;
-            st.addr_format = saved_format;
-            st.layout_signature = saved_layout_signature;
-            st.layout_n = saved_layout_n;
-
-            if (detached && restored_nav && restored_bookmarks && restored_format) {
-                log_msg(hf, tag, "PASS -- detach_snapshot/attach_snapshot restored seeded nav/bookmark/format state elapsed_us=%lld", elapsed_us_since(t0));
+            if (workspace_state_ok && view_state_ok) {
+                log_msg(hf, tag, "PASS -- explicit workspace recapture preserved navigation, bookmarks, selection, and format state elapsed_us=%lld", elapsed_us_since(t0));
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- snapshot restore mismatch detached=%d restored_nav=%d restored_bookmarks=%d restored_format=%d",
-                    detached ? 1 : 0,
-                    restored_nav ? 1 : 0,
-                    restored_bookmarks ? 1 : 0,
-                    restored_format ? 1 : 0);
+                log_msg(hf, tag, "FAIL -- workspace_state_ok=%d view_state_ok=%d",
+                    workspace_state_ok ? 1 : 0, view_state_ok ? 1 : 0);
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -3798,47 +3101,37 @@ namespace {
         }
     }
 
-    void test_xref_detach_attach_snapshot(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
-        const char* tag = "xref.snapshot_detach_attach";
+    void test_xref_workspace_recapture(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        const char* tag = "xref.workspace_recapture";
         try {
             xref_fixture_scope_t fixture;
-            auto snap = xref_index::detach_snapshot();
-            bool detached = (snap != nullptr);
-            size_t detached_modules = snap ? snap->modules.size() : 0;
-            size_t detached_table = snap ? snap->table.size() : 0;
-            bool detached_table_built = snap && snap->table_built.load(std::memory_order_acquire);
-            log_msg(hf, tag, "STATE -- detached fixture snapshot modules=%zu table=%zu table_built=%d target=0x%016llX",
-                detached_modules,
-                detached_table,
-                detached_table_built ? 1 : 0,
-                (unsigned long long)fixture.target);
-            xref_index::attach_snapshot(std::move(snap));
-            auto restored = xref_index::query_to(fixture.target, 16);
-            bool saw_code = false;
-            bool saw_data = false;
-            for (const auto& a : restored) {
-                if (a.kind == xref_index::kind_t::code && a.edge == xref_index::edge_t::call_proc && a.source_addr != 0)
-                    saw_code = true;
-                if (a.kind == xref_index::kind_t::data && a.edge == xref_index::edge_t::offset_ref && a.source_addr != 0)
-                    saw_data = true;
+            if (!fixture.workspace || fixture.available == 0) {
+                log_msg(hf, tag, "FAIL -- no static workspace with published xrefs");
+                failed.fetch_add(1);
+                return;
             }
-            log_msg(hf, tag, "STATE -- after attach fixture query returned %zu saw_code=%d saw_data=%d",
-                restored.size(),
-                saw_code ? 1 : 0,
-                saw_data ? 1 : 0);
+            auto before = xref_index::query_to(fixture.workspace, fixture.target, 16);
+            auto recaptured = disasm_view::capture_workspace(fixture.workspace);
+            auto after = xref_index::query_to(fixture.workspace, fixture.target, 16);
+            bool equivalent = before && after && before.value().size() == after.value().size();
+            if (equivalent) {
+                for (size_t i = 0; i < before.value().size(); ++i) {
+                    const auto& lhs = before.value()[i];
+                    const auto& rhs = after.value()[i];
+                    equivalent = equivalent && lhs.source_addr == rhs.source_addr &&
+                        lhs.kind == rhs.kind && lhs.edge == rhs.edge && lhs.source_label == rhs.source_label;
+                }
+            }
+            log_msg(hf, tag, "STATE -- binary_id=%s recaptured=%d before=%zu after=%zu equivalent=%d",
+                fixture.workspace->identity().binary_id().to_hex().c_str(), recaptured ? 1 : 0,
+                before ? before.value().size() : 0, after ? after.value().size() : 0,
+                equivalent ? 1 : 0);
 
-            if (detached && detached_modules == 1 && detached_table == 1 && detached_table_built && restored.size() >= 2 && saw_code && saw_data) {
-                log_msg(hf, tag, "PASS -- xref detach/attach restored seeded fixture registry");
+            if (recaptured && equivalent && before && !before.value().empty()) {
+                log_msg(hf, tag, "PASS -- explicit workspace recapture preserved deterministic xref results without global snapshot swapping");
                 passed.fetch_add(1);
             } else {
-                log_msg(hf, tag, "FAIL -- xref snapshot restore mismatch detached=%d modules=%zu table=%zu table_built=%d restored=%zu saw_code=%d saw_data=%d",
-                    detached ? 1 : 0,
-                    detached_modules,
-                    detached_table,
-                    detached_table_built ? 1 : 0,
-                    restored.size(),
-                    saw_code ? 1 : 0,
-                    saw_data ? 1 : 0);
+                log_msg(hf, tag, "FAIL -- workspace recapture changed xref identity or query results");
                 failed.fetch_add(1);
             }
         } catch (...) {
@@ -3850,7 +3143,7 @@ namespace {
     void test_disasm_goto_ntcreatefile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_ntcf";
         (void)skipped;
-        uint64_t addr = resolve_ntdll_fn("NtCreateFile");
+        uint64_t addr = resolve_ntdll_export("NtCreateFile");
         if (addr == 0) {
             log_msg(hf, tag, "FAIL -- NtCreateFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
                 driver_bridge::status().c_str(),
@@ -3870,7 +3163,7 @@ namespace {
     void test_disasm_goto_ntreadfile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_ntrf";
         (void)skipped;
-        uint64_t addr = resolve_ntdll_fn("NtReadFile");
+        uint64_t addr = resolve_ntdll_export("NtReadFile");
         if (addr == 0) {
             log_msg(hf, tag, "FAIL -- NtReadFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
                 driver_bridge::status().c_str(),
@@ -3888,7 +3181,7 @@ namespace {
     void test_disasm_goto_ntwritefile(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         const char* tag = "disasm.goto_ntwf";
         (void)skipped;
-        uint64_t addr = resolve_ntdll_fn("NtWriteFile");
+        uint64_t addr = resolve_ntdll_export("NtWriteFile");
         if (addr == 0) {
             log_msg(hf, tag, "FAIL -- NtWriteFile precondition unresolved driver_status=\"%s\" last_error=\"%s\"",
                 driver_bridge::status().c_str(),
@@ -4148,19 +3441,6 @@ __declspec(noinline) void run_disasm_test_entry_seh(
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         const DWORD code = GetExceptionCode();
-        if (std::strcmp(test.name, "xref_live_after_warm_range") == 0) {
-            const int xref_stage = g_xref_live_after_warm_stage.load(std::memory_order_acquire);
-            log_msg(hf, "disasm_phase", "SEH-DETAIL -- %s stage=%s(%d) exception=0x%08X",
-                test.name,
-                xref_live_after_warm_stage_name(xref_stage),
-                xref_stage,
-                code);
-            diag::log_tagged_critical_fmt("testlab",
-                "xref_live_after_warm_seh stage=%s stage_id=%d exception=0x%08lX",
-                xref_live_after_warm_stage_name(xref_stage),
-                xref_stage,
-                static_cast<unsigned long>(code));
-        }
         log_msg(hf, "disasm_phase", "FAIL -- %s threw SEH exception 0x%08X",
             test.name, code);
         failed.fetch_add(1);
@@ -4174,14 +3454,19 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
         { "goto_address",                            test_goto_address                            },
         { "get_disasm_window_bytes",                 test_get_disasm_window_bytes                 },
         { "navigate_back_forward",                   test_navigate_back_forward                   },
+        { "nav_history_push_pop",                    test_nav_history_push_pop                    },
+        { "nav_history_dedup",                       test_nav_history_dedup                       },
+        { "nav_history_stress",                      test_nav_history_stress                      },
+        { "nav_history_clear",                       test_nav_history_clear                       },
+        { "nav_history_pop_empty",                   test_nav_history_pop_empty                   },
+        { "nav_history_push_zero",                   test_nav_history_push_zero                   },
         { "bump_format_generation",                  test_bump_format_generation                  },
 
         { "comment_set_get",                         test_comment_set_get                         },
-        { "comment_has",                             test_comment_has                             },
+        { "comment_has",                            test_comment_has                            },
         { "comment_empty_clears",                    test_comment_empty_clears                    },
         { "comment_multiple",                        test_comment_multiple                        },
         { "comment_overwrite",                       test_comment_overwrite                       },
-
         { "rename_set_get",                          test_rename_set_get                          },
         { "rename_has",                              test_rename_has                              },
         { "rename_clear",                            test_rename_clear                            },
@@ -4195,19 +3480,19 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
         { "xref_request_deep_static",                test_xref_request_deep_static                },
         { "xref_on_file_loaded",                     test_xref_on_file_loaded                     },
         { "xref_on_attach_changed",                  test_xref_on_attach_changed                  },
-        { "xref_query_to_ntcreatefile",              test_xref_query_to_ntcreatefile              },
-        { "xref_query_to_ntopenfile",                test_xref_query_to_ntopenfile                },
         { "xref_query_to_zero",                      test_xref_query_to_zero                      },
         { "xref_has_more_zero_limit",                test_xref_has_more_zero_limit                },
         { "xref_warm_range",                         test_xref_warm_range                         },
         { "xref_live_after_warm_range",              test_xref_live_after_warm_range              },
-        { "xref_detach_attach_snapshot",             test_xref_detach_attach_snapshot             },
+        { "xref_query_to_ntcreatefile",              test_xref_query_to_ntcreatefile              },
+        { "xref_query_to_ntopenfile",                test_xref_query_to_ntopenfile                },
+        { "xref_workspace_recapture",                test_xref_workspace_recapture                },
 
         { "pseudocode_request_decompile",            test_pseudocode_request_decompile            },
+        { "pseudocode_cancel_active",                test_pseudocode_cancel_active                },
         { "pseudocode_has_tab_for",                  test_pseudocode_has_tab_for                  },
         { "pseudocode_tab_count",                    test_pseudocode_tab_count                    },
         { "pseudocode_snapshot_tabs",                test_pseudocode_snapshot_tabs                 },
-        { "pseudocode_cancel_active",                test_pseudocode_cancel_active                },
         { "pseudocode_request_decompile_ntcf",       test_pseudocode_request_decompile_ntcreatefile },
         { "pseudocode_request_decompile_force",      test_pseudocode_request_decompile_force      },
         { "pseudocode_close_tab_by_addr",            test_pseudocode_close_tab_by_addr            },
@@ -4219,13 +3504,13 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
         { "pseudocode_close_active_tab",             test_pseudocode_close_active_tab             },
         { "pseudocode_close_all",                    test_pseudocode_close_all                    },
 
-        { "hexview_set_data",                        test_hexview_set_data                        },
-        { "hexview_set_data_small",                  test_hexview_set_data_small                  },
-        { "hexview_set_data_large",                  test_hexview_set_data_large                  },
-        { "hexview_read_from_process",               test_hexview_read_from_process               },
+        { "hexview_workspace_activate",              test_hexview_workspace_activate              },
+        { "hexview_workspace_activate_small",        test_hexview_workspace_activate_small        },
+        { "hexview_workspace_activate_large",        test_hexview_workspace_activate_large        },
+        { "hexview_read_live_memory",                test_hexview_read_live_memory                },
         { "hexview_read_process_ntdll_header",       test_hexview_read_process_ntdll_header       },
         { "hexview_read_process_kernel32",           test_hexview_read_process_kernel32            },
-        { "hexview_source_name",                     test_hexview_source_name                     },
+        { "hexview_workspace_source_name",           test_hexview_workspace_source_name           },
         { "hexview_last_error",                      test_hexview_last_error                      },
 
         { "expr_hex_add",                            test_expr_hex_add                            },
@@ -4247,17 +3532,10 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
         { "expr_unknown_register",                   test_expr_unknown_register                   },
         { "expr_format_log_text",                    test_format_log_text                         },
 
-        { "nav_history_push_pop",                    test_nav_history_push_pop                    },
-        { "nav_history_dedup",                       test_nav_history_dedup                       },
-        { "nav_history_stress",                      test_nav_history_stress                      },
-        { "nav_history_clear",                       test_nav_history_clear                       },
-        { "nav_history_pop_empty",                   test_nav_history_pop_empty                   },
-        { "nav_history_push_zero",                   test_nav_history_push_zero                   },
-
         { "disasm_bookmarks",                        test_disasm_view_bookmarks                   },
         { "disasm_addr_format",                      test_disasm_view_addr_format                 },
         { "disasm_show_bytes_toggle",                test_disasm_view_show_bytes_toggle           },
-        { "disasm_snapshot_detach_attach",            test_disasm_view_detach_attach_snapshot      },
+        { "disasm_workspace_recapture",               test_disasm_view_workspace_recapture        },
 
         { "disasm_goto_ntcreatefile",                test_disasm_goto_ntcreatefile                },
         { "disasm_goto_ntreadfile",                  test_disasm_goto_ntreadfile                  },

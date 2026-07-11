@@ -82,17 +82,11 @@ inline void merge_stats(aggregate_stats_t& out, const runtime::stats_t& s, runti
     });
 }
 
-inline runtime::stats_t domain_stats(runtime::executor_domain_t domain)
-{
-    runtime::pool_t& pool = runtime::domain_pool(domain);
-    return runtime::stats_for(pool, pool.configured_pool_size, runtime::domain_name(domain));
-}
-
 inline aggregate_stats_t aggregate(std::initializer_list<runtime::executor_domain_t> domains)
 {
     aggregate_stats_t out;
     for (runtime::executor_domain_t domain : domains)
-        merge_stats(out, domain_stats(domain), domain);
+        merge_stats(out, runtime::domain_stats(domain), domain);
     return out;
 }
 

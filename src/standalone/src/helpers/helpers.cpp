@@ -83,7 +83,6 @@
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
 static int                        g_loader_icon_w    = 0;
 static int                        g_loader_icon_h    = 0;
-DisasmState                       g_disasm;
 render_section_state_t            g_render_section;
 
 namespace test_all_features {
@@ -895,7 +894,7 @@ static bool has_any_target()
 {
 	return analysis_session::session_count() > 0
 	    || driver_bridge::attached_pid() != 0
-	    || g_disasm.file.loaded;
+	    || analysis_session::active_workspace() != nullptr;
 }
 
 static bool license_activate_impl(const char* key_str,
@@ -1530,7 +1529,7 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 	int    open_ctx_for = -1;
 
 	for (size_t i = 0; i < count; ++i) {
-		const analysis_session::analysis_session_t* sess = analysis_session::session_at(i);
+		const auto sess = analysis_session::session_handle_at(i);
 		if (!sess) continue;
 		bool is_live = (sess->attached_pid != 0);
 		bool is_dead = is_live && !session_health::is_alive(sess->attached_pid);
@@ -1716,7 +1715,7 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 	if (ImGui::BeginPopup("##session_tab_ctx")) {
 		int ctx_idx = ImGui::GetStateStorage()->GetInt(ImGui::GetID("##session_tab_ctx_idx"), -1);
 		if (ctx_idx >= 0 && ctx_idx < static_cast<int>(analysis_session::session_count())) {
-			const auto* sess = analysis_session::session_at(static_cast<size_t>(ctx_idx));
+			const auto sess = analysis_session::session_handle_at(static_cast<size_t>(ctx_idx));
 			if (sess) {
 				bool live = (sess->attached_pid != 0);
 				bool dead = live && !session_health::is_alive(sess->attached_pid);
@@ -1750,7 +1749,7 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 		size_t sw_idx = static_cast<size_t>(switch_intent);
 		bool ok = analysis_session::switch_session(sw_idx);
 		const char* sw_name = "(unknown)";
-		const analysis_session::analysis_session_t* sw_sess = analysis_session::session_at(sw_idx);
+		const auto sw_sess = analysis_session::session_handle_at(sw_idx);
 		if (sw_sess) {
 			sw_name = sw_sess->filename.empty()
 				? (sw_sess->path.empty() ? "(unnamed)" : sw_sess->path.c_str())
@@ -1761,7 +1760,7 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 			"session_switch idx=%zu name=%s ok=%d", sw_idx, sw_name, ok ? 1 : 0);
 		anti_tamper::webhook::write_log("chrome", sw_buf);
 		if (ok) {
-			if (g_disasm.file.loaded) {
+			if (analysis_session::active_workspace()) {
 				globals::ui::active_center_view = center_view_t::disassembly;
 			}
 		}
@@ -1775,6 +1774,8 @@ void helpers::render_title()
 {
 	g_render_section = "entry";
 	float dt = ImGui::GetIO().DeltaTime;
+	const auto active_workspace_handle = analysis_session::active_workspace();
+	const auto active_workspace_context = disasm_view::capture_workspace(active_workspace_handle);
 	globals::ui::load_timer += dt;
 	file_menu_deferred::run_pending();
 
@@ -2106,7 +2107,7 @@ void helpers::render_title()
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
-			if (pseudocode_view::has_active_tab()) {
+			if (pseudocode_view::has_active_tab(active_workspace_context)) {
 				globals::ui::active_center_view = center_view_t::pseudocode;
 				diag::log_tagged("ui", "view_switch to=pseudocode hotkey=F5");
 			}
@@ -3570,7 +3571,8 @@ void helpers::render_title()
 			float bc_x = title_x + name_ts.x + gap * 2.f;
 			float bc_y = wp.y + (title_h - bc_font_sz) * 0.5f;
 			std::vector<std::string> segs;
-			if (g_disasm.file.loaded) segs.push_back(g_disasm.file.filename);
+			if (active_workspace_context)
+				segs.push_back(active_workspace_context.workspace->identity().bin_name());
 			if (code_editor::active && !code_editor::filename.empty())
 				segs.push_back(code_editor::filename);
 			switch (globals::ui::active_center_view) {
@@ -5155,7 +5157,7 @@ void helpers::render_title()
 					ImGui::Dummy(ImVec2(fw, 16.f));
 
 					for (size_t si = 0; si < open_count; ++si) {
-						const analysis_session::analysis_session_t* sess = analysis_session::session_at(si);
+						const auto sess = analysis_session::session_handle_at(si);
 						if (!sess) continue;
 						any_drawn = true;
 						float row_h = 38.f;
@@ -5229,7 +5231,7 @@ void helpers::render_title()
 				for (auto& p : recent_list) {
 					bool is_open = false;
 					for (size_t si = 0; si < open_count; ++si) {
-						const analysis_session::analysis_session_t* sess = analysis_session::session_at(si);
+						const auto sess = analysis_session::session_handle_at(si);
 						if (sess && paths_eq(sess->path, p)) { is_open = true; break; }
 					}
 					if (!is_open) closed_list.push_back(p);
@@ -5484,7 +5486,7 @@ void helpers::render_title()
 	{
 
 
-		bool row2_has_vt_btn = g_disasm.file.loaded;
+		bool row2_has_vt_btn = static_cast<bool>(active_workspace_context);
 		float row2_vt_btn_w = 0.f;
 		if (row2_has_vt_btn) {
 			bool is_hex_view_pre = (globals::ui::active_center_view == center_view_t::hex_view);
@@ -5559,7 +5561,7 @@ void helpers::render_title()
 		{
 			g_render_section = "title_strip_psv_snapshot";
 			const unsigned long long psv_snap1_t0 = GetTickCount64();
-			auto psv_tabs_for_strip = pseudocode_view::snapshot_tabs();
+			auto psv_tabs_for_strip = pseudocode_view::snapshot_tabs(active_workspace_context);
 			const unsigned long long psv_snap1_elapsed = GetTickCount64() - psv_snap1_t0;
 			if (psv_snap1_elapsed >= 50ULL) {
 				diag::log_tagged_critical_fmt("helpers",
@@ -5570,7 +5572,7 @@ void helpers::render_title()
 					static_cast<unsigned long long>(GetTickCount64()));
 			}
 			bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
-			uint64_t active_psv_addr = pseudocode_view::active_tab_address();
+			uint64_t active_psv_addr = pseudocode_view::active_tab_address(active_workspace_context);
 			for (auto& pt : psv_tabs_for_strip) {
 				strip_entry_t e;
 				if (!pt.function_name.empty()) e.label = pt.function_name;
@@ -5591,11 +5593,12 @@ void helpers::render_title()
 			}
 		}
 
-		if (hex_view::g_state.active) {
+		if (hex_view::active(active_workspace_context)) {
 			strip_entry_t e;
-			e.label = hex_view::g_state.source_name.empty()
+			const std::string hex_source = hex_view::source_name(active_workspace_context);
+			e.label = hex_source.empty()
 				? std::string("Hex View")
-				: hex_view::g_state.source_name + " (Hex)";
+				: hex_source + " (Hex)";
 			e.kind = 3;
 			e.is_active = (globals::ui::active_center_view == center_view_t::hex_view);
 			e.width = strip_calc_w(e.label);
@@ -5785,7 +5788,7 @@ void helpers::render_title()
 		{
 			g_render_section = "title_strip_psv_render";
 			const unsigned long long psv_snap2_t0 = GetTickCount64();
-			auto psv_tabs = pseudocode_view::snapshot_tabs();
+			auto psv_tabs = pseudocode_view::snapshot_tabs(active_workspace_context);
 			const unsigned long long psv_snap2_elapsed = GetTickCount64() - psv_snap2_t0;
 			if (psv_snap2_elapsed >= 50ULL) {
 				diag::log_tagged_critical_fmt("helpers",
@@ -5797,7 +5800,7 @@ void helpers::render_title()
 			}
 			if (!psv_tabs.empty()) {
 				bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
-				uint64_t active_psv_addr = pseudocode_view::active_tab_address();
+				uint64_t active_psv_addr = pseudocode_view::active_tab_address(active_workspace_context);
 
 				const float p_close_sz = 10.f;
 				float tab_h_p = row_h - 2.f;
@@ -5884,22 +5887,23 @@ void helpers::render_title()
 				}
 
 				if (to_close_addr != 0) {
-					pseudocode_view::close_tab_by_addr(to_close_addr);
-					if (psv_view_active && pseudocode_view::tab_count() == 0) {
+					pseudocode_view::close_tab_by_addr(active_workspace_context, to_close_addr);
+					if (psv_view_active && pseudocode_view::tab_count(active_workspace_context) == 0) {
 						globals::ui::active_center_view = center_view_t::disassembly;
 					}
 				} else if (to_activate_addr != 0) {
-					pseudocode_view::activate_tab_by_addr(to_activate_addr);
+					pseudocode_view::activate_tab_by_addr(active_workspace_context, to_activate_addr);
 					globals::ui::active_center_view = center_view_t::pseudocode;
 				}
 			}
 		}
 
-		if (hex_view::g_state.active) {
+		if (hex_view::active(active_workspace_context)) {
 			bool hex_is_active = (globals::ui::active_center_view == center_view_t::hex_view);
-			std::string hex_label_str = hex_view::g_state.source_name.empty()
+			const std::string hex_source = hex_view::source_name(active_workspace_context);
+			std::string hex_label_str = hex_source.empty()
 				? std::string("Hex View")
-				: hex_view::g_state.source_name + " (Hex)";
+				: hex_source + " (Hex)";
 			const char* hex_label = hex_label_str.c_str();
 			ImVec2 hts = ImGui::CalcTextSize(hex_label);
 			const float hex_close_sz = 10.f;
@@ -5956,9 +5960,7 @@ void helpers::render_title()
 				wdl->AddLine(ImVec2(hcmx + hcr, hcmy - hcr), ImVec2(hcmx - hcr, hcmy + hcr), hclose_col, 1.2f);
 
 				if (hclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-					hex_view::g_state.active = false;
-					hex_view::g_state.data.clear();
-					hex_view::g_state.source_name.clear();
+					hex_view::close(active_workspace_context);
 					if (globals::ui::active_center_view == center_view_t::hex_view)
 						globals::ui::active_center_view = center_view_t::code_editor;
 				} else if (htab_hov && !hclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -6166,7 +6168,7 @@ void helpers::render_title()
 					} else if (chosen_kind == 1) {
 						globals::ui::active_center_view = center_view_t::disassembly;
 					} else if (chosen_kind == 2 && chosen_addr != 0) {
-						pseudocode_view::activate_tab_by_addr(chosen_addr);
+						pseudocode_view::activate_tab_by_addr(active_workspace_context, chosen_addr);
 						globals::ui::active_center_view = center_view_t::pseudocode;
 					} else if (chosen_kind == 3) {
 						globals::ui::active_center_view = center_view_t::hex_view;
@@ -6678,7 +6680,7 @@ void helpers::render_title()
 
 	{
 
-		if (g_disasm.file.loaded) {
+		if (active_workspace_context) {
 			bool is_hex_view = (globals::ui::active_center_view == center_view_t::hex_view);
 			const char* vt_label = is_hex_view ? "View Disassembly" : "View Hex";
 			float vtbtn_w = ImGui::CalcTextSize(vt_label).x + 22.f;
@@ -6692,8 +6694,6 @@ void helpers::render_title()
 				if (is_hex_view) {
 					globals::ui::active_center_view = center_view_t::disassembly;
 				} else {
-					if (!hex_view::g_state.active || hex_view::g_state.data.empty())
-						hex_view::load_from_file(g_disasm.file.path);
 					globals::ui::active_center_view = center_view_t::hex_view;
 				}
 			}
@@ -6747,7 +6747,7 @@ void helpers::render_title()
 					sess_count);
 				anti_tamper::webhook::write_log("chrome", log_buf);
 			} else if (sess_count == 1) {
-				const auto* sess = analysis_session::session_at(0);
+				const auto sess = analysis_session::session_handle_at(0);
 				if (sess && !sess->path.empty()) {
 					launch_session_path(sess->path);
 					_snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
@@ -6756,8 +6756,8 @@ void helpers::render_title()
 					anti_tamper::webhook::write_log("chrome", log_buf);
 				} else {
 					std::string prefill_exe;
-					if (g_disasm.file.loaded && !g_disasm.file.path.empty())
-						prefill_exe = g_disasm.file.path;
+					if (active_workspace_context)
+						prefill_exe = active_workspace_context.workspace->identity().normalized_source_path();
 					if (!prefill_exe.empty()) {
 						launch_session_path(prefill_exe);
 					} else {
@@ -6769,8 +6769,8 @@ void helpers::render_title()
 				}
 			} else {
 				std::string prefill_exe;
-				if (g_disasm.file.loaded && !g_disasm.file.path.empty()) {
-					prefill_exe = g_disasm.file.path;
+			if (active_workspace_context) {
+					prefill_exe = active_workspace_context.workspace->identity().normalized_source_path();
 				} else if (code_editor::active && !file_tabs::tabs.empty() &&
 					file_tabs::active_tab < (int)file_tabs::tabs.size()) {
 					auto& tab = file_tabs::tabs[file_tabs::active_tab];
@@ -6866,7 +6866,7 @@ void helpers::render_title()
 					ImVec2(520.f, std::min(360.f, std::max(80.f, static_cast<float>(sess_count) * 28.f + 16.f))),
 					true, ImGuiWindowFlags_None);
 				for (size_t i = 0; i < sess_count; ++i) {
-					const auto* sess = analysis_session::session_at(i);
+					const auto sess = analysis_session::session_handle_at(i);
 					if (!sess) continue;
 					std::string label = sess->filename.empty()
 						? (sess->path.empty() ? std::string("(unnamed)") : sess->path)
@@ -6909,7 +6909,7 @@ void helpers::render_title()
 
 				if (launch_btn && s_run_pick_selected >= 0 &&
 					s_run_pick_selected < static_cast<int>(sess_count)) {
-					const auto* sess = analysis_session::session_at(
+					const auto sess = analysis_session::session_handle_at(
 						static_cast<size_t>(s_run_pick_selected));
 					if (sess && !sess->path.empty()) {
 						std::string chosen_label = sess->filename.empty() ? sess->path : sess->filename;
@@ -7111,9 +7111,9 @@ void helpers::render_title()
 	if (cv == center_view_t::welcome && !overlay_blocking) {
 		if (code_editor::active && !code_editor::buffer.empty())
 			cv = center_view_t::code_editor;
-		else if (g_disasm.file.loaded && (g_disasm.live_mode || g_disasm.file.decoding || !g_disasm.file.instrs.empty()))
+		else if (active_workspace_context)
 			cv = center_view_t::disassembly;
-		else if (hex_view::g_state.active)
+		else if (hex_view::active(active_workspace_context))
 			cv = center_view_t::hex_view;
 	}
 
@@ -7145,10 +7145,10 @@ void helpers::render_title()
 	}
 
 
-	else if (cv == center_view_t::hex_view && hex_view::g_state.active)
+	else if (cv == center_view_t::hex_view && active_workspace_context)
 	{
 		mark_center_render_section("center_view_hex_view", cv, overlay_blocking, vw, vh);
-		hex_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		hex_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, active_workspace_context);
 		log_center_dispatch_exit("center_view_hex_view");
 	}
 
@@ -7159,10 +7159,10 @@ void helpers::render_title()
 		log_center_dispatch_exit("center_view_image_view");
 	}
 
-	else if (cv == center_view_t::disassembly && g_disasm.file.loaded && (g_disasm.live_mode || g_disasm.file.decoding || !g_disasm.file.instrs.empty()))
+	else if (cv == center_view_t::disassembly && active_workspace_context)
 	{
 		mark_center_render_section("center_view_disassembly", cv, overlay_blocking, vw, vh);
-		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, g_disasm, dt);
+		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, active_workspace_context, dt);
 		log_center_dispatch_exit("center_view_disassembly");
 	}
 
@@ -7170,7 +7170,7 @@ void helpers::render_title()
 	{
 		mark_center_render_section("center_view_graph_view", cv, overlay_blocking, vw, vh);
 		ImVec2 wp = ImGui::GetWindowPos();
-		cfg_view::render(wp.x, wp.y, vw, vh, a, ax3, ay3, az3);
+		cfg_view::render(wp.x, wp.y, vw, vh, a, ax3, ay3, az3, active_workspace_context);
 		log_center_dispatch_exit("center_view_graph_view");
 	}
 
@@ -7191,7 +7191,7 @@ void helpers::render_title()
 	else if (cv == center_view_t::pseudocode)
 	{
 		mark_center_render_section("center_view_pseudocode", cv, overlay_blocking, vw, vh);
-		pseudocode_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		pseudocode_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, active_workspace_context);
 		log_center_dispatch_exit("center_view_pseudocode");
 	}
 
@@ -7218,14 +7218,16 @@ void helpers::render_title()
 		|| cv == center_view_t::stealth_view || cv == center_view_t::fuzzer_view)
 	{
 		mark_center_render_section("center_view_analysis_hub", cv, overlay_blocking, vw, vh);
-		analysis_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
+		analysis_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3,
+			active_workspace_context);
 		log_center_dispatch_exit("center_view_analysis_hub");
 	}
 
 	else if (cv == center_view_t::binary_map)
 	{
 		mark_center_render_section("center_view_binary_map", cv, overlay_blocking, vw, vh);
-		aida::binary_map_view::render(0, 0, vw, vh, a, ax3, ay3, az3);
+		aida::binary_map_view::render(0, 0, vw, vh, a, ax3, ay3, az3,
+			active_workspace_context);
 		log_center_dispatch_exit("center_view_binary_map");
 	}
 
@@ -7246,9 +7248,13 @@ void helpers::render_title()
 		ImVec2      orig = ImGui::GetWindowPos();
 
 		if (!overlay_blocking) {
-			const char* hint = !g_disasm.file.err.empty()     ? g_disasm.file.err.c_str()
-				             : !g_disasm.file.loaded           ? "Choose a file to begin"
-				             :                                   "Click 'Run' to choose VM or host launch";
+			std::string hint_text = "Choose a file to begin";
+			if (active_workspace_context.progress.error)
+				hint_text = active_workspace_context.progress.error->stable_code() + ": " +
+					active_workspace_context.progress.error->message;
+			else if (active_workspace_context)
+				hint_text = "Click 'Run' to choose VM or host launch";
+			const char* hint = hint_text.c_str();
 			ImVec2 ht2 = ImGui::CalcTextSize(hint);
 			float  window_h = ImGui::GetWindowHeight();
 			cdl->AddText(ImVec2(orig.x + vw*0.5f - ht2.x*0.5f, orig.y + window_h * 0.5f - ht2.y*0.5f),
@@ -9514,16 +9520,13 @@ void helpers::render_title()
 							}
 							uint64_t mod_size = target_mod->size;
 							if (mod_size == 0) mod_size = 0x100000;
-							driver_bridge::debug_log("ATTACH: calling start_live pid=%u base=0x%llX size=0x%llX mod=%s\n",
+							driver_bridge::debug_log("ATTACH: workspace snapshot pid=%u base=0x%llX size=0x%llX mod=%s\n",
 								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
-							diag::log_tagged_critical_fmt("attach", "phase=pre_start_live pid=%u base=0x%llX size=0x%llX mod=%s",
+							diag::log_tagged_critical_fmt("attach", "phase=workspace_snapshot_ready pid=%u base=0x%llX size=0x%llX mod=%s",
 								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
-							disasm::start_live(g_disasm, p.pid, target_mod->base, mod_size, target_mod->name);
-							diag::log_tagged_critical("attach", "phase=post_start_live");
 							globals::ui::active_center_view = center_view_t::disassembly;
 							diag::log_tagged_critical("attach", "phase=post_set_center_view");
 						} else {
-							g_disasm.file = DisasmFile{};
 							output_log::push(bottom_tab_t::output,
 								"[Driver] Attached to PID " + std::to_string(p.pid) + " but could not enumerate modules.\n");
 						}
@@ -10078,7 +10081,7 @@ void helpers::render_title()
 	}
 
 	g_render_section = "popups_initial_analysis";
-	initial_analysis_view::render_frame();
+	initial_analysis_view::render_frame(active_workspace_context);
 
 	g_render_section = "popups_loading_binary";
 	loading_binary_overlay::render();

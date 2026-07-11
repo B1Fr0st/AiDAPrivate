@@ -36,8 +36,6 @@
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
 
-extern DisasmState g_disasm;
-
 namespace snapshot_diff {
 
 struct memory_region_t {

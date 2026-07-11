@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -11,7 +11,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
@@ -20,17 +23,17 @@
 #include "source_reconstructor.hpp"
 #include "ui_anim.hpp"
 #include "theme.hpp"
+#include "../disasm/disasm_view.hpp"
 
 namespace source_reconstruct_view {
 
-struct state_t {
+struct view_state_t {
 	bool   open = false;
 	bool   prev_open = false;
 	float  fade = 0.f;
 	float  scale_anim = 0.f;
 	float  anim_time = 0.f;
 	char   output_dir[512] = {};
-	char   module_filter[128] = {};
 	bool   started = false;
 	float  progress_display = 0.f;
 	float  shimmer_phase = 0.f;
@@ -38,14 +41,58 @@ struct state_t {
 	int    done_display = 0;
 	float  stage_dot_pulse[8] = {};
 	float  pipeline_line_anim = 0.f;
+	source_reconstructor::workspace_reconstruction_state_t recon_state;
 };
 
-inline state_t g_state;
+namespace {
 
-inline bool is_open() { return g_state.open || g_state.fade > 0.01f; }
+inline std::mutex& view_registry_mutex() {
+	static std::mutex value;
+	return value;
+}
 
-inline void apply_default_output_dir() {
-	if (g_state.output_dir[0] != '\0') return;
+inline std::unordered_map<aida::analysis::binary_id_t, std::shared_ptr<view_state_t>, aida::analysis::binary_id_hash_t>&
+view_registry() {
+	static std::unordered_map<aida::analysis::binary_id_t, std::shared_ptr<view_state_t>, aida::analysis::binary_id_hash_t> value;
+	return value;
+}
+
+inline std::shared_ptr<view_state_t> view_for(const disasm_view::workspace_context_t& context) {
+	if (!context.workspace)
+		return {};
+	const auto id = context.workspace->identity().binary_id();
+	std::lock_guard<std::mutex> lock(view_registry_mutex());
+	auto& registry = view_registry();
+	for (auto it = registry.begin(); it != registry.end();) {
+		if (it->second && !it->second->open &&
+		    !source_reconstructor::is_running_workspace(it->second->recon_state) &&
+		    it->second->fade < 0.01f)
+			it = registry.erase(it);
+		else
+			++it;
+	}
+	auto found = registry.find(id);
+	if (found != registry.end())
+		return found->second;
+	auto created = std::make_shared<view_state_t>();
+	registry[id] = created;
+	return created;
+}
+
+inline std::shared_ptr<view_state_t> view_for_selected() {
+	return view_for(disasm_view::capture_selected_workspace());
+}
+
+}
+
+inline bool is_open() {
+	auto st = view_for_selected();
+	if (!st) return false;
+	return st->open || st->fade > 0.01f;
+}
+
+inline void apply_default_output_dir(view_state_t& st) {
+	if (st.output_dir[0] != '\0') return;
 	char home[MAX_PATH] = {};
 	DWORD got = GetEnvironmentVariableA("USERPROFILE", home, MAX_PATH);
 	if (got == 0 || got >= MAX_PATH) {
@@ -55,24 +102,30 @@ inline void apply_default_output_dir() {
 		}
 	}
 	if (home[0] == '\0') {
-		std::strncpy(g_state.output_dir, "C:\\AiDA_Reconstruction", sizeof(g_state.output_dir) - 1);
+		std::strncpy(st.output_dir, "C:\\AiDA_Reconstruction", sizeof(st.output_dir) - 1);
 		return;
 	}
-	std::snprintf(g_state.output_dir, sizeof(g_state.output_dir),
+	std::snprintf(st.output_dir, sizeof(st.output_dir),
 		"%s\\Documents\\AiDA_Reconstruction", home);
 }
 
-inline void open() {
-	g_state.open = true;
-	g_state.started = false;
-	g_state.progress_display = 0.f;
-	g_state.pipeline_line_anim = 0.f;
-	for (int i = 0; i < 8; ++i) g_state.stage_dot_pulse[i] = 0.f;
-	apply_default_output_dir();
+inline void open(const disasm_view::workspace_context_t& context) {
+	auto st = view_for(context);
+	if (!st) return;
+	st->open = true;
+	st->started = false;
+	st->progress_display = 0.f;
+	st->pipeline_line_anim = 0.f;
+	for (int i = 0; i < 8; ++i) st->stage_dot_pulse[i] = 0.f;
+	apply_default_output_dir(*st);
 }
 
-inline void close() {
-	g_state.open = false;
+inline void close(const disasm_view::workspace_context_t& context) {
+	auto st = view_for(context);
+	if (!st) return;
+	if (source_reconstructor::is_running_workspace(st->recon_state))
+		source_reconstructor::cancel_workspace(st->recon_state);
+	st->open = false;
 }
 
 inline bool pick_output_directory(HWND owner, char* buf, size_t buf_size) {
@@ -90,14 +143,15 @@ inline bool pick_output_directory(HWND owner, char* buf, size_t buf_size) {
 	return true;
 }
 
-inline void render(float alpha, float ar, float ag, float ab) {
-	auto& st = g_state;
+inline void render_impl(float alpha, float ar, float ag, float ab,
+                        view_state_t& st,
+                        const disasm_view::workspace_context_t& context) {
 	float dt = ImGui::GetIO().DeltaTime;
 	st.anim_time += dt;
 
 	bool opening_transition = (st.open && !st.prev_open);
 	st.prev_open = st.open;
-	if (opening_transition) apply_default_output_dir();
+	if (opening_transition) apply_default_output_dir(st);
 
 	float fade_target = st.open ? 1.f : 0.f;
 	st.fade = ui_anim::smooth_lerp(st.fade, fade_target, 10.f, dt);
@@ -131,8 +185,6 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		ImGui::End();
 		return;
 	}
-
-	bool blocker_clicked = false;
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 
@@ -222,8 +274,8 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		dl->AddLine(ImVec2(close_x + 14, close_y + 2), ImVec2(close_x + 2, close_y + 14), close_col, 2.f);
 
 		if (close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			if (source_reconstructor::is_running())
-				source_reconstructor::cancel();
+			if (source_reconstructor::is_running_workspace(st.recon_state))
+				source_reconstructor::cancel_workspace(st.recon_state);
 			st.open = false;
 		}
 
@@ -300,9 +352,9 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		cur_y += input_h + 10.f;
 	}
 
-	auto recon_stage = source_reconstructor::get_stage();
-	int total_fn = source_reconstructor::get_total_functions();
-	int done_fn = source_reconstructor::get_decompiled_count();
+	auto recon_stage = static_cast<source_reconstructor::stage_t>(
+		st.recon_state.stage.load(std::memory_order_relaxed));
+	int total_fn = source_reconstructor::get_total_functions_workspace(st.recon_state);
 
 	if (st.started && total_fn > 0) {
 		char info[256];
@@ -421,7 +473,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		float bar_w = sw - pad * 2.f;
 		float bar_h = 18.f;
 
-		float real_progress = source_reconstructor::get_progress();
+		float real_progress = source_reconstructor::get_progress_workspace(st.recon_state);
 		st.progress_display = ui_anim::smooth_lerp(st.progress_display, real_progress, 8.f, dt);
 		st.shimmer_phase += dt * 1.5f;
 		if (st.shimmer_phase > 1.f) st.shimmer_phase -= 1.f;
@@ -443,7 +495,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 
 			float shimmer_x = bar_x + fill_w * st.shimmer_phase;
 			float shimmer_w = fill_w * 0.15f;
-			if (shimmer_w > 8.f && source_reconstructor::is_running()) {
+			if (shimmer_w > 8.f && source_reconstructor::is_running_workspace(st.recon_state)) {
 				ImU32 sh_off = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.f);
 				ImU32 sh_on  = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.20f * fa);
 				dl->AddRectFilledMultiColor(
@@ -463,9 +515,8 @@ inline void render(float alpha, float ar, float ag, float ab) {
 	}
 
 	if (st.started) {
-		int total = source_reconstructor::get_total_functions();
-		int done = source_reconstructor::get_decompiled_count();
-		float progress = source_reconstructor::get_progress();
+		int total = source_reconstructor::get_total_functions_workspace(st.recon_state);
+		int done = source_reconstructor::get_decompiled_count_workspace(st.recon_state);
 
 		st.total_display = total;
 		st.done_display = done;
@@ -492,7 +543,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 
 		cur_y += 22.f;
 
-		std::string status = source_reconstructor::get_status();
+		std::string status = source_reconstructor::get_status_workspace(st.recon_state);
 		if (!status.empty()) {
 			if (status.size() > 80) status = status.substr(0, 80) + "...";
 			dl->AddText(ImVec2(dx + pad, cur_y), text_dim, status.c_str());
@@ -505,6 +556,7 @@ inline void render(float alpha, float ar, float ag, float ab) {
 
 		if (!st.started) {
 			bool has_output = (st.output_dir[0] != '\0');
+			bool has_workspace = context.workspace && !context.workspace->closed();
 
 			float btn_w = 140.f;
 			float btn_h = 36.f;
@@ -513,9 +565,9 @@ inline void render(float alpha, float ar, float ag, float ab) {
 
 			ImVec2 bmin(btn_x, btn_y);
 			ImVec2 bmax(btn_x + btn_w, btn_y + btn_h);
-			bool bhov = has_output && ImGui::IsMouseHoveringRect(bmin, bmax);
+			bool bhov = has_output && has_workspace && ImGui::IsMouseHoveringRect(bmin, bmax);
 
-			float button_alpha = has_output ? fa : (fa * _ut.disabled_alpha);
+			float button_alpha = (has_output && has_workspace) ? fa : (fa * _ut.disabled_alpha);
 			float bhov_f = bhov ? 1.f : 0.f;
 			ImU32 idle_top = aida::ui::with_alpha(_ut.accent_dim, 0.55f);
 			ImU32 idle_bot = aida::ui::with_alpha(_ut.accent_dim, 0.30f);
@@ -542,21 +594,21 @@ inline void render(float alpha, float ar, float ag, float ab) {
 				       btn_y + (btn_h - slsz.y) * 0.5f),
 				start_text_col, start_lbl);
 
-			if (bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !source_reconstructor::is_running()) {
-				auto mods = driver_bridge::enumerate_modules();
-				if (!mods.empty()) {
-					source_reconstructor::reconstruction_config_t config;
-					config.output_dir = st.output_dir;
-					config.module_base = mods[0].base;
-					config.module_size = mods[0].size;
-					config.module_name = mods[0].name;
-					config.use_ai_refinement = false;
-					source_reconstructor::reconstruct(config);
-					st.started = true;
-				}
+			if (bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+			    !source_reconstructor::is_running_workspace(st.recon_state) && has_workspace) {
+				source_reconstructor::workspace_reconstruction_config_t config;
+				config.workspace = context.workspace;
+				config.output_dir = st.output_dir;
+				config.project_name = "reconstructed";
+				config.include_imports = true;
+				config.include_exports = true;
+				config.generate_cmake = true;
+				config.max_functions = 0;
+				source_reconstructor::reconstruct_workspace(config, st.recon_state);
+				st.started = true;
 			}
 		} else {
-			bool running = source_reconstructor::is_running();
+			bool running = source_reconstructor::is_running_workspace(st.recon_state);
 
 			if (running) {
 				float btn_w = 100.f;
@@ -581,9 +633,9 @@ inline void render(float alpha, float ar, float ag, float ab) {
 					aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.86f * fa), cancel_lbl);
 
 				if (bhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-					source_reconstructor::cancel();
+					source_reconstructor::cancel_workspace(st.recon_state);
 			} else {
-				auto& last = source_reconstructor::get_last_result();
+				const auto& last = source_reconstructor::get_last_result_workspace(st.recon_state);
 				const char* done_lbl = last.success ? "Complete!" : "Failed";
 				const auto& th_done = aida::ui::resolved();
 				ImU32 done_col = last.success ? aida::ui::with_alpha(th_done.success, 0.86f * fa)
@@ -624,8 +676,8 @@ inline void render(float alpha, float ar, float ag, float ab) {
 	if (st.open) {
 		bool esc = ImGui::IsKeyPressed(ImGuiKey_Escape);
 		if (esc) {
-			if (source_reconstructor::is_running())
-				source_reconstructor::cancel();
+			if (source_reconstructor::is_running_workspace(st.recon_state))
+				source_reconstructor::cancel_workspace(st.recon_state);
 			st.open = false;
 		}
 
@@ -633,14 +685,26 @@ inline void render(float alpha, float ar, float ag, float ab) {
 		                      ImGui::GetMousePos().x <= dmax.x &&
 		                      ImGui::GetMousePos().y >= dmin.y &&
 		                      ImGui::GetMousePos().y <= dmax.y);
-		(void)blocker_clicked;
-		if (!inside_dialog && !source_reconstructor::is_running() &&
+		if (!inside_dialog && !source_reconstructor::is_running_workspace(st.recon_state) &&
 		    ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemActive()) {
 			st.open = false;
 		}
 	}
 
 	ImGui::End();
+}
+
+inline void render(float alpha, float ar, float ag, float ab,
+                   const disasm_view::workspace_context_t& context) {
+	auto st = view_for(context);
+	if (!st) return;
+	render_impl(alpha, ar, ag, ab, *st, context);
+}
+
+inline void render(float alpha, float ar, float ag, float ab) {
+	auto st = view_for_selected();
+	if (!st) return;
+	render_impl(alpha, ar, ag, ab, *st, disasm_view::capture_selected_workspace());
 }
 
 }

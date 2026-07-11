@@ -16,6 +16,7 @@
 #include "enforcement.hpp"
 #include "webhook.hpp"
 #include "obfuscation_macros.hpp"
+#include "wbaes.hpp"
 
 namespace anti_tamper {
 
@@ -235,14 +236,15 @@ namespace token_chain {
                                    uint64_t rdtsc_val, uint64_t proof_hash,
                                    uint64_t k0, uint64_t k1)
         {
-            uint8_t buf[32];
+            uint8_t buf[64];
             uint64_t a = check_result ^ chain_prev;
             uint64_t b = rdtsc_val ^ proof_hash;
             memcpy(buf, &a, 8);
             memcpy(buf + 8, &b, 8);
             memcpy(buf + 16, &chain_prev, 8);
             memcpy(buf + 24, &check_result, 8);
-            return integrity::siphash::hash(buf, 32, k0, k1);
+            wbaes::get_table_hash(buf + 32);
+            return integrity::siphash::hash(buf, 64, k0, k1);
         }
 
 #pragma region RDTSC_ENTANGLE
@@ -253,7 +255,7 @@ namespace token_chain {
             uint64_t e0 = rdtsc_entangle_sample();
             uint64_t e1 = rdtsc_entangle_sample();
 
-            uint8_t buf[48];
+            uint8_t buf[80];
             uint64_t a = check_result ^ chain_prev;
             uint64_t b = rdtsc_val ^ proof_hash;
             uint64_t c = MBA_TRANSFORM(e0, _rotl64(rdtsc_val, 7));
@@ -264,7 +266,8 @@ namespace token_chain {
             memcpy(buf + 24, &check_result, 8);
             memcpy(buf + 32, &c, 8);
             memcpy(buf + 40, &d, 8);
-            return integrity::siphash::hash(buf, 48, k0, k1);
+            wbaes::get_table_hash(buf + 48);
+            return integrity::siphash::hash(buf, 80, k0, k1);
         }
 #pragma endregion
 

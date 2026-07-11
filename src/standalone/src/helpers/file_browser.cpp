@@ -6,40 +6,45 @@
 #endif
 
 #include "globals.h"
-#include "zydis_disasm.hpp"
-#include "function_index.hpp"
-#include "xref_index.hpp"
 #include "standalone_license.hpp"
 #include "hex_view.hpp"
 #include "image_view.hpp"
-#include "initial_analysis.hpp"
-#include "loading_binary_overlay.hpp"
 #include "analysis_session.hpp"
 #include "standalone_settings.hpp"
 #include "diag_log.hpp"
 #include "imgui/imgui.h"
 #include "components.hpp"
 #include "theme.hpp"
+#include "fonts.hpp"
+#include "ui_anim.hpp"
 #include "../core/infra/executor.hpp"
+#include "../core/infra/taskflow_runtime.hpp"
+#include "../core/analysis/workspace/byte_provider.hpp"
+#include "../core/analysis/workspace/workspace_registry.hpp"
+#include "../core/analysis/workspace/zip_container.hpp"
 #include "../core/ui/ui_thread_dispatcher.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <fstream>
 #include <sstream>
 #include <atomic>
+#include <limits>
+#include <memory>
 #include <thread>
 #include <mutex>
+#include <optional>
 #include <cstring>
 
 namespace fs = std::filesystem;
 
 extern HWND g_hwnd;
-extern DisasmState g_disasm;
 
 
 void file_browser::refresh(const std::string& dir)
@@ -199,7 +204,7 @@ static const char* k_binary_exts[] = {
 
 static const char* k_archive_exts[] = {
     ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz",
-    ".cab", ".iso",
+    ".cab", ".iso", ".apk", ".ipa", ".jar",
 };
 
 inline std::string lower_ext(const std::string& filename)
@@ -233,6 +238,254 @@ inline bool is_binary(const std::string& ext)
 inline bool is_archive(const std::string& ext)
 {
     return matches(ext, k_archive_exts, sizeof(k_archive_exts)/sizeof(k_archive_exts[0]));
+}
+
+}
+
+namespace {
+
+struct hex_preview_state_t {
+    std::mutex mutex;
+    std::uint64_t serial = 0;
+    bool loading = false;
+    std::string path;
+    std::string error;
+    std::optional<aida::analysis::workspace_admission_handle_t> admission;
+};
+
+hex_preview_state_t& hex_preview_state()
+{
+    static hex_preview_state_t value;
+    return value;
+}
+
+bool hex_preview_is_current(std::uint64_t serial)
+{
+    std::lock_guard<std::mutex> lock(hex_preview_state().mutex);
+    return hex_preview_state().serial == serial;
+}
+
+void complete_hex_preview_failure(std::uint64_t serial, std::string path, std::string error)
+{
+    if (!aida::ui_thread::post([serial, path = std::move(path), error = std::move(error)]() mutable {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        if (preview.serial != serial)
+            return;
+        preview.loading = false;
+        preview.path = std::move(path);
+        preview.error = std::move(error);
+        preview.admission.reset();
+    }, "file_browser", "hex_fallback", "failure")) {
+        diag::log_tagged_fmt("file_browser", "hex_fallback_ui_post_failed serial=%llu",
+            static_cast<unsigned long long>(serial));
+    }
+}
+
+bool has_suffix(const std::string& value, const char* suffix)
+{
+    const std::size_t suffix_size = std::strlen(suffix);
+    return value.size() >= suffix_size && value.compare(value.size() - suffix_size,
+        suffix_size, suffix) == 0;
+}
+
+int archive_member_priority(const aida::analysis::zip_member_t& member)
+{
+    if (member.kind != aida::analysis::zip_member_kind_t::regular_file ||
+        member.uncompressed_size == 0)
+        return (std::numeric_limits<int>::max)();
+    std::string path = member.normalized_path;
+    std::transform(path.begin(), path.end(), path.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    if (path == "classes.dex" || has_suffix(path, "/classes.dex"))
+        return 0;
+    if (has_suffix(path, ".dex") || has_suffix(path, ".odex") || has_suffix(path, ".vdex"))
+        return 1;
+    if (has_suffix(path, ".so") || has_suffix(path, ".elf") || has_suffix(path, ".exe") ||
+        has_suffix(path, ".dll") || has_suffix(path, ".sys") || has_suffix(path, ".dylib"))
+        return 2;
+    if (has_suffix(path, ".o") || has_suffix(path, ".obj") || has_suffix(path, ".a") ||
+        has_suffix(path, ".lib") || has_suffix(path, ".class"))
+        return 3;
+    const auto slash = path.find_last_of('/');
+    const auto dot = path.find_last_of('.');
+    if (path.find(".app/") != std::string::npos &&
+        (dot == std::string::npos || (slash != std::string::npos && dot < slash)))
+        return 4;
+    return (std::numeric_limits<int>::max)();
+}
+
+bool open_archive_member_provider(const std::shared_ptr<const aida::analysis::byte_provider_t>& root,
+                                  std::shared_ptr<const aida::analysis::byte_provider_t>& member_provider,
+                                  const aida::analysis::cancellation_token_t& cancel,
+                                  std::string& error)
+{
+    auto archive = aida::analysis::zip_container_t::open(root, {}, cancel);
+    if (!archive) {
+        error = archive.error().stable_code() + ": " + archive.error().message;
+        return false;
+    }
+    auto integrity = archive.value()->verify_integrity(cancel);
+    if (!integrity) {
+        error = integrity.error().stable_code() + ": " + integrity.error().message;
+        return false;
+    }
+    const auto& members = archive.value()->members();
+    std::size_t selected = members.size();
+    int priority = (std::numeric_limits<int>::max)();
+    for (std::size_t index = 0; index < members.size(); ++index) {
+        const int candidate = archive_member_priority(members[index]);
+        if (candidate < priority || (candidate == priority && selected < members.size() &&
+            members[index].normalized_path < members[selected].normalized_path)) {
+            priority = candidate;
+            selected = index;
+        }
+    }
+    if (selected == members.size() || priority == (std::numeric_limits<int>::max)()) {
+        error = "UNSUPPORTED_FORMAT: archive has no supported static member for the hex workspace";
+        return false;
+    }
+    auto opened = archive.value()->open_member_provider(selected, cancel);
+    if (!opened) {
+        error = opened.error().stable_code() + ": " + opened.error().message;
+        return false;
+    }
+    member_provider = std::static_pointer_cast<const aida::analysis::byte_provider_t>(opened.take_value());
+    return true;
+}
+
+void complete_hex_preview_success(
+    std::uint64_t serial, std::string path,
+    aida::analysis::workspace_result_t<std::shared_ptr<aida::analysis::analysis_workspace_t>> result)
+{
+    if (!aida::ui_thread::post([serial, path = std::move(path), result = std::move(result)]() mutable {
+        auto& preview = hex_preview_state();
+        {
+            std::lock_guard<std::mutex> lock(preview.mutex);
+            if (preview.serial != serial)
+                return;
+        }
+        if (!result) {
+            std::lock_guard<std::mutex> lock(preview.mutex);
+            if (preview.serial != serial)
+                return;
+            preview.loading = false;
+            preview.error = result.error().stable_code() + ": " + result.error().message;
+            preview.admission.reset();
+            return;
+        }
+        auto workspace = result.take_value();
+        const auto selected = aida::analysis::workspace_registry().select_for_ui(
+            workspace->identity().binary_id());
+        const auto context = disasm_view::capture_workspace(workspace);
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        if (preview.serial != serial)
+            return;
+        preview.loading = false;
+        preview.admission.reset();
+        if (!selected || !context) {
+            preview.error = !selected ? selected.error().stable_code() + ": " + selected.error().message :
+                "TARGET_NOT_FOUND: admitted workspace context is unavailable";
+            return;
+        }
+        hex_view::activate(context);
+        globals::ui::active_center_view = center_view_t::hex_view;
+        record_recent_workspace(path);
+        preview.error.clear();
+        diag::log_tagged_fmt("file_browser", "hex_fallback_complete path=%s target=%s",
+            path.c_str(), workspace->identity().binary_id().to_hex().c_str());
+    }, "file_browser", "hex_fallback", "complete")) {
+        diag::log_tagged_fmt("file_browser", "hex_fallback_ui_post_failed serial=%llu",
+            static_cast<unsigned long long>(serial));
+    }
+}
+
+void async_hex_fallback(const std::string& path, bool archive)
+{
+    std::optional<aida::analysis::workspace_admission_handle_t> previous;
+    std::uint64_t serial = 0;
+    {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        previous = std::move(preview.admission);
+        serial = ++preview.serial;
+        preview.loading = true;
+        preview.path = path;
+        preview.error.clear();
+    }
+    if (previous)
+        aida::analysis::workspace_registry_t::cancel_admission(*previous);
+    aida::infra::taskflow_runtime::task_descriptor_t task;
+    task.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+    task.owner_subsystem = "file_browser";
+    task.label = "file_browser.hex_provider_admission";
+    task.thread_class = "bounded_provider_open";
+    task.ui_access_policy = "none";
+    task.failure_policy = "structured_completion";
+    task.shutdown_policy = "cancel_and_drain";
+    task.cancellable_body = [path, archive, serial](
+        const aida::infra::taskflow_runtime::cancellation_token_t& cancel) {
+        if (cancel.requested.load(std::memory_order_acquire) || !hex_preview_is_current(serial))
+            return;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        aida::analysis::cancellation_source_t provider_cancel(deadline);
+        auto mapped = aida::analysis::mapped_file_provider_t::open(path);
+        if (!mapped) {
+            complete_hex_preview_failure(serial, path,
+                mapped.error().stable_code() + ": " + mapped.error().message);
+            return;
+        }
+        std::shared_ptr<const aida::analysis::byte_provider_t> provider =
+            std::static_pointer_cast<const aida::analysis::byte_provider_t>(mapped.take_value());
+        if (archive) {
+            std::string member_error;
+            std::shared_ptr<const aida::analysis::byte_provider_t> member;
+            if (!open_archive_member_provider(provider, member, provider_cancel.token(), member_error)) {
+                complete_hex_preview_failure(serial, path, std::move(member_error));
+                return;
+            }
+            provider = std::move(member);
+        }
+        if (cancel.requested.load(std::memory_order_acquire) || !hex_preview_is_current(serial))
+            return;
+        aida::analysis::baseline_analysis_settings_t settings;
+        const std::string profile = "aida-pe-workspace-engine-1|" + settings.canonical_json();
+        aida::analysis::open_provider_workspace_request_t request;
+        request.provider = provider;
+        request.bin_name = fs::path(path).filename().string();
+        if (const auto& member = provider->member_metadata())
+            request.member_metadata = *member;
+        request.load_profile.assign(profile.begin(), profile.end());
+        request.analysis_settings = settings;
+        auto admitted = aida::analysis::workspace_registry().admit_verified_provider_async(
+            std::move(request), [serial, path](auto result) mutable {
+                complete_hex_preview_success(serial, path, std::move(result));
+            }, deadline);
+        if (!admitted) {
+            complete_hex_preview_failure(serial, path,
+                admitted.error().stable_code() + ": " + admitted.error().message);
+            return;
+        }
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        if (preview.serial == serial)
+            preview.admission = admitted.take_value();
+        else {
+            auto handle = admitted.take_value();
+            aida::analysis::workspace_registry_t::cancel_admission(handle);
+        }
+    };
+    const auto submitted = aida::infra::taskflow_runtime::submit(std::move(task));
+    if (!submitted.submitted) {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        if (preview.serial == serial) {
+            preview.loading = false;
+            preview.error = "SERVICE_CONFLICT: provider admission task was rejected: " +
+                submitted.reject_reason;
+        }
+    }
 }
 
 }
@@ -306,9 +559,7 @@ void open_path(const std::string& path)
         code_editor::buffer.clear();
         code_editor::filename.clear();
         code_editor::filepath.clear();
-        g_disasm.file = DisasmFile{};
-        hex_view::load_from_file(path, 0, 0);
-        globals::ui::active_center_view = center_view_t::hex_view;
+        async_hex_fallback(path, true);
         diag::log_tagged_fmt("file_browser", "open_path -> hex_view archive path=%s", path.c_str());
         return;
     }
@@ -342,11 +593,8 @@ void open_path(const std::string& path)
             analysis_session::last_error() ? analysis_session::last_error() : "(null)");
     }
 
-    if (loading_binary_overlay::is_active()) {
-        diag::log_tagged_fmt("file_browser",
-            "open_path skipped overlay_active path=%s", path.c_str());
-        return;
-    }
+    if (analysis_session::session_count() >= analysis_session::kMaxSessions)
+        analysis_session::prune_lru(analysis_session::kMaxSessions - 1);
 
     bool started = analysis_session::open_session(path);
     if (started) {
@@ -369,9 +617,7 @@ void open_path(const std::string& path)
         code_editor::buffer.clear();
         code_editor::filename.clear();
         code_editor::filepath.clear();
-        g_disasm.file = DisasmFile{};
-        hex_view::load_from_file(path, 0, 0);
-        globals::ui::active_center_view = center_view_t::hex_view;
+        async_hex_fallback(path, false);
         diag::log_tagged_fmt("file_browser",
             "open_path -> hex_view fallback path=%s err=%s",
             path.c_str(), err ? err : "(null)");
@@ -410,6 +656,56 @@ inline std::string truncate_middle(const std::string& s, size_t max_len) {
     return out;
 }
 
+}
+
+void render_hex_loading_indicator()
+{
+    bool loading = false;
+    std::string preview_path;
+    std::string preview_error;
+    {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        loading = preview.loading;
+        preview_path = preview.path;
+        preview_error = preview.error;
+    }
+    if (!loading && preview_error.empty()) return;
+    const auto& theme = aida::ui::resolved();
+    const ImVec2 viewport = ImGui::GetIO().DisplaySize;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    draw->AddRectFilled(ImVec2(0, 0), viewport,
+        IM_COL32(0, 0, 0, static_cast<int>(140)));
+    const ImVec2 size(380.f, loading ? 88.f : 116.f);
+    const ImVec2 minimum((viewport.x - size.x) * 0.5f, (viewport.y - size.y) * 0.5f);
+    const ImVec2 maximum(minimum.x + size.x, minimum.y + size.y);
+    draw->AddRectFilled(minimum, maximum,
+        aida::ui::with_alpha(theme.bg_elevated, 0.98f), 12.f);
+    draw->AddRect(minimum, maximum,
+        aida::ui::with_alpha(theme.border_strong, 1.f), 12.f, 0, 1.2f);
+    if (loading) {
+        ui_anim::render_spinner(draw, minimum.x + 32.f, minimum.y + 44.f, 14.f, 3.f,
+            aida::ui::with_alpha(theme.accent_u32, 1.f),
+            static_cast<float>(ImGui::GetTime()));
+    }
+    ImFont* body = aida::ui::fonts::body_strong();
+    draw->AddText(body, 15.f, ImVec2(minimum.x + 66.f, minimum.y + 20.f),
+        aida::ui::with_alpha(loading ? theme.text_primary : theme.error, 1.f),
+        loading ? "Loading hex preview..." : "Hex preview unavailable");
+    if (!preview_path.empty()) {
+        const auto slash = preview_path.find_last_of("\\/");
+        const std::string filename = slash != std::string::npos
+            ? preview_path.substr(slash + 1) : preview_path;
+        ImFont* caption = aida::ui::fonts::caption();
+        draw->AddText(caption, 12.f, ImVec2(minimum.x + 66.f, minimum.y + 46.f),
+            aida::ui::with_alpha(theme.text_dim, 1.f), filename.c_str());
+    }
+    if (!loading && !preview_error.empty()) {
+        const std::string message = truncate_middle(preview_error, 170);
+        ImFont* caption = aida::ui::fonts::caption();
+        draw->AddText(caption, 12.f, ImVec2(minimum.x + 22.f, minimum.y + 78.f),
+            aida::ui::with_alpha(theme.text_secondary, 1.f), message.c_str());
+    }
 }
 
 void request_open_confirmation(const std::string& path)
@@ -484,6 +780,8 @@ void record_recent_workspace(const std::string& path)
 
 void render_pending_confirm_modal()
 {
+    render_hex_loading_indicator();
+
     if (file_browser::pending_open_should_open) {
         ImGui::OpenPopup("##aida_open_binary_confirm");
         file_browser::pending_open_should_open = false;
