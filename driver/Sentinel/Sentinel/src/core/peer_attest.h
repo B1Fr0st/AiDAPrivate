@@ -3,6 +3,7 @@
 #include <ntifs.h>
 #include <imports/Defs.h>
 #include <core/KernelCrypto.h>
+#include <core/HardwareId.h>
 
 extern "C" PPEB NTAPI PsGetProcessPeb(PEPROCESS Process);
 
@@ -16,6 +17,7 @@ namespace peer_attest {
     constexpr ULONG PEER_ATTEST_POOL_TAG = 'aPpS';
     constexpr ULONG MAX_PEER_SECTION_SIZE = 32u * 1024u * 1024u;
     constexpr ULONG MAX_PEER_SECTIONS     = 32u;
+    constexpr ULONG BUGCHECK_CLONE_DETECTED = 0xA1DA0001u;
 
     constexpr UINT8 g_domain_separator[] = {
         'A','I','D','A','_','P','E','E','R','_','A','T','T','E','S','T','_','V','1', 0
@@ -218,6 +220,23 @@ namespace peer_attest {
     inline volatile LONG64 g_last_peer_hash_tsc = 0;
     inline volatile LONG   g_last_peer_status   = 0;
 
+    inline UINT8           g_last_known_hwid[32]      = {};
+    inline UINT8           g_last_known_code_hash[32]  = {};
+    inline volatile LONG   g_clone_check_initialized   = 0;
+
+    __forceinline UINT64 fold_hash_64(const UINT8 hash[32])
+    {
+        UINT64 fold = 0;
+        for (ULONG i = 0; i < 32; i += 8) {
+            UINT64 chunk = 0;
+            RtlCopyMemory(&chunk, hash + i, 8);
+            fold ^= chunk;
+            fold *= 0x100000001B3ULL;
+            fold ^= fold >> 33;
+        }
+        return fold;
+    }
+
     __forceinline NTSTATUS refresh_peer_hash(HANDLE peer_pid)
     {
         if (!peer_pid) {
@@ -238,6 +257,50 @@ namespace peer_attest {
         if (NT_SUCCESS(st)) {
             for (ULONG i = 0; i < 32; ++i) g_last_peer_hash[i] = hash[i];
             _InterlockedExchange64(&g_last_peer_hash_tsc, static_cast<LONG64>(__rdtsc()));
+
+            if (hardware_id::g_anchors_valid) {
+                UINT8 current_hwid[32] = {};
+                RtlCopyMemory(current_hwid, hardware_id::g_anchors.composite_sha256, 32);
+
+                if (_InterlockedCompareExchange(&g_clone_check_initialized, 0, 0) == 1) {
+                    BOOLEAN code_hash_match = TRUE;
+                    for (ULONG i = 0; i < 32; ++i) {
+                        if (g_last_known_code_hash[i] != hash[i]) {
+                            code_hash_match = FALSE;
+                            break;
+                        }
+                    }
+
+                    if (code_hash_match) {
+                        BOOLEAN hwid_match = TRUE;
+                        for (ULONG i = 0; i < 32; ++i) {
+                            if (g_last_known_hwid[i] != current_hwid[i]) {
+                                hwid_match = FALSE;
+                                break;
+                            }
+                        }
+
+                        if (!hwid_match) {
+                            UINT64 code_hash_fold = fold_hash_64(hash);
+                            UINT64 hwid_fold = fold_hash_64(current_hwid);
+                            SN_LOG("peer_attest::refresh_peer_hash: CLONE DETECTED pid=%llu code_hash_match=1 hwid_match=0 -> BUGCHECK 0x%08lx",
+                                static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(peer_pid)),
+                                BUGCHECK_CLONE_DETECTED);
+                            if (_KeBugCheckEx)
+                                _KeBugCheckEx(BUGCHECK_CLONE_DETECTED,
+                                    static_cast<ULONG_PTR>(peer_pid),
+                                    static_cast<ULONG_PTR>(code_hash_fold),
+                                    static_cast<ULONG_PTR>(hwid_fold),
+                                    0);
+                        }
+                    }
+                }
+
+                RtlCopyMemory(g_last_known_hwid, current_hwid, 32);
+                RtlCopyMemory(g_last_known_code_hash, hash, 32);
+                _InterlockedExchange(&g_clone_check_initialized, 1);
+                RtlSecureZeroMemory(current_hwid, sizeof(current_hwid));
+            }
         }
 
         if (proc) {

@@ -57,10 +57,20 @@ struct dex_parse_limits_t {
     std::uint64_t max_single_string_bytes = 1ULL * 1024ULL * 1024ULL;
 };
 
+struct dex_compact_dex_features_t {
+    std::uint32_t declared_header_size = 0;
+    std::uint32_t feature_flags = 0;
+    std::uint32_t unknown_feature_flags = 0;
+    bool default_methods = false;
+    bool compact_code_items = true;
+    bool debug_info_offset_table = true;
+};
+
 struct dex_container_info_t {
     dex_container_kind_t kind = dex_container_kind_t::unknown;
     std::string version;
     std::uint64_t header_size = 0;
+    std::optional<dex_compact_dex_features_t> compact_features;
     std::vector<std::uint64_t> embedded_dex_offsets;
 };
 

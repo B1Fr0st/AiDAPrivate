@@ -34,19 +34,21 @@
 
 namespace {
 
-struct system_handle_entry_t {
-	USHORT pid;
-	USHORT creator_back_trace_index;
-	UCHAR  object_type_index;
-	UCHAR  handle_attributes;
-	USHORT handle_value;
-	PVOID  object;
-	ULONG  granted_access;
+struct system_handle_entry_ex_t {
+	PVOID       object;
+	ULONG_PTR   unique_process_id;
+	ULONG_PTR   handle_value;
+	ACCESS_MASK granted_access;
+	USHORT      creator_back_trace_index;
+	USHORT      object_type_index;
+	ULONG       handle_attributes;
+	ULONG       reserved;
 };
 
-struct system_handle_information_t {
-	ULONG number_of_handles;
-	system_handle_entry_t handles[1];
+struct system_handle_information_ex_t {
+	ULONG_PTR number_of_handles;
+	ULONG_PTR reserved;
+	system_handle_entry_ex_t handles[1];
 };
 
 using nt_query_system_information_fn = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
@@ -3739,7 +3741,7 @@ void enumerate_handles() {
 	for (int attempt = 0; attempt < 8; ++attempt) {
 		buffer.resize(buf_size);
 		ULONG returned = 0;
-		nts = nt_query(16, buffer.data(), buf_size, &returned);
+		nts = nt_query(64, buffer.data(), buf_size, &returned);
 		if (nts == 0) break;
 		if (nts == static_cast<NTSTATUS>(0xC0000004))
 			buf_size *= 2;
@@ -3748,7 +3750,7 @@ void enumerate_handles() {
 	}
 	if (nts != 0) return;
 
-	auto* info = reinterpret_cast<system_handle_information_t*>(buffer.data());
+	auto* info = reinterpret_cast<system_handle_information_ex_t*>(buffer.data());
 	std::vector<handle_info_t> result;
 
 	size_t metadata_attempted = 0;
@@ -3758,9 +3760,9 @@ void enumerate_handles() {
 	size_t metadata_skipped_budget = 0;
 	size_t duplicate_failed = 0;
 
-	for (ULONG i = 0; i < info->number_of_handles; ++i) {
+	for (ULONG_PTR i = 0; i < info->number_of_handles; ++i) {
 		auto& entry = info->handles[i];
-		if (static_cast<uint32_t>(entry.pid) != st.target_pid)
+		if (static_cast<uint32_t>(entry.unique_process_id) != st.target_pid)
 			continue;
 		handle_info_t hi;
 		hi.handle = entry.handle_value;

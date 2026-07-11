@@ -140,6 +140,7 @@ typedef struct _UM_LDR_DATA_TABLE_ENTRY_X {
 constexpr ULONG_PTR AIDA_WATERMARK_MAGIC = 0xA1DA71A5u;
 constexpr ULONG_PTR AIDA_WATERMARK_OPT_HDR_OFFSET = 0x70;
 constexpr ULONG BUGCHECK_MODULE_CROSSCHECK = 0xA1DA0001u;
+constexpr ULONG BUGCHECK_SSDT_HOOK         = 0xA1DA000Au;
 
 extern "C" NTSTATUS NTAPI ZwQuerySystemInformation(
     _In_ SYSTEM_INFORMATION_CLASS_INTERNAL SystemInformationClass,
@@ -342,6 +343,13 @@ inline NTSTATUS           (NTAPI* _ObQueryNameString)               (PVOID, POBJ
 inline PPEB               (NTAPI* _PsGetProcessPeb)                 (PEPROCESS);
 
 inline POBJECT_TYPE*       _IoDriverObjectType_ptr = nullptr;
+inline POBJECT_TYPE*       _IoFileObjectType_ptr = nullptr;
+inline POBJECT_TYPE        (NTAPI* _ObGetObjectType)(PVOID) = nullptr;
+
+inline PVOID              (NTAPI* _MmGetSystemRoutineAddress)     (PUNICODE_STRING);
+
+inline NTSTATUS           (NTAPI* _ZwOpenFile)                    (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
+inline NTSTATUS           (NTAPI* _ObReferenceObjectByHandle)     (HANDLE, ACCESS_MASK, POBJECT_TYPE, KPROCESSOR_MODE, PVOID*, POBJECT_HANDLE_INFORMATION);
 
 
 inline bool SetupFunctions() {
@@ -434,6 +442,12 @@ inline bool SetupFunctions() {
     *(PVOID*)&_PsGetProcessPeb                 = GetProcAddress(kernelBase, (PCHAR)skCrypt("PsGetProcessPeb"));
 
     _IoDriverObjectType_ptr = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoDriverObjectType"));
+    _IoFileObjectType_ptr = (POBJECT_TYPE*)GetProcAddress(kernelBase, (PCHAR)skCrypt("IoFileObjectType"));
+    *(PVOID*)&_ObGetObjectType = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObGetObjectType"));
+
+    *(PVOID*)&_MmGetSystemRoutineAddress     = GetProcAddress(kernelBase, (PCHAR)skCrypt("MmGetSystemRoutineAddress"));
+    *(PVOID*)&_ZwOpenFile                    = GetProcAddress(kernelBase, (PCHAR)skCrypt("ZwOpenFile"));
+    *(PVOID*)&_ObReferenceObjectByHandle     = GetProcAddress(kernelBase, (PCHAR)skCrypt("ObReferenceObjectByHandle"));
 
     SN_LOG("SetupFunctions: kernelBase=%p", kernelBase);
     SN_LOG("SetupFunctions: _MmIsAddressValid=%p _MmCopyMemory=%p _MmMapIoSpaceEx=%p _MmUnmapIoSpace=%p", _MmIsAddressValid, _MmCopyMemory, _MmMapIoSpaceEx, _MmUnmapIoSpace);
@@ -452,8 +466,11 @@ inline bool SetupFunctions() {
     SN_LOG("SetupFunctions: _PsSetCreateProcessNotifyRoutine=%p _PsSetCreateProcessNotifyRoutineEx=%p", _PsSetCreateProcessNotifyRoutine, _PsSetCreateProcessNotifyRoutineEx);
     SN_LOG("SetupFunctions: _PsSetLoadImageNotifyRoutine=%p _PsRemoveLoadImageNotifyRoutine=%p", _PsSetLoadImageNotifyRoutine, _PsRemoveLoadImageNotifyRoutine);
     SN_LOG("SetupFunctions: _ZwTerminateProcess=%p _ZwOpenProcess=%p _IoDriverObjectType_ptr=%p", _ZwTerminateProcess, _ZwOpenProcess, _IoDriverObjectType_ptr);
+    SN_LOG("SetupFunctions: _IoFileObjectType_ptr=%p _ObGetObjectType=%p", _IoFileObjectType_ptr, _ObGetObjectType);
     SN_LOG("SetupFunctions: _KeStackAttachProcess=%p _KeUnstackDetachProcess=%p _ObQueryNameString=%p _PsGetProcessPeb=%p",
         _KeStackAttachProcess, _KeUnstackDetachProcess, _ObQueryNameString, _PsGetProcessPeb);
+    SN_LOG("SetupFunctions: _MmGetSystemRoutineAddress=%p", _MmGetSystemRoutineAddress);
+    SN_LOG("SetupFunctions: _ZwOpenFile=%p _ObReferenceObjectByHandle=%p", _ZwOpenFile, _ObReferenceObjectByHandle);
 
     if (!_MmIsAddressValid || !_MmCopyMemory ||
         !_IoAllocateMdl || !_IoFreeMdl || !_MmBuildMdlForNonPagedPool ||

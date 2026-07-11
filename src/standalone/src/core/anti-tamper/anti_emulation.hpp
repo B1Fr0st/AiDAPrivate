@@ -818,6 +818,19 @@ inline bool check_unicorn_emulation_preflight()
     return emulation_signals == 3;
 }
 
+using timing_canary_fn_t = bool(*)();
+inline timing_canary_fn_t& timing_canary_fn_storage()
+{
+    static timing_canary_fn_t fn = nullptr;
+    return fn;
+}
+inline void set_timing_canary_fn(timing_canary_fn_t fn)
+{
+    timing_canary_fn_storage() = fn;
+}
+
+inline void run_diagnostic_probes();
+
 inline bool run_anti_emulation_preflight()
 {
     if (check_unicorn_emulation_preflight())
@@ -826,6 +839,8 @@ inline bool run_anti_emulation_preflight()
         show_message_and_exit(L"Unsupported environment");
         return false;
     }
+
+    run_diagnostic_probes();
 
     int cpuid_data[4] = {};
     __cpuid(cpuid_data, 1);
@@ -840,7 +855,9 @@ inline bool run_anti_emulation_preflight()
             return false;
         }
 
-        if (check_hypervisor_timing_uniform())
+        auto canary_fn = timing_canary_fn_storage();
+        bool timing_suspicious = canary_fn ? canary_fn() : check_hypervisor_timing_uniform();
+        if (timing_suspicious)
         {
             webhook::send_debug_log("anti_emu", "hijacked_hypervisor_uniform_timing", true);
             show_message_and_exit(L"Unsupported virtualization environment");
@@ -1335,6 +1352,46 @@ inline bool check_unicorn_rdseed_deterministic()
     }
 
     return distinct < 30;
+}
+
+inline void run_diagnostic_probes()
+{
+    struct probe_entry_t
+    {
+        const char* name;
+        bool (*fn)();
+    };
+
+    static const probe_entry_t probes[] = {
+        {"page_fault", check_unicorn_page_fault_behavior},
+        {"no_tlb", check_unicorn_no_tlb},
+        {"invlpg", check_unicorn_invlpg_no_ud},
+        {"wbinvd", check_unicorn_wbinvd_no_ud},
+        {"vmx", check_unicorn_vmx_unmodeled},
+        {"sgx", check_unicorn_sgx_unmodeled},
+        {"rdpid", check_unicorn_rdpid_zeros},
+        {"rdpmc", check_unicorn_rdpmc_zeros},
+        {"endbr", check_unicorn_endbr_behavior},
+    };
+
+    for (const auto& p : probes)
+    {
+        bool result = false;
+        __try
+        {
+            result = p.fn();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            result = false;
+        }
+
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "diagnostic_probe name=%s result=%d",
+            p.name, result ? 1 : 0);
+        webhook::write_log("anti_emu", buf);
+    }
 }
 
 }

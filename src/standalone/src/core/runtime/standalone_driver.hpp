@@ -636,6 +636,7 @@ namespace driver_bridge
     bool trigger_dma_countermeasure(uint32_t action, uint32_t reason);
 
     bool update_re_tool_hashes(const uint8_t* hashes, uint32_t count);
+    bool update_ce_driver_hashes(const uint8_t* hashes, uint32_t count);
 
     struct anti_debug_result_t {
         uint32_t result_flags;
@@ -691,6 +692,9 @@ namespace driver_bridge
 
     bool relay_server_token(uint32_t token_hash, uint64_t server_nonce);
     bool relay_server_token_v2(uint32_t token_hash, uint64_t server_nonce, uint64_t* out_driver_proof = nullptr);
+
+    bool initiate_driver_handshake(uint8_t out_driver_challenge[32] = nullptr);
+    bool complete_driver_challenge(const uint8_t driver_challenge[32]);
 
     struct reloc_mask_entry_t {
         uint32_t offset;
@@ -860,4 +864,8 @@ namespace driver_bridge
                             debug_event_stats_t* out_stats = nullptr);
 
     uint64_t watchdog_last_ok_tick();
+
+    bool kernel_read_prologue_hash(uint64_t va, uint32_t size, uint64_t& out_hash);
+    bool query_sentinel_dispatch_guard(uint8_t& hook_detected, uint64_t& hook_target);
+    bool query_sentinel_callback_scan(uint8_t& hostile_drivers, uint8_t& modified_callbacks);
 }

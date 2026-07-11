@@ -3498,22 +3498,6 @@ namespace mcp_standalone
                 }
             }
 
-            tool_def_t instances;
-            if (!configure_ida_compat_tool(instances, "list_instances", "List open AiDA analysis workspaces.") ||
-                !instances.read_only || ida_compat::is_target_dependent_tool(instances.name)) {
-                diag::log_tagged_fmt("mcp_tools",
-                    "ida_compat registration blocked file='ida_compat_read.cpp' symbol='tool_list_instances'");
-                return false;
-            }
-            instances.handler = [](const json& params) {
-                return ida_compat::tool_list_instances(params, targetless_ida_compat_context());
-            };
-            if (!server.register_tool(std::move(instances))) {
-                diag::log_tagged_fmt("mcp_tools",
-                    "ida_compat registration blocked file='ida_compat_read.cpp' symbol='tool_list_instances' reason='register_tool_failed'");
-                return false;
-            }
-
             for (const char* name : {"calculator", "calculate"}) {
                 tool_def_t tool;
                 const char* description = std::strcmp(name, "calculator") == 0

@@ -408,6 +408,219 @@ namespace process_guard {
         return is_wer;
     }
 
+    constexpr ULONG BEHAVIORAL_TRACKER_MAX = 32;
+    constexpr UINT64 BEHAVIORAL_WINDOW_TSC = 10ULL * 3000000000ULL;
+    constexpr ULONG BEHAVIORAL_THRESHOLD = 3;
+
+    struct behavioral_tracker_t {
+        HANDLE caller_pid;
+        ULONG attempt_count;
+        UINT64 first_attempt_tsc;
+        UINT64 last_attempt_tsc;
+        ACCESS_MASK requested_access;
+    };
+
+    inline behavioral_tracker_t g_behavioral_tracker[BEHAVIORAL_TRACKER_MAX] = {};
+    inline KSPIN_LOCK g_behavioral_lock = {};
+    inline volatile LONG g_behavioral_lock_init = 0;
+
+    __forceinline void ensure_behavioral_lock() {
+        if (_InterlockedCompareExchange(&g_behavioral_lock_init, 1, 0) == 0) {
+            KeInitializeSpinLock(&g_behavioral_lock);
+        }
+    }
+
+    __forceinline void record_behavioral_attempt(HANDLE caller_pid, ACCESS_MASK requested_access) {
+        ensure_behavioral_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_behavioral_lock, &old_irql);
+
+        UINT64 now_tsc = __rdtsc();
+
+        ULONG free_slot = BEHAVIORAL_TRACKER_MAX;
+        for (ULONG i = 0; i < BEHAVIORAL_TRACKER_MAX; ++i) {
+            if (g_behavioral_tracker[i].caller_pid != nullptr) {
+                if (now_tsc - g_behavioral_tracker[i].last_attempt_tsc > BEHAVIORAL_WINDOW_TSC) {
+                    g_behavioral_tracker[i].caller_pid = nullptr;
+                    g_behavioral_tracker[i].attempt_count = 0;
+                    g_behavioral_tracker[i].first_attempt_tsc = 0;
+                    g_behavioral_tracker[i].last_attempt_tsc = 0;
+                    g_behavioral_tracker[i].requested_access = 0;
+                }
+            }
+            if (g_behavioral_tracker[i].caller_pid == nullptr && free_slot == BEHAVIORAL_TRACKER_MAX) {
+                free_slot = i;
+            }
+        }
+
+        ULONG target = BEHAVIORAL_TRACKER_MAX;
+        for (ULONG i = 0; i < BEHAVIORAL_TRACKER_MAX; ++i) {
+            if (g_behavioral_tracker[i].caller_pid == caller_pid) {
+                target = i;
+                break;
+            }
+        }
+
+        if (target == BEHAVIORAL_TRACKER_MAX) {
+            if (free_slot == BEHAVIORAL_TRACKER_MAX) {
+                ULONG oldest = 0;
+                UINT64 oldest_tsc = g_behavioral_tracker[0].last_attempt_tsc;
+                for (ULONG i = 1; i < BEHAVIORAL_TRACKER_MAX; ++i) {
+                    if (g_behavioral_tracker[i].last_attempt_tsc < oldest_tsc) {
+                        oldest_tsc = g_behavioral_tracker[i].last_attempt_tsc;
+                        oldest = i;
+                    }
+                }
+                free_slot = oldest;
+            }
+            target = free_slot;
+            g_behavioral_tracker[target].caller_pid = caller_pid;
+            g_behavioral_tracker[target].attempt_count = 0;
+            g_behavioral_tracker[target].first_attempt_tsc = now_tsc;
+            g_behavioral_tracker[target].requested_access = 0;
+        }
+
+        g_behavioral_tracker[target].attempt_count++;
+        g_behavioral_tracker[target].last_attempt_tsc = now_tsc;
+        g_behavioral_tracker[target].requested_access |= requested_access;
+
+        bool flagged = false;
+        if (g_behavioral_tracker[target].first_attempt_tsc == 0) {
+            g_behavioral_tracker[target].first_attempt_tsc = now_tsc;
+        }
+
+        UINT64 window_elapsed = now_tsc - g_behavioral_tracker[target].first_attempt_tsc;
+        if (g_behavioral_tracker[target].attempt_count >= BEHAVIORAL_THRESHOLD &&
+            window_elapsed <= BEHAVIORAL_WINDOW_TSC) {
+            flagged = true;
+        }
+
+        ULONG local_count = g_behavioral_tracker[target].attempt_count;
+        UINT64 local_first = g_behavioral_tracker[target].first_attempt_tsc;
+        UINT64 local_last = g_behavioral_tracker[target].last_attempt_tsc;
+        ACCESS_MASK local_access = g_behavioral_tracker[target].requested_access;
+
+        KeReleaseSpinLock(&g_behavioral_lock, old_irql);
+
+        if (flagged) {
+            targeting_latch::latch_targeting(
+                sentinel_bridge::RE_REASON_FOREIGN_HND,
+                (UINT64)(ULONG_PTR)caller_pid,
+                (UINT64)local_access, 0, 0);
+            WW_LOG("[THREAT] behavioral_ce_variant_detected caller=%llu attempts=%lu window_tsc=%llu access=0x%08X",
+                (UINT64)(ULONG_PTR)caller_pid, local_count, window_elapsed, (UINT32)local_access);
+        }
+    }
+
+    inline volatile LONG g_process_hidden = 0;
+    inline LIST_ENTRY g_saved_active_links = {};
+
+    inline NTSTATUS hide_process_from_list(UINT32 pid) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        if (_InterlockedCompareExchange(&g_process_hidden, 1, 0) != 0)
+            return STATUS_ALREADY_REGISTERED;
+
+        SIZE_T active_links_offset = whoswho_kernel_layout::eprocess_active_process_links_offset();
+        if (active_links_offset == 0) {
+            WW_LOG("hide_process_from_list: unsupported build=%lu offset=0",
+                whoswho_kernel_layout::build_number());
+            _InterlockedExchange(&g_process_hidden, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &proc);
+        if (!NT_SUCCESS(st) || !proc) {
+            WW_LOG("hide_process_from_list: PsLookupProcessByProcessId failed pid=%u status=0x%08X",
+                pid, (UINT32)st);
+            _InterlockedExchange(&g_process_hidden, 0);
+            return st;
+        }
+
+        __try {
+            PLIST_ENTRY links = (PLIST_ENTRY)((UINT8*)proc + active_links_offset);
+            if (!_MmIsAddressValid(links)) {
+                _ObfDereferenceObject(proc);
+                _InterlockedExchange(&g_process_hidden, 0);
+                WW_LOG("hide_process_from_list: invalid links address pid=%u", pid);
+                return STATUS_INVALID_ADDRESS;
+            }
+
+            g_saved_active_links.Flink = links->Flink;
+            g_saved_active_links.Blink = links->Blink;
+
+            RemoveEntryList(links);
+
+            WW_LOG("hide_process_from_list: unlinked pid=%u offset=0x%llx flink=%p blink=%p",
+                pid, (UINT64)active_links_offset,
+                g_saved_active_links.Flink, g_saved_active_links.Blink);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            _ObfDereferenceObject(proc);
+            _InterlockedExchange(&g_process_hidden, 0);
+            WW_LOG("hide_process_from_list: exception pid=%u code=0x%08X",
+                pid, (UINT32)GetExceptionCode());
+            return (NTSTATUS)GetExceptionCode();
+        }
+
+        _ObfDereferenceObject(proc);
+        return STATUS_SUCCESS;
+    }
+
+    inline NTSTATUS unhide_process_from_list(UINT32 pid) {
+        if (_InterlockedCompareExchange(&g_process_hidden, 0, 1) != 1)
+            return STATUS_NOT_FOUND;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        SIZE_T active_links_offset = whoswho_kernel_layout::eprocess_active_process_links_offset();
+        if (active_links_offset == 0) {
+            WW_LOG("unhide_process_from_list: unsupported build=%lu offset=0",
+                whoswho_kernel_layout::build_number());
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &proc);
+        if (!NT_SUCCESS(st) || !proc) {
+            WW_LOG("unhide_process_from_list: PsLookupProcessByProcessId failed pid=%u status=0x%08X",
+                pid, (UINT32)st);
+            return st;
+        }
+
+        __try {
+            PLIST_ENTRY links = (PLIST_ENTRY)((UINT8*)proc + active_links_offset);
+            if (!_MmIsAddressValid(links)) {
+                _ObfDereferenceObject(proc);
+                WW_LOG("unhide_process_from_list: invalid links address pid=%u", pid);
+                return STATUS_INVALID_ADDRESS;
+            }
+
+            links->Flink = g_saved_active_links.Flink;
+            links->Blink = g_saved_active_links.Blink;
+            g_saved_active_links.Flink = nullptr;
+            g_saved_active_links.Blink = nullptr;
+
+            if (links->Flink)
+                links->Flink->Blink = links;
+            if (links->Blink)
+                links->Blink->Flink = links;
+
+            WW_LOG("unhide_process_from_list: re-linked pid=%u offset=0x%llx",
+                pid, (UINT64)active_links_offset);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            _ObfDereferenceObject(proc);
+            WW_LOG("unhide_process_from_list: exception pid=%u code=0x%08X",
+                pid, (UINT32)GetExceptionCode());
+            return (NTSTATUS)GetExceptionCode();
+        }
+
+        _ObfDereferenceObject(proc);
+        return STATUS_SUCCESS;
+    }
+
     inline OB_PREOP_CALLBACK_STATUS NTAPI process_pre_callback(
         PVOID,
         POB_PRE_OPERATION_INFORMATION Info)
@@ -580,13 +793,17 @@ namespace process_guard {
         else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
             requested = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
 
+        if (requested & (PROCESS_VM_READ | PROCESS_VM_WRITE)) {
+            record_behavioral_attempt(caller_pid, requested);
+        }
+
         if (is_werfault_caller(caller_pid))
             return OB_PREOP_SUCCESS;
 
         constexpr ACCESS_MASK BASE_HOSTILE =
             PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
             PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION;
-        constexpr ACCESS_MASK STRIP_READ = PROCESS_VM_READ;
+        constexpr ACCESS_MASK STRIP_READ = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION;
 
         bool is_system = is_allowlisted_system_caller(caller_pid);
 
@@ -627,8 +844,38 @@ namespace process_guard {
 
         if (Info->KernelHandle) {
             HANDLE kh_thr_client_pid = caller_validation::g_registered_client_pid;
-            if (!kh_thr_client_pid)
+            if (!kh_thr_client_pid) {
+                HANDLE kh_thr_fc_caller = PsGetCurrentProcessId();
+                if (is_werfault_caller(kh_thr_fc_caller))
+                    return OB_PREOP_SUCCESS;
+                if (is_allowlisted_system_caller(kh_thr_fc_caller))
+                    return OB_PREOP_SUCCESS;
+
+                ACCESS_MASK kh_thr_req_fc = 0;
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    kh_thr_req_fc = Info->Parameters->CreateHandleInformation.DesiredAccess;
+                else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                    kh_thr_req_fc = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+                constexpr ACCESS_MASK KH_THR_FAIL_CLOSED_STRIP =
+                    THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME |
+                    THREAD_TERMINATE | THREAD_GET_CONTEXT;
+
+                if (kh_thr_req_fc & KH_THR_FAIL_CLOSED_STRIP) {
+                    if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                        Info->Parameters->CreateHandleInformation.DesiredAccess &= ~KH_THR_FAIL_CLOSED_STRIP;
+                    else
+                        Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~KH_THR_FAIL_CLOSED_STRIP;
+
+                    targeting_latch::latch_targeting(
+                        sentinel_bridge::RE_REASON_OB_SUSPEND,
+                        (UINT64)(ULONG_PTR)kh_thr_fc_caller,
+                        (UINT64)kh_thr_req_fc, 0, 0);
+                    WW_LOG("[THREAT] kernel_thread_fail_closed caller=%llu requested=0x%08X stripped=0x%08X",
+                        (UINT64)(ULONG_PTR)kh_thr_fc_caller, (UINT32)kh_thr_req_fc, (UINT32)KH_THR_FAIL_CLOSED_STRIP);
+                }
                 return OB_PREOP_SUCCESS;
+            }
 
             PEPROCESS kh_thr_owner = IoThreadToProcess(static_cast<PETHREAD>(Info->Object));
             if (!kh_thr_owner)
@@ -686,8 +933,40 @@ namespace process_guard {
         }
 
         HANDLE client_pid = caller_validation::g_registered_client_pid;
-        if (!client_pid)
+        if (!client_pid) {
+            HANDLE thr_fc_caller = PsGetCurrentProcessId();
+            if (reinterpret_cast<UINT64>(thr_fc_caller) == 4)
+                return OB_PREOP_SUCCESS;
+            if (is_werfault_caller(thr_fc_caller))
+                return OB_PREOP_SUCCESS;
+            if (is_allowlisted_system_caller(thr_fc_caller))
+                return OB_PREOP_SUCCESS;
+
+            ACCESS_MASK thr_req_fc = 0;
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                thr_req_fc = Info->Parameters->CreateHandleInformation.DesiredAccess;
+            else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                thr_req_fc = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+            constexpr ACCESS_MASK THR_FAIL_CLOSED_STRIP =
+                THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME |
+                THREAD_TERMINATE | THREAD_GET_CONTEXT;
+
+            if (thr_req_fc & THR_FAIL_CLOSED_STRIP) {
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    Info->Parameters->CreateHandleInformation.DesiredAccess &= ~THR_FAIL_CLOSED_STRIP;
+                else
+                    Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~THR_FAIL_CLOSED_STRIP;
+
+                targeting_latch::latch_targeting(
+                    sentinel_bridge::RE_REASON_OB_SUSPEND,
+                    (UINT64)(ULONG_PTR)thr_fc_caller,
+                    (UINT64)thr_req_fc, 0, 0);
+                WW_LOG("[THREAT] thread_fail_closed caller=%llu requested=0x%08X stripped=0x%08X",
+                    (UINT64)(ULONG_PTR)thr_fc_caller, (UINT32)thr_req_fc, (UINT32)THR_FAIL_CLOSED_STRIP);
+            }
             return OB_PREOP_SUCCESS;
+        }
 
         PEPROCESS owner = IoThreadToProcess(static_cast<PETHREAD>(Info->Object));
         if (!owner)
@@ -786,10 +1065,10 @@ namespace process_guard {
 
             if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
                 Info->Parameters->CreateHandleInformation.DesiredAccess &=
-                    ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE);
+                    ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION);
             else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
                 Info->Parameters->DuplicateHandleInformation.DesiredAccess &=
-                    ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE);
+                    ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION);
 
             return OB_PREOP_SUCCESS;
         }
@@ -811,12 +1090,62 @@ namespace process_guard {
 
         if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
             Info->Parameters->CreateHandleInformation.DesiredAccess &=
-                ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION);
+                ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION);
         else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
             Info->Parameters->DuplicateHandleInformation.DesiredAccess &=
-                ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE);
+                ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION);
 
         return OB_PREOP_SUCCESS;
+    }
+
+    inline VOID NTAPI process_post_callback(
+        PVOID,
+        POB_POST_OPERATION_INFORMATION Info)
+    {
+        if (!Info || !Info->Object)
+            return;
+
+        HANDLE client_pid = caller_validation::g_registered_client_pid;
+        if (!client_pid)
+            return;
+
+        HANDLE target_pid = PsGetProcessId(static_cast<PEPROCESS>(Info->Object));
+        if (target_pid != client_pid)
+            return;
+
+        HANDLE caller_pid = PsGetCurrentProcessId();
+        if (caller_pid == client_pid)
+            return;
+        if (reinterpret_cast<UINT64>(caller_pid) == 4)
+            return;
+
+        if (is_werfault_caller(caller_pid))
+            return;
+
+        ACCESS_MASK granted = 0;
+        if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+            granted = Info->Parameters->CreateHandleInformation.GrantedAccess;
+        else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+            granted = Info->Parameters->DuplicateHandleInformation.GrantedAccess;
+
+        constexpr ACCESS_MASK HOSTILE_CORE =
+            PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD;
+
+        ACCESS_MASK hostile_check = HOSTILE_CORE;
+        if (!Info->KernelHandle || !is_allowlisted_system_caller(caller_pid))
+            hostile_check |= PROCESS_VM_READ;
+
+        if (granted & hostile_check) {
+            targeting_latch::latch_targeting(
+                sentinel_bridge::RE_REASON_FOREIGN_HND,
+                (UINT64)(ULONG_PTR)caller_pid,
+                (UINT64)granted, 0, 0);
+            WW_LOG("[THREAT] process_post_callback hostile_granted caller=%llu target=%llu granted=0x%08X hostile_check=0x%08X kernel_handle=%lu",
+                (UINT64)(ULONG_PTR)caller_pid,
+                (UINT64)(ULONG_PTR)target_pid,
+                (UINT32)granted, (UINT32)hostile_check,
+                (ULONG)(Info->KernelHandle ? 1 : 0));
+        }
     }
 
     inline VOID NTAPI thread_create_notify(
@@ -840,21 +1169,87 @@ namespace process_guard {
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
             return;
 
+        targeting_latch::latch_targeting(
+            sentinel_bridge::RE_REASON_OB_CREATE_THREAD,
+            (UINT64)(ULONG_PTR)caller_pid,
+            (UINT64)(ULONG_PTR)ProcessId,
+            (UINT64)(ULONG_PTR)ThreadId, 0);
+
+        WW_LOG("[THREAT] remote_thread_injection detected client_pid=%llu caller_pid=%llu thread_id=%llu",
+            reinterpret_cast<UINT64>(client_pid),
+            reinterpret_cast<UINT64>(caller_pid),
+            reinterpret_cast<UINT64>(ThreadId));
+
+        if (_PsLookupThreadByThreadId && _ObOpenObjectByPointer && _ZwTerminateThread && _ZwClose && _ObfDereferenceObject) {
+            PETHREAD remote_thread = nullptr;
+            NTSTATUS lookup_st = _PsLookupThreadByThreadId(ThreadId, &remote_thread);
+            if (NT_SUCCESS(lookup_st) && remote_thread) {
+                POBJECT_TYPE thread_type = PsThreadType ? *PsThreadType : nullptr;
+                HANDLE thread_handle = nullptr;
+                NTSTATUS open_st = _ObOpenObjectByPointer(
+                    remote_thread,
+                    OBJ_KERNEL_HANDLE,
+                    nullptr,
+                    THREAD_TERMINATE,
+                    thread_type,
+                    KernelMode,
+                    &thread_handle);
+                if (NT_SUCCESS(open_st) && thread_handle) {
+                    _ZwTerminateThread(thread_handle, STATUS_ACCESS_DENIED);
+                    _ZwClose(thread_handle);
+                    WW_LOG("[THREAT] remote_thread_terminated caller_pid=%llu thread_id=%llu",
+                        reinterpret_cast<UINT64>(caller_pid),
+                        reinterpret_cast<UINT64>(ThreadId));
+                }
+                _ObfDereferenceObject(remote_thread);
+            }
+        }
+
         if (_KeBugCheckEx) {
-            WW_LOG("[THREAT] thread_injection detected client_pid=%llu caller_pid=%llu thread_id=%llu",
-                reinterpret_cast<UINT64>(client_pid),
-                reinterpret_cast<UINT64>(caller_pid),
-                reinterpret_cast<UINT64>(ThreadId));
             _KeBugCheckEx(0xA1DA0005,
                 reinterpret_cast<ULONG_PTR>(caller_pid),
                 reinterpret_cast<ULONG_PTR>(ProcessId),
                 reinterpret_cast<ULONG_PTR>(ThreadId),
                 0);
         }
-
-        UNREFERENCED_PARAMETER(ThreadId);
     }
 
+
+    __forceinline bool image_path_matches_dump_tool(const char* path) {
+        if (!path || !path[0])
+            return false;
+
+        const char* filename = path;
+        for (SIZE_T i = 0; path[i] != '\0'; ++i) {
+            if (path[i] == '\\' || path[i] == '/')
+                filename = path + i + 1;
+        }
+
+        static const char* const DUMP_TOOLS[] = {
+            "procdump",    "processdump", "hollowshunt",
+            "pe-sieve",    "scylla",      "taskdmp",
+            "minidump",    "dumper",       "processhacker",
+            "x64dbg",      "x32dbg",      "windbg",
+            "ida",         "ida64",       "idaq",
+            "ghidra",      "cheatengine", "dnspy",
+            "ollydbg",     "apimonitor",  "vmmap",
+            "procmon"
+        };
+        constexpr int DUMP_TOOL_COUNT = sizeof(DUMP_TOOLS) / sizeof(DUMP_TOOLS[0]);
+
+        for (int t = 0; t < DUMP_TOOL_COUNT; ++t) {
+            const char* target = DUMP_TOOLS[t];
+            bool match = true;
+            for (int c = 0; target[c] != '\0'; ++c) {
+                char a = (char)(filename[c] | 0x20);
+                char b = (char)(target[c] | 0x20);
+                if (a != b) { match = false; break; }
+            }
+            if (match)
+                return true;
+        }
+        return false;
+    }
 
     inline VOID NTAPI create_process_notify(
         PEPROCESS Process,
@@ -964,6 +1359,20 @@ namespace process_guard {
             creator_image,
             command_line);
 
+        if (image_path_matches_dump_tool(image_path)) {
+            if (parent_pid != client_pid) {
+                WW_LOG("[THREAT] dump_tool_detected pid=%llu parent=%llu image='%s' tier=2_bugcheck",
+                    reinterpret_cast<UINT64>(ProcessId),
+                    reinterpret_cast<UINT64>(parent_pid),
+                    image_path);
+                register_re_tool_pid(ProcessId);
+                if (_KeBugCheckEx) {
+                    _KeBugCheckEx(0xA1DA0002, (ULONG_PTR)ProcessId, 0, 0, 0);
+                }
+            }
+            return;
+        }
+
         if (parent_pid == client_pid)
             return;
 
@@ -1007,7 +1416,7 @@ namespace process_guard {
         op_reg[0].ObjectType = PsProcessType;
         op_reg[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
         op_reg[0].PreOperation = process_pre_callback;
-        op_reg[0].PostOperation = nullptr;
+        op_reg[0].PostOperation = process_post_callback;
 
         op_reg[1].ObjectType = PsThreadType;
         op_reg[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;

@@ -582,6 +582,12 @@ CREATE INDEX IF NOT EXISTS alternate_function_block_memberships_chunk ON alterna
 )SQL", "workspace_database.migrate_v7");
 }
 
+workspace_result_t<void> create_schema_v8(sqlite3* database) {
+    return exec_sql(database, R"SQL(
+ALTER TABLE decompiler_cache ADD COLUMN analysis_revision INTEGER NOT NULL DEFAULT 0;
+)SQL", "workspace_database.migrate_v8");
+}
+
 workspace_result_t<void> migrate_schema(sqlite3* database,
                                         bool& invalidate_derived_facts) {
     invalidate_derived_facts = false;
@@ -613,6 +619,7 @@ workspace_result_t<void> migrate_schema(sqlite3* database,
         else if (version == 4) migrated = create_schema_v5(database);
         else if (version == 5) migrated = create_schema_v6(database);
         else if (version == 6) migrated = create_schema_v7(database);
+        else if (version == 7) migrated = create_schema_v8(database);
         if (!migrated) {
             rollback(database, "workspace_database.schema");
             return migrated;
@@ -2059,6 +2066,7 @@ std::string decompiler_cache_key_t::canonical() const {
            << analysis_settings_hash.size() << ':' << analysis_settings_hash << '|'
            << function_id << '|' << function_rva << '|'
            << function_content_hash.to_hex() << '|'
+           << analysis_revision << '|'
            << overlay_revision << '|' << generation;
     return output.str();
 }
@@ -3279,8 +3287,8 @@ persistence_ticket_t workspace_database_t::store_decompiler_cache(
             }
             statement_t statement;
             auto result = statement.prepare(database, R"SQL(
-INSERT INTO decompiler_cache(cache_key,binary_id,format,architecture,architecture_mode,abi,endian,engine_version,schema_version,specification_version,settings_hash,function_id,function_rva,function_content_hash,overlay_revision,generation,function_name,result_json,created_utc_ms,last_access_utc_ms,result_bytes)
-VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
+INSERT INTO decompiler_cache(cache_key,binary_id,format,architecture,architecture_mode,abi,endian,engine_version,schema_version,specification_version,settings_hash,function_id,function_rva,function_content_hash,analysis_revision,overlay_revision,generation,function_name,result_json,created_utc_ms,last_access_utc_ms,result_bytes)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
 ON CONFLICT(cache_key) DO UPDATE SET function_name=excluded.function_name,result_json=excluded.result_json,last_access_utc_ms=excluded.last_access_utc_ms,result_bytes=excluded.result_bytes
 )SQL", "workspace_database.decompiler_cache");
             if (!result) return result;
@@ -3298,13 +3306,14 @@ ON CONFLICT(cache_key) DO UPDATE SET function_name=excluded.function_name,result
             result = statement.bind_uint(12, record.key.function_id); if (!result) return result;
             result = statement.bind_uint(13, record.key.function_rva); if (!result) return result;
             result = statement.bind_blob(14, record.key.function_content_hash.bytes.data(), record.key.function_content_hash.bytes.size()); if (!result) return result;
-            result = statement.bind_uint(15, record.key.overlay_revision); if (!result) return result;
-            result = statement.bind_uint(16, record.key.generation); if (!result) return result;
-            result = statement.bind_text(17, record.function_name); if (!result) return result;
-            result = statement.bind_text(18, record.result_json); if (!result) return result;
-            result = statement.bind_uint(19, record.created_utc_ms); if (!result) return result;
-            result = statement.bind_uint(20, record.last_access_utc_ms); if (!result) return result;
-            result = statement.bind_uint(21, record.result_bytes); if (!result) return result;
+            result = statement.bind_uint(15, record.key.analysis_revision); if (!result) return result;
+            result = statement.bind_uint(16, record.key.overlay_revision); if (!result) return result;
+            result = statement.bind_uint(17, record.key.generation); if (!result) return result;
+            result = statement.bind_text(18, record.function_name); if (!result) return result;
+            result = statement.bind_text(19, record.result_json); if (!result) return result;
+            result = statement.bind_uint(20, record.created_utc_ms); if (!result) return result;
+            result = statement.bind_uint(21, record.last_access_utc_ms); if (!result) return result;
+            result = statement.bind_uint(22, record.result_bytes); if (!result) return result;
             return statement.step_done();
         }, std::move(cancel));
 }

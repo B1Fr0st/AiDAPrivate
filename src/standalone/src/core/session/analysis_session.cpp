@@ -334,7 +334,7 @@ workspace_result_t<bool> reopen_persisted_analysis(
     const std::shared_ptr<workspace_database_t>& database,
     const cancellation_token_t& cancel)
 {
-    auto loaded = database->load_snapshot(workspace->image(), cancel);
+    auto loaded = database->load_snapshot(workspace->normalized_image(), workspace->image(), cancel);
     if (!loaded)
         return workspace_result_t<bool>::failure(loaded.error());
     if (!loaded.value())
@@ -359,6 +359,12 @@ workspace_result_t<bool> reopen_persisted_analysis(
         std::move(products.value().types), metrics, {}, cancel);
     if (!index)
         return workspace_result_t<bool>::failure(index.error());
+    if (cancel.stop_requested()) {
+        return workspace_result_t<bool>::failure(make_workspace_error(
+            workspace_error_code_t::cancelled,
+            "Persisted analysis reopen was cancelled before publication",
+            "analysis_session.reopen"));
+    }
     auto published = workspace->publish_analysis_bundle(workspace->generation(),
         workspace->analysis_revision(), snapshot, index.take_value(),
         snapshot->baseline_complete);
@@ -1499,8 +1505,11 @@ void restore_driver_active_pid(std::uint32_t previous_pid)
     }
 }
 
-bool ensure_driver_active_for_session(std::uint32_t pid, bool& attached_by_transaction,
-                                      std::string& out_error)
+bool ensure_driver_active_for_session(
+    std::uint32_t pid,
+    bool& attached_by_transaction,
+    std::string& out_error,
+    const driver_bridge::identity::live_target_identity_t* identity = nullptr)
 {
     attached_by_transaction = false;
     if (pid == 0 || pid == static_cast<std::uint32_t>(GetCurrentProcessId())) {
@@ -1520,6 +1529,28 @@ bool ensure_driver_active_for_session(std::uint32_t pid, bool& attached_by_trans
         }
         attached_by_transaction = true;
     }
+    if (identity) {
+        const auto attached_identity =
+            driver_bridge::identity::validate_attached_target_identity(*identity);
+        if (!attached_identity.matches) {
+            std::string identity_error;
+            if (!driver_bridge::identity::refresh_attached_target_identity(*identity,
+                                                                           &identity_error)) {
+                out_error = identity_error.empty()
+                    ? "TARGET_DRIVER_CONTEXT_REFRESH_FAILED"
+                    : identity_error;
+                return false;
+            }
+            attached_by_transaction = true;
+            const auto rebound_identity =
+                driver_bridge::identity::validate_attached_target_identity(*identity);
+            if (!rebound_identity.matches) {
+                out_error = std::string(driver_bridge::identity::staleness_code(
+                    rebound_identity.staleness)) + ": " + rebound_identity.detail;
+                return false;
+            }
+        }
+    }
     if (!driver_bridge::set_active_pid(pid)) {
         out_error = "activate_failed: " + driver_bridge::last_error();
         return false;
@@ -1527,10 +1558,35 @@ bool ensure_driver_active_for_session(std::uint32_t pid, bool& attached_by_trans
     return true;
 }
 
-void rollback_driver_activation(std::uint32_t pid, std::uint32_t previous_pid,
-                                bool attached_by_transaction)
+bool may_detach_live_identity(
+    std::uint32_t pid,
+    const driver_bridge::identity::live_target_identity_t* identity,
+    const char* reason)
 {
-    if (attached_by_transaction)
+    if (pid == 0 || !identity)
+        return false;
+    const auto validation = driver_bridge::identity::validate_live_target_identity(*identity);
+    if (validation.matches)
+        return true;
+    diag::log_tagged_fmt("analysis_session",
+        "live_session_detach_skipped reason=%s source_pid=%u process_creation_100ns=%llu module_base=0x%llX module_size=%llu stale_code=%s detail=%s",
+        reason, pid,
+        static_cast<unsigned long long>(identity->process.creation_time_100ns),
+        static_cast<unsigned long long>(identity->module.base),
+        static_cast<unsigned long long>(identity->module.size),
+        driver_bridge::identity::staleness_code(validation.staleness),
+        validation.detail.c_str());
+    return false;
+}
+
+void rollback_driver_activation(
+    std::uint32_t pid,
+    std::uint32_t previous_pid,
+    bool attached_by_transaction,
+    const driver_bridge::identity::live_target_identity_t* identity = nullptr)
+{
+    if (attached_by_transaction &&
+        may_detach_live_identity(pid, identity, "analysis_session.rollback"))
         (void)driver_bridge::detach_one(pid);
     if (driver_bridge::attached_pid() != previous_pid)
         restore_driver_active_pid(previous_pid);
@@ -1562,15 +1618,17 @@ bool activate_session_transaction(size_t idx, std::string* out_error)
     const bool live = session->attached_pid != 0;
     const std::uint32_t previous_driver_pid = driver_bridge::attached_pid();
     bool attached_by_transaction = false;
+    live_session_binding_t live_binding;
     std::string error;
-    if (live && !validate_live_session_binding(session->id, workspace, nullptr, error)) {
+    if (live && !validate_live_session_binding(session->id, workspace, &live_binding, error)) {
         if (out_error) *out_error = error;
         return false;
     }
     if (live && !ensure_driver_active_for_session(session->attached_pid,
-                                                   attached_by_transaction, error)) {
+                                                   attached_by_transaction, error,
+                                                   &live_binding.source_identity)) {
         rollback_driver_activation(session->attached_pid, previous_driver_pid,
-                                   attached_by_transaction);
+                                   attached_by_transaction, &live_binding.source_identity);
         {
             std::lock_guard<std::mutex> lock(state().mutex);
             state().last_error = error;
@@ -1578,9 +1636,9 @@ bool activate_session_transaction(size_t idx, std::string* out_error)
         if (out_error) *out_error = error;
         return false;
     }
-    if (live && !validate_live_session_binding(session->id, workspace, nullptr, error)) {
+    if (live && !validate_live_session_binding(session->id, workspace, &live_binding, error)) {
         rollback_driver_activation(session->attached_pid, previous_driver_pid,
-                                   attached_by_transaction);
+                                   attached_by_transaction, &live_binding.source_identity);
         if (out_error) *out_error = error;
         return false;
     }
@@ -1590,7 +1648,7 @@ bool activate_session_transaction(size_t idx, std::string* out_error)
         error = selected.error().stable_code() + ": " + selected.error().message;
         if (live)
             rollback_driver_activation(session->attached_pid, previous_driver_pid,
-                                       attached_by_transaction);
+                                       attached_by_transaction, &live_binding.source_identity);
         {
             std::lock_guard<std::mutex> lock(state().mutex);
             state().last_error = error;
@@ -1616,7 +1674,7 @@ bool activate_session_transaction(size_t idx, std::string* out_error)
     }
     if (live)
         rollback_driver_activation(session->attached_pid, previous_driver_pid,
-                                   attached_by_transaction);
+                                   attached_by_transaction, &live_binding.source_identity);
     if (out_error) *out_error = error;
     return false;
 }
@@ -1625,13 +1683,10 @@ bool may_detach_live_binding(std::uint32_t pid,
                              const std::optional<live_session_binding_t>& binding,
                              const char* reason)
 {
-    if (pid == 0 || !binding) return pid != 0;
-    const auto validation = driver_bridge::identity::validate_live_target_identity(
-        binding->source_identity);
-    if (validation.matches ||
-        validation.staleness == driver_bridge::identity::staleness_t::process_unavailable ||
-        validation.staleness == driver_bridge::identity::staleness_t::process_exited ||
-        validation.staleness == driver_bridge::identity::staleness_t::module_unavailable)
+    if (pid == 0 || !binding)
+        return false;
+    const auto validation = driver_bridge::identity::validate_live_target_identity(binding->source_identity);
+    if (validation.matches)
         return true;
     diag::log_tagged_fmt("analysis_session",
         "live_session_detach_skipped reason=%s source_pid=%u process_creation_100ns=%llu module_base=0x%llX module_size=%llu capture_sha256=%s stale_code=%s detail=%s",
@@ -2023,8 +2078,6 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
             if (!activated && out_err && out_err->empty()) *out_err = last_error();
             return activated;
         }
-        if (attached_pid_contains(pid))
-            (void)driver_bridge::detach_one(pid);
         if (!close_session(existing)) {
             const std::string error = "stale_session_close_failed";
             {
@@ -2058,8 +2111,9 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
     const std::uint32_t previous_pid = driver_bridge::attached_pid();
     bool attached_by_transaction = false;
     std::string driver_error;
-    if (!ensure_driver_active_for_session(pid, attached_by_transaction, driver_error)) {
-        rollback_driver_activation(pid, previous_pid, attached_by_transaction);
+    if (!ensure_driver_active_for_session(pid, attached_by_transaction, driver_error,
+                                          &source_identity)) {
+        rollback_driver_activation(pid, previous_pid, attached_by_transaction, &source_identity);
         const std::string error = std::move(driver_error);
         {
             std::lock_guard<std::mutex> lock(state().mutex);
@@ -2068,14 +2122,14 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         if (out_err) *out_err = error;
         return false;
     }
-    auto rollback_attach = [previous_pid, pid, attached_by_transaction](
+    auto rollback_attach = [previous_pid, pid, attached_by_transaction, source_identity](
         const std::shared_ptr<analysis_workspace_t>& workspace = {}) {
         if (workspace) {
             workspace->request_cancel();
             (void)workspace_registry().close(workspace->identity().binary_id(),
                 std::chrono::steady_clock::now() + std::chrono::seconds(2));
         }
-        rollback_driver_activation(pid, previous_pid, attached_by_transaction);
+        rollback_driver_activation(pid, previous_pid, attached_by_transaction, &source_identity);
     };
     bool is_64_bit = true;
     if (!inspect_live_pe(pid, source_identity.module.base, is_64_bit)) {

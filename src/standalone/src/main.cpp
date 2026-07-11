@@ -517,8 +517,8 @@ static HICON g_aidaWindowIcon = nullptr;
 
 helpers helper;
 HWND g_hwnd = nullptr;
-static wchar_t g_aidaWindowTitle[128] = L"AiDA Standalone";
-static wchar_t g_aidaClassName[128] = L"AiDAStandaloneWindow";
+wchar_t g_aidaWindowTitle[128] = L"AiDA Standalone";
+wchar_t g_aidaClassName[128] = L"AiDAStandaloneWindow";
 static constexpr const wchar_t* kAidaWindowTitle = g_aidaWindowTitle;
 static constexpr int kAidaFullTestHotkeyId = 0xA1DA;
 static constexpr UINT kAidaUiDispatcherWakeMessage = WM_APP + 0x1DB;
@@ -7413,6 +7413,18 @@ int main(int, char**)
                         hash_result.detected_title[0] = L'\0';
                         re_tool_preflight::show_refuse_dialog_and_exit(hash_result);
                     }
+                    re_tool_preflight::push_hashes_to_kernel(hashes);
+                }
+                re_tool_preflight::set_refresh_credentials(server_host, lic_key);
+
+                {
+                    const uint64_t ph_tick = static_cast<uint64_t>(GetTickCount64());
+                    startup_log_critical_fmt("prologue_hash_fetch_pre tick=%llu",
+                        static_cast<unsigned long long>(ph_tick));
+                    anti_hook::fetch_server_prologue_hashes(server_host, lic_key, sess_token);
+                    startup_log_critical_fmt("prologue_hash_fetch_post elapsed_ms=%llu",
+                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ph_tick));
+                    crash_log_write("prologue_hash_fetch_done");
                 }
             } else {
                 startup_log_critical_fmt("re_tool_hash_preflight_skip no_credentials elapsed_ms=%llu",

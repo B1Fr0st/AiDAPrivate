@@ -57,6 +57,8 @@ namespace sentinel_bridge {
     constexpr ULONG BRIDGE_CMD_REGISTER_HONEYPOT_PID     = 0x0000C003u;
     constexpr ULONG BRIDGE_CMD_REGISTER_HONEYPOT_GUARD   = 0x0000C004u;
 
+    constexpr ULONG BRIDGE_CMD_UPDATE_CE_HASHES          = 0x0000D001u;
+
     constexpr ULONG BUGCHECK_HONEYPOT_STRING_ACCESS = 0xA1DA0001u;
     constexpr ULONG BUGCHECK_HONEYPOT_CANARY_PATCH  = 0xA1DA0002u;
 
@@ -220,6 +222,23 @@ namespace sentinel_bridge {
         volatile UINT64  challenge_issued_tsc;
         volatile UINT64  challenge_counter;
         volatile UINT8   challenge_tag[16];
+        volatile LONG64  protected_pid;
+        volatile UINT8   sentinel_dispatch_hook_detected;
+        UINT8            _pad_dh[7];
+        volatile UINT64  sentinel_dispatch_hook_target;
+        volatile UINT8   sentinel_hostile_drivers;
+        volatile UINT8   sentinel_modified_callbacks;
+        UINT8            _pad_cb[6];
+        volatile UINT64  whoswho_challenge;
+        volatile UINT64  sentinel_response;
+        volatile UINT8   expected_watermark[16];
+        volatile UINT8   actual_watermark[16];
+        volatile UINT8   watermark_verified;
+        volatile UINT32  watermark_rva;
+        UINT8            _pad_wm[3];
+        volatile UINT8   ce_driver_hash_data[32 * 32];
+        volatile UINT32  ce_driver_hash_count;
+        UINT8            _pad_ce[4];
     };
 
 
@@ -248,6 +267,23 @@ namespace sentinel_bridge {
             0,
             0,
             0,
+            0,
+            {0},
+            0,
+            0,
+            {0},
+            0,
+            0,
+            {0},
+            0,
+            0,
+            0,
+            {0},
+            {0},
+            0,
+            0,
+            {0},
+            {0},
             0,
             {0}
         },
@@ -417,6 +453,80 @@ namespace sentinel_bridge {
         RtlSecureZeroMemory(mac, sizeof(mac));
         RtlSecureZeroMemory(in,  sizeof(in));
         return result;
+    }
+
+    inline volatile UINT64 g_reverse_challenge_value       = 0;
+    inline volatile UINT64 g_reverse_challenge_issued_tsc  = 0;
+    inline volatile LONG64 g_last_verified_reverse_challenge = 0;
+    inline volatile LONG   g_reverse_challenge_failures    = 0;
+
+    __forceinline void compute_reverse_challenge() {
+        if (_InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) == 0)
+            return;
+
+        UINT64 existing_challenge = static_cast<UINT64>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_challenge), 0, 0));
+        if (existing_challenge != 0)
+            return;
+
+        UINT64 challenge = __rdtsc() ^ (static_cast<UINT64>(__rdtsc()) << 17);
+        challenge |= 1;
+
+        _InterlockedExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_bridge.sentinel_response), 0);
+        _InterlockedExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_challenge),
+            static_cast<LONG64>(challenge));
+
+        g_reverse_challenge_value = challenge;
+        g_reverse_challenge_issued_tsc = __rdtsc();
+
+        WW_LOG("compute_reverse_challenge: issued challenge=0x%llx", challenge);
+    }
+
+    __forceinline BOOLEAN verify_sentinel_response() {
+        UINT64 challenge = static_cast<UINT64>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_challenge), 0, 0));
+        if (challenge == 0)
+            return TRUE;
+
+        UINT64 response = static_cast<UINT64>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_bridge.sentinel_response), 0, 0));
+        if (response == 0) {
+            UINT64 issued_tsc = g_reverse_challenge_issued_tsc;
+            UINT64 now = __rdtsc();
+            if (now - issued_tsc > 30ULL * 3000000000ULL) {
+                WW_LOG("verify_sentinel_response: TIMEOUT challenge=0x%llx no response",
+                    challenge);
+                return FALSE;
+            }
+            return TRUE;
+        }
+
+        UINT64 expected = compute_challenge_response(challenge);
+        if (response != expected) {
+            WW_LOG("verify_sentinel_response: FAIL challenge=0x%llx response=0x%llx expected=0x%llx",
+                challenge, response, expected);
+            _InterlockedExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_challenge), 0);
+            _InterlockedExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_bridge.sentinel_response), 0);
+            return FALSE;
+        }
+
+        _InterlockedExchange64(&g_last_verified_reverse_challenge,
+            static_cast<LONG64>(challenge));
+        _InterlockedExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_bridge.whoswho_challenge), 0);
+        _InterlockedExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_bridge.sentinel_response), 0);
+        g_reverse_challenge_value = 0;
+
+        WW_LOG("verify_sentinel_response: PASS challenge=0x%llx", challenge);
+        return TRUE;
     }
 
     namespace evidence_accumulator {
@@ -643,6 +753,21 @@ namespace sentinel_bridge {
             }
         }
 
+
+        compute_reverse_challenge();
+        if (!verify_sentinel_response()) {
+            LONG fails = _InterlockedIncrement(&g_reverse_challenge_failures);
+            WW_LOG("tick: reverse challenge FAILED fails=%ld challenge=0x%llx response=0x%llx -> BUGCHECK 0xDEAD5E08",
+                fails,
+                static_cast<unsigned long long>(g_reverse_challenge_value),
+                static_cast<unsigned long long>(g_bridge.sentinel_response));
+            if (_KeBugCheckEx)
+                _KeBugCheckEx(0xDEAD5E08,
+                    static_cast<ULONG_PTR>(g_reverse_challenge_value),
+                    static_cast<ULONG_PTR>(g_bridge.sentinel_response),
+                    static_cast<ULONG_PTR>(g_bridge.whoswho_challenge),
+                    2);
+        }
 
         rotate_bridge_nonce();
 

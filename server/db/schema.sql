@@ -763,4 +763,37 @@ CREATE INDEX IF NOT EXISTS idx_patch_attempts_hwid ON patch_attempts (hwid);
 CREATE INDEX IF NOT EXISTS idx_patch_attempts_license ON patch_attempts (license_key);
 CREATE INDEX IF NOT EXISTS idx_patch_attempts_timestamp ON patch_attempts (timestamp DESC);
 
+CREATE TABLE IF NOT EXISTS prologue_hashes (
+    id SERIAL PRIMARY KEY,
+    function_name VARCHAR(128) NOT NULL,
+    module VARCHAR(64) NOT NULL,
+    hash VARCHAR(64) NOT NULL,
+    os_build INTEGER NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_prologue_hashes_os_build ON prologue_hashes(os_build);
+CREATE INDEX IF NOT EXISTS idx_prologue_hashes_active ON prologue_hashes(active);
+
+CREATE TABLE IF NOT EXISTS ce_driver_hashes (
+    hash VARCHAR(64) NOT NULL UNIQUE,
+    driver_name VARCHAR(128),
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ce_driver_hashes_active ON ce_driver_hashes(active);
+
+CREATE TABLE IF NOT EXISTS re_tool_hashes (
+    id SERIAL PRIMARY KEY,
+    hash VARCHAR(64) NOT NULL UNIQUE,
+    tool_name VARCHAR(128),
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_re_tool_hashes_active ON re_tool_hashes(active);
+CREATE INDEX IF NOT EXISTS idx_re_tool_hashes_hash ON re_tool_hashes(hash);
+
 COMMIT;

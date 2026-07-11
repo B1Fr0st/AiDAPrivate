@@ -885,6 +885,29 @@ namespace anti_debug {
                         cursor += info->NextEntryOffset;
                         continue;
                     }
+                    if (image_name) {
+                        static const char* debugger_names[] = {
+                            "x64dbg.exe", "x32dbg.exe", "windbg.exe", "ollydbg.exe",
+                            "ida.exe", "ida64.exe", "idaq.exe", "idaq64.exe",
+                            "dnspy.exe", "cheatengine", "ce.exe", "processhacker",
+                            "apimonitor", "scylla", "titanhide", "hyperdbg.exe",
+                            "radare2.exe", "cetrainer", "ce trainer", "ceserver",
+                            "memrecon", "memrecon64", "artmoney", "sorcefan",
+                            "editbyte", "hexworkshop", "hxd.exe", "010editor",
+                            "processhacker2", "systeminformer"
+                        };
+                        for (int di = 0; di < static_cast<int>(sizeof(debugger_names) / sizeof(debugger_names[0])); ++di) {
+                            if (image_file_name_matches_ascii_prefix(image_name, debugger_names[di])) {
+                                process_guard_fwd::register_re_tool_pid(current_pid);
+                                *out_debugger_pid = (UINT64)(ULONG_PTR)current_pid;
+                                ObDereferenceObject(process);
+                                ExFreePoolWithTag(buffer, ADBG_PROCESS_SCAN_TAG);
+                                WW_LOG("[ADBG] scan_debuggers_exit status=0x%08X result=name_hit scanned=%lu pid=%llu name=%.15s",
+                                    STATUS_SUCCESS, scanned, *out_debugger_pid, image_name);
+                                return STATUS_SUCCESS;
+                            }
+                        }
+                    }
                     ObDereferenceObject(process);
                 } else {
                     ++lookup_misses;
@@ -1221,6 +1244,166 @@ namespace anti_debug {
         return install_instrumentation_callback(pid, nullptr);
     }
 
+    namespace werfault_check {
+
+        struct HANDLE_ENTRY_WF {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct HANDLE_INFO_EX_WF {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            HANDLE_ENTRY_WF Handles[1];
+        };
+
+        constexpr ULONG POOL_TAG_WF = 'WFCK';
+        constexpr SYSTEM_INFORMATION_CLASS_INTERNAL HandleInfoClassWF =
+            static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(64);
+
+        inline bool is_werfault_debugger(UINT32 pid)
+        {
+            if (KeGetCurrentIrql() != PASSIVE_LEVEL) return false;
+            if (pid == 0) return false;
+
+            ULONG buffer_size = 0x100000;
+            ULONG return_length = 0;
+            PVOID hbuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, buffer_size, POOL_TAG_WF);
+            if (!hbuf) return false;
+
+            NTSTATUS hstatus = ZwQuerySystemInformation(
+                HandleInfoClassWF, hbuf, buffer_size, &return_length);
+
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (hstatus != STATUS_INFO_LENGTH_MISMATCH &&
+                    hstatus != STATUS_BUFFER_TOO_SMALL &&
+                    hstatus != STATUS_BUFFER_OVERFLOW)
+                    break;
+                ExFreePoolWithTag(hbuf, POOL_TAG_WF);
+                buffer_size = return_length > buffer_size
+                    ? return_length + 0x10000
+                    : buffer_size * 2;
+                hbuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, buffer_size, POOL_TAG_WF);
+                if (!hbuf) return false;
+                return_length = 0;
+                hstatus = ZwQuerySystemInformation(
+                    HandleInfoClassWF, hbuf, buffer_size, &return_length);
+            }
+
+            if (!NT_SUCCESS(hstatus)) {
+                ExFreePoolWithTag(hbuf, POOL_TAG_WF);
+                return false;
+            }
+
+            auto* info = reinterpret_cast<HANDLE_INFO_EX_WF*>(hbuf);
+            bool result = false;
+
+            for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
+                const auto& h = info->Handles[i];
+                if (!h.Object) continue;
+
+                UINT32 holder_pid = static_cast<UINT32>(h.UniqueProcessId);
+                if (holder_pid == pid) continue;
+                if (holder_pid <= 4) continue;
+
+                POBJECT_TYPE obj_type = nullptr;
+                __try {
+                    if (_ObGetObjectType)
+                        obj_type = _ObGetObjectType(h.Object);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    continue;
+                }
+                if (!obj_type) continue;
+
+                bool is_debug_object = false;
+                bool is_process_object = false;
+
+                __try {
+                    const WCHAR* type_name = reinterpret_cast<const WCHAR*>(obj_type->Name.Buffer);
+                    if (type_name && obj_type->Name.Length >= sizeof(WCHAR) * 11) {
+                        const WCHAR debug_str[] = L"DebugObject";
+                        bool match = true;
+                        for (int c = 0; c < 11; ++c) {
+                            if (type_name[c] != debug_str[c]) { match = false; break; }
+                        }
+                        is_debug_object = match;
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    is_debug_object = false;
+                }
+
+                if (!is_debug_object) {
+                    __try {
+                        if (PsProcessType && *PsProcessType && obj_type == *PsProcessType)
+                            is_process_object = true;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        is_process_object = false;
+                    }
+                }
+
+                if (!is_debug_object && !is_process_object)
+                    continue;
+
+                bool targets_our_pid = false;
+
+                if (is_debug_object) {
+                    targets_our_pid = true;
+                } else if (is_process_object) {
+                    __try {
+                        HANDLE obj_pid = PsGetProcessId(static_cast<PEPROCESS>(h.Object));
+                        if (static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(obj_pid)) == pid) {
+                            if (h.GrantedAccess & PROCESS_VM_READ) {
+                                targets_our_pid = true;
+                            }
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        targets_our_pid = false;
+                    }
+                }
+
+                if (!targets_our_pid)
+                    continue;
+
+                PEPROCESS holder_proc = nullptr;
+                NTSTATUS lookup_st = PsLookupProcessByProcessId(
+                    (HANDLE)(ULONG_PTR)holder_pid, &holder_proc);
+                if (!NT_SUCCESS(lookup_st) || !holder_proc)
+                    continue;
+
+                UCHAR* img_name = nullptr;
+                __try {
+                    img_name = PsGetProcessImageFileName(holder_proc);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    img_name = nullptr;
+                }
+
+                if (img_name) {
+                    bool is_werfault = image_file_name_equals_ascii(img_name, "WerFault.exe");
+                    if (is_werfault) {
+                        WW_LOG("[ADBG] werfault_debugger_detected holder_pid=%u target_pid=%u handle=0x%llx access=0x%08X is_debug_object=%d",
+                            holder_pid, pid,
+                            static_cast<UINT64>(h.HandleValue),
+                            static_cast<ULONG>(h.GrantedAccess),
+                            is_debug_object ? 1 : 0);
+                        result = true;
+                        ObDereferenceObject(holder_proc);
+                        break;
+                    }
+                }
+
+                ObDereferenceObject(holder_proc);
+            }
+
+            ExFreePoolWithTag(hbuf, POOL_TAG_WF);
+            return result;
+        }
+    }
+
     inline NTSTATUS clear_debug_objects(UINT32 pid)
     {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
@@ -1247,8 +1430,13 @@ namespace anti_debug {
                     pid,
                     static_cast<unsigned long long>(debug_port_offset),
                     port_tag);
+                if (werfault_check::is_werfault_debugger(pid)) {
+                    WW_LOG("anti_debug: debug port set by WerFault (crash dump generation) -- SKIP BSOD pid=%u", pid);
+                    ObDereferenceObject(process);
+                    return STATUS_SUCCESS;
+                }
 #ifndef AIDA_DEV_MODE
-                KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)port_value, 0, 0);
+                KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)debug_port_offset, 0, 0);
 #endif
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1619,7 +1807,6 @@ namespace continuous_anti_debug {
         }
 
         if ((cycle % 3) == 0) {
-            anti_debug::clear_debug_objects(pid);
             WW_LOG("[CONT-ADBG] cycle=%llu calling inspect_instrumentation_callback_eprocess pid=%u", cycle, pid);
             anti_debug::clear_instrumentation_callback_eprocess(pid);
 
@@ -1682,15 +1869,13 @@ namespace continuous_anti_debug {
             }
         }
 
-        if ((cycle % 5) == 0) {
-
+        {
 
             BOOLEAN target_being_debugged = FALSE;
             {
                 PEPROCESS target_proc = nullptr;
                 if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &target_proc)) && target_proc) {
                     __try {
-
 
                         SIZE_T debug_port_offset = whoswho_kernel_layout::eprocess_debug_port_offset();
                         if (debug_port_offset == 0) {
@@ -1700,10 +1885,16 @@ namespace continuous_anti_debug {
                         } else {
                             ULONG_PTR* debug_port_ptr = (ULONG_PTR*)((UINT8*)target_proc + debug_port_offset);
                             if (_MmIsAddressValid(debug_port_ptr) && *debug_port_ptr != 0) {
-                                target_being_debugged = TRUE;
+                                if (anti_debug::werfault_check::is_werfault_debugger(pid)) {
+                                    WW_LOG("[CONT-ADBG] debug port set by WerFault (crash dump generation) -- SKIP BSOD pid=%u", pid);
+                                } else {
+                                    target_being_debugged = TRUE;
+                                    sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
+                                    sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)pid;
 #ifndef AIDA_DEV_MODE
-                                KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)*debug_port_ptr, 0, 0);
+                                    KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)debug_port_offset, 0, 0);
 #endif
+                                }
                             }
                         }
                     } __except (EXCEPTION_EXECUTE_HANDLER) {}

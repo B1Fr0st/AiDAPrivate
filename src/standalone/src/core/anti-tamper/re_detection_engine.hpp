@@ -22,9 +22,14 @@
 #include "standalone_driver.hpp"
 #include "standalone_license.hpp"
 #include "self_guard.hpp"
+#include "process_scan.hpp"
+#include "re_tool_preflight.hpp"
 #include "../infra/win_thread.hpp"
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+extern wchar_t g_aidaWindowTitle[128];
+extern wchar_t g_aidaClassName[128];
 
 namespace anti_tamper {
 namespace re_detect {
@@ -49,6 +54,8 @@ constexpr uint32_t SIGNAL_VTABLE_HOOKED         = 1u << 23;
 constexpr uint32_t SIGNAL_KERNEL_CALLBACK_HOOKED = 1u << 24;
 constexpr uint32_t SIGNAL_SELF_HOOK_DETECTED     = 1u << 25;
 constexpr uint32_t SIGNAL_PROLOGUE_SERVER_MISMATCH = 1u << 26;
+constexpr uint32_t SIGNAL_CE_BEHAVIORAL  = 1u << 27;
+constexpr uint32_t SIGNAL_WINDOW_ENUM    = 1u << 28;
 
 constexpr uint32_t FAMILY_TARGET    = 0x01;
 constexpr uint32_t FAMILY_HANDLE    = 0x02;
@@ -107,6 +114,8 @@ inline const signal_desc_t& signals(uint32_t bit)
         { SIGNAL_DEBUG_REATTACH, FAMILY_ATTACH, "debug_reattach" },
         { SIGNAL_INT3_BREAKPOINT, FAMILY_MEMORY, "int3_breakpoint" },
         { SIGNAL_KD_TARGETING_US, FAMILY_KDEBUG, "kernel_debug_targeting_us" },
+        { SIGNAL_CE_BEHAVIORAL, FAMILY_HANDLE, "ce_behavioral_pattern" },
+        { SIGNAL_WINDOW_ENUM, FAMILY_HANDLE, "window_enumeration" },
     };
     static const signal_desc_t zero = { 0, 0, "unknown" };
     for (const auto& d : table) {
@@ -1113,6 +1122,215 @@ namespace detail {
         return kdi.KernelDebuggerEnabled != 0 && kdi.KernelDebuggerNotPresent == 0;
     }
 
+    inline bool detect_ce_behavioral_pattern()
+    {
+        DWORD my_pid = GetCurrentProcessId();
+        ULONG buf_size = 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ULONG ret_len = 0;
+
+        if (!syscall::is_initialized())
+            return false;
+
+        NTSTATUS st = syscall::NtQuerySystemInformation()(
+            64, buf.data(), buf_size, &ret_len);
+        if (st == static_cast<NTSTATUS>(0xC0000004) && ret_len > buf_size) {
+            buf_size = ret_len + 65536;
+            buf.resize(buf_size);
+            st = syscall::NtQuerySystemInformation()(
+                64, buf.data(), buf_size, &ret_len);
+        }
+        if (st < 0) return false;
+
+        struct handle_entry_t {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct handle_info_ex_t {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            handle_entry_t Handles[1];
+        };
+
+        auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
+        constexpr ACCESS_MASK VM_ACCESS =
+            PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+
+        static const char* system_procs[] = {
+            "csrss.exe", "lsass.exe", "svchost.exe", "services.exe",
+            "wininit.exe", "winlogon.exe", "smss.exe", "msmpeng.exe",
+            "securityhealthservice.exe", "werfault.exe"
+        };
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
+            const auto& h = info->Handles[i];
+            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid) continue;
+            if (static_cast<DWORD>(h.UniqueProcessId) <= 4) continue;
+            if ((h.GrantedAccess & VM_ACCESS) == 0) continue;
+
+            HANDLE src_proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE,
+                static_cast<DWORD>(h.UniqueProcessId));
+            if (!src_proc) continue;
+
+            HANDLE dup = nullptr;
+            BOOL dup_ok = DuplicateHandle(
+                src_proc,
+                reinterpret_cast<HANDLE>(h.HandleValue),
+                GetCurrentProcess(),
+                &dup,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                FALSE,
+                0);
+            CloseHandle(src_proc);
+            if (!dup_ok || !dup) continue;
+
+            DWORD target_pid = GetProcessId(dup);
+            CloseHandle(dup);
+
+            if (target_pid == my_pid) {
+                std::string owner_name = process_image_for_log(
+                    static_cast<DWORD>(h.UniqueProcessId));
+                bool is_system = false;
+                for (const char* s : system_procs) {
+                    if (_stricmp(owner_name.c_str(), s) == 0) {
+                        is_system = true;
+                        break;
+                    }
+                }
+                if (!is_system && !owner_name.empty() && owner_name != "?") {
+                    char log_buf[512];
+                    _snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
+                        "ce_behavioral_detected self_pid=%lu owner_pid=%lu owner=%s access=0x%08lX",
+                        static_cast<unsigned long>(my_pid),
+                        static_cast<unsigned long>(h.UniqueProcessId),
+                        owner_name.c_str(),
+                        static_cast<unsigned long>(h.GrantedAccess));
+                    webhook::write_log("re_ce_behavioral", log_buf);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    inline bool detect_window_enumeration_threat()
+    {
+        HWND own_hwnd = FindWindowW(g_aidaClassName, g_aidaWindowTitle);
+        if (!own_hwnd || !IsWindow(own_hwnd))
+            return false;
+
+        DWORD hwnd_owner_pid = 0;
+        GetWindowThreadProcessId(own_hwnd, &hwnd_owner_pid);
+        if (hwnd_owner_pid != GetCurrentProcessId())
+            return false;
+
+        wchar_t title[256] = {};
+        if (!GetWindowTextW(own_hwnd, title, 256))
+            return false;
+
+        DWORD my_pid = GetCurrentProcessId();
+        ULONG buf_size = 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ULONG ret_len = 0;
+
+        if (!syscall::is_initialized())
+            return false;
+
+        NTSTATUS st = syscall::NtQuerySystemInformation()(
+            64, buf.data(), buf_size, &ret_len);
+        if (st == static_cast<NTSTATUS>(0xC0000004) && ret_len > buf_size) {
+            buf_size = ret_len + 65536;
+            buf.resize(buf_size);
+            st = syscall::NtQuerySystemInformation()(
+                64, buf.data(), buf_size, &ret_len);
+        }
+        if (st < 0) return false;
+
+        struct handle_entry_t {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct handle_info_ex_t {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            handle_entry_t Handles[1];
+        };
+
+        auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
+        constexpr ACCESS_MASK QUERY_ACCESS =
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION;
+
+        static const char* system_procs[] = {
+            "csrss.exe", "lsass.exe", "svchost.exe", "services.exe",
+            "wininit.exe", "winlogon.exe", "smss.exe", "msmpeng.exe",
+            "securityhealthservice.exe", "werfault.exe", "explorer.exe",
+            "dwm.exe"
+        };
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
+            const auto& h = info->Handles[i];
+            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid) continue;
+            if (static_cast<DWORD>(h.UniqueProcessId) <= 4) continue;
+            if ((h.GrantedAccess & QUERY_ACCESS) == 0) continue;
+
+            HANDLE src_proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE,
+                static_cast<DWORD>(h.UniqueProcessId));
+            if (!src_proc) continue;
+
+            HANDLE dup = nullptr;
+            BOOL dup_ok = DuplicateHandle(
+                src_proc,
+                reinterpret_cast<HANDLE>(h.HandleValue),
+                GetCurrentProcess(),
+                &dup,
+                0,
+                FALSE,
+                0);
+            CloseHandle(src_proc);
+            if (!dup_ok || !dup) continue;
+
+            DWORD target_pid = GetProcessId(dup);
+            CloseHandle(dup);
+
+            if (target_pid == my_pid) {
+                std::string owner_name = process_image_for_log(
+                    static_cast<DWORD>(h.UniqueProcessId));
+                bool is_system = false;
+                for (const char* s : system_procs) {
+                    if (_stricmp(owner_name.c_str(), s) == 0) {
+                        is_system = true;
+                        break;
+                    }
+                }
+                if (!is_system && !owner_name.empty() && owner_name != "?") {
+                    char log_buf[512];
+                    _snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
+                        "window_enum_threat self_pid=%lu owner_pid=%lu owner=%s hwnd=0x%llX access=0x%08lX",
+                        static_cast<unsigned long>(my_pid),
+                        static_cast<unsigned long>(h.UniqueProcessId),
+                        owner_name.c_str(),
+                        static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(own_hwnd)),
+                        static_cast<unsigned long>(h.GrantedAccess));
+                    webhook::write_log("re_window_enum", log_buf);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     inline uint64_t module_image_hash()
     {
         static std::atomic<uint64_t> cached{ 0 };
@@ -1238,6 +1456,12 @@ namespace detail {
 
         if (detect_int3_breakpoints())
             mask |= SIGNAL_INT3_BREAKPOINT;
+
+        if (detect_ce_behavioral_pattern())
+            mask |= SIGNAL_CE_BEHAVIORAL;
+
+        if (detect_window_enumeration_threat())
+            mask |= SIGNAL_WINDOW_ENUM;
 
         return mask;
     }
@@ -1563,12 +1787,25 @@ inline void worker_loop()
     auto& s = state_ref();
     s.worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
     Sleep(2000);
+    uint64_t hash_refresh_tick = 0;
+    constexpr uint64_t kHashRefreshInitialTicks = 60;
+    constexpr uint64_t kHashRefreshIntervalTicks = 600;
     while (s.running.load()) {
         int rc = seh_tick_wrapper();
         if (rc != 0) {
             char tb[64];
             _snprintf_s(tb, sizeof(tb), _TRUNCATE, "seh_crash code=0x%X", rc);
             webhook::write_log("re_worker", tb);
+        }
+        hash_refresh_tick++;
+        if (hash_refresh_tick == kHashRefreshInitialTicks ||
+            (hash_refresh_tick > kHashRefreshInitialTicks &&
+             (hash_refresh_tick - kHashRefreshInitialTicks) % kHashRefreshIntervalTicks == 0)) {
+            __try {
+                re_tool_preflight::refresh_re_tool_hashes();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                webhook::write_log("re_worker", "hash_refresh_exception");
+            }
         }
         Sleep(TICK_INTERVAL_MS);
     }

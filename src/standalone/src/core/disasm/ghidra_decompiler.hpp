@@ -519,6 +519,14 @@ inline std::string find_specs_dir() {
 	return "";
 }
 
+inline std::string active_specs_dir()
+{
+	std::lock_guard<std::mutex> lock(g_state.init_mtx);
+	if (g_state.initialized.load(std::memory_order_acquire) && !g_state.specs_dir.empty())
+		return g_state.specs_dir;
+	return find_specs_dir();
+}
+
 inline aida_ghidra::arch_descriptor_t resolve_arch(const DisasmFile* file) {
 	if (file && file->loaded)
 		return aida_ghidra::detect_arch_from_pe(*file);
@@ -1684,6 +1692,18 @@ inline aida::analysis::workspace_result_t<void> validate_ghidra_adapter_request(
 		request.language, request.language_catalog, cancel);
 	if (!staged)
 		return staged;
+	auto staged_files = aida::analysis::ghidra_adapter::require_staged_ghidra_language(
+		request.language, active_specs_dir(), cancel);
+	if (!staged_files)
+		return staged_files;
+	if (request.language.family !=
+		aida::analysis::ghidra_adapter::ghidra_language_family_t::x86) {
+		return aida::analysis::workspace_result_t<void>::failure(
+			aida::analysis::make_workspace_error(
+				aida::analysis::workspace_error_code_t::unsupported_format,
+				"the selected Ghidra language is staged but native adapter execution is not enabled for this family",
+				"ghidra.adapter.native_gate"));
+	}
 
 	auto expected_revision = aida::analysis::ghidra_adapter::make_ghidra_adapter_revision(
 		*request.workspace_identity, *request.analysis_snapshot, cancel);

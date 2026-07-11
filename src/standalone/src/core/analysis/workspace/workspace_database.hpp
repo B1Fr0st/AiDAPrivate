@@ -18,7 +18,7 @@ struct sqlite3;
 
 namespace aida::analysis {
 
-inline constexpr std::uint32_t workspace_database_schema_version = 7;
+inline constexpr std::uint32_t workspace_database_schema_version = 8;
 inline constexpr std::uint32_t workspace_instruction_blob_version = 2;
 inline constexpr std::uint64_t workspace_decompiler_cache_record_limit = 64ULL << 20;
 inline constexpr std::uint64_t workspace_search_blob_limit = 512ULL << 20;
@@ -54,6 +54,7 @@ struct decompiler_cache_key_t {
     entity_id_t function_id = 0;
     std::uint64_t function_rva = 0;
     sha256_digest_t function_content_hash;
+    std::uint64_t analysis_revision = 0;
     std::uint64_t overlay_revision = 0;
     std::uint64_t generation = 0;
 

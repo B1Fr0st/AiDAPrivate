@@ -18,6 +18,11 @@ namespace anti_dump_kernel {
 
     inline volatile LONG g_permitted_pids[8] = {};
 
+    inline PVOID g_pMmCopyVirtualMemory = nullptr;
+    inline volatile LONG g_mmcopy_resolved = 0;
+    inline volatile UINT32 g_canary_crc32 = 0;
+    inline volatile LONG g_kernel_dump_detected = 0;
+
     __forceinline char lowercase_ascii_char(char ch)
     {
         if (ch >= 'A' && ch <= 'Z')
@@ -674,6 +679,10 @@ namespace anti_dump_kernel {
         }
         g_protected_pid = 0;
         _InterlockedExchange(&g_initialized, 0);
+        g_pMmCopyVirtualMemory = nullptr;
+        _InterlockedExchange(&g_mmcopy_resolved, 0);
+        _InterlockedExchange((volatile LONG*)&g_canary_crc32, 0);
+        _InterlockedExchange(&g_kernel_dump_detected, 0);
     }
 
     inline NTSTATUS scan_and_kill_readers(UINT32 pid)
@@ -770,6 +779,399 @@ namespace anti_dump_kernel {
 
         return STATUS_SUCCESS;
     }
+
+    __forceinline UINT32 crc32_compute(const UINT8* data, SIZE_T len)
+    {
+        static UINT32 table[256] = {};
+        static volatile LONG table_init = 0;
+        if (_InterlockedCompareExchange(&table_init, 1, 0) == 0) {
+            for (UINT32 i = 0; i < 256; ++i) {
+                UINT32 c = i;
+                for (int j = 0; j < 8; ++j) {
+                    c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                }
+                table[i] = c;
+            }
+            KeMemoryBarrier();
+            _InterlockedExchange(&table_init, 2);
+        } else {
+            while (_InterlockedCompareExchange(&table_init, 0, 0) == 1)
+                YieldProcessor();
+        }
+
+        UINT32 crc = 0xFFFFFFFFu;
+        __try {
+            for (SIZE_T i = 0; i < len; ++i) {
+                crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
+        return crc ^ 0xFFFFFFFFu;
+    }
+
+#pragma pack(push, 1)
+    struct SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX_AD {
+        PVOID Object;
+        ULONG_PTR UniqueProcessId;
+        ULONG_PTR HandleValue;
+        ACCESS_MASK GrantedAccess;
+        USHORT CreatorBackTraceIndex;
+        USHORT ObjectTypeIndex;
+        ULONG HandleAttributes;
+        ULONG Reserved;
+    };
+    struct SYSTEM_HANDLE_INFORMATION_EX_AD {
+        ULONG_PTR NumberOfHandles;
+        ULONG_PTR Reserved;
+        SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX_AD Handles[1];
+    };
+#pragma pack(pop)
+
+    __forceinline NTSTATUS monitor_kernel_reads(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (pid == 0) return STATUS_INVALID_PARAMETER;
+
+        PEPROCESS protected_proc = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &protected_proc);
+        if (!NT_SUCCESS(status)) return status;
+
+        ULONG buf_size = 4 * 1024 * 1024;
+        PVOID buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'hKAW');
+        if (!buf) {
+            ObDereferenceObject(protected_proc);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        ULONG ret_len = 0;
+        status = ZwQuerySystemInformation(
+            (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+            buf, buf_size, &ret_len);
+
+        if (status == STATUS_INFO_LENGTH_MISMATCH && ret_len > buf_size) {
+            ExFreePoolWithTag(buf, 'hKAW');
+            buf_size = ret_len + 65536;
+            buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'hKAW');
+            if (!buf) {
+                ObDereferenceObject(protected_proc);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            status = ZwQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+                buf, buf_size, &ret_len);
+        }
+
+        if (!NT_SUCCESS(status)) {
+            ExFreePoolWithTag(buf, 'hKAW');
+            ObDereferenceObject(protected_proc);
+            return status;
+        }
+
+        auto* info = (SYSTEM_HANDLE_INFORMATION_EX_AD*)buf;
+
+        __try {
+            for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+                auto& h = info->Handles[i];
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId == pid) continue;
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId <= 4) continue;
+
+                if (!_MmIsAddressValid || !_MmIsAddressValid(h.Object)) continue;
+                if (h.Object != protected_proc) continue;
+
+                if (h.GrantedAccess & PROCESS_VM_READ) {
+                    UINT32 owner_pid = (UINT32)h.UniqueProcessId;
+                    if (is_permitted_pid(owner_pid)) continue;
+
+                    if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+                        OBJECT_ATTRIBUTES oa;
+                        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+                        CLIENT_ID cid = {};
+                        cid.UniqueProcess = (HANDLE)h.UniqueProcessId;
+                        HANDLE hProc = nullptr;
+                        if (NT_SUCCESS(_ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid)) && hProc) {
+                            _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
+                            _ZwClose(hProc);
+                            WW_LOG("anti_dump: monitor_kernel_reads killed pid=%u vm_read_handle_to_protected=%u",
+                                owner_pid, pid);
+                        }
+                    }
+                    InterlockedIncrement64((volatile LONG64*)&g_blocks_count);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ExFreePoolWithTag(buf, 'hKAW');
+        ObDereferenceObject(protected_proc);
+        return status;
+    }
+
+    __forceinline PVOID pattern_scan_ntoskrnl(const UINT8* pattern, const bool* wildcard, SIZE_T pattern_len)
+    {
+        std::uintptr_t nt_base_val = get_nt_base();
+        if (nt_base_val == 0) return nullptr;
+
+        PVOID nt_base_ptr = (PVOID)nt_base_val;
+        ULONG nt_size = 0;
+        __try {
+            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)nt_base_ptr;
+            if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+            PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((UINT8*)nt_base_ptr + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+            nt_size = nt->OptionalHeader.SizeOfImage;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
+        }
+
+        if (nt_size < pattern_len) return nullptr;
+
+        PUCHAR base = (PUCHAR)nt_base_ptr;
+        for (ULONG offset = 0; offset + pattern_len <= nt_size; ++offset) {
+            bool match = true;
+            for (SIZE_T j = 0; j < pattern_len; ++j) {
+                if (wildcard[j]) continue;
+                if (base[offset + j] != pattern[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return (PVOID)(base + offset);
+        }
+        return nullptr;
+    }
+
+    __forceinline NTSTATUS scrub_keys_on_kernel_dump_detection(UINT32 pid);
+
+    __forceinline NTSTATUS detect_mmcopyvirtualmemory(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
+        if (_InterlockedCompareExchange(&g_mmcopy_resolved, 0, 0) == 0) {
+            LONG prev = _InterlockedCompareExchange(&g_mmcopy_resolved, 1, 0);
+            if (prev == 0) {
+                const UINT8 pattern[] = {
+                    0x48, 0x89, 0x5C, 0x24, 0x00,
+                    0x48, 0x89, 0x6C, 0x24, 0x00,
+                    0x48, 0x89, 0x74, 0x24, 0x00,
+                    0x57, 0x48, 0x81, 0xEC
+                };
+                const bool wildcard[] = {
+                    false, false, false, false, true,
+                    false, false, false, false, true,
+                    false, false, false, false, true,
+                    false, false, false, false
+                };
+                constexpr SIZE_T pattern_len = sizeof(pattern);
+
+                PVOID found = pattern_scan_ntoskrnl(pattern, wildcard, pattern_len);
+                if (found) {
+                    g_pMmCopyVirtualMemory = found;
+                    WW_LOG("anti_dump: MmCopyVirtualMemory resolved at %p", found);
+                } else {
+                    WW_LOG("anti_dump: MmCopyVirtualMemory pattern not found");
+                }
+                KeMemoryBarrier();
+                _InterlockedExchange(&g_mmcopy_resolved, 2);
+            } else {
+                while (_InterlockedCompareExchange(&g_mmcopy_resolved, 0, 0) == 1)
+                    YieldProcessor();
+            }
+        }
+
+        if (_InterlockedCompareExchange(&g_canary_initialized, 0, 0) == 0 || !g_canary_page_addr)
+            return STATUS_NOT_FOUND;
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            PVOID canary = g_canary_page_addr;
+            if (_MmIsAddressValid(canary)) {
+                UINT8* bytes = (UINT8*)canary;
+                UINT32 current_crc = crc32_compute(bytes, 64);
+
+                UINT32 prev_crc = (UINT32)_InterlockedCompareExchange(
+                    (volatile LONG*)&g_canary_crc32, 0, 0);
+
+                if (prev_crc == 0) {
+                    _InterlockedExchange((volatile LONG*)&g_canary_crc32, (LONG)current_crc);
+                } else if (current_crc != prev_crc) {
+                    WW_LOG("anti_dump: canary CRC32 mismatch prev=0x%08X curr=0x%08X pid=%u mmcopy=%p",
+                        prev_crc, current_crc, pid, g_pMmCopyVirtualMemory);
+                    scrub_keys_on_kernel_dump_detection(pid);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+        return status;
+    }
+
+    __forceinline NTSTATUS scrub_keys_on_kernel_dump_detection(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (pid == 0) return STATUS_INVALID_PARAMETER;
+
+        _InterlockedExchange(&g_kernel_dump_detected, 1);
+        WW_LOG("anti_dump: KERNEL_DUMP_DETECTED pid=%u scrubbing_keys", pid);
+
+        PEPROCESS process = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
+        if (!NT_SUCCESS(status)) return status;
+
+        KAPC_STATE apc;
+        _KeStackAttachProcess(process, &apc);
+
+        __try {
+            PVOID peb_raw = _PsGetProcessPeb(process);
+            if (peb_raw && _MmIsAddressValid(peb_raw)) {
+                ULONG old_prot = 0;
+                PVOID prot_base = peb_raw;
+                SIZE_T prot_size = 0x1000;
+                NTSTATUS pst = _ZwProtectVirtualMemory(
+                    ZwCurrentProcess(), &prot_base, &prot_size,
+                    PAGE_READWRITE, &old_prot);
+                if (NT_SUCCESS(pst)) {
+                    RtlZeroMemory(peb_raw, 0x1000);
+                    _ZwProtectVirtualMemory(
+                        ZwCurrentProcess(), &prot_base, &prot_size,
+                        old_prot, &old_prot);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(process);
+
+        WW_LOG("anti_dump: TIER2_BSOD kernel_dump pid=%u", pid);
+        if (_KeBugCheckEx) {
+            _KeBugCheckEx(0xA1DA0002u, (ULONG_PTR)pid, 0, 0, 0);
+        }
+        return status;
+    }
+
+    __forceinline NTSTATUS scan_for_dump_files(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (pid == 0) return STATUS_INVALID_PARAMETER;
+
+        ULONG buf_size = 4 * 1024 * 1024;
+        PVOID buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'hDSW');
+        if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+
+        ULONG ret_len = 0;
+        NTSTATUS status = ZwQuerySystemInformation(
+            (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+            buf, buf_size, &ret_len);
+
+        if (status == STATUS_INFO_LENGTH_MISMATCH && ret_len > buf_size) {
+            ExFreePoolWithTag(buf, 'hDSW');
+            buf_size = ret_len + 65536;
+            buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'hDSW');
+            if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+            status = ZwQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+                buf, buf_size, &ret_len);
+        }
+
+        if (!NT_SUCCESS(status)) {
+            ExFreePoolWithTag(buf, 'hDSW');
+            return status;
+        }
+
+        auto* info = (SYSTEM_HANDLE_INFORMATION_EX_AD*)buf;
+
+        USHORT file_type_idx = 0;
+        if (_IoFileObjectType && *_IoFileObjectType && _ObGetObjectType) {
+            __try {
+                for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000 && file_type_idx == 0; ++i) {
+                    auto& h = info->Handles[i];
+                    if (!_MmIsAddressValid || !_MmIsAddressValid(h.Object)) continue;
+                    POBJECT_TYPE otype = _ObGetObjectType(h.Object);
+                    if (otype == *_IoFileObjectType) {
+                        file_type_idx = h.ObjectTypeIndex;
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    file_type_idx = 0;
+                }
+            }
+        }
+
+        __try {
+            for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+                auto& h = info->Handles[i];
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId == pid) continue;
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId <= 4) continue;
+
+                if (file_type_idx != 0 && h.ObjectTypeIndex != file_type_idx) continue;
+
+                if (!_MmIsAddressValid || !_MmIsAddressValid(h.Object)) continue;
+
+                PFILE_OBJECT file_obj = (PFILE_OBJECT)h.Object;
+                if (!file_obj || !_MmIsAddressValid(file_obj)) continue;
+                if (file_obj->FileName.Length == 0) continue;
+                if (!file_obj->FileName.Buffer || !_MmIsAddressValid(file_obj->FileName.Buffer)) continue;
+
+                WCHAR lower_name[256] = {};
+                USHORT chars = file_obj->FileName.Length / sizeof(WCHAR);
+                if (chars > 255) chars = 255;
+                for (USHORT c = 0; c < chars; ++c) {
+                    WCHAR ch = file_obj->FileName.Buffer[c];
+                    lower_name[c] = (ch >= L'A' && ch <= L'Z') ? (ch + 32) : ch;
+                }
+
+                bool is_dump = false;
+                if (chars >= 4) {
+                    if (lower_name[chars-4] == L'.' && lower_name[chars-3] == L'd' &&
+                        lower_name[chars-2] == L'm' && lower_name[chars-1] == L'p')
+                        is_dump = true;
+                    else if (chars >= 5 && lower_name[chars-5] == L'.' &&
+                             lower_name[chars-4] == L'd' && lower_name[chars-3] == L'u' &&
+                             lower_name[chars-2] == L'm' && lower_name[chars-1] == L'p')
+                        is_dump = true;
+                    else if (chars >= 5 && lower_name[chars-5] == L'.' &&
+                             lower_name[chars-4] == L'm' && lower_name[chars-3] == L'd' &&
+                             lower_name[chars-2] == L'm' && lower_name[chars-1] == L'p')
+                        is_dump = true;
+                }
+
+                if (is_dump) {
+                    UINT32 owner_pid = (UINT32)h.UniqueProcessId;
+                    if (is_permitted_pid(owner_pid)) continue;
+
+                    if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+                        OBJECT_ATTRIBUTES oa;
+                        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+                        CLIENT_ID cid = {};
+                        cid.UniqueProcess = (HANDLE)h.UniqueProcessId;
+                        HANDLE hProc = nullptr;
+                        if (NT_SUCCESS(_ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid)) && hProc) {
+                            _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
+                            _ZwClose(hProc);
+                            WW_LOG("anti_dump: scan_for_dump_files killed pid=%u dump_file_handle", owner_pid);
+                        }
+                    }
+                    InterlockedIncrement64((volatile LONG64*)&g_blocks_count);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ExFreePoolWithTag(buf, 'hDSW');
+        return status;
+    }
 }
 
 namespace continuous_anti_dump {
@@ -805,6 +1207,7 @@ namespace continuous_anti_dump {
 
             if ((cycle % 3) == 0) {
                 anti_dump_kernel::hide_all_threads(pid);
+                anti_dump_kernel::monitor_kernel_reads(pid);
             }
 
             if ((cycle % 10) == 0) {
@@ -841,6 +1244,11 @@ namespace continuous_anti_dump {
                         _KeBugCheckEx(0xA1DA0002u, pid, 0, 0, 0);
                     }
                 }
+                anti_dump_kernel::detect_mmcopyvirtualmemory(pid);
+            }
+
+            if ((cycle % 20) == 0) {
+                anti_dump_kernel::scan_for_dump_files(pid);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {

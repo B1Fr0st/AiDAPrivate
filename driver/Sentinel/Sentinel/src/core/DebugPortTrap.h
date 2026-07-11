@@ -23,7 +23,7 @@ namespace debug_port_trap {
             return true;
         }
         if (ver.dwBuildNumber >= 17763) {
-            *debug_port_offset = 0x550;
+            *debug_port_offset = 0x578;
             return true;
         }
         return false;

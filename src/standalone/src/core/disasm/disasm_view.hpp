@@ -147,6 +147,8 @@ void render(float pos_x, float pos_y, float width, float height,
             const workspace_context_t& context, float dt);
 
 void goto_address(std::uint64_t address, const workspace_context_t& context);
+void goto_address(const aida::analysis::address_t& address,
+                  const workspace_context_t& context);
 void navigate_back(const workspace_context_t& context);
 void navigate_forward(const workspace_context_t& context);
 void open_xrefs(std::uint64_t address, const workspace_context_t& context);

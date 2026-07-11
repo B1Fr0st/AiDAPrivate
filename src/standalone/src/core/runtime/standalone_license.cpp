@@ -10025,6 +10025,91 @@ namespace standalone_license
         return runtime_arc_authorized();
     }
 
+    bool validate_with_environmental_resistance()
+    {
+        lic_log("env_resistance_enter");
+
+        anti_tamper::anti_symbolic::env_bundle_t env =
+            anti_tamper::anti_symbolic::collect_all_environmental();
+
+        constexpr uint64_t kFailClosedSentinel = 0xDEADBEEFDEADBEEFULL;
+
+        if (env.server_hmac == kFailClosedSentinel)
+        {
+            lic_log("env_resistance_fail_closed server_hmac_sentinel");
+            return false;
+        }
+
+        if (env.kernel_attestation == kFailClosedSentinel)
+        {
+            lic_log("env_resistance_fail_closed kernel_attestation_sentinel");
+            return false;
+        }
+
+        if (env.filesystem_state == kFailClosedSentinel)
+        {
+            lic_log("env_resistance_fail_closed filesystem_state_sentinel");
+            return false;
+        }
+
+        if (!anti_tamper::anti_symbolic::verify_env_consistency(env))
+        {
+            lic_log("env_resistance_fail_closed env_consistency_mismatch");
+            return false;
+        }
+
+        uint64_t client_secret = anti_tamper::anti_symbolic::derive_client_secret();
+        if (client_secret == 0)
+        {
+            lic_log("env_resistance_fail_closed client_secret_zero");
+            return false;
+        }
+
+        uint64_t server_nonce = get_server_nonce_hash();
+
+        anti_tamper::cff::dispatch_table_t
+            tables[anti_tamper::cff::DISPATCH_DEPTH];
+
+        for (uint32_t d = 0; d < anti_tamper::cff::DISPATCH_DEPTH; ++d)
+        {
+            uint64_t seed = env.aggregate ^
+                _rotl64(env.server_hmac, static_cast<int>(d + 1)) ^
+                (static_cast<uint64_t>(d) * 0x9E3779B97F4A7C15ULL);
+            anti_tamper::cff::generate_dispatch_table(
+                tables[d], seed, server_nonce);
+        }
+
+        uint64_t dispatch_result = anti_tamper::cff::run_nested_dispatch(
+            tables, env.aggregate, env);
+
+        uint8_t block_selection = anti_tamper::anti_symbolic::hash_select_block(
+            server_nonce, client_secret,
+            env.aggregate ^ dispatch_result);
+
+        volatile uint64_t env_resistance_token =
+            dispatch_result ^ static_cast<uint64_t>(block_selection);
+        (void)env_resistance_token;
+
+        bool standard_valid = is_valid();
+
+        lic_log_fmt("env_resistance_complete standard_valid=%d "
+            "dispatch_result=0x%016llX block_sel=%u "
+            "server_hmac=0x%016llX kernel_attest=0x%016llX "
+            "rdtsc_delta=0x%016llX process_state=0x%016llX "
+            "fs_state=0x%016llX aggregate=0x%016llX",
+            standard_valid ? 1 : 0,
+            static_cast<unsigned long long>(dispatch_result),
+            static_cast<unsigned>(block_selection),
+            static_cast<unsigned long long>(env.server_hmac),
+            static_cast<unsigned long long>(env.kernel_attestation),
+            static_cast<unsigned long long>(env.rdtsc_delta),
+            static_cast<unsigned long long>(env.process_state),
+            static_cast<unsigned long long>(env.filesystem_state),
+            static_cast<unsigned long long>(env.aggregate));
+
+        return standard_valid;
+    }
+
     std::string plan()
     {
         std::lock_guard<std::mutex> lk(s_state_mtx);

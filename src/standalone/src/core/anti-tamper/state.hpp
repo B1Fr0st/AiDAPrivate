@@ -52,6 +52,7 @@ struct iat_entry_t
 {
     uint64_t slot_va;
     uint64_t resolved_va;
+    char     expected_module[64] = {};
 };
 
 struct token_chain_state_t

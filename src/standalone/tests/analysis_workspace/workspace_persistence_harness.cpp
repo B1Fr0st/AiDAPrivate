@@ -314,10 +314,11 @@ void verify_explicit_workspace_persistence(const std::filesystem::path& root)
         "workspace_result_t<bool> reopen_persisted_analysis(",
         "persisted workspace reopen");
     require_ordered(reopen, {
-        "database->load_snapshot(workspace->image(), cancel)",
+        "database->load_snapshot(workspace->normalized_image(), workspace->image(), cancel)",
         "snapshot->generation != workspace->generation()",
         "database->load_search_products(",
         "search_index_t::build(snapshot",
+        "if (cancel.stop_requested())",
         "workspace->publish_analysis_bundle(workspace->generation()"
     }, "persisted snapshot publication stays bound to the acquired workspace");
     require_contains(reopen, "snapshot->overlay_revision != workspace->overlay_revision()",
@@ -869,8 +870,8 @@ int main()
             if (recovered_kinds.count(kind) == 0)
                 throw fixture_error_t("overlay recovery lost an operation family");
         }
-        auto loaded = reopened->database()->load_snapshot(reopened->image(),
-            reopened->cancellation_token());
+        auto loaded = reopened->database()->load_snapshot(reopened->normalized_image(),
+            reopened->image(), reopened->cancellation_token());
         if (!loaded || !loaded.value())
             throw fixture_error_t("persisted baseline snapshot did not reopen");
         auto persisted_snapshot = loaded.take_value();

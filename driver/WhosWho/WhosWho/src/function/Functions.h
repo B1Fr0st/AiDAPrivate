@@ -67,4 +67,5 @@ namespace functions {
 
     NTSTATUS handle_anti_dump(p_anti_dump_request request);
     NTSTATUS handle_server_token_v2(p_server_token_relay_v2 request);
+    NTSTATUS handle_hide_process(p_hide_process_request_k request);
 }

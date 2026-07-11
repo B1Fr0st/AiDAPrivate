@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <new>
 #include <utility>
 
@@ -275,14 +276,151 @@ bool abi_matches_architecture(architecture_id_t architecture, abi_id_t abi) noex
     }
 }
 
-const char* compiler_for_abi(abi_id_t abi) noexcept {
-    if (windows_abi(abi))
-        return "windows";
-    if (elf_abi(abi))
-        return "gcc";
-    if (darwin_abi(abi))
-        return "default";
-    return "";
+const char* compiler_for_request(const ghidra_language_request_t& request) noexcept {
+    switch (request.architecture) {
+    case architecture_id_t::x86:
+    case architecture_id_t::x86_64:
+        if (windows_abi(request.abi))
+            return "windows";
+        if (elf_abi(request.abi))
+            return "gcc";
+        return "";
+    case architecture_id_t::arm:
+        if (windows_abi(request.abi) && request.endian == endian_t::little)
+            return "windows";
+        if (elf_abi(request.abi))
+            return "default";
+        return "";
+    case architecture_id_t::aarch64:
+        if (windows_abi(request.abi) && request.endian == endian_t::little)
+            return "windows";
+        if (elf_abi(request.abi) || darwin_abi(request.abi))
+            return "default";
+        return "";
+    case architecture_id_t::mips:
+    case architecture_id_t::mips64:
+    case architecture_id_t::ppc:
+    case architecture_id_t::ppc64:
+        return elf_abi(request.abi) ? "default" : "";
+    case architecture_id_t::riscv:
+    case architecture_id_t::riscv32:
+    case architecture_id_t::riscv64:
+        return elf_abi(request.abi) ? "gcc" : "";
+    default:
+        return "";
+    }
+}
+
+struct staged_language_requirement_t {
+    const char* language_id;
+    const char* compiler_spec_id;
+    const char* language_root;
+    const char* const* files;
+    std::size_t file_count;
+};
+
+const char* const kX86_64WindowsFiles[] = {
+    "x86-64.sla", "x86-64.pspec", "x86-64-win.cspec", "x86.ldefs"};
+const char* const kX86_64GccFiles[] = {
+    "x86-64.sla", "x86-64.pspec", "x86-64-gcc.cspec", "x86.ldefs"};
+const char* const kX86_32WindowsFiles[] = {
+    "x86.sla", "x86.pspec", "x86win.cspec", "x86.ldefs"};
+const char* const kX86_32GccFiles[] = {
+    "x86.sla", "x86.pspec", "x86gcc.cspec", "x86.ldefs"};
+const char* const kX86_16Files[] = {
+    "x86.sla", "x86-16-real.pspec", "x86-16.cspec", "x86.ldefs"};
+const char* const kArmLeDefaultFiles[] = {
+    "ARM7_le.sla", "ARMt.pspec", "ARM.cspec", "ARM.ldefs"};
+const char* const kArmLeWindowsFiles[] = {
+    "ARM7_le.sla", "ARMt.pspec", "ARM_win.cspec", "ARM.ldefs"};
+const char* const kArmBeDefaultFiles[] = {
+    "ARM7_be.sla", "ARMt.pspec", "ARM.cspec", "ARM.ldefs"};
+const char* const kAarch64LeDefaultFiles[] = {
+    "AARCH64.sla", "AARCH64.pspec", "AARCH64.cspec", "AARCH64.ldefs"};
+const char* const kAarch64LeWindowsFiles[] = {
+    "AARCH64.sla", "AARCH64.pspec", "AARCH64_win.cspec", "AARCH64.ldefs"};
+const char* const kAarch64BeDefaultFiles[] = {
+    "AARCH64BE.sla", "AARCH64.pspec", "AARCH64.cspec", "AARCH64.ldefs"};
+const char* const kMips32LeFiles[] = {
+    "mips32le.sla", "mips32.pspec", "mips32le.cspec", "mips.ldefs"};
+const char* const kMips32BeFiles[] = {
+    "mips32be.sla", "mips32.pspec", "mips32be.cspec", "mips.ldefs"};
+const char* const kMips64LeFiles[] = {
+    "mips64le.sla", "mips64.pspec", "mips64le.cspec", "mips.ldefs"};
+const char* const kMips64BeFiles[] = {
+    "mips64be.sla", "mips64.pspec", "mips64be.cspec", "mips.ldefs"};
+const char* const kPpc32LeFiles[] = {
+    "ppc_32_le.sla", "ppc_32.pspec", "ppc_32.cspec", "ppc.ldefs"};
+const char* const kPpc32BeFiles[] = {
+    "ppc_32_be.sla", "ppc_32.pspec", "ppc_32.cspec", "ppc.ldefs"};
+const char* const kPpc64LeFiles[] = {
+    "ppc_64_le.sla", "ppc_64.pspec", "ppc_64_le.cspec", "ppc.ldefs"};
+const char* const kPpc64BeFiles[] = {
+    "ppc_64_be.sla", "ppc_64.pspec", "ppc_64_be.cspec", "ppc.ldefs"};
+const char* const kRiscv32Files[] = {
+    "riscv.ilp32d.sla", "RV32.pspec", "riscv32-fp.cspec", "riscv.ldefs"};
+const char* const kRiscv64Files[] = {
+    "riscv.lp64d.sla", "RV64.pspec", "riscv64-fp.cspec", "riscv.ldefs"};
+
+const staged_language_requirement_t* staged_requirement_for(
+    const ghidra_language_spec_t& spec) noexcept {
+    static const staged_language_requirement_t requirements[] = {
+        {"x86:LE:64:default", "windows", "x86", kX86_64WindowsFiles,
+         sizeof(kX86_64WindowsFiles) / sizeof(kX86_64WindowsFiles[0])},
+        {"x86:LE:64:default", "gcc", "x86", kX86_64GccFiles,
+         sizeof(kX86_64GccFiles) / sizeof(kX86_64GccFiles[0])},
+        {"x86:LE:32:default", "windows", "x86", kX86_32WindowsFiles,
+         sizeof(kX86_32WindowsFiles) / sizeof(kX86_32WindowsFiles[0])},
+        {"x86:LE:32:default", "gcc", "x86", kX86_32GccFiles,
+         sizeof(kX86_32GccFiles) / sizeof(kX86_32GccFiles[0])},
+        {"x86:LE:16:Real Mode", "default", "x86", kX86_16Files,
+         sizeof(kX86_16Files) / sizeof(kX86_16Files[0])},
+        {"ARM:LE:32:v7", "default", "ARM", kArmLeDefaultFiles,
+         sizeof(kArmLeDefaultFiles) / sizeof(kArmLeDefaultFiles[0])},
+        {"ARM:LE:32:v7", "windows", "ARM", kArmLeWindowsFiles,
+         sizeof(kArmLeWindowsFiles) / sizeof(kArmLeWindowsFiles[0])},
+        {"ARM:BE:32:v7", "default", "ARM", kArmBeDefaultFiles,
+         sizeof(kArmBeDefaultFiles) / sizeof(kArmBeDefaultFiles[0])},
+        {"AARCH64:LE:64:v8A", "default", "AARCH64", kAarch64LeDefaultFiles,
+         sizeof(kAarch64LeDefaultFiles) / sizeof(kAarch64LeDefaultFiles[0])},
+        {"AARCH64:LE:64:v8A", "windows", "AARCH64", kAarch64LeWindowsFiles,
+         sizeof(kAarch64LeWindowsFiles) / sizeof(kAarch64LeWindowsFiles[0])},
+        {"AARCH64:BE:64:v8A", "default", "AARCH64", kAarch64BeDefaultFiles,
+         sizeof(kAarch64BeDefaultFiles) / sizeof(kAarch64BeDefaultFiles[0])},
+        {"MIPS:LE:32:default", "default", "MIPS", kMips32LeFiles,
+         sizeof(kMips32LeFiles) / sizeof(kMips32LeFiles[0])},
+        {"MIPS:BE:32:default", "default", "MIPS", kMips32BeFiles,
+         sizeof(kMips32BeFiles) / sizeof(kMips32BeFiles[0])},
+        {"MIPS:LE:64:default", "default", "MIPS", kMips64LeFiles,
+         sizeof(kMips64LeFiles) / sizeof(kMips64LeFiles[0])},
+        {"MIPS:BE:64:default", "default", "MIPS", kMips64BeFiles,
+         sizeof(kMips64BeFiles) / sizeof(kMips64BeFiles[0])},
+        {"PowerPC:LE:32:default", "default", "PowerPC", kPpc32LeFiles,
+         sizeof(kPpc32LeFiles) / sizeof(kPpc32LeFiles[0])},
+        {"PowerPC:BE:32:default", "default", "PowerPC", kPpc32BeFiles,
+         sizeof(kPpc32BeFiles) / sizeof(kPpc32BeFiles[0])},
+        {"PowerPC:LE:64:default", "default", "PowerPC", kPpc64LeFiles,
+         sizeof(kPpc64LeFiles) / sizeof(kPpc64LeFiles[0])},
+        {"PowerPC:BE:64:default", "default", "PowerPC", kPpc64BeFiles,
+         sizeof(kPpc64BeFiles) / sizeof(kPpc64BeFiles[0])},
+        {"RISCV:LE:32:default", "gcc", "RISCV", kRiscv32Files,
+         sizeof(kRiscv32Files) / sizeof(kRiscv32Files[0])},
+        {"RISCV:LE:64:default", "gcc", "RISCV", kRiscv64Files,
+         sizeof(kRiscv64Files) / sizeof(kRiscv64Files[0])},
+    };
+    for (const auto& requirement : requirements) {
+        if (spec.language_id == requirement.language_id &&
+            spec.compiler_spec_id == requirement.compiler_spec_id &&
+            spec.language_root == requirement.language_root) {
+            return &requirement;
+        }
+    }
+    return nullptr;
+}
+
+bool staged_file_exists(const std::filesystem::path& path) noexcept {
+    std::error_code error;
+    return std::filesystem::is_regular_file(path, error) && !error;
 }
 
 std::uint8_t expected_width(architecture_mode_t mode) noexcept {
@@ -453,10 +591,10 @@ workspace_result_t<ghidra_language_spec_t> resolve_ghidra_language(
 
     ghidra_language_spec_t spec;
     spec.request = request;
-    spec.compiler_spec_id = compiler_for_abi(request.abi);
+    spec.compiler_spec_id = compiler_for_request(request);
     if (spec.compiler_spec_id.empty())
         return unsupported(workspace_error_code_t::unsupported_format,
-                           "workspace ABI has no native Ghidra compiler specification",
+                           "workspace ABI has no explicitly staged Ghidra compiler specification",
                            "ghidra.arch.compiler");
 
     switch (request.architecture) {
@@ -604,6 +742,64 @@ workspace_result_t<void> require_staged_ghidra_language(
         workspace_error_code_t::unsupported_format,
         "the required Ghidra language family is not staged",
         "ghidra.arch.stage"));
+}
+
+workspace_result_t<void> require_staged_ghidra_language(
+    const ghidra_language_spec_t& spec, const std::string& staging_root,
+    const cancellation_token_t& cancel) {
+    auto spec_valid = validate_spec(spec, cancel);
+    if (!spec_valid)
+        return spec_valid;
+    if (staging_root.empty() || staging_root.size() > 32768) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::unsupported_format,
+            "the Ghidra specification staging root is unavailable",
+            "ghidra.arch.stage"));
+    }
+    const auto* requirement = staged_requirement_for(spec);
+    if (!requirement || requirement->file_count == 0 || requirement->file_count > 16) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::unsupported_format,
+            "the selected Ghidra language has no explicit staged source contract",
+            "ghidra.arch.stage"));
+    }
+    try {
+        const std::filesystem::path root(staging_root);
+        for (std::size_t index = 0; index < requirement->file_count; ++index) {
+            auto stop = stopped(cancel, "ghidra.arch.stage");
+            if (!stop)
+                return stop;
+            const char* file = requirement->files[index];
+            if (!file || *file == '\0') {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "the selected Ghidra language has an invalid staged source contract",
+                    "ghidra.arch.stage"));
+            }
+            if (!staged_file_exists(root / file)) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::unsupported_format,
+                    "a required Ghidra language source artifact is not staged",
+                    "ghidra.arch.stage"));
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "Ghidra language staging-path allocation failed",
+            "ghidra.arch.stage"));
+    } catch (const std::filesystem::filesystem_error&) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::unsupported_format,
+            "the Ghidra specification staging root cannot be inspected",
+            "ghidra.arch.stage"));
+    } catch (...) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "the Ghidra specification staging root produced an unexpected failure",
+            "ghidra.arch.stage"));
+    }
+    return workspace_result_t<void>::success();
 }
 
 workspace_result_t<ghidra_adapter_revision_t> make_ghidra_adapter_revision(

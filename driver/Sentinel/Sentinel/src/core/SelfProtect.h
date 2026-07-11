@@ -1153,4 +1153,385 @@ namespace self_protect {
         _InterlockedExchange(&g_own_integrity_strikes, 0);
         return true;
     }
+
+
+    struct KSERVICE_TABLE_DESCRIPTOR {
+        PULONG_PTR ServiceTableBase;
+        PULONG     Count;
+        ULONG      Limit;
+        PUCHAR     ParamTableBase;
+    };
+
+    inline ULONG_PTR* g_ssdt_snapshot = nullptr;
+    inline ULONG      g_ssdt_entry_count = 0;
+    inline KSPIN_LOCK g_ssdt_lock = {};
+    inline volatile LONG g_ssdt_snapshot_taken = 0;
+
+    inline volatile PVOID g_ssdt_resolved_addr = nullptr;
+    inline volatile LONG  g_ssdt_addr_resolved = 0;
+
+    __forceinline PVOID resolve_ssdt_address() {
+        if (_InterlockedCompareExchange(&g_ssdt_addr_resolved, 0, 0) == 2)
+            return (PVOID)g_ssdt_resolved_addr;
+
+        LONG prev = _InterlockedCompareExchange(&g_ssdt_addr_resolved, 1, 0);
+        if (prev == 2) return (PVOID)g_ssdt_resolved_addr;
+        if (prev == 1) {
+            wait_for_resolver_state(&g_ssdt_addr_resolved, 2, "ssdt_addr");
+            return (PVOID)g_ssdt_resolved_addr;
+        }
+
+        PVOID result = nullptr;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_ssdt_addr_resolved, 2);
+            SN_LOG("self_protect::resolve_ssdt: SKIP irql=%u", KeGetCurrentIrql());
+            return nullptr;
+        }
+
+        if (!_MmIsAddressValid) {
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_ssdt_addr_resolved, 2);
+            SN_LOG("self_protect::resolve_ssdt: FAIL no_MmIsAddressValid");
+            return nullptr;
+        }
+
+        PVOID nt_base = reinterpret_cast<PVOID>(get_nt_base());
+        if (!nt_base || !_MmIsAddressValid(nt_base)) {
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_ssdt_addr_resolved, 2);
+            SN_LOG("self_protect::resolve_ssdt: FAIL no_nt_base");
+            return nullptr;
+        }
+
+        PIMAGE_DOS_HEADER dos = static_cast<PIMAGE_DOS_HEADER>(nt_base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_ssdt_addr_resolved, 2);
+            SN_LOG("self_protect::resolve_ssdt: FAIL bad_dos_sig");
+            return nullptr;
+        }
+
+        PIMAGE_NT_HEADERS64 nt_hdr = reinterpret_cast<PIMAGE_NT_HEADERS64>(
+            static_cast<UCHAR*>(nt_base) + dos->e_lfanew);
+        if (!_MmIsAddressValid(nt_hdr) || nt_hdr->Signature != IMAGE_NT_SIGNATURE) {
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_ssdt_addr_resolved, 2);
+            SN_LOG("self_protect::resolve_ssdt: FAIL bad_nt_sig");
+            return nullptr;
+        }
+
+        SIZE_T image_size = nt_hdr->OptionalHeader.SizeOfImage;
+        ULONG64 img_start = reinterpret_cast<ULONG64>(nt_base);
+        ULONG64 img_end = img_start + image_size;
+
+        PVOID sec_bases[16];
+        SIZE_T sec_sizes[16];
+        ULONG sec_count = get_executable_sections(nt_base, sec_bases, sec_sizes, 16);
+        if (sec_count == 0) {
+            KeMemoryBarrier();
+            _InterlockedExchange(&g_ssdt_addr_resolved, 2);
+            SN_LOG("self_protect::resolve_ssdt: FAIL no_exec_sections");
+            return nullptr;
+        }
+
+        static const UCHAR pat_r10[] = { 0x4C, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00 };
+        static const char* mask_r10  = "xxx????";
+
+        static const UCHAR pat_r11[] = { 0x4C, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00 };
+        static const char* mask_r11  = "xxx????";
+
+        struct ssdt_pat_t {
+            const UCHAR* bytes;
+            const char* mask;
+        };
+
+        ssdt_pat_t pats[] = {
+            { pat_r10, mask_r10 },
+            { pat_r11, mask_r11 },
+        };
+        constexpr int NUM_PATS = 2;
+
+        for (int p = 0; p < NUM_PATS && !result; p++) {
+            for (ULONG sec = 0; sec < sec_count && !result; sec++) {
+                SIZE_T search_off = 0;
+
+                for (;;) {
+                    PVOID found = find_pattern_from(sec_bases[sec], sec_sizes[sec],
+                                                    search_off, pats[p].bytes, pats[p].mask);
+                    if (!found)
+                        break;
+
+                    PVOID target = resolve_relative(found, 3, 7);
+                    bool valid = false;
+
+                    if (target && _MmIsAddressValid(target)) {
+                        ULONG64 target_addr = reinterpret_cast<ULONG64>(target);
+
+                        if (target_addr >= img_start && target_addr < img_end &&
+                            (target_addr & 0x7) == 0) {
+
+                            bool in_exec = false;
+                            for (ULONG s = 0; s < sec_count; s++) {
+                                ULONG64 s_start = reinterpret_cast<ULONG64>(sec_bases[s]);
+                                if (target_addr >= s_start &&
+                                    target_addr < s_start + sec_sizes[s]) {
+                                    in_exec = true;
+                                    break;
+                                }
+                            }
+
+                            if (!in_exec) {
+                                __try {
+                                    KSERVICE_TABLE_DESCRIPTOR* desc =
+                                        static_cast<KSERVICE_TABLE_DESCRIPTOR*>(target);
+
+                                    if (desc->ServiceTableBase &&
+                                        _MmIsAddressValid(desc->ServiceTableBase)) {
+                                        ULONG64 stb = reinterpret_cast<ULONG64>(
+                                            desc->ServiceTableBase);
+                                        if (stb >= img_start && stb < img_end) {
+                                            if (desc->Limit >= 0x80 && desc->Limit <= 0x1000) {
+                                                if (desc->ParamTableBase &&
+                                                    _MmIsAddressValid(desc->ParamTableBase)) {
+                                                    ULONG64 ptb = reinterpret_cast<ULONG64>(
+                                                        desc->ParamTableBase);
+                                                    if (ptb >= img_start && ptb < img_end) {
+                                                        valid = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                                    valid = false;
+                                }
+                            }
+                        }
+                    }
+
+                    if (valid) {
+                        result = target;
+                        break;
+                    }
+
+                    SIZE_T consumed = static_cast<SIZE_T>(
+                        static_cast<UCHAR*>(found) -
+                        static_cast<UCHAR*>(sec_bases[sec])) + 1;
+                    if (consumed >= sec_sizes[sec])
+                        break;
+                    search_off = consumed;
+                }
+            }
+        }
+
+        g_ssdt_resolved_addr = result;
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_ssdt_addr_resolved, 2);
+
+        if (result) {
+            SN_LOG("self_protect::resolve_ssdt: OK addr=%p", result);
+        } else {
+            SN_LOG("self_protect::resolve_ssdt: FAIL pattern_not_found");
+        }
+
+        return result;
+    }
+
+    __forceinline bool ssdt_snapshot() {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            SN_LOG("self_protect::ssdt_snapshot: SKIP irql=%u", KeGetCurrentIrql());
+            return false;
+        }
+
+        if (!_MmIsAddressValid) {
+            SN_LOG("self_protect::ssdt_snapshot: FAIL missing_ptrs mmvalid=%p", _MmIsAddressValid);
+            return false;
+        }
+
+        PVOID ssdt_addr = resolve_ssdt_address();
+
+        if (!ssdt_addr) {
+            SN_LOG("self_protect::ssdt_snapshot: FAIL ssdt_unresolved_via_pattern_scan");
+            return false;
+        }
+
+        if (!_MmIsAddressValid(ssdt_addr)) {
+            SN_LOG("self_protect::ssdt_snapshot: FAIL ssdt_addr invalid=%p", ssdt_addr);
+            return false;
+        }
+
+        KSERVICE_TABLE_DESCRIPTOR* ssdt = static_cast<KSERVICE_TABLE_DESCRIPTOR*>(ssdt_addr);
+
+        ULONG entry_count = 0;
+        PULONG service_table = nullptr;
+
+        __try {
+            if (!ssdt->ServiceTableBase || !_MmIsAddressValid(ssdt->ServiceTableBase)) {
+                SN_LOG("self_protect::ssdt_snapshot: FAIL ServiceTableBase null or invalid");
+                return false;
+            }
+
+            entry_count = ssdt->Limit;
+            service_table = reinterpret_cast<PULONG>(ssdt->ServiceTableBase);
+
+            if (entry_count == 0 || entry_count > 0x1000) {
+                SN_LOG("self_protect::ssdt_snapshot: FAIL unreasonable_limit=%lu", entry_count);
+                return false;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("self_protect::ssdt_snapshot: EXCEPTION reading descriptor");
+            return false;
+        }
+
+        ULONG_PTR* new_snapshot = static_cast<ULONG_PTR*>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                            (SIZE_T)entry_count * sizeof(ULONG_PTR),
+                            'sdSS')
+        );
+        if (!new_snapshot) {
+            SN_LOG("self_protect::ssdt_snapshot: FAIL alloc entries=%lu", entry_count);
+            return false;
+        }
+
+        __try {
+            for (ULONG i = 0; i < entry_count; i++) {
+                new_snapshot[i] = (ULONG_PTR)service_table[i];
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("self_protect::ssdt_snapshot: EXCEPTION reading entries");
+            ExFreePoolWithTag(new_snapshot, 'sdSS');
+            return false;
+        }
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_ssdt_lock, &old_irql);
+
+        ULONG_PTR* old_snapshot = g_ssdt_snapshot;
+        g_ssdt_snapshot = new_snapshot;
+        g_ssdt_entry_count = entry_count;
+
+        KeReleaseSpinLock(&g_ssdt_lock, old_irql);
+
+        if (old_snapshot) {
+            ExFreePoolWithTag(old_snapshot, 'sdSS');
+        }
+
+        _InterlockedExchange(&g_ssdt_snapshot_taken, 1);
+        SN_LOG("self_protect::ssdt_snapshot: OK entries=%lu table=%p snap=%p",
+            entry_count, service_table, new_snapshot);
+        return true;
+    }
+
+    __forceinline bool ssdt_verify() {
+        if (!_InterlockedCompareExchange(&g_ssdt_snapshot_taken, 1, 1))
+            return true;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return true;
+
+        if (!_MmIsAddressValid)
+            return true;
+
+        PVOID ssdt_addr = resolve_ssdt_address();
+
+        if (!ssdt_addr || !_MmIsAddressValid(ssdt_addr)) {
+            SN_LOG("self_protect::ssdt_verify: FAIL unresolved=%p", ssdt_addr);
+            return true;
+        }
+
+        KSERVICE_TABLE_DESCRIPTOR* ssdt = static_cast<KSERVICE_TABLE_DESCRIPTOR*>(ssdt_addr);
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_ssdt_lock, &old_irql);
+
+        ULONG_PTR* snapshot = g_ssdt_snapshot;
+        ULONG entry_count = g_ssdt_entry_count;
+
+        KeReleaseSpinLock(&g_ssdt_lock, old_irql);
+
+        if (!snapshot || entry_count == 0)
+            return true;
+
+        PULONG service_table = nullptr;
+        ULONG current_limit = 0;
+
+        __try {
+            if (!ssdt->ServiceTableBase || !_MmIsAddressValid(ssdt->ServiceTableBase)) {
+                SN_LOG("self_protect::ssdt_verify: FAIL ServiceTableBase invalid");
+                return true;
+            }
+            current_limit = ssdt->Limit;
+            service_table = reinterpret_cast<PULONG>(ssdt->ServiceTableBase);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("self_protect::ssdt_verify: EXCEPTION reading descriptor");
+            return true;
+        }
+
+        if (current_limit != entry_count) {
+            SN_LOG("self_protect::ssdt_verify: LIMIT_CHANGED snap=%lu current=%lu",
+                entry_count, current_limit);
+            driver_load_audit::record(
+                0x53534454ULL,
+                (UINT64)ssdt_addr,
+                current_limit,
+                5
+            );
+#ifndef AIDA_DEV_MODE
+            if (_KeBugCheckEx) {
+                _KeBugCheckEx(BUGCHECK_SSDT_HOOK,
+                    (ULONG_PTR)0xFFFFFFFF,
+                    (ULONG_PTR)entry_count,
+                    (ULONG_PTR)current_limit,
+                    0);
+            }
+#endif
+            return false;
+        }
+
+        ULONG mismatch_index = (ULONG)-1;
+        ULONG_PTR mismatch_original = 0;
+        ULONG_PTR mismatch_current = 0;
+
+        __try {
+            for (ULONG i = 0; i < entry_count; i++) {
+                ULONG_PTR current_val = (ULONG_PTR)service_table[i];
+                if (current_val != snapshot[i]) {
+                    mismatch_index = i;
+                    mismatch_original = snapshot[i];
+                    mismatch_current = current_val;
+                    break;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("self_protect::ssdt_verify: EXCEPTION comparing entries");
+            return true;
+        }
+
+        if (mismatch_index != (ULONG)-1) {
+            SN_LOG("self_protect::ssdt_verify: HOOK idx=%lu orig=0x%llx curr=0x%llx",
+                mismatch_index,
+                (unsigned long long)mismatch_original,
+                (unsigned long long)mismatch_current);
+            driver_load_audit::record(
+                0x53534454ULL,
+                (UINT64)ssdt_addr,
+                entry_count,
+                5
+            );
+#ifndef AIDA_DEV_MODE
+            if (_KeBugCheckEx) {
+                _KeBugCheckEx(BUGCHECK_SSDT_HOOK,
+                    (ULONG_PTR)mismatch_index,
+                    (ULONG_PTR)mismatch_original,
+                    (ULONG_PTR)mismatch_current,
+                    0);
+            }
+#endif
+            return false;
+        }
+
+        return true;
+    }
 }

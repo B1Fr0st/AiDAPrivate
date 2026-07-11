@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include "../mcp/ida_compat_schemas.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "../session/analysis_session.hpp"
 #include "../analysis/workspace/workspace_database.hpp"
@@ -23,6 +24,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace session_tools {
 
@@ -565,13 +567,14 @@ static tool_result_t sessions_run_binary(const json& params)
 void register_session_tools(mcp_standalone::server_t& srv)
 {
 	diag::log_tagged_fmt("sess_tools", "register_session_tools entry");
-	srv.register_tool({
-		"list_instances",
-		"List every open AiDA static workspace and driver-backed live target without consulting or changing the active UI tab.",
-		{},
-		true,
-		[&srv](const json&) -> tool_result_t { return list_instances(srv.get_port()); }
-	});
+	mcp_standalone::tool_def_t instances;
+	instances.name = "list_instances";
+	instances.description = "List every open AiDA static workspace and driver-backed live target without consulting or changing the active UI tab.";
+	instances.read_only = true;
+	instances.handler = [&srv](const json&) -> tool_result_t { return list_instances(srv.get_port()); };
+	if (const auto* schema = mcp_standalone::ida_compat::find_schema("list_instances"))
+		instances.input_schema = *schema;
+	srv.register_tool(std::move(instances));
 	srv.register_tool({
 		"sessions_manage",
 		"Manage static file, live process, and sandbox sessions. Actions: list, get_active, open_file, attach_pid, close, run_binary.",

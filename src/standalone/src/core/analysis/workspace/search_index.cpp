@@ -150,7 +150,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
     }
     if (snapshot->binary_id.empty() || snapshot->load_profile_hash.empty() ||
         snapshot->generation == 0 || snapshot->analysis_revision == 0 ||
-        !snapshot->image) {
+        (!snapshot->normalized_image && !snapshot->image)) {
         return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                 "search index snapshot identity or revision is incomplete",

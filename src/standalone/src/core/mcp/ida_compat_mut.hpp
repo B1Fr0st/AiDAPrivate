@@ -1,7 +1,6 @@
 #pragma once
 
 #include "mcp_standalone.hpp"
-#include "ida_compat_schemas.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -40,5 +39,4 @@ namespace mcp_standalone::ida_compat
     };
 
     std::vector<mut_tool_def_t> get_mutation_tool_defs();
-    void register_mutation_tools(server_t& server);
 }

@@ -922,20 +922,20 @@ bool queue_type_declaration(const workspace_context_t& context,
     return queue_overlay_operation(context, std::move(operation));
 }
 
-void goto_address(std::uint64_t value, const workspace_context_t& context) {
-    const auto destination = typed_address(context, value);
-    if (!destination || !context.workspace || !context.view)
+void goto_address(const aida::analysis::address_t& destination,
+                  const workspace_context_t& context) {
+    if (!context.workspace || !context.view || !context.model)
         return;
     const auto previous = context.workspace->view_state().selection;
     auto updated = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
-        if (state.selection && *state.selection != *destination) {
+        if (state.selection && *state.selection != destination) {
             state.navigation_back.push_back(*state.selection);
             if (state.navigation_back.size() > 4096)
                 state.navigation_back.erase(state.navigation_back.begin(),
                     state.navigation_back.begin() +
                     static_cast<std::ptrdiff_t>(state.navigation_back.size() - 4096));
         }
-        state.selection = *destination;
+        state.selection = destination;
         state.navigation_forward.clear();
     });
     if (!updated)
@@ -943,8 +943,15 @@ void goto_address(std::uint64_t value, const workspace_context_t& context) {
     if (previous)
         context.model->navigation.push(*previous);
     std::lock_guard<std::mutex> lock(context.view->mutex);
-    context.view->selection = *destination;
+    context.view->selection = destination;
     context.view->scroll_to_selection = true;
+}
+
+void goto_address(std::uint64_t value, const workspace_context_t& context) {
+    const auto destination = typed_address(context, value);
+    if (!destination)
+        return;
+    goto_address(*destination, context);
 }
 
 void navigate_back(const workspace_context_t& context) {

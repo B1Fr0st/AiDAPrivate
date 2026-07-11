@@ -21,6 +21,11 @@
 
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "tdh.lib")
+
+#include <evntrace.h>
+#include <tdh.h>
+#include "standalone_driver.hpp"
 
 #ifndef PROCESS_SET_LIMITED_INFORMATION
 #define PROCESS_SET_LIMITED_INFORMATION 0x2000
@@ -987,6 +992,268 @@ namespace anti_minidump
         return true;
     }
 
+    using WriteDumpFile_t = BOOL(WINAPI*)(LPCWSTR, DWORD, PVOID, PVOID, PVOID);
+
+    inline WriteDumpFile_t original_write_dump_file = nullptr;
+
+    inline BOOL WINAPI hooked_write_dump_file(LPCWSTR file_name, DWORD dump_type,
+        PVOID except, PVOID user_stream, PVOID callback)
+    {
+        DWORD self_pid = GetCurrentProcessId();
+        bool target_is_self = true;
+
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE)
+        {
+            PROCESSENTRY32W pe{};
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe))
+            {
+                do {
+                    if (pe.th32ProcessID == self_pid)
+                    {
+                        target_is_self = true;
+                        break;
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+
+        if (target_is_self)
+        {
+            anti_tamper::webhook::write_log_critical("anti_dump",
+                "write_dump_file_blocked target=self");
+            SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+
+        if (original_write_dump_file)
+            return original_write_dump_file(file_name, dump_type, except, user_stream, callback);
+        return FALSE;
+    }
+
+    inline bool hook_write_dump_file()
+    {
+        HMODULE dbghelp = GetModuleHandleW(WOBFSTR(L"dbghelp.dll").c_str());
+        if (!dbghelp)
+            dbghelp = LoadLibraryW(L"dbghelp.dll");
+        if (!dbghelp) return false;
+
+        auto* target = reinterpret_cast<uint8_t*>(
+            GetProcAddress(dbghelp, OBFSTR_C("WriteDumpFile")));
+        if (!target) return false;
+
+        auto* trampoline = static_cast<uint8_t*>(VirtualAlloc(
+            nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (!trampoline) return false;
+
+        memcpy(trampoline, target, 14);
+        trampoline[14] = 0xFF;
+        trampoline[15] = 0x25;
+        *reinterpret_cast<uint32_t*>(trampoline + 16) = 0;
+        *reinterpret_cast<uint64_t*>(trampoline + 20) = reinterpret_cast<uint64_t>(target + 14);
+        FlushInstructionCache(GetCurrentProcess(), trampoline, 64);
+
+        original_write_dump_file = reinterpret_cast<WriteDumpFile_t>(trampoline);
+
+        DWORD old_prot;
+        if (!VirtualProtect(target, 14, PAGE_EXECUTE_READWRITE, &old_prot))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            original_write_dump_file = nullptr;
+            return false;
+        }
+
+        auto* hook_addr = reinterpret_cast<uint8_t*>(&hooked_write_dump_file);
+
+        target[0] = 0xFF;
+        target[1] = 0x25;
+        *reinterpret_cast<uint32_t*>(target + 2) = 0;
+        *reinterpret_cast<uint64_t*>(target + 6) = reinterpret_cast<uint64_t>(hook_addr);
+
+        VirtualProtect(target, 14, old_prot, &old_prot);
+        FlushInstructionCache(GetCurrentProcess(), target, 14);
+
+        anti_tamper::webhook::write_log_critical("anti_dump",
+            "hook_write_dump_file_installed");
+        return true;
+    }
+
+    namespace etw_detail {
+        inline TRACEHANDLE g_session_handle = 0;
+        inline TRACEHANDLE g_trace_handle = INVALID_PROCESSTRACE_HANDLE;
+        inline EVENT_TRACE_LOGFILEW g_trace_logfile{};
+        inline std::atomic<bool> g_dump_tool_detected{false};
+        inline std::atomic<bool> g_etw_initialized{false};
+        inline HANDLE g_consumer_thread = nullptr;
+        inline wchar_t g_session_name[] = L"AiDA_EtwDumpMon";
+
+        inline void WINAPI event_record_callback(PEVENT_RECORD er) {
+            if (!er) return;
+            if (er->EventHeader.EventDescriptor.Id != 1) return;
+
+            DWORD data_len = er->UserDataLength;
+            if (data_len == 0 || !er->UserData) return;
+
+            const wchar_t* dump_tools[] = {
+                L"procdump.exe", L"procdump64.exe",
+                L"HxD.exe",
+                L"windbg.exe", L"kd.exe", L"cdb.exe", L"ntsd.exe",
+                L"DumpChk.exe",
+                L"procexp.exe", L"procexp64.exe",
+                L"ProcessHacker.exe",
+                L"procmon.exe", L"procmon64.exe",
+                L"HTTPDebuggerPro.exe"
+            };
+            constexpr int num_tools = sizeof(dump_tools) / sizeof(dump_tools[0]);
+
+            const uint8_t* data = static_cast<const uint8_t*>(er->UserData);
+
+            for (DWORD i = 0; i + 2 <= data_len; i += 2) {
+                const wchar_t* str = reinterpret_cast<const wchar_t*>(data + i);
+                DWORD remaining = (data_len - i) / 2;
+                for (int j = 0; j < num_tools; ++j) {
+                    size_t name_len = wcslen(dump_tools[j]);
+                    if (remaining < name_len) continue;
+                    if (_wcsnicmp(str, dump_tools[j], name_len) == 0) {
+                        g_dump_tool_detected.store(true, std::memory_order_release);
+                        char dbg[256];
+                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                            "etw_process_start_dump_tool: %S", dump_tools[j]);
+                        anti_tamper::webhook::write_log_critical("anti_dump", dbg);
+                        return;
+                    }
+                }
+            }
+        }
+
+        inline DWORD WINAPI consumer_thread_proc(LPVOID) {
+            ProcessTrace(&g_trace_handle, 1, nullptr, nullptr);
+            return 0;
+        }
+    }
+
+    inline bool detect_dump_via_etw() {
+        if (!etw_detail::g_etw_initialized.load(std::memory_order_acquire)) {
+            bool expected = false;
+            if (etw_detail::g_etw_initialized.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel))
+            {
+                GUID provider_guid = {0x22FB2CD6, 0x0E7B, 0x422B,
+                    {0xA0, 0xC7, 0x2F, 0xAD, 0x1F, 0xD0, 0xE7, 0x16}};
+
+                DWORD props_size = sizeof(EVENT_TRACE_PROPERTIES) + 256 * sizeof(wchar_t);
+                auto* props = static_cast<EVENT_TRACE_PROPERTIES*>(malloc(props_size));
+                if (!props) {
+                    etw_detail::g_etw_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
+                memset(props, 0, props_size);
+                props->Wnode.BufferSize = props_size;
+                props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+                props->Wnode.ClientContext = 1;
+                props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+                props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+                ULONG status = StartTraceW(&etw_detail::g_session_handle,
+                    etw_detail::g_session_name, props);
+                if (status == ERROR_ALREADY_EXISTS) {
+                    StopTraceW(0, etw_detail::g_session_name, props);
+                    status = StartTraceW(&etw_detail::g_session_handle,
+                        etw_detail::g_session_name, props);
+                }
+                if (status != ERROR_SUCCESS) {
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "etw_start_trace_failed status=0x%08X", status);
+                    free(props);
+                    etw_detail::g_etw_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
+
+                status = EnableTraceEx2(etw_detail::g_session_handle,
+                    &provider_guid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                    TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr);
+                if (status != ERROR_SUCCESS) {
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "etw_enable_provider_failed status=0x%08X", status);
+                    StopTraceW(etw_detail::g_session_handle, etw_detail::g_session_name, props);
+                    etw_detail::g_session_handle = 0;
+                    free(props);
+                    etw_detail::g_etw_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
+
+                memset(&etw_detail::g_trace_logfile, 0, sizeof(etw_detail::g_trace_logfile));
+                etw_detail::g_trace_logfile.LoggerName = etw_detail::g_session_name;
+                etw_detail::g_trace_logfile.EventRecordCallback = etw_detail::event_record_callback;
+                etw_detail::g_trace_logfile.ProcessTraceMode =
+                    PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_REAL_TIME;
+
+                etw_detail::g_trace_handle = OpenTraceW(&etw_detail::g_trace_logfile);
+                if (etw_detail::g_trace_handle == INVALID_PROCESSTRACE_HANDLE) {
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "etw_open_trace_failed gle=%lu", GetLastError());
+                    StopTraceW(etw_detail::g_session_handle, etw_detail::g_session_name, props);
+                    etw_detail::g_session_handle = 0;
+                    free(props);
+                    etw_detail::g_etw_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
+
+                etw_detail::g_consumer_thread = CreateThread(nullptr, 0,
+                    etw_detail::consumer_thread_proc, nullptr, 0, nullptr);
+                if (!etw_detail::g_consumer_thread) {
+                    CloseTrace(etw_detail::g_trace_handle);
+                    etw_detail::g_trace_handle = INVALID_PROCESSTRACE_HANDLE;
+                    StopTraceW(etw_detail::g_session_handle, etw_detail::g_session_name, props);
+                    etw_detail::g_session_handle = 0;
+                    free(props);
+                    etw_detail::g_etw_initialized.store(false, std::memory_order_release);
+                    return false;
+                }
+
+                free(props);
+                anti_tamper::webhook::write_log_critical("anti_dump",
+                    "etw_dump_monitor_session_started");
+            }
+        }
+
+        if (etw_detail::g_dump_tool_detected.load(std::memory_order_acquire)) {
+            anti_tamper::webhook::write_log_critical("anti_dump",
+                "etw_dump_tool_detected_corrupting_memory");
+            corrupt_memory_before_dump();
+            etw_detail::g_dump_tool_detected.store(false, std::memory_order_release);
+        }
+
+        return true;
+    }
+
+    inline void shutdown_etw() {
+        if (etw_detail::g_trace_handle != INVALID_PROCESSTRACE_HANDLE) {
+            CloseTrace(etw_detail::g_trace_handle);
+            etw_detail::g_trace_handle = INVALID_PROCESSTRACE_HANDLE;
+        }
+        if (etw_detail::g_consumer_thread) {
+            WaitForSingleObject(etw_detail::g_consumer_thread, 3000);
+            CloseHandle(etw_detail::g_consumer_thread);
+            etw_detail::g_consumer_thread = nullptr;
+        }
+        if (etw_detail::g_session_handle != 0) {
+            DWORD props_size = sizeof(EVENT_TRACE_PROPERTIES) + 256 * sizeof(wchar_t);
+            auto* props = static_cast<EVENT_TRACE_PROPERTIES*>(malloc(props_size));
+            if (props) {
+                memset(props, 0, props_size);
+                props->Wnode.BufferSize = props_size;
+                props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+                StopTraceW(0, etw_detail::g_session_name, props);
+                free(props);
+            }
+            etw_detail::g_session_handle = 0;
+        }
+        etw_detail::g_etw_initialized.store(false, std::memory_order_release);
+    }
+
 }
 
 
@@ -1340,6 +1607,156 @@ namespace working_set {
         }
         locked_pages().clear();
     }
+
+    struct sensitive_heap_region_t {
+        uint64_t base;
+        uint32_t size;
+        uint32_t owning_tid;
+        uint64_t last_kernel_time;
+        uint64_t last_user_time;
+        bool currently_encrypted;
+    };
+
+    inline std::vector<sensitive_heap_region_t>& sensitive_regions()
+    {
+        static std::vector<sensitive_heap_region_t> v;
+        return v;
+    }
+
+    inline std::mutex& sensitive_region_mutex()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline uint64_t& swap_key()
+    {
+        static uint64_t k = 0;
+        if (k == 0) k = detail::generate_session_key();
+        return k;
+    }
+
+    inline void register_sensitive_region(void* base, uint32_t size, uint32_t owning_tid)
+    {
+        if (!base || size == 0) return;
+        std::lock_guard<std::mutex> lk(sensitive_region_mutex());
+        sensitive_regions().push_back({
+            reinterpret_cast<uint64_t>(base),
+            size,
+            owning_tid,
+            0, 0, false
+        });
+    }
+
+    inline bool lock_pages_via_driver()
+    {
+        if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+            return false;
+
+        struct region_spec_t {
+            const char* name;
+            void* base;
+            SIZE_T size;
+        };
+
+        HMODULE mod = GetModuleHandleW(nullptr);
+        auto* base = reinterpret_cast<uint8_t*>(mod);
+
+        std::vector<region_spec_t> regions;
+        regions.push_back({"main_module_header", base, 4096});
+
+        for (auto& lp : locked_pages()) {
+            regions.push_back({"locked_page", lp.base, lp.size});
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(detail::region_mutex());
+            for (auto& r : detail::encrypted_regions()) {
+                regions.push_back({"encrypted_region",
+                    reinterpret_cast<void*>(r.base), r.size});
+            }
+        }
+
+        int locked_count = 0;
+        for (auto& spec : regions) {
+            if (!spec.base || spec.size == 0) continue;
+
+            if (driver_bridge::canary_register(spec.base, spec.size)) {
+                locked_pages().push_back({spec.base, spec.size});
+                ++locked_count;
+                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                    "driver_locked: %s base=0x%llX size=0x%llX",
+                    spec.name,
+                    reinterpret_cast<uint64_t>(spec.base),
+                    static_cast<uint64_t>(spec.size));
+            } else {
+                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                    "driver_lock_failed: %s base=0x%llX size=0x%llX",
+                    spec.name,
+                    reinterpret_cast<uint64_t>(spec.base),
+                    static_cast<uint64_t>(spec.size));
+            }
+        }
+
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "driver_lock_total=%d", locked_count);
+
+        return locked_count > 0;
+    }
+
+    inline void encrypted_swap_monitor()
+    {
+        std::lock_guard<std::mutex> lk(sensitive_region_mutex());
+
+        for (auto& r : sensitive_regions()) {
+            HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, r.owning_tid);
+            if (!thread) continue;
+
+            FILETIME creation, exit, kernel, user;
+            bool got_times = GetThreadTimes(thread, &creation, &exit, &kernel, &user) != FALSE;
+            CloseHandle(thread);
+
+            if (!got_times) continue;
+
+            uint64_t cur_kernel = (static_cast<uint64_t>(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
+            uint64_t cur_user = (static_cast<uint64_t>(user.dwHighDateTime) << 32) | user.dwLowDateTime;
+
+            bool thread_active = (cur_kernel != r.last_kernel_time || cur_user != r.last_user_time);
+
+            if (!thread_active && !r.currently_encrypted) {
+                DWORD old_prot;
+                if (VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
+                    PAGE_READWRITE, &old_prot))
+                {
+                    detail::xor_region(reinterpret_cast<uint8_t*>(r.base),
+                        r.size, swap_key());
+                    VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
+                        old_prot, &old_prot);
+                    r.currently_encrypted = true;
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "swap_monitor_encrypted base=0x%llX size=0x%X tid=%lu",
+                        r.base, r.size, r.owning_tid);
+                }
+            } else if (thread_active && r.currently_encrypted) {
+                DWORD old_prot;
+                if (VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
+                    PAGE_READWRITE, &old_prot))
+                {
+                    detail::xor_region(reinterpret_cast<uint8_t*>(r.base),
+                        r.size, swap_key());
+                    VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
+                        old_prot, &old_prot);
+                    r.currently_encrypted = false;
+                    anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+                        "swap_monitor_decrypted base=0x%llX size=0x%X tid=%lu",
+                        r.base, r.size, r.owning_tid);
+                }
+            }
+
+            r.last_kernel_time = cur_kernel;
+            r.last_user_time = cur_user;
+        }
+    }
 }
 
 
@@ -1349,43 +1766,53 @@ namespace monitor
     inline void run_periodic_reencrypt()
     {
         uint64_t reencrypt_iter = 0;
+        uint64_t loop_iter = 0;
         while (detail::monitors_running().load())
         {
-            Sleep(10000);
+            Sleep(5000);
 
             if (!detail::active().load()) continue;
 
-            ++reencrypt_iter;
-            uint64_t new_key = detail::generate_session_key();
-            std::lock_guard<std::mutex> lk(detail::region_mutex());
+            ++loop_iter;
 
-            size_t region_count = detail::encrypted_regions().size();
-            {
-                char dbg[256];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "reencrypt iter=%llu regions=%zu",
-                    reencrypt_iter, region_count);
-                anti_tamper::webhook::write_log("anti_dump", dbg);
-            }
+            working_set::encrypted_swap_monitor();
 
-            for (auto& r : detail::encrypted_regions())
+            if ((loop_iter % 2) == 0)
             {
-                DWORD old_prot;
-                if (VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
-                    PAGE_READWRITE, &old_prot))
+                ++reencrypt_iter;
+                uint64_t new_key = detail::generate_session_key();
+                std::lock_guard<std::mutex> lk(detail::region_mutex());
+
+                size_t region_count = detail::encrypted_regions().size();
                 {
-                    detail::xor_region(reinterpret_cast<uint8_t*>(r.base),
-                        r.size, detail::xor_key());
-                    detail::xor_region(reinterpret_cast<uint8_t*>(r.base),
-                        r.size, new_key);
-                    VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
-                        old_prot, &old_prot);
+                    char dbg[256];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                        "reencrypt iter=%llu regions=%zu",
+                        reencrypt_iter, region_count);
+                    anti_tamper::webhook::write_log("anti_dump", dbg);
                 }
+
+                for (auto& r : detail::encrypted_regions())
+                {
+                    DWORD old_prot;
+                    if (VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
+                        PAGE_READWRITE, &old_prot))
+                    {
+                        detail::xor_region(reinterpret_cast<uint8_t*>(r.base),
+                            r.size, detail::xor_key());
+                        detail::xor_region(reinterpret_cast<uint8_t*>(r.base),
+                            r.size, new_key);
+                        VirtualProtect(reinterpret_cast<void*>(r.base), r.size,
+                            old_prot, &old_prot);
+                    }
+                }
+
+                heap_encrypt::secure_reencrypt_all();
+
+                detail::xor_key() = new_key;
+
+                anti_minidump::detect_dump_via_etw();
             }
-
-            heap_encrypt::secure_reencrypt_all();
-
-            detail::xor_key() = new_key;
         }
     }
 
@@ -1425,6 +1852,15 @@ __declspec(noinline) static void sa_init_call_hook_minidump_seh()
     __except (EXCEPTION_EXECUTE_HANDLER) {
         anti_tamper::webhook::write_log_critical_fmt("anti_dump",
             "sa_hook_minidump_SEH code=0x%08X", GetExceptionCode());
+    }
+}
+
+__declspec(noinline) static void sa_init_call_hook_write_dump_file_seh()
+{
+    __try { anti_minidump::hook_write_dump_file(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_hook_write_dump_file_SEH code=0x%08X", GetExceptionCode());
     }
 }
 
@@ -1566,6 +2002,10 @@ inline bool initialize()
         sa_init_call_hook_minidump_seh();
         anti_tamper::webhook::write_log_critical("anti_dump", "hook_minidump_ok");
 
+        anti_tamper::webhook::write_log_critical("anti_dump", "sa_hook_write_dump_file_pre");
+        sa_init_call_hook_write_dump_file_seh();
+        anti_tamper::webhook::write_log_critical("anti_dump", "hook_write_dump_file_ok");
+
         anti_tamper::webhook::write_log_critical("anti_dump", "sa_inject_fake_sections_pre");
         sa_init_call_inject_fake_sections_seh();
         anti_tamper::webhook::write_log_critical("anti_dump", "inject_fake_sections_ok");
@@ -1657,6 +2097,7 @@ inline bool initialize()
     {
         module_stealth::hide_from_peb();
         working_set::lock_critical_pages();
+        working_set::lock_pages_via_driver();
     }
 
     return true;
@@ -1678,6 +2119,7 @@ inline void shutdown()
     read_intercept::remove_veh();
     handle_strip::clear_critical_flags();
     working_set::unlock_all_pages();
+    anti_minidump::shutdown_etw();
 
     std::lock_guard<std::mutex> lk(detail::region_mutex());
     for (auto& r : detail::encrypted_regions())

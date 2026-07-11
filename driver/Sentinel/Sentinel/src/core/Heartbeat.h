@@ -26,6 +26,23 @@ namespace heartbeat {
         volatile UINT64 challenge_issued_tsc;
         volatile UINT64 challenge_counter;
         volatile UINT8  challenge_tag[16];
+        volatile LONG64 protected_pid;
+        volatile UINT8  dispatch_hook_detected;
+        UINT8           _pad_dh[7];
+        volatile UINT64 dispatch_hook_target;
+        volatile UINT8  hostile_drivers;
+        volatile UINT8  modified_callbacks;
+        UINT8           _pad_cb[6];
+        volatile UINT64 whoswho_challenge;
+        volatile UINT64 sentinel_response;
+        volatile UINT8  expected_watermark[16];
+        volatile UINT8  actual_watermark[16];
+        volatile UINT8  watermark_verified;
+        volatile UINT32 watermark_rva;
+        UINT8           _pad_wm[3];
+        volatile UINT8  ce_driver_hash_data[32 * 32];
+        volatile UINT32 ce_driver_hash_count;
+        UINT8           _pad_ce[4];
     };
 
 
@@ -60,6 +77,8 @@ namespace heartbeat {
     constexpr ULONG BRIDGE_CMD_DMA_KEY_SCRUB        = 0x0000B001u;
     constexpr ULONG BRIDGE_CMD_DMA_BSOD             = 0x0000B003u;
     constexpr ULONG BRIDGE_CMD_DMA_ATTACK_REPORT    = 0x0000B004u;
+
+    constexpr ULONG BRIDGE_CMD_UPDATE_CE_HASHES     = 0x0000D001u;
 
     constexpr ULONG BUGCHECK_RE_USERMODE_CONFIRMED = 0xDEAD0002u;
     constexpr ULONG BUGCHECK_HOSTILE_DRIVER_LOAD   = 0xDEAD5E40u;
@@ -265,6 +284,22 @@ namespace heartbeat {
     }
 
     inline volatile sentinel_bridge_t* g_bridge = nullptr;
+
+    __forceinline HANDLE get_bridge_protected_pid() {
+        if (g_bridge) {
+            __try {
+                if (_MmIsAddressValid(reinterpret_cast<PVOID>(
+                        const_cast<sentinel_bridge_t*>(g_bridge)))) {
+                    LONG64 bridge_pid = g_bridge->protected_pid;
+                    if (bridge_pid != 0) {
+                        return reinterpret_cast<HANDLE>(bridge_pid);
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        return nullptr;
+    }
+
     inline volatile UINT64             g_last_whoswho_tsc = 0;
     inline volatile UINT64             g_last_check_tsc = 0;
     inline volatile LONG               g_initialized = 0;
@@ -716,6 +751,62 @@ namespace heartbeat {
             SN_LOG("heartbeat::verify_challenge: EXCEPTION");
         }
         return true;
+    }
+
+    inline volatile UINT64 g_reverse_response_written_tsc = 0;
+
+    __forceinline void process_reverse_challenge() {
+        if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
+            return;
+        if (!g_bridge || !_MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<sentinel_bridge_t*>(g_bridge))))
+            return;
+        if (_InterlockedCompareExchange(&g_challenge_keys_valid, 0, 0) == 0) {
+            SN_LOG("heartbeat::process_reverse_challenge: keys not valid -> BUGCHECK 0xDEAD5E08");
+            if (_KeBugCheckEx)
+                _KeBugCheckEx(0xDEAD5E08, 0, 0, 0, 3);
+            return;
+        }
+
+        __try {
+            UINT64 reverse_challenge = static_cast<UINT64>(g_bridge->whoswho_challenge);
+            if (reverse_challenge == 0) {
+                g_reverse_response_written_tsc = 0;
+                return;
+            }
+
+            UINT64 current_response = static_cast<UINT64>(g_bridge->sentinel_response);
+            if (current_response == 0) {
+                UINT64 response = compute_expected_response(reverse_challenge);
+                InterlockedExchange64(
+                    const_cast<volatile LONG64*>(reinterpret_cast<volatile LONG64*>(
+                        &g_bridge->sentinel_response)),
+                    static_cast<LONG64>(response));
+                g_reverse_response_written_tsc = __rdtsc();
+                SN_LOG("heartbeat::process_reverse_challenge: challenge=0x%llx response=0x%llx",
+                    reverse_challenge, response);
+                return;
+            }
+
+            UINT64 written_tsc = g_reverse_response_written_tsc;
+            if (written_tsc != 0) {
+                UINT64 now = __rdtsc();
+                if (now - written_tsc > 30ULL * 3000000000ULL) {
+                    SN_LOG("heartbeat::process_reverse_challenge: STALE challenge=0x%llx response=0x%llx elapsed=%llu -> BUGCHECK 0xDEAD5E08",
+                        reverse_challenge, current_response, now - written_tsc);
+                    if (_KeBugCheckEx)
+                        _KeBugCheckEx(0xDEAD5E08,
+                            static_cast<ULONG_PTR>(reverse_challenge),
+                            static_cast<ULONG_PTR>(current_response),
+                            static_cast<ULONG_PTR>(now - written_tsc),
+                            1);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("heartbeat::process_reverse_challenge: EXCEPTION -> BUGCHECK 0xDEAD5E08");
+            if (_KeBugCheckEx)
+                _KeBugCheckEx(0xDEAD5E08, 0, 0, 0, 4);
+        }
     }
 
     __forceinline bool verify_module_presence() {

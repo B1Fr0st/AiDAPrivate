@@ -585,16 +585,54 @@ namespace mcp_standalone::ida_compat
             s["calculate"] = json::parse(R"({
                 "type": "object",
                 "properties": {
+                    "id": {"type": "string"},
                     "expression": {"type": "string", "maxLength": 4096},
+                    "bits": {
+                        "oneOf": [
+                            {"type": "integer", "minimum": 1, "maximum": 65536},
+                            {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                        ]
+                    },
+                    "width": {
+                        "oneOf": [
+                            {"type": "integer", "minimum": 1, "maximum": 65536},
+                            {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                        ]
+                    },
+                    "signed": {
+                        "oneOf": [
+                            {"type": "boolean"},
+                            {"type": "string", "pattern": "^(?:[sS][iI][gG][nN][eE][dD]|[uU][nN][sS][iI][gG][nN][eE][dD])$"}
+                        ]
+                    },
                     "items": {
                         "type": "array",
+                        "minItems": 1,
                         "maxItems": 128,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "id": {"type": "string"},
                                 "expression": {"type": "string", "maxLength": 4096},
-                                "format": {"type": "string", "enum": ["decimal", "hex", "octal", "binary", "all"], "default": "hex"}
+                                "bits": {
+                                    "oneOf": [
+                                        {"type": "integer", "minimum": 1, "maximum": 65536},
+                                        {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                    ]
+                                },
+                                "width": {
+                                    "oneOf": [
+                                        {"type": "integer", "minimum": 1, "maximum": 65536},
+                                        {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                    ]
+                                },
+                                "signed": {
+                                    "oneOf": [
+                                        {"type": "boolean"},
+                                        {"type": "string", "pattern": "^(?:[sS][iI][gG][nN][eE][dD]|[uU][nN][sS][iI][gG][nN][eE][dD])$"}
+                                    ]
+                                },
+                                "format": {"type": "string", "enum": ["decimal", "hex", "octal", "oct", "binary", "bin", "all"], "default": "hex"}
                             },
                             "required": ["expression"],
                             "additionalProperties": false
@@ -604,23 +642,58 @@ namespace mcp_standalone::ida_compat
                         "type": "object",
                         "additionalProperties": {"type": "string"}
                     },
-                    "format": {"type": "string", "enum": ["decimal", "hex", "octal", "binary", "all"], "default": "hex"},
+                    "format": {"type": "string", "enum": ["decimal", "hex", "octal", "oct", "binary", "bin", "all"], "default": "hex"},
                     "mapping": {
                         "type": "object",
                         "properties": {
-                            "image_base": {"type": "string"},
+                            "image_base": {
+                                "oneOf": [
+                                    {"type": "integer", "minimum": 0},
+                                    {"type": "string", "minLength": 1, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                ]
+                            },
                             "sections": {
                                 "type": "array",
+                                "maxItems": 1024,
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "name": {"type": "string"},
-                                        "va_start": {"type": "string"},
-                                        "va_end": {"type": "string"},
-                                        "rva_start": {"type": "integer"},
-                                        "file_offset_start": {"type": "integer"}
+                                        "va_start": {
+                                            "oneOf": [
+                                                {"type": "integer", "minimum": 0},
+                                                {"type": "string", "minLength": 1, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                            ]
+                                        },
+                                        "rva_start": {
+                                            "oneOf": [
+                                                {"type": "integer", "minimum": 0},
+                                                {"type": "string", "minLength": 1, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                            ]
+                                        },
+                                        "virtual_size": {
+                                            "oneOf": [
+                                                {"type": "integer", "minimum": 0},
+                                                {"type": "string", "minLength": 1, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                            ]
+                                        },
+                                        "raw_offset": {
+                                            "oneOf": [
+                                                {"type": "integer", "minimum": 0},
+                                                {"type": "string", "minLength": 1, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                            ]
+                                        },
+                                        "raw_size": {
+                                            "oneOf": [
+                                                {"type": "integer", "minimum": 0},
+                                                {"type": "string", "minLength": 1, "pattern": "^\\+?(?:[0-9](?:_?[0-9])*|0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*)$"}
+                                            ]
+                                        }
                                     },
-                                    "required": ["name", "va_start", "va_end", "rva_start", "file_offset_start"],
+                                    "required": ["virtual_size", "raw_offset", "raw_size"],
+                                    "anyOf": [
+                                        {"required": ["rva_start"]},
+                                        {"required": ["va_start"]}
+                                    ],
                                     "additionalProperties": false
                                 }
                             }
@@ -628,6 +701,10 @@ namespace mcp_standalone::ida_compat
                         "additionalProperties": false
                     }
                 },
+                "anyOf": [
+                    {"required": ["expression"]},
+                    {"required": ["items"]}
+                ],
                 "additionalProperties": false
             })");
 
@@ -638,6 +715,46 @@ namespace mcp_standalone::ida_compat
                 "properties": {},
                 "additionalProperties": false
             })");
+
+            const json calculator_integer_value = {
+                {"oneOf", json::array({
+                    json{{"type", "integer"}},
+                    json{{"type", "string"}, {"minLength", 1}, {"maxLength", 65536}}
+                })}
+            };
+            const json calculator_variable_value = {
+                {"oneOf", json::array({
+                    json{{"type", "integer"}},
+                    json{{"type", "string"}, {"minLength", 1}, {"maxLength", 65536}},
+                    json{
+                        {"type", "object"},
+                        {"properties", {
+                            {"integer", calculator_integer_value},
+                            {"bytes", json{{"type", "string"}, {"maxLength", 2097152}}},
+                            {"ascii", json{{"type", "string"}, {"maxLength", 1048576}}},
+                            {"utf8", json{{"type", "string"}, {"maxLength", 1048576}}}
+                        }},
+                        {"anyOf", json::array({
+                            json{{"required", json::array({"integer"})}},
+                            json{{"required", json::array({"bytes"})}},
+                            json{{"required", json::array({"ascii"})}},
+                            json{{"required", json::array({"utf8"})}}
+                        })},
+                        {"additionalProperties", false}
+                    }
+                })}
+            };
+            const json calculator_variables = {
+                {"type", "object"},
+                {"propertyNames", json{{"pattern", "^[A-Za-z_][A-Za-z0-9_]*$"}}},
+                {"additionalProperties", calculator_variable_value}
+            };
+            const json calculator_mapping = s["calculate"]["properties"]["mapping"];
+            s["calculate"]["properties"]["variables"] = calculator_variables;
+            s["calculate"]["properties"]["items"]["items"]["properties"]["variables"] =
+                calculator_variables;
+            s["calculate"]["properties"]["items"]["items"]["properties"]["mapping"] =
+                calculator_mapping;
 
             const json selector_bin_name = {
                 {"type", "string"},

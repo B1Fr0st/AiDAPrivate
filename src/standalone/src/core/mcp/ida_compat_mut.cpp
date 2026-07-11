@@ -1723,16 +1723,4 @@ namespace mcp_standalone::ida_compat
         };
     }
 
-    void register_mutation_tools(server_t& server)
-    {
-        for (const auto& definition : get_mutation_tool_defs()) {
-            tool_def_t tool;
-            tool.name = definition.name;
-            tool.description = std::string("ida-pro-mcp compatible mutation: ") + definition.name;
-            tool.read_only = false;
-            tool.visibility = tool_visibility_t::external_visible;
-            tool.workspace_handler = definition.handler;
-            server.register_tool(std::move(tool));
-        }
-    }
 }

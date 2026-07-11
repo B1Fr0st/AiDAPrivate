@@ -35,6 +35,11 @@ struct env_bundle_t
     uint64_t rdtsc_delta;
     uint64_t process_state;
     uint64_t filesystem_state;
+    uint64_t peb_entropy;
+    uint64_t kuser_shared_data_entropy;
+    uint64_t teb_entropy;
+    uint64_t cpu_topology_entropy;
+    uint64_t smbios_entropy;
     uint64_t aggregate;
 };
 
@@ -302,19 +307,39 @@ namespace detail {
         return _mm_xor_si128(key, tmp);
     }
 
+    static __forceinline uint8_t aes_compute_rcon(int round) {
+        if (round <= 0) return 0;
+        volatile uint64_t tsc = __rdtsc();
+        volatile uint8_t noise = static_cast<uint8_t>(tsc & 0xFF);
+        uint8_t r = 1;
+        for (int j = 1; j < round; ++j) {
+            uint8_t hi = r & 0x80u;
+            r = static_cast<uint8_t>(r << 1);
+            if (hi) r ^= 0x1Bu;
+        }
+        volatile uint8_t masked = r ^ noise;
+        return static_cast<uint8_t>(masked ^ noise);
+    }
+
+    static __forceinline __m128i aes128_keygen_rcon(__m128i prev_key, int round) {
+        uint8_t rcon = aes_compute_rcon(round);
+        __m128i keygened = aes128_expand_key_round(prev_key, _mm_aeskeygenassist_si128(prev_key, 0));
+        return _mm_xor_si128(keygened, _mm_set1_epi32(static_cast<int>(rcon) << 24));
+    }
+
     static __forceinline void aes128_key_schedule(__m128i key, __m128i round_keys[11])
     {
         round_keys[0] = key;
-        round_keys[1]  = aes128_expand_key_round(round_keys[0],  _mm_aeskeygenassist_si128(round_keys[0],  0x01));
-        round_keys[2]  = aes128_expand_key_round(round_keys[1],  _mm_aeskeygenassist_si128(round_keys[1],  0x02));
-        round_keys[3]  = aes128_expand_key_round(round_keys[2],  _mm_aeskeygenassist_si128(round_keys[2],  0x04));
-        round_keys[4]  = aes128_expand_key_round(round_keys[3],  _mm_aeskeygenassist_si128(round_keys[3],  0x08));
-        round_keys[5]  = aes128_expand_key_round(round_keys[4],  _mm_aeskeygenassist_si128(round_keys[4],  0x10));
-        round_keys[6]  = aes128_expand_key_round(round_keys[5],  _mm_aeskeygenassist_si128(round_keys[5],  0x20));
-        round_keys[7]  = aes128_expand_key_round(round_keys[6],  _mm_aeskeygenassist_si128(round_keys[6],  0x40));
-        round_keys[8]  = aes128_expand_key_round(round_keys[7],  _mm_aeskeygenassist_si128(round_keys[7],  0x80));
-        round_keys[9]  = aes128_expand_key_round(round_keys[8],  _mm_aeskeygenassist_si128(round_keys[8],  0x1B));
-        round_keys[10] = aes128_expand_key_round(round_keys[9],  _mm_aeskeygenassist_si128(round_keys[9],  0x36));
+        round_keys[1]  = aes128_keygen_rcon(round_keys[0], 1);
+        round_keys[2]  = aes128_keygen_rcon(round_keys[1], 2);
+        round_keys[3]  = aes128_keygen_rcon(round_keys[2], 3);
+        round_keys[4]  = aes128_keygen_rcon(round_keys[3], 4);
+        round_keys[5]  = aes128_keygen_rcon(round_keys[4], 5);
+        round_keys[6]  = aes128_keygen_rcon(round_keys[5], 6);
+        round_keys[7]  = aes128_keygen_rcon(round_keys[6], 7);
+        round_keys[8]  = aes128_keygen_rcon(round_keys[7], 8);
+        round_keys[9]  = aes128_keygen_rcon(round_keys[8], 9);
+        round_keys[10] = aes128_keygen_rcon(round_keys[9], 10);
     }
 
     static __forceinline uint8_t aes128_encrypt_first_byte(
@@ -454,6 +479,24 @@ namespace detail {
         ui.LowPart = ft_write.dwLowDateTime;
         ui.HighPart = ft_write.dwHighDateTime;
         return ui.QuadPart;
+    }
+
+    __forceinline uint64_t rotl64(uint64_t v, int r)
+    {
+        return (v << r) | (v >> (64 - r));
+    }
+
+    __forceinline uint64_t fnv1a_64(const uint8_t* data, size_t len)
+    {
+        constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+        constexpr uint64_t FNV_PRIME        = 1099511628211ULL;
+        uint64_t hash = FNV_OFFSET_BASIS;
+        for (size_t i = 0; i < len; ++i)
+        {
+            hash ^= static_cast<uint64_t>(data[i]);
+            hash *= FNV_PRIME;
+        }
+        return hash;
     }
 
 }
@@ -661,11 +704,172 @@ inline uint64_t collect_filesystem_state()
     return state;
 }
 
+inline uint64_t collect_peb_entropy()
+{
+    uint64_t mixed = 0;
+
+    __try {
+        uint8_t* peb = reinterpret_cast<uint8_t*>(__readgsqword(0x60));
+        if (peb == nullptr) return detail::FAIL_CLOSED_SENTINEL;
+
+        uint8_t  being_debugged     = *reinterpret_cast<uint8_t*>(peb + 0x02);
+        uint32_t nt_global_flag     = *reinterpret_cast<uint32_t*>(peb + 0xBC);
+        uint64_t process_heap       = *reinterpret_cast<uint64_t*>(peb + 0x30);
+        uint32_t number_of_procs    = *reinterpret_cast<uint32_t*>(peb + 0x104);
+        uint64_t image_base_address = *reinterpret_cast<uint64_t*>(peb + 0x10);
+
+        mixed ^= static_cast<uint64_t>(being_debugged);
+        mixed = detail::rotl64(mixed, 7);
+        mixed ^= static_cast<uint64_t>(nt_global_flag);
+        mixed = detail::rotl64(mixed, 11);
+        mixed ^= process_heap;
+        mixed = detail::rotl64(mixed, 13);
+        mixed ^= static_cast<uint64_t>(number_of_procs);
+        mixed = detail::rotl64(mixed, 17);
+        mixed ^= image_base_address;
+        mixed = detail::rotl64(mixed, 23);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return detail::FAIL_CLOSED_SENTINEL;
+    }
+
+    return mixed;
+}
+
+inline uint64_t collect_kuser_shared_data_entropy()
+{
+    constexpr uintptr_t KUSER_SHARED_DATA_ADDR = 0x7FFE0000ULL;
+
+    uint64_t mixed = 0;
+
+    __try {
+        uint8_t* ksd = reinterpret_cast<uint8_t*>(KUSER_SHARED_DATA_ADDR);
+
+        uint64_t tick_count  = *reinterpret_cast<uint64_t*>(ksd + 0x320);
+        uint64_t system_time = *reinterpret_cast<uint64_t*>(ksd + 0x14);
+        uint64_t cookie      = *reinterpret_cast<uint64_t*>(ksd + 0x330);
+
+        mixed ^= tick_count;
+        mixed = detail::rotl64(mixed, 13);
+        mixed ^= system_time;
+        mixed = detail::rotl64(mixed, 17);
+        mixed ^= cookie;
+        mixed = detail::rotl64(mixed, 23);
+
+        volatile LONG* random_seed_ptr = reinterpret_cast<volatile LONG*>(ksd + 0x338);
+        uint32_t random_seed = *random_seed_ptr;
+        mixed ^= static_cast<uint64_t>(random_seed);
+        mixed = detail::rotl64(mixed, 29);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return detail::FAIL_CLOSED_SENTINEL;
+    }
+
+    return mixed;
+}
+
+inline uint64_t collect_teb_entropy()
+{
+    uint64_t mixed = 0;
+
+    __try {
+        uint8_t* teb = reinterpret_cast<uint8_t*>(__readgsqword(0x30));
+        if (teb == nullptr) return detail::FAIL_CLOSED_SENTINEL;
+
+        uint32_t pid          = *reinterpret_cast<uint32_t*>(teb + 0x40);
+        uint32_t tid          = *reinterpret_cast<uint32_t*>(teb + 0x48);
+        uint64_t stack_base   = *reinterpret_cast<uint64_t*>(teb + 0x08);
+        uint64_t stack_limit  = *reinterpret_cast<uint64_t*>(teb + 0x10);
+        uint32_t gdi_batch    = *reinterpret_cast<uint32_t*>(teb + 0x174);
+
+        mixed ^= static_cast<uint64_t>(pid);
+        mixed = detail::rotl64(mixed, 7);
+        mixed ^= static_cast<uint64_t>(tid);
+        mixed = detail::rotl64(mixed, 11);
+        mixed ^= stack_base;
+        mixed = detail::rotl64(mixed, 13);
+        mixed ^= stack_limit;
+        mixed = detail::rotl64(mixed, 17);
+        mixed ^= static_cast<uint64_t>(gdi_batch);
+        mixed = detail::rotl64(mixed, 23);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return detail::FAIL_CLOSED_SENTINEL;
+    }
+
+    return mixed;
+}
+
+inline uint64_t collect_cpu_topology_entropy()
+{
+    int regs[4] = {};
+
+    uint64_t mixed = 0;
+
+    __cpuid(regs, 1);
+    uint32_t ebx = static_cast<uint32_t>(regs[1]);
+    uint32_t edx = static_cast<uint32_t>(regs[3]);
+    uint32_t logical_per_core = (ebx >> 8) & 0xFF;
+    uint32_t htt_support      = (edx >> 28) & 0x1;
+
+    mixed ^= static_cast<uint64_t>(logical_per_core);
+    mixed = detail::rotl64(mixed, 7);
+    mixed ^= static_cast<uint64_t>(htt_support);
+    mixed = detail::rotl64(mixed, 11);
+
+    __cpuid(regs, 4);
+    uint32_t eax4 = static_cast<uint32_t>(regs[0]);
+    uint32_t max_logical_ids = (eax4 >> 14) & 0xFFF;
+
+    mixed ^= static_cast<uint64_t>(max_logical_ids);
+    mixed = detail::rotl64(mixed, 13);
+
+    __cpuid(regs, 0x80000008);
+    uint32_t ecx8 = static_cast<uint32_t>(regs[2]);
+    uint32_t phys_addr_bits = ecx8 & 0xFF;
+
+    mixed ^= static_cast<uint64_t>(phys_addr_bits);
+    mixed = detail::rotl64(mixed, 17);
+
+    return mixed;
+}
+
+inline uint64_t collect_smbios_entropy()
+{
+    __try {
+        DWORD size = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
+        if (size == 0) return __rdtsc();
+
+        uint8_t* buffer = static_cast<uint8_t*>(
+            VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!buffer) return __rdtsc();
+
+        DWORD actual = GetSystemFirmwareTable('RSMB', 0, buffer, size);
+        if (actual == 0 || actual > size)
+        {
+            VirtualFree(buffer, 0, MEM_RELEASE);
+            return __rdtsc();
+        }
+
+        size_t hash_len = static_cast<size_t>(actual);
+        if (hash_len > 256) hash_len = 256;
+
+        uint64_t result = detail::fnv1a_64(buffer, hash_len);
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        return result;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return __rdtsc();
+    }
+}
+
 inline bool verify_env_consistency(const env_bundle_t& env)
 {
     uint64_t expected = env.server_hmac ^ env.kernel_attestation ^
                         env.rdtsc_delta ^ env.process_state ^
-                        env.filesystem_state;
+                        env.filesystem_state ^ env.peb_entropy ^
+                        env.kuser_shared_data_entropy ^ env.teb_entropy ^
+                        env.cpu_topology_entropy ^ env.smbios_entropy;
     return env.aggregate == expected;
 }
 
@@ -673,15 +877,22 @@ inline env_bundle_t collect_all_environmental()
 {
     env_bundle_t env{};
 
-    env.server_hmac        = collect_server_hmac_challenge();
-    env.kernel_attestation = collect_kernel_attestation();
-    env.rdtsc_delta        = collect_rdtsc_delta();
-    env.process_state      = collect_process_state();
-    env.filesystem_state   = collect_filesystem_state();
+    env.server_hmac               = collect_server_hmac_challenge();
+    env.kernel_attestation        = collect_kernel_attestation();
+    env.rdtsc_delta               = collect_rdtsc_delta();
+    env.process_state             = collect_process_state();
+    env.filesystem_state          = collect_filesystem_state();
+    env.peb_entropy               = collect_peb_entropy();
+    env.kuser_shared_data_entropy = collect_kuser_shared_data_entropy();
+    env.teb_entropy               = collect_teb_entropy();
+    env.cpu_topology_entropy      = collect_cpu_topology_entropy();
+    env.smbios_entropy            = collect_smbios_entropy();
 
     env.aggregate = env.server_hmac ^ env.kernel_attestation ^
                     env.rdtsc_delta ^ env.process_state ^
-                    env.filesystem_state;
+                    env.filesystem_state ^ env.peb_entropy ^
+                    env.kuser_shared_data_entropy ^ env.teb_entropy ^
+                    env.cpu_topology_entropy ^ env.smbios_entropy;
 
     return env;
 }

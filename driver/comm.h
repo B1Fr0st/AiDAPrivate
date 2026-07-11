@@ -209,6 +209,13 @@ namespace ioctl_codes {
     __forceinline DWORD KRDM() { return make(72); }
     __forceinline DWORD XREV() { return make(73); }
     __forceinline DWORD RUHS() { return make(74); }
+    __forceinline DWORD KPHS() { return make(75); }
+    __forceinline DWORD SDGR() { return make(76); }
+    __forceinline DWORD SCBS() { return make(77); }
+
+    __forceinline DWORD HSHK() { return make(78); }
+    __forceinline DWORD HRES() { return make(79); }
+    __forceinline DWORD CEDH() { return make(81); }
 
     __forceinline DWORD HWID() {
         return static_cast<DWORD>(CTL_CODE(FILE_DEVICE_UNKNOWN, 0xA1D0, METHOD_BUFFERED, FILE_READ_DATA));
@@ -311,7 +318,7 @@ namespace voyager {
             if (encoded < base)
                 return false;
             const std::uint32_t candidate = encoded - base;
-            if (candidate > 74u)
+            if (candidate > 79u)
                 return false;
             offset = candidate;
             return true;
@@ -1328,6 +1335,19 @@ namespace voyager {
         };
         static_assert(sizeof(re_evidence_blob_t) == 56, "re_evidence_blob_t must match kernel struct");
 
+        constexpr std::uint32_t HANDSHAKE_MAGIC = 0x4853484Bu;
+
+        struct handshake_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint8_t  challenge[32];
+            std::uint8_t  response[32];
+            std::uint8_t  driver_challenge[32];
+            std::uint32_t verified;
+            std::uint32_t padding;
+        };
+        static_assert(sizeof(handshake_request) == 112, "handshake_request must match kernel struct");
+
         struct re_confirmed_usermode_request {
             std::uint32_t magic;
             std::uint32_t session_key;
@@ -1658,6 +1678,18 @@ namespace voyager {
         static_assert(sizeof(re_tool_hash_update_request) == 536, "re_tool_hash_update_request must match kernel struct");
 #pragma pack(pop)
 
+#pragma pack(push, 8)
+        struct ce_driver_hash_update_request {
+            std::uint32_t magic;
+            std::uint32_t hash_count;
+            std::uint32_t session_key;
+            std::uint32_t padding;
+            std::uint8_t  hashes[32 * 32];
+            std::uint64_t timestamp;
+        };
+        static_assert(sizeof(ce_driver_hash_update_request) == 1048, "ce_driver_hash_update_request must match kernel struct");
+#pragma pack(pop)
+
 #pragma pack(push, 1)
         struct reloc_mask_entry_abi_t {
             std::uint32_t offset;
@@ -1697,6 +1729,28 @@ namespace voyager {
         };
         static_assert(sizeof(cross_ring_evidence_abi_t) == 352,
             "cross_ring_evidence_abi_t must be 352 bytes");
+
+        struct prologue_hash_request {
+            std::uint64_t va;
+            std::uint32_t size;
+            std::uint32_t pad;
+            std::uint64_t hash_result;
+        };
+        static_assert(sizeof(prologue_hash_request) == 24, "prologue_hash_request must match kernel struct");
+
+        struct dispatch_guard_query {
+            std::uint8_t  hook_detected;
+            std::uint8_t  pad[7];
+            std::uint64_t hook_target;
+        };
+        static_assert(sizeof(dispatch_guard_query) == 16, "dispatch_guard_query must match kernel struct");
+
+        struct callback_scan_query {
+            std::uint8_t  hostile_drivers;
+            std::uint8_t  modified_callbacks;
+            std::uint8_t  pad[6];
+        };
+        static_assert(sizeof(callback_scan_query) == 8, "callback_scan_query must match kernel struct");
 
 #pragma pack(pop)
     }
@@ -2320,6 +2374,7 @@ namespace voyager {
         bool trigger_dma_countermeasure(std::uint32_t action, std::uint32_t reason) noexcept;
 
         bool update_re_tool_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept;
+        bool update_ce_driver_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept;
 
         struct anti_debug_result {
             std::uint32_t result_flags;
@@ -2360,7 +2415,14 @@ namespace voyager {
         bool relay_server_token(std::uint32_t token_hash, std::uint64_t server_nonce) noexcept;
         bool relay_server_token_v2(std::uint32_t token_hash, std::uint64_t server_nonce, std::uint64_t* out_driver_proof = nullptr) noexcept;
 
+        bool initiate_driver_handshake(std::uint8_t out_driver_challenge[32]) noexcept;
+        bool complete_driver_challenge(const std::uint8_t driver_challenge[32]) noexcept;
+
         bool run_hv_detect(detail::hv_detect_result& out) noexcept;
+
+        bool kernel_read_prologue_hash(std::uint64_t va, std::uint32_t size, std::uint64_t& out_hash) noexcept;
+        bool query_sentinel_dispatch_guard(std::uint8_t& out_hook_detected, std::uint64_t& out_hook_target) noexcept;
+        bool query_sentinel_callback_scan(std::uint8_t& out_hostile_drivers, std::uint8_t& out_modified_callbacks) noexcept;
 
         enum class debug_event_type_e : std::uint32_t {
             invalid         = 0,

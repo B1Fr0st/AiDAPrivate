@@ -5,6 +5,7 @@
 #include <tlhelp32.h>
 #include <bcrypt.h>
 #include <winternl.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +25,7 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "winhttp.lib")
 
 namespace anti_tamper {
 namespace anti_hook {
@@ -665,7 +667,39 @@ namespace detail {
         return m;
     }
 
+    struct self_func_entry_t
+    {
+        std::string name;
+        uint64_t address;
+    };
+
+    inline std::vector<self_func_entry_t>& self_func_inventory()
+    {
+        static std::vector<self_func_entry_t> v;
+        return v;
+    }
+
+    inline std::vector<prologue_baseline_t>& self_baselines()
+    {
+        static std::vector<prologue_baseline_t> v;
+        return v;
+    }
+
+    inline std::mutex& self_func_mtx()
+    {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::atomic<bool>& self_prologues_captured()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
 }
+
+inline bool capture_self_prologues();
 
 namespace baseline {
 
@@ -725,6 +759,8 @@ namespace baseline {
 
         if (detail::load_disk_image_ntdll())
             detail::disk_image_loaded().store(true);
+
+        capture_self_prologues();
 
         bool any = ok_n || ok_k;
         if (any)
@@ -917,6 +953,229 @@ namespace veh_chain {
         return true;
     }
 
+    inline bool is_microsoft_module(HMODULE mod)
+    {
+        if (!mod) return false;
+        wchar_t path[MAX_PATH]{};
+        DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
+        if (len == 0) return false;
+        CharLowerBuffW(path, len);
+
+        const wchar_t* const k_ms_modules[] = {
+            L"ntdll.dll",
+            L"kernelbase.dll",
+            L"kernel32.dll",
+            L"vcruntime140.dll",
+            L"vcruntime140_1.dll",
+            L"msvcp140.dll",
+            L"ucrtbase.dll",
+        };
+
+        for (const wchar_t* ms_name : k_ms_modules)
+        {
+            if (wcsstr(path, ms_name))
+                return true;
+        }
+        return false;
+    }
+
+    inline bool is_baseline_handler(uint64_t handler_va)
+    {
+        const auto& base = baseline_handlers();
+        for (uint64_t bh : base)
+        {
+            if (bh == handler_va) return true;
+        }
+        return false;
+    }
+
+    inline uint32_t remove_foreign_handlers()
+    {
+        uint64_t head_addr = list_head_addr().load();
+        if (head_addr == 0)
+        {
+            head_addr = locate_veh_list_head();
+            if (head_addr == 0) return 0;
+            list_head_addr().store(head_addr);
+        }
+
+        auto* head = reinterpret_cast<_VECTORED_HANDLER_LIST*>(head_addr);
+        if (!pointer_readable(head, sizeof(_VECTORED_HANDLER_LIST)))
+            return 0;
+
+        uint32_t removed = 0;
+
+        __try
+        {
+            LIST_ENTRY* cursor = head->ListHead.Flink;
+            uint32_t guard = 0;
+            while (cursor != &head->ListHead && guard < 256)
+            {
+                if (!pointer_readable(cursor, sizeof(LIST_ENTRY)))
+                    break;
+
+                auto* entry = CONTAINING_RECORD(cursor, _VECTORED_HANDLER_ENTRY, Entry);
+                if (!pointer_readable(entry, sizeof(_VECTORED_HANDLER_ENTRY)))
+                    break;
+
+                uint64_t handler_va = reinterpret_cast<uint64_t>(entry->VectoredHandler);
+                LIST_ENTRY* next = cursor->Flink;
+
+                bool is_known = is_baseline_handler(handler_va);
+                bool is_ms = false;
+                if (!is_known)
+                {
+                    HMODULE owner_mod = nullptr;
+                    BOOL owner_ok = GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        reinterpret_cast<LPCWSTR>(handler_va), &owner_mod);
+                    is_ms = owner_ok && owner_mod && is_microsoft_module(owner_mod);
+                }
+
+                if (!is_known && !is_ms)
+                {
+                    LIST_ENTRY* prev = cursor->Blink;
+                    if (prev && next)
+                    {
+                        prev->Flink = next;
+                        next->Blink = prev;
+                        ++removed;
+                        char dbg[256];
+                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                            "veh_foreign_handler_removed va=0x%llX",
+                            static_cast<unsigned long long>(handler_va));
+                        webhook::write_log_critical("veh_chain", dbg);
+                    }
+                }
+
+                cursor = next;
+                ++guard;
+                if (!cursor) break;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return removed;
+        }
+        return removed;
+    }
+
+    inline PVOID WINAPI veh_hook_AddVectoredExceptionHandler(
+        ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+    {
+        if (!Handler) return nullptr;
+
+        HMODULE self_mod = GetModuleHandleW(nullptr);
+        uint64_t self_base = reinterpret_cast<uint64_t>(self_mod);
+        uint64_t self_end = 0;
+        if (self_mod)
+        {
+            MODULEINFO mi{};
+            if (GetModuleInformation(GetCurrentProcess(), self_mod, &mi, sizeof(mi)))
+                self_end = self_base + mi.SizeOfImage;
+        }
+
+        HMODULE caller_mod = nullptr;
+        BOOL owner_ok = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(_ReturnAddress()),
+            &caller_mod);
+
+        bool caller_is_self = false;
+        if (owner_ok && caller_mod && self_mod)
+        {
+            uint64_t caller_addr = reinterpret_cast<uint64_t>(_ReturnAddress());
+            caller_is_self = caller_addr >= self_base && caller_addr < self_end;
+        }
+
+        if (!caller_is_self)
+        {
+            char dbg[256];
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "veh_insertion_blocked foreign_handler=0x%llX",
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Handler)));
+            webhook::write_log_critical("veh_chain", dbg);
+            return nullptr;
+        }
+
+        using AddVEH_t = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+        static AddVEH_t s_real_AddVEH = nullptr;
+        if (!s_real_AddVEH)
+        {
+            HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+            if (k32)
+                s_real_AddVEH = reinterpret_cast<AddVEH_t>(
+                    GetProcAddress(k32, "AddVectoredExceptionHandler"));
+        }
+        if (!s_real_AddVEH) return nullptr;
+        return s_real_AddVEH(First, Handler);
+    }
+
+    inline bool install_veh_insertion_protection()
+    {
+        HMODULE self_mod = GetModuleHandleW(nullptr);
+        if (!self_mod) return false;
+
+        auto* base = reinterpret_cast<uint8_t*>(self_mod);
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+        const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0) return false;
+
+        auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+            base + imp_dir.VirtualAddress);
+
+        FARPROC real_AddVEH = nullptr;
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        if (k32)
+            real_AddVEH = GetProcAddress(k32, "AddVectoredExceptionHandler");
+        if (!real_AddVEH) return false;
+
+        for (; imp->Name != 0; ++imp)
+        {
+            const char* dll_name = reinterpret_cast<const char*>(base + imp->Name);
+            if (_stricmp(dll_name, "kernel32.dll") != 0 &&
+                _stricmp(dll_name, "KERNEL32.dll") != 0 &&
+                _stricmp(dll_name, "kernel32") != 0)
+                continue;
+
+            if (imp->FirstThunk == 0) continue;
+            auto* iat = reinterpret_cast<uintptr_t*>(base + imp->FirstThunk);
+            auto* ilt = (imp->OriginalFirstThunk != 0)
+                ? reinterpret_cast<uintptr_t*>(base + imp->OriginalFirstThunk)
+                : iat;
+
+            for (size_t i = 0; iat[i] != 0; ++i)
+            {
+                if (IMAGE_SNAP_BY_ORDINAL(ilt[i])) continue;
+                auto* name_ref = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                    base + (ilt[i] & ~IMAGE_ORDINAL_FLAG));
+                if (strcmp(name_ref->Name, "AddVectoredExceptionHandler") != 0)
+                    continue;
+
+                if (reinterpret_cast<FARPROC>(iat[i]) != real_AddVEH)
+                    continue;
+
+                DWORD old_prot = 0;
+                if (!VirtualProtect(&iat[i], sizeof(uintptr_t),
+                    PAGE_READWRITE, &old_prot))
+                    continue;
+
+                iat[i] = reinterpret_cast<uintptr_t>(&veh_hook_AddVectoredExceptionHandler);
+
+                VirtualProtect(&iat[i], sizeof(uintptr_t), old_prot, &old_prot);
+                FlushInstructionCache(GetCurrentProcess(), &iat[i], sizeof(uintptr_t));
+
+                webhook::write_log("veh_chain", "veh_insertion_protection_installed");
+                return true;
+            }
+        }
+        return false;
+    }
+
 }
 
 namespace dr_scan {
@@ -1084,12 +1343,13 @@ namespace dispatch_check {
             {
                 for (size_t off = 0; off + 5 < 0x40; ++off)
                 {
-                    if (fn[off] == 0xE9 || fn[off] == 0xEB)
+                    if (fn[off] == 0xE9 || fn[off] == 0xE8 || fn[off] == 0xEB)
                     {
-                        int32_t disp = (fn[off] == 0xE9)
+                        bool is_rel32 = (fn[off] == 0xE9 || fn[off] == 0xE8);
+                        int32_t disp = is_rel32
                             ? *reinterpret_cast<const int32_t*>(fn + off + 1)
                             : static_cast<int32_t>(static_cast<int8_t>(fn[off + 1]));
-                        size_t skip = (fn[off] == 0xE9) ? 5 : 2;
+                        size_t skip = is_rel32 ? 5 : 2;
                         uint64_t target = reinterpret_cast<uint64_t>(fn + off) + skip + disp;
 
                         if (target < ntdll_range.base || target >= ntdll_range.end)
@@ -1099,7 +1359,7 @@ namespace dispatch_check {
                         }
                     }
 
-                    if (fn[off] == 0xFF && fn[off + 1] == 0x25)
+                    if (fn[off] == 0xFF && (fn[off + 1] == 0x25 || fn[off + 1] == 0x15))
                     {
                         int32_t disp = *reinterpret_cast<const int32_t*>(fn + off + 2);
                         uint64_t slot = reinterpret_cast<uint64_t>(fn + off) + 6 + disp;
@@ -1175,6 +1435,82 @@ inline bool is_self_hooked(uint64_t func_va)
         return true;
     }
     return false;
+}
+
+inline void register_self_function(const char* name, void* fn)
+{
+    if (!name || !fn) return;
+    std::lock_guard<std::mutex> lk(detail::self_func_mtx());
+    detail::self_func_entry_t e{};
+    e.name = name;
+    e.address = reinterpret_cast<uint64_t>(fn);
+    detail::self_func_inventory().push_back(std::move(e));
+}
+
+inline bool capture_self_prologues()
+{
+    std::lock_guard<std::mutex> lk(detail::self_func_mtx());
+    auto& baselines = detail::self_baselines();
+    baselines.clear();
+
+    for (const auto& entry : detail::self_func_inventory())
+    {
+        auto* addr = reinterpret_cast<const uint8_t*>(entry.address);
+        detail::prologue_baseline_t b{};
+        b.name = entry.name;
+        b.cached_va = entry.address;
+
+        uint8_t hash[32];
+        __try
+        {
+            if (!detail::sha256_hash(addr, detail::k_prologue_bytes, hash))
+                continue;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            continue;
+        }
+
+        memcpy(b.hash, hash, 32);
+        baselines.push_back(std::move(b));
+    }
+
+    detail::self_prologues_captured().store(!baselines.empty());
+    return !baselines.empty();
+}
+
+inline bool verify_self_prologue_hashes(std::string& mismatched_name)
+{
+    if (!detail::self_prologues_captured().load())
+        return true;
+
+    std::lock_guard<std::mutex> lk(detail::self_func_mtx());
+    for (const auto& b : detail::self_baselines())
+    {
+        auto* addr = reinterpret_cast<const uint8_t*>(b.cached_va);
+        uint8_t hash[32]{};
+
+        __try
+        {
+            if (!detail::sha256_hash(addr, detail::k_prologue_bytes, hash))
+            {
+                mismatched_name = b.name;
+                return false;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            mismatched_name = b.name;
+            return false;
+        }
+
+        if (memcmp(hash, b.hash, 32) != 0)
+        {
+            mismatched_name = b.name;
+            return false;
+        }
+    }
+    return true;
 }
 
 namespace vtable_check {
@@ -1462,6 +1798,46 @@ namespace self_heal {
             }
         }
 
+        if (report.prologue_hash_mismatch && !report.hooked_function.empty())
+        {
+            HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+            if (ntdll)
+            {
+                auto* fn = GetProcAddress(ntdll, report.hooked_function.c_str());
+                if (fn)
+                {
+                    if (restore_prologue(reinterpret_cast<uint64_t>(fn),
+                        report.hooked_function.c_str()))
+                        ++healed;
+                }
+                else
+                {
+                    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+                    if (k32)
+                    {
+                        fn = GetProcAddress(k32, report.hooked_function.c_str());
+                        if (fn && restore_prologue(reinterpret_cast<uint64_t>(fn),
+                            report.hooked_function.c_str()))
+                            ++healed;
+                    }
+                }
+            }
+        }
+
+        if (report.self_prologue_mismatch && !report.hooked_function.empty())
+        {
+            std::lock_guard<std::mutex> lk(detail::self_func_mtx());
+            for (const auto& b : detail::self_baselines())
+            {
+                if (b.name == report.hooked_function)
+                {
+                    if (restore_prologue(b.cached_va, b.name.c_str()))
+                        ++healed;
+                    break;
+                }
+            }
+        }
+
         return healed;
     }
 
@@ -1650,6 +2026,149 @@ inline bool verify_iat_target_modules(const std::vector<state::iat_entry_t>& sna
         }
         if (!in_module)
             return false;
+    }
+    return true;
+}
+
+inline bool verify_iat_module_identity(const std::vector<state::iat_entry_t>& snapshot)
+{
+    HMODULE self_mod = GetModuleHandleW(nullptr);
+    if (!self_mod) return true;
+
+    auto* self_base = reinterpret_cast<const uint8_t*>(self_mod);
+    const auto* self_dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(self_base);
+    if (self_dos->e_magic != IMAGE_DOS_SIGNATURE) return true;
+    const auto* self_nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        self_base + self_dos->e_lfanew);
+    if (self_nt->Signature != IMAGE_NT_SIGNATURE) return true;
+
+    uint64_t didat_start = 0;
+    uint64_t didat_end = 0;
+    const auto* self_sec = IMAGE_FIRST_SECTION(self_nt);
+    for (WORD i = 0; i < self_nt->FileHeader.NumberOfSections; ++i)
+    {
+        if (memcmp(self_sec[i].Name, ".didat", 6) == 0)
+        {
+            didat_start = reinterpret_cast<uint64_t>(self_base) + self_sec[i].VirtualAddress;
+            didat_end = didat_start + self_sec[i].Misc.VirtualSize;
+            break;
+        }
+    }
+
+    auto is_forwarder_allowed = [](const wchar_t* from_path, const wchar_t* to_path) -> bool {
+        if (!from_path || !to_path) return false;
+        wchar_t from_lower[MAX_PATH]{};
+        wchar_t to_lower[MAX_PATH]{};
+        wcsncpy_s(from_lower, from_path, MAX_PATH - 1);
+        wcsncpy_s(to_lower, to_path, MAX_PATH - 1);
+        CharLowerBuffW(from_lower, MAX_PATH);
+        CharLowerBuffW(to_lower, MAX_PATH);
+
+        auto contains = [](const wchar_t* haystack, const wchar_t* needle) -> bool {
+            return wcsstr(haystack, needle) != nullptr;
+        };
+
+        bool from_k32 = contains(from_lower, L"kernel32.dll");
+        bool from_kbase = contains(from_lower, L"kernelbase.dll");
+        bool to_kbase = contains(to_lower, L"kernelbase.dll");
+        bool to_ntdll = contains(to_lower, L"ntdll.dll");
+
+        if (from_k32 && (to_kbase || to_ntdll)) return true;
+        if (from_kbase && to_ntdll) return true;
+        return false;
+    };
+
+    auto module_has_forwarder = [](HMODULE mod, uint64_t export_rva) -> bool {
+        if (!mod || export_rva == 0) return false;
+        auto* base = reinterpret_cast<const uint8_t*>(mod);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+        const auto& exp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (exp_dir.VirtualAddress == 0 || exp_dir.Size == 0) return false;
+        uint64_t exp_start = reinterpret_cast<uint64_t>(base) + exp_dir.VirtualAddress;
+        uint64_t exp_end = exp_start + exp_dir.Size;
+        return export_rva >= exp_start && export_rva < exp_end;
+    };
+
+    for (const auto& e : snapshot)
+    {
+        uint64_t current = 0;
+        if (!detail::safe_read_uint64(e.slot_va, &current))
+            continue;
+        if (current == 0) continue;
+
+        if (didat_start != 0 && current >= didat_start && current < didat_end)
+            continue;
+
+        HMODULE current_mod = nullptr;
+        BOOL current_ok = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(current), &current_mod);
+        if (!current_ok || !current_mod)
+        {
+            webhook::write_log("iat_identity", "iat_entry_no_owning_module");
+            return false;
+        }
+
+        wchar_t current_path[MAX_PATH]{};
+        DWORD current_len = GetModuleFileNameW(current_mod, current_path, MAX_PATH);
+        if (current_len == 0)
+        {
+            webhook::write_log("iat_identity", "iat_entry_no_module_name");
+            return false;
+        }
+
+        HMODULE baseline_mod = nullptr;
+        BOOL baseline_ok = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(e.resolved_va), &baseline_mod);
+        if (!baseline_ok || !baseline_mod)
+            continue;
+
+        wchar_t baseline_path[MAX_PATH]{};
+        DWORD baseline_len = GetModuleFileNameW(baseline_mod, baseline_path, MAX_PATH);
+        if (baseline_len == 0)
+            continue;
+
+        if (current_mod == baseline_mod)
+            continue;
+
+        uint64_t current_rva = current - reinterpret_cast<uint64_t>(current_mod);
+        if (module_has_forwarder(baseline_mod, e.resolved_va))
+        {
+            if (is_forwarder_allowed(baseline_path, current_path))
+                continue;
+        }
+
+        bool current_is_system = false;
+        {
+            wchar_t current_lower[MAX_PATH]{};
+            wcsncpy_s(current_lower, current_path, MAX_PATH - 1);
+            CharLowerBuffW(current_lower, MAX_PATH);
+            if (wcsstr(current_lower, L"ntdll.dll") ||
+                wcsstr(current_lower, L"kernel32.dll") ||
+                wcsstr(current_lower, L"kernelbase.dll") ||
+                wcsstr(current_lower, L"ucrtbase.dll"))
+            {
+                current_is_system = true;
+            }
+        }
+
+        if (!current_is_system)
+        {
+            char dbg[512];
+            char cp[260]{};
+            char bp[260]{};
+            WideCharToMultiByte(CP_UTF8, 0, current_path, -1, cp, sizeof(cp), nullptr, nullptr);
+            WideCharToMultiByte(CP_UTF8, 0, baseline_path, -1, bp, sizeof(bp), nullptr, nullptr);
+            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                "iat_module_identity_mismatch current=%s baseline=%s slot_va=0x%llX",
+                cp, bp, e.slot_va);
+            webhook::write_log("iat_identity", dbg);
+            return false;
+        }
     }
     return true;
 }
@@ -1963,6 +2482,16 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
         }
     }
 
+    if (!report.iat_modified)
+    {
+        bool identity_ok = verify_iat_module_identity(iat_snap);
+        if (!identity_ok)
+        {
+            report.iat_modified = true;
+            webhook::send_debug_log("iat_identity", "iat_module_identity_failed", true);
+        }
+    }
+
     std::string ntdll_hooked;
     report.ntdll_inline_hooked = scan_inline_hooks_ntdll(ntdll_hooked);
     if (report.ntdll_inline_hooked)
@@ -2002,6 +2531,14 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
         webhook::send_debug_log("prologue_hash", "prologue_mismatch: " + proem, true);
     }
 
+    std::string self_proem;
+    report.self_prologue_mismatch = !verify_self_prologue_hashes(self_proem);
+    if (report.self_prologue_mismatch)
+    {
+        report.hooked_function = self_proem;
+        webhook::send_debug_log("self_prologue", "self_prologue_mismatch: " + self_proem, true);
+    }
+
     std::string disk_name;
     report.disk_image_mismatch = !verify_disk_image(disk_name);
     if (report.disk_image_mismatch)
@@ -2012,7 +2549,13 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
 
     report.veh_chain_tampered = !veh_chain::verify_chain();
     if (report.veh_chain_tampered)
+    {
         webhook::send_debug_log("veh_chain", "veh_chain_modified", true);
+        uint32_t removed = veh_chain::remove_foreign_handlers();
+        if (removed > 0)
+            webhook::write_log_critical_fmt("veh_chain",
+                "foreign_handlers_removed count=%u", removed);
+    }
 
     auto& rt = state::get();
     if (rt.code_snap.text_base != 0 && rt.code_snap.text_size != 0)
@@ -2095,6 +2638,7 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
     if (report.syscall_stubs_modified) report.summary += "syscall ";
     if (report.eat_hooked) report.summary += "eat ";
     if (report.prologue_hash_mismatch) report.summary += "prologue:" + proem + " ";
+    if (report.self_prologue_mismatch) report.summary += "selfprologue:" + self_proem + " ";
     if (report.disk_image_mismatch) report.summary += "disk:" + disk_name + " ";
     if (report.veh_chain_tampered) report.summary += "veh ";
     if (report.dr_in_text_range) report.summary += "dr ";
@@ -2113,6 +2657,479 @@ inline hook_report_t full_scan(const std::vector<state::iat_entry_t>& iat_snap)
 inline hook_report_t runtime_scan(const std::vector<state::iat_entry_t>& iat_snap)
 {
     return scan_impl(iat_snap, true);
+}
+
+namespace fetch_detail {
+
+    inline std::string compute_hmac_sha256_hex(const std::string& key,
+                                                const std::string& message)
+    {
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        DWORD hash_len = 0;
+        DWORD cbData = 0;
+        std::string result;
+
+        if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                         BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return result;
+
+        if (BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH,
+                              reinterpret_cast<PUCHAR>(&hash_len),
+                              sizeof(hash_len), &cbData, 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return result;
+        }
+
+        if (BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+                              reinterpret_cast<PUCHAR>(const_cast<char*>(key.data())),
+                              static_cast<ULONG>(key.size()), 0) != 0)
+        {
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return result;
+        }
+
+        if (BCryptHashData(hHash,
+                           reinterpret_cast<PUCHAR>(const_cast<char*>(message.data())),
+                           static_cast<ULONG>(message.size()), 0) != 0)
+        {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            return result;
+        }
+
+        std::vector<BYTE> hash_out(hash_len);
+        if (BCryptFinishHash(hHash, hash_out.data(), hash_len, 0) == 0)
+        {
+            char hex[65] = {};
+            for (DWORD i = 0; i < hash_len; ++i)
+                _snprintf_s(hex + i * 2, sizeof(hex) - i * 2, _TRUNCATE, "%02x", hash_out[i]);
+            result = hex;
+        }
+
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return result;
+    }
+
+    inline bool hex_string_to_bytes(const std::string& hex, uint8_t* out, size_t out_len)
+    {
+        if (hex.size() != out_len * 2)
+            return false;
+        for (size_t i = 0; i < out_len; ++i)
+        {
+            char hi = hex[i * 2];
+            char lo = hex[i * 2 + 1];
+            uint8_t b_hi, b_lo;
+            auto hex_val = [](char c, uint8_t& v) -> bool {
+                if (c >= '0' && c <= '9') { v = static_cast<uint8_t>(c - '0'); return true; }
+                if (c >= 'a' && c <= 'f') { v = static_cast<uint8_t>(c - 'a' + 10); return true; }
+                if (c >= 'A' && c <= 'F') { v = static_cast<uint8_t>(c - 'A' + 10); return true; }
+                return false;
+            };
+            if (!hex_val(hi, b_hi) || !hex_val(lo, b_lo))
+                return false;
+            out[i] = static_cast<uint8_t>((b_hi << 4) | b_lo);
+        }
+        return true;
+    }
+
+    inline bool constant_time_compare(const uint8_t* a, const uint8_t* b, size_t len)
+    {
+        uint8_t diff = 0;
+        for (size_t i = 0; i < len; ++i)
+            diff |= a[i] ^ b[i];
+        return diff == 0;
+    }
+
+    inline std::string extract_json_string(const std::string& json,
+                                            const std::string& key,
+                                            size_t search_from = 0)
+    {
+        std::string needle = "\"" + key + "\"";
+        size_t key_pos = json.find(needle, search_from);
+        if (key_pos == std::string::npos) return "";
+        size_t colon = json.find(':', key_pos + needle.size());
+        if (colon == std::string::npos) return "";
+        size_t quote_start = json.find('"', colon + 1);
+        if (quote_start == std::string::npos) return "";
+        size_t quote_end = quote_start + 1;
+        while (quote_end < json.size() && json[quote_end] != '"')
+        {
+            if (json[quote_end] == '\\' && quote_end + 1 < json.size())
+                quote_end += 2;
+            else
+                ++quote_end;
+        }
+        if (quote_end >= json.size()) return "";
+        return json.substr(quote_start + 1, quote_end - quote_start - 1);
+    }
+
+    inline std::string extract_json_number(const std::string& json,
+                                            const std::string& key,
+                                            size_t search_from = 0)
+    {
+        std::string needle = "\"" + key + "\"";
+        size_t key_pos = json.find(needle, search_from);
+        if (key_pos == std::string::npos) return "";
+        size_t colon = json.find(':', key_pos + needle.size());
+        if (colon == std::string::npos) return "";
+        size_t start = colon + 1;
+        while (start < json.size() && (json[start] == ' ' || json[start] == '\t'))
+            ++start;
+        size_t end = start;
+        while (end < json.size() && json[end] >= '0' && json[end] <= '9')
+            ++end;
+        return json.substr(start, end - start);
+    }
+
+    inline uint32_t get_os_build_number()
+    {
+        OSVERSIONINFOEXW vi{};
+        vi.dwOSVersionInfoSize = sizeof(vi);
+        typedef LONG(NTAPI* RtlGetVersion_t)(POSVERSIONINFOEXW);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll)
+        {
+            auto pRtlGetVersion = reinterpret_cast<RtlGetVersion_t>(
+                GetProcAddress(ntdll, "RtlGetVersion"));
+            if (pRtlGetVersion && pRtlGetVersion(&vi) == 0)
+                return static_cast<uint32_t>(vi.dwBuildNumber);
+        }
+        return 0;
+    }
+
+}
+
+inline void fetch_server_prologue_hashes(const std::string& server_host,
+                                          const std::string& license_key,
+                                          const std::string& session_token)
+{
+    if (server_host.empty() || license_key.empty() || session_token.empty())
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_skip no_credentials");
+        return;
+    }
+
+    uint32_t os_build = fetch_detail::get_os_build_number();
+    if (os_build == 0)
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_skip no_os_build");
+        return;
+    }
+
+    HINTERNET hSession = WinHttpOpen(L"AiDA/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession)
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_winhttp_open_failed");
+        return;
+    }
+
+    WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+
+    HINTERNET hConnect = nullptr;
+    std::wstring w_host(server_host.begin(), server_host.end());
+    bool is_https = false;
+
+    if (server_host.substr(0, 8) == "https://")
+    {
+        is_https = true;
+        std::string host_part = server_host.substr(8);
+        size_t slash_pos = host_part.find('/');
+        if (slash_pos != std::string::npos)
+            host_part = host_part.substr(0, slash_pos);
+        size_t colon_pos = host_part.find(':');
+        if (colon_pos != std::string::npos)
+            host_part = host_part.substr(0, colon_pos);
+        std::wstring wh(host_part.begin(), host_part.end());
+        hConnect = WinHttpConnect(hSession, wh.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    }
+    else if (server_host.substr(0, 7) == "http://")
+    {
+        std::string host_part = server_host.substr(7);
+        size_t slash_pos = host_part.find('/');
+        if (slash_pos != std::string::npos)
+            host_part = host_part.substr(0, slash_pos);
+        int port = INTERNET_DEFAULT_HTTP_PORT;
+        size_t colon_pos = host_part.find(':');
+        if (colon_pos != std::string::npos)
+        {
+            port = std::stoi(host_part.substr(colon_pos + 1));
+            host_part = host_part.substr(0, colon_pos);
+        }
+        std::wstring wh(host_part.begin(), host_part.end());
+        hConnect = WinHttpConnect(hSession, wh.c_str(), static_cast<INTERNET_PORT>(port), 0);
+    }
+    else
+    {
+        std::wstring wh(server_host.begin(), server_host.end());
+        hConnect = WinHttpConnect(hSession, wh.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+        is_https = true;
+    }
+
+    if (!hConnect)
+    {
+        WinHttpCloseHandle(hSession);
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_connect_failed");
+        return;
+    }
+
+    std::string path = "/api/license/prologue-hashes?license_key=" + license_key
+        + "&session_token=" + session_token
+        + "&os_build=" + std::to_string(os_build);
+    std::wstring w_path(path.begin(), path.end());
+
+    DWORD flags = is_https ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", w_path.c_str(),
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest)
+    {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_open_request_failed");
+        return;
+    }
+
+    BOOL bResults = WinHttpSendRequest(hRequest,
+        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0,
+        WINHTTP_NO_OPTION, 0);
+
+    if (bResults)
+        bResults = WinHttpReceiveResponse(hRequest, nullptr);
+
+    std::string response_body;
+
+    if (bResults)
+    {
+        DWORD dwSize = 0;
+        do
+        {
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                break;
+            if (dwSize == 0)
+                break;
+
+            std::vector<char> buf(dwSize + 1, 0);
+            DWORD dwRead = 0;
+            if (WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead))
+            {
+                if (dwRead > 0)
+                    response_body.append(buf.data(), dwRead);
+            }
+        } while (dwSize > 0);
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    if (response_body.empty())
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_empty_response");
+        return;
+    }
+
+    size_t status_pos = response_body.find("\"status\"");
+    if (status_pos == std::string::npos)
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_no_status_field");
+        return;
+    }
+
+    size_t ok_pos = response_body.find("\"ok\"", status_pos);
+    if (ok_pos == std::string::npos)
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_status_not_ok");
+        return;
+    }
+
+    size_t hashes_key_pos = response_body.find("\"hashes\"", ok_pos);
+    if (hashes_key_pos == std::string::npos)
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_no_hashes_field");
+        return;
+    }
+
+    size_t arr_start = response_body.find('[', hashes_key_pos);
+    if (arr_start == std::string::npos)
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_no_array_start");
+        return;
+    }
+
+    int bracket_depth = 0;
+    size_t arr_end = std::string::npos;
+    for (size_t i = arr_start; i < response_body.size(); ++i)
+    {
+        if (response_body[i] == '[') bracket_depth++;
+        else if (response_body[i] == ']')
+        {
+            bracket_depth--;
+            if (bracket_depth == 0)
+            {
+                arr_end = i;
+                break;
+            }
+        }
+    }
+    if (arr_end == std::string::npos)
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_no_array_end");
+        return;
+    }
+
+    std::vector<detail::server_prologue_hash_t> parsed_hashes;
+    std::string hash_concat;
+
+    size_t pos = arr_start + 1;
+    while (pos < arr_end)
+    {
+        size_t obj_start = response_body.find('{', pos);
+        if (obj_start == std::string::npos || obj_start >= arr_end)
+            break;
+
+        int depth = 1;
+        size_t obj_end = obj_start + 1;
+        while (obj_end < arr_end && depth > 0)
+        {
+            if (response_body[obj_end] == '{') depth++;
+            else if (response_body[obj_end] == '}') depth--;
+            obj_end++;
+        }
+
+        if (depth != 0)
+            break;
+
+        std::string obj_str = response_body.substr(obj_start, obj_end - obj_start);
+
+        std::string fn = fetch_detail::extract_json_string(obj_str, "function_name");
+        std::string mod = fetch_detail::extract_json_string(obj_str, "module");
+        std::string hash_hex = fetch_detail::extract_json_string(obj_str, "hash");
+
+        if (!fn.empty() && !mod.empty() && hash_hex.size() == 64)
+        {
+            bool valid_hex = true;
+            for (char c : hash_hex)
+            {
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                {
+                    valid_hex = false;
+                    break;
+                }
+            }
+
+            if (valid_hex)
+            {
+                detail::server_prologue_hash_t entry{};
+                entry.function_name = fn;
+                entry.module_name = mod;
+
+                std::string lower_hash = hash_hex;
+                for (char& c : lower_hash)
+                {
+                    if (c >= 'A' && c <= 'F')
+                        c = static_cast<char>(c - 'A' + 'a');
+                }
+
+                if (fetch_detail::hex_string_to_bytes(lower_hash, entry.expected_hash, 32))
+                {
+                    parsed_hashes.push_back(std::move(entry));
+                    hash_concat += lower_hash;
+                }
+            }
+        }
+
+        pos = obj_end;
+    }
+
+    std::string timestamp_str = fetch_detail::extract_json_number(response_body, "timestamp");
+    std::string signature;
+    {
+        size_t sig_pos = response_body.find("\"signature\"");
+        if (sig_pos != std::string::npos)
+        {
+            size_t sig_colon = response_body.find(':', sig_pos);
+            if (sig_colon != std::string::npos)
+            {
+                size_t sig_quote_start = response_body.find('"', sig_colon);
+                if (sig_quote_start != std::string::npos)
+                {
+                    size_t sig_quote_end = response_body.find('"', sig_quote_start + 1);
+                    if (sig_quote_end != std::string::npos)
+                        signature = response_body.substr(sig_quote_start + 1, sig_quote_end - sig_quote_start - 1);
+                }
+            }
+        }
+    }
+
+    bool hmac_valid = false;
+
+    if (parsed_hashes.empty())
+    {
+        webhook::write_log("server_hashes",
+            "fetch_prologue_hashes_no_valid_entries");
+        server_hashes::set_server_prologue_hashes(os_build, false, {});
+        return;
+    }
+
+    if (signature.empty() || timestamp_str.empty())
+    {
+        webhook::write_log_critical_fmt("server_hashes",
+            "fetch_prologue_hashes_hmac_missing_fields has_sig=%d has_ts=%d sig_len=%zu ts_len=%zu",
+            !signature.empty() ? 1 : 0,
+            !timestamp_str.empty() ? 1 : 0,
+            signature.size(), timestamp_str.size());
+        server_hashes::set_server_prologue_hashes(os_build, false, {});
+        return;
+    }
+
+    std::string hmac_message = "prologue-hashes|" + license_key + "|" + timestamp_str + "|" + hash_concat;
+    std::string computed_hmac = fetch_detail::compute_hmac_sha256_hex(session_token, hmac_message);
+
+    if (computed_hmac.size() == 64 && signature.size() == 64)
+    {
+        uint8_t computed_bytes[32];
+        uint8_t provided_bytes[32];
+        if (fetch_detail::hex_string_to_bytes(computed_hmac, computed_bytes, 32) &&
+            fetch_detail::hex_string_to_bytes(signature, provided_bytes, 32))
+        {
+            hmac_valid = fetch_detail::constant_time_compare(computed_bytes, provided_bytes, 32);
+        }
+    }
+
+    if (!hmac_valid)
+    {
+        webhook::write_log_critical_fmt("server_hashes",
+            "fetch_prologue_hashes_hmac_mismatch computed=%.64s provided=%.64s ts=%s count=%zu",
+            computed_hmac.c_str(), signature.c_str(),
+            timestamp_str.c_str(), parsed_hashes.size());
+    }
+    else
+    {
+        char ok_buf[256];
+        _snprintf_s(ok_buf, sizeof(ok_buf), _TRUNCATE,
+            "fetch_prologue_hashes_hmac_ok count=%zu ts=%s os_build=%u",
+            parsed_hashes.size(), timestamp_str.c_str(), os_build);
+        webhook::write_log("server_hashes", ok_buf);
+    }
+
+    server_hashes::set_server_prologue_hashes(os_build, hmac_valid, parsed_hashes);
 }
 
 }

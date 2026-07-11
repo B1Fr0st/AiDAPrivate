@@ -98,6 +98,9 @@ workspace_result_t<ghidra_language_spec_t> resolve_ghidra_language(
 workspace_result_t<void> require_staged_ghidra_language(
     const ghidra_language_spec_t& spec, const ghidra_language_catalog_t& catalog,
     const cancellation_token_t& cancel = {});
+workspace_result_t<void> require_staged_ghidra_language(
+    const ghidra_language_spec_t& spec, const std::string& staging_root,
+    const cancellation_token_t& cancel = {});
 
 workspace_result_t<ghidra_adapter_revision_t> make_ghidra_adapter_revision(
     const workspace_identity_t& identity, const analysis_snapshot_t& snapshot,

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "mcp_standalone.hpp"
-#include "ida_compat_schemas.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -40,8 +39,6 @@ namespace mcp_standalone::ida_compat
     tool_result_t tool_basic_blocks(const json& params, const workspace_request_context_t& ctx);
     tool_result_t tool_export_funcs(const json& params, const workspace_request_context_t& ctx);
     tool_result_t tool_callgraph(const json& params, const workspace_request_context_t& ctx);
-    tool_result_t tool_list_instances(const json& params, const workspace_request_context_t& ctx);
-
     struct read_tool_def_t
     {
         const char* name;
@@ -49,5 +46,4 @@ namespace mcp_standalone::ida_compat
     };
 
     std::vector<read_tool_def_t> get_read_tool_defs();
-    void register_read_tools(server_t& server);
 }

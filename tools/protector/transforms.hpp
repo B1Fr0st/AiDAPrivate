@@ -1452,6 +1452,11 @@ struct packed_section_layout_t {
     uint32_t total_size;
     uint32_t key_slots_offset;
     uint32_t key_slots_size;
+    uint32_t watermark_slots_offset;
+    uint32_t watermark_slots_size;
+    uint32_t template_version;
+    uint8_t  template_build_hash[32];
+    uint64_t template_timestamp;
 };
 
 struct transform_result_t {

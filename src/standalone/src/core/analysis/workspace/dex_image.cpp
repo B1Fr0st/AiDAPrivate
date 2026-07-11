@@ -12,6 +12,10 @@ namespace aida::analysis {
 namespace {
 
 constexpr std::uint32_t kDexHeaderSize = 112;
+constexpr std::uint32_t kCompactDexFeatureFlagsOffset = kDexHeaderSize;
+constexpr std::uint32_t kCompactDexInspectionSize =
+    kCompactDexFeatureFlagsOffset + sizeof(std::uint32_t);
+constexpr std::uint32_t kCompactDexDefaultMethodsFeature = 0x1U;
 constexpr std::uint32_t kDexEndianConstant = 0x12345678U;
 constexpr std::uint32_t kNoIndex = 0xffffffffU;
 constexpr std::uint16_t kMapHeaderItem = 0x0000U;
@@ -109,6 +113,16 @@ bool is_dex_magic(const std::uint8_t* data, std::size_t size) noexcept {
 bool is_compact_dex_magic(const std::uint8_t* data, std::size_t size) noexcept {
     return size >= 8 && data[0] == 'c' && data[1] == 'd' && data[2] == 'e' && data[3] == 'x' &&
            is_decimal_version(data + 4);
+}
+
+std::string format_u32_hex(std::uint32_t value) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string formatted = "0x00000000";
+    for (std::size_t index = 0; index < 8; ++index) {
+        const auto shift = static_cast<unsigned>((7U - static_cast<unsigned>(index)) * 4U);
+        formatted[2 + index] = digits[(value >> shift) & 0x0fU];
+    }
+    return formatted;
 }
 
 std::optional<std::uint64_t> fixed_map_item_size(std::uint16_t type) noexcept {
@@ -1497,6 +1511,80 @@ workspace_result_t<dex_container_info_t> detect_from_prefix(const std::vector<st
     return workspace_result_t<dex_container_info_t>::success(std::move(info));
 }
 
+workspace_error_t compact_dex_unsupported_error(const dex_container_info_t& info,
+                                                std::uint64_t offset) {
+    auto error = dex_error(workspace_error_code_t::unsupported_format,
+                           "compact DEX is unsupported by the local parser",
+                           "dex.compact.unsupported", offset, 8);
+    error.details.emplace_back("container_kind", "compact-dex");
+    error.details.emplace_back("version", info.version);
+    error.details.emplace_back("indexing", "refused-before-indexing");
+    if (!info.compact_features) {
+        error.details.emplace_back("feature_layout", "unknown-for-version");
+        return error;
+    }
+    const auto& features = *info.compact_features;
+    error.details.emplace_back("feature_layout", "cdex-001");
+    error.details.emplace_back("declared_header_size", std::to_string(features.declared_header_size));
+    error.details.emplace_back("feature_flags", format_u32_hex(features.feature_flags));
+    error.details.emplace_back("default_methods", features.default_methods ? "true" : "false");
+    error.details.emplace_back("unknown_feature_flags", format_u32_hex(features.unknown_feature_flags));
+    error.details.emplace_back("code_item_encoding",
+                               features.compact_code_items ? "compact-preheader" : "unavailable");
+    error.details.emplace_back("debug_info_encoding",
+                               features.debug_info_offset_table ? "offset-table" : "unavailable");
+    return error;
+}
+
+workspace_result_t<dex_container_info_t> inspect_compact_dex_at(const byte_provider_t& provider,
+                                                                  std::uint64_t offset,
+                                                                  const cancellation_token_t& cancel) {
+    if (cancel.stop_requested())
+        return workspace_result_t<dex_container_info_t>::failure(dex_stop_error(cancel, "dex.compact.header"));
+    if (!span_within(offset, 8, provider.size()))
+        return workspace_result_t<dex_container_info_t>::failure(dex_error(
+            workspace_error_code_t::out_of_range, "compact DEX magic is truncated", "dex.compact.header",
+            offset, 8));
+    auto prefix_result = provider.read_vector(offset, 8, 8, cancel);
+    if (!prefix_result)
+        return workspace_result_t<dex_container_info_t>::failure(prefix_result.error());
+    auto detected = detect_from_prefix(prefix_result.value());
+    if (!detected)
+        return detected;
+    auto info = detected.take_value();
+    if (info.kind != dex_container_kind_t::compact_dex)
+        return workspace_result_t<dex_container_info_t>::failure(dex_error(
+            workspace_error_code_t::unsupported_format, "compact DEX magic is invalid", "dex.compact.header",
+            offset, 8));
+    if (info.version != "001")
+        return workspace_result_t<dex_container_info_t>::success(std::move(info));
+    if (!span_within(offset, kCompactDexInspectionSize, provider.size()))
+        return workspace_result_t<dex_container_info_t>::failure(dex_error(
+            workspace_error_code_t::out_of_range,
+            "compact DEX header is truncated before its feature flags", "dex.compact.header", offset,
+            kCompactDexInspectionSize));
+    auto header_result = provider.read_vector(offset, kCompactDexInspectionSize,
+                                              kCompactDexInspectionSize, cancel);
+    if (!header_result)
+        return workspace_result_t<dex_container_info_t>::failure(header_result.error());
+    const auto& header = header_result.value();
+    const auto declared_header_size = read_u32_le(header.data() + 36);
+    if (declared_header_size < kCompactDexInspectionSize ||
+        !span_within(offset, declared_header_size, provider.size()))
+        return workspace_result_t<dex_container_info_t>::failure(dex_error(
+            workspace_error_code_t::malformed_image, "compact DEX declared header size is invalid",
+            "dex.compact.header", offset + 36, sizeof(declared_header_size)));
+    const auto feature_flags = read_u32_le(header.data() + kCompactDexFeatureFlagsOffset);
+    dex_compact_dex_features_t features;
+    features.declared_header_size = declared_header_size;
+    features.feature_flags = feature_flags;
+    features.default_methods = (feature_flags & kCompactDexDefaultMethodsFeature) != 0;
+    features.unknown_feature_flags = feature_flags & ~kCompactDexDefaultMethodsFeature;
+    info.header_size = declared_header_size;
+    info.compact_features = features;
+    return workspace_result_t<dex_container_info_t>::success(std::move(info));
+}
+
 workspace_result_t<dex_image_t> parse_dex_at(const byte_provider_t& provider, std::uint64_t offset,
                                               dex_container_info_t container,
                                               const dex_parse_limits_t& limits,
@@ -1562,40 +1650,49 @@ workspace_image_t make_container_workspace_image(const byte_provider_t& provider
     return image;
 }
 
+workspace_result_t<bool> collect_container_dex_candidates(
+    const byte_provider_t& provider, const std::vector<std::uint8_t>& scan,
+    dex_container_info_t& container, const dex_parse_limits_t& limits,
+    const cancellation_token_t& cancel) {
+    for (std::uint64_t offset = 0; offset + 8 <= scan.size(); ++offset) {
+        if ((offset & 0xfffU) == 0 && cancel.stop_requested())
+            return workspace_result_t<bool>::failure(dex_stop_error(cancel, "dex.container"));
+        const auto remaining = scan.size() - static_cast<std::size_t>(offset);
+        if (is_compact_dex_magic(scan.data() + offset, remaining)) {
+            if (remaining < kCompactDexInspectionSize && scan.size() < provider.size())
+                return workspace_result_t<bool>::failure(dex_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "compact DEX header exceeds the container scan limit", "dex.container", offset,
+                    kCompactDexInspectionSize));
+            auto compact = inspect_compact_dex_at(provider, offset, cancel);
+            if (!compact)
+                return workspace_result_t<bool>::failure(compact.error());
+            auto error = compact_dex_unsupported_error(compact.value(), offset);
+            error.details.emplace_back("enclosing_container", dex_container_kind_name(container.kind));
+            return workspace_result_t<bool>::failure(std::move(error));
+        }
+        if (!is_dex_magic(scan.data() + offset, remaining))
+            continue;
+        if (container.embedded_dex_offsets.size() >= limits.max_embedded_dex_files)
+            return workspace_result_t<bool>::failure(dex_error(
+                workspace_error_code_t::limit_exceeded, "embedded DEX candidate limit exceeded",
+                "dex.container", offset, 8));
+        container.embedded_dex_offsets.push_back(offset);
+    }
+    return workspace_result_t<bool>::success(true);
+}
+
 workspace_result_t<dex_image_t> parse_container(const byte_provider_t& provider,
                                                  dex_container_info_t container,
                                                  const dex_parse_limits_t& limits,
                                                  const cancellation_token_t& cancel) {
-    if (provider.size() > limits.max_container_scan_bytes) {
-        auto scan_result = provider.read_vector(0, limits.max_container_scan_bytes,
-                                                limits.max_container_scan_bytes, cancel);
-        if (!scan_result)
-            return workspace_result_t<dex_image_t>::failure(scan_result.error());
-        auto scan = scan_result.take_value();
-        for (std::uint64_t offset = 0; offset + 8 <= scan.size(); ++offset) {
-            if (!is_dex_magic(scan.data() + offset, scan.size() - static_cast<std::size_t>(offset)))
-                continue;
-            if (container.embedded_dex_offsets.size() >= limits.max_embedded_dex_files)
-                return workspace_result_t<dex_image_t>::failure(dex_error(
-                    workspace_error_code_t::limit_exceeded, "embedded DEX candidate limit exceeded",
-                    "dex.container", offset, 8));
-            container.embedded_dex_offsets.push_back(offset);
-        }
-    } else {
-        auto scan_result = provider.read_vector(0, provider.size(), limits.max_container_scan_bytes, cancel);
-        if (!scan_result)
-            return workspace_result_t<dex_image_t>::failure(scan_result.error());
-        auto scan = scan_result.take_value();
-        for (std::uint64_t offset = 0; offset + 8 <= scan.size(); ++offset) {
-            if (!is_dex_magic(scan.data() + offset, scan.size() - static_cast<std::size_t>(offset)))
-                continue;
-            if (container.embedded_dex_offsets.size() >= limits.max_embedded_dex_files)
-                return workspace_result_t<dex_image_t>::failure(dex_error(
-                    workspace_error_code_t::limit_exceeded, "embedded DEX candidate limit exceeded",
-                    "dex.container", offset, 8));
-            container.embedded_dex_offsets.push_back(offset);
-        }
-    }
+    const auto scan_size = std::min(provider.size(), limits.max_container_scan_bytes);
+    auto scan_result = provider.read_vector(0, scan_size, limits.max_container_scan_bytes, cancel);
+    if (!scan_result)
+        return workspace_result_t<dex_image_t>::failure(scan_result.error());
+    auto candidates = collect_container_dex_candidates(provider, scan_result.value(), container, limits, cancel);
+    if (!candidates)
+        return workspace_result_t<dex_image_t>::failure(candidates.error());
     for (const auto offset : container.embedded_dex_offsets) {
         auto parsed = parse_dex_at(provider, offset, container, limits, cancel);
         if (!parsed)
@@ -1725,7 +1822,12 @@ detect_dex_container(const byte_provider_t& provider, const cancellation_token_t
     auto prefix = read_prefix(provider, 8, cancel);
     if (!prefix)
         return workspace_result_t<dex_container_info_t>::failure(prefix.error());
-    return detect_from_prefix(prefix.value());
+    auto detected = detect_from_prefix(prefix.value());
+    if (!detected)
+        return detected;
+    if (detected.value().kind != dex_container_kind_t::compact_dex)
+        return detected;
+    return inspect_compact_dex_at(provider, 0, cancel);
 }
 
 workspace_result_t<bool>
@@ -1775,9 +1877,8 @@ parse_dex_image(const byte_provider_t& provider, const dex_parse_limits_t& limit
             case dex_container_kind_t::vdex:
                 return parse_container(provider, detected.take_value(), limits, cancel);
             case dex_container_kind_t::compact_dex:
-                return workspace_result_t<dex_image_t>::failure(dex_error(
-                    workspace_error_code_t::unsupported_format,
-                    "compact DEX detection succeeded but compact DEX decoding is unavailable", "dex.detect"));
+                return workspace_result_t<dex_image_t>::failure(
+                    compact_dex_unsupported_error(detected.value(), 0));
             case dex_container_kind_t::unknown:
                 return workspace_result_t<dex_image_t>::failure(dex_error(
                     workspace_error_code_t::unsupported_format, "input is not DEX, OAT, or VDEX", "dex.detect"));

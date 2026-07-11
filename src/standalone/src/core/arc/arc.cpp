@@ -13,6 +13,7 @@
 #include "anti-tamper/cff.hpp"
 #include "arc_build_seed.hpp"
 #include "anti-tamper/wb_crypto.hpp"
+#include "../anti-tamper/heap_encrypt.hpp"
 #include "obfuscation.hpp"
 #include "shared/hardware_id/hardware_id_v2.hpp"
 
@@ -877,7 +878,7 @@ struct session_data_t
 };
 
 std::mutex g_session_mtx;
-encrypted_session_t g_enc_session = {};
+anti_tamper::heap_encrypt::secure_heap_header_t* g_enc_session_secure = nullptr;
 
 alignas(64) uint8_t  g_key_seed[32] = {};
 bool g_key_seed_valid = false;
@@ -936,15 +937,40 @@ bool decrypt_session_blob(encrypted_session_t* enc, session_data_t* out)
 void store_session(const session_data_t& data)
 {
     session_data_t copy = data;
-    g_enc_session.rolling_key = __rdtsc() ^ 0x5DEECE66DULL;
-    g_enc_session.xor_mask = __rdtsc() ^ 0x6A09E667BB67AE85ULL;
-    encrypt_session_blob(&copy, &g_enc_session);
+    encrypted_session_t enc = {};
+    enc.rolling_key = __rdtsc() ^ 0x5DEECE66DULL;
+    enc.xor_mask = __rdtsc() ^ 0x6A09E667BB67AE85ULL;
+    encrypt_session_blob(&copy, &enc);
     SecureZeroMemory(&copy, sizeof(copy));
+
+    anti_tamper::heap_encrypt::secure_heap_header_t* new_hdr =
+        anti_tamper::heap_encrypt::secure_alloc(static_cast<uint32_t>(sizeof(encrypted_session_t)));
+    if (new_hdr)
+    {
+        anti_tamper::heap_encrypt::secure_accessor_t acc(new_hdr);
+        if (acc.header)
+        {
+            std::memcpy(acc.buffer, &enc, sizeof(encrypted_session_t));
+            acc.mark_modified();
+        }
+    }
+    SecureZeroMemory(&enc, sizeof(enc));
+
+    anti_tamper::heap_encrypt::secure_heap_header_t* old = g_enc_session_secure;
+    g_enc_session_secure = new_hdr;
+    if (old) anti_tamper::heap_encrypt::secure_free(old);
 }
 
 bool load_session(session_data_t& out)
 {
-    return decrypt_session_blob(&g_enc_session, &out);
+    if (!g_enc_session_secure) return false;
+    anti_tamper::heap_encrypt::secure_accessor_t acc(g_enc_session_secure);
+    if (!acc.header) return false;
+    encrypted_session_t enc;
+    std::memcpy(&enc, acc.buffer, sizeof(encrypted_session_t));
+    bool result = decrypt_session_blob(&enc, &out);
+    SecureZeroMemory(&enc, sizeof(enc));
+    return result;
 }
 
 uint64_t g_vtable_crypt_key = 0;
@@ -987,7 +1013,7 @@ struct feature_blob_header_t
     uint32_t total_size;
 };
 
-volatile uint8_t g_bind_secret_obf[32] = {};
+anti_tamper::heap_encrypt::secure_heap_header_t* g_bind_secret_secure = nullptr;
 uint64_t g_bind_secret_xor_key[4] = {};
 bool     g_bind_secret_loaded = false;
 std::mutex g_bind_secret_mtx;
@@ -1003,24 +1029,56 @@ void bind_secret_obf_store_unlocked(const uint8_t plain[32])
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         g_bind_secret_xor_key[slot] = z ^ (z >> 31);
     }
+    uint8_t obf[32] = {};
     for (int i = 0; i < 32; i += 8)
     {
         uint64_t v = 0;
         memcpy(&v, plain + i, 8);
         v ^= g_bind_secret_xor_key[i / 8];
-        memcpy(const_cast<uint8_t*>(g_bind_secret_obf + i), &v, 8);
+        memcpy(obf + i, &v, 8);
     }
+
+    anti_tamper::heap_encrypt::secure_heap_header_t* new_hdr =
+        anti_tamper::heap_encrypt::secure_alloc(32);
+    if (new_hdr)
+    {
+        anti_tamper::heap_encrypt::secure_accessor_t acc(new_hdr);
+        if (acc.header)
+        {
+            std::memcpy(acc.buffer, obf, 32);
+            acc.mark_modified();
+        }
+    }
+    SecureZeroMemory(obf, sizeof(obf));
+
+    anti_tamper::heap_encrypt::secure_heap_header_t* old = g_bind_secret_secure;
+    g_bind_secret_secure = new_hdr;
+    if (old) anti_tamper::heap_encrypt::secure_free(old);
 }
 
 void bind_secret_obf_load_unlocked(uint8_t out[32])
 {
+    if (!g_bind_secret_secure)
+    {
+        SecureZeroMemory(out, 32);
+        return;
+    }
+    anti_tamper::heap_encrypt::secure_accessor_t acc(g_bind_secret_secure);
+    if (!acc.header)
+    {
+        SecureZeroMemory(out, 32);
+        return;
+    }
+    uint8_t obf[32] = {};
+    std::memcpy(obf, acc.buffer, 32);
     for (int i = 0; i < 32; i += 8)
     {
         uint64_t v = 0;
-        memcpy(&v, const_cast<const uint8_t*>(g_bind_secret_obf + i), 8);
+        memcpy(&v, obf + i, 8);
         v ^= g_bind_secret_xor_key[i / 8];
         memcpy(out + i, &v, 8);
     }
+    SecureZeroMemory(obf, sizeof(obf));
 }
 
 bool load_bind_secret()
@@ -1282,10 +1340,20 @@ __declspec(noreturn) __forceinline void enforce_violation(const char* reason, co
     {
         arc_log("violation", "step02_session_locked");
         session_data_t sess = {};
-        if (decrypt_session_blob(&g_enc_session, &sess) && sess.initialized)
+        if (g_enc_session_secure)
         {
-            strncpy_s(hwid_buf, sizeof(hwid_buf), sess.hwid, _TRUNCATE);
-            strncpy_s(sess_buf, sizeof(sess_buf), sess.session_token, _TRUNCATE);
+            anti_tamper::heap_encrypt::secure_accessor_t sacc(g_enc_session_secure);
+            if (sacc.header)
+            {
+                encrypted_session_t enc;
+                std::memcpy(&enc, sacc.buffer, sizeof(encrypted_session_t));
+                if (decrypt_session_blob(&enc, &sess) && sess.initialized)
+                {
+                    strncpy_s(hwid_buf, sizeof(hwid_buf), sess.hwid, _TRUNCATE);
+                    strncpy_s(sess_buf, sizeof(sess_buf), sess.session_token, _TRUNCATE);
+                }
+                SecureZeroMemory(&enc, sizeof(enc));
+            }
         }
         SecureZeroMemory(&sess, sizeof(sess));
         g_session_mtx.unlock();
@@ -3727,7 +3795,12 @@ ARC_API void arc_cleanup()
     g_vtable_ready.store(false, std::memory_order_release);
     arc_cleanup_unregister_protection_seh();
     std::lock_guard<std::mutex> lk(g_session_mtx);
-    SecureZeroMemory(&g_enc_session, sizeof(g_enc_session));
+    anti_tamper::heap_encrypt::secure_free(g_enc_session_secure);
+    g_enc_session_secure = nullptr;
+    anti_tamper::heap_encrypt::secure_free(g_bind_secret_secure);
+    g_bind_secret_secure = nullptr;
+    SecureZeroMemory(g_bind_secret_xor_key, sizeof(g_bind_secret_xor_key));
+    g_bind_secret_loaded = false;
     SecureZeroMemory(&g_vtable, sizeof(g_vtable));
     SecureZeroMemory(g_key_seed, sizeof(g_key_seed));
     g_key_seed_valid = false;

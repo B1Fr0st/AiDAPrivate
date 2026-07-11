@@ -692,6 +692,8 @@ namespace
         uint64_t    cached_image_base = 0;
         uint64_t    cached_dtb = 0;
         uint64_t    cached_kernel_dtb = 0;
+        bool        has_identity = false;
+        driver_bridge::identity::live_target_identity_t identity;
     };
 
     std::unordered_map<uint32_t, process_ctx_t> g_processes;
@@ -4762,6 +4764,18 @@ namespace
             CloseHandle(g_process);
             g_process = nullptr;
         }
+    }
+
+    bool same_live_identity(const driver_bridge::identity::live_target_identity_t& lhs,
+                            const driver_bridge::identity::live_target_identity_t& rhs)
+    {
+        return lhs.process.pid == rhs.process.pid &&
+            lhs.process.creation_time_100ns == rhs.process.creation_time_100ns &&
+            lhs.process.normalized_process_path == rhs.process.normalized_process_path &&
+            lhs.module.base == rhs.module.base &&
+            lhs.module.size == rhs.module.size &&
+            lhs.module.normalized_name == rhs.module.normalized_name &&
+            lhs.module.normalized_path == rhs.module.normalized_path;
     }
 
     std::string to_lower_copy(std::string text)
@@ -11240,6 +11254,32 @@ namespace driver_bridge
         return ok;
     }
 
+    bool update_ce_driver_hashes(const uint8_t* hashes, uint32_t count)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        if (!hashes || count == 0) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->update_ce_driver_hashes(hashes, count);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("update_ce_driver_hashes_post ok=%d err=%lu count=%u",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            count);
+        return ok;
+    }
+
     bool kernel_anti_debug_query(anti_debug_result_t& out)
     {
         const uint64_t started = static_cast<uint64_t>(GetTickCount64());
@@ -11835,6 +11875,54 @@ namespace driver_bridge
             ok ? 1 : 0,
             static_cast<unsigned long>(gle),
             (out_driver_proof && *out_driver_proof != 0) ? 1 : 0,
+            static_cast<unsigned long long>(GetTickCount64() - start));
+        SetLastError(gle);
+        return ok;
+    }
+
+    bool initiate_driver_handshake(uint8_t out_driver_challenge[32])
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_DEVICE_NOT_CONNECTED);
+            diag::log_tagged_fmt("driver", "initiate_driver_handshake_preflight_failed kernel=%d", kernel_mode ? 1 : 0);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        const ULONGLONG start = GetTickCount64();
+        bool ok = device->initiate_driver_handshake(out_driver_challenge);
+        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("driver", "initiate_driver_handshake_result ok=%d gle=%lu elapsed_ms=%llu",
+            ok ? 1 : 0, static_cast<unsigned long>(gle),
+            static_cast<unsigned long long>(GetTickCount64() - start));
+        SetLastError(gle);
+        return ok;
+    }
+
+    bool complete_driver_challenge(const uint8_t driver_challenge[32])
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_DEVICE_NOT_CONNECTED);
+            diag::log_tagged_fmt("driver", "complete_driver_challenge_preflight_failed kernel=%d", kernel_mode ? 1 : 0);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        const ULONGLONG start = GetTickCount64();
+        bool ok = device->complete_driver_challenge(driver_challenge);
+        DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+        diag::log_tagged_fmt("driver", "complete_driver_challenge_result ok=%d gle=%lu elapsed_ms=%llu",
+            ok ? 1 : 0, static_cast<unsigned long>(gle),
             static_cast<unsigned long long>(GetTickCount64() - start));
         SetLastError(gle);
         return ok;
@@ -12700,6 +12788,48 @@ namespace driver_bridge
     {
         return g_driver_watchdog_last_ok_tick.load(std::memory_order_acquire);
     }
+
+    bool kernel_read_prologue_hash(uint64_t va, uint32_t size, uint64_t& out_hash)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            return false;
+        }
+        SetLastError(ERROR_SUCCESS);
+        return device->kernel_read_prologue_hash(va, size, out_hash);
+    }
+
+    bool query_sentinel_dispatch_guard(uint8_t& hook_detected, uint64_t& hook_target)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            return false;
+        }
+        SetLastError(ERROR_SUCCESS);
+        return device->query_sentinel_dispatch_guard(hook_detected, hook_target);
+    }
+
+    bool query_sentinel_callback_scan(uint8_t& hostile_drivers, uint8_t& modified_callbacks)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            return false;
+        }
+        SetLastError(ERROR_SUCCESS);
+        return device->query_sentinel_callback_scan(hostile_drivers, modified_callbacks);
+    }
 }
 
 namespace driver_bridge::identity {
@@ -12926,6 +13056,95 @@ bool capture_live_target_identity(std::uint32_t pid, std::uint64_t preferred_mod
     if (out_error)
         *out_error = captured ? std::string{} : staleness_code(staleness) + ": " + detail;
     return captured;
+}
+
+validation_result_t validate_attached_target_identity(const live_target_identity_t& expected)
+{
+    validation_result_t result = validate_live_target_identity(expected);
+    if (!result.matches)
+        return result;
+    std::lock_guard<std::mutex> lk(g_state_mtx);
+    const auto found = g_processes.find(expected.process.pid);
+    if (found == g_processes.end()) {
+        result.matches = false;
+        result.staleness = staleness_t::process_unavailable;
+        result.detail = "TARGET_STALE: driver context is not attached";
+        return result;
+    }
+    if (!found->second.has_identity) {
+        result.matches = false;
+        result.staleness = staleness_t::process_identity_changed;
+        result.detail = "TARGET_STALE: driver context identity is not bound";
+        return result;
+    }
+    if (!same_live_identity(found->second.identity, expected)) {
+        result.matches = false;
+        result.staleness = staleness_t::process_identity_changed;
+        result.observed = found->second.identity;
+        result.detail = "TARGET_STALE: driver context identity changed";
+        return result;
+    }
+    return result;
+}
+
+bool refresh_attached_target_identity(const live_target_identity_t& expected,
+                                      std::string* out_error)
+{
+    const auto current = validate_live_target_identity(expected);
+    if (!current.matches) {
+        if (out_error)
+            *out_error = std::string(staleness_code(current.staleness)) + ": " + current.detail;
+        return false;
+    }
+    std::unique_lock<std::mutex> lk(g_state_mtx);
+    auto found = g_processes.find(expected.process.pid);
+    if (found == g_processes.end()) {
+        if (out_error)
+            *out_error = "TARGET_DRIVER_CONTEXT_MISSING";
+        return false;
+    }
+    constexpr DWORD access = PROCESS_QUERY_LIMITED_INFORMATION;
+    unique_handle process(OpenProcess(access, FALSE, expected.process.pid));
+    if (!process) {
+        if (out_error)
+            *out_error = "OpenProcess query failed for PID " +
+                std::to_string(expected.process.pid) +
+                " (error " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    process_ctx_t& ctx = found->second;
+    release_ctx_handle(ctx);
+    ctx.h_process = process.release();
+    ctx.has_vm_read = false;
+    ctx.name = process_name_from_pid(expected.process.pid);
+    ctx.cached_image_base = 0;
+    ctx.cached_dtb = 0;
+    ctx.cached_kernel_dtb = 0;
+    if (g_pid == expected.process.pid) {
+        close_process_handle_locked();
+        g_process = ctx.h_process;
+        ctx.h_process = nullptr;
+        g_process_name = ctx.name;
+        g_has_vm_read = false;
+    }
+    if (!refresh_kernel_context_locked(lk, expected.process.pid, ctx,
+                                       "refresh_attached_target_identity")) {
+        ctx.has_identity = false;
+        if (out_error)
+            *out_error = "TARGET_DRIVER_CONTEXT_REFRESH_FAILED: " + g_last_error;
+        return false;
+    }
+    ctx.identity = expected;
+    ctx.has_identity = true;
+    if (g_pid == expected.process.pid) {
+        g_kernel_attached = ctx.kernel_attached;
+        g_has_vm_read = ctx.has_vm_read;
+        if (g_process_name.empty())
+            g_process_name = ctx.name;
+    }
+    if (out_error)
+        out_error->clear();
+    return true;
 }
 
 validation_result_t validate_live_target_identity(const live_target_identity_t& expected)

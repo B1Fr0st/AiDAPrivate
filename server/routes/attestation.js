@@ -141,12 +141,18 @@ function createTablesIfNeeded() {
         CREATE INDEX IF NOT EXISTS idx_attest_records_hwid ON attestation_records(hwid_hash);
         CREATE INDEX IF NOT EXISTS idx_attest_records_nonce ON attestation_records(nonce);
         CREATE INDEX IF NOT EXISTS idx_attest_records_build ON attestation_records(build_id);
+        ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS watermark_state VARCHAR(64) NOT NULL DEFAULT '';
+        ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS watermark_verified BOOLEAN NOT NULL DEFAULT false;
+        ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS driver_proof VARCHAR(128) NOT NULL DEFAULT '';
+        ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS driver_proof_verified BOOLEAN NOT NULL DEFAULT false;
+        ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS clone_flagged BOOLEAN NOT NULL DEFAULT false;
         CREATE TABLE IF NOT EXISTS builds (
             build_id            VARCHAR(32) PRIMARY KEY,
             expected_text_sha256 VARCHAR(64) NOT NULL,
             retired             BOOLEAN     NOT NULL DEFAULT false,
             created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
+        ALTER TABLE builds ADD COLUMN IF NOT EXISTS expected_watermark VARCHAR(64) NOT NULL DEFAULT '';
     `);
 }
 
@@ -207,7 +213,7 @@ async function getBuildExpectedHash(buildId) {
     if (!buildId || typeof buildId !== 'string') return null;
     try {
         const { rows } = await pool.query(
-            'SELECT expected_text_sha256, retired FROM builds WHERE build_id = $1',
+            'SELECT expected_text_sha256, expected_watermark, retired FROM builds WHERE build_id = $1',
             [buildId]
         );
         if (rows.length === 0) return null;
@@ -215,7 +221,9 @@ async function getBuildExpectedHash(buildId) {
         const hash = typeof row.expected_text_sha256 === 'string'
             ? row.expected_text_sha256.trim().toLowerCase() : '';
         if (!/^[0-9a-f]{64}$/.test(hash)) return null;
-        return { hash, retired: !!row.retired };
+        const watermark = typeof row.expected_watermark === 'string'
+            ? row.expected_watermark.trim().toLowerCase() : '';
+        return { hash, watermark, retired: !!row.retired };
     } catch (err) {
         console.warn('[attestation] getBuildExpectedHash failed:',
             err && err.message ? err.message : err);
@@ -351,6 +359,8 @@ router.post('/verify', async (req, res) => {
         const buildId = body.build_id;
         const clientTimestamp = body.timestamp;
         const clientAttestHmac = body.attest_hmac;
+        const watermarkState = body.watermark_state;
+        const driverProof = body.driver_proof;
 
         if (typeof license_key !== 'string' || !isHexString(nonce, 64)) {
             return res.status(400).json({ status: 'error', reason: 'invalid_request' });
@@ -527,6 +537,61 @@ router.post('/verify', async (req, res) => {
                 retired: buildInfo.retired,
             };
 
+            let watermarkVerified = false;
+            let watermarkMatched = true;
+            if (typeof watermarkState === 'string' && watermarkState.length > 0) {
+                const clientWatermark = watermarkState.trim().toLowerCase();
+                if (!/^[0-9a-f]{1,64}$/.test(clientWatermark)) {
+                    await trackAnomaly(license_key, 'invalid_watermark_format',
+                        { build_id: buildId, watermark_length: clientWatermark.length }, state);
+                    watermarkMatched = false;
+                } else if (buildInfo.watermark && buildInfo.watermark.length > 0) {
+                    watermarkVerified = timingSafeHexCompare(clientWatermark, buildInfo.watermark);
+                    if (!watermarkVerified) {
+                        watermarkMatched = false;
+                        await trackAnomaly(license_key, 'watermark_mismatch',
+                            { expected: buildInfo.watermark, observed: clientWatermark, build_id: buildId }, state);
+                        await pool.query(
+                            `UPDATE licenses
+                                SET flagged = true,
+                                    flagged_reason = $1,
+                                    flagged_at = $2,
+                                    flagged_score = 0.9
+                              WHERE key = $3`,
+                            [`watermark_mismatch:build=${buildId}`, now, license_key]
+                        );
+                    }
+                } else {
+                    watermarkVerified = true;
+                }
+            }
+
+            let driverProofVerified = false;
+            if (typeof driverProof === 'string' && driverProof.length > 0) {
+                const proofTrimmed = driverProof.trim().toLowerCase();
+                if (/^[0-9a-f]{32,128}$/.test(proofTrimmed)) {
+                    driverProofVerified = true;
+                } else {
+                    await trackAnomaly(license_key, 'invalid_driver_proof_format',
+                        { build_id: buildId, proof_length: proofTrimmed.length }, state);
+                }
+            }
+
+            const cloneFlagged = !watermarkMatched || !driverProofVerified;
+            if (cloneFlagged) {
+                console.warn('[attestation] clone_detected',
+                    ` license=${license_key.slice(0, 14)}`,
+                    ` build=${buildId}`,
+                    ` watermark_ok=${watermarkMatched}`,
+                    ` driver_proof_ok=${driverProofVerified}`);
+                await trackAnomaly(license_key, 'potential_clone_detected',
+                    {
+                        build_id: buildId,
+                        watermark_verified: watermarkVerified,
+                        driver_proof_verified: driverProofVerified,
+                    }, state);
+            }
+
             const hwidHash = crypto.createHash('sha256')
                 .update(String(hwid || ''), 'utf8')
                 .digest('hex');
@@ -538,9 +603,15 @@ router.post('/verify', async (req, res) => {
 
             await pool.query(
                 `INSERT INTO attestation_records
-                    (hwid_hash, nonce, usermode_code_hash, build_id, timestamp)
-                 VALUES ($1, $2, $3, $4, $5)`,
-                [hwidHash, nonce, usermodeHashNormalized, buildId, recordTimestamp]
+                    (hwid_hash, nonce, usermode_code_hash, build_id, timestamp,
+                     watermark_state, watermark_verified, driver_proof, driver_proof_verified, clone_flagged)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+                [hwidHash, nonce, usermodeHashNormalized, buildId, recordTimestamp,
+                 typeof watermarkState === 'string' ? watermarkState.trim().toLowerCase() : '',
+                 watermarkVerified,
+                 typeof driverProof === 'string' ? driverProof.trim().toLowerCase() : '',
+                 driverProofVerified,
+                 cloneFlagged]
             );
         }
 
@@ -577,6 +648,8 @@ router.post('/verify', async (req, res) => {
             dma_state_recorded: dmaStateResult !== null,
             dma_attack_flagged: dmaStateResult !== null && (dmaStateResult.canaryHits > 0 || dmaStateResult.eptAnomaly || dmaStateResult.pcieUnknown >= 2) && !dmaStateResult.tier2BsodArmed,
             build_validation: buildValidationResult,
+            watermark_verified: typeof watermarkState === 'string' && watermarkState.length > 0,
+            driver_proof_verified: typeof driverProof === 'string' && driverProof.length > 0,
         };
 
         return res.json(canonicalResponse.buildEnvelope(responsePayload));

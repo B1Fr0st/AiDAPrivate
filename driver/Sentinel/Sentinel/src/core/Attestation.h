@@ -321,4 +321,140 @@ namespace attestation
         SN_LOG("attestation::init: SUCCESS");
         return TRUE;
     }
+
+    constexpr ULONG WATERMARK_SIZE = 16;
+
+    struct watermark_state_t {
+        UINT8   expected_watermark[WATERMARK_SIZE];
+        UINT8   actual_watermark[WATERMARK_SIZE];
+        BOOLEAN watermark_verified;
+        UINT32  watermark_rva;
+        UINT64  verification_timestamp;
+    };
+
+    inline watermark_state_t g_watermark_state = {};
+
+    __forceinline NTSTATUS extract_usermode_watermark(
+        PEPROCESS process, UINT32* watermark_offset, UINT8 out_watermark[16])
+    {
+        if (!process || !out_watermark || !watermark_offset)
+            return STATUS_INVALID_PARAMETER;
+
+        if (!_PsGetProcessPeb || !_KeStackAttachProcess || !_KeUnstackDetachProcess || !_MmIsAddressValid)
+            return STATUS_NOT_IMPLEMENTED;
+
+        *watermark_offset = 0;
+        RtlZeroMemory(out_watermark, 16);
+
+        KAPC_STATE apc_state;
+        BOOLEAN attached = FALSE;
+        NTSTATUS result = STATUS_UNSUCCESSFUL;
+
+        __try {
+            PPEB peb = _PsGetProcessPeb(process);
+            if (!peb) {
+                SN_LOG("attestation::extract_usermode_watermark: PEB is null");
+                goto detach_and_return;
+            }
+
+            _KeStackAttachProcess(reinterpret_cast<PRKPROCESS>(process), &apc_state);
+            attached = TRUE;
+
+            if (!_MmIsAddressValid(peb)) {
+                SN_LOG("attestation::extract_usermode_watermark: PEB not valid after attach");
+                goto detach_and_return;
+            }
+
+            PVOID image_base = *reinterpret_cast<PVOID*>(
+                reinterpret_cast<PUCHAR>(peb) + 0x10);
+            if (!image_base || !_MmIsAddressValid(image_base)) {
+                SN_LOG("attestation::extract_usermode_watermark: image_base invalid base=%p", image_base);
+                goto detach_and_return;
+            }
+
+            PUCHAR base = static_cast<PUCHAR>(image_base);
+
+            if (!_MmIsAddressValid(reinterpret_cast<PVOID>(base + 0x3C))) {
+                SN_LOG("attestation::extract_usermode_watermark: DOS header e_lfanew ptr invalid");
+                goto detach_and_return;
+            }
+
+            DWORD e_lfanew = *reinterpret_cast<DWORD*>(base + 0x3C);
+            if (e_lfanew == 0 || e_lfanew > 0x100000) {
+                SN_LOG("attestation::extract_usermode_watermark: e_lfanew invalid=%lu", e_lfanew);
+                goto detach_and_return;
+            }
+
+            ULONG wm_offset = e_lfanew + 24 + static_cast<ULONG>(AIDA_WATERMARK_OPT_HDR_OFFSET);
+            PVOID watermark_addr = reinterpret_cast<PVOID>(base + wm_offset);
+
+            if (!_MmIsAddressValid(watermark_addr)) {
+                SN_LOG("attestation::extract_usermode_watermark: watermark addr invalid offset=%lu", wm_offset);
+                goto detach_and_return;
+            }
+
+            RtlCopyMemory(out_watermark, watermark_addr, 16);
+            *watermark_offset = wm_offset;
+            result = STATUS_SUCCESS;
+
+            SN_LOG("attestation::extract_usermode_watermark: success base=%p e_lfanew=%lu wm_offset=%lu wm[0..3]=0x%02x%02x%02x%02x",
+                image_base, e_lfanew, wm_offset,
+                out_watermark[0], out_watermark[1], out_watermark[2], out_watermark[3]);
+
+        detach_and_return:
+            if (attached) {
+                __try {
+                    _KeUnstackDetachProcess(&apc_state);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            SN_LOG("attestation::extract_usermode_watermark: EXCEPTION");
+            if (attached) {
+                __try {
+                    _KeUnstackDetachProcess(&apc_state);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            result = STATUS_ACCESS_VIOLATION;
+        }
+
+        return result;
+    }
+
+    __forceinline BOOLEAN verify_watermark(PEPROCESS process, const UINT8 expected[16])
+    {
+        if (!process || !expected)
+            return FALSE;
+
+        UINT32 wm_offset = 0;
+        UINT8 actual[16] = {};
+
+        NTSTATUS st = extract_usermode_watermark(process, &wm_offset, actual);
+        if (!NT_SUCCESS(st)) {
+            SN_LOG("attestation::verify_watermark: extract failed status=0x%08lx", st);
+            RtlCopyMemory(g_watermark_state.expected_watermark, expected, 16);
+            RtlZeroMemory(g_watermark_state.actual_watermark, 16);
+            g_watermark_state.watermark_verified = FALSE;
+            g_watermark_state.watermark_rva = 0;
+            g_watermark_state.verification_timestamp = static_cast<UINT64>(__rdtsc());
+            return FALSE;
+        }
+
+        BOOLEAN match = static_cast<BOOLEAN>(RtlEqualMemory(actual, expected, 16));
+
+        RtlCopyMemory(g_watermark_state.expected_watermark, expected, 16);
+        RtlCopyMemory(g_watermark_state.actual_watermark, actual, 16);
+        g_watermark_state.watermark_verified = match;
+        g_watermark_state.watermark_rva = wm_offset;
+
+        LARGE_INTEGER ts;
+        KeQuerySystemTime(&ts);
+        g_watermark_state.verification_timestamp = static_cast<UINT64>(ts.QuadPart);
+
+        SN_LOG("attestation::verify_watermark: match=%u wm_offset=%lu expected[0..3]=0x%02x%02x%02x%02x actual[0..3]=0x%02x%02x%02x%02x",
+            match ? 1u : 0u, wm_offset,
+            expected[0], expected[1], expected[2], expected[3],
+            actual[0], actual[1], actual[2], actual[3]);
+
+        return match;
+    }
 }

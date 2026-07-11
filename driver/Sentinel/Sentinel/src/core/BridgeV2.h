@@ -2,6 +2,7 @@
 
 #include <ntddk.h>
 #include "KernelCrypto.h"
+#include "WitnessKey.h"
 
 namespace bridge_v2
 {
@@ -94,7 +95,26 @@ namespace bridge_v2
         g_bridge_v2->version = BRIDGE_V2_VERSION;
         g_bridge_v2->counter = 0;
 
-        RtlCopyMemory(g_bridge_key, kw_subkey, 32);
+        UINT8 witness_derived_key[32] = {};
+        BOOLEAN witness_ok = witness_key::derive_subkey("bridge-v2", witness_derived_key);
+        if (witness_ok) {
+            RtlCopyMemory(g_bridge_key, witness_derived_key, 32);
+            SN_LOG("bridge_v2::init_bridge: using witness-derived key key_hash=0x%llx",
+                static_cast<unsigned long long>(bridge_diag_hash(g_bridge_key, sizeof(g_bridge_key))));
+        } else if (kw_subkey) {
+            RtlCopyMemory(g_bridge_key, kw_subkey, 32);
+            SN_LOG("bridge_v2::init_bridge: witness derive failed, using fallback key key_hash=0x%llx",
+                static_cast<unsigned long long>(bridge_diag_hash(g_bridge_key, sizeof(g_bridge_key))));
+        } else {
+            SN_LOG("bridge_v2::init_bridge: FAIL reason=no_key_source witness_ok=%u kw_subkey_present=%u",
+                witness_ok ? 1u : 0u, kw_subkey ? 1u : 0u);
+            ExFreePoolWithTag(g_bridge_v2, BRIDGE_POOL_TAG);
+            g_bridge_v2 = nullptr;
+            RtlSecureZeroMemory(witness_derived_key, sizeof(witness_derived_key));
+            return FALSE;
+        }
+        RtlSecureZeroMemory(witness_derived_key, sizeof(witness_derived_key));
+
         KeInitializeSpinLock(&g_bridge_lock);
         g_last_counter = 0;
 

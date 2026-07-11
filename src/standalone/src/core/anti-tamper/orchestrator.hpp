@@ -40,6 +40,7 @@
 #include "cff.hpp"
 #include "call_obfuscation.hpp"
 #include "decoy_call_graph.hpp"
+#include "honeypot_license.hpp"
 #include "nanomites.hpp"
 #include "binary_protocol.hpp"
 #include "server_pages.hpp"
@@ -276,6 +277,83 @@ inline uint32_t apply_anti_emulation_nested()
     rt.atp_flags[0x7A1DA0Eu] |= ATP_VM_NESTED;
 
     webhook::write_log("init", "anti_emu_nested_applied");
+
+    {
+        uint32_t entangled_rva_a = 0x7A1DA1Au;
+        uint32_t entangled_rva_b = 0x7A1DA1Bu;
+
+        uint64_t key_a = resolve_rolling_key_for(entangled_rva_a);
+        uint64_t key_b = resolve_rolling_key_for(entangled_rva_b);
+
+        uint8_t opcode_map_a[256];
+        uint8_t reverse_map_a[256];
+        virtualizer::detail::derive_function_maps(
+            entangled_rva_a, state::g_vm_master_key, opcode_map_a, reverse_map_a);
+
+        uint8_t opcode_map_b[256];
+        uint8_t reverse_map_b[256];
+        virtualizer::detail::derive_function_maps(
+            entangled_rva_b, state::g_vm_master_key, opcode_map_b, reverse_map_b);
+
+        auto entangled = vm_compiler::build_entangled_anti_emu_programs(
+            key_a, key_b, opcode_map_a, opcode_map_b);
+
+        if (entangled.first.empty() || entangled.second.empty())
+        {
+            webhook::write_log("init", "anti_emu_entangled_empty");
+        }
+        else
+        {
+            uint64_t exec_a_result = 0;
+            uint64_t exec_b_result = 0;
+            bool exec_a_ok = false;
+            bool exec_b_ok = false;
+
+            __try
+            {
+                virtualizer::detail::vm_state_t vm_a;
+                uint64_t seed_a = __rdtsc() ^ 0x7A1DA1Au ^ GetCurrentProcessId();
+                virtualizer::detail::init_vm(vm_a, seed_a);
+                exec_a_result = virtualizer::detail::vm_execute_with_rva(
+                    vm_a, entangled.first.data(),
+                    static_cast<uint32_t>(entangled.first.size()),
+                    entangled_rva_a, state::g_vm_master_key);
+                virtualizer::detail::destroy_vm(vm_a);
+                exec_a_ok = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                webhook::write_log("init", "anti_emu_entangled_exec_a_exception");
+            }
+
+            __try
+            {
+                virtualizer::detail::vm_state_t vm_b;
+                uint64_t seed_b = __rdtsc() ^ 0x7A1DA1Bu ^ GetCurrentProcessId();
+                virtualizer::detail::init_vm(vm_b, seed_b);
+                exec_b_result = virtualizer::detail::vm_execute_with_rva(
+                    vm_b, entangled.second.data(),
+                    static_cast<uint32_t>(entangled.second.size()),
+                    entangled_rva_b, state::g_vm_master_key);
+                virtualizer::detail::destroy_vm(vm_b);
+                exec_b_ok = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                webhook::write_log("init", "anti_emu_entangled_exec_b_exception");
+            }
+
+            char entangled_log[256];
+            _snprintf_s(entangled_log, sizeof(entangled_log), _TRUNCATE,
+                "anti_emu_entangled_results a_ok=%d a_result=0x%llX b_ok=%d b_result=0x%llX",
+                exec_a_ok ? 1 : 0,
+                static_cast<unsigned long long>(exec_a_result),
+                exec_b_ok ? 1 : 0,
+                static_cast<unsigned long long>(exec_b_result));
+            webhook::write_log("init", entangled_log);
+        }
+    }
+
     return 1;
 }
 
@@ -844,6 +922,35 @@ inline bool ensure_driver_hardening(const char* phase)
         webhook::send_debug_log("init", "driver_hardening_dynamic_ioctl_not_ready_after_auth", true);
         enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_hardening_dynamic_ioctl_not_ready_after_auth"), "driver_hardening_dynamic_ioctl_not_ready_after_auth");
         return false;
+    }
+
+    {
+        uint8_t driver_challenge[32] = {};
+        webhook::write_log_critical_fmt("init",
+            "driver_handshake_initiate_pre phase=%s pid=%lu tid=%lu",
+            phase_name, GetCurrentProcessId(), GetCurrentThreadId());
+        bool hs_ok = driver_bridge::initiate_driver_handshake(driver_challenge);
+        DWORD hs_err = hs_ok ? ERROR_SUCCESS : GetLastError();
+        webhook::write_log_critical_fmt("init",
+            "driver_handshake_initiate_post phase=%s ok=%d err=%lu",
+            phase_name, hs_ok ? 1 : 0, static_cast<unsigned long>(hs_err));
+        if (hs_ok) {
+            webhook::write_log_critical_fmt("init",
+                "driver_handshake_complete_pre phase=%s pid=%lu tid=%lu",
+                phase_name, GetCurrentProcessId(), GetCurrentThreadId());
+            hs_ok = driver_bridge::complete_driver_challenge(driver_challenge);
+            hs_err = hs_ok ? ERROR_SUCCESS : GetLastError();
+            webhook::write_log_critical_fmt("init",
+                "driver_handshake_complete_post phase=%s ok=%d err=%lu",
+                phase_name, hs_ok ? 1 : 0, static_cast<unsigned long>(hs_err));
+        }
+        SecureZeroMemory(driver_challenge, sizeof(driver_challenge));
+        if (!hs_ok) {
+            webhook::send_debug_log("init", "driver_handshake_failed", true);
+            enforce_violation_id(aida::reason_ids::reason_id_from_string("driver_handshake_failed"), "driver_handshake_failed");
+            return false;
+        }
+        webhook::write_log("init", "driver_handshake_ok");
     }
 
     struct driver_hardening_scope_t
@@ -1423,6 +1530,8 @@ inline bool initialize()
     }
     webhook::write_log("init", "syscall_ok");
 
+    anti_emulation::set_timing_canary_fn(&execute_vm_protected_timing_canary);
+
     {
         uint64_t anti_emu_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
@@ -1945,6 +2054,40 @@ inline bool initialize()
     webhook::write_log("init", "anti_hook_ok");
     webhook::write_log_critical("init", "anti_hook_ok_log_post");
 
+    {
+        anti_hook::register_self_function("anti_hook::scan_impl",
+            reinterpret_cast<void*>(&anti_hook::scan_impl));
+        anti_hook::register_self_function("anti_hook::full_scan",
+            reinterpret_cast<void*>(&anti_hook::full_scan));
+        anti_hook::register_self_function("anti_hook::runtime_scan",
+            reinterpret_cast<void*>(&anti_hook::runtime_scan));
+        anti_hook::register_self_function("syscall::call_NtQueryInformationProcess",
+            reinterpret_cast<void*>(&syscall::call_NtQueryInformationProcess));
+        anti_hook::register_self_function("syscall::call_NtQuerySystemInformation",
+            reinterpret_cast<void*>(&syscall::call_NtQuerySystemInformation));
+        anti_hook::register_self_function("syscall::call_NtClose",
+            reinterpret_cast<void*>(&syscall::call_NtClose));
+        anti_hook::register_self_function("enforce_violation_id",
+            reinterpret_cast<void*>(&enforce_violation_id));
+        anti_hook::register_self_function("integrity::snapshot_code",
+            reinterpret_cast<void*>(&integrity::snapshot_code));
+        anti_hook::register_self_function("integrity::detail::verify_page_locked",
+            reinterpret_cast<void*>(&integrity::detail::verify_page_locked));
+        anti_hook::register_self_function("ghost_veh::dispatch",
+            reinterpret_cast<void*>(&ghost_veh::dispatch));
+        anti_hook::register_self_function("ghost_veh::ghost_veh_thunk",
+            reinterpret_cast<void*>(&ghost_veh::ghost_veh_thunk));
+        anti_hook::register_self_function("call_obfuscation::resolve",
+            reinterpret_cast<void*>(&call_obfuscation::resolve));
+        anti_hook::register_self_function("re_detect::detail::collect_signals",
+            reinterpret_cast<void*>(&re_detect::detail::collect_signals));
+        anti_hook::register_self_function("re_detect::tick",
+            reinterpret_cast<void*>(&re_detect::tick));
+
+        anti_hook::capture_self_prologues();
+        webhook::write_log("init", "self_function_prologues_captured");
+    }
+
     webhook::write_log_critical("init", "ambient_tool_posture_enforcement_removed");
 
     {
@@ -2068,6 +2211,59 @@ inline bool initialize()
     webhook::write_log("init", "code_encrypt_ok");
     webhook::write_log_critical("init", "code_encrypt_ok_log_post");
 
+    {
+        HMODULE hMod = GetModuleHandleW(nullptr);
+        uint64_t mod_base = reinterpret_cast<uint64_t>(hMod);
+
+        static const char* const kCodeEncryptExportNames[] = {
+            "arc_init",
+            "arc_validate_tool_exec_v2",
+            "arc_heartbeat",
+            "arc_get_comm_bridge",
+        };
+        static const uint32_t kCodeEncryptExportSizes[] = {
+            1024,
+            512,
+            512,
+            256,
+        };
+        for (size_t i = 0; i < sizeof(kCodeEncryptExportNames) / sizeof(kCodeEncryptExportNames[0]); ++i)
+        {
+            uint32_t rva = resolve_export_rva(kCodeEncryptExportNames[i]);
+            if (rva != 0)
+            {
+                code_encrypt::register_function(
+                    mod_base + rva, kCodeEncryptExportSizes[i],
+                    kCodeEncryptExportNames[i]);
+            }
+            else
+            {
+                char dbg[128];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "code_encrypt_register_export_deferred name=%s", kCodeEncryptExportNames[i]);
+                webhook::write_log("init", dbg);
+            }
+        }
+
+        code_encrypt::register_function(
+            reinterpret_cast<uint64_t>(&standalone_license::validate_with_environmental_resistance),
+            512, "standalone_license::validate");
+        code_encrypt::register_function(
+            reinterpret_cast<uint64_t>(&standalone_license::arc_heartbeat),
+            256, "standalone_license::heartbeat");
+        code_encrypt::register_function(
+            reinterpret_cast<uint64_t>(&anti_tamper::enforce_violation_id),
+            512, "anti_tamper::enforce_violation_id");
+        code_encrypt::register_function(
+            reinterpret_cast<uint64_t>(&integrity::snapshot_code),
+            512, "integrity::snapshot_code");
+        code_encrypt::register_function(
+            reinterpret_cast<uint64_t>(&integrity::verify_usermode),
+            512, "integrity::verify_code");
+
+        webhook::write_log("init", "code_encrypt_functions_registered");
+    }
+
     uint64_t metamorphic_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "metamorphic_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2167,6 +2363,26 @@ inline bool initialize()
             iso_hits);
     }
 
+    {
+        uint64_t honeypot_tick = GetTickCount64();
+        webhook::write_log_critical_fmt("init",
+            "honeypot_initialize_pre pid=%lu tid=%lu tick=%llu",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            static_cast<unsigned long long>(honeypot_tick));
+        __try {
+            honeypot::initialize();
+            webhook::write_log("init", "honeypot_initialize_ok");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            webhook::write_log_critical_fmt("init",
+                "honeypot_initialize_seh_exception code=0x%08X",
+                GetExceptionCode());
+            diag::log_tagged_critical("init", "honeypot_initialize_failed_critical_continue");
+        }
+        webhook::write_log_critical_fmt("init",
+            "honeypot_initialize_post elapsed_ms=%llu",
+            static_cast<unsigned long long>(GetTickCount64() - honeypot_tick));
+    }
 
     {
         packer::build_protection_status_t packer_status{};
@@ -3466,6 +3682,7 @@ inline bool guard()
     CFF_STATE(guard_cff, 3)
     {
         DECOY_CALL_INTEGRATED(g3);
+        HONEYPOT_LICENSE_WEAVE(g3b);
         auto dbg = anti_debug::full_scan(rt.code_snap.module_base, rt.code_snap.module_end);
         if (dbg.any_detected())
         {
@@ -3480,6 +3697,32 @@ inline bool guard()
         uint64_t anti_hook_tick = GetTickCount64();
         auto hook = anti_hook::runtime_scan(rt.iat_snap);
         uint64_t anti_hook_elapsed = GetTickCount64() - anti_hook_tick;
+
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver()) {
+            uint8_t k_hook_detected = 0;
+            uint64_t k_hook_target = 0;
+            if (driver_bridge::query_sentinel_dispatch_guard(k_hook_detected, k_hook_target)) {
+                hook.kernel_dispatch_hooked = (k_hook_detected != 0);
+                if (hook.kernel_dispatch_hooked) {
+                    char dbg[160];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                        "kernel_dispatch_hook_detected target=0x%llX",
+                        static_cast<unsigned long long>(k_hook_target));
+                    webhook::write_log_critical("guard", dbg);
+                }
+            }
+            uint8_t k_hostile = 0;
+            uint8_t k_modified = 0;
+            if (driver_bridge::query_sentinel_callback_scan(k_hostile, k_modified)) {
+                hook.kernel_callback_hooked = (k_modified != 0);
+                if (hook.kernel_callback_hooked) {
+                    webhook::write_log_critical_fmt("guard",
+                        "kernel_callback_hook_detected hostile_drivers=%u modified_callbacks=%u",
+                        k_hostile ? 1u : 0u,
+                        k_modified ? 1u : 0u);
+                }
+            }
+        }
         if (hook.any_detected() || anti_hook_elapsed >= 1000ULL)
         {
             webhook::write_log_critical_fmt("guard",
@@ -3773,6 +4016,7 @@ inline bool guard()
     CFF_STATE(guard_cff, 7)
     {
         DECOY_CALL_INTEGRATED(g7);
+        HONEYPOT_LICENSE_WEAVE(g7b);
         bool call_obf_ok = call_obfuscation::verify_table_integrity();
         if (!call_obf_ok)
         {
@@ -4207,6 +4451,16 @@ inline bool guard()
     }
     CFF_STATE(guard_cff, 10)
     {
+        if ((rt.verify_counter & 0xF) == 0)
+        {
+            __try {
+                honeypot::periodic_canary_check();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                webhook::write_log_critical_fmt("guard",
+                    "honeypot_periodic_canary_check_seh code=0x%08X",
+                    GetExceptionCode());
+            }
+        }
         CFF_GOTO(guard_cff, 11);
     }
     CFF_STATE(guard_cff, 11)

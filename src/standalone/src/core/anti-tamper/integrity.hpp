@@ -456,6 +456,20 @@ namespace detail {
         return static_cast<uint64_t>((q.QuadPart * 1000ULL) / f.QuadPart);
     }
 
+    static __forceinline uint8_t aes_compute_rcon(int round) {
+        if (round <= 0) return 0;
+        volatile uint64_t tsc = __rdtsc();
+        volatile uint8_t noise = static_cast<uint8_t>(tsc & 0xFF);
+        uint8_t r = 1;
+        for (int j = 1; j < round; ++j) {
+            uint8_t hi = r & 0x80u;
+            r = static_cast<uint8_t>(r << 1);
+            if (hi) r ^= 0x1Bu;
+        }
+        volatile uint8_t masked = r ^ noise;
+        return static_cast<uint8_t>(masked ^ noise);
+    }
+
     inline void aes128_expand_key(const uint8_t key[16], __m128i round_keys[11])
     {
         round_keys[0] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key));
@@ -469,16 +483,21 @@ namespace detail {
             k = _mm_xor_si128(k, t);
             return _mm_xor_si128(k, ka);
         };
-        round_keys[1]  = exp(round_keys[0],  _mm_aeskeygenassist_si128(round_keys[0],  0x01));
-        round_keys[2]  = exp(round_keys[1],  _mm_aeskeygenassist_si128(round_keys[1],  0x02));
-        round_keys[3]  = exp(round_keys[2],  _mm_aeskeygenassist_si128(round_keys[2],  0x04));
-        round_keys[4]  = exp(round_keys[3],  _mm_aeskeygenassist_si128(round_keys[3],  0x08));
-        round_keys[5]  = exp(round_keys[4],  _mm_aeskeygenassist_si128(round_keys[4],  0x10));
-        round_keys[6]  = exp(round_keys[5],  _mm_aeskeygenassist_si128(round_keys[5],  0x20));
-        round_keys[7]  = exp(round_keys[6],  _mm_aeskeygenassist_si128(round_keys[6],  0x40));
-        round_keys[8]  = exp(round_keys[7],  _mm_aeskeygenassist_si128(round_keys[7],  0x80));
-        round_keys[9]  = exp(round_keys[8],  _mm_aeskeygenassist_si128(round_keys[8],  0x1B));
-        round_keys[10] = exp(round_keys[9],  _mm_aeskeygenassist_si128(round_keys[9],  0x36));
+        auto keygen_rcon = [&](__m128i prev_key, int round) -> __m128i {
+            uint8_t rcon = aes_compute_rcon(round);
+            __m128i keygened = exp(prev_key, _mm_aeskeygenassist_si128(prev_key, 0));
+            return _mm_xor_si128(keygened, _mm_set1_epi32(static_cast<int>(rcon) << 24));
+        };
+        round_keys[1]  = keygen_rcon(round_keys[0], 1);
+        round_keys[2]  = keygen_rcon(round_keys[1], 2);
+        round_keys[3]  = keygen_rcon(round_keys[2], 3);
+        round_keys[4]  = keygen_rcon(round_keys[3], 4);
+        round_keys[5]  = keygen_rcon(round_keys[4], 5);
+        round_keys[6]  = keygen_rcon(round_keys[5], 6);
+        round_keys[7]  = keygen_rcon(round_keys[6], 7);
+        round_keys[8]  = keygen_rcon(round_keys[7], 8);
+        round_keys[9]  = keygen_rcon(round_keys[8], 9);
+        round_keys[10] = keygen_rcon(round_keys[9], 10);
     }
 
     __forceinline __m128i aes128_encrypt_block(const __m128i round_keys[11], __m128i in)
@@ -1849,15 +1868,18 @@ inline void snapshot_iat(std::vector<state::iat_entry_t>& snap)
     for (; imp->Name != 0; ++imp)
     {
         ++descriptor_count;
+        const char* dll_name = reinterpret_cast<const char*>(base + imp->Name);
         auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(
             base + imp->FirstThunk);
 
         for (; thunk->u1.Function != 0; ++thunk)
         {
-            snap.push_back({
-                reinterpret_cast<uint64_t>(&thunk->u1.Function),
-                thunk->u1.Function
-            });
+            state::iat_entry_t entry{};
+            entry.slot_va = reinterpret_cast<uint64_t>(&thunk->u1.Function);
+            entry.resolved_va = thunk->u1.Function;
+            _snprintf_s(entry.expected_module, sizeof(entry.expected_module),
+                        _TRUNCATE, "%s", dll_name);
+            snap.push_back(entry);
         }
     }
     webhook::write_log_critical_fmt("integrity",

@@ -37,5 +37,4 @@ namespace mcp_standalone::ida_compat
     static constexpr std::size_t CALC_MAX_BITS = 65536;
 
     tool_result_t tool_calculate(const json& params, const workspace_request_context_t& ctx);
-    void register_calculator_tool(server_t& server);
 }

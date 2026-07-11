@@ -3,6 +3,7 @@
 #include <core/Heartbeat.h>
 #include <core/ObjectGuard.h>
 #include <core/ThreadGuard.h>
+#include <core/DriverLoadAudit.h>
 
 namespace process_notify {
 
@@ -37,6 +38,7 @@ namespace process_notify {
         { "PROCEXP152",    11 },
         { "PROCEXP",         7 },
         { "physmem",         7 },
+        { "rdpdr",           5 },
     };
     constexpr int g_ce_driver_name_count = sizeof(g_ce_driver_names) / sizeof(g_ce_driver_names[0]);
 
@@ -215,6 +217,43 @@ namespace process_notify {
         return match;
     }
 
+    __forceinline void update_ce_driver_hashes(const UINT8* hash_data, ULONG hash_count) {
+        if (!hash_data || hash_count == 0)
+            return;
+        if (hash_count > 32)
+            hash_count = 32;
+
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_ce_hash_lock, &old_irql);
+
+        RtlZeroMemory(g_ce_driver_hashes, sizeof(g_ce_driver_hashes));
+        for (ULONG i = 0; i < hash_count; ++i) {
+            RtlCopyMemory(g_ce_driver_hashes[i].hash, hash_data + (i * 32), 32);
+        }
+        _InterlockedExchange(&g_ce_driver_hash_count, static_cast<LONG>(hash_count));
+
+        KeReleaseSpinLock(&g_ce_hash_lock, old_irql);
+        SN_LOG("process_notify: update_ce_driver_hashes count=%lu", hash_count);
+    }
+
+    __forceinline HANDLE get_effective_protected_pid() {
+        HANDLE bridge_pid = heartbeat::get_bridge_protected_pid();
+        if (bridge_pid)
+            return bridge_pid;
+        return reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+    }
+
+    __forceinline UINT64 compute_driver_name_hash(const UCHAR* name, int name_len) {
+        UINT64 hash = 14695981039346656037ULL;
+        for (int i = 0; i < name_len; ++i) {
+            hash ^= static_cast<UINT8>(name[i] | 0x20);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
     __forceinline void detect_ce_driver() {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL)
             return;
@@ -272,10 +311,15 @@ namespace process_notify {
                 if (hash_match) {
                     SN_LOG("process_notify: CE driver HASH MATCH -- BSOD driver='%.*s'",
                         drv_name_len, drv_name);
+                    driver_load_audit::record(
+                        compute_driver_name_hash(drv_name, drv_name_len),
+                        reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
+                        modules->Modules[i].ImageSize,
+                        3);
                     ExFreePoolWithTag(modules, 'ceDM');
 #ifndef AIDA_DEV_MODE
                     if (_KeBugCheckEx) {
-                        _KeBugCheckEx(0xA1DA0005,
+                        _KeBugCheckEx(0xA1DA0007,
                             (ULONG_PTR)i,
                             (ULONG_PTR)modules->Modules[i].ImageBase,
                             0, 0);
@@ -286,6 +330,11 @@ namespace process_notify {
 
                 SN_LOG("process_notify: CE driver name match but hash NOT in list -- tier 1 log '%.*s'",
                     drv_name_len, drv_name);
+                driver_load_audit::record(
+                    compute_driver_name_hash(drv_name, drv_name_len),
+                    reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
+                    modules->Modules[i].ImageSize,
+                    1);
                 heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER,
                     static_cast<ULONG>(i));
             } else {
@@ -304,10 +353,15 @@ namespace process_notify {
                 }
 
                 if (high_confidence) {
+                    driver_load_audit::record(
+                        compute_driver_name_hash(drv_name, drv_name_len),
+                        reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
+                        modules->Modules[i].ImageSize,
+                        3);
                     ExFreePoolWithTag(modules, 'ceDM');
 #ifndef AIDA_DEV_MODE
                     if (_KeBugCheckEx) {
-                        _KeBugCheckEx(0xA1DA0005,
+                        _KeBugCheckEx(0xA1DA0007,
                             (ULONG_PTR)i,
                             (ULONG_PTR)modules->Modules[i].ImageBase,
                             0, 0);
@@ -316,6 +370,11 @@ namespace process_notify {
                     return;
                 }
 
+                driver_load_audit::record(
+                    compute_driver_name_hash(drv_name, drv_name_len),
+                    reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
+                    modules->Modules[i].ImageSize,
+                    1);
                 heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER,
                     static_cast<ULONG>(i));
             }
@@ -329,9 +388,7 @@ namespace process_notify {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL)
             return STATUS_INVALID_DEVICE_STATE;
 
-        HANDLE prot_pid = reinterpret_cast<HANDLE>(
-            _InterlockedCompareExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        HANDLE prot_pid = get_effective_protected_pid();
         if (!prot_pid)
             return STATUS_NOT_FOUND;
 
@@ -389,9 +446,7 @@ namespace process_notify {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL)
             return STATUS_INVALID_DEVICE_STATE;
 
-        HANDLE prot_pid = reinterpret_cast<HANDLE>(
-            _InterlockedCompareExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        HANDLE prot_pid = get_effective_protected_pid();
         if (!prot_pid)
             return STATUS_NOT_FOUND;
 
@@ -463,9 +518,7 @@ namespace process_notify {
         UNREFERENCED_PARAMETER(process);
 
         if (!create_info) {
-            HANDLE prot_pid = reinterpret_cast<HANDLE>(
-                _InterlockedCompareExchange64(
-                    reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+            HANDLE prot_pid = get_effective_protected_pid();
             if (prot_pid && pid == prot_pid) {
                 LONG64 previous = _InterlockedCompareExchange64(
                     reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0,
@@ -478,9 +531,7 @@ namespace process_notify {
             return;
         }
 
-        HANDLE prot_pid = reinterpret_cast<HANDLE>(
-            _InterlockedCompareExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        HANDLE prot_pid = get_effective_protected_pid();
         if (!prot_pid)
             return;
 
@@ -510,9 +561,7 @@ namespace process_notify {
 
     static VOID process_create_callback(HANDLE, HANDLE pid, BOOLEAN create) {
         if (!create) {
-            HANDLE prot_pid = reinterpret_cast<HANDLE>(
-                _InterlockedCompareExchange64(
-                    reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+            HANDLE prot_pid = get_effective_protected_pid();
             if (prot_pid && pid == prot_pid) {
                 LONG64 previous = _InterlockedCompareExchange64(
                     reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0,
@@ -525,9 +574,7 @@ namespace process_notify {
             return;
         }
 
-        HANDLE prot_pid = reinterpret_cast<HANDLE>(
-            _InterlockedCompareExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        HANDLE prot_pid = get_effective_protected_pid();
         if (!prot_pid)
             return;
 
@@ -625,9 +672,15 @@ namespace process_notify {
                             if (hash_ok && hash_matches_ce_list(file_hash)) {
                                 SN_LOG("process_notify: CE driver HASH MATCH at load -- BSOD '%.*s'",
                                     static_cast<int>(copy_len), narrow);
+                                driver_load_audit::record(
+                                    compute_driver_name_hash((const UCHAR*)narrow, static_cast<int>(copy_len)),
+                                    reinterpret_cast<UINT64>(ImageInfo->ImageBase),
+                                    ImageInfo->ImageSize,
+                                    3);
+                                hide_aida_process();
 #ifndef AIDA_DEV_MODE
                                 if (_KeBugCheckEx) {
-                                    _KeBugCheckEx(0xA1DA0005,
+                                    _KeBugCheckEx(0xA1DA0007,
                                         (ULONG_PTR)ProcessId,
                                         (ULONG_PTR)ImageInfo->ImageBase,
                                         0, 0);
@@ -652,9 +705,15 @@ namespace process_notify {
                             if (high) {
                                 SN_LOG("process_notify: CE high-confidence driver at load -- BSOD '%.*s'",
                                     static_cast<int>(copy_len), narrow);
+                                driver_load_audit::record(
+                                    compute_driver_name_hash((const UCHAR*)narrow, static_cast<int>(copy_len)),
+                                    reinterpret_cast<UINT64>(ImageInfo->ImageBase),
+                                    ImageInfo->ImageSize,
+                                    3);
+                                hide_aida_process();
 #ifndef AIDA_DEV_MODE
                                 if (_KeBugCheckEx) {
-                                    _KeBugCheckEx(0xA1DA0005,
+                                    _KeBugCheckEx(0xA1DA0007,
                                         (ULONG_PTR)ProcessId,
                                         (ULONG_PTR)ImageInfo->ImageBase,
                                         0, 0);
@@ -663,6 +722,11 @@ namespace process_notify {
                                 return;
                             }
 
+                            driver_load_audit::record(
+                                compute_driver_name_hash((const UCHAR*)narrow, static_cast<int>(copy_len)),
+                                reinterpret_cast<UINT64>(ImageInfo->ImageBase),
+                                ImageInfo->ImageSize,
+                                1);
                             heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER, 0);
                         }
                     }
@@ -670,9 +734,7 @@ namespace process_notify {
             }
         }
 
-        HANDLE prot_pid = reinterpret_cast<HANDLE>(
-            _InterlockedCompareExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        HANDLE prot_pid = get_effective_protected_pid();
         if (!prot_pid || ProcessId != prot_pid)
             return;
 
@@ -711,9 +773,39 @@ namespace process_notify {
     inline volatile LONG g_thread_notify_registered = 0;
 
     static VOID thread_create_callback(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
-        UNREFERENCED_PARAMETER(ThreadId);
-        UNREFERENCED_PARAMETER(ProcessId);
-        UNREFERENCED_PARAMETER(Create);
+        if (!Create)
+            return;
+
+        HANDLE prot_pid = get_effective_protected_pid();
+        if (!prot_pid || ProcessId != prot_pid)
+            return;
+
+        HANDLE caller_pid = PsGetCurrentProcessId();
+        if (caller_pid == prot_pid)
+            return;
+        if ((ULONG_PTR)caller_pid == 4)
+            return;
+        if ((ULONG_PTR)caller_pid == 0)
+            return;
+
+        SN_LOG("process_notify: REMOTE_THREAD detected protected_pid=%llu creator_pid=%llu tid=%llu",
+            (UINT64)(ULONG_PTR)ProcessId,
+            (UINT64)(ULONG_PTR)caller_pid,
+            (UINT64)(ULONG_PTR)ThreadId);
+
+        targeting_latch::latch_targeting(
+            targeting_latch::RE_REASON_OB_CREATE_THREAD,
+            (UINT64)(ULONG_PTR)caller_pid,
+            (UINT64)(ULONG_PTR)ThreadId,
+            0, 0
+        );
+
+        heartbeat::send_command(heartbeat::BRIDGE_CMD_DUMP_TOOL_FOUND,
+            static_cast<ULONG>((ULONG_PTR)caller_pid & 0xFFFFFFFF));
+
+        thread_guard::detect_remote_thread_injection(ProcessId, ThreadId);
+
+        hide_aida_process();
     }
 
     __forceinline bool init() {

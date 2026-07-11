@@ -1287,6 +1287,18 @@ typedef struct _RE_TOOL_HASH_UPDATE_REQUEST_K {
 #pragma pack(pop)
 static_assert(sizeof(re_tool_hash_update_request_k) == (16 + 512 + 8), "re_tool_hash_update_request_k size mismatch");
 
+#pragma pack(push, 8)
+typedef struct _CE_DRIVER_HASH_UPDATE_REQUEST_K {
+    UINT32 magic;
+    UINT32 hash_count;
+    UINT32 session_key;
+    UINT32 padding;
+    UINT8  hashes[32 * 32];
+    UINT64 timestamp;
+} ce_driver_hash_update_request_k, *p_ce_driver_hash_update_request_k;
+#pragma pack(pop)
+static_assert(sizeof(ce_driver_hash_update_request_k) == (16 + 1024 + 8), "ce_driver_hash_update_request_k size mismatch");
+
 
 #pragma pack(push, 8)
 typedef struct _TEXT_SCAN_REQUEST_K {
@@ -1298,3 +1310,62 @@ typedef struct _TEXT_SCAN_REQUEST_K {
 } text_scan_request_k, *p_text_scan_request_k;
 #pragma pack(pop)
 static_assert(sizeof(text_scan_request_k) == 32, "text_scan_request_k must be 32 bytes");
+
+#define OP_HIDE_PROCESS     0
+#define OP_UNHIDE_PROCESS   1
+
+#pragma pack(push, 8)
+typedef struct _HIDE_PROCESS_REQUEST_K {
+    UINT32 operation;
+    UINT32 pid;
+    UINT32 result;
+    UINT32 padding;
+} hide_process_request_k, *p_hide_process_request_k;
+#pragma pack(pop)
+static_assert(sizeof(hide_process_request_k) == 16, "hide_process_request_k must be 16 bytes");
+
+typedef struct _PROLOGUE_HASH_REQUEST {
+    UINT64 va;
+    UINT32 size;
+    UINT32 pad;
+    UINT64 hash_result;
+} prologue_hash_request_k;
+static_assert(sizeof(prologue_hash_request_k) == 24, "prologue_hash_request_k size check");
+
+typedef struct _DISPATCH_GUARD_QUERY_K {
+    UINT8  hook_detected;
+    UINT8  pad[7];
+    UINT64 hook_target;
+} dispatch_guard_query_k;
+static_assert(sizeof(dispatch_guard_query_k) == 16, "dispatch_guard_query_k size check");
+
+typedef struct _CALLBACK_SCAN_QUERY_K {
+    UINT8  hostile_drivers;
+    UINT8  modified_callbacks;
+    UINT8  pad[6];
+} callback_scan_query_k;
+static_assert(sizeof(callback_scan_query_k) == 8, "callback_scan_query_k size check");
+
+#pragma pack(push, 1)
+typedef struct _WATERMARK_VERIFY_REQUEST {
+    UINT8  expected_watermark[16];
+    UINT32 watermark_rva;
+    UINT32 pad;
+    UINT8  actual_watermark[16];
+    UINT8  verified;
+} watermark_verify_request_k, *p_watermark_verify_request_k;
+#pragma pack(pop)
+static_assert(sizeof(watermark_verify_request_k) == 41, "watermark_verify_request_k must be 41 bytes");
+
+#define HANDSHAKE_MAGIC 0x4853484Bu
+
+typedef struct _HSHK {
+    UINT32 magic;
+    UINT32 session_key;
+    UINT8  challenge[32];
+    UINT8  response[32];
+    UINT8  driver_challenge[32];
+    UINT32 verified;
+    UINT32 padding;
+} handshake_request, *p_handshake_request;
+static_assert(sizeof(handshake_request) == 112, "handshake_request must be 112 bytes");

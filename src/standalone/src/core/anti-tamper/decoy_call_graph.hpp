@@ -26,6 +26,11 @@ namespace anti_tamper::call_obfuscation::detail {
     extern call_entry_t g_table[];
 }
 
+namespace anti_tamper::honeypot {
+    void initialize();
+    void anchor_honeypot_decoy_entries();
+}
+
 
 namespace anti_tamper::decoy {
 
@@ -792,6 +797,7 @@ namespace anti_tamper::decoy {
         for (int i = 0; i < 16; ++i)
             sink += reinterpret_cast<uintptr_t>(g_decoy_strings[i]);
 
+        honeypot::anchor_honeypot_decoy_entries();
         (void)sink;
     }
 
@@ -838,7 +844,9 @@ namespace anti_tamper::decoy {
         volatile uintptr_t sink = 0;
         for (int i = 0; i < FAKE_IMPORT_COUNT; ++i)
             sink += reinterpret_cast<uintptr_t>(g_fake_imports[i].addr);
+        volatile int hp_count = HONEYPOT_FAKE_IMPORT_COUNT;
         (void)sink;
+        (void)hp_count;
     }
 
 
@@ -1048,6 +1056,7 @@ namespace taint_poison {
         anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_2);
         anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_3);
         anchor += reinterpret_cast<uintptr_t>(&decoy_sink_hmac_4);
+        honeypot::initialize();
         (void)anchor;
     }
 
@@ -1398,3 +1407,17 @@ namespace taint_poison {
             static_cast<uint64_t>(tainted_var),                                  \
             0x484D4147ULL | (uint64_t)__LINE__);                                 \
     } while (0)
+
+#include "honeypot_license.hpp"
+
+namespace anti_tamper::honeypot {
+    inline void anchor_honeypot_decoy_entries() {
+        volatile uintptr_t sink = 0;
+        for (int i = 0; i < 8; ++i)
+            sink += reinterpret_cast<uintptr_t>(g_honeypot_fake_imports[i].addr);
+        for (int i = 0; i < 5; ++i)
+            sink += reinterpret_cast<uintptr_t>(&g_decoy_metas[i]);
+        sink += reinterpret_cast<uintptr_t>(&g_license_honeypot_strings[0]);
+        (void)sink;
+    }
+}

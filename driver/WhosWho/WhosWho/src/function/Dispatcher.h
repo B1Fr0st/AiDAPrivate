@@ -19,6 +19,7 @@
 
 namespace dll_protection {
     ULONG cleanup_for_session_reset(UINT32 pid, const char* reason);
+    NTSTATUS read_process_bytes_physical(UINT32 pid, UINT64 va, UINT8* out, UINT32 size, UINT32* bytes_read);
 }
 
 __forceinline ULONG hash_build_key(ULONG key) {
@@ -154,6 +155,14 @@ namespace ioctl_codes {
     __forceinline ULONG DMCT() { return make(70); }
     __forceinline ULONG TXTS() { return make(71); }
     __forceinline ULONG RTHS() { return make(72); }
+    __forceinline ULONG HDPR() { return make(73); }
+    __forceinline ULONG KPHS() { return make(75); }
+    __forceinline ULONG SDGR() { return make(76); }
+    __forceinline ULONG SCBS() { return make(77); }
+    __forceinline ULONG HSHK() { return make(78); }
+    __forceinline ULONG HRES() { return make(79); }
+    __forceinline ULONG WMRK() { return make(80); }
+    __forceinline ULONG CEDH() { return make(81); }
 }
 
 namespace phase3_msg {
@@ -344,12 +353,12 @@ namespace dispatcher {
         out.encoded = (code & 0x0000FFFFu) >> 2;
         if (out.base_previous != 0 && out.encoded >= out.base_previous) {
             ULONG prev_candidate = out.encoded - out.base_previous;
-            if (prev_candidate <= 72u)
+            if (prev_candidate <= 80u)
                 out.offset_via_previous = prev_candidate;
         }
         if (out.encoded >= out.base) {
             ULONG candidate = out.encoded - out.base;
-            if (candidate <= 72u) {
+            if (candidate <= 80u) {
                 out.offset = candidate;
                 out.valid = TRUE;
             }
@@ -461,6 +470,8 @@ namespace dispatcher {
         case 70u: return "DMCT";
         case 71u: return "TXTS";
         case 72u: return "RTHS";
+        case 80u: return "WMRK";
+        case 81u: return "CEDH";
         default: return "OTHER";
         }
     }
@@ -485,6 +496,8 @@ namespace dispatcher {
         case 70u: return ioctl_codes::DMCT();
         case 71u: return ioctl_codes::TXTS();
         case 72u: return ioctl_codes::RTHS();
+        case 80u: return ioctl_codes::WMRK();
+        case 81u: return ioctl_codes::CEDH();
         default: return 0;
         }
     }
@@ -556,7 +569,8 @@ namespace dispatcher {
             code == ioctl_codes::DMST() ||
             code == ioctl_codes::DMCT() ||
             code == ioctl_codes::TXTS() ||
-            code == ioctl_codes::RTHS())
+            code == ioctl_codes::RTHS() ||
+            code == ioctl_codes::CEDH())
             return TRUE;
         return looks_like_startup_ioctl_shape(input_size, output_size);
     }
@@ -1235,7 +1249,7 @@ namespace dispatcher {
 
         ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
         if (early_decode.accepted_via_previous && early_decode.valid &&
-            early_decode.offset != 0xffffffffu && early_decode.offset <= 71u) {
+            early_decode.offset != 0xffffffffu && early_decode.offset <= 79u) {
             const ULONG canonical_code = ioctl_codes::make(early_decode.offset);
             if (canonical_code != code) {
                 WW_LOG("ioctl_seed_previous_canonicalize raw_code=0x%08lx canonical_code=0x%08lx offset=%lu base_current=0x%lx base_previous=0x%lx caller_pid=%llu registered_pid=%llu",
@@ -2550,8 +2564,13 @@ namespace dispatcher {
         }
         else if (code == ioctl_codes::ADMP()) {
             if (input_size >= sizeof(anti_dump_request) && output_size >= sizeof(anti_dump_request)) {
-                status = functions::handle_anti_dump((p_anti_dump_request)buffer);
-                bytes = sizeof(anti_dump_request);
+                auto* admp = (p_anti_dump_request)buffer;
+                if (admp->operation == ADMP_OP_LOCK_PAGES && input_size < sizeof(admp_lock_pages_req)) {
+                    status = STATUS_INFO_LENGTH_MISMATCH;
+                } else {
+                    status = functions::handle_anti_dump((p_anti_dump_request)buffer);
+                    bytes = sizeof(anti_dump_request);
+                }
             }
             else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
@@ -3505,6 +3524,200 @@ namespace dispatcher {
                         req->hash_count,
                         reinterpret_cast<UINT64>(PsGetCurrentProcessId()));
                 }
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::CEDH()) {
+            if (input_size >= sizeof(ce_driver_hash_update_request_k) &&
+                output_size >= sizeof(ce_driver_hash_update_request_k)) {
+                auto* req = reinterpret_cast<ce_driver_hash_update_request_k*>(buffer);
+                ULONG expected_magic = 0x5A4E0C03u ^ g_session_key ^ dynamic_key::get();
+                if (req->magic != expected_magic) {
+                    status = STATUS_ACCESS_DENIED;
+                    bytes = sizeof(ce_driver_hash_update_request_k);
+                } else if (req->hash_count > 32) {
+                    status = STATUS_INVALID_PARAMETER;
+                    bytes = sizeof(ce_driver_hash_update_request_k);
+                } else {
+                    RtlCopyMemory(
+                        const_cast<PUCHAR>(sentinel_bridge::g_bridge.ce_driver_hash_data),
+                        req->hashes,
+                        static_cast<SIZE_T>(req->hash_count) * 32u);
+                    sentinel_bridge::g_bridge.ce_driver_hash_count = req->hash_count;
+                    _InterlockedExchange(
+                        (volatile LONG*)&sentinel_bridge::g_bridge.sentinel_cmd,
+                        sentinel_bridge::BRIDGE_CMD_UPDATE_CE_HASHES);
+                    _InterlockedExchange(
+                        (volatile LONG*)&sentinel_bridge::g_bridge.sentinel_cmd_param,
+                        static_cast<LONG>(req->hash_count));
+                    req->magic = 0;
+                    status = STATUS_SUCCESS;
+                    bytes = sizeof(ce_driver_hash_update_request_k);
+                    WW_LOG("CEDH_IOCTL: forwarded ce_driver_hashes count=%lu caller_pid=%llu",
+                        req->hash_count,
+                        reinterpret_cast<UINT64>(PsGetCurrentProcessId()));
+                }
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::HDPR()) {
+            if (input_size >= sizeof(hide_process_request_k) &&
+                output_size >= sizeof(hide_process_request_k)) {
+                status = functions::handle_hide_process((p_hide_process_request_k)buffer);
+                bytes = sizeof(hide_process_request_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::KPHS()) {
+            if (input_size >= sizeof(prologue_hash_request_k) &&
+                output_size >= sizeof(prologue_hash_request_k)) {
+                auto* req = (prologue_hash_request_k*)buffer;
+                UINT32 requestor_pid = (UINT32)(ULONG_PTR)IoGetRequestorProcessId(irp);
+                if (req->size == 0 || req->size > 0x10000) {
+                    req->hash_result = 0;
+                    status = STATUS_INVALID_PARAMETER;
+                    bytes = sizeof(prologue_hash_request_k);
+                } else {
+                    UINT8* read_buf = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, req->size, 'SHPK');
+                    if (!read_buf) {
+                        req->hash_result = 0;
+                        status = STATUS_INSUFFICIENT_RESOURCES;
+                        bytes = sizeof(prologue_hash_request_k);
+                    } else {
+                        UINT32 bytes_read = 0;
+                        NTSTATUS read_st = dll_protection::read_process_bytes_physical(
+                            requestor_pid, req->va, read_buf, req->size, &bytes_read);
+                        if (NT_SUCCESS(read_st) && bytes_read == req->size) {
+                            UINT32 crc = 0xFFFFFFFFu;
+                            for (UINT32 i = 0; i < bytes_read; i++) {
+                                crc = _mm_crc32_u8(crc, read_buf[i]);
+                            }
+                            req->hash_result = (UINT64)(crc ^ 0xFFFFFFFFu);
+                            status = STATUS_SUCCESS;
+                        } else {
+                            req->hash_result = 0;
+                            status = NT_SUCCESS(read_st) ? STATUS_UNSUCCESSFUL : read_st;
+                        }
+                        bytes = sizeof(prologue_hash_request_k);
+                        ExFreePoolWithTag(read_buf, 'SHPK');
+                    }
+                }
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::SDGR()) {
+            if (input_size >= sizeof(dispatch_guard_query_k) &&
+                output_size >= sizeof(dispatch_guard_query_k)) {
+                auto* req = (dispatch_guard_query_k*)buffer;
+                req->hook_detected = sentinel_bridge::g_bridge.sentinel_dispatch_hook_detected;
+                req->hook_target = sentinel_bridge::g_bridge.sentinel_dispatch_hook_target;
+                status = STATUS_SUCCESS;
+                bytes = sizeof(dispatch_guard_query_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::SCBS()) {
+            if (input_size >= sizeof(callback_scan_query_k) &&
+                output_size >= sizeof(callback_scan_query_k)) {
+                auto* req = (callback_scan_query_k*)buffer;
+                req->hostile_drivers = sentinel_bridge::g_bridge.sentinel_hostile_drivers;
+                req->modified_callbacks = sentinel_bridge::g_bridge.sentinel_modified_callbacks;
+                status = STATUS_SUCCESS;
+                bytes = sizeof(callback_scan_query_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::HSHK()) {
+            if (input_size >= sizeof(handshake_request) &&
+                output_size >= sizeof(handshake_request)) {
+                auto* hs = (p_handshake_request)buffer;
+                if (hs->magic != HANDSHAKE_MAGIC || hs->session_key != g_session_key) {
+                    hs->verified = 0;
+                    WW_LOG("HSHK: rejected magic/session mismatch magic=0x%08X session=0x%08X expected=0x%08X",
+                        hs->magic, hs->session_key, g_session_key);
+                    status = STATUS_ACCESS_DENIED;
+                    bytes = sizeof(handshake_request);
+                } else {
+                    UCHAR session_key_bytes[4];
+                    session_key_bytes[0] = (UCHAR)(hs->session_key & 0xFF);
+                    session_key_bytes[1] = (UCHAR)((hs->session_key >> 8) & 0xFF);
+                    session_key_bytes[2] = (UCHAR)((hs->session_key >> 16) & 0xFF);
+                    session_key_bytes[3] = (UCHAR)((hs->session_key >> 24) & 0xFF);
+
+                    UCHAR hmac_out[32];
+                    kernel_crypto::sw_hmac_sha256(session_key_bytes, 4, hs->challenge, 32, hmac_out);
+                    RtlCopyMemory(hs->response, hmac_out, 32);
+                    RtlSecureZeroMemory(hmac_out, sizeof(hmac_out));
+
+                    UCHAR drv_rand[32];
+                    LARGE_INTEGER perf;
+                    KeQueryPerformanceCounter(&perf);
+                    ULONG seed = (ULONG)(perf.QuadPart ^ (LONG64)PsGetCurrentThreadId());
+                    for (int i = 0; i < 32; ++i) {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        drv_rand[i] = (UCHAR)(seed & 0xFF);
+                    }
+                    RtlCopyMemory(hs->driver_challenge, drv_rand, 32);
+                    RtlSecureZeroMemory(drv_rand, sizeof(drv_rand));
+                    hs->verified = 1;
+
+                    WW_LOG("HSHK: accepted session=0x%08X challenge_set=1", hs->session_key);
+                    status = STATUS_SUCCESS;
+                    bytes = sizeof(handshake_request);
+                }
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::HRES()) {
+            if (input_size >= sizeof(handshake_request) &&
+                output_size >= sizeof(handshake_request)) {
+                auto* hs = (p_handshake_request)buffer;
+                if (hs->magic != HANDSHAKE_MAGIC || hs->session_key != g_session_key) {
+                    hs->verified = 0;
+                    WW_LOG("HRES: rejected magic/session mismatch magic=0x%08X session=0x%08X expected=0x%08X",
+                        hs->magic, hs->session_key, g_session_key);
+                    status = STATUS_ACCESS_DENIED;
+                    bytes = sizeof(handshake_request);
+                } else {
+                    UCHAR session_key_bytes[4];
+                    session_key_bytes[0] = (UCHAR)(hs->session_key & 0xFF);
+                    session_key_bytes[1] = (UCHAR)((hs->session_key >> 8) & 0xFF);
+                    session_key_bytes[2] = (UCHAR)((hs->session_key >> 16) & 0xFF);
+                    session_key_bytes[3] = (UCHAR)((hs->session_key >> 24) & 0xFF);
+
+                    UCHAR expected_hmac[32];
+                    kernel_crypto::sw_hmac_sha256(session_key_bytes, 4, hs->challenge, 32, expected_hmac);
+
+                    BOOLEAN match = TRUE;
+                    for (int i = 0; i < 32; ++i) {
+                        if (expected_hmac[i] != hs->response[i]) match = FALSE;
+                    }
+                    RtlSecureZeroMemory(expected_hmac, sizeof(expected_hmac));
+
+                    if (match) {
+                        hs->verified = 1;
+                        WW_LOG("HRES: accepted session=0x%08X usermode_verified=1", hs->session_key);
+                        status = STATUS_SUCCESS;
+                    } else {
+                        hs->verified = 0;
+                        WW_LOG("HRES: rejected hmac_mismatch session=0x%08X", hs->session_key);
+                        status = STATUS_ACCESS_DENIED;
+                    }
+                    bytes = sizeof(handshake_request);
+                }
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::WMRK()) {
+            if (input_size >= sizeof(watermark_verify_request_k) &&
+                output_size >= sizeof(watermark_verify_request_k)) {
+                auto* req = (p_watermark_verify_request_k)buffer;
+                for (int i = 0; i < 16; ++i)
+                    sentinel_bridge::g_bridge.expected_watermark[i] = req->expected_watermark[i];
+                sentinel_bridge::g_bridge.watermark_rva = req->watermark_rva;
+                for (int i = 0; i < 16; ++i)
+                    req->actual_watermark[i] = sentinel_bridge::g_bridge.actual_watermark[i];
+                req->verified = sentinel_bridge::g_bridge.watermark_verified;
+                WW_LOG("WMRK: expected[0..3]=0x%02x%02x%02x%02x rva=%lu verified=%u",
+                    req->expected_watermark[0], req->expected_watermark[1],
+                    req->expected_watermark[2], req->expected_watermark[3],
+                    req->watermark_rva, req->verified ? 1u : 0u);
+                status = STATUS_SUCCESS;
+                bytes = sizeof(watermark_verify_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
         }
         else {

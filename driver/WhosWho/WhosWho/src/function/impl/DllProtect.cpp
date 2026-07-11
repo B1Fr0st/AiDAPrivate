@@ -263,7 +263,7 @@ namespace dll_protection {
         return slot_hard_bugcheck_enabled(slot) ? "module_hard_bugcheck" : "diagnostic_fail_closed";
     }
 
-    static NTSTATUS read_process_bytes_physical(UINT32 pid, UINT64 va, UINT8* out, UINT32 size, UINT32* bytes_read)
+    NTSTATUS read_process_bytes_physical(UINT32 pid, UINT64 va, UINT8* out, UINT32 size, UINT32* bytes_read)
     {
         if (bytes_read)
             *bytes_read = 0;

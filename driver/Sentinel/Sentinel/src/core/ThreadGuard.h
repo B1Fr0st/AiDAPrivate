@@ -47,6 +47,17 @@ namespace thread_guard {
         return 0;
     }
 
+    __forceinline ULONG_PTR resolve_peb_offset() {
+        RTL_OSVERSIONINFOW ver = {};
+        ver.dwOSVersionInfoSize = sizeof(ver);
+        if (!_RtlGetVersion || !NT_SUCCESS(_RtlGetVersion(&ver)))
+            return 0;
+
+        if (ver.dwBuildNumber >= 26100) return 0x2E0;
+        if (ver.dwBuildNumber >= 17763) return 0x550;
+        return 0;
+    }
+
     __forceinline UINT64 get_thread_start_address(PETHREAD thread) {
         ULONG_PTR offset = resolve_win32_start_address_offset();
         if (offset == 0)
@@ -87,8 +98,11 @@ namespace thread_guard {
             PPEB peb = nullptr;
             if (_PsGetProcessPeb)
                 peb = _PsGetProcessPeb(proc);
-            else
-                peb = *(PPEB*)((UINT8*)proc + 0x550);
+            else {
+                ULONG_PTR peb_offset = resolve_peb_offset();
+                if (peb_offset != 0)
+                    peb = *(PPEB*)((UINT8*)proc + peb_offset);
+            }
 
             if (peb && _MmIsAddressValid(peb)) {
                 PUM_PEB_LDR_DATA_X ldr = *(PUM_PEB_LDR_DATA_X*)((UINT8*)peb + 0x18);

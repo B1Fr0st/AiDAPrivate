@@ -918,9 +918,15 @@ endif()
 
 # --- Ghidra Native Decompiler (embedded as static library) ---
 set(GHIDRA_DECOMP_DIR "${CMAKE_SOURCE_DIR}/sources/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp")
-set(GHIDRA_SPECS_SRC_DIR "${CMAKE_SOURCE_DIR}/sources/ghidra/Ghidra/Processors/x86/data/languages")
+set(GHIDRA_PROCESSORS_DIR "${CMAKE_SOURCE_DIR}/sources/ghidra/Ghidra/Processors")
 set(GHIDRA_SPECS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/ghidra_specs")
-set(GHIDRA_PREBUILT_SLA "${GHIDRA_SPECS_SRC_DIR}/x86-64.sla")
+set(GHIDRA_X86_SPECS_DIR "${GHIDRA_PROCESSORS_DIR}/x86/data/languages")
+set(GHIDRA_ARM_SPECS_DIR "${GHIDRA_PROCESSORS_DIR}/ARM/data/languages")
+set(GHIDRA_AARCH64_SPECS_DIR "${GHIDRA_PROCESSORS_DIR}/AARCH64/data/languages")
+set(GHIDRA_MIPS_SPECS_DIR "${GHIDRA_PROCESSORS_DIR}/MIPS/data/languages")
+set(GHIDRA_POWERPC_SPECS_DIR "${GHIDRA_PROCESSORS_DIR}/PowerPC/data/languages")
+set(GHIDRA_RISCV_SPECS_DIR "${GHIDRA_PROCESSORS_DIR}/RISCV/data/languages")
+set(GHIDRA_PREBUILT_SLA "${GHIDRA_X86_SPECS_DIR}/x86-64.sla")
 
 file(GLOB GHIDRA_ALL_CC "${GHIDRA_DECOMP_DIR}/*.cc")
 
@@ -1023,50 +1029,109 @@ target_link_libraries(ghidra_sleigh_compiler PRIVATE zlibstatic)
 
 file(MAKE_DIRECTORY "${GHIDRA_SPECS_OUTPUT_DIR}")
 
-if(EXISTS "${GHIDRA_PREBUILT_SLA}")
-    add_custom_command(
-        OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${GHIDRA_PREBUILT_SLA}" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-        DEPENDS "${GHIDRA_PREBUILT_SLA}"
-        COMMENT "Copying prebuilt SLEIGH: x86-64.sla"
-        VERBATIM
-    )
-else()
-    add_custom_command(
-        OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-        COMMAND ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-        DEPENDS ghidra_sleigh_compiler "${GHIDRA_SPECS_SRC_DIR}/x86-64.slaspec"
-        WORKING_DIRECTORY "${GHIDRA_SPECS_SRC_DIR}"
-        COMMENT "Compiling SLEIGH: x86-64.slaspec -> x86-64.sla"
-        VERBATIM
-    )
-endif()
+function(aida_stage_ghidra_sla output_variable source_dir source_stem)
+    set(output_file "${GHIDRA_SPECS_OUTPUT_DIR}/${source_stem}.sla")
+    set(prebuilt_file "${source_dir}/${source_stem}.sla")
+    set(source_file "${source_dir}/${source_stem}.slaspec")
+    if(EXISTS "${prebuilt_file}")
+        add_custom_command(
+            OUTPUT "${output_file}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${prebuilt_file}" "${output_file}"
+            DEPENDS "${prebuilt_file}"
+            VERBATIM
+        )
+    elseif(EXISTS "${source_file}")
+        file(GLOB ghidra_sleigh_inputs CONFIGURE_DEPENDS
+            "${source_dir}/*.sinc"
+            "${source_dir}/*.slaspec")
+        add_custom_command(
+            OUTPUT "${output_file}"
+            COMMAND ghidra_sleigh_compiler "${source_file}" "${output_file}"
+            DEPENDS ghidra_sleigh_compiler ${ghidra_sleigh_inputs}
+            WORKING_DIRECTORY "${source_dir}"
+            VERBATIM
+        )
+    else()
+        message(FATAL_ERROR "Missing Ghidra SLEIGH source for ${source_stem}: ${source_dir}")
+    endif()
+    set(${output_variable} ${${output_variable}} "${output_file}" PARENT_SCOPE)
+endfunction()
 
-add_custom_command(
-    OUTPUT "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
-           "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
-           "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${GHIDRA_SPECS_SRC_DIR}/x86-64.pspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${GHIDRA_SPECS_SRC_DIR}/x86-64-win.cspec" "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${GHIDRA_SPECS_SRC_DIR}/x86.ldefs" "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
-    DEPENDS
-        "${GHIDRA_SPECS_SRC_DIR}/x86-64.pspec"
-        "${GHIDRA_SPECS_SRC_DIR}/x86-64-win.cspec"
-        "${GHIDRA_SPECS_SRC_DIR}/x86.ldefs"
-    COMMENT "Copying Ghidra spec files"
-    VERBATIM
+set(GHIDRA_STAGED_SLA_OUTPUTS)
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_X86_SPECS_DIR}" "x86-64")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_X86_SPECS_DIR}" "x86")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_ARM_SPECS_DIR}" "ARM7_le")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_ARM_SPECS_DIR}" "ARM7_be")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_AARCH64_SPECS_DIR}" "AARCH64")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_AARCH64_SPECS_DIR}" "AARCH64BE")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_MIPS_SPECS_DIR}" "mips32le")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_MIPS_SPECS_DIR}" "mips32be")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_MIPS_SPECS_DIR}" "mips64le")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_MIPS_SPECS_DIR}" "mips64be")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_POWERPC_SPECS_DIR}" "ppc_32_le")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_POWERPC_SPECS_DIR}" "ppc_32_be")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_POWERPC_SPECS_DIR}" "ppc_64_le")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_POWERPC_SPECS_DIR}" "ppc_64_be")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_RISCV_SPECS_DIR}" "riscv.ilp32d")
+aida_stage_ghidra_sla(GHIDRA_STAGED_SLA_OUTPUTS "${GHIDRA_RISCV_SPECS_DIR}" "riscv.lp64d")
+
+set(GHIDRA_STAGED_STATIC_INPUTS
+    "${GHIDRA_X86_SPECS_DIR}/x86-64.pspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86-64-win.cspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86-64-gcc.cspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86.pspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86win.cspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86gcc.cspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86-16-real.pspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86-16.cspec"
+    "${GHIDRA_X86_SPECS_DIR}/x86.ldefs"
+    "${GHIDRA_ARM_SPECS_DIR}/ARMt.pspec"
+    "${GHIDRA_ARM_SPECS_DIR}/ARM.cspec"
+    "${GHIDRA_ARM_SPECS_DIR}/ARM_win.cspec"
+    "${GHIDRA_ARM_SPECS_DIR}/ARM.ldefs"
+    "${GHIDRA_AARCH64_SPECS_DIR}/AARCH64.pspec"
+    "${GHIDRA_AARCH64_SPECS_DIR}/AARCH64.cspec"
+    "${GHIDRA_AARCH64_SPECS_DIR}/AARCH64_win.cspec"
+    "${GHIDRA_AARCH64_SPECS_DIR}/AARCH64.ldefs"
+    "${GHIDRA_MIPS_SPECS_DIR}/mips32.pspec"
+    "${GHIDRA_MIPS_SPECS_DIR}/mips64.pspec"
+    "${GHIDRA_MIPS_SPECS_DIR}/mips32le.cspec"
+    "${GHIDRA_MIPS_SPECS_DIR}/mips32be.cspec"
+    "${GHIDRA_MIPS_SPECS_DIR}/mips64le.cspec"
+    "${GHIDRA_MIPS_SPECS_DIR}/mips64be.cspec"
+    "${GHIDRA_MIPS_SPECS_DIR}/mips.ldefs"
+    "${GHIDRA_POWERPC_SPECS_DIR}/ppc_32.pspec"
+    "${GHIDRA_POWERPC_SPECS_DIR}/ppc_64.pspec"
+    "${GHIDRA_POWERPC_SPECS_DIR}/ppc_32.cspec"
+    "${GHIDRA_POWERPC_SPECS_DIR}/ppc_64_le.cspec"
+    "${GHIDRA_POWERPC_SPECS_DIR}/ppc_64_be.cspec"
+    "${GHIDRA_POWERPC_SPECS_DIR}/ppc.ldefs"
+    "${GHIDRA_RISCV_SPECS_DIR}/RV32.pspec"
+    "${GHIDRA_RISCV_SPECS_DIR}/RV64.pspec"
+    "${GHIDRA_RISCV_SPECS_DIR}/riscv32-fp.cspec"
+    "${GHIDRA_RISCV_SPECS_DIR}/riscv64-fp.cspec"
+    "${GHIDRA_RISCV_SPECS_DIR}/riscv.ldefs"
 )
 
-add_custom_target(ghidra_specs ALL DEPENDS
-    "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-    "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
-    "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
-    "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
+set(GHIDRA_STAGED_STATIC_OUTPUTS)
+foreach(ghidra_static_input IN LISTS GHIDRA_STAGED_STATIC_INPUTS)
+    get_filename_component(ghidra_static_name "${ghidra_static_input}" NAME)
+    set(ghidra_static_output "${GHIDRA_SPECS_OUTPUT_DIR}/${ghidra_static_name}")
+    add_custom_command(
+        OUTPUT "${ghidra_static_output}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ghidra_static_input}" "${ghidra_static_output}"
+        DEPENDS "${ghidra_static_input}"
+        VERBATIM
+    )
+    list(APPEND GHIDRA_STAGED_STATIC_OUTPUTS "${ghidra_static_output}")
+endforeach()
+
+set(GHIDRA_STAGED_SPEC_OUTPUTS
+    ${GHIDRA_STAGED_SLA_OUTPUTS}
+    ${GHIDRA_STAGED_STATIC_OUTPUTS}
 )
+
+add_custom_target(ghidra_specs ALL DEPENDS ${GHIDRA_STAGED_SPEC_OUTPUTS})
 
 # --- Auto-encrypt embedded driver/mapper byte arrays ---
 # When the built drivers/mapper change (WhosWho.sys, Sentinel.sys,
@@ -1501,9 +1566,6 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_scope.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_architecture.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_code_xml_parse.cpp"
-            "${STANDALONE_ROOT}/core/disasm/aida_arch_map.cpp"
-            "${STANDALONE_ROOT}/core/disasm/aida_function_db.cpp"
-            "${STANDALONE_ROOT}/core/disasm/aida_load_image.cpp"
             "${STANDALONE_ROOT}/core/editor/hex_view.cpp"
             "${STANDALONE_ROOT}/core/editor/image_view.cpp"
             "${STANDALONE_ROOT}/core/ui/chat_render.cpp"
@@ -2305,35 +2367,22 @@ if(WIN32)
         )
 
         add_dependencies(AiDAStandalone ghidra_specs)
-        add_custom_command(TARGET AiDAStandalone POST_BUILD
+        set(AIDA_GHIDRA_POST_BUILD_STAGE_COMMANDS
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86-64.sla"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86-64.pspec"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86-64-win.cspec"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/x86.ldefs"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.sla"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86-64.sla"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64.pspec"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86-64.pspec"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86-64-win.cspec"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86-64-win.cspec"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${GHIDRA_SPECS_OUTPUT_DIR}/x86.ldefs"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/x86.ldefs"
-            COMMENT "Staging Ghidra specs beside AiDAStandalone.exe..."
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs")
+        foreach(ghidra_staged_spec IN LISTS GHIDRA_STAGED_SPEC_OUTPUTS)
+            get_filename_component(ghidra_staged_name "${ghidra_staged_spec}" NAME)
+            list(APPEND AIDA_GHIDRA_POST_BUILD_STAGE_COMMANDS
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${ghidra_staged_spec}"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/${ghidra_staged_name}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${ghidra_staged_spec}"
+                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/${ghidra_staged_name}")
+        endforeach()
+        add_custom_command(TARGET AiDAStandalone POST_BUILD
+            ${AIDA_GHIDRA_POST_BUILD_STAGE_COMMANDS}
             VERBATIM
         )
         if(TARGET encrypt_drivers)

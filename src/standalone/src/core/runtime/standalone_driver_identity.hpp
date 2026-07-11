@@ -46,6 +46,9 @@ bool capture_live_target_identity(std::uint32_t pid,
                                   live_target_identity_t& out,
                                   std::string* out_error = nullptr);
 validation_result_t validate_live_target_identity(const live_target_identity_t& expected);
+validation_result_t validate_attached_target_identity(const live_target_identity_t& expected);
+bool refresh_attached_target_identity(const live_target_identity_t& expected,
+                                      std::string* out_error = nullptr);
 const char* staleness_code(staleness_t value) noexcept;
 
 }

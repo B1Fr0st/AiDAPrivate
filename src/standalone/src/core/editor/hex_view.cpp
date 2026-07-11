@@ -502,6 +502,100 @@ std::optional<std::uint64_t> parse_u64(std::string text) {
         ? std::optional<std::uint64_t>(value) : std::nullopt;
 }
 
+std::optional<aida::analysis::address_t> normalized_address_for_file_offset(
+    const disasm_view::workspace_context_t& context,
+    std::uint64_t offset) {
+    if (!context.workspace)
+        return {};
+    const auto image = context.workspace->normalized_image();
+    if (!image)
+        return {};
+    const auto& identity = context.workspace->identity();
+    for (const auto& mapping : image->address_mappings) {
+        if (mapping.source_space != aida::analysis::address_space_id_t::file_offset ||
+            mapping.size == 0 || offset < mapping.source_start)
+            continue;
+        const std::uint64_t delta = offset - mapping.source_start;
+        if (delta >= mapping.size)
+            continue;
+        if (mapping.target_start >
+            (std::numeric_limits<std::uint64_t>::max)() - delta)
+            return {};
+        aida::analysis::address_t address;
+        address.space = mapping.target_space;
+        address.value = mapping.target_start + delta;
+        address.architecture = identity.architecture();
+        address.mode = image->architecture_mode;
+        return address;
+    }
+    return {};
+}
+
+std::optional<std::uint64_t> display_address_for_file_offset(
+    const disasm_view::workspace_context_t& context,
+    std::uint64_t offset) {
+    auto address = normalized_address_for_file_offset(context, offset);
+    if (address) {
+        if (address->space == aida::analysis::address_space_id_t::virtual_address)
+            return address->value;
+        if (address->space == aida::analysis::address_space_id_t::relative_virtual) {
+            const auto image = context.workspace ? context.workspace->normalized_image() : nullptr;
+            if (!image)
+                return {};
+            if (image->image_base >
+                (std::numeric_limits<std::uint64_t>::max)() - address->value)
+                return {};
+            return image->image_base + address->value;
+        }
+    }
+    if (context.image) {
+        auto rva = context.image->file_offset_to_rva(offset);
+        if (rva) {
+            auto va = context.image->rva_to_va(rva.value());
+            if (va)
+                return va.value();
+        }
+    }
+    return {};
+}
+
+std::optional<std::uint64_t> file_offset_for_normalized_address(
+    const disasm_view::workspace_context_t& context,
+    std::uint64_t value) {
+    if (!context.workspace)
+        return {};
+    const auto image = context.workspace->normalized_image();
+    if (!image)
+        return {};
+    const auto checked_mapping_offset = [&](aida::analysis::address_space_id_t target_space,
+                                            std::uint64_t target_value) -> std::optional<std::uint64_t> {
+        for (const auto& mapping : image->address_mappings) {
+            if (mapping.source_space != aida::analysis::address_space_id_t::file_offset ||
+                mapping.target_space != target_space || mapping.size == 0 ||
+                target_value < mapping.target_start)
+                continue;
+            const std::uint64_t delta = target_value - mapping.target_start;
+            if (delta >= mapping.size)
+                continue;
+            if (mapping.source_start >
+                (std::numeric_limits<std::uint64_t>::max)() - delta)
+                return {};
+            return mapping.source_start + delta;
+        }
+        return {};
+    };
+    if (auto offset = checked_mapping_offset(
+            aida::analysis::address_space_id_t::virtual_address, value))
+        return offset;
+    if (image->image_base <= value) {
+        const std::uint64_t rva = value - image->image_base;
+        if (auto offset = checked_mapping_offset(
+                aida::analysis::address_space_id_t::relative_virtual, rva))
+            return offset;
+    }
+    return checked_mapping_offset(aida::analysis::address_space_id_t::relative_virtual, value);
+}
+
 void copy_selection(const disasm_view::workspace_context_t& context,
                     const std::shared_ptr<workspace_hex_state_t>& state) {
     std::int64_t begin = -1;
@@ -704,7 +798,9 @@ void render(float, float, float width, float height,
                 if (live_source && *value >= live_base)
                     offset = *value - live_base;
                 else if (!live_source) {
-                    if (auto typed = disasm_view::typed_address(context, *value))
+                    if (auto normalized_offset = file_offset_for_normalized_address(context, *value))
+                        offset = *normalized_offset;
+                    else if (auto typed = disasm_view::typed_address(context, *value))
                         offset = disasm_view::provider_offset(context, *typed).value_or(offset);
                 }
                 if (offset < source_size) {
@@ -814,13 +910,9 @@ void render(float, float, float width, float height,
                 break;
             char address[32]{};
             std::uint64_t display_address = live_source ? live_base + row_offset : row_offset;
-            if (!live_source && context.image) {
-                auto rva = context.image->file_offset_to_rva(row_offset);
-                if (rva) {
-                    auto va = context.image->rva_to_va(rva.value());
-                    if (va)
-                        display_address = va.value();
-                }
+            if (!live_source) {
+                if (auto translated = display_address_for_file_offset(context, row_offset))
+                    display_address = *translated;
             }
             std::snprintf(address, sizeof(address), "%016llX",
                 static_cast<unsigned long long>(display_address));
@@ -873,14 +965,10 @@ void render(float, float, float width, float height,
                     else
                         state->ui.sel_start = state->ui.sel_end =
                             static_cast<std::int64_t>(offset);
-                    if (!live_source && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && context.image) {
-                        auto rva = context.image->file_offset_to_rva(offset);
-                        if (rva) {
-                            auto va = context.image->rva_to_va(rva.value());
-                            if (va) {
-                                disasm_view::goto_address(va.value(), context);
-                                globals::ui::active_center_view = center_view_t::disassembly;
-                            }
+                    if (!live_source && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        if (auto translated = normalized_address_for_file_offset(context, offset)) {
+                            disasm_view::goto_address(*translated, context);
+                            globals::ui::active_center_view = center_view_t::disassembly;
                         }
                     }
                 }
@@ -890,9 +978,7 @@ void render(float, float, float width, float height,
                     if (ImGui::MenuItem("Copy byte"))
                         ImGui::SetClipboardText(encoded);
                     if (!live_source && ImGui::MenuItem("Patch to 00")) {
-                        if (auto typed = context.image
-                                ? disasm_view::typed_address(context, display_address + column)
-                                : std::nullopt)
+                        if (auto typed = normalized_address_for_file_offset(context, offset))
                             disasm_view::queue_patch(context, *typed, {0});
                     }
                     ImGui::EndPopup();

@@ -240,6 +240,9 @@ namespace detail
         OP_JUNK_MUL = 0x38,
         OP_JUNK_MEM = 0x39,
         OP_JUNK_XOR = 0x3A,
+        OP_JUNK_REG_SAFE = 0x3B,
+        OP_COMPUTED_JUMP = 0x3C,
+        OP_IRREDUCIBLE_LOOP = 0x3D,
         OP_MAX
     };
 
@@ -3728,6 +3731,114 @@ namespace detail
         dispatch_next(vm, bc, bc_size);
     }
 
+    VM_HANDLER(h_junk_reg_safe)
+    {
+        uint8_t a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t b = fetch_byte(vm, bc, bc_size) & 0x0F;
+
+        uint64_t temp_r15 = read_vreg(vm, 15);
+
+        uint64_t va = read_vreg(vm, a);
+        uint64_t vb = read_vreg(vm, b);
+        uint64_t entropy = handler_entropy_bit(vm, 0x42);
+        uint64_t junk1 = mba_add(va, vb, entropy);
+        uint64_t junk2 = mba_xor(junk1, entropy, handler_entropy_bit(vm, 0x43));
+
+        write_vreg(vm, 13, junk1);
+        write_vreg(vm, 14, junk2);
+
+        if (vm.discard_buffer)
+        {
+            uint32_t doff = static_cast<uint32_t>((junk1 ^ junk2) & 0xFF8);
+            if (doff + 16 <= 4096)
+            {
+                memcpy(vm.discard_buffer + doff, &junk1, 8);
+                memcpy(vm.discard_buffer + doff + 8, &junk2, 8);
+            }
+        }
+
+        write_vreg(vm, 15, temp_r15);
+
+        dispatch_next(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_computed_jump)
+    {
+        uint8_t operand_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint64_t reg_val = read_vreg(vm, operand_reg);
+
+        handler_pool_t& pool = vm.pool ? *vm.pool : g_default_pool;
+
+        uintptr_t pool_base = reinterpret_cast<uintptr_t>(&pool.slots[0]);
+        uintptr_t pool_end = pool_base + sizeof(pool.slots);
+
+        uint64_t raw_index = (vm.rolling_key ^ reg_val) % HANDLER_POOL_SIZE;
+        uintptr_t computed_addr = pool_base + raw_index * sizeof(handler_slot_t);
+
+        if (computed_addr < pool_base || computed_addr >= pool_end)
+        {
+            write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+            vm.halted = true;
+            return;
+        }
+
+        handler_slot_t* slot = reinterpret_cast<handler_slot_t*>(computed_addr);
+        if (!slot->fn)
+        {
+            write_vreg(vm, 0, 0xDEADBEEFDEADBEEFULL);
+            vm.halted = true;
+            return;
+        }
+
+        advance_rolling_key(vm);
+        compute_handler_chain_addr(vm, static_cast<uint8_t>(raw_index & 0xFF));
+        ++vm.insn_count;
+        mutate_shuffle_per_op(vm, OP_COMPUTED_JUMP, vm.last_op_result);
+
+        slot->fn(vm, bc, bc_size);
+    }
+
+    VM_HANDLER(h_irreducible_loop)
+    {
+        uint8_t state_reg_a = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t state_reg_b = fetch_byte(vm, bc, bc_size) & 0x0F;
+        uint8_t switch_reg = fetch_byte(vm, bc, bc_size) & 0x0F;
+
+        uint64_t sa = read_vreg(vm, state_reg_a);
+        uint64_t sb = read_vreg(vm, state_reg_b);
+
+        uint32_t iterations = 0;
+        while ((sa ^ sb) != 0)
+        {
+            uint64_t sw = handler_entropy_bit(vm, static_cast<uint8_t>(0x45 + iterations));
+            sw ^= read_vreg(vm, switch_reg);
+            sw ^= vm.rolling_key;
+            uint8_t entry = static_cast<uint8_t>(sw & 1);
+
+            if (entry == 0)
+            {
+                sa = _rotl64(sa, 7) ^ sb;
+                write_vreg(vm, state_reg_a, sa);
+            }
+            else
+            {
+                sb = _rotr64(sb, 11) ^ sa;
+                write_vreg(vm, state_reg_b, sb);
+            }
+
+            ++iterations;
+            ++vm.insn_count;
+
+            if (vm.insn_count >= vm.max_insn || iterations > 4096)
+            {
+                vm.halted = true;
+                return;
+            }
+        }
+
+        dispatch_next(vm, bc, bc_size);
+    }
+
     VM_HANDLER(h_load_reg_entangled)
     {
         uint8_t packed = fetch_byte(vm, bc, bc_size);
@@ -4536,6 +4647,9 @@ namespace detail
         base_handlers[OP_JUNK_MUL]  = h_junk_mul;
         base_handlers[OP_JUNK_MEM]  = h_junk_mem;
         base_handlers[OP_JUNK_XOR]  = h_junk_xor;
+        base_handlers[OP_JUNK_REG_SAFE] = h_junk_reg_safe;
+        base_handlers[OP_COMPUTED_JUMP] = h_computed_jump;
+        base_handlers[OP_IRREDUCIBLE_LOOP] = h_irreducible_loop;
 
         handler_fn variant_table[] = {
             h_nand_v2, h_xor_v2, h_hash_v2, h_cmp_v2,
@@ -5314,6 +5428,44 @@ namespace detail
         xorshift_advance(state);
         uint32_t block_order = static_cast<uint32_t>(state % 24);
         return instr_sub * reg_alloc * nop_sled * block_order;
+    }
+
+    inline std::vector<uint8_t> emit_overlapping_vm_instructions(
+        const uint8_t opcode_map[256], uint64_t initial_key)
+    {
+        uint8_t m_nop          = opcode_map[OP_NOP];
+        uint8_t m_load_imm32   = opcode_map[OP_LOAD_IMM32];
+        uint8_t m_not          = opcode_map[OP_NOT];
+        uint8_t m_jmp          = opcode_map[OP_JMP];
+        uint8_t m_halt         = opcode_map[OP_HALT];
+
+        std::vector<uint8_t> raw;
+
+        raw.push_back(m_nop);
+        raw.push_back(m_load_imm32);
+        raw.push_back(0x00);
+        raw.push_back(0x5A);
+        raw.push_back(m_not);
+        raw.push_back(0x0D);
+        raw.push_back(m_halt);
+        raw.push_back(m_jmp);
+
+        uint32_t jmp_target = 4;
+        uint8_t buf[4];
+        memcpy(buf, &jmp_target, 4);
+        for (int i = 0; i < 4; ++i)
+            raw.push_back(buf[i]);
+
+        cipher_stream_t stream{};
+        cipher_stream_init(stream, initial_key);
+
+        std::vector<uint8_t> encrypted;
+        encrypted.reserve(raw.size());
+        for (uint8_t b : raw)
+            encrypted.push_back(cipher_stream_xcrypt(stream, b, true));
+
+        SecureZeroMemory(&stream, sizeof(stream));
+        return encrypted;
     }
 
 

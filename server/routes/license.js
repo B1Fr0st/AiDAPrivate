@@ -4235,6 +4235,134 @@ router.post('/', async (req, res) => {
     }
 });
 
+router.post('/driver-auth', async (req, res) => {
+    const dispatchStartedAt = Date.now();
+    try {
+        const body = req.body || {};
+        const { license_key, session_token, driver_proof, hwid } = body;
+        const clientIp = getClientIp(req);
+
+        if (!license_key || typeof license_key !== 'string' || license_key.length < 4) {
+            return sendEauth(res, dispatchStartedAt, 'invalid_license');
+        }
+        if (!session_token || typeof session_token !== 'string') {
+            return sendEauth(res, dispatchStartedAt, 'invalid_session_token');
+        }
+        if (!driver_proof || typeof driver_proof !== 'string' || !/^[0-9a-fA-F]{16,128}$/.test(driver_proof)) {
+            return sendEauth(res, dispatchStartedAt, 'invalid_driver_proof');
+        }
+
+        const session = await getSession(license_key);
+        if (!session || session.session_token !== session_token) {
+            auditLog.logV2({
+                action: 'license.driver_auth',
+                license_key,
+                hwid: hwid || '',
+                source_ip: clientIp || '',
+                decision: 'deny',
+                reason_code: 'session_mismatch',
+                extra: {},
+            }).catch(() => {});
+            return sendEauth(res, dispatchStartedAt, 'session_mismatch');
+        }
+
+        if (session.kill_flag) {
+            return res.status(200).json(canonicalResponse.buildEnvelope({
+                status: 'killed', alive: false, reason: 'kill_flag_set',
+            }));
+        }
+
+        const proofNum = BigInt(`0x${driver_proof}`);
+        if (proofNum === 0n) {
+            await pool.query('UPDATE sessions SET kill_flag = true WHERE license_key = $1', [license_key]);
+            await revokeLicenseAndSession(license_key, 'zero_driver_auth_proof', body.plugin_version, hwid || session.hwid);
+            await recordBan(hwid || session.hwid, clientIp, 'zero_driver_auth_proof', body.plugin_version, {
+                route: 'license',
+                action: 'driver_auth',
+                license_key,
+                session_token,
+                reasons: ['zero_driver_auth_proof'],
+                evidence: { driver_proof: String(driver_proof).slice(0, 64) },
+            });
+            return res.status(200).json(canonicalResponse.buildEnvelope({
+                status: 'killed', alive: false, reason: 'zero_driver_auth_proof',
+            }));
+        }
+
+        const storedProofToken = session.last_proof_token || '';
+        const proofTrimmed = driver_proof.trim().toLowerCase();
+        const proofMatch = storedProofToken && proofTrimmed === storedProofToken.trim().toLowerCase();
+
+        if (!proofMatch) {
+            if (body.proof_version === 3) {
+                const lic = await lookupLicense(license_key);
+                if (lic && lic.witness_key_wrapped) {
+                    let kw;
+                    try { kw = kwWrap.unwrap(lic.witness_key_wrapped, 'kw/v1'); }
+                    catch (_) { kw = null; }
+                    if (kw) {
+                        const { token_hash, tsc, cr3, boot_nonce, hardware_id } = body;
+                        if (token_hash && boot_nonce && hardware_id) {
+                            if (!lic.hardware_id_sha256 || lic.hardware_id_sha256 === hardware_id) {
+                                const subkey = kwWrap.deriveKwSubkey(kw, 'driver_proof/v3');
+                                const canonical = `${token_hash}|${session.server_nonce || ''}|${tsc || 0}|${cr3 || 0}|${boot_nonce}|${hardware_id}`;
+                                const expected = crypto.createHmac('sha256', subkey).update(canonical).digest('hex');
+                                const aBuf = Buffer.from(expected, 'utf8');
+                                const bBuf = Buffer.from(proofTrimmed, 'utf8');
+                                if (aBuf.length === bBuf.length && crypto.timingSafeEqual(aBuf, bBuf)) {
+                                    await updateLastProofToken(license_key, proofTrimmed);
+                                    auditLog.logV2({
+                                        action: 'license.driver_auth',
+                                        license_key,
+                                        hwid: hwid || session.hwid || '',
+                                        source_ip: clientIp || '',
+                                        decision: 'allow',
+                                        reason_code: 'proof_v3_verified',
+                                        extra: { proof_version: 3 },
+                                    }).catch(() => {});
+                                    await applyTimingBudget(dispatchStartedAt);
+                                    return res.json(canonicalResponse.buildEnvelope({
+                                        status: 'ok', verified: true, license_key,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            auditLog.logV2({
+                action: 'license.driver_auth',
+                license_key,
+                hwid: hwid || session.hwid || '',
+                source_ip: clientIp || '',
+                decision: 'deny',
+                reason_code: 'driver_proof_mismatch',
+                extra: { proof_version: body.proof_version || 0 },
+            }).catch(() => {});
+            return sendEauth(res, dispatchStartedAt, 'driver_proof_mismatch');
+        }
+
+        await updateLastProofToken(license_key, proofTrimmed);
+        auditLog.logV2({
+            action: 'license.driver_auth',
+            license_key,
+            hwid: hwid || session.hwid || '',
+            source_ip: clientIp || '',
+            decision: 'allow',
+            reason_code: 'proof_token_match',
+            extra: {},
+        }).catch(() => {});
+
+        await applyTimingBudget(dispatchStartedAt);
+        return res.json(canonicalResponse.buildEnvelope({
+            status: 'ok', verified: true, license_key,
+        }));
+    } catch (err) {
+        console.error('[license/driver-auth] error:', err && err.message ? err.message : err);
+        return sendEauth(res, dispatchStartedAt);
+    }
+});
+
 
 router.post('/honeypot', async (req, res) => {
     const clientIp = getClientIp(req);
@@ -4963,6 +5091,174 @@ router.get('/re-tool-hashes', async (req, res) => {
     }
 });
 
+router.get('/prologue-hashes', async (req, res) => {
+    const dispatchStartedAt = Date.now();
+    const licenseKey = typeof req.query.license_key === 'string' ? req.query.license_key.trim() : '';
+    const sessionToken = typeof req.query.session_token === 'string' ? req.query.session_token.trim() :
+        (typeof req.headers['authorization'] === 'string' ? req.headers['authorization'].replace(/^Bearer\s+/i, '').trim() : '');
+    const osBuild = parseInt(typeof req.query.os_build === 'string' ? req.query.os_build.trim() : '', 10);
+
+    if (!licenseKey || !sessionToken) {
+        return sendEauth(res, dispatchStartedAt, 'prologue_hashes_missing_credentials');
+    }
+    if (!Number.isFinite(osBuild) || osBuild <= 0) {
+        return sendEauth(res, dispatchStartedAt, 'prologue_hashes_invalid_os_build');
+    }
+
+    try {
+        const normalizedKey = keyFormat.normalizeForLookup(licenseKey);
+        if (!normalizedKey) {
+            return sendEauth(res, dispatchStartedAt, 'prologue_hashes_invalid_key');
+        }
+
+        const rl = await licenseRateLimit.check(normalizedKey, { bucket: 'prologue_hashes' });
+        if (!rl.ok) {
+            return sendEauth(res, dispatchStartedAt, 'prologue_hashes_rate_limited');
+        }
+
+        const session = await getSession(normalizedKey);
+        if (!session) {
+            return sendEauth(res, dispatchStartedAt, 'prologue_hashes_no_session');
+        }
+        if (session.kill_flag) {
+            return sendEauth(res, dispatchStartedAt, 'prologue_hashes_session_killed');
+        }
+        if (!sessionTokenMatches(session.session_token || '', sessionToken)) {
+            return sendEauth(res, dispatchStartedAt, 'prologue_hashes_token_mismatch');
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const issuedAt = Number(session.issued_at || 0);
+        const ttl = Number(session.ttl || 0);
+        if (issuedAt > 0 && ttl > 0 && now > issuedAt + Math.floor(ttl * SESSION_TTL_GRACE_FACTOR)) {
+            return sendEauth(res, dispatchStartedAt, 'prologue_hashes_session_expired');
+        }
+
+        let hashes = [];
+        try {
+            const { rows } = await pool.query(
+                'SELECT function_name, module, hash, os_build FROM prologue_hashes WHERE active = true AND os_build = $1 ORDER BY id ASC',
+                [osBuild]
+            );
+            hashes = (rows || []).map(r => ({
+                function_name: String(r.function_name || ''),
+                module: String(r.module || ''),
+                hash: String(r.hash || '').toLowerCase(),
+                os_build: Number(r.os_build || 0),
+            })).filter(h => h.function_name && h.module && /^[0-9a-f]{64}$/.test(h.hash));
+        } catch (err) {
+            if (err && (err.code === '42P01' || (err.message && err.message.includes('prologue_hashes')))) {
+                hashes = [];
+            } else {
+                throw err;
+            }
+        }
+
+        const timestamp = now;
+        const hashConcat = hashes.map(h => h.hash).join('');
+        const signKey = String(session.session_token || '');
+        const signature = crypto.createHmac('sha256', signKey)
+            .update(`prologue-hashes|${normalizedKey}|${timestamp}|${hashConcat}`)
+            .digest('hex');
+
+        return res.status(200).json({
+            status: 'ok',
+            hashes,
+            timestamp,
+            signature,
+            count: hashes.length,
+        });
+    } catch (err) {
+        console.error('[prologue-hashes] Error:', err && err.message ? err.message : err);
+        return res.status(200).json({
+            status: 'ok',
+            hashes: [],
+            timestamp: Math.floor(Date.now() / 1000),
+            signature: '',
+            count: 0,
+        });
+    }
+});
+
+router.get('/ce-driver-hashes', async (req, res) => {
+    const dispatchStartedAt = Date.now();
+    const licenseKey = typeof req.query.license_key === 'string' ? req.query.license_key.trim() : '';
+    const sessionToken = typeof req.query.session_token === 'string' ? req.query.session_token.trim() :
+        (typeof req.headers['authorization'] === 'string' ? req.headers['authorization'].replace(/^Bearer\s+/i, '').trim() : '');
+
+    if (!licenseKey || !sessionToken) {
+        return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_missing_credentials');
+    }
+
+    try {
+        const normalizedKey = keyFormat.normalizeForLookup(licenseKey);
+        if (!normalizedKey) {
+            return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_invalid_key');
+        }
+
+        const rl = await licenseRateLimit.check(normalizedKey, { bucket: 'ce_driver_hashes' });
+        if (!rl.ok) {
+            return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_rate_limited');
+        }
+
+        const session = await getSession(normalizedKey);
+        if (!session) {
+            return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_no_session');
+        }
+        if (session.kill_flag) {
+            return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_session_killed');
+        }
+        if (!sessionTokenMatches(session.session_token || '', sessionToken)) {
+            return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_token_mismatch');
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const issuedAt = Number(session.issued_at || 0);
+        const ttl = Number(session.ttl || 0);
+        if (issuedAt > 0 && ttl > 0 && now > issuedAt + Math.floor(ttl * SESSION_TTL_GRACE_FACTOR)) {
+            return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_session_expired');
+        }
+
+        let hashes = [];
+        try {
+            const { rows } = await pool.query(
+                'SELECT hash FROM ce_driver_hashes WHERE active = true ORDER BY created_at DESC'
+            );
+            hashes = (rows || []).map(r => String(r.hash || '').toLowerCase()).filter(h => /^[0-9a-f]{64}$/.test(h));
+        } catch (err) {
+            if (err && (err.code === '42P01' || (err.message && err.message.includes('ce_driver_hashes')))) {
+                hashes = [];
+            } else {
+                throw err;
+            }
+        }
+
+        const timestamp = now;
+        const hashConcat = hashes.join('');
+        const signKey = String(session.session_token || '');
+        const signature = crypto.createHmac('sha256', signKey)
+            .update(`ce-driver-hashes|${normalizedKey}|${timestamp}|${hashConcat}`)
+            .digest('hex');
+
+        return res.status(200).json({
+            status: 'ok',
+            hashes,
+            timestamp,
+            signature,
+            count: hashes.length,
+        });
+    } catch (err) {
+        console.error('[ce-driver-hashes] Error:', err && err.message ? err.message : err);
+        return res.status(200).json({
+            status: 'ok',
+            hashes: [],
+            timestamp: Math.floor(Date.now() / 1000),
+            signature: '',
+            count: 0,
+        });
+    }
+});
+
 router._internal = {
     evaluateHeartbeatContinuity,
     isNonEnforcingBanReason,
@@ -4995,6 +5291,51 @@ router._internal = {
     isLegacyAggregateHwidOnlyFactors,
     verifyOrBindHwid,
     storeSession,
+    cosineSimilarity,
+        if (issuedAt > 0 && ttl > 0 && now > issuedAt + Math.floor(ttl * SESSION_TTL_GRACE_FACTOR)) {
+            return sendEauth(res, dispatchStartedAt, 'ce_driver_hashes_session_expired');
+        }
+
+        let hashes = [];
+        try {
+            const { rows } = await pool.query(
+                'SELECT hash FROM ce_driver_hashes WHERE active = true ORDER BY created_at DESC'
+            );
+            hashes = (rows || []).map(r => String(r.hash || '').toLowerCase()).filter(h => /^[0-9a-f]{64}$/.test(h));
+        } catch (err) {
+            if (err && (err.code === '42P01' || (err.message && err.message.includes('ce_driver_hashes')))) {
+                hashes = [];
+            } else {
+                throw err;
+            }
+        }
+
+        const timestamp = now;
+        const hashConcat = hashes.join('');
+        const signKey = String(session.session_token || '');
+        const signature = crypto.createHmac('sha256', signKey)
+            .update(`ce-driver-hashes|${normalizedKey}|${timestamp}|${hashConcat}`)
+            .digest('hex');
+
+        return res.status(200).json({
+            status: 'ok',
+            hashes,
+            timestamp,
+            signature,
+            count: hashes.length,
+        });
+    } catch (err) {
+        console.error('[ce-driver-hashes] Error:', err && err.message ? err.message : err);
+        return res.status(200).json({
+            status: 'ok',
+            hashes: [],
+            timestamp: Math.floor(Date.now() / 1000),
+            signature: '',
+            count: 0,
+        });
+    }
+});
+
     cosineSimilarity,
     haversineDistanceKm,
     verifyWatermarkProof,

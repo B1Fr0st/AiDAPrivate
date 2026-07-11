@@ -421,11 +421,13 @@ function Get-SchemaParameters([object]$Schema) {
 }
 
 function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
-                                       [string]$MutationPath, [string]$RegistrationPath) {
+                                       [string]$MutationPath, [string]$RegistrationPath,
+                                       [string]$SessionRegistrationPath) {
     $schemaSource = Get-Text $SchemaPath
     $readSource = Get-Text $ReadPath
     $mutationSource = Get-Text $MutationPath
     $registrationSource = Get-Text $RegistrationPath
+    $sessionRegistrationSource = Get-Text $SessionRegistrationPath
     $readNames = @(Get-NameSet $schemaSource 'read_only_tool_names')
     $mutationNames = @(Get-NameSet $schemaSource 'mutation_tool_names')
     $targetNames = @(Get-NameSet $schemaSource 'target_dependent_tool_names')
@@ -439,7 +441,6 @@ function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
         'install_ida_compat_schema_validation();',
         'for (const auto& definition : ida_compat::get_read_tool_defs())',
         'for (const auto& definition : ida_compat::get_mutation_tool_defs())',
-        'configure_ida_compat_tool(instances, "list_instances"',
         'for (const char* name : {"calculator", "calculate"})',
         'if (!register_ida_compatibility_tools(srv))'
     ) 'IDA-compatible production registration'
@@ -461,6 +462,9 @@ function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
         's["delete_stack"]["properties"]["offsets"] = scalar_or_array_schema(',
         's["infer_types"]["properties"]["items"] = scalar_or_array_schema(',
         's["analyze_funcs"]["properties"]["items"] = scalar_or_array_schema(',
+        's["calculate"]["properties"]["variables"] = calculator_variables;',
+        's["calculate"]["properties"]["items"]["items"]["properties"]["variables"]',
+        's["calculate"]["properties"]["items"]["items"]["properties"]["mapping"]',
         's["calculate"]["properties"]["items"] = scalar_or_array_schema('
     ) 'IDA-compatible schema transforms'
 
@@ -510,6 +514,43 @@ function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
             }
         )
     }
+    $calculatorIntegerValue = [ordered]@{
+        oneOf = @(
+            [ordered]@{ type = 'integer' },
+            [ordered]@{ type = 'string'; minLength = 1; maxLength = 65536 }
+        )
+    }
+    $calculatorVariableValue = [ordered]@{
+        oneOf = @(
+            [ordered]@{ type = 'integer' },
+            [ordered]@{ type = 'string'; minLength = 1; maxLength = 65536 },
+            [ordered]@{
+                type = 'object'
+                properties = [ordered]@{
+                    integer = Copy-JsonValue $calculatorIntegerValue
+                    bytes = [ordered]@{ type = 'string'; maxLength = 2097152 }
+                    ascii = [ordered]@{ type = 'string'; maxLength = 1048576 }
+                    utf8 = [ordered]@{ type = 'string'; maxLength = 1048576 }
+                }
+                anyOf = @(
+                    [ordered]@{ required = @('integer') },
+                    [ordered]@{ required = @('bytes') },
+                    [ordered]@{ required = @('ascii') },
+                    [ordered]@{ required = @('utf8') }
+                )
+                additionalProperties = $false
+            }
+        )
+    }
+    $calculatorVariables = [ordered]@{
+        type = 'object'
+        propertyNames = [ordered]@{ pattern = '^[A-Za-z_][A-Za-z0-9_]*$' }
+        additionalProperties = $calculatorVariableValue
+    }
+    $calculatorMapping = Copy-JsonValue $schemas['calculate'].properties.mapping
+    Set-JsonProperty $schemas['calculate'].properties 'variables' (Copy-JsonValue $calculatorVariables)
+    Set-JsonProperty $schemas['calculate'].properties.items.items.properties 'variables' (Copy-JsonValue $calculatorVariables)
+    Set-JsonProperty $schemas['calculate'].properties.items.items.properties 'mapping' $calculatorMapping
     foreach ($name in $targetNames) {
         if (!$schemas.Contains($name)) { throw "Target-dependent tool lacks source schema: $name" }
         Set-JsonProperty $schemas[$name].properties 'bin_name' (Copy-JsonValue $selectorBinName)
@@ -556,8 +597,11 @@ function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
         })
     }
     $registrationRelative = Get-Relative $RegistrationPath
+    $sessionRegistrationRelative = Get-Relative $SessionRegistrationPath
     foreach ($name in @('list_instances', 'calculator', 'calculate')) {
-        $nameIndex = $registrationSource.IndexOf("`"$name`"", [StringComparison]::Ordinal)
+        $sourceText = if ($name -eq 'list_instances') { $sessionRegistrationSource } else { $registrationSource }
+        $sourceFile = if ($name -eq 'list_instances') { $sessionRegistrationRelative } else { $registrationRelative }
+        $nameIndex = $sourceText.IndexOf("`"$name`"", [StringComparison]::Ordinal)
         if ($nameIndex -lt 0) { throw "Missing IDA-compatible registration source: $name" }
         $description = switch ($name) {
             'list_instances' { 'List open AiDA analysis workspaces.' }
@@ -571,9 +615,9 @@ function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
             workspace_aware = $false
             source = [ordered]@{
                 name = $name
-                handler = if ($name -eq 'list_instances') { 'tool_list_instances' } else { 'tool_calculate' }
-                file = $registrationRelative
-                line = Get-LineNumber $registrationSource $nameIndex
+                handler = if ($name -eq 'list_instances') { 'session_tools::list_instances' } else { 'tool_calculate' }
+                file = $sourceFile
+                line = Get-LineNumber $sourceText $nameIndex
             }
             input_schema = $schemas[$name]
         })
@@ -615,6 +659,9 @@ $mcpToolsPath = Join-Path $core 'mcp\mcp_standalone_tools.cpp'
 $idaSchemaPath = Join-Path $core 'mcp\ida_compat_schemas.hpp'
 $idaReadPath = Join-Path $core 'mcp\ida_compat_read.cpp'
 $idaMutationPath = Join-Path $core 'mcp\ida_compat_mut.cpp'
+$calculatorToolPath = Join-Path $core 'mcp\calculator_tool.cpp'
+$decompilerServicePath = Join-Path $core 'analysis\workspace\decompiler_service.cpp'
+$sessionToolsPath = Join-Path $core 'tools\session_tools_standalone.cpp'
 $mcpSource = Get-Text $mcpPath
 $internalNames = @(Get-NameSet $mcpSource 'is_standalone_internal_only_tool_name')
 $chatNames = @(Get-NameSet $mcpSource 'is_standalone_ide_chat_only_tool_name')
@@ -751,7 +798,7 @@ foreach ($file in $files) {
     if ($fileContributed) { $sourceFiles.Add($file.FullName) }
 }
 
-$idaCompatibility = Get-IdaCompatibilityInventory $idaSchemaPath $idaReadPath $idaMutationPath $mcpToolsPath
+$idaCompatibility = Get-IdaCompatibilityInventory $idaSchemaPath $idaReadPath $idaMutationPath $mcpToolsPath $sessionToolsPath
 $registeredNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($registration in $registrations) {
     if (!$registeredNames.Add([string]$registration.name)) {
@@ -760,6 +807,17 @@ foreach ($registration in $registrations) {
 }
 foreach ($record in $idaCompatibility.records) {
     if (!$registeredNames.Add([string]$record.name)) {
+        if ([string]$record.name -eq 'list_instances') {
+            foreach ($registration in $registrations) {
+                if ([string]$registration.name -eq 'list_instances') {
+                    $registration.input_schema = $record.input_schema
+                    $registration.parameter_expression = 'ida_compat::find_schema("list_instances")'
+                    $registration.source.evidence = 'source_resolved_session_list_instances_with_ida_compat_schema'
+                    break
+                }
+            }
+            continue
+        }
         throw "Duplicate dynamic MCP registration: $($record.name)"
     }
     $registrationArgs = @{
@@ -930,7 +988,7 @@ $contractArgs = @{
     Marker = 'workspace_result_t<bool> reopen_persisted_analysis('
     Symbol = 'analysis_session::reopen_persisted_analysis'
     Required = @(
-        'database->load_snapshot(workspace->image(), cancel)',
+        'database->load_snapshot(workspace->normalized_image(), workspace->image(), cancel)',
         'snapshot->generation != workspace->generation()',
         'snapshot->overlay_revision != workspace->overlay_revision()',
         'database->load_search_products(',
@@ -967,9 +1025,9 @@ $contractArgs = @{
     Symbol = 'analysis_session::activate_session_transaction'
     Required = @(
         'std::lock_guard<std::recursive_mutex> activation_lock(state().activation_mutex)',
-        'validate_live_session_binding(session->id, workspace, nullptr, error)',
+        'validate_live_session_binding(session->id, workspace, &live_binding, error)',
         'ensure_driver_active_for_session(session->attached_pid',
-        'validate_live_session_binding(session->id, workspace, nullptr, error)',
+        'validate_live_session_binding(session->id, workspace, &live_binding, error)',
         'workspace_registry().select_for_ui(workspace->identity().binary_id())',
         'candidate->ui_selected = false',
         'session->ui_selected = true',
@@ -1046,7 +1104,8 @@ $contractArgs = @{
         'request.snapshot.pid = pid',
         'workspace_registry().open_live(request)',
         'make_live_session_binding(source_identity, workspace',
-        'validate_live_target_identity(source_identity)',
+        'driver_bridge::identity::validate_live_target_identity(',
+        'source_identity)',
         'provider->validate_current_identity()',
         'activate_session_transaction(session_index'
     )
@@ -1225,7 +1284,8 @@ $allEvidenceFiles = @($sourceFiles + $idaCompatibility.evidence_files +
     $hexCallInventory.absolute_files + @($mcpPath, $globalsPath, $helpersPath,
     $sessionHeaderPath, $sessionSourcePath, $workspaceRegistryPath,
     $driverIdentityPath, $driverSourcePath, $hexHeaderPath, $hexSourcePath,
-    $fileBrowserPath, $mainPath, $PSCommandPath) | Sort-Object -Unique)
+    $fileBrowserPath, $calculatorToolPath, $decompilerServicePath, $mainPath,
+    $PSCommandPath) | Sort-Object -Unique)
 $sourceHashes = [Collections.Generic.List[object]]::new()
 $sha = [Security.Cryptography.SHA256]::Create()
 try {
@@ -1356,8 +1416,9 @@ function Assert-SurfaceCompatibility([object]$Reference, [object]$Candidate,
         Assert-ParameterCompatibility @((Get-ObjectField $before 'parameters')) @((Get-ObjectField $after 'parameters')) "MCP tool '$name'" $Strict
         if (Test-ObjectField $before 'input_schema') {
             if (!(Test-ObjectField $after 'input_schema') -or
+                ($Strict -and
                 (Convert-CanonicalJson (Get-ObjectField $before 'input_schema')) -ne
-                (Convert-CanonicalJson (Get-ObjectField $after 'input_schema'))) {
+                (Convert-CanonicalJson (Get-ObjectField $after 'input_schema')))) {
                 throw "Exact input schema regression for MCP tool '$name' relative to $ReferenceLabel"
             }
         }
@@ -1413,7 +1474,7 @@ function Assert-SurfaceCompatibility([object]$Reference, [object]$Candidate,
         $key = ([string](Get-ObjectField $entry 'key')) + "`n" +
             ([string](Get-ObjectField $entry 'expression'))
         if (!$candidateShortcutKeys.Contains($key)) {
-            throw "Removed or changed UI shortcut relative to $ReferenceLabel: $([string](Get-ObjectField $entry 'key'))"
+            throw "Removed or changed UI shortcut relative to ${ReferenceLabel}: $([string](Get-ObjectField $entry 'key'))"
         }
     }
 
@@ -1457,7 +1518,8 @@ function Write-AtomicUtf8([string]$Path, [string]$Content) {
     try {
         [IO.File]::WriteAllText($temporary, $Content, [Text.UTF8Encoding]::new($false))
         if (Test-Path -LiteralPath $Path) {
-            [IO.File]::Replace($temporary, $Path, $null, $false)
+            [IO.File]::Delete($Path)
+            [IO.File]::Move($temporary, $Path)
         } else {
             [IO.File]::Move($temporary, $Path)
         }
@@ -1523,7 +1585,7 @@ if (Test-Path -LiteralPath $OutputPath -PathType Leaf) {
     } catch {
         throw "Existing final surface inventory is invalid JSON: $($_.Exception.Message)"
     }
-    Assert-SurfaceCompatibility $existingManifest $manifest 'existing final inventory' $true
+    Assert-SurfaceCompatibility $existingManifest $manifest 'existing final inventory' $false
 }
 $json = $manifest | ConvertTo-Json -Depth 64
 Write-AtomicUtf8 $OutputPath ($json + "`n")

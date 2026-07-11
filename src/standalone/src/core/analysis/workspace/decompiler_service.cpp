@@ -1,8 +1,13 @@
 #include "decompiler_service.hpp"
 
-#include "../../disasm/aida_arch_map.hpp"
-#include "../../disasm/aida_function_db.hpp"
-#include "../../disasm/aida_load_image.hpp"
+#include "advanced_cfg.hpp"
+#include "calling_convention.hpp"
+#include "pseudocode_readability.hpp"
+#include "semantic_fusion.hpp"
+#include "type_recovery.hpp"
+#include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
+#include "../../disasm/ghidra_adapters/aida_function_db.hpp"
+#include "../../disasm/ghidra_adapters/aida_load_image.hpp"
 #include "../../disasm/ghidra_decompiler.hpp"
 
 #include <algorithm>
@@ -16,6 +21,7 @@
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
@@ -487,7 +493,9 @@ workspace_result_t<decompiler_cache_key_t> make_cache_key(
     key.binary_id = identity.binary_id();
     key.format = identity.format();
     key.architecture = identity.architecture();
+    key.architecture_mode = identity.architecture_mode();
     key.abi = identity.abi();
+    key.endian = identity.endian();
     key.engine_version = versions.engine_version;
     key.specification_version = versions.specification_version;
     key.analysis_settings_hash = versions.analysis_settings_hash;
@@ -508,6 +516,7 @@ workspace_result_t<decompiler_cache_key_t> make_cache_key(
     key.function_id = function.function.id;
     key.function_rva = function.function_rva;
     key.function_content_hash = content_hash;
+    key.analysis_revision = function.analysis_revision;
     key.overlay_revision = function.overlay_revision;
     key.generation = function.generation;
     const std::string canonical = key.canonical();
@@ -1046,6 +1055,7 @@ workspace_result_t<void> ensure_request_current(
         }
     }
     if (workspace->generation() != function.generation ||
+        workspace->analysis_revision() != function.analysis_revision ||
         workspace->overlay_revision() != function.overlay_revision) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::stale_generation,
@@ -1059,6 +1069,414 @@ workspace_result_t<void> ensure_request_current(
             phase));
     }
     return workspace_result_t<void>::success();
+}
+
+struct decompiler_quality_result_t {
+    std::optional<semantic_fusion_result_t> semantic;
+    std::optional<cfg_analysis_result_t> cfg;
+    std::optional<cc_analysis_result_t> calling_convention;
+    std::optional<type_recovery_result_t> types;
+    std::vector<decompiler_feedback_fact_t> feedback_facts;
+};
+
+bool quality_error_requires_abort(const workspace_error_t& error) noexcept {
+    if (error.cancellation || error.deadline)
+        return true;
+    switch (error.code) {
+    case workspace_error_code_t::cancelled:
+    case workspace_error_code_t::deadline_exceeded:
+    case workspace_error_code_t::stale_generation:
+    case workspace_error_code_t::target_stale:
+    case workspace_error_code_t::revision_conflict:
+    case workspace_error_code_t::workspace_closing:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::string bounded_quality_detail(std::string detail) {
+    constexpr std::size_t max_detail_bytes = 512;
+    if (detail.empty())
+        return "quality module did not provide a diagnostic";
+    if (detail.size() > max_detail_bytes)
+        detail.resize(max_detail_bytes);
+    return detail;
+}
+
+std::uint64_t feedback_type_revision(const decompiler_request_t& request,
+                                     const resolved_function_t& function) noexcept {
+    return request.context ? *request.context->type_revision : function.analysis_revision;
+}
+
+decompiler_feedback_range_t feedback_function_range(const resolved_function_t& function) {
+    return {function.entry_va, function.byte_size};
+}
+
+std::string quality_fact_suffix(const resolved_function_t& function,
+                                std::uint64_t type_revision) {
+    return std::to_string(function.function.id) + ":" +
+        std::to_string(function.entry_va) + ":" +
+        std::to_string(function.generation) + ":" +
+        std::to_string(function.analysis_revision) + ":" +
+        std::to_string(function.overlay_revision) + ":" +
+        std::to_string(type_revision);
+}
+
+void append_quality_abstention(decompiler_quality_result_t& quality,
+                               const resolved_function_t& function,
+                               std::uint64_t type_revision,
+                               const std::string& category,
+                               decompiler_feedback_abstention_reason_t reason,
+                               std::string detail) {
+    const std::string suffix = quality_fact_suffix(function, type_revision);
+    decompiler_feedback_fact_t fact;
+    fact.fact_id = "decompiler-quality-abstention:" + category + ":" + suffix;
+    fact.logical_key = "decompiler-quality:" + category + ":" +
+        std::to_string(function.entry_va);
+    fact.publisher_id = "workspace-decompiler-quality";
+    fact.kind = decompiler_feedback_fact_kind_t::abstention;
+    fact.authority = decompiler_feedback_authority_t::decompiler;
+    fact.validation.grade = decompiler_feedback_validation_grade_t::validated;
+    fact.validation.validator_id = "workspace-quality-integration";
+    fact.validation.evidence_id = function.workspace->identity().binary_id().to_hex();
+    fact.validation.evidence_revision = function.analysis_revision;
+    fact.source_revision = function.analysis_revision;
+    fact.affected_range = feedback_function_range(function);
+    fact.payload = decompiler_feedback_abstention_t{reason, bounded_quality_detail(std::move(detail))};
+    quality.feedback_facts.push_back(std::move(fact));
+}
+
+void append_quality_error(decompiler_quality_result_t& quality,
+                          const resolved_function_t& function,
+                          std::uint64_t type_revision,
+                          const std::string& category,
+                          decompiler_feedback_error_class_t error_class,
+                          std::string detail) {
+    const std::string suffix = quality_fact_suffix(function, type_revision);
+    decompiler_feedback_fact_t fact;
+    fact.fact_id = "decompiler-quality-error:" + category + ":" + suffix;
+    fact.logical_key = "decompiler-quality:" + category + ":" +
+        std::to_string(function.entry_va);
+    fact.publisher_id = "workspace-decompiler-quality";
+    fact.kind = decompiler_feedback_fact_kind_t::error;
+    fact.authority = decompiler_feedback_authority_t::decompiler;
+    fact.validation.grade = decompiler_feedback_validation_grade_t::validated;
+    fact.validation.validator_id = "workspace-quality-integration";
+    fact.validation.evidence_id = function.workspace->identity().binary_id().to_hex();
+    fact.validation.evidence_revision = function.analysis_revision;
+    fact.source_revision = function.analysis_revision;
+    fact.affected_range = feedback_function_range(function);
+    fact.payload = decompiler_feedback_error_t{error_class, bounded_quality_detail(std::move(detail)), false};
+    quality.feedback_facts.push_back(std::move(fact));
+}
+
+bool feedback_address_in_function(const resolved_function_t& function,
+                                  const address_t& address,
+                                  std::uint64_t& value) {
+    auto translated = address_to_va(address, function.workspace->identity(), function.image.get());
+    if (!translated)
+        return false;
+    if (!feedback_function_range(function).contains(translated.value()))
+        return false;
+    value = translated.value();
+    return true;
+}
+
+bool feedback_range_end_in_function(const resolved_function_t& function,
+                                    const address_t& address,
+                                    std::uint64_t& value) {
+    auto translated = address_to_va(address, function.workspace->identity(), function.image.get());
+    if (!translated || translated.value() <= function.entry_va ||
+        translated.value() > function.end_va) {
+        return false;
+    }
+    value = translated.value();
+    return true;
+}
+
+bool quality_stop_requested(const cancellation_token_t& caller,
+                            const cancellation_token_t& workspace_cancel,
+                            const cancellation_token_t& deadline) noexcept {
+    return caller.stop_requested() || workspace_cancel.stop_requested() ||
+        deadline.stop_requested();
+}
+
+std::optional<decompiler_feedback_fact_t> make_validated_cfg_fact(
+    const resolved_function_t& function,
+    std::uint64_t type_revision,
+    const cfg_analysis_result_t& cfg,
+    const cancellation_token_t& caller,
+    const cancellation_token_t& workspace_cancel,
+    const cancellation_token_t& deadline) {
+    if (cfg.bounded || !cfg.conflicts.empty() || cfg.basic_blocks.empty())
+        return std::nullopt;
+    decompiler_feedback_cfg_t payload;
+    payload.blocks.reserve(cfg.basic_blocks.size());
+    for (std::size_t index = 0; index < cfg.basic_blocks.size(); ++index) {
+        if ((index & 63U) == 0 && quality_stop_requested(caller, workspace_cancel, deadline))
+            return std::nullopt;
+        const auto& block = cfg.basic_blocks[index];
+        if (block.function_id != function.function.id || block.quality.conflicted ||
+            block.quality.confidence != 100) {
+            return std::nullopt;
+        }
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        if (!feedback_address_in_function(function, block.start, begin) ||
+            !feedback_range_end_in_function(function, block.end, end) || end <= begin) {
+            return std::nullopt;
+        }
+        payload.blocks.push_back({{begin, end - begin}, block.terminal});
+    }
+    std::sort(payload.blocks.begin(), payload.blocks.end(), [](const auto& left, const auto& right) {
+        return left.range < right.range;
+    });
+    for (std::size_t index = 1; index < payload.blocks.size(); ++index) {
+        if (payload.blocks[index - 1].range.overlaps(payload.blocks[index].range))
+            return std::nullopt;
+    }
+    payload.edges.reserve(cfg.cfg_edges.size());
+    for (std::size_t index = 0; index < cfg.cfg_edges.size(); ++index) {
+        if ((index & 63U) == 0 && quality_stop_requested(caller, workspace_cancel, deadline))
+            return std::nullopt;
+        const auto& edge = cfg.cfg_edges[index];
+        if (edge.derived || edge.external_target || edge.quality.conflicted ||
+            edge.quality.confidence != 100) {
+            return std::nullopt;
+        }
+        std::uint64_t source = 0;
+        std::uint64_t target = 0;
+        if (!feedback_address_in_function(function, edge.source, source) ||
+            !feedback_address_in_function(function, edge.target, target)) {
+            return std::nullopt;
+        }
+        payload.edges.push_back({source, target});
+    }
+    std::sort(payload.edges.begin(), payload.edges.end(), [](const auto& left, const auto& right) {
+        return std::tie(left.source, left.target) < std::tie(right.source, right.target);
+    });
+    payload.edges.erase(std::unique(payload.edges.begin(), payload.edges.end(), [](const auto& left,
+                                                                                   const auto& right) {
+        return left.source == right.source && left.target == right.target;
+    }), payload.edges.end());
+    const std::string suffix = quality_fact_suffix(function, type_revision);
+    decompiler_feedback_fact_t fact;
+    fact.fact_id = "decompiler-quality-cfg:" + suffix;
+    fact.logical_key = "decompiler-cfg:" + std::to_string(function.entry_va);
+    fact.publisher_id = "workspace-decompiler-quality";
+    fact.kind = decompiler_feedback_fact_kind_t::cfg;
+    fact.authority = decompiler_feedback_authority_t::baseline_graph;
+    fact.validation.grade = decompiler_feedback_validation_grade_t::proven;
+    fact.validation.validator_id = "advanced-cfg-range-validator";
+    fact.validation.evidence_id = function.workspace->identity().binary_id().to_hex();
+    fact.validation.evidence_revision = function.analysis_revision;
+    fact.source_revision = function.analysis_revision;
+    fact.affected_range = feedback_function_range(function);
+    fact.payload = std::move(payload);
+    return fact;
+}
+
+bool has_authoritative_type_evidence(
+    const recovered_type_t& type,
+    const std::unordered_map<std::uint64_t, const type_recovery_evidence_t*>& evidence_by_id) {
+    if (type.state != type_resolution_state_t::resolved ||
+        type.confidence != 100 || type.descriptor.declared_name.empty()) {
+        return false;
+    }
+    for (const auto evidence_id : type.supporting_evidence_ids) {
+        const auto found = evidence_by_id.find(evidence_id);
+        if (found == evidence_by_id.end() || found->second->propagated ||
+            !found->second->hard_constraint || found->second->confidence != 100 ||
+            (found->second->provenance != type_evidence_provenance_t::debug_info &&
+             found->second->provenance != type_evidence_provenance_t::user_definition) ||
+            found->second->candidate.declared_name != type.descriptor.declared_name) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+void append_validated_type_facts(decompiler_quality_result_t& quality,
+                                 const resolved_function_t& function,
+                                 std::uint64_t type_revision,
+                                 const type_recovery_result_t& recovery,
+                                 const cancellation_token_t& caller,
+                                 const cancellation_token_t& workspace_cancel,
+                                 const cancellation_token_t& deadline) {
+    std::unordered_map<std::uint64_t, const type_recovery_evidence_t*> evidence_by_id;
+    evidence_by_id.reserve(recovery.evidence.size());
+    for (std::size_t index = 0; index < recovery.evidence.size(); ++index) {
+        if ((index & 63U) == 0 && quality_stop_requested(caller, workspace_cancel, deadline))
+            return;
+        const auto& evidence = recovery.evidence[index];
+        if (evidence.evidence_id != 0)
+            evidence_by_id.emplace(evidence.evidence_id, &evidence);
+    }
+    std::size_t appended = 0;
+    constexpr std::size_t max_type_facts = 16;
+    for (std::size_t index = 0; index < recovery.types.size(); ++index) {
+        if ((index & 63U) == 0 && quality_stop_requested(caller, workspace_cancel, deadline))
+            return;
+        if (appended == max_type_facts)
+            break;
+        const auto& type = recovery.types[index];
+        if (!has_authoritative_type_evidence(type, evidence_by_id))
+            continue;
+        std::uint64_t address = 0;
+        if (!feedback_address_in_function(function, type.subject.address, address))
+            continue;
+        const std::string suffix = quality_fact_suffix(function, type_revision);
+        decompiler_feedback_fact_t fact;
+        fact.fact_id = "decompiler-quality-type:" + suffix + ":" +
+            std::to_string(type.subject.entity_id) + ":" + std::to_string(address);
+        fact.logical_key = "decompiler-type:" + std::to_string(address) + ":" +
+            type.descriptor.declared_name;
+        fact.publisher_id = "workspace-decompiler-quality";
+        fact.kind = decompiler_feedback_fact_kind_t::type_assignment;
+        fact.authority = decompiler_feedback_authority_t::trusted_recovery;
+        fact.validation.grade = decompiler_feedback_validation_grade_t::proven;
+        fact.validation.validator_id = "type-recovery-authoritative-evidence";
+        fact.validation.evidence_id = function.workspace->identity().binary_id().to_hex();
+        fact.validation.evidence_revision = function.analysis_revision;
+        fact.source_revision = function.analysis_revision;
+        fact.affected_range = feedback_function_range(function);
+        fact.payload = decompiler_feedback_type_assignment_t{address, type.descriptor.declared_name};
+        quality.feedback_facts.push_back(std::move(fact));
+        ++appended;
+    }
+}
+
+workspace_result_t<decompiler_quality_result_t> run_decompiler_quality(
+    const std::shared_ptr<decompiler_service_t::state_t>& state,
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    const resolved_function_t& function,
+    const decompiler_request_t& request,
+    const cancellation_token_t& caller,
+    const cancellation_token_t& workspace_cancel,
+    const cancellation_token_t& deadline) {
+    decompiler_quality_result_t quality;
+    const std::uint64_t type_revision = feedback_type_revision(request, function);
+    const cancellation_token_t& quality_cancel = request.deadline ? deadline : caller;
+    const auto current = [&](const char* phase) {
+        return ensure_request_current(state, workspace, function, request.context,
+            caller, workspace_cancel, deadline, phase);
+    };
+    auto gate = current("decompiler.quality.semantic.preflight");
+    if (!gate)
+        return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
+
+    semantic_fusion_request_t semantic_request;
+    semantic_request.function_rva = function.function_rva;
+    semantic_request.function_address = function.function.start;
+    auto semantic = fuse_semantic_evidence(*workspace, semantic_request, quality_cancel);
+    if (!semantic) {
+        if (quality_error_requires_abort(semantic.error()))
+            return workspace_result_t<decompiler_quality_result_t>::failure(semantic.error());
+        append_quality_error(quality, function, type_revision, "semantic",
+            decompiler_feedback_error_class_t::ir_lift, semantic.error().message);
+    } else {
+        quality.semantic = semantic.take_value();
+        append_quality_abstention(quality, function, type_revision, "semantic",
+            decompiler_feedback_abstention_reason_t::unsupported_encoding,
+            "semantic fusion facts were consumed by type recovery; the feedback model has no value, alias, or use-def payload");
+    }
+    gate = current("decompiler.quality.semantic.complete");
+    if (!gate)
+        return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
+
+    auto cfg = analyze_advanced_cfg(*workspace, function.function.start.value, quality_cancel);
+    if (!cfg) {
+        if (quality_error_requires_abort(cfg.error()))
+            return workspace_result_t<decompiler_quality_result_t>::failure(cfg.error());
+        append_quality_error(quality, function, type_revision, "cfg",
+            decompiler_feedback_error_class_t::cfg_reconstruction, cfg.error().message);
+    } else {
+        quality.cfg = cfg.take_value();
+        auto fact = make_validated_cfg_fact(function, type_revision, *quality.cfg,
+            caller, workspace_cancel, deadline);
+        if (fact) {
+            quality.feedback_facts.push_back(std::move(*fact));
+        } else {
+            append_quality_abstention(quality, function, type_revision, "cfg",
+                decompiler_feedback_abstention_reason_t::contradictory_evidence,
+                "advanced CFG did not produce a complete conflict-free range-proven graph for feedback publication");
+        }
+    }
+    gate = current("decompiler.quality.cfg.complete");
+    if (!gate)
+        return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
+
+    calling_convention_request_t calling_convention_request;
+    calling_convention_request.function = function.function.start;
+    calling_convention_request.expected_generation = function.generation;
+    calling_convention_request.expected_analysis_revision = function.analysis_revision;
+    calling_convention_request.expected_overlay_revision = function.overlay_revision;
+    auto calling_convention = infer_calling_convention(*workspace, calling_convention_request,
+                                                       quality_cancel);
+    if (!calling_convention) {
+        if (quality_error_requires_abort(calling_convention.error())) {
+            return workspace_result_t<decompiler_quality_result_t>::failure(
+                calling_convention.error());
+        }
+        append_quality_error(quality, function, type_revision, "calling-convention",
+            decompiler_feedback_error_class_t::integration, calling_convention.error().message);
+    } else {
+        quality.calling_convention = calling_convention.take_value();
+        append_quality_abstention(quality, function, type_revision, "calling-convention",
+            decompiler_feedback_abstention_reason_t::unsupported_encoding,
+            "calling-convention inference was consumed by type recovery; no source-proven C declaration is available for prototype publication");
+    }
+    gate = current("decompiler.quality.calling_convention.complete");
+    if (!gate)
+        return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
+
+    type_recovery_request_t type_request;
+    type_request.function_rva = function.function.start.value;
+    type_request.address_space = function.function.start.space;
+    type_request.semantic_result = quality.semantic ? &*quality.semantic : nullptr;
+    type_request.cfg_result = quality.cfg ? &*quality.cfg : nullptr;
+    type_request.calling_convention_result = quality.calling_convention
+        ? &*quality.calling_convention : nullptr;
+    auto types = recover_types(*workspace, type_request, quality_cancel);
+    if (!types) {
+        if (quality_error_requires_abort(types.error()))
+            return workspace_result_t<decompiler_quality_result_t>::failure(types.error());
+        append_quality_error(quality, function, type_revision, "type-recovery",
+            decompiler_feedback_error_class_t::type_recovery, types.error().message);
+    } else {
+        quality.types = types.take_value();
+        const std::size_t facts_before = quality.feedback_facts.size();
+        append_validated_type_facts(quality, function, type_revision, *quality.types,
+            caller, workspace_cancel, deadline);
+        if (quality.feedback_facts.size() == facts_before) {
+            append_quality_abstention(quality, function, type_revision, "type-recovery",
+                decompiler_feedback_abstention_reason_t::unsupported_encoding,
+                "type recovery produced no direct non-propagated confidence-100 debug or user declaration for feedback publication");
+        }
+    }
+    gate = current("decompiler.quality.type_recovery.complete");
+    if (!gate)
+        return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
+
+    const typed_pseudocode_ast_t* typed_ast = nullptr;
+    const auto readability = render_typed_pseudocode(typed_ast, {});
+    if (readability.succeeded() || readability.errors.size() != 1 ||
+        readability.errors.front().code != pseudocode_render_error_code_t::invalid_ast) {
+        return workspace_result_t<decompiler_quality_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "typed pseudocode renderer did not report the expected missing-AST state",
+            "decompiler.quality.readability"));
+    }
+    append_quality_error(quality, function, type_revision, "readability",
+        decompiler_feedback_error_class_t::integration,
+        "ghidra_adapter_decompile_result_t supplies text, annotations, mappings, and callees but no typed_pseudocode_ast_t; " +
+            readability.errors.front().detail);
+    gate = current("decompiler.quality.readability.complete");
+    if (!gate)
+        return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
+    return workspace_result_t<decompiler_quality_result_t>::success(std::move(quality));
 }
 
 workspace_error_t feedback_error(
@@ -1080,8 +1498,9 @@ workspace_result_t<void> publish_feedback(
     const cancellation_token_t& caller,
     const cancellation_token_t& workspace_cancel,
     const cancellation_token_t& deadline,
+    const decompiler_quality_result_t* quality,
     decompiler_result_t& result) {
-    if (!request.context || !request.publish_feedback)
+    if (!request.publish_feedback)
         return workspace_result_t<void>::success();
     auto current = ensure_request_current(state, workspace, function, request.context,
         caller, workspace_cancel, deadline, "decompiler.feedback.preflight");
@@ -1100,14 +1519,17 @@ workspace_result_t<void> publish_feedback(
     }
 
     decompiler_feedback_scope_key_t scope;
-    scope.workspace_id = request.context->workspace_id;
+    scope.workspace_id = request.context ? request.context->workspace_id
+                                         : workspace->identity().binary_id().to_hex();
     scope.binary_id = workspace->identity().binary_id().to_hex();
-    scope.address_space_id = address_space_text(*request.context->address_space);
+    scope.address_space_id = request.context
+        ? address_space_text(*request.context->address_space)
+        : address_space_text(function.function.start.space);
     scope.architecture_id = "architecture-" + std::to_string(
         static_cast<unsigned int>(workspace->identity().architecture()));
-    scope.generation = *request.context->generation;
-    scope.overlay_revision = *request.context->overlay_revision;
-    scope.type_revision = *request.context->type_revision;
+    scope.generation = function.generation;
+    scope.overlay_revision = function.overlay_revision;
+    scope.type_revision = feedback_type_revision(request, function);
 
     auto scope_validation = decompiler_feedback_model_t::validate_scope(
         scope, feedback->limits());
@@ -1134,7 +1556,7 @@ workspace_result_t<void> publish_feedback(
     const std::string fact_suffix = std::to_string(function.function.id) + ":" +
         std::to_string(function.entry_va) + ":" + std::to_string(function.generation) +
         ":" + std::to_string(function.overlay_revision) + ":" +
-        std::to_string(*request.context->type_revision);
+        std::to_string(feedback_type_revision(request, function));
     decompiler_feedback_fact_t boundary;
     boundary.fact_id = "decompiler-boundary:" + fact_suffix;
     boundary.logical_key = "function-boundary:" + std::to_string(function.entry_va);
@@ -1151,7 +1573,7 @@ workspace_result_t<void> publish_feedback(
         function.entry_va, function.end_va};
 
     std::vector<decompiler_feedback_fact_t> facts;
-    facts.reserve(result.function_name.empty() ? 1U : 2U);
+    facts.reserve(1U + (quality ? quality->feedback_facts.size() : 0U));
     auto boundary_validation = decompiler_feedback_model_t::validate_fact(
         boundary, feedback->limits());
     if (!boundary_validation.valid) {
@@ -1164,24 +1586,17 @@ workspace_result_t<void> publish_feedback(
     }
     facts.push_back(std::move(boundary));
 
-    if (!result.function_name.empty()) {
-        decompiler_feedback_fact_t name;
-        name.fact_id = "decompiler-name:" + fact_suffix;
-        name.logical_key = "function-name:" + std::to_string(function.entry_va);
-        name.publisher_id = "workspace-decompiler-service";
-        name.kind = decompiler_feedback_fact_kind_t::name;
-        name.authority = decompiler_feedback_authority_t::decompiler;
-        name.validation.grade = decompiler_feedback_validation_grade_t::validated;
-        name.validation.validator_id = "workspace-function-range";
-        name.validation.evidence_id = workspace->identity().binary_id().to_hex();
-        name.validation.evidence_revision = function.analysis_revision;
-        name.source_revision = function.analysis_revision;
-        name.affected_range = function_range;
-        name.payload = decompiler_feedback_name_t{function.entry_va, result.function_name};
-        auto name_validation = decompiler_feedback_model_t::validate_fact(
-            name, feedback->limits());
-        if (name_validation.valid)
-            facts.push_back(std::move(name));
+    if (quality) {
+        for (const auto& candidate : quality->feedback_facts) {
+            if (facts.size() >= feedback->limits().max_facts_per_publication)
+                break;
+            if (!function_range.contains(candidate.affected_range))
+                continue;
+            auto validation = decompiler_feedback_model_t::validate_fact(
+                candidate, feedback->limits());
+            if (validation.valid)
+                facts.push_back(candidate);
+        }
     }
 
     decompiler_feedback_publication_request_t publication;
@@ -1459,8 +1874,17 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
             cached->cache_hit = true;
             cached->persistent_cache_hit = false;
             cached->feedback.reset();
+            std::optional<decompiler_quality_result_t> quality;
+            if (request.publish_feedback) {
+                auto generated = run_decompiler_quality(state_, workspace, function.value(), request,
+                    cancel, workspace_cancel, deadline_token);
+                if (!generated)
+                    return fail(generated.error());
+                quality = generated.take_value();
+            }
             auto published = publish_feedback(state_, workspace, function.value(), request,
-                cancel, workspace_cancel, deadline_token, *cached);
+                cancel, workspace_cancel, deadline_token,
+                quality ? &*quality : nullptr, *cached);
             if (!published)
                 return fail(published.error());
             current = ensure_request_current(state_, workspace, function.value(), request.context,
@@ -1491,8 +1915,17 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
                 cached.cache_hit = true;
                 cached.persistent_cache_hit = true;
                 cached.feedback.reset();
+                std::optional<decompiler_quality_result_t> quality;
+                if (request.publish_feedback) {
+                    auto generated = run_decompiler_quality(state_, workspace, function.value(), request,
+                        cancel, workspace_cancel, deadline_token);
+                    if (!generated)
+                        return fail(generated.error());
+                    quality = generated.take_value();
+                }
                 auto published = publish_feedback(state_, workspace, function.value(), request,
-                    cancel, workspace_cancel, deadline_token, cached);
+                    cancel, workspace_cancel, deadline_token,
+                    quality ? &*quality : nullptr, cached);
                 if (!published)
                     return fail(published.error());
                 current = ensure_request_current(state_, workspace, function.value(), request.context,
@@ -1635,6 +2068,15 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     if (!size)
         return fail(size.error());
 
+    std::optional<decompiler_quality_result_t> quality;
+    if (request.publish_feedback) {
+        auto generated = run_decompiler_quality(state_, workspace, function.value(), request,
+            cancel, workspace_cancel, deadline_token);
+        if (!generated)
+            return fail(generated.error());
+        quality = generated.take_value();
+    }
+
     std::string result_json;
     try {
         result_json = serialize_result(result).dump();
@@ -1675,7 +2117,8 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
             return fail(current.error());
     }
     auto published = publish_feedback(state_, workspace, function.value(), request,
-        cancel, workspace_cancel, deadline_token, result);
+        cancel, workspace_cancel, deadline_token,
+        quality ? &*quality : nullptr, result);
     if (!published)
         return fail(published.error());
     current = ensure_request_current(state_, workspace, function.value(), request.context,

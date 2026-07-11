@@ -48,6 +48,8 @@ namespace detail {
     constexpr uint32_t kEntryNtFreeVirtualMemory       = 17;
     constexpr uint32_t kEntryNtOpenProcess             = 18;
     constexpr uint32_t kEntryNtCreateFile              = 19;
+    constexpr uint32_t kEntryNtCreateThreadEx          = 20;
+    constexpr uint32_t kEntryNtSetContextThread        = 21;
 
     struct slot_t
     {
@@ -411,6 +413,16 @@ using NtCreateFile_t = NTSTATUS(NTAPI*)(
     ULONG ShareAccess, ULONG CreateDisposition,
     ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength);
 
+using NtCreateThreadEx_t = NTSTATUS(NTAPI*)(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, HANDLE ProcessHandle,
+    PVOID StartRoutine, PVOID Argument,
+    ULONG CreateFlags, ULONG_PTR ZeroBits,
+    SIZE_T StackCommit, SIZE_T StackReserve, PVOID AttributeList);
+
+using NtSetContextThread_t = NTSTATUS(NTAPI*)(
+    HANDLE ThreadHandle, CONTEXT* Context);
+
 namespace detail {
 
     template <typename Fn>
@@ -484,6 +496,8 @@ inline bool initialize()
     ok &= detail::resolve_slot(detail::kEntryNtFreeVirtualMemory,       "NtFreeVirtualMemory");
     ok &= detail::resolve_slot(detail::kEntryNtOpenProcess,             "NtOpenProcess");
     ok &= detail::resolve_slot(detail::kEntryNtCreateFile,              "NtCreateFile");
+    ok &= detail::resolve_slot(detail::kEntryNtCreateThreadEx,          "NtCreateThreadEx");
+    ok &= detail::resolve_slot(detail::kEntryNtSetContextThread,        "NtSetContextThread");
 
     t.initialized.store(ok, std::memory_order_release);
     return ok;
@@ -772,6 +786,33 @@ inline NTSTATUS call_NtCreateFile(
         });
 }
 
+inline NTSTATUS call_NtCreateThreadEx(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, HANDLE ProcessHandle,
+    PVOID StartRoutine, PVOID Argument,
+    ULONG CreateFlags, ULONG_PTR ZeroBits,
+    SIZE_T StackCommit, SIZE_T StackReserve, PVOID AttributeList)
+{
+    return detail::run_call(detail::kEntryNtCreateThreadEx,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtCreateThreadEx_t>(code);
+            return fn(ThreadHandle, DesiredAccess, ObjectAttributes,
+                      ProcessHandle, StartRoutine, Argument,
+                      CreateFlags, ZeroBits,
+                      StackCommit, StackReserve, AttributeList);
+        });
+}
+
+inline NTSTATUS call_NtSetContextThread(
+    HANDLE ThreadHandle, CONTEXT* Context)
+{
+    return detail::run_call(detail::kEntryNtSetContextThread,
+        [&](uint8_t* code) -> NTSTATUS {
+            auto fn = reinterpret_cast<NtSetContextThread_t>(code);
+            return fn(ThreadHandle, Context);
+        });
+}
+
 namespace adapters {
 
     inline NTSTATUS NTAPI adapter_NtQueryInformationProcess(
@@ -882,6 +923,20 @@ namespace adapters {
         return call_NtCreateFile(h, da, oa, iosb, as, fa, sa, cd, co, ea, eal);
     }
 
+    inline NTSTATUS NTAPI adapter_NtCreateThreadEx(
+        PHANDLE th, ACCESS_MASK da, PVOID oa, HANDLE ph,
+        PVOID sr, PVOID arg, ULONG cf, ULONG_PTR zb,
+        SIZE_T sc, SIZE_T sr2, PVOID al)
+    {
+        return call_NtCreateThreadEx(th, da, oa, ph, sr, arg, cf, zb, sc, sr2, al);
+    }
+
+    inline NTSTATUS NTAPI adapter_NtSetContextThread(
+        HANDLE h, CONTEXT* c)
+    {
+        return call_NtSetContextThread(h, c);
+    }
+
 }
 
 inline NtQueryInformationProcess_t NtQueryInformationProcess()
@@ -972,6 +1027,16 @@ inline NtOpenProcess_t NtOpenProcess()
 inline NtCreateFile_t NtCreateFile()
 {
     return &adapters::adapter_NtCreateFile;
+}
+
+inline NtCreateThreadEx_t NtCreateThreadEx()
+{
+    return &adapters::adapter_NtCreateThreadEx;
+}
+
+inline NtSetContextThread_t NtSetContextThread()
+{
+    return &adapters::adapter_NtSetContextThread;
 }
 
 namespace detail {

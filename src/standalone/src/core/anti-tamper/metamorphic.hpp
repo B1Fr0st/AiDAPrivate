@@ -366,6 +366,11 @@ namespace mba {
         return a ^ 0xFFFFFFFFFFFFFFFFULL;
     }
 
+    __forceinline uint64_t mba_neg_plain(uint64_t a)
+    {
+        return (~a) + 1;
+    }
+
     __forceinline uint64_t environmental_mba_chain(
         uint64_t input,
         const anti_symbolic::env_bundle_t& env)
@@ -402,6 +407,12 @@ namespace mba {
     {
         uint64_t a;
         uint64_t b;
+        uint64_t add;
+        uint64_t xor_;
+        uint64_t and_;
+        uint64_t or_;
+        uint64_t neg_a;
+        uint64_t neg_b;
     };
 
     static const mba_test_pair_t s_mba_test_vectors[1000] = {
@@ -441,7 +452,61 @@ namespace mba {
             uint64_t a = s_mba_test_vectors[i].a;
             uint64_t b = s_mba_test_vectors[i].b;
 
-            if (mba_add_plain(a, b) != (a + b))
+            if (s_mba_test_vectors[i].add != (a + b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail vector_add idx=%d a=0x%016llX b=0x%016llX expected=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b,
+                        (unsigned long long)s_mba_test_vectors[i].add);
+            }
+            if (s_mba_test_vectors[i].xor_ != (a ^ b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail vector_xor idx=%d a=0x%016llX b=0x%016llX expected=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b,
+                        (unsigned long long)s_mba_test_vectors[i].xor_);
+            }
+            if (s_mba_test_vectors[i].and_ != (a & b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail vector_and idx=%d a=0x%016llX b=0x%016llX expected=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b,
+                        (unsigned long long)s_mba_test_vectors[i].and_);
+            }
+            if (s_mba_test_vectors[i].or_ != (a | b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail vector_or idx=%d a=0x%016llX b=0x%016llX expected=0x%016llX",
+                        i, (unsigned long long)a, (unsigned long long)b,
+                        (unsigned long long)s_mba_test_vectors[i].or_);
+            }
+            if (s_mba_test_vectors[i].neg_a != (0ULL - a))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail vector_neg_a idx=%d a=0x%016llX expected=0x%016llX",
+                        i, (unsigned long long)a,
+                        (unsigned long long)s_mba_test_vectors[i].neg_a);
+            }
+            if (s_mba_test_vectors[i].neg_b != (0ULL - b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail vector_neg_b idx=%d b=0x%016llX expected=0x%016llX",
+                        i, (unsigned long long)b,
+                        (unsigned long long)s_mba_test_vectors[i].neg_b);
+            }
+            if (mba_add_plain(a, b) != s_mba_test_vectors[i].add)
             {
                 ++fail_count;
                 if (fail_count <= 4)
@@ -449,7 +514,7 @@ namespace mba {
                         "mba_verify_fail plain_add idx=%d a=0x%016llX b=0x%016llX",
                         i, (unsigned long long)a, (unsigned long long)b);
             }
-            if (mba_xor_plain(a, b) != (a ^ b))
+            if (mba_xor_plain(a, b) != s_mba_test_vectors[i].xor_)
             {
                 ++fail_count;
                 if (fail_count <= 4)
@@ -457,7 +522,7 @@ namespace mba {
                         "mba_verify_fail plain_xor idx=%d a=0x%016llX b=0x%016llX",
                         i, (unsigned long long)a, (unsigned long long)b);
             }
-            if (mba_and_plain(a, b) != (a & b))
+            if (mba_and_plain(a, b) != s_mba_test_vectors[i].and_)
             {
                 ++fail_count;
                 if (fail_count <= 4)
@@ -465,13 +530,29 @@ namespace mba {
                         "mba_verify_fail plain_and idx=%d a=0x%016llX b=0x%016llX",
                         i, (unsigned long long)a, (unsigned long long)b);
             }
-            if (mba_or_plain(a, b) != (a | b))
+            if (mba_or_plain(a, b) != s_mba_test_vectors[i].or_)
             {
                 ++fail_count;
                 if (fail_count <= 4)
                     webhook::write_log_critical_fmt("metamorphic",
                         "mba_verify_fail plain_or idx=%d a=0x%016llX b=0x%016llX",
                         i, (unsigned long long)a, (unsigned long long)b);
+            }
+            if (mba_neg_plain(a) != s_mba_test_vectors[i].neg_a)
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_neg_a idx=%d a=0x%016llX",
+                        i, (unsigned long long)a);
+            }
+            if (mba_neg_plain(b) != s_mba_test_vectors[i].neg_b)
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_neg_b idx=%d b=0x%016llX",
+                        i, (unsigned long long)b);
             }
         }
 
@@ -483,7 +564,7 @@ namespace mba {
                 uint64_t a = s_mba_test_vectors[i].a;
                 uint64_t b = s_mba_test_vectors[i].b;
 
-                if (keyed_xor(a, b, ent) != (a ^ b))
+                if (keyed_xor(a, b, ent) != s_mba_test_vectors[i].xor_)
                 {
                     ++fail_count;
                     if (fail_count <= 4)
@@ -493,7 +574,7 @@ namespace mba {
                             e, i, (unsigned long long)ent,
                             (unsigned long long)a, (unsigned long long)b);
                 }
-                if (keyed_add(a, b, ent) != (a + b))
+                if (keyed_add(a, b, ent) != s_mba_test_vectors[i].add)
                 {
                     ++fail_count;
                     if (fail_count <= 4)
@@ -503,7 +584,7 @@ namespace mba {
                             e, i, (unsigned long long)ent,
                             (unsigned long long)a, (unsigned long long)b);
                 }
-                if (keyed_and(a, b, ent) != (a & b))
+                if (keyed_and(a, b, ent) != s_mba_test_vectors[i].and_)
                 {
                     ++fail_count;
                     if (fail_count <= 4)
@@ -513,7 +594,7 @@ namespace mba {
                             e, i, (unsigned long long)ent,
                             (unsigned long long)a, (unsigned long long)b);
                 }
-                if (keyed_or(a, b, ent) != (a | b))
+                if (keyed_or(a, b, ent) != s_mba_test_vectors[i].or_)
                 {
                     ++fail_count;
                     if (fail_count <= 4)
@@ -530,7 +611,7 @@ namespace mba {
         {
             webhook::write_log_critical_fmt("metamorphic",
                 "mba_verify_complete failures=%u total_tests=%d",
-                fail_count, 4000 + 42 * 4000);
+                fail_count, 12000 + 42 * 4000);
         }
         else
         {

@@ -379,6 +379,28 @@ namespace vm_compiler {
             emit_raw(reg_b);
         }
 
+        void emit_junk_reg_safe(uint8_t reg_a, uint8_t reg_b)
+        {
+            emit_opcode(virtualizer::detail::OP_JUNK_REG_SAFE);
+            emit_raw(reg_a);
+            emit_raw(reg_b);
+        }
+
+        void emit_computed_jump(uint8_t operand_reg)
+        {
+            emit_opcode(virtualizer::detail::OP_COMPUTED_JUMP);
+            emit_raw(operand_reg);
+        }
+
+        void emit_irreducible_block(uint8_t state_reg_a, uint8_t state_reg_b,
+                                    uint8_t switch_reg)
+        {
+            emit_opcode(virtualizer::detail::OP_IRREDUCIBLE_LOOP);
+            emit_raw(state_reg_a);
+            emit_raw(state_reg_b);
+            emit_raw(switch_reg);
+        }
+
         void emit_load_reg_entangled(uint8_t vm_index, uint8_t src_reg, uint8_t dst_reg)
         {
             uint8_t packed = static_cast<uint8_t>((vm_index << 6) | (src_reg & 0x0F));
@@ -700,7 +722,7 @@ namespace vm_compiler {
             for (uint32_t i = 0; i < count; ++i)
             {
                 rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
-                uint8_t choice = static_cast<uint8_t>(rng >> 33) % 9;
+                uint8_t choice = static_cast<uint8_t>(rng >> 33) % 10;
                 switch (choice)
                 {
                 case 0: emit_nop(); break;
@@ -720,6 +742,8 @@ namespace vm_compiler {
                                       static_cast<uint8_t>((rng >> 28) % 10)); break;
                 case 8: emit_junk_xor(static_cast<uint8_t>((rng >> 16) % 10),
                                       static_cast<uint8_t>((rng >> 24) % 10)); break;
+                case 9: emit_junk_reg_safe(static_cast<uint8_t>((rng >> 8) % 10),
+                                           static_cast<uint8_t>((rng >> 20) % 10)); break;
                 }
             }
         }

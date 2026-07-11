@@ -24,14 +24,14 @@ namespace whoswho_kernel_layout {
         SIZE_T active_threads = 0;
         const char* source = "unsupported_build";
 
-        if (build >= 22000) {
+        if (build >= 26100) {
             unique_pid = 0x1D0;
             active_links = 0x1D8;
             object_table = 0x300;
             debug_port = 0x308;
             instrumentation_callback = 0x168;
             active_threads = 0x380;
-            source = "static_table_win11";
+            source = "static_table_win11_24h2";
         } else if (build >= 19041) {
             unique_pid = 0x440;
             active_links = 0x448;
@@ -44,7 +44,7 @@ namespace whoswho_kernel_layout {
             unique_pid = 0x440;
             active_links = 0x448;
             object_table = 0x570;
-            debug_port = 0x550;
+            debug_port = 0x578;
             instrumentation_callback = 0x460;
             active_threads = 0x5F0;
             source = "static_table_win10_1809";
@@ -104,44 +104,51 @@ namespace whoswho_kernel_layout {
 
     __forceinline SIZE_T eprocess_unique_process_id_offset() {
         ULONG build = build_number();
-        if (build >= 22000) return 0x1D0;
+        if (build >= 26100) return 0x1D0;
         if (build >= 17763) return 0x440;
         return 0;
     }
 
     __forceinline SIZE_T eprocess_active_process_links_offset() {
         ULONG build = build_number();
-        if (build >= 22000) return 0x1D8;
+        if (build >= 26100) return 0x1D8;
         if (build >= 17763) return 0x448;
         return 0;
     }
 
     __forceinline SIZE_T eprocess_object_table_offset() {
         ULONG build = build_number();
-        if (build >= 22000) return 0x300;
+        if (build >= 26100) return 0x300;
         if (build >= 17763) return 0x570;
         return 0;
     }
 
     __forceinline SIZE_T eprocess_debug_port_offset() {
         ULONG build = build_number();
-        if (build >= 22000) return 0x308;
+        if (build >= 26100) return 0x308;
         if (build >= 19041) return 0x578;
-        if (build >= 17763) return 0x550;
+        if (build >= 17763) return 0x578;
         return 0;
     }
 
     __forceinline SIZE_T eprocess_instrumentation_callback_offset() {
         ULONG build = build_number();
-        if (build >= 22000) return 0x168;
+        if (build >= 26100) return 0x168;
         if (build >= 17763) return 0x460;
         return 0;
     }
 
     __forceinline SIZE_T eprocess_active_threads_offset() {
         ULONG build = build_number();
-        if (build >= 22000) return 0x380;
+        if (build >= 26100) return 0x380;
         if (build >= 17763) return 0x5F0;
+        return 0;
+    }
+
+    __forceinline SIZE_T eprocess_peb_offset() {
+        ULONG build = build_number();
+        if (build >= 26100) return 0x2E0;
+        if (build >= 17763) return 0x550;
         return 0;
     }
 }

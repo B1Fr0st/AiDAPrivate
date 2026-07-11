@@ -2292,9 +2292,15 @@ namespace mcp_standalone::ida_compat
                 environment.mapping = parse_mapping(params.at("mapping"));
 
             if (params.contains("items")) {
-                if (!params.at("items").is_array())
-                    return tool_result_t::error("items must be an array", std::string("INVALID_ARGUMENT"));
-                const json& items = params.at("items");
+                json single_item_batch;
+                const json* items_ptr = &params.at("items");
+                if (params.at("items").is_object()) {
+                    single_item_batch = json::array({params.at("items")});
+                    items_ptr = &single_item_batch;
+                } else if (!params.at("items").is_array()) {
+                    return tool_result_t::error("items must be an object or array", std::string("INVALID_ARGUMENT"));
+                }
+                const json& items = *items_ptr;
                 if (items.empty())
                     return tool_result_t::error("items must not be empty", std::string("INVALID_ARGUMENT"));
                 if (items.size() > CALC_MAX_ITEMS)
@@ -2348,14 +2354,4 @@ namespace mcp_standalone::ida_compat
         }
     }
 
-    void register_calculator_tool(server_t& server)
-    {
-        tool_def_t td;
-        td.name = "calculate";
-        td.description = "Safe target-independent integer, bytes, hash, floating-point, and address mapping calculator";
-        td.read_only = true;
-        td.visibility = tool_visibility_t::external_visible;
-        td.workspace_handler = tool_calculate;
-        server.register_tool(std::move(td));
-    }
 }

@@ -2270,33 +2270,6 @@ namespace mcp_standalone::ida_compat
             {"edge_count", edge_count}, {"truncated", !queue.empty()}});
     }
 
-    tool_result_t tool_list_instances(const json&, const workspace_request_context_t& ctx) {
-        json instances = json::array();
-        const auto workspaces = workspace_registry().list();
-        for (const auto& workspace : workspaces) {
-            if (auto stopped = stop_result(ctx)) return std::move(*stopped);
-            if (!workspace) continue;
-            const auto& identity = workspace->identity();
-            const auto progress = workspace->progress();
-            json instance = {
-                {"binary_id", identity.binary_id().to_hex()},
-                {"bin_name", identity.bin_name()},
-                {"kind", identity.target_kind() == target_kind_t::live_snapshot ? "live" : "static"},
-                {"format", static_cast<unsigned>(identity.format())},
-                {"architecture", static_cast<unsigned>(identity.architecture())},
-                {"analysis_revision", workspace->analysis_revision()},
-                {"overlay_revision", workspace->overlay_revision()},
-                {"readiness", static_cast<unsigned>(progress.readiness)}
-            };
-            if (identity.process()) instance["pid"] = identity.process()->pid;
-            else instance["pid"] = nullptr;
-            instances.push_back(std::move(instance));
-            if (instances.size() >= kMaxPageItems) break;
-        }
-        return adapter_ok(ctx, {{"instances", instances}, {"count", instances.size()},
-            {"truncated", instances.size() < workspaces.size()}});
-    }
-
     std::vector<read_tool_def_t> get_read_tool_defs() {
         return {
             {"lookup_funcs", tool_lookup_funcs},
@@ -2326,17 +2299,4 @@ namespace mcp_standalone::ida_compat
         };
     }
 
-    void register_read_tools(server_t& server) {
-        for (const auto& def : get_read_tool_defs()) {
-            tool_def_t td;
-            td.name = def.name;
-            td.description = std::string("ida-pro-mcp compatible: ") + def.name;
-            td.read_only = true;
-            td.visibility = tool_visibility_t::external_visible;
-            td.workspace_handler = def.handler;
-            auto* sch = find_schema(def.name);
-            if (sch) td.params = {};
-            server.register_tool(std::move(td));
-        }
-    }
 }

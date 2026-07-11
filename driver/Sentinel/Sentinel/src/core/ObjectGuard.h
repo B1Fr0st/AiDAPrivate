@@ -44,6 +44,8 @@ namespace object_guard {
     constexpr ACCESS_MASK TIER_LOG_MASK   = PROCESS_VM_READ;
     constexpr ACCESS_MASK TIER_BLOCK_MASK = PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION;
 
+    constexpr ULONG BUGCHECK_HOSTILE_HANDLE = 0xA1DA0003u;
+
     __forceinline bool is_caller_allowlisted(HANDLE caller_pid) {
         if (!caller_pid || (ULONG_PTR)caller_pid == 4)
             return true;
@@ -84,13 +86,20 @@ namespace object_guard {
             reinterpret_cast<LONG64>(pid));
     }
 
+    __forceinline HANDLE get_effective_protected_pid() {
+        HANDLE bridge_pid = heartbeat::get_bridge_protected_pid();
+        if (bridge_pid)
+            return bridge_pid;
+        return reinterpret_cast<HANDLE>(
+            _InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+    }
+
     OB_PREOP_CALLBACK_STATUS pre_operation_callback(PVOID, POB_PRE_OPERATION_INFORMATION info) {
         if (!info || !info->ObjectType || !info->Object)
             return OB_PREOP_SUCCESS;
 
-        HANDLE prot_pid = reinterpret_cast<HANDLE>(
-            _InterlockedCompareExchange64(
-                reinterpret_cast<volatile LONG64*>(&g_protected_pid), 0, 0));
+        HANDLE prot_pid = get_effective_protected_pid();
         if (!prot_pid)
             return OB_PREOP_SUCCESS;
 
@@ -140,7 +149,7 @@ namespace object_guard {
 
 #ifndef AIDA_DEV_MODE
                     if (_KeBugCheckEx) {
-                        _KeBugCheckEx(0xA1DA0001, (ULONG_PTR)caller_pid, (ULONG_PTR)desired, 0, 0);
+                        _KeBugCheckEx(BUGCHECK_HOSTILE_HANDLE, (ULONG_PTR)caller_pid, (ULONG_PTR)desired, 0, 0);
                     }
 #endif
                 } else {

@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <winioctl.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
 #include <cstdint>
 #include <intrin.h>
@@ -28,6 +29,7 @@
 #endif
 
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 #ifndef _PCLIENT_ID_DEFINED
 #define _PCLIENT_ID_DEFINED
@@ -694,7 +696,7 @@ bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::ui
     const std::uint32_t instance_base = compute_ioctl_base_snapshot();
     if (encoded >= instance_base) {
         const std::uint32_t candidate = encoded - instance_base;
-            if (candidate <= 74u) {
+            if (candidate <= 79u) {
                 offset = candidate;
                 return true;
             }
@@ -704,7 +706,7 @@ bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::ui
         const std::uint32_t synced_base = ioctl_codes::get_base();
         if (encoded >= synced_base) {
             const std::uint32_t candidate = encoded - synced_base;
-            if (candidate <= 74u) {
+            if (candidate <= 79u) {
                 offset = candidate;
                 return true;
             }
@@ -722,7 +724,7 @@ bool voyager::device_t::decode_ioctl_offset_snapshot(DWORD control_code, std::ui
         ioctl_codes::g_server_ioctl_seed = saved_ioctl_seed;
         if (encoded >= base_unseeded) {
             const std::uint32_t candidate = encoded - base_unseeded;
-            if (candidate <= 74u) {
+            if (candidate <= 79u) {
             offset = candidate;
             return true;
         }
@@ -7898,6 +7900,26 @@ bool voyager::device_t::update_re_tool_hashes(const std::uint8_t* hashes, std::u
     return true;
 }
 
+bool voyager::device_t::update_ce_driver_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept
+{
+    if (!is_connected()) return false;
+    if (!hashes || count == 0) return false;
+    if (count > 32) count = 32;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::ce_driver_hash_update_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0C03u;
+    req.session_key = session_key_;
+    req.hash_count = count;
+    req.timestamp = static_cast<std::uint64_t>(__rdtsc());
+    std::memcpy(req.hashes, hashes, static_cast<std::size_t>(count) * 32u);
+
+    if (!send_request_in_lock(ioctl_codes::CEDH(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return true;
+}
+
 bool voyager::device_t::protect_sandbox_pid(std::uint32_t pid, std::uint32_t flags, std::uint64_t* out_denials) noexcept
 {
     diag::log_tagged_fmt("ww:malsafe-um", "protect_sandbox_pid ENTER pid=%u flags_in=0x%08X connected=%d session_present=%d self_pid=%lu",
@@ -8690,6 +8712,124 @@ bool voyager::device_t::relay_server_token_v2(std::uint32_t token_hash, std::uin
     return false;
 }
 
+static bool compute_hmac_sha256(const void* key, std::size_t key_len,
+                                const void* data, std::size_t data_len,
+                                std::uint8_t out[32]) noexcept {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (!NT_SUCCESS(status)) return false;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    status = BCryptCreateHash(alg, &hash, nullptr, 0,
+                              reinterpret_cast<PUCHAR>(const_cast<void*>(key)),
+                              static_cast<ULONG>(key_len), 0);
+    if (!NT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(alg, 0); return false; }
+    status = BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<void*>(data)),
+                            static_cast<ULONG>(data_len), 0);
+    if (!NT_SUCCESS(status)) { BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(alg, 0); return false; }
+    status = BCryptFinishHash(hash, out, 32, 0);
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return NT_SUCCESS(status);
+}
+
+bool voyager::device_t::initiate_driver_handshake(std::uint8_t out_driver_challenge[32]) noexcept {
+    if (!is_connected()) { SetLastError(ERROR_INVALID_HANDLE); return false; }
+    if (session_key_ == 0) { SetLastError(ERROR_INVALID_STATE); return false; }
+
+    detail::handshake_request req{};
+    req.magic = detail::HANDSHAKE_MAGIC;
+    req.session_key = session_key_;
+
+    NTSTATUS rnd_status = BCryptGenRandom(nullptr, req.challenge, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!NT_SUCCESS(rnd_status)) {
+        for (int i = 0; i < 32; ++i)
+            req.challenge[i] = static_cast<std::uint8_t>(__rdtsc() >> (i % 8));
+        for (int i = 0; i < 32; ++i)
+            req.challenge[i] ^= static_cast<std::uint8_t>(GetCurrentProcessId() >> (i % 8));
+    }
+
+    const DWORD ioctl_code = make_ioctl_snapshot(78);
+    diag::log_tagged_fmt("comm", "initiate_driver_handshake_pre ioctl=0x%08X session_key=0x%08X",
+        static_cast<unsigned>(ioctl_code), session_key_);
+
+    SetLastError(ERROR_SUCCESS);
+    if (!send_request(ioctl_code, &req, sizeof(req))) {
+        diag::log_tagged_fmt("comm", "initiate_driver_handshake_send_failed gle=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+
+    if (req.verified == 0) {
+        diag::log_tagged_fmt("comm", "initiate_driver_handshake_driver_rejected");
+        SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+
+    std::uint8_t expected_hmac[32];
+    if (!compute_hmac_sha256(&session_key_, sizeof(session_key_), req.challenge, 32, expected_hmac)) {
+        diag::log_tagged_fmt("comm", "initiate_driver_handshake_hmac_compute_failed");
+        SetLastError(ERROR_GEN_FAILURE);
+        return false;
+    }
+
+    bool response_ok = (std::memcmp(expected_hmac, req.response, 32) == 0);
+    SecureZeroMemory(expected_hmac, sizeof(expected_hmac));
+
+    if (!response_ok) {
+        diag::log_tagged_fmt("comm", "initiate_driver_handshake_hmac_mismatch");
+        SetLastError(ERROR_INVALID_DATA);
+        return false;
+    }
+
+    if (out_driver_challenge) {
+        std::memcpy(out_driver_challenge, req.driver_challenge, 32);
+    }
+
+    SecureZeroMemory(&req, sizeof(req));
+    diag::log_tagged_fmt("comm", "initiate_driver_handshake_ok");
+    return true;
+}
+
+bool voyager::device_t::complete_driver_challenge(const std::uint8_t driver_challenge[32]) noexcept {
+    if (!is_connected()) { SetLastError(ERROR_INVALID_HANDLE); return false; }
+    if (session_key_ == 0) { SetLastError(ERROR_INVALID_STATE); return false; }
+
+    detail::handshake_request req{};
+    req.magic = detail::HANDSHAKE_MAGIC;
+    req.session_key = session_key_;
+    std::memcpy(req.challenge, driver_challenge, 32);
+
+    if (!compute_hmac_sha256(&session_key_, sizeof(session_key_), driver_challenge, 32, req.response)) {
+        diag::log_tagged_fmt("comm", "complete_driver_challenge_hmac_compute_failed");
+        SetLastError(ERROR_GEN_FAILURE);
+        return false;
+    }
+
+    const DWORD ioctl_code = make_ioctl_snapshot(79);
+    diag::log_tagged_fmt("comm", "complete_driver_challenge_pre ioctl=0x%08X session_key=0x%08X",
+        static_cast<unsigned>(ioctl_code), session_key_);
+
+    SetLastError(ERROR_SUCCESS);
+    if (!send_request(ioctl_code, &req, sizeof(req))) {
+        diag::log_tagged_fmt("comm", "complete_driver_challenge_send_failed gle=%lu",
+            static_cast<unsigned long>(GetLastError()));
+        SecureZeroMemory(&req, sizeof(req));
+        return false;
+    }
+
+    bool ok = (req.verified != 0);
+    SecureZeroMemory(&req, sizeof(req));
+
+    if (!ok) {
+        diag::log_tagged_fmt("comm", "complete_driver_challenge_driver_rejected");
+        SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+
+    diag::log_tagged_fmt("comm", "complete_driver_challenge_ok");
+    return true;
+}
+
 bool voyager::device_t::force_post_desync_relay_v2_locked(DWORD* out_error) noexcept
 {
     auto fail = [&](DWORD err) noexcept -> bool {
@@ -9009,5 +9149,53 @@ bool voyager::device_t::drain_debug_events(std::vector<debug_event_record>& out,
         out_stats->total_published = buffer->total_published;
     }
 
+    return true;
+}
+
+bool voyager::device_t::kernel_read_prologue_hash(std::uint64_t va, std::uint32_t size, std::uint64_t& out_hash) noexcept {
+    if (!is_connected()) {
+        return false;
+    }
+    detail::prologue_hash_request req{};
+    req.va = va;
+    req.size = size;
+    req.pad = 0;
+    req.hash_result = 0;
+    if (!send_request(ioctl_codes::KPHS(), &req, sizeof(req))) {
+        return false;
+    }
+    out_hash = req.hash_result;
+    return out_hash != 0;
+}
+
+bool voyager::device_t::query_sentinel_dispatch_guard(std::uint8_t& out_hook_detected, std::uint64_t& out_hook_target) noexcept {
+    if (!is_connected()) {
+        return false;
+    }
+    detail::dispatch_guard_query req{};
+    req.hook_detected = 0;
+    std::memset(req.pad, 0, sizeof(req.pad));
+    req.hook_target = 0;
+    if (!send_request(ioctl_codes::SDGR(), &req, sizeof(req))) {
+        return false;
+    }
+    out_hook_detected = req.hook_detected;
+    out_hook_target = req.hook_target;
+    return true;
+}
+
+bool voyager::device_t::query_sentinel_callback_scan(std::uint8_t& out_hostile_drivers, std::uint8_t& out_modified_callbacks) noexcept {
+    if (!is_connected()) {
+        return false;
+    }
+    detail::callback_scan_query req{};
+    req.hostile_drivers = 0;
+    req.modified_callbacks = 0;
+    std::memset(req.pad, 0, sizeof(req.pad));
+    if (!send_request(ioctl_codes::SCBS(), &req, sizeof(req))) {
+        return false;
+    }
+    out_hostile_drivers = req.hostile_drivers;
+    out_modified_callbacks = req.modified_callbacks;
     return true;
 }

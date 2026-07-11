@@ -3,6 +3,7 @@
 #include "../Struct.h"
 #include "../AntiDebug.h"
 #include "../Dispatcher.h"
+#include "../ProcessGuard.h"
 #include "AntiDumpKernel.h"
 
 namespace functions {
@@ -86,9 +87,14 @@ namespace functions {
 
             case ADMP_OP_LOCK_PAGES:
             {
+                auto* lock_req = reinterpret_cast<p_admp_lock_pages_req>(request);
+                UINT32 count = lock_req->page_count;
+                if (count > 32) count = 32;
                 status = anti_dump_kernel::lock_pages(
-                    request->pid, nullptr, nullptr, 0);
-                request->result = NT_SUCCESS(status) ? 1 : 0;
+                    request->pid,
+                    lock_req->page_bases,
+                    lock_req->page_sizes,
+                    count);
             }
             break;
 
@@ -188,5 +194,37 @@ namespace functions {
                ioctl_codes::g_server_ioctl_seed != 0 ? 1u : 0u);
 
         return STATUS_SUCCESS;
+    }
+
+    NTSTATUS handle_hide_process(p_hide_process_request_k request)
+    {
+        if (!request) return STATUS_INVALID_PARAMETER;
+        if (request->pid == 0) {
+            request->result = (UINT32)STATUS_INVALID_PARAMETER;
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        NTSTATUS status = STATUS_SUCCESS;
+
+        switch (request->operation) {
+            case OP_HIDE_PROCESS:
+                status = process_guard::hide_process_from_list(request->pid);
+                request->result = (UINT32)status;
+                WW_LOG("HDPR: hide pid=%u status=0x%08X", request->pid, (UINT32)status);
+                break;
+
+            case OP_UNHIDE_PROCESS:
+                status = process_guard::unhide_process_from_list(request->pid);
+                request->result = (UINT32)status;
+                WW_LOG("HDPR: unhide pid=%u status=0x%08X", request->pid, (UINT32)status);
+                break;
+
+            default:
+                request->result = (UINT32)STATUS_INVALID_PARAMETER;
+                status = STATUS_INVALID_PARAMETER;
+                break;
+        }
+
+        return status;
     }
 }

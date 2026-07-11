@@ -21,9 +21,14 @@
 #include "../runtime/reason_ids.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../../../../../libs/nlohmann/json.hpp"
+#include "../../../../../libs/cpp-httplib/httplib.h"
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "winhttp.lib")
+
+#ifndef STATUS_GUARD_PAGE_VIOLATION
+#define STATUS_GUARD_PAGE_VIOLATION ((DWORD)0x80000001L)
+#endif
 
 namespace anti_tamper::honeypot {
 
@@ -723,6 +728,254 @@ inline volatile const char* g_license_honeypot_strings[] = {
         (void)sink;
     }
 
+    struct module_range_t {
+        uint64_t base;
+        uint64_t size;
+    };
+
+    inline module_range_t g_aida_module_range = {};
+    inline DWORD g_honeypot_page_size = 4096;
+
+    struct honeypot_string_range_t {
+        uint64_t addr;
+        uint64_t length;
+    };
+
+    inline honeypot_string_range_t g_honeypot_ranges[20] = {};
+    inline void* g_honeypot_guard_pages[64] = {};
+    inline uint32_t g_honeypot_guard_page_count = 0;
+    inline PVOID g_honeypot_veh_handle = nullptr;
+
+    __forceinline void report_honeypot_access(uint64_t accessed_addr, uint64_t rip, uint32_t pid)
+    {
+        char log_buf[160];
+        _snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
+            "honeypot_string_access addr=0x%016llX rip=0x%016llX pid=%u",
+            static_cast<unsigned long long>(accessed_addr),
+            static_cast<unsigned long long>(rip),
+            pid);
+        webhook::write_log("honeypot", log_buf);
+
+        __try {
+            nlohmann::json body;
+            body["accessed_addr"] = static_cast<unsigned long long>(accessed_addr);
+            body["rip"] = static_cast<unsigned long long>(rip);
+            body["pid"] = pid;
+            body["hwid"] = webhook::get_computer_name();
+            body["license_key"] = standalone_license::get_session_token();
+            body["watermark"] = "aida_standalone";
+            body["bug_code"] = static_cast<uint32_t>(HONEYPOT_BUGCHECK_STRING_ACCESS);
+            std::string body_str = body.dump();
+
+            HINTERNET hSession = WinHttpOpen(L"AiDAStandalone/4.0",
+                WINHTTP_ACCESSYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS, 0);
+            if (hSession)
+            {
+                DWORD timeout = 3000;
+                WinHttpSetTimeouts(hSession, timeout, timeout, timeout, timeout);
+
+                const wchar_t* whost = L"aidapro.net";
+                INTERNET_PORT wport = INTERNET_DEFAULT_HTTPS_PORT;
+                DWORD wflags = WINHTTP_FLAG_SECURE;
+
+#ifdef AIDA_LOCAL_LICENSE_SERVER
+                whost = L"localhost";
+                wport = 3001;
+                wflags = 0;
+#endif
+                const wchar_t* wpath = L"/api/honeypot/honeypot-access";
+
+                HINTERNET hConnect = WinHttpConnect(hSession, whost, wport, 0);
+                if (hConnect)
+                {
+                    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
+                        wpath, nullptr, WINHTTP_NO_REFERER,
+                        WINHTTP_DEFAULT_ACCEPT_TYPES, wflags);
+                    if (hRequest)
+                    {
+                        std::wstring hdrs = L"Content-Type: application/json\r\n";
+                        WinHttpSendRequest(hRequest,
+                            hdrs.c_str(), static_cast<DWORD>(hdrs.size()),
+                            const_cast<char*>(body_str.c_str()),
+                            static_cast<DWORD>(body_str.size()),
+                            static_cast<DWORD>(body_str.size()), 0);
+                        WinHttpReceiveResponse(hRequest, nullptr);
+                        WinHttpCloseHandle(hRequest);
+                    }
+                    WinHttpCloseHandle(hConnect);
+                }
+                WinHttpCloseHandle(hSession);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    __declspec(noinline) static LONG WINAPI honeypot_guard_page_handler(EXCEPTION_POINTERS* ep)
+    {
+        if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        if (ep->ExceptionRecord->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        thread_local int recursion_guard = 0;
+        if (recursion_guard > 0)
+        {
+            DWORD old_protect = 0;
+            uintptr_t page_base = static_cast<uintptr_t>(
+                ep->ExceptionRecord->ExceptionInformation[1]) &
+                ~static_cast<uintptr_t>(g_honeypot_page_size - 1);
+            VirtualProtect(reinterpret_cast<LPVOID>(page_base),
+                g_honeypot_page_size, PAGE_READONLY | PAGE_GUARD, &old_protect);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        ++recursion_guard;
+
+        uint64_t fault_addr = static_cast<uint64_t>(
+            ep->ExceptionRecord->ExceptionInformation[1]);
+
+        bool in_honeypot = false;
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            if (g_honeypot_ranges[i].addr == 0 || g_honeypot_ranges[i].length == 0)
+                continue;
+            if (fault_addr >= g_honeypot_ranges[i].addr &&
+                fault_addr < g_honeypot_ranges[i].addr + g_honeypot_ranges[i].length)
+            {
+                in_honeypot = true;
+                break;
+            }
+        }
+
+        if (!in_honeypot)
+        {
+            DWORD old_protect = 0;
+            uintptr_t page_base = static_cast<uintptr_t>(fault_addr) &
+                ~static_cast<uintptr_t>(g_honeypot_page_size - 1);
+            VirtualProtect(reinterpret_cast<LPVOID>(page_base),
+                g_honeypot_page_size, PAGE_READONLY | PAGE_GUARD, &old_protect);
+            --recursion_guard;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        uint64_t rip = ep->ContextRecord->Rip;
+        uint32_t pid = GetCurrentProcessId();
+
+        bool external = false;
+        if (g_aida_module_range.base != 0 && g_aida_module_range.size != 0)
+        {
+            if (rip < g_aida_module_range.base ||
+                rip >= g_aida_module_range.base + g_aida_module_range.size)
+                external = true;
+        }
+
+        diag::log_tagged_critical_fmt("honeypot",
+            "guard_page_violation addr=0x%016llX rip=0x%016llX pid=%u external=%d",
+            static_cast<unsigned long long>(fault_addr),
+            static_cast<unsigned long long>(rip),
+            pid, external ? 1 : 0);
+
+        report_honeypot_access(fault_addr, rip, pid);
+
+        if (external)
+        {
+            driver_bridge::trigger_kernel_bsod(
+                HONEYPOT_BUGCHECK_STRING_ACCESS, fault_addr);
+        }
+
+        DWORD old_protect = 0;
+        uintptr_t page_base = static_cast<uintptr_t>(fault_addr) &
+            ~static_cast<uintptr_t>(g_honeypot_page_size - 1);
+        VirtualProtect(reinterpret_cast<LPVOID>(page_base),
+            g_honeypot_page_size, PAGE_READONLY | PAGE_GUARD, &old_protect);
+
+        --recursion_guard;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    __forceinline void install_honeypot_guard_pages()
+    {
+        SYSTEM_INFO si = {};
+        GetSystemInfo(&si);
+        g_honeypot_page_size = si.dwPageSize;
+        if (g_honeypot_page_size == 0)
+            g_honeypot_page_size = 4096;
+
+        HMODULE hMod = GetModuleHandleW(nullptr);
+        if (hMod)
+        {
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(hMod);
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+            {
+                auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
+                    reinterpret_cast<uint8_t*>(hMod) + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE)
+                {
+                    g_aida_module_range.base = reinterpret_cast<uint64_t>(hMod);
+                    g_aida_module_range.size = nt->OptionalHeader.SizeOfImage;
+                }
+            }
+        }
+
+        g_honeypot_guard_page_count = 0;
+
+        for (uint32_t i = 0; i < 20; ++i)
+        {
+            const char* str = const_cast<const char*>(g_license_honeypot_strings[i]);
+            if (!str) continue;
+
+            uint64_t addr = reinterpret_cast<uint64_t>(str);
+            uint64_t len = std::strlen(str);
+            if (len == 0)
+            {
+                g_honeypot_ranges[i].addr = 0;
+                g_honeypot_ranges[i].length = 0;
+                continue;
+            }
+
+            g_honeypot_ranges[i].addr = addr;
+            g_honeypot_ranges[i].length = len;
+
+            uint64_t start_page = addr & ~static_cast<uint64_t>(g_honeypot_page_size - 1);
+            uint64_t end_page = (addr + len - 1) & ~static_cast<uint64_t>(g_honeypot_page_size - 1);
+
+            for (uint64_t page = start_page; page <= end_page; page += g_honeypot_page_size)
+            {
+                bool already = false;
+                for (uint32_t j = 0; j < g_honeypot_guard_page_count; ++j)
+                {
+                    if (reinterpret_cast<uint64_t>(g_honeypot_guard_pages[j]) == page)
+                    {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already && g_honeypot_guard_page_count < 64)
+                {
+                    DWORD old_protect = 0;
+                    if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(page)),
+                        g_honeypot_page_size, PAGE_READONLY | PAGE_GUARD, &old_protect))
+                    {
+                        g_honeypot_guard_pages[g_honeypot_guard_page_count++] =
+                            reinterpret_cast<void*>(static_cast<uintptr_t>(page));
+                    }
+                }
+            }
+        }
+
+        g_honeypot_veh_handle = AddVectoredExceptionHandler(1,
+            reinterpret_cast<PVECTORED_EXCEPTION_HANDLER>(honeypot_guard_page_handler));
+
+        char log_buf[160];
+        _snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
+            "guard_pages_installed count=%u module_base=0x%016llX module_size=0x%08X veh=%p",
+            g_honeypot_guard_page_count,
+            static_cast<unsigned long long>(g_aida_module_range.base),
+            static_cast<uint32_t>(g_aida_module_range.size),
+            g_honeypot_veh_handle);
+        webhook::write_log("honeypot", log_buf);
+    }
+
     inline void initialize()
     {
         anchor_honeypot_graph();
@@ -787,6 +1040,8 @@ inline volatile const char* g_license_honeypot_strings[] = {
                     ("canary_register_seh_exception decoy_id=" + std::to_string(i)).c_str());
             }
         }
+
+        install_honeypot_guard_pages();
 
         webhook::write_log("honeypot", "honeypot_initialize_complete");
     }

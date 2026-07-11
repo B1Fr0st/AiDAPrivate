@@ -290,4 +290,55 @@ namespace dispatch_guard {
 
         return true;
     }
+
+    __forceinline void query_status(UINT8& out_hook_detected, UINT64& out_hook_target) {
+        out_hook_detected = 0;
+        out_hook_target = 0;
+        if (!_InterlockedCompareExchange(&g_initialized, 1, 1))
+            return;
+        PDRIVER_OBJECT drv_obj = (PDRIVER_OBJECT)g_target_driver_object;
+        if (!drv_obj || !_MmIsAddressValid(drv_obj))
+            return;
+        module_range_t mod_cache[MAX_CACHED_MODULES];
+        ULONG mod_count = build_module_cache(mod_cache, MAX_CACHED_MODULES);
+        __try {
+            for (ULONG i = 0; i < MAX_DISPATCH_SLOTS; i++) {
+                PDRIVER_DISPATCH current_handler = drv_obj->MajorFunction[i];
+                if (current_handler != g_snapshot[i].handler) {
+                    if (!is_address_in_cached_modules(reinterpret_cast<PVOID>(current_handler), mod_cache, mod_count)) {
+                        out_hook_detected = 1;
+                        out_hook_target = reinterpret_cast<UINT64>(current_handler);
+                        return;
+                    }
+                }
+                if (current_handler && _MmIsAddressValid(reinterpret_cast<PVOID>(current_handler))) {
+                    UCHAR current_prologue[PROLOGUE_SIZE];
+                    RtlCopyMemory(current_prologue, reinterpret_cast<PVOID>(current_handler), PROLOGUE_SIZE);
+                    bool mismatch = false;
+                    for (ULONG b = 0; b < PROLOGUE_SIZE; b++) {
+                        if (current_prologue[b] != g_snapshot[i].prologue[b]) {
+                            mismatch = true;
+                            break;
+                        }
+                    }
+                    if (mismatch) {
+                        PVOID hook_dest = resolve_hook_destination(current_prologue, reinterpret_cast<PVOID>(current_handler));
+                        if (hook_dest) {
+                            if (!is_address_in_cached_modules(hook_dest, mod_cache, mod_count)) {
+                                out_hook_detected = 1;
+                                out_hook_target = reinterpret_cast<UINT64>(current_handler);
+                                return;
+                            }
+                        } else {
+                            out_hook_detected = 1;
+                            out_hook_target = reinterpret_cast<UINT64>(current_handler);
+                            return;
+                        }
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return;
+        }
+    }
 }

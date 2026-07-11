@@ -311,6 +311,13 @@ namespace guardian {
             self_ok ? 1u : 0u);
 
         step = perf_mark();
+        bool ssdt_ok = self_protect::ssdt_verify();
+        SN_LOG("guardian::step cycle=%ld name=ssdt_verify elapsed_us=%lu result=%u",
+            cycle,
+            perf_elapsed_us(step),
+            ssdt_ok ? 1u : 0u);
+
+        step = perf_mark();
         bool integrity_ok = integrity::verify();
         SN_LOG("guardian::step cycle=%ld name=integrity elapsed_us=%lu result=%u",
             cycle,
@@ -323,6 +330,15 @@ namespace guardian {
             cycle,
             perf_elapsed_us(step),
             dispatch_ok ? 1u : 0u);
+
+        if (heartbeat::g_bridge && _MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)))) {
+            UINT8 dg_hook = 0;
+            UINT64 dg_target = 0;
+            dispatch_guard::query_status(dg_hook, dg_target);
+            const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)->dispatch_hook_detected = dg_hook;
+            const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)->dispatch_hook_target = dg_target;
+        }
 
         step = perf_mark();
         thread_guard::check_and_clear_current_cpu();
@@ -337,11 +353,27 @@ namespace guardian {
             perf_elapsed_us(step),
             callback_ok ? 1u : 0u);
 
+        if (heartbeat::g_bridge && _MmIsAddressValid(reinterpret_cast<PVOID>(
+                const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)))) {
+            const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)->hostile_drivers =
+                callback_scanner::g_hostile_driver_loads > 0 ? 1 : 0;
+            const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)->modified_callbacks =
+                callback_ok ? 0 : 1;
+        }
+
         step = perf_mark();
         pool_scrub::periodic_scrub();
         SN_LOG("guardian::step cycle=%ld name=pool_scrub elapsed_us=%lu",
             cycle,
             perf_elapsed_us(step));
+
+        if ((cycle % 30) == 0 && session.active) {
+            step = perf_mark();
+            process_notify::detect_ce_driver();
+            SN_LOG("guardian::step cycle=%ld name=ce_driver_scan elapsed_us=%lu",
+                cycle,
+                perf_elapsed_us(step));
+        }
 
         HANDLE protected_pid = session.object_protected_pid ? session.object_protected_pid : session.notify_protected_pid;
 
@@ -359,6 +391,15 @@ namespace guardian {
             perf_elapsed_us(step),
             static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
 
+        if ((cycle % 5) == 0 && session.active) {
+            step = perf_mark();
+            vad_text_guard::check_header_region_intact(protected_pid);
+            SN_LOG("guardian::step cycle=%ld name=header_region_intact elapsed_us=%lu protected_pid=%llu",
+                cycle,
+                perf_elapsed_us(step),
+                static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
+        }
+
         step = perf_mark();
         bool module_present = heartbeat::verify_module_presence();
         if (!module_present) {
@@ -372,6 +413,11 @@ namespace guardian {
         step = perf_mark();
         heartbeat::verify_challenge_response();
         SN_LOG("guardian::step cycle=%ld name=challenge_verify elapsed_us=%lu",
+            cycle,
+            perf_elapsed_us(step));
+        step = perf_mark();
+        heartbeat::process_reverse_challenge();
+        SN_LOG("guardian::step cycle=%ld name=reverse_challenge elapsed_us=%lu",
             cycle,
             perf_elapsed_us(step));
         step = perf_mark();
@@ -470,6 +516,26 @@ namespace guardian {
                                 _KeBugCheckEx(heartbeat::BUGCHECK_DMA_ATTACK, dma_param, 0, 0, 0);
                         }
                     }
+
+                    if (dma_cmd == heartbeat::BRIDGE_CMD_UPDATE_CE_HASHES) {
+                        ULONG ce_count = dma_param;
+                        if (ce_count > 32) ce_count = 32;
+                        SN_LOG("guardian::dpc: UPDATE_CE_HASHES count=%lu cycle=%ld", ce_count, cycle);
+                        if (ce_count > 0) {
+                            process_notify::update_ce_driver_hashes(
+                                const_cast<PUCHAR>(
+                                    reinterpret_cast<const UCHAR*>(
+                                        heartbeat::g_bridge->ce_driver_hash_data)),
+                                ce_count);
+                        }
+                        _InterlockedExchange(
+                            (volatile LONG*)&heartbeat::g_bridge->sentinel_cmd,
+                            heartbeat::BRIDGE_CMD_NONE);
+                        _InterlockedExchange(
+                            (volatile LONG*)&heartbeat::g_bridge->sentinel_cmd_param,
+                            0);
+                        dma_cmd_processed = TRUE;
+                    }
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 SN_LOG("guardian::work: DMA bridge check EXCEPTION");
@@ -491,6 +557,81 @@ namespace guardian {
             } else {
                 SN_LOG("guardian::step cycle=%ld name=attestation elapsed_us=%lu status=0x%08lx FAILED",
                     cycle, perf_elapsed_us(step), attest_st);
+            }
+        }
+
+        if ((cycle % 30) == 0 && session.active) {
+            step = perf_mark();
+            BOOLEAN wm_has_expected = FALSE;
+            if (heartbeat::g_bridge && _MmIsAddressValid(reinterpret_cast<PVOID>(
+                    const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)))) {
+                __try {
+                    volatile UINT8 exp[16];
+                    BOOLEAN any_nonzero = FALSE;
+                    for (int i = 0; i < 16; ++i) {
+                        exp[i] = heartbeat::g_bridge->expected_watermark[i];
+                        if (exp[i] != 0) any_nonzero = TRUE;
+                    }
+                    wm_has_expected = any_nonzero;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    SN_LOG("guardian::step cycle=%ld name=watermark_verify elapsed_us=%lu result=bridge_read_exception",
+                        cycle, perf_elapsed_us(step));
+                }
+            }
+
+            if (wm_has_expected) {
+                HANDLE protected_pid = session.object_protected_pid ?
+                    session.object_protected_pid : session.notify_protected_pid;
+                if (protected_pid && (ULONG_PTR)protected_pid > 4) {
+                    PEPROCESS proc = nullptr;
+                    NTSTATUS lookup_st = PsLookupProcessByProcessId(protected_pid, &proc);
+                    if (NT_SUCCESS(lookup_st) && proc) {
+                        UINT8 expected_wm[16];
+                        if (heartbeat::g_bridge && _MmIsAddressValid(reinterpret_cast<PVOID>(
+                                const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)))) {
+                            for (int i = 0; i < 16; ++i)
+                                expected_wm[i] = heartbeat::g_bridge->expected_watermark[i];
+                        } else {
+                            RtlZeroMemory(expected_wm, 16);
+                        }
+
+                        BOOLEAN wm_match = attestation::verify_watermark(proc, expected_wm);
+
+                        if (heartbeat::g_bridge && _MmIsAddressValid(reinterpret_cast<PVOID>(
+                                const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)))) {
+                            __try {
+                                for (int i = 0; i < 16; ++i)
+                                    const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)->actual_watermark[i] =
+                                        attestation::g_watermark_state.actual_watermark[i];
+                                const_cast<heartbeat::sentinel_bridge_t*>(heartbeat::g_bridge)->watermark_verified = wm_match;
+                            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                        }
+
+                        _ObfDereferenceObject(proc);
+
+                        SN_LOG("guardian::step cycle=%ld name=watermark_verify elapsed_us=%lu match=%u pid=%llu",
+                            cycle, perf_elapsed_us(step), wm_match ? 1u : 0u,
+                            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
+
+                        if (!wm_match) {
+                            SN_LOG("guardian::watermark_mismatch: BSOD pid=%llu magic=0x%08lx",
+                                static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)),
+                                static_cast<ULONG>(AIDA_WATERMARK_MAGIC));
+                            if (_KeBugCheckEx)
+                                _KeBugCheckEx(static_cast<ULONG>(BUGCHECK_MODULE_CROSSCHECK),
+                                    (ULONG_PTR)protected_pid,
+                                    (ULONG_PTR)AIDA_WATERMARK_MAGIC,
+                                    0, 0);
+                        }
+                    } else {
+                        SN_LOG("guardian::step cycle=%ld name=watermark_verify elapsed_us=%lu result=lookup_failed status=0x%08lx pid=%llu",
+                            cycle, perf_elapsed_us(step), lookup_st,
+                            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
+                    }
+                }
+            } else {
+                SN_LOG("guardian::step cycle=%ld name=watermark_verify elapsed_us=%lu result=no_expected_watermark",
+                    cycle, perf_elapsed_us(step));
             }
         }
         }
@@ -550,6 +691,8 @@ namespace guardian {
         _KeInitializeDpc(&g_dpc, dpc_callback, nullptr);
 
         targeting_latch::init();
+
+        self_protect::ssdt_snapshot();
 
         LARGE_INTEGER due_time;
         due_time.QuadPart = CHECK_INTERVAL;
