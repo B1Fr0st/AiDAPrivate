@@ -1,5 +1,5 @@
-using System.Text.Json;
 using System.Text;
+using System.Text.Json;
 
 namespace Aida.ManagedDecompiler;
 
@@ -178,8 +178,8 @@ internal static class Program
     {
         if (!string.Equals(cancellation.Schema, WorkerProtocol.Schema, StringComparison.Ordinal) || cancellation.SchemaVersion != WorkerProtocol.Version ||
             !string.Equals(cancellation.Kind, "cancel", StringComparison.Ordinal) || cancellation.Sequence == 0 ||
-            string.IsNullOrWhiteSpace(cancellation.RequestId) || cancellation.RequestId.Length > 128 ||
-            string.IsNullOrWhiteSpace(cancellation.StableReason) || cancellation.StableReason.Length > 256)
+            string.IsNullOrWhiteSpace(cancellation.RequestId) || cancellation.RequestId.Length > 128 || cancellation.RequestId.Contains('\0') ||
+            string.IsNullOrWhiteSpace(cancellation.StableReason) || cancellation.StableReason.Length > 256 || cancellation.StableReason.Contains('\0'))
             throw new InvalidDataException("worker cancellation violates the offline contract");
     }
 

@@ -34,6 +34,7 @@ internal sealed class ResourceBudgetGuard : IAsyncDisposable
     private readonly CancellationTokenSource monitorCancellation = new();
     private readonly Task monitorTask;
     private int limitKind;
+    private int checkpointCount;
     private int monitorStopped;
     private int disposed;
 
@@ -60,7 +61,8 @@ internal sealed class ResourceBudgetGuard : IAsyncDisposable
     internal void Checkpoint(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        SampleAndSignal();
+        if ((Interlocked.Increment(ref checkpointCount) & 63) == 1)
+            SampleAndSignal();
         ThrowIfExceeded();
         cancellationToken.ThrowIfCancellationRequested();
     }

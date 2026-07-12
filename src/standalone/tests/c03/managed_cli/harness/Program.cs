@@ -91,6 +91,16 @@ internal static class Program
                 baseline = serialized;
             }
         }
+        var firstMethod = inventory.Methods[manifest.Methods[0].Symbol];
+        var cancellationRequest = CreateRequest(sequence++, fixturePath, moduleHash, firstMethod, StandardBudget);
+        var cancelled = await worker.DecompileAndCancelAsync(cancellationRequest).ConfigureAwait(false);
+        Require(cancelled.Diagnostics.Count == 1 && string.Equals(cancelled.Diagnostics[0].Code, "cancelled", StringComparison.Ordinal),
+            "managed CLI worker cancellation response is invalid");
+        var memoryRequest = CreateRequest(sequence, fixturePath, moduleHash, firstMethod,
+            new WorkerBudget("balanced", 5_000, 5_000, 1, 1_000_000));
+        var limited = await worker.DecompileFailureAsync(memoryRequest).ConfigureAwait(false);
+        Require(limited.Diagnostics.Count == 1 && string.Equals(limited.Diagnostics[0].Code, "resource_limit", StringComparison.Ordinal),
+            "managed CLI worker resource response is invalid");
     }
 
     private static async Task<WorkerResult> AnalyzeAsync(WorkerRequest request, CancellationToken cancellationToken)
@@ -467,17 +477,54 @@ internal static class Program
             Require(!process.HasExited, "managed CLI worker exited before accepting a fixture");
             await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(request)).ConfigureAwait(false);
             await process.StandardInput.FlushAsync().ConfigureAwait(false);
-            var line = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
-            if (line is null)
-            {
-                var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
-                throw new InvalidOperationException("managed CLI worker returned no fixture response: " + error);
-            }
+            var line = await ReadResponseAsync().ConfigureAwait(false);
             using var document = JsonDocument.Parse(line);
             var kind = document.RootElement.GetProperty("kind").GetString();
             if (!string.Equals(kind, "result", StringComparison.Ordinal))
                 throw new InvalidOperationException("managed CLI worker rejected a fixture: " + line);
             return WorkerProtocol.Deserialize<WorkerResult>(line);
+        }
+
+        internal async Task<WorkerFailure> DecompileAndCancelAsync(WorkerRequest request)
+        {
+            Require(!process.HasExited, "managed CLI worker exited before accepting cancellation");
+            var cancellation = new WorkerCancellation(
+                WorkerProtocol.Schema,
+                WorkerProtocol.Version,
+                "cancel",
+                request.Sequence + 100_000,
+                request.RequestId,
+                "managed_cli_fixture_cancel");
+            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(request)).ConfigureAwait(false);
+            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(cancellation)).ConfigureAwait(false);
+            await process.StandardInput.FlushAsync().ConfigureAwait(false);
+            return WorkerProtocol.Deserialize<WorkerFailure>(await ReadFailureResponseAsync().ConfigureAwait(false));
+        }
+
+        internal async Task<WorkerFailure> DecompileFailureAsync(WorkerRequest request)
+        {
+            Require(!process.HasExited, "managed CLI worker exited before accepting a limited fixture");
+            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(request)).ConfigureAwait(false);
+            await process.StandardInput.FlushAsync().ConfigureAwait(false);
+            return WorkerProtocol.Deserialize<WorkerFailure>(await ReadFailureResponseAsync().ConfigureAwait(false));
+        }
+
+        private async Task<string> ReadFailureResponseAsync()
+        {
+            var line = await ReadResponseAsync().ConfigureAwait(false);
+            using var document = JsonDocument.Parse(line);
+            if (!string.Equals(document.RootElement.GetProperty("kind").GetString(), "failure", StringComparison.Ordinal))
+                throw new InvalidOperationException("managed CLI worker returned a result where failure was required: " + line);
+            return line;
+        }
+
+        private async Task<string> ReadResponseAsync()
+        {
+            var line = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
+            if (line is not null)
+                return line;
+            var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
+            throw new InvalidOperationException("managed CLI worker returned no fixture response: " + error);
         }
 
         public async ValueTask DisposeAsync()

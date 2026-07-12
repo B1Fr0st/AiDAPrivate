@@ -170,7 +170,7 @@ private:
     std::weak_ptr<analysis_workspace_t> workspace_;
     std::shared_ptr<workspace_database_t> database_;
     overlay_limits_t limits_;
-    overlay_target_identity_v9_t fixed_target_;
+    const overlay_target_identity_v9_t fixed_target_;
     mutable std::shared_mutex state_mutex_;
     std::unordered_map<std::string, overlay_operation_t> items_;
     std::uint64_t revision_ = 0;

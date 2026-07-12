@@ -472,9 +472,11 @@ workspace_result_t<request_t> make_request(
     offline_lock_t offline_lock,
     const cancellation_token_t& cancel)
 {
-    if (sequence == 0 || request_id.empty() || request_id.size() > 128 || module_path.empty() || module_path.size() > 32768 ||
+    if (sequence == 0 || request_id.empty() || request_id.size() > 128 || request_id.find('\0') != std::string::npos ||
+        module_path.empty() || module_path.size() > 32768 || module_path.find('\0') != std::string::npos ||
         workspace_generation == 0 || std::string_view(worker.provider_version) != k_decompiler_package_version ||
-        worker.worker_build_id.empty() || worker.worker_build_id.size() > 256 || worker.worker_build_hash.empty())
+        worker.worker_build_id.empty() || worker.worker_build_id.size() > 256 || worker.worker_build_id.find('\0') != std::string::npos ||
+        worker.worker_build_hash.empty())
         return failure<request_t>(workspace_error_code_t::invalid_argument, "managed CLI request identity is invalid", "managed_cli.request");
     const auto verified_lock = verify_offline_lock(offline_lock, cancel);
     if (!verified_lock)

@@ -127,7 +127,7 @@ internal static class OfflinePackageLock
         CancellationToken cancellationToken)
     {
         const int BufferSize = 1024 * 1024;
-        resourceBudget?.EnsureAllocationFits(BufferSize, cancellationToken);
+        resourceBudget?.EnsureAllocationFits((ulong)BufferSize, cancellationToken);
         byte[] buffer;
         try
         {

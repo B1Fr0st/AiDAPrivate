@@ -37,6 +37,7 @@ internal static class MetadataAnalysis
 {
     private const long MaximumModuleBytes = int.MaxValue;
     private const int MaximumSourceBytes = 8 * 1024 * 1024;
+    private const int MaximumMetadataEntries = 1_048_576;
 
     internal static WorkerResult Analyze(WorkerRequest request, ResourceBudgetGuard resourceBudget, CancellationToken cancellationToken)
     {
@@ -52,8 +53,10 @@ internal static class MetadataAnalysis
             throw new BadImageFormatException("target does not contain CLI metadata");
 
         var reader = module.Metadata;
+        if (reader.TypeDefinitions.Count > MaximumMetadataEntries || reader.MethodDefinitions.Count > MaximumMetadataEntries)
+            throw new ResourceLimitException(ResourceLimitKind.Memory);
         var methodHandle = RequireMethodHandle(request.MetadataToken, reader);
-        var declaringTypes = BuildDeclaringTypeMap(reader);
+        var declaringTypes = BuildDeclaringTypeMap(reader, resourceBudget, cancellationToken);
         var parsed = ParseMethod(reader, peReader, methodHandle, declaringTypes, request, resourceBudget, cancellationToken);
         var source = DecompileMethod(module, request.MetadataToken, cancellationToken);
         resourceBudget.Checkpoint(cancellationToken);
@@ -86,7 +89,8 @@ internal static class MetadataAnalysis
     {
         if (!string.Equals(request.Schema, WorkerProtocol.Schema, StringComparison.Ordinal) || request.SchemaVersion != WorkerProtocol.Version ||
             !string.Equals(request.Kind, "decompile", StringComparison.Ordinal) || request.Sequence == 0 || string.IsNullOrWhiteSpace(request.RequestId) ||
-            request.RequestId.Length > 128 || string.IsNullOrWhiteSpace(request.ModulePath) || request.ModulePath.Length > 32768 ||
+            request.RequestId.Length > 128 || request.RequestId.Contains('\0') || string.IsNullOrWhiteSpace(request.ModulePath) ||
+            request.ModulePath.Length > 32768 || request.ModulePath.Contains('\0') ||
             !Path.IsPathFullyQualified(request.ModulePath) || request.WorkspaceGeneration == 0 || request.MetadataToken == 0 ||
             request.Budget is null || request.Provider is null || !IsLowerHexDigest(request.ModuleHash) ||
             !FixedTimeHexEquals(request.OfflineLockHash, OfflinePackageLock.ManifestHashHex) ||
@@ -95,6 +99,7 @@ internal static class MetadataAnalysis
             !string.Equals(request.Provider.Version, "10.1.0.8386", StringComparison.Ordinal) ||
             !FixedTimeHexEquals(request.Provider.DecompilerAssemblyHash, OfflinePackageLock.DecompilerAssemblySha256) ||
             string.IsNullOrWhiteSpace(request.Provider.WorkerBuildId) || request.Provider.WorkerBuildId.Length > 256 ||
+            request.Provider.WorkerBuildId.Contains('\0') ||
             !IsLowerHexDigest(request.Provider.WorkerBuildHash) ||
             request.Provider.WorkerBuildHash.All(character => character == '0'))
             throw new InvalidDataException("managed decompiler request violates the offline contract");
@@ -147,14 +152,21 @@ internal static class MetadataAnalysis
         return MetadataTokens.MethodDefinitionHandle(unchecked((int)token));
     }
 
-    private static Dictionary<MethodDefinitionHandle, string> BuildDeclaringTypeMap(MetadataReader reader)
+    private static Dictionary<MethodDefinitionHandle, string> BuildDeclaringTypeMap(
+        MetadataReader reader,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
     {
         var result = new Dictionary<MethodDefinitionHandle, string>();
         foreach (var handle in reader.TypeDefinitions)
         {
+            resourceBudget.Checkpoint(cancellationToken);
             var name = GetTypeDefinitionName(reader, handle);
             foreach (var method in reader.GetTypeDefinition(handle).GetMethods())
+            {
+                resourceBudget.Checkpoint(cancellationToken);
                 result.Add(method, name);
+            }
         }
         return result;
     }
@@ -243,7 +255,7 @@ internal static class MetadataAnalysis
             var identity = BuildIdentity(reader, handle, declaringTypes, provider);
             var method = reader.GetMethodDefinition(handle);
             var token = unchecked((uint)MetadataTokens.GetToken(handle));
-            var attributes = GetAttributeTypeNames(reader, method.GetCustomAttributes(), declaringTypes);
+            var attributes = GetAttributeTypeNames(reader, method.GetCustomAttributes(), declaringTypes, resourceBudget, cancellationToken);
             var isAsync = attributes.Contains("System.Runtime.CompilerServices.AsyncStateMachineAttribute", StringComparer.Ordinal) ||
                 attributes.Contains("System.Runtime.CompilerServices.AsyncIteratorStateMachineAttribute", StringComparer.Ordinal);
             var isIterator = attributes.Contains("System.Runtime.CompilerServices.IteratorStateMachineAttribute", StringComparer.Ordinal) ||
@@ -259,11 +271,14 @@ internal static class MetadataAnalysis
     private static IReadOnlyList<string> GetAttributeTypeNames(
         MetadataReader reader,
         CustomAttributeHandleCollection attributes,
-        IReadOnlyDictionary<MethodDefinitionHandle, string> declaringTypes)
+        IReadOnlyDictionary<MethodDefinitionHandle, string> declaringTypes,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
     {
         var names = new List<string>();
         foreach (var handle in attributes)
         {
+            resourceBudget.Checkpoint(cancellationToken);
             var attribute = reader.GetCustomAttribute(handle);
             var constructor = attribute.Constructor;
             string? name = constructor.Kind switch

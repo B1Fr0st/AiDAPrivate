@@ -220,9 +220,26 @@ json operation_json(const overlay_operation_t& operation,
     return result;
 }
 
+json legacy_operation_json(const overlay_operation_t& operation) {
+    json result{{"address", address_json(operation.address)},
+                {"assembly", operation.assembly},
+                {"bytes", hex_encode(operation.bytes)},
+                {"integer_type", operation.integer_type},
+                {"integer_value", operation.integer_value},
+                {"kind", static_cast<unsigned>(operation.kind)},
+                {"name", operation.name},
+                {"signature", operation.signature},
+                {"stack_offset", std::to_string(operation.stack_offset)},
+                {"text", operation.text},
+                {"type", operation.type},
+                {"variable", operation.variable}};
+    result["end"] = operation.end ? address_json(*operation.end) : json(nullptr);
+    return result;
+}
+
 workspace_result_t<overlay_operation_t> parse_operation(
     const std::string& text,
-    const overlay_target_identity_v9_t* expected_target = nullptr) {
+    const overlay_target_identity_v9_t& expected_target) {
     auto value = json::parse(text, nullptr, false);
     if (value.is_discarded() || !value.is_object()) {
         return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
@@ -252,7 +269,7 @@ workspace_result_t<overlay_operation_t> parse_operation(
                 "overlay_journal.recovery"));
         }
         auto serialized_target = deserialize_overlay_target_identity_v9(value["target"].dump());
-        if (!serialized_target || (expected_target && *serialized_target != *expected_target)) {
+        if (!serialized_target || *serialized_target != expected_target) {
             return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
                 workspace_error_code_t::target_conflict,
                 "overlay operation target identity does not match the workspace",
@@ -1160,6 +1177,22 @@ workspace_result_t<void> apply_item(sqlite3* database, const std::string& entity
         result = remove.bind_text(1, entity); if (!result) return result;
         return remove.step_done();
     }
+    std::string materialized_payload;
+    try {
+        if (kind == overlay_operation_kind_t::comment_update) {
+            kind = overlay_operation_kind_t::comment;
+            parsed["kind"] = static_cast<unsigned>(kind);
+        } else if (kind == overlay_operation_kind_t::type_update) {
+            kind = overlay_operation_kind_t::type_application;
+            parsed["kind"] = static_cast<unsigned>(kind);
+        }
+        materialized_payload = parsed.dump();
+    } catch (...) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "overlay payload cannot be materialized",
+            "overlay_journal.apply"));
+    }
     overlay_statement_t upsert;
     auto result = upsert.prepare(database,
         "INSERT INTO overlay_items(entity_key,kind,address_space,address_value,address_arch,address_mode,payload_json,updated_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(entity_key) DO UPDATE SET kind=excluded.kind,address_space=excluded.address_space,address_value=excluded.address_value,address_arch=excluded.address_arch,address_mode=excluded.address_mode,payload_json=excluded.payload_json,updated_revision=excluded.updated_revision",
@@ -1168,7 +1201,7 @@ workspace_result_t<void> apply_item(sqlite3* database, const std::string& entity
     result = upsert.bind_text(1, entity); if (!result) return result;
     result = upsert.bind_int(2, static_cast<std::int64_t>(kind)); if (!result) return result;
     result = bind_operation_address(upsert, 3, address); if (!result) return result;
-    result = upsert.bind_text(7, payload); if (!result) return result;
+    result = upsert.bind_text(7, materialized_payload); if (!result) return result;
     result = upsert.bind_uint(8, revision); if (!result) return result;
     return upsert.step_done();
 }
@@ -1208,7 +1241,7 @@ workspace_result_t<void> migrate_operation_payloads(
         try {
             if (sqlite3_column_type(query.get(), 2) != SQLITE_NULL) {
                 const std::string persisted_before = overlay_column_text(query.get(), 2);
-                auto parsed = parse_operation(persisted_before, &target);
+                auto parsed = parse_operation(persisted_before, target);
                 if (!parsed)
                     return workspace_result_t<void>::failure(parsed.error());
                 migration.before = operation_json(parsed.value(), &target).dump();
@@ -1218,7 +1251,7 @@ workspace_result_t<void> migrate_operation_payloads(
             if (after == "null") {
                 migration.after = after;
             } else {
-                auto parsed = parse_operation(after, &target);
+                auto parsed = parse_operation(after, target);
                 if (!parsed)
                     return workspace_result_t<void>::failure(parsed.error());
                 migration.after = operation_json(parsed.value(), &target).dump();
@@ -1561,7 +1594,7 @@ workspace_result_t<void> overlay_journal_t::reload_items() {
             }
             const std::string key = overlay_column_text(statement.get(), 0);
             auto operation = parse_operation(overlay_column_text(statement.get(), 1),
-                                             &fixed_target_);
+                                             fixed_target_);
             if (!operation) return workspace_result_t<void>::failure(operation.error());
             auto owner = workspace_.lock();
             if (!owner) {
@@ -1714,6 +1747,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     }
 
     std::string request_hash;
+    std::optional<std::string> legacy_request_hash;
     if (!request.dry_run) {
         json request_json;
         request_json["expected_revision"] = request.expected_revision
@@ -1728,6 +1762,27 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             return workspace_result_t<overlay_transaction_result_t>::failure(
                 request_hash_result.error());
         request_hash = request_hash_result.value().to_hex();
+        const bool legacy_compatible = request.idempotency_key &&
+            std::all_of(request.operations.begin(), request.operations.end(),
+                [](const overlay_operation_t& operation) {
+                    return static_cast<unsigned>(operation.kind) <=
+                               static_cast<unsigned>(overlay_operation_kind_t::integer_patch) &&
+                        operation.reanalysis_flags == 0 && !operation.remove;
+                });
+        if (legacy_compatible) {
+            json legacy_request;
+            legacy_request["expected_revision"] = request.expected_revision
+                ? json(std::to_string(*request.expected_revision)) : json(nullptr);
+            legacy_request["idempotency_key"] = *request.idempotency_key;
+            legacy_request["operations"] = json::array();
+            for (const auto& operation : request.operations)
+                legacy_request["operations"].push_back(legacy_operation_json(operation));
+            auto legacy_hash = sha256_text(legacy_request.dump(), cancel);
+            if (!legacy_hash)
+                return workspace_result_t<overlay_transaction_result_t>::failure(
+                    legacy_hash.error());
+            legacy_request_hash = legacy_hash.value().to_hex();
+        }
     }
 
     if (request.idempotency_key && !request.dry_run) {
@@ -1754,7 +1809,9 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                     error.sqlite_status = status;
                     return workspace_result_t<void>::failure(std::move(error));
                 }
-                if (overlay_column_text(statement.get(), 0) != request_hash) {
+                const std::string persisted_hash = overlay_column_text(statement.get(), 0);
+                if (persisted_hash != request_hash &&
+                    (!legacy_request_hash || persisted_hash != *legacy_request_hash)) {
                     return workspace_result_t<void>::failure(make_workspace_error(
                         workspace_error_code_t::revision_conflict,
                         "idempotency key was already used for a different transaction",
@@ -1879,9 +1936,10 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     const auto operations = request.operations;
     const auto idempotency = request.idempotency_key;
     auto ticket = database_->enqueue_write("analysis.overlay.commit",
-        [operations, keys, idempotency, request_hash, request_expected = request.expected_revision,
-         target = fixed_target_, result_holder](sqlite3* writer,
-                                                const cancellation_token_t& token) -> workspace_result_t<void> {
+        [operations, keys, idempotency, request_hash, legacy_request_hash,
+         request_expected = request.expected_revision, target = fixed_target_,
+         result_holder](sqlite3* writer,
+                        const cancellation_token_t& token) -> workspace_result_t<void> {
             if (token.stop_requested())
                 return workspace_result_t<void>::failure(make_workspace_error(
                     token.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
@@ -1901,7 +1959,9 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 current = idempotency_query.bind_text(1, *idempotency); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 const int status = sqlite3_step(idempotency_query.get());
                 if (status == SQLITE_ROW) {
-                    if (overlay_column_text(idempotency_query.get(), 0) != request_hash) {
+                    const std::string persisted_hash = overlay_column_text(idempotency_query.get(), 0);
+                    if (persisted_hash != request_hash &&
+                        (!legacy_request_hash || persisted_hash != *legacy_request_hash)) {
                         overlay_exec(writer, "ROLLBACK", "overlay_journal.commit");
                         return workspace_result_t<void>::failure(make_workspace_error(
                             workspace_error_code_t::revision_conflict,
