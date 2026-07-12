@@ -48,6 +48,24 @@ bool valid_effect_lock_pair(
     return false;
 }
 
+bool expected_read_only_for_effect(
+    mcp::compat::contract_effect_t effect) {
+    using mcp::compat::contract_effect_t;
+    switch (effect) {
+    case contract_effect_t::workspace_read:
+    case contract_effect_t::registry_read:
+    case contract_effect_t::debugger_read:
+        return true;
+    case contract_effect_t::workspace_checkpoint:
+    case contract_effect_t::workspace_overlay_mutation:
+    case contract_effect_t::debugger_control:
+    case contract_effect_t::debugger_write:
+    case contract_effect_t::isolated_python:
+        return false;
+    }
+    return false;
+}
+
 }
 
 bool run_contract_generation_harness(std::string& failure) {
@@ -57,6 +75,7 @@ bool run_contract_generation_harness(std::string& failure) {
     static_assert(k_compatibility_tool_count == 88);
     static_assert(k_aida_extension_count == 4);
     static_assert(k_union_tool_count == 92);
+    static_assert(k_compatibility_tool_count + k_aida_extension_count == k_union_tool_count);
 
     const auto reject = [&failure](std::string_view message) {
         failure.assign(message.data(), message.size());
@@ -66,6 +85,24 @@ bool run_contract_generation_harness(std::string& failure) {
     if (!is_sha256(k_pinned_archive_sha256) || !is_sha256(k_generated_contract_ledger_sha256) ||
         !is_sha256(k_generated_effect_ledger_sha256) || !is_sha256(k_generated_archive_manifest_sha256)) {
         return reject("generated contract hashes are malformed");
+    }
+    if (k_pinned_archive_sha256 != "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7") {
+        return reject("pinned archive SHA-256 does not match the expected canonical value 3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7");
+    }
+    if (k_generated_contract_ledger_sha256.empty()) {
+        return reject("generated contract ledger SHA-256 is empty");
+    }
+    {
+        bool all_zero = true;
+        bool all_same = true;
+        const char first_char = k_generated_contract_ledger_sha256[0];
+        for (const char c : k_generated_contract_ledger_sha256) {
+            if (c != '0') all_zero = false;
+            if (c != first_char) all_same = false;
+        }
+        if (all_zero || all_same) {
+            return reject("generated contract ledger SHA-256 is a degenerate constant, not a genuine hash of the contract descriptors");
+        }
     }
     if (contract_count() != k_compatibility_tool_count) {
         return reject("generated compatibility contract count is incorrect");
@@ -89,11 +126,14 @@ bool run_contract_generation_harness(std::string& failure) {
             contains_forbidden_resource(contract.output_schema_json) || contains_forbidden_resource(contract.annotations_json)) {
             return reject("generated compatibility table contains an excluded MCP surface");
         }
-        if (contract.input_schema_json.empty() || contract.annotations_json.empty() || contract.adapter_symbol.empty()) {
+        if (contract.input_schema_json.empty() || contract.output_schema_json.empty() || contract.annotations_json.empty() || contract.adapter_symbol.empty()) {
             return reject("generated compatibility contract is missing required metadata");
         }
         if (!valid_effect_lock_pair(contract.effect, contract.lock)) {
             return reject("generated effect ledger has an invalid lock policy");
+        }
+        if (contract.read_only != expected_read_only_for_effect(contract.effect)) {
+            return reject("generated contract read_only flag is inconsistent with its effect class");
         }
         if (contract.target_dependent != (contract.accepts_pid && contract.accepts_bin_name)) {
             return reject("generated target routing fields are inconsistent");

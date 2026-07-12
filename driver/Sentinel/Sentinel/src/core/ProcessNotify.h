@@ -25,20 +25,21 @@ namespace process_notify {
     struct ce_driver_name_t {
         const char* name;
         int         len;
+        UINT32      tier;
     };
 
     constexpr ce_driver_name_t g_ce_driver_names[] = {
-        { "DBK64.sys",     10 },
-        { "DBK32.sys",     10 },
-        { "ceserver.sys",  13 },
-        { "ce_driver",      9 },
-        { "cedriver",       9 },
-        { "mod_driver",    10 },
-        { "moddriver",      9 },
-        { "PROCEXP152",    11 },
-        { "PROCEXP",         7 },
-        { "physmem",         7 },
-        { "rdpdr",           5 },
+        { "DBK64.sys",     10, 3 },
+        { "DBK32.sys",     10, 3 },
+        { "ceserver.sys",  13, 3 },
+        { "ce_driver",      9, 3 },
+        { "cedriver",       9, 3 },
+        { "mod_driver",    10, 2 },
+        { "moddriver",      9, 2 },
+        { "PROCEXP152",    11, 2 },
+        { "PROCEXP",         7, 2 },
+        { "physmem",         7, 3 },
+        { "rdpdr",           5, 1 },
     };
     constexpr int g_ce_driver_name_count = sizeof(g_ce_driver_names) / sizeof(g_ce_driver_names[0]);
 
@@ -194,12 +195,12 @@ namespace process_notify {
         return true;
     }
 
-    __forceinline bool is_ce_driver_name(const UCHAR* name, int name_len) {
+    __forceinline int get_ce_driver_tier(const UCHAR* name, int name_len) {
         for (int i = 0; i < g_ce_driver_name_count; ++i) {
             if (match_driver_name_ci(name, name_len, g_ce_driver_names[i].name, g_ce_driver_names[i].len))
-                return true;
+                return static_cast<int>(g_ce_driver_names[i].tier);
         }
-        return false;
+        return 0;
     }
 
     __forceinline bool hash_matches_ce_list(const UINT8 hash[32]) {
@@ -293,11 +294,12 @@ namespace process_notify {
             const UCHAR* drv_name = full_path + name_start;
             int drv_name_len = static_cast<int>(path_len - name_start);
 
-            if (!is_ce_driver_name(drv_name, drv_name_len))
+            int matched_tier = get_ce_driver_tier(drv_name, drv_name_len);
+            if (matched_tier == 0)
                 continue;
 
-            SN_LOG("process_notify: CE driver name match '%.*s' -- hashing file",
-                drv_name_len, drv_name);
+            SN_LOG("process_notify: CE driver name match tier=%u '%.*s' -- hashing file",
+                matched_tier, drv_name_len, drv_name);
 
             wchar_t wide_path[260] = {};
             for (ULONG j = 0; j < path_len && j < 259; ++j)
@@ -308,8 +310,34 @@ namespace process_notify {
 
             if (hash_ok) {
                 bool hash_match = hash_matches_ce_list(file_hash);
-                if (hash_match) {
-                    SN_LOG("process_notify: CE driver HASH MATCH -- BSOD driver='%.*s'",
+
+                if (matched_tier >= 3) {
+                    if (hash_match) {
+                        SN_LOG("process_notify: CE driver tier=%u HASH MATCH -- BSOD driver='%.*s'",
+                            matched_tier, drv_name_len, drv_name);
+                    } else {
+                        SN_LOG("process_notify: CE driver tier=%u name match (no hash) -- BSOD high confidence '%.*s'",
+                            matched_tier, drv_name_len, drv_name);
+                    }
+                    driver_load_audit::record(
+                        compute_driver_name_hash(drv_name, drv_name_len),
+                        reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
+                        modules->Modules[i].ImageSize,
+                        3);
+                    ExFreePoolWithTag(modules, 'ceDM');
+#ifndef AIDA_DEV_MODE
+                    if (_KeBugCheckEx) {
+                        _KeBugCheckEx(0xA1DA0007,
+                            (ULONG_PTR)i,
+                            (ULONG_PTR)modules->Modules[i].ImageBase,
+                            0, 0);
+                    }
+#endif
+                    return;
+                }
+
+                if (matched_tier == 2 && hash_match) {
+                    SN_LOG("process_notify: CE driver tier=2 HASH MATCH -- BSOD '%.*s'",
                         drv_name_len, drv_name);
                     driver_load_audit::record(
                         compute_driver_name_hash(drv_name, drv_name_len),
@@ -328,8 +356,8 @@ namespace process_notify {
                     return;
                 }
 
-                SN_LOG("process_notify: CE driver name match but hash NOT in list -- tier 1 log '%.*s'",
-                    drv_name_len, drv_name);
+                SN_LOG("process_notify: CE driver tier=%u no BSOD -- log only '%.*s'",
+                    matched_tier, drv_name_len, drv_name);
                 driver_load_audit::record(
                     compute_driver_name_hash(drv_name, drv_name_len),
                     reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
@@ -338,21 +366,9 @@ namespace process_notify {
                 heartbeat::send_command(heartbeat::BRIDGE_CMD_HOSTILE_DRIVER,
                     static_cast<ULONG>(i));
             } else {
-                SN_LOG("process_notify: CE driver name match but hash FAIL -- BSOD (high confidence) '%.*s'",
-                    drv_name_len, drv_name);
-
-                const char* high_confidence_names[] = { "DBK64.sys", "DBK32.sys", "ceserver.sys" };
-                bool high_confidence = false;
-                for (int j = 0; j < 3; ++j) {
-                    int hlen = 0;
-                    while (high_confidence_names[j][hlen]) ++hlen;
-                    if (match_driver_name_ci(drv_name, drv_name_len, high_confidence_names[j], hlen)) {
-                        high_confidence = true;
-                        break;
-                    }
-                }
-
-                if (high_confidence) {
+                if (matched_tier >= 3) {
+                    SN_LOG("process_notify: CE driver tier=%u hash FAIL -- BSOD high confidence '%.*s'",
+                        matched_tier, drv_name_len, drv_name);
                     driver_load_audit::record(
                         compute_driver_name_hash(drv_name, drv_name_len),
                         reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
@@ -370,6 +386,8 @@ namespace process_notify {
                     return;
                 }
 
+                SN_LOG("process_notify: CE driver tier=%u hash FAIL -- log only '%.*s'",
+                    matched_tier, drv_name_len, drv_name);
                 driver_load_audit::record(
                     compute_driver_name_hash(drv_name, drv_name_len),
                     reinterpret_cast<UINT64>(modules->Modules[i].ImageBase),
@@ -658,9 +676,10 @@ namespace process_notify {
                         ext[i] = (char)(narrow[copy_len - 4 + i] | 0x20);
 
                     if (ext[0] == '.' && ext[1] == 's' && ext[2] == 'y' && ext[3] == 's') {
-                        if (is_ce_driver_name((const UCHAR*)narrow, static_cast<int>(copy_len))) {
-                            SN_LOG("process_notify: CE driver loading into kernel '%.*s' -- hashing",
-                                static_cast<int>(copy_len), narrow);
+                        int matched_tier = get_ce_driver_tier((const UCHAR*)narrow, static_cast<int>(copy_len));
+                        if (matched_tier > 0) {
+                            SN_LOG("process_notify: CE driver tier=%u loading into kernel '%.*s' -- hashing",
+                                matched_tier, static_cast<int>(copy_len), narrow);
 
                             wchar_t wide_path[260] = {};
                             for (USHORT i = 0; i < chars && i < 259; ++i)
@@ -668,9 +687,35 @@ namespace process_notify {
 
                             UINT8 file_hash[32] = {};
                             bool hash_ok = compute_file_sha256(wide_path, file_hash);
+                            bool hash_match = hash_ok && hash_matches_ce_list(file_hash);
 
-                            if (hash_ok && hash_matches_ce_list(file_hash)) {
-                                SN_LOG("process_notify: CE driver HASH MATCH at load -- BSOD '%.*s'",
+                            if (matched_tier >= 3) {
+                                if (hash_match) {
+                                    SN_LOG("process_notify: CE driver tier=%u HASH MATCH at load -- BSOD '%.*s'",
+                                        matched_tier, static_cast<int>(copy_len), narrow);
+                                } else {
+                                    SN_LOG("process_notify: CE driver tier=%u at load -- BSOD high confidence '%.*s'",
+                                        matched_tier, static_cast<int>(copy_len), narrow);
+                                }
+                                driver_load_audit::record(
+                                    compute_driver_name_hash((const UCHAR*)narrow, static_cast<int>(copy_len)),
+                                    reinterpret_cast<UINT64>(ImageInfo->ImageBase),
+                                    ImageInfo->ImageSize,
+                                    3);
+                                hide_aida_process();
+#ifndef AIDA_DEV_MODE
+                                if (_KeBugCheckEx) {
+                                    _KeBugCheckEx(0xA1DA0007,
+                                        (ULONG_PTR)ProcessId,
+                                        (ULONG_PTR)ImageInfo->ImageBase,
+                                        0, 0);
+                                }
+#endif
+                                return;
+                            }
+
+                            if (matched_tier == 2 && hash_match) {
+                                SN_LOG("process_notify: CE driver tier=2 HASH MATCH at load -- BSOD '%.*s'",
                                     static_cast<int>(copy_len), narrow);
                                 driver_load_audit::record(
                                     compute_driver_name_hash((const UCHAR*)narrow, static_cast<int>(copy_len)),
@@ -689,39 +734,8 @@ namespace process_notify {
                                 return;
                             }
 
-                            const char* high_confidence[] = { "DBK64.sys", "DBK32.sys", "ceserver.sys" };
-                            bool high = false;
-                            for (int j = 0; j < 3; ++j) {
-                                int hlen = 0;
-                                while (high_confidence[j][hlen]) ++hlen;
-                                if (match_driver_name_ci((const UCHAR*)narrow,
-                                    static_cast<int>(copy_len),
-                                    high_confidence[j], hlen)) {
-                                    high = true;
-                                    break;
-                                }
-                            }
-
-                            if (high) {
-                                SN_LOG("process_notify: CE high-confidence driver at load -- BSOD '%.*s'",
-                                    static_cast<int>(copy_len), narrow);
-                                driver_load_audit::record(
-                                    compute_driver_name_hash((const UCHAR*)narrow, static_cast<int>(copy_len)),
-                                    reinterpret_cast<UINT64>(ImageInfo->ImageBase),
-                                    ImageInfo->ImageSize,
-                                    3);
-                                hide_aida_process();
-#ifndef AIDA_DEV_MODE
-                                if (_KeBugCheckEx) {
-                                    _KeBugCheckEx(0xA1DA0007,
-                                        (ULONG_PTR)ProcessId,
-                                        (ULONG_PTR)ImageInfo->ImageBase,
-                                        0, 0);
-                                }
-#endif
-                                return;
-                            }
-
+                            SN_LOG("process_notify: CE driver tier=%u at load -- log only '%.*s'",
+                                matched_tier, static_cast<int>(copy_len), narrow);
                             driver_load_audit::record(
                                 compute_driver_name_hash((const UCHAR*)narrow, static_cast<int>(copy_len)),
                                 reinterpret_cast<UINT64>(ImageInfo->ImageBase),

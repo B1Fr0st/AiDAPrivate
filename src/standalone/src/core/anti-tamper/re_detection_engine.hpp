@@ -1219,8 +1219,138 @@ namespace detail {
         return false;
     }
 
+    using FindWindowW_t = HWND(WINAPI*)(LPCWSTR, LPCWSTR);
+    using FindWindowA_t = HWND(WINAPI*)(LPCSTR, LPCSTR);
+    using EnumWindows_t = BOOL(WINAPI*)(WNDENUMPROC, LPARAM);
+
+    struct window_iat_hook_state_t
+    {
+        FindWindowW_t orig_FindWindowW = nullptr;
+        FindWindowA_t orig_FindWindowA = nullptr;
+        EnumWindows_t orig_EnumWindows = nullptr;
+        uintptr_t* iat_slot_FindWindowW = nullptr;
+        uintptr_t* iat_slot_FindWindowA = nullptr;
+        uintptr_t* iat_slot_EnumWindows = nullptr;
+        std::atomic<bool> installed{ false };
+        std::mutex mtx;
+    };
+
+    inline window_iat_hook_state_t& window_iat_hook_state()
+    {
+        static window_iat_hook_state_t s;
+        return s;
+    }
+
+    inline thread_local bool g_iat_hook_bypass = false;
+
+    struct iat_hook_bypass_guard_t
+    {
+        iat_hook_bypass_guard_t() { g_iat_hook_bypass = true; }
+        ~iat_hook_bypass_guard_t() { g_iat_hook_bypass = false; }
+    };
+
+    inline HWND WINAPI hook_FindWindowW(LPCWSTR lpClassName, LPCWSTR lpWindowName)
+    {
+        if (g_iat_hook_bypass)
+        {
+            auto& st = window_iat_hook_state();
+            auto orig = st.orig_FindWindowW;
+            if (!orig)
+            {
+                HMODULE user32 = GetModuleHandleW(L"user32.dll");
+                if (!user32) return nullptr;
+                orig = reinterpret_cast<FindWindowW_t>(
+                    GetProcAddress(user32, "FindWindowW"));
+                if (!orig) return nullptr;
+            }
+            return orig(lpClassName, lpWindowName);
+        }
+        if (lpClassName && g_aidaClassName[0] != 0)
+        {
+            if (lstrcmpW(lpClassName, g_aidaClassName) == 0)
+            {
+                char buf[256];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "iat_hook_findwindoww_blocked_internal cls_len=%lu",
+                    static_cast<unsigned long>(wcslen(lpClassName)));
+                webhook::write_log("re_iat_hook", buf);
+                return nullptr;
+            }
+        }
+        auto& st = window_iat_hook_state();
+        auto orig = st.orig_FindWindowW;
+        if (!orig)
+        {
+            HMODULE user32 = GetModuleHandleW(L"user32.dll");
+            if (!user32) return nullptr;
+            orig = reinterpret_cast<FindWindowW_t>(
+                GetProcAddress(user32, "FindWindowW"));
+            if (!orig) return nullptr;
+        }
+        return orig(lpClassName, lpWindowName);
+    }
+
+    inline HWND WINAPI hook_FindWindowA(LPCSTR lpClassName, LPCSTR lpWindowName)
+    {
+        if (g_iat_hook_bypass)
+        {
+            auto& st = window_iat_hook_state();
+            auto orig = st.orig_FindWindowA;
+            if (!orig)
+            {
+                HMODULE user32 = GetModuleHandleW(L"user32.dll");
+                if (!user32) return nullptr;
+                orig = reinterpret_cast<FindWindowA_t>(
+                    GetProcAddress(user32, "FindWindowA"));
+                if (!orig) return nullptr;
+            }
+            return orig(lpClassName, lpWindowName);
+        }
+        if (lpClassName && g_aidaClassName[0] != 0)
+        {
+            wchar_t wide_class[128] = {};
+            int len = MultiByteToWideChar(CP_ACP, 0, lpClassName, -1,
+                wide_class, 127);
+            if (len > 0 && lstrcmpW(wide_class, g_aidaClassName) == 0)
+            {
+                char buf[256];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                    "iat_hook_findwindowa_blocked_internal cls_len=%d", len);
+                webhook::write_log("re_iat_hook", buf);
+                return nullptr;
+            }
+        }
+        auto& st = window_iat_hook_state();
+        auto orig = st.orig_FindWindowA;
+        if (!orig)
+        {
+            HMODULE user32 = GetModuleHandleW(L"user32.dll");
+            if (!user32) return nullptr;
+            orig = reinterpret_cast<FindWindowA_t>(
+                GetProcAddress(user32, "FindWindowA"));
+            if (!orig) return nullptr;
+        }
+        return orig(lpClassName, lpWindowName);
+    }
+
+    inline BOOL WINAPI hook_EnumWindows(WNDENUMPROC lpEnumFunc, LPARAM lParam)
+    {
+        auto& st = window_iat_hook_state();
+        auto orig = st.orig_EnumWindows;
+        if (!orig)
+        {
+            HMODULE user32 = GetModuleHandleW(L"user32.dll");
+            if (!user32) return FALSE;
+            orig = reinterpret_cast<EnumWindows_t>(
+                GetProcAddress(user32, "EnumWindows"));
+            if (!orig) return FALSE;
+        }
+        return orig(lpEnumFunc, lParam);
+    }
+
     inline bool detect_window_enumeration_threat()
     {
+        iat_hook_bypass_guard_t bypass_guard;
         HWND own_hwnd = FindWindowW(g_aidaClassName, g_aidaWindowTitle);
         if (!own_hwnd || !IsWindow(own_hwnd))
             return false;
@@ -1329,6 +1459,120 @@ namespace detail {
             }
         }
         return false;
+    }
+
+    inline bool detect_findwindow_probe()
+    {
+        iat_hook_bypass_guard_t bypass_guard;
+        HWND own_hwnd = FindWindowW(g_aidaClassName, g_aidaWindowTitle);
+        if (!own_hwnd || !IsWindow(own_hwnd))
+            return false;
+
+        DWORD hwnd_owner_pid = 0;
+        GetWindowThreadProcessId(own_hwnd, &hwnd_owner_pid);
+        if (hwnd_owner_pid != GetCurrentProcessId())
+            return false;
+
+        DWORD my_pid = GetCurrentProcessId();
+        ULONG buf_size = 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ULONG ret_len = 0;
+
+        if (!syscall::is_initialized())
+            return detect_window_enumeration_threat();
+
+        NTSTATUS st = syscall::NtQuerySystemInformation()(
+            64, buf.data(), buf_size, &ret_len);
+        if (st == static_cast<NTSTATUS>(0xC0000004) && ret_len > buf_size) {
+            buf_size = ret_len + 65536;
+            buf.resize(buf_size);
+            st = syscall::NtQuerySystemInformation()(
+                64, buf.data(), buf_size, &ret_len);
+        }
+        if (st < 0)
+            return detect_window_enumeration_threat();
+
+        struct handle_entry_t {
+            PVOID Object;
+            ULONG_PTR UniqueProcessId;
+            ULONG_PTR HandleValue;
+            ACCESS_MASK GrantedAccess;
+            USHORT CreatorBackTraceIndex;
+            USHORT ObjectTypeIndex;
+            ULONG HandleAttributes;
+            ULONG Reserved;
+        };
+        struct handle_info_ex_t {
+            ULONG_PTR NumberOfHandles;
+            ULONG_PTR Reserved;
+            handle_entry_t Handles[1];
+        };
+
+        auto* info = reinterpret_cast<handle_info_ex_t*>(buf.data());
+
+        const ULONG_PTR hwnd_handle_value =
+            reinterpret_cast<ULONG_PTR>(own_hwnd);
+        PVOID window_object = nullptr;
+        USHORT window_type_index = 0;
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
+            const auto& h = info->Handles[i];
+            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid &&
+                h.HandleValue == hwnd_handle_value) {
+                window_object = h.Object;
+                window_type_index = h.ObjectTypeIndex;
+                break;
+            }
+        }
+
+        if (!window_object)
+            return detect_window_enumeration_threat();
+
+        static const char* system_procs[] = {
+            "csrss.exe", "lsass.exe", "svchost.exe", "services.exe",
+            "wininit.exe", "winlogon.exe", "smss.exe", "msmpeng.exe",
+            "securityhealthservice.exe", "werfault.exe", "explorer.exe",
+            "dwm.exe"
+        };
+
+        bool detected = false;
+
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i) {
+            const auto& h = info->Handles[i];
+            if (h.Object != window_object) continue;
+            if (static_cast<DWORD>(h.UniqueProcessId) == my_pid) continue;
+            if (static_cast<DWORD>(h.UniqueProcessId) <= 4) continue;
+
+            std::string owner_name = process_image_for_log(
+                static_cast<DWORD>(h.UniqueProcessId));
+            bool is_system = false;
+            for (const char* s : system_procs) {
+                if (_stricmp(owner_name.c_str(), s) == 0) {
+                    is_system = true;
+                    break;
+                }
+            }
+            if (!is_system && !owner_name.empty() && owner_name != "?") {
+                char log_buf[512];
+                _snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
+                    "findwindow_probe_detected self_pid=%lu owner_pid=%lu owner=%s hwnd=0x%llX window_object=0x%llX type_index=%u access=0x%08lX",
+                    static_cast<unsigned long>(my_pid),
+                    static_cast<unsigned long>(h.UniqueProcessId),
+                    owner_name.c_str(),
+                    static_cast<unsigned long long>(hwnd_handle_value),
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<ULONG_PTR>(window_object)),
+                    static_cast<unsigned>(window_type_index),
+                    static_cast<unsigned long>(h.GrantedAccess));
+                webhook::write_log("re_findwindow_probe", log_buf);
+                detected = true;
+            }
+        }
+
+        if (detected)
+            return true;
+
+        return detect_window_enumeration_threat();
     }
 
     inline uint64_t module_image_hash()
@@ -1460,7 +1704,7 @@ namespace detail {
         if (detect_ce_behavioral_pattern())
             mask |= SIGNAL_CE_BEHAVIORAL;
 
-        if (detect_window_enumeration_threat())
+        if (detect_findwindow_probe())
             mask |= SIGNAL_WINDOW_ENUM;
 
         return mask;
@@ -1623,6 +1867,199 @@ namespace detail {
             webhook::write_log(path ? path : "re_detect", legacy);
         }
         return enforce;
+    }
+}
+
+inline bool install_window_api_iat_hooks()
+{
+    auto& st = detail::window_iat_hook_state();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    if (st.installed.load(std::memory_order_acquire))
+        return true;
+
+    auto* base = reinterpret_cast<uint8_t*>(&__ImageBase);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    const auto& imp_dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0) return false;
+
+    auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+        base + imp_dir.VirtualAddress);
+
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return false;
+
+    FARPROC real_FindWindowW = GetProcAddress(user32, "FindWindowW");
+    FARPROC real_FindWindowA = GetProcAddress(user32, "FindWindowA");
+    FARPROC real_EnumWindows = GetProcAddress(user32, "EnumWindows");
+
+    int hooks_installed = 0;
+
+    for (; imp->Name != 0; ++imp)
+    {
+        if (imp->FirstThunk == 0) continue;
+        auto* iat = reinterpret_cast<uintptr_t*>(base + imp->FirstThunk);
+        auto* ilt = (imp->OriginalFirstThunk != 0)
+            ? reinterpret_cast<uintptr_t*>(base + imp->OriginalFirstThunk)
+            : iat;
+
+        for (size_t i = 0; iat[i] != 0; ++i)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL(ilt[i])) continue;
+            auto* name_ref = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                base + (ilt[i] & ~IMAGE_ORDINAL_FLAG));
+            const char* func_name = name_ref->Name;
+
+            bool is_fww = strcmp(func_name, "FindWindowW") == 0;
+            bool is_fwa = strcmp(func_name, "FindWindowA") == 0;
+            bool is_ew  = strcmp(func_name, "EnumWindows") == 0;
+
+            if (!is_fww && !is_fwa && !is_ew)
+                continue;
+
+            FARPROC real_fn = nullptr;
+            void* hook_fn = nullptr;
+
+            if (is_fww && real_FindWindowW && !st.iat_slot_FindWindowW)
+            {
+                real_fn = real_FindWindowW;
+                hook_fn = reinterpret_cast<void*>(&detail::hook_FindWindowW);
+            }
+            else if (is_fwa && real_FindWindowA && !st.iat_slot_FindWindowA)
+            {
+                real_fn = real_FindWindowA;
+                hook_fn = reinterpret_cast<void*>(&detail::hook_FindWindowA);
+            }
+            else if (is_ew && real_EnumWindows && !st.iat_slot_EnumWindows)
+            {
+                real_fn = real_EnumWindows;
+                hook_fn = reinterpret_cast<void*>(&detail::hook_EnumWindows);
+            }
+            else
+                continue;
+
+            if (reinterpret_cast<FARPROC>(iat[i]) != real_fn)
+                continue;
+
+            DWORD old_prot = 0;
+            if (!VirtualProtect(&iat[i], sizeof(uintptr_t),
+                PAGE_READWRITE, &old_prot))
+                continue;
+
+            if (is_fww)
+            {
+                st.orig_FindWindowW =
+                    reinterpret_cast<detail::FindWindowW_t>(real_fn);
+                st.iat_slot_FindWindowW = &iat[i];
+            }
+            else if (is_fwa)
+            {
+                st.orig_FindWindowA =
+                    reinterpret_cast<detail::FindWindowA_t>(real_fn);
+                st.iat_slot_FindWindowA = &iat[i];
+            }
+            else
+            {
+                st.orig_EnumWindows =
+                    reinterpret_cast<detail::EnumWindows_t>(real_fn);
+                st.iat_slot_EnumWindows = &iat[i];
+            }
+
+            iat[i] = reinterpret_cast<uintptr_t>(hook_fn);
+            VirtualProtect(&iat[i], sizeof(uintptr_t), old_prot, &old_prot);
+            FlushInstructionCache(GetCurrentProcess(),
+                &iat[i], sizeof(uintptr_t));
+            ++hooks_installed;
+        }
+    }
+
+    if (hooks_installed > 0)
+    {
+        st.installed.store(true, std::memory_order_release);
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "window_api_iat_hooks_installed count=%d", hooks_installed);
+        webhook::write_log("re_iat_hook", buf);
+        return true;
+    }
+    return false;
+}
+
+inline void remove_window_api_iat_hooks()
+{
+    auto& st = detail::window_iat_hook_state();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    if (!st.installed.load(std::memory_order_acquire))
+        return;
+
+    int restored = 0;
+
+    if (st.iat_slot_FindWindowW && st.orig_FindWindowW)
+    {
+        DWORD old_prot = 0;
+        if (VirtualProtect(st.iat_slot_FindWindowW, sizeof(uintptr_t),
+            PAGE_READWRITE, &old_prot))
+        {
+            *st.iat_slot_FindWindowW =
+                reinterpret_cast<uintptr_t>(st.orig_FindWindowW);
+            VirtualProtect(st.iat_slot_FindWindowW, sizeof(uintptr_t),
+                old_prot, &old_prot);
+            FlushInstructionCache(GetCurrentProcess(),
+                st.iat_slot_FindWindowW, sizeof(uintptr_t));
+            ++restored;
+        }
+        st.iat_slot_FindWindowW = nullptr;
+        st.orig_FindWindowW = nullptr;
+    }
+
+    if (st.iat_slot_FindWindowA && st.orig_FindWindowA)
+    {
+        DWORD old_prot = 0;
+        if (VirtualProtect(st.iat_slot_FindWindowA, sizeof(uintptr_t),
+            PAGE_READWRITE, &old_prot))
+        {
+            *st.iat_slot_FindWindowA =
+                reinterpret_cast<uintptr_t>(st.orig_FindWindowA);
+            VirtualProtect(st.iat_slot_FindWindowA, sizeof(uintptr_t),
+                old_prot, &old_prot);
+            FlushInstructionCache(GetCurrentProcess(),
+                st.iat_slot_FindWindowA, sizeof(uintptr_t));
+            ++restored;
+        }
+        st.iat_slot_FindWindowA = nullptr;
+        st.orig_FindWindowA = nullptr;
+    }
+
+    if (st.iat_slot_EnumWindows && st.orig_EnumWindows)
+    {
+        DWORD old_prot = 0;
+        if (VirtualProtect(st.iat_slot_EnumWindows, sizeof(uintptr_t),
+            PAGE_READWRITE, &old_prot))
+        {
+            *st.iat_slot_EnumWindows =
+                reinterpret_cast<uintptr_t>(st.orig_EnumWindows);
+            VirtualProtect(st.iat_slot_EnumWindows, sizeof(uintptr_t),
+                old_prot, &old_prot);
+            FlushInstructionCache(GetCurrentProcess(),
+                st.iat_slot_EnumWindows, sizeof(uintptr_t));
+            ++restored;
+        }
+        st.iat_slot_EnumWindows = nullptr;
+        st.orig_EnumWindows = nullptr;
+    }
+
+    st.installed.store(false, std::memory_order_release);
+
+    if (restored > 0)
+    {
+        char buf[128];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+            "window_api_iat_hooks_removed count=%d", restored);
+        webhook::write_log("re_iat_hook", buf);
     }
 }
 
@@ -1806,6 +2243,11 @@ inline void worker_loop()
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 webhook::write_log("re_worker", "hash_refresh_exception");
             }
+            __try {
+                re_tool_preflight::refresh_ce_driver_hashes();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                webhook::write_log("re_worker", "ce_hash_refresh_exception");
+            }
         }
         Sleep(TICK_INTERVAL_MS);
     }
@@ -1908,6 +2350,8 @@ inline void initialize()
         }
     }
 
+    install_window_api_iat_hooks();
+
     std::string worker_error;
     if (!aida::infra::win_thread::start_detached(worker_loop,
             &worker_error,
@@ -1933,6 +2377,7 @@ inline void shutdown()
 {
     auto& s = state_ref();
     s.running.store(false);
+    remove_window_api_iat_hooks();
 }
 
 }

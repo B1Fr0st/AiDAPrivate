@@ -157,6 +157,53 @@ namespace process_guard {
         }
     }
 
+    static const char* const KERNEL_MODULE_ALLOWLIST[] = {
+        "msmpeng",    "wdf01000",   "wdfilter",  "wdnisdrv",
+        "securityhe", "csfalcon",   "crowdstrik", "cylance",
+        "mpksldrv",   "mbam"
+    };
+    static const int KERNEL_MODULE_ALLOWLIST_LENS[] = { 7, 8, 8, 8, 10, 8, 10, 7, 8, 4 };
+    constexpr int KERNEL_MODULE_ALLOWLIST_COUNT = 10;
+
+    __forceinline bool is_allowlisted_kernel_module(const char* module_name) {
+        if (!module_name || !module_name[0])
+            return false;
+        for (int i = 0; i < KERNEL_MODULE_ALLOWLIST_COUNT; ++i) {
+            const char* prefix = KERNEL_MODULE_ALLOWLIST[i];
+            int plen = KERNEL_MODULE_ALLOWLIST_LENS[i];
+            bool match = true;
+            for (int c = 0; c < plen; ++c) {
+                char a = (char)(module_name[c] | 0x20);
+                char b = (char)(prefix[c] | 0x20);
+                if (a != b) { match = false; break; }
+            }
+            if (match) return true;
+        }
+        return false;
+    }
+
+    __forceinline bool is_system_process_allowlisted_kernel_caller(HANDLE caller_pid) {
+        if (reinterpret_cast<UINT64>(caller_pid) != 4)
+            return false;
+        PEPROCESS sys_proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &sys_proc)) || !sys_proc)
+            return false;
+        bool matched = false;
+        __try {
+            UCHAR* img = PsGetProcessImageFileName(sys_proc);
+            if (img && _MmIsAddressValid(img)) {
+                char img_name[16] = {};
+                for (int i = 0; i < 15 && img[i]; ++i)
+                    img_name[i] = static_cast<char>(img[i]);
+                matched = is_allowlisted_kernel_module(img_name);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            matched = false;
+        }
+        _ObfDereferenceObject(sys_proc);
+        return matched;
+    }
+
     __forceinline bool compute_caller_attrs_uncached(HANDLE caller_pid, bool* out_is_werfault, bool* out_is_allowlisted) {
         *out_is_werfault = false;
         *out_is_allowlisted = false;
@@ -725,6 +772,12 @@ namespace process_guard {
                 return STATUS_INVALID_ADDRESS;
             }
 
+            if (g_saved_active_links.Flink == nullptr) {
+                _ObfDereferenceObject(proc);
+                WW_LOG("unhide_process_from_list: saved links Flink is null, cannot re-link pid=%u", pid);
+                return STATUS_INVALID_ADDRESS;
+            }
+
             links->Flink = g_saved_active_links.Flink;
             links->Blink = g_saved_active_links.Blink;
             g_saved_active_links.Flink = nullptr;
@@ -746,6 +799,34 @@ namespace process_guard {
 
         _ObfDereferenceObject(proc);
         return STATUS_SUCCESS;
+    }
+
+    __forceinline void auto_hide_on_detection() {
+        if (_InterlockedCompareExchange(&g_process_hidden, 0, 0) != 0)
+            return;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
+
+        bool targeting_confirmed = _InterlockedCompareExchange(
+            &targeting_latch::g_targeting_confirmed, 0, 0) != 0;
+
+        UINT32 family_mask = sentinel_bridge::evidence_accumulator::active_family_mask();
+
+        if (!targeting_confirmed && family_mask == 0)
+            return;
+
+        HANDLE client_pid = caller_validation::g_registered_client_pid;
+        if (!client_pid)
+            return;
+
+        UINT32 pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(client_pid));
+        if (pid == 0 || pid == 4)
+            return;
+
+        NTSTATUS st = hide_process_from_list(pid);
+        WW_LOG("auto_hide_on_detection: targeting_confirmed=%d family_mask=0x%08X pid=%u status=0x%08X",
+            targeting_confirmed ? 1 : 0, (UINT32)family_mask, pid, (UINT32)st);
     }
 
     inline OB_PREOP_CALLBACK_STATUS NTAPI process_pre_callback(
@@ -824,6 +905,8 @@ namespace process_guard {
                 kh_requested = Info->Parameters->DuplicateHandleInformation.DesiredAccess;
 
             bool kh_allowlisted = is_allowlisted_system_caller(kh_caller);
+            if (!kh_allowlisted && is_system_process_allowlisted_kernel_caller(kh_caller))
+                kh_allowlisted = true;
 
             if (kh_allowlisted) {
                 constexpr ACCESS_MASK KH_ALLOWLIST_STRIP =
@@ -932,13 +1015,17 @@ namespace process_guard {
             PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION;
         constexpr ACCESS_MASK STRIP_READ = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION;
 
+        constexpr ACCESS_MASK TIER_ALLOW = 0x0400;
+        constexpr ACCESS_MASK TIER_LOG = 0x0010;
+        constexpr ACCESS_MASK TIER_BLOCK = 0x002A;
+
         bool is_system = is_allowlisted_system_caller(caller_pid);
 
         ACCESS_MASK hostile_proc = BASE_HOSTILE;
         if (!is_system)
             hostile_proc |= PROCESS_DUP_HANDLE;
 
-        if (requested & hostile_proc) {
+        if (requested & TIER_BLOCK) {
             if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
                 Info->Parameters->CreateHandleInformation.DesiredAccess &= ~(hostile_proc | STRIP_READ);
             else
@@ -951,12 +1038,21 @@ namespace process_guard {
                     (UINT64)requested,
                     0, 0
                 );
+                auto_hide_on_detection();
             }
-        } else if (requested & STRIP_READ) {
+        } else if (requested & TIER_LOG) {
+            if (!is_system) {
+                if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                    Info->Parameters->CreateHandleInformation.DesiredAccess &= ~PROCESS_VM_READ;
+                else
+                    Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~PROCESS_VM_READ;
+            }
+        } else if (requested & TIER_ALLOW) {
+        } else if (requested & hostile_proc) {
             if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
-                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~STRIP_READ;
+                Info->Parameters->CreateHandleInformation.DesiredAccess &= ~hostile_proc;
             else
-                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~STRIP_READ;
+                Info->Parameters->DuplicateHandleInformation.DesiredAccess &= ~hostile_proc;
         }
 
         return OB_PREOP_SUCCESS;
@@ -1377,18 +1473,6 @@ namespace process_guard {
                 reinterpret_cast<ULONG_PTR>(ProcessId),
                 reinterpret_cast<ULONG_PTR>(ThreadId),
                 start_address);
-        }
-    }
-                _ObfDereferenceObject(remote_thread);
-            }
-        }
-
-        if (_KeBugCheckEx) {
-            _KeBugCheckEx(0xA1DA0006,
-                reinterpret_cast<ULONG_PTR>(caller_pid),
-                reinterpret_cast<ULONG_PTR>(ProcessId),
-                reinterpret_cast<ULONG_PTR>(ThreadId),
-                0);
         }
     }
 

@@ -790,6 +790,8 @@ namespace dispatcher {
         _InterlockedExchange64(&dispatcher_rekey::g_last_rekey_required_log_qpc, 0);
         process_hide::uninstall();
         caller_validation::unregister_client();
+        _InterlockedExchange64(
+            reinterpret_cast<volatile LONG64*>(&sentinel_bridge::g_bridge.protected_pid), 0);
         secure_comm::reset();
         handshake_auth::reset();
 
@@ -1111,6 +1113,8 @@ namespace dispatcher {
             _InterlockedExchange(&g_driver_activated, 0);
             process_hide::uninstall();
             caller_validation::unregister_client();
+            _InterlockedExchange64(
+                reinterpret_cast<volatile LONG64*>(&sentinel_bridge::g_bridge.protected_pid), 0);
             irp->IoStatus.Status = STATUS_ACCESS_DENIED;
             irp->IoStatus.Information = 0;
             if (startup_trace)
@@ -2535,6 +2539,9 @@ namespace dispatcher {
                                 caller_validation::register_client();
 
                                 HANDLE caller_pid = PsGetCurrentProcessId();
+                                _InterlockedExchange64(
+                                    reinterpret_cast<volatile LONG64*>(&sentinel_bridge::g_bridge.protected_pid),
+                                    static_cast<LONG64>(reinterpret_cast<INT_PTR>(caller_pid)));
                                 UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                                 continuous_anti_debug::start(client_pid);
                                 context_guard::install();
@@ -3815,6 +3822,9 @@ namespace dispatcher {
                             WW_LOG("HB-RECONNECT: registering new client");
                             caller_validation::register_client();
 
+                            _InterlockedExchange64(
+                                reinterpret_cast<volatile LONG64*>(&sentinel_bridge::g_bridge.protected_pid),
+                                static_cast<LONG64>(reinterpret_cast<INT_PTR>(caller_pid)));
                             UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                             continuous_anti_debug::start(client_pid);
                             context_guard::install();

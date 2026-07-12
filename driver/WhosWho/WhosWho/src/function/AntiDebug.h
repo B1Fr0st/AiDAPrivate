@@ -1266,6 +1266,50 @@ namespace anti_debug {
         constexpr SYSTEM_INFORMATION_CLASS_INTERNAL HandleInfoClassWF =
             static_cast<SYSTEM_INFORMATION_CLASS_INTERNAL>(64);
 
+        inline UINT8 g_werfault_hashes[16][32] = {};
+        inline volatile LONG g_werfault_hash_count = 0;
+        inline KSPIN_LOCK g_werfault_hash_lock = {};
+        inline volatile LONG g_werfault_hash_lock_init = 0;
+
+        __forceinline void ensure_werfault_hash_lock() {
+            if (_InterlockedCompareExchange(&g_werfault_hash_lock_init, 1, 0) == 0) {
+                KeInitializeSpinLock(&g_werfault_hash_lock);
+            }
+        }
+
+        __forceinline void update_werfault_hashes(const UINT8* hashes, ULONG count) {
+            if (!hashes || count == 0) return;
+            if (count > 16) count = 16;
+            ensure_werfault_hash_lock();
+            KIRQL old_irql;
+            KeAcquireSpinLock(&g_werfault_hash_lock, &old_irql);
+            RtlSecureZeroMemory(g_werfault_hashes, sizeof(g_werfault_hashes));
+            RtlCopyMemory(g_werfault_hashes, hashes, count * 32);
+            _InterlockedExchange(&g_werfault_hash_count, static_cast<LONG>(count));
+            KeReleaseSpinLock(&g_werfault_hash_lock, old_irql);
+            WW_LOG("[ADBG] werfault_hashes_updated count=%lu", count);
+        }
+
+        __forceinline bool match_werfault_hash(const UINT8 hash[32]) {
+            if (!hash) return false;
+            ensure_werfault_hash_lock();
+            KIRQL old_irql;
+            KeAcquireSpinLock(&g_werfault_hash_lock, &old_irql);
+            bool matched = false;
+            LONG count = g_werfault_hash_count;
+            if (count > 16) count = 16;
+            for (LONG i = 0; i < count; ++i) {
+                const UINT8* entry = g_werfault_hashes[i];
+                bool same = true;
+                for (int j = 0; j < 32; ++j) {
+                    if (entry[j] != hash[j]) { same = false; break; }
+                }
+                if (same) { matched = true; break; }
+            }
+            KeReleaseSpinLock(&g_werfault_hash_lock, old_irql);
+            return matched;
+        }
+
         inline bool is_werfault_debugger(UINT32 pid)
         {
             if (KeGetCurrentIrql() != PASSIVE_LEVEL) return false;
@@ -1383,16 +1427,57 @@ namespace anti_debug {
                 }
 
                 if (img_name) {
-                    bool is_werfault = image_file_name_equals_ascii(img_name, "WerFault.exe");
+                    LONG wf_hash_count = g_werfault_hash_count;
+                    bool is_werfault = false;
+                    const char* wf_method = "none";
+
+                    if (wf_hash_count > 0) {
+                        WCHAR wf_path_buf[520] = {};
+                        UNICODE_STRING wf_image_path = {};
+                        NTSTATUS wf_path_st = get_process_image_path(
+                            (HANDLE)(ULONG_PTR)holder_pid,
+                            &wf_image_path, wf_path_buf,
+                            sizeof(wf_path_buf) - sizeof(WCHAR));
+                        if (NT_SUCCESS(wf_path_st)) {
+                            UINT8 wf_file_hash[32] = {};
+                            NTSTATUS wf_hash_st = compute_file_sha256(&wf_image_path, wf_file_hash);
+                            if (NT_SUCCESS(wf_hash_st)) {
+                                bool wf_matched = match_werfault_hash(wf_file_hash);
+                                RtlSecureZeroMemory(wf_file_hash, sizeof(wf_file_hash));
+                                if (wf_matched) {
+                                    is_werfault = true;
+                                    wf_method = "hash_match";
+                                } else {
+                                    wf_method = "hash_mismatch";
+                                }
+                            } else {
+                                is_werfault = image_file_name_equals_ascii(img_name, "WerFault.exe");
+                                wf_method = "hash_failed_name_fallback";
+                            }
+                        } else {
+                            is_werfault = image_file_name_equals_ascii(img_name, "WerFault.exe");
+                            wf_method = "path_failed_name_fallback";
+                        }
+                    } else {
+                        is_werfault = image_file_name_equals_ascii(img_name, "WerFault.exe");
+                        wf_method = "name_only";
+                    }
+
                     if (is_werfault) {
-                        WW_LOG("[ADBG] werfault_debugger_detected holder_pid=%u target_pid=%u handle=0x%llx access=0x%08X is_debug_object=%d",
+                        WW_LOG("[ADBG] werfault_debugger_detected holder_pid=%u target_pid=%u handle=0x%llx access=0x%08X is_debug_object=%d method=%s",
                             holder_pid, pid,
                             static_cast<UINT64>(h.HandleValue),
                             static_cast<ULONG>(h.GrantedAccess),
-                            is_debug_object ? 1 : 0);
+                            is_debug_object ? 1 : 0,
+                            wf_method);
                         result = true;
                         ObDereferenceObject(holder_proc);
                         break;
+                    } else if (wf_hash_count > 0) {
+                        WW_LOG("[ADBG] werfault_rejected holder_pid=%u target_pid=%u handle=0x%llx method=%s",
+                            holder_pid, pid,
+                            static_cast<UINT64>(h.HandleValue),
+                            wf_method);
                     }
                 }
 

@@ -747,6 +747,78 @@ def override_idb_save_contract(contract: dict[str, Any]) -> None:
     contract["description"] = "Flush and durably checkpoint the active AiDA workspace. This compatibility operation never creates an IDA database or writes a caller-selected file."
 
 
+def override_py_exec_file_contract(contract: dict[str, Any]) -> None:
+    input_schema = contract["input_schema"]
+    input_properties = input_schema.get("properties")
+    if not isinstance(input_properties, dict):
+        raise ContractGenerationError("py_exec_file input schema must expose object properties")
+    file_path_schema = input_properties.get("file_path")
+    if not isinstance(file_path_schema, dict) or file_path_schema.get("type") != "string":
+        raise ContractGenerationError("py_exec_file input compatibility shape changed for file_path")
+    file_path_schema["description"] = "Workspace-relative path to the Python script"
+    file_path_schema["maxLength"] = 4096
+    file_path_schema["minLength"] = 1
+    input_properties["approve_unsafe"] = {
+        "description": "Explicit approval for isolated script execution",
+        "type": "boolean",
+    }
+    bin_name_schema = input_properties.get("bin_name")
+    if isinstance(bin_name_schema, dict):
+        bin_name_schema["description"] = "AiDA workspace binary name used to route this call"
+    pid_schema = input_properties.get("pid")
+    if isinstance(pid_schema, dict):
+        pid_schema["description"] = "AiDA workspace process ID used to route this call when applicable"
+    input_schema["additionalProperties"] = False
+    required = input_schema.get("required")
+    if not isinstance(required, list) or "file_path" not in required:
+        raise ContractGenerationError("py_exec_file input schema must require file_path")
+    if "approve_unsafe" not in required:
+        required.append("approve_unsafe")
+
+    output_schema = contract["output_schema"]
+    if not isinstance(output_schema, dict):
+        raise ContractGenerationError("py_exec_file output schema must remain object-shaped")
+    output_properties = output_schema.get("properties")
+    if not isinstance(output_properties, dict):
+        raise ContractGenerationError("py_exec_file output schema must expose object properties")
+    output_properties["worker_generation"] = {"type": "integer"}
+    output_properties["worker_process_id"] = {"type": "integer"}
+    output_properties["diagnostics"] = {"type": "array"}
+    output_required = output_schema.get("required")
+    if not isinstance(output_required, list):
+        raise ContractGenerationError("py_exec_file output schema must expose required list")
+    for field in ("worker_generation", "worker_process_id", "diagnostics"):
+        if field not in output_required:
+            output_required.append(field)
+
+    annotations = contract["annotations"]
+    decorators = annotations.get("decorators")
+    if not isinstance(decorators, list):
+        raise ContractGenerationError("py_exec_file annotation decorators must be a list")
+    decorators[:] = [d for d in decorators if not (isinstance(d, dict) and d.get("name") == "idasync")]
+    parameters = annotations.get("parameters")
+    if not isinstance(parameters, list) or len(parameters) != 1 or not isinstance(parameters[0], dict):
+        raise ContractGenerationError("py_exec_file annotation compatibility shape changed")
+    parameter = parameters[0]
+    if parameter.get("name") != "file_path" or parameter.get("required") is not True:
+        raise ContractGenerationError("py_exec_file annotation compatibility parameter changed")
+    parameter["annotation"] = "Annotated[str, 'Workspace-relative path to a Python script']"
+    parameters.append({
+        "annotation": "Annotated[bool, 'Explicit approval for isolated script execution']",
+        "name": "approve_unsafe",
+        "required": True,
+    })
+    annotations["extension"] = "aida_standalone_isolated_worker"
+    annotations["return"] = "IsolatedPythonWorkerResult"
+    contract["adapter_symbol"] = "aida::standalone::mcp::compat::python_worker_host_t::execute"
+    contract["description"] = (
+        "Execute a workspace-relative Python script in AiDA Standalone's isolated analysis worker "
+        "and return bounded stdout/stderr. Explicit unsafe approval is required. The worker has no "
+        "network, child-process, or live-target write capability and can query only approved "
+        "static-workspace APIs."
+    )
+
+
 def adapter_symbol(name: str) -> str:
     return f"aida::standalone::mcp::compat::adapters::{name}"
 
@@ -810,6 +882,8 @@ def collect_archive_tools(modules: dict[str, Module]) -> list[dict[str, Any]]:
             }
             if symbol == "idb_save":
                 override_idb_save_contract(contract)
+            if symbol == "py_exec_file":
+                override_py_exec_file_contract(contract)
             contracts.append(contract)
         unknown_direct = sorted(set(direct).difference(defined))
         if unknown_direct:

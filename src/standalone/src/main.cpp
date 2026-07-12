@@ -7418,6 +7418,21 @@ int main(int, char**)
                 re_tool_preflight::set_refresh_credentials(server_host, lic_key);
 
                 {
+                    const uint64_t ce_hash_tick = static_cast<uint64_t>(GetTickCount64());
+                    startup_log_critical_fmt("ce_driver_hash_refresh_pre tick=%llu",
+                        static_cast<unsigned long long>(ce_hash_tick));
+                    try {
+                        re_tool_preflight::refresh_ce_driver_hashes();
+                    } catch (...) {
+                        startup_log_critical_fmt("ce_driver_hash_refresh_exception pid=%lu tid=%lu",
+                            GetCurrentProcessId(), GetCurrentThreadId());
+                    }
+                    startup_log_critical_fmt("ce_driver_hash_refresh_post elapsed_ms=%llu",
+                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ce_hash_tick));
+                    crash_log_write("ce_driver_hash_refresh_done");
+                }
+
+                {
                     const uint64_t ph_tick = static_cast<uint64_t>(GetTickCount64());
                     startup_log_critical_fmt("prologue_hash_fetch_pre tick=%llu",
                         static_cast<unsigned long long>(ph_tick));

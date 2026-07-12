@@ -7,6 +7,8 @@ namespace whoswho_kernel_layout {
     inline volatile ULONG g_build_number = 0;
     inline volatile LONG g_build_resolved = 0;
     inline volatile LONG g_static_layout_logged = 0;
+    inline volatile LONG g_debug_port_scan_resolved = 0;
+    inline volatile SIZE_T g_debug_port_scanned_offset = 0;
 
     __forceinline void cpu_pause() {
         _mm_pause();
@@ -123,12 +125,67 @@ namespace whoswho_kernel_layout {
         return 0;
     }
 
+    __forceinline SIZE_T scan_debug_port_offset() {
+        LONG state = _InterlockedCompareExchange(&g_debug_port_scan_resolved, 0, 0);
+        if (state == 2)
+            return g_debug_port_scanned_offset;
+
+        LONG prev = _InterlockedCompareExchange(&g_debug_port_scan_resolved, 1, 0);
+        if (prev == 2)
+            return g_debug_port_scanned_offset;
+        if (prev == 1) {
+            for (ULONG wait = 0; wait < 10000; ++wait) {
+                if (_InterlockedCompareExchange(&g_debug_port_scan_resolved, 0, 0) == 2)
+                    return g_debug_port_scanned_offset;
+                cpu_pause();
+            }
+            return 0;
+        }
+
+        SIZE_T resolved = 0;
+        PVOID fn_addr = nullptr;
+
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            UNICODE_STRING fn_name;
+            RtlInitUnicodeString(&fn_name, L"PsGetProcessDebugPort");
+            fn_addr = MmGetSystemRoutineAddress(&fn_name);
+
+            if (fn_addr) {
+                __try {
+                    UINT8* bytes = static_cast<UINT8*>(fn_addr);
+                    if (bytes[0] == 0x48 && bytes[1] == 0x8B && bytes[2] == 0x81) {
+                        UINT32 disp = *reinterpret_cast<UINT32*>(bytes + 3);
+                        if (disp > 0 && disp < 0x10000) {
+                            resolved = static_cast<SIZE_T>(disp);
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    resolved = 0;
+                }
+            }
+        }
+
+        g_debug_port_scanned_offset = resolved;
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_debug_port_scan_resolved, 2);
+
+        BOOLEAN valid = (resolved != 0);
+        WW_LOG("KVALIDATE build=%lu kind=pattern_scan name=EPROCESS.DebugPort source=PsGetProcessDebugPort offset=0x%llx validation=%s evidence=\"fn_addr=%p instruction_prefix=48_8B_81\" fail_closed=%s",
+            build_number(),
+            static_cast<unsigned long long>(resolved),
+            ww_kernel_validation_state(valid),
+            fn_addr,
+            valid ? "none" : "pattern_scan_failed");
+
+        return resolved;
+    }
+
     __forceinline SIZE_T eprocess_debug_port_offset() {
         ULONG build = build_number();
         if (build >= 26100) return 0x308;
         if (build >= 19041) return 0x578;
         if (build >= 17763) return 0x578;
-        return 0;
+        return scan_debug_port_offset();
     }
 
     __forceinline SIZE_T eprocess_instrumentation_callback_offset() {

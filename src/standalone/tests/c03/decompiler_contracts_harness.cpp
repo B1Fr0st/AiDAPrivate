@@ -394,8 +394,27 @@ void verify_cache_identity_dimensions(const decompiler_pipeline_cache_key_t& cac
     require_distinct([](auto& value) { ++value.type_graph_revision; }, "cache hash ignored type graph revision");
     require_distinct([](auto& value) { ++value.overlay_revision; }, "cache hash ignored overlay revision");
     require_distinct([](auto& value) { value.profile = profile(decompiler_profile_id_t::fast); }, "cache hash ignored profile");
-    require_distinct([](auto& value) { value.renderer.style_id = "aida.c03.alt"; }, "cache hash ignored renderer");
+    require_distinct([](auto& value) { value.renderer.style_id = "aida.c03.alt"; }, "cache hash ignored renderer style");
     require_distinct([](auto& value) { value.dependencies.front().content_hash = digest("ghidra-dependency-2"); }, "cache hash ignored dependency version");
+
+    require_distinct([](auto& value) { value.entity.kind = decompiler_entity_kind_t::cli_method; }, "cache hash ignored entity kind");
+    require_distinct([](auto& value) {
+        std::get<native_decompiler_entity_identity_t>(value.entity.identity).function_bytes_hash = digest("native-function-2");
+    }, "cache hash ignored entity identity bytes");
+    require_distinct([](auto& value) { value.entity.architecture = architecture_id_t::arm; }, "cache hash ignored entity architecture");
+
+    require_distinct([](auto& value) { value.language.architecture = architecture_id_t::arm; }, "cache hash ignored language architecture");
+    require_distinct([](auto& value) { value.language.mode = architecture_mode_t::aarch64; }, "cache hash ignored language mode");
+    require_distinct([](auto& value) { value.language.endian = endian_t::big; }, "cache hash ignored language endian");
+
+    require_distinct([](auto& value) { value.hir_schema_version = 2; }, "cache hash ignored HIR schema version");
+    require_distinct([](auto& value) { value.ast_schema_version = 3; }, "cache hash ignored AST schema version");
+    require_distinct([](auto& value) { value.document_schema_version = 2; }, "cache hash ignored document schema version");
+
+    require_distinct([](auto& value) { value.provider_ir_schema_version = 2; }, "cache hash ignored provider IR schema version");
+    require_distinct([](auto& value) { value.type_graph_schema_version = 2; }, "cache hash ignored type graph schema version");
+
+    require_distinct([](auto& value) { value.renderer.schema_version = 2; }, "cache hash ignored renderer schema version");
 
     auto invalid_provider_ir_schema = cache;
     invalid_provider_ir_schema.provider_ir_schema_version = 0;
@@ -404,6 +423,18 @@ void verify_cache_identity_dimensions(const decompiler_pipeline_cache_key_t& cac
     auto invalid_type_graph_schema = cache;
     invalid_type_graph_schema.type_graph_schema_version = 0;
     require(!validate_decompiler_pipeline_cache_key(invalid_type_graph_schema).valid(), "cache key accepted type graph schema drift");
+
+    auto invalid_hir_schema = cache;
+    invalid_hir_schema.hir_schema_version = 0;
+    require(!validate_decompiler_pipeline_cache_key(invalid_hir_schema).valid(), "cache key accepted HIR schema drift");
+
+    auto invalid_ast_schema = cache;
+    invalid_ast_schema.ast_schema_version = 0;
+    require(!validate_decompiler_pipeline_cache_key(invalid_ast_schema).valid(), "cache key accepted AST schema drift");
+
+    auto invalid_document_schema = cache;
+    invalid_document_schema.document_schema_version = 0;
+    require(!validate_decompiler_pipeline_cache_key(invalid_document_schema).valid(), "cache key accepted document schema drift");
 
     auto invalid_stage = cache;
     invalid_stage.stage = static_cast<decompiler_cache_stage_t>(0xFFU);

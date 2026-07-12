@@ -464,6 +464,31 @@ void verify_publication_contract()
     require(!regression &&
             regression.error().code == contract_error_code_t::publication_transition_rejected,
             "publication stage regression was accepted");
+
+    require(publication_stage_name(publication_stage_t::none) == "none",
+            "publication stage name for none changed");
+    require(publication_stage_name(publication_stage_t::metadata_ready) == "metadata_ready",
+            "publication stage name for metadata_ready changed");
+    require(publication_stage_name(publication_stage_t::baseline_ready) == "baseline_ready",
+            "publication stage name for baseline_ready changed");
+    require(publication_stage_name(publication_stage_t::retired) == "retired",
+            "publication stage name for retired changed");
+
+    require(publication_stage_transition_allowed(publication_stage_t::none,
+                                                  publication_stage_t::baseline_ready),
+            "none to baseline_ready transition was rejected");
+    require(publication_stage_transition_allowed(publication_stage_t::metadata_ready,
+                                                  publication_stage_t::retired),
+            "metadata_ready to retired transition was rejected");
+    require(publication_stage_transition_allowed(publication_stage_t::baseline_ready,
+                                                  publication_stage_t::retired),
+            "baseline_ready to retired transition was rejected");
+    require(!publication_stage_transition_allowed(publication_stage_t::retired,
+                                                   publication_stage_t::metadata_ready),
+            "retired to metadata_ready transition was accepted");
+    require(!publication_stage_transition_allowed(publication_stage_t::retired,
+                                                   publication_stage_t::baseline_ready),
+            "retired to baseline_ready transition was accepted");
 }
 
 void verify_resource_budget_contract()
@@ -495,6 +520,188 @@ void verify_resource_budget_contract()
     const auto invalid_budget = validate_analysis_resource_budget(budget);
     require(!invalid_budget && invalid_budget.error().code == contract_error_code_t::invalid_resource_budget,
             "incoherent resource budget was accepted");
+
+    analysis_resource_budget_t clean_budget;
+
+    {
+        analysis_resource_usage_t cur;
+        cur.workspace_mapped_window_bytes = max_workspace_mapped_window_bytes - 1;
+        const auto ok = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 1, 0, 0, 0, 0, 0});
+        require(ok && ok.value().workspace_mapped_window_bytes == max_workspace_mapped_window_bytes,
+                "workspace mapped window budget did not permit an exact cap reservation");
+        const auto over = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 2, 0, 0, 0, 0, 0});
+        require(!over && over.error().code == contract_error_code_t::resource_budget_exceeded,
+                "workspace mapped window budget overrun did not fail deterministically");
+    }
+
+    {
+        analysis_resource_usage_t cur;
+        cur.global_mapped_window_bytes = max_global_mapped_window_bytes - 1;
+        const auto ok = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 1, 0, 0, 0, 0});
+        require(ok && ok.value().global_mapped_window_bytes == max_global_mapped_window_bytes,
+                "global mapped window budget did not permit an exact cap reservation");
+        const auto over = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 2, 0, 0, 0, 0});
+        require(!over && over.error().code == contract_error_code_t::resource_budget_exceeded,
+                "global mapped window budget overrun did not fail deterministically");
+    }
+
+    {
+        analysis_resource_usage_t cur;
+        cur.workspace_spill_bytes = max_workspace_spill_bytes - 1;
+        const auto ok = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 1, 0, 0, 0});
+        require(ok && ok.value().workspace_spill_bytes == max_workspace_spill_bytes,
+                "workspace spill budget did not permit an exact cap reservation");
+        const auto over = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 2, 0, 0, 0});
+        require(!over && over.error().code == contract_error_code_t::resource_budget_exceeded,
+                "workspace spill budget overrun did not fail deterministically");
+    }
+
+    {
+        analysis_resource_usage_t cur;
+        cur.global_spill_bytes = max_global_spill_bytes - 1;
+        const auto ok = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 0, 1, 0, 0});
+        require(ok && ok.value().global_spill_bytes == max_global_spill_bytes,
+                "global spill budget did not permit an exact cap reservation");
+        const auto over = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 0, 2, 0, 0});
+        require(!over && over.error().code == contract_error_code_t::resource_budget_exceeded,
+                "global spill budget overrun did not fail deterministically");
+    }
+
+    {
+        analysis_resource_usage_t cur;
+        cur.workspace_cache_bytes = max_workspace_cache_bytes - 1;
+        const auto ok = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 0, 0, 1, 0});
+        require(ok && ok.value().workspace_cache_bytes == max_workspace_cache_bytes,
+                "workspace cache budget did not permit an exact cap reservation");
+        const auto over = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 0, 0, 2, 0});
+        require(!over && over.error().code == contract_error_code_t::resource_budget_exceeded,
+                "workspace cache budget overrun did not fail deterministically");
+    }
+
+    {
+        analysis_resource_usage_t cur;
+        cur.global_cache_bytes = max_global_cache_bytes - 1;
+        const auto ok = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 0, 0, 0, 1});
+        require(ok && ok.value().global_cache_bytes == max_global_cache_bytes,
+                "global cache budget did not permit an exact cap reservation");
+        const auto over = reserve_analysis_resources(
+            clean_budget, cur, analysis_resource_usage_t{0, 0, 0, 0, 0, 0, 2});
+        require(!over && over.error().code == contract_error_code_t::resource_budget_exceeded,
+                "global cache budget overrun did not fail deterministically");
+    }
+
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.cancellation_checkpoint_milliseconds = 0;
+        const auto result = validate_analysis_resource_budget(bad);
+        require(!result && result.error().code == contract_error_code_t::invalid_resource_budget,
+                "zero cancellation_checkpoint_milliseconds was accepted");
+    }
+
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.cancellation_checkpoint_milliseconds = max_cancellation_checkpoint_milliseconds + 1;
+        const auto result = validate_analysis_resource_budget(bad);
+        require(!result && result.error().code == contract_error_code_t::invalid_resource_budget,
+                "cancellation_checkpoint_milliseconds exceeding max constant was accepted");
+    }
+
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_incremental_private_bytes = 0;
+        require(!validate_analysis_resource_budget(bad),
+                "zero max_incremental_private_bytes was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_workspace_mapped_window_bytes = 0;
+        require(!validate_analysis_resource_budget(bad),
+                "zero max_workspace_mapped_window_bytes was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_global_mapped_window_bytes = 0;
+        require(!validate_analysis_resource_budget(bad),
+                "zero max_global_mapped_window_bytes was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_workspace_spill_bytes = 0;
+        require(!validate_analysis_resource_budget(bad),
+                "zero max_workspace_spill_bytes was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_global_spill_bytes = 0;
+        require(!validate_analysis_resource_budget(bad),
+                "zero max_global_spill_bytes was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_workspace_cache_bytes = 0;
+        require(!validate_analysis_resource_budget(bad),
+                "zero max_workspace_cache_bytes was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_global_cache_bytes = 0;
+        require(!validate_analysis_resource_budget(bad),
+                "zero max_global_cache_bytes was accepted");
+    }
+
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_incremental_private_bytes = max_incremental_private_bytes + 1;
+        require(!validate_analysis_resource_budget(bad),
+                "max_incremental_private_bytes exceeding max constant was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_workspace_mapped_window_bytes = max_workspace_mapped_window_bytes + 1;
+        require(!validate_analysis_resource_budget(bad),
+                "max_workspace_mapped_window_bytes exceeding max constant was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_global_mapped_window_bytes = max_global_mapped_window_bytes + 1;
+        require(!validate_analysis_resource_budget(bad),
+                "max_global_mapped_window_bytes exceeding max constant was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_workspace_spill_bytes = max_workspace_spill_bytes + 1;
+        require(!validate_analysis_resource_budget(bad),
+                "max_workspace_spill_bytes exceeding max constant was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_global_spill_bytes = max_global_spill_bytes + 1;
+        require(!validate_analysis_resource_budget(bad),
+                "max_global_spill_bytes exceeding max constant was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_workspace_cache_bytes = max_workspace_cache_bytes + 1;
+        require(!validate_analysis_resource_budget(bad),
+                "max_workspace_cache_bytes exceeding max constant was accepted");
+    }
+    {
+        analysis_resource_budget_t bad = clean_budget;
+        bad.max_global_cache_bytes = max_global_cache_bytes + 1;
+        require(!validate_analysis_resource_budget(bad),
+                "max_global_cache_bytes exceeding max constant was accepted");
+    }
 }
 
 void verify_cancellation_domains()
@@ -567,6 +774,179 @@ void verify_stable_schema_and_error_values()
     require(contract_error_code_name(contract_error_code_t::packed_id_overflow) ==
                 "C03_PACKED_ID_OVERFLOW",
             "packed id overflow error code changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_workspace_identity) ==
+                "C03_INVALID_WORKSPACE_IDENTITY",
+            "invalid_workspace_identity error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_target_identity) ==
+                "C03_INVALID_TARGET_IDENTITY",
+            "invalid_target_identity error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_generation_identity) ==
+                "C03_INVALID_GENERATION_IDENTITY",
+            "invalid_generation_identity error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_publication_stage) ==
+                "C03_INVALID_PUBLICATION_STAGE",
+            "invalid_publication_stage error code name changed");
+    require(contract_error_code_name(contract_error_code_t::publication_transition_rejected) ==
+                "C03_PUBLICATION_TRANSITION_REJECTED",
+            "publication_transition_rejected error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_packed_id) ==
+                "C03_INVALID_PACKED_ID",
+            "invalid_packed_id error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_resource_budget) ==
+                "C03_INVALID_RESOURCE_BUDGET",
+            "invalid_resource_budget error code name changed");
+    require(contract_error_code_name(contract_error_code_t::resource_budget_exceeded) ==
+                "C03_RESOURCE_BUDGET_EXCEEDED",
+            "resource_budget_exceeded error code name changed");
+    require(contract_error_code_name(contract_error_code_t::arithmetic_overflow) ==
+                "C03_ARITHMETIC_OVERFLOW",
+            "arithmetic_overflow error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_cancellation_domain) ==
+                "C03_INVALID_CANCELLATION_DOMAIN",
+            "invalid_cancellation_domain error code name changed");
+    require(contract_error_code_name(contract_error_code_t::cancellation_domain_mismatch) ==
+                "C03_CANCELLATION_DOMAIN_MISMATCH",
+            "cancellation_domain_mismatch error code name changed");
+    require(contract_error_code_name(contract_error_code_t::serialization_schema_mismatch) ==
+                "C03_SERIALIZATION_SCHEMA_MISMATCH",
+            "serialization_schema_mismatch error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_static_provider_provenance) ==
+                "C03_INVALID_STATIC_PROVIDER_PROVENANCE",
+            "invalid_static_provider_provenance error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_live_target_identity) ==
+                "C03_INVALID_LIVE_TARGET_IDENTITY",
+            "invalid_live_target_identity error code name changed");
+    require(contract_error_code_name(contract_error_code_t::target_identity_provenance_mismatch) ==
+                "C03_TARGET_IDENTITY_PROVENANCE_MISMATCH",
+            "target_identity_provenance_mismatch error code name changed");
+}
+
+void verify_equality_operators()
+{
+    const auto workspace = make_workspace(71);
+    const auto generation = make_generation(workspace, 0x4001, 5);
+
+    const auto snapshot_a = require_value(immutable_snapshot_contract_t::make(
+        generation, 10, 5, 3), "snapshot equality fixture creation failed");
+    const auto snapshot_b = require_value(immutable_snapshot_contract_t::make(
+        generation, 10, 5, 3), "snapshot equality fixture creation failed");
+    require(snapshot_a == snapshot_b, "equal immutable snapshot contracts diverged");
+    require(!(snapshot_a != snapshot_b), "equal immutable snapshot contracts compared unequal");
+    const auto snapshot_diff_rev = require_value(immutable_snapshot_contract_t::make(
+        generation, 11, 5, 3), "snapshot equality fixture creation failed");
+    require(snapshot_a != snapshot_diff_rev,
+            "snapshot revision was omitted from snapshot equality");
+    const auto snapshot_diff_layout = require_value(immutable_snapshot_contract_t::make(
+        generation, 10, 6, 3), "snapshot equality fixture creation failed");
+    require(snapshot_a != snapshot_diff_layout,
+            "layout revision was omitted from snapshot equality");
+    const auto snapshot_diff_overlay = require_value(immutable_snapshot_contract_t::make(
+        generation, 10, 5, 4), "snapshot equality fixture creation failed");
+    require(snapshot_a != snapshot_diff_overlay,
+            "overlay revision was omitted from snapshot equality");
+    const auto other_generation = make_generation(workspace, 0x4002, 5);
+    const auto snapshot_diff_gen = require_value(immutable_snapshot_contract_t::make(
+        other_generation, 10, 5, 3), "snapshot equality fixture creation failed");
+    require(snapshot_a != snapshot_diff_gen,
+            "generation was omitted from snapshot equality");
+
+    const auto publication_a = require_value(immutable_publication_contract_t::make(
+        generation, snapshot_a, publication_stage_t::metadata_ready, 20),
+        "publication equality fixture creation failed");
+    const auto publication_b = require_value(immutable_publication_contract_t::make(
+        generation, snapshot_a, publication_stage_t::metadata_ready, 20),
+        "publication equality fixture creation failed");
+    require(publication_a == publication_b,
+            "equal immutable publication contracts diverged");
+    require(!(publication_a != publication_b),
+            "equal immutable publication contracts compared unequal");
+    const auto publication_diff_stage = require_value(immutable_publication_contract_t::make(
+        generation, snapshot_a, publication_stage_t::baseline_ready, 20),
+        "publication equality fixture creation failed");
+    require(publication_a != publication_diff_stage,
+            "stage was omitted from publication equality");
+    const auto publication_diff_rev = require_value(immutable_publication_contract_t::make(
+        generation, snapshot_a, publication_stage_t::metadata_ready, 21),
+        "publication equality fixture creation failed");
+    require(publication_a != publication_diff_rev,
+            "publication revision was omitted from publication equality");
+    const auto publication_diff_snap = require_value(immutable_publication_contract_t::make(
+        generation, snapshot_diff_rev, publication_stage_t::metadata_ready, 20),
+        "publication equality fixture creation failed");
+    require(publication_a != publication_diff_snap,
+            "snapshot was omitted from publication equality");
+
+    const auto packed_a = require_value(packed_analysis_id_t::make(1, 2, 3),
+                                         "packed id equality fixture creation failed");
+    const auto packed_b = require_value(packed_analysis_id_t::make(1, 2, 3),
+                                         "packed id equality fixture creation failed");
+    require(packed_a == packed_b, "equal packed analysis ids diverged");
+    require(!(packed_a != packed_b), "equal packed analysis ids compared unequal");
+    const auto packed_c = require_value(packed_analysis_id_t::make(1, 2, 4),
+                                         "packed id equality fixture creation failed");
+    require(packed_a != packed_c, "different packed analysis ids compared equal");
+
+    const auto domain_a = require_value(cancellation_domain_t::for_workspace(workspace, 1),
+                                         "cancellation domain equality fixture creation failed");
+    const auto domain_b = require_value(cancellation_domain_t::for_workspace(workspace, 1),
+                                         "cancellation domain equality fixture creation failed");
+    require(domain_a == domain_b, "equal cancellation domains diverged");
+    require(!(domain_a != domain_b), "equal cancellation domains compared unequal");
+    const auto domain_diff_epoch = require_value(
+        cancellation_domain_t::for_workspace(workspace, 2),
+        "cancellation domain equality fixture creation failed");
+    require(domain_a != domain_diff_epoch,
+            "epoch was omitted from cancellation domain equality");
+    const auto domain_diff_scope = require_value(cancellation_domain_t::for_target(
+        generation.target(), 1), "cancellation domain equality fixture creation failed");
+    require(domain_a != domain_diff_scope,
+            "scope was omitted from cancellation domain equality");
+}
+
+void verify_primitive_id_rejection()
+{
+    const auto zero_workspace = workspace_id_t::from_bytes(workspace_id_t::bytes_t{});
+    require(!zero_workspace &&
+            zero_workspace.error().code == contract_error_code_t::invalid_workspace_identity,
+            "all-zero workspace id bytes were accepted");
+
+    const auto zero_target = target_id_t::from_value(0);
+    require(!zero_target &&
+            zero_target.error().code == contract_error_code_t::invalid_target_identity,
+            "zero target id value was accepted");
+
+    const auto zero_generation = generation_id_t::from_value(0);
+    require(!zero_generation &&
+            zero_generation.error().code == contract_error_code_t::invalid_generation_identity,
+            "zero generation id value was accepted");
+}
+
+void verify_provider_kinds()
+{
+    const auto workspace = make_workspace(81);
+
+    auto spill_provenance = make_static_provider_provenance(82);
+    spill_provenance.provider_kind = static_provider_kind_t::spill;
+    const auto spill_target = make_static_target(workspace, 0x1501, spill_provenance);
+    require(spill_target.valid() &&
+            spill_target.static_provider_provenance() &&
+            spill_target.static_provider_provenance()->provider_kind == static_provider_kind_t::spill,
+            "spill provider kind was not retained as a valid static target");
+    require(static_cast<bool>(validate_static_provider_provenance(
+                *spill_target.static_provider_provenance())),
+            "spill provider provenance was rejected by the validator");
+
+    auto streaming_provenance = make_static_provider_provenance(92);
+    streaming_provenance.provider_kind = static_provider_kind_t::streaming;
+    const auto streaming_target = make_static_target(workspace, 0x1502, streaming_provenance);
+    require(streaming_target.valid() &&
+            streaming_target.static_provider_provenance() &&
+            streaming_target.static_provider_provenance()->provider_kind ==
+                static_provider_kind_t::streaming,
+            "streaming provider kind was not retained as a valid static target");
+    require(static_cast<bool>(validate_static_provider_provenance(
+                *streaming_target.static_provider_provenance())),
+            "streaming provider provenance was rejected by the validator");
 }
 
 }
@@ -582,6 +962,9 @@ int main()
         verify_resource_budget_contract();
         verify_cancellation_domains();
         verify_stable_schema_and_error_values();
+        verify_equality_operators();
+        verify_primitive_id_rejection();
+        verify_provider_kinds();
         std::cout << "analysis contracts harness passed\n";
         return 0;
     } catch (const std::exception& error) {

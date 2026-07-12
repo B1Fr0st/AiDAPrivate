@@ -116,13 +116,13 @@ namespace re_tool_preflight {
 
     constexpr window_sig_t kWindowSigs[] = {
         { L"Cheat Engine",      12 },
-        { L"x64dbg",             5 },
-        { L"x32dbg",             5 },
+        { L"x64dbg",             6 },
+        { L"x32dbg",             6 },
         { L"OllyDbg",            7 },
         { L"Ghidra",             6 },
         { L"HxD",                3 },
-        { L"Process Hacker",    15 },
-        { L"Process Explorer",  17 },
+        { L"Process Hacker",    14 },
+        { L"Process Explorer",  16 },
         { L"ScyllaHide",        10 },
         { L"API Monitor",       11 },
         { L"WinDbg",             6 },
@@ -181,25 +181,6 @@ namespace re_tool_preflight {
         }
     }
 
-    __forceinline bool wcsistr_contains(const wchar_t* haystack, int haystack_len, const wchar_t* needle, int needle_len) {
-        if (haystack_len < needle_len || needle_len == 0)
-            return false;
-        for (int i = 0; i <= haystack_len - needle_len; ++i) {
-            bool match = true;
-            for (int j = 0; j < needle_len; ++j) {
-                wchar_t a = haystack[i + j] | 0x20;
-                wchar_t b = needle[j] | 0x20;
-                if (a != b) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match)
-                return true;
-        }
-        return false;
-    }
-
     __forceinline bool is_word_boundary_char(wchar_t ch) {
         return !((ch >= L'a' && ch <= L'z') ||
                  (ch >= L'A' && ch <= L'Z') ||
@@ -207,6 +188,34 @@ namespace re_tool_preflight {
                  (ch >= 0x0430 && ch <= 0x044F) ||
                  (ch >= 0x0410 && ch <= 0x042F) ||
                  ch == L'_');
+    }
+
+    __forceinline bool match_word_boundary(const wchar_t* title, int title_len,
+                                            const wchar_t* pattern, int pattern_len) {
+        if (pattern_len == 0 || title_len < pattern_len)
+            return false;
+
+        for (int i = 0; i <= title_len - pattern_len; ++i) {
+            bool prefix_ok = (i == 0) || is_word_boundary_char(title[i - 1]);
+            if (!prefix_ok)
+                continue;
+
+            bool match = true;
+            for (int j = 0; j < pattern_len; ++j) {
+                if ((title[i + j] | 0x20) != (pattern[j] | 0x20)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match)
+                continue;
+
+            int after_pos = i + pattern_len;
+            bool suffix_ok = (after_pos >= title_len) || is_word_boundary_char(title[after_pos]);
+            if (suffix_ok)
+                return true;
+        }
+        return false;
     }
 
     __forceinline bool match_ida_word_boundary(const wchar_t* title, int title_len) {
@@ -355,7 +364,7 @@ namespace re_tool_preflight {
                 lower_sig[j] = kWindowSigs[i].sig[j] | 0x20;
             lower_sig[kWindowSigs[i].len] = L'\0';
 
-            if (wcsistr_contains(lower_title, copy_len, lower_sig, kWindowSigs[i].len)) {
+            if (match_word_boundary(lower_title, copy_len, lower_sig, kWindowSigs[i].len)) {
                 bool is_exact = is_exact_title_match(lower_title, copy_len, lower_sig, kWindowSigs[i].len);
 
                 if (is_browser_proc && !is_exact) {
