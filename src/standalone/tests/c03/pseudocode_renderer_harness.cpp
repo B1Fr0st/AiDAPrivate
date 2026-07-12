@@ -29,10 +29,10 @@ address_t address(const std::uint64_t value)
     return result;
 }
 
-decompiler_entity_key_t entity()
+decompiler_entity_key_t entity(const std::uint64_t function_id = 911)
 {
     native_decompiler_entity_identity_t identity;
-    identity.function_id = 911;
+    identity.function_id = function_id;
     identity.entry = address(0x140001000ULL);
     identity.end = address(0x140001080ULL);
     identity.function_bytes_hash = stable_serialization_hash("c03-pseudocode-renderer-fixture");
@@ -85,6 +85,43 @@ type_graph_t type_graph(const decompiler_entity_key_t& entity_value)
     return result;
 }
 
+provider_ir_t provider_ir(const decompiler_entity_key_t& entity_value)
+{
+    decompiler_provider_identity_t provider;
+    provider.provider = decompiler_provider_id_t::ghidra_native;
+    provider.provider_name = "ghidra";
+    provider.provider_version = "11.3.0";
+    provider.provider_binary_hash = stable_serialization_hash("c03-provider-binary");
+    provider.worker_build_id = "c03-provider-worker";
+    provider.worker_build_hash = stable_serialization_hash("c03-provider-worker");
+    decompiler_language_identity_t language;
+    language.language_id = "x86:LE:64:default";
+    language.language_version = "11.3";
+    language.compiler_spec_id = "windows";
+    language.language_spec_hash = stable_serialization_hash("c03-provider-language");
+    language.architecture = architecture_id_t::x86_64;
+    language.mode = architecture_mode_t::x86_64;
+    provider_ir_value_t value;
+    value.id = 1;
+    value.opcode = provider_ir_opcode_t::return_value;
+    value.type_id = 1;
+    value.stable_immediate = "result";
+    value.coordinate = coordinate(entity_value, decompiler_coordinate_layer_t::provider_ir);
+    value.confidence = 100;
+    value.provenance = decompiler_fact_provenance_t::provider_semantics;
+    provider_ir_block_t block;
+    block.id = 1;
+    block.values.push_back(std::move(value));
+    block.coordinate = coordinate(entity_value, decompiler_coordinate_layer_t::provider_ir);
+    provider_ir_t result;
+    result.provider = std::move(provider);
+    result.language = std::move(language);
+    result.entity = entity_value;
+    result.entry_block_id = 1;
+    result.blocks.push_back(std::move(block));
+    return result;
+}
+
 hir_variable_t variable(
     const std::uint64_t id,
     std::string name,
@@ -119,7 +156,9 @@ hir_value_t value(
     return result;
 }
 
-hir_function_t straight_line_hir(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+hir_function_t straight_line_hir(const decompiler_entity_key_t& entity_value,
+                                 const type_graph_t& types,
+                                 const provider_ir_t& provider)
 {
     hir_block_t block;
     block.id = 1;
@@ -134,7 +173,7 @@ hir_function_t straight_line_hir(const decompiler_entity_key_t& entity_value, co
         value(7, hir_node_kind_t::return_value, {}, {4}, entity_value)};
     hir_function_t result;
     result.entity = entity_value;
-    result.provider_ir_hash = stable_serialization_hash("c03-pseudocode-provider");
+    result.provider_ir_hash = stable_serialization_hash(provider);
     result.type_graph_revision = types.revision;
     result.return_type_id = 1;
     result.parameters.push_back(variable(1, "arg0", entity_value));
@@ -213,12 +252,13 @@ void require_source_map_coverage(const decompiler_document_t& document)
 
 void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
-    const auto hir = straight_line_hir(entity_value, types);
+    const auto provider = provider_ir(entity_value);
+    const auto hir = straight_line_hir(entity_value, types, provider);
     decompiler_service_v2_request_t request;
     request.renderer.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto first = decompiler_service_t::render_typed_pseudocode_v2(hir, types, request);
-    const auto second = decompiler_service_t::render_typed_pseudocode_v2(hir, types, request);
-    require(first.succeeded() && second.succeeded(), "decompiler service V2 path rejected a proven straight-line body");
+    const auto first = decompiler_service_t::render_provider_document_v2(provider, hir, types, request);
+    const auto second = decompiler_service_t::render_provider_document_v2(provider, hir, types, request);
+    require(first.succeeded() && second.succeeded(), "decompiler service production V2 path rejected a proven straight-line body");
     require(validate_typed_ast_v2_semantics(*first.ast_build.ast, types).valid(), "typed AST semantic validation failed");
     require(stable_serialization_hash(*first.ast_build.ast) == stable_serialization_hash(*second.ast_build.ast),
         "typed AST construction is nondeterministic");
@@ -242,6 +282,41 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
     require(decoded_document.valid(), "renderer document serialization did not round-trip");
     require(stable_serialization_hash(*rendered.document) == stable_serialization_hash(*decoded_document.value),
         "renderer document serialization hash drifted");
+
+    auto mismatched_hir = hir;
+    mismatched_hir.provider_ir_hash = stable_serialization_hash("c03-mismatched-provider-ir");
+    const auto mismatch = decompiler_service_t::render_provider_document_v2(provider, mismatched_hir, types, request);
+    require(!mismatch.succeeded(), "decompiler service accepted an HIR/provider-IR hash mismatch");
+    require(std::any_of(mismatch.diagnostics.begin(), mismatch.diagnostics.end(),
+        [](const decompiler_diagnostic_t& diagnostic) {
+            return diagnostic.code == decompiler_diagnostic_code_t::malformed_hir &&
+                   diagnostic.localization_key == "decompiler.service.v2.provider_ir_hash";
+        }), "decompiler service omitted the strict provider-IR binding diagnostic");
+
+    auto mismatched_types = types;
+    ++mismatched_types.revision;
+    require(validate_type_graph(mismatched_types).valid(), "type-graph mismatch fixture is invalid");
+    const auto type_graph_mismatch = decompiler_service_t::render_provider_document_v2(
+        provider, hir, mismatched_types, request);
+    require(!type_graph_mismatch.succeeded(), "decompiler service accepted an HIR/type-graph revision mismatch");
+    require(!type_graph_mismatch.rendering.has_value(), "decompiler service rendered an HIR/type-graph revision mismatch");
+    require(std::any_of(type_graph_mismatch.diagnostics.begin(), type_graph_mismatch.diagnostics.end(),
+        [](const decompiler_diagnostic_t& diagnostic) {
+            return diagnostic.code == decompiler_diagnostic_code_t::malformed_type_graph &&
+                   diagnostic.localization_key == "decompiler.service.v2.type_graph_revision";
+        }), "decompiler service omitted the strict type-graph revision diagnostic");
+
+    const auto mismatched_entity_types = type_graph(entity(912));
+    require(validate_type_graph(mismatched_entity_types).valid(), "entity-binding mismatch type graph fixture is invalid");
+    const auto entity_binding_mismatch = decompiler_service_t::render_provider_document_v2(
+        provider, hir, mismatched_entity_types, request);
+    require(!entity_binding_mismatch.succeeded(), "decompiler service accepted a provider/HIR/type-graph entity mismatch");
+    require(!entity_binding_mismatch.rendering.has_value(), "decompiler service rendered a provider/HIR/type-graph entity mismatch");
+    require(std::any_of(entity_binding_mismatch.diagnostics.begin(), entity_binding_mismatch.diagnostics.end(),
+        [](const decompiler_diagnostic_t& diagnostic) {
+            return diagnostic.code == decompiler_diagnostic_code_t::malformed_hir &&
+                   diagnostic.localization_key == "decompiler.service.v2.entity_binding";
+        }), "decompiler service omitted the strict entity-binding diagnostic");
 }
 
 void verify_structured_semantic_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
@@ -276,9 +351,10 @@ void verify_structured_semantic_fixture(const decompiler_entity_key_t& entity_va
 
 void verify_no_fabricated_body(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
-    auto hir = straight_line_hir(entity_value, types);
+    const auto provider = provider_ir(entity_value);
+    auto hir = straight_line_hir(entity_value, types, provider);
     hir.blocks.front().values.push_back(value(8, hir_node_kind_t::conditional, {}, {2}, entity_value));
-    const auto result = decompiler_service_t::render_typed_pseudocode_v2(hir, types);
+    const auto result = decompiler_service_t::render_provider_document_v2(provider, hir, types);
     require(!result.succeeded(), "decompiler service fabricated a structured body for an unproven conditional region");
     require(!result.rendering.has_value(), "decompiler service rendered an AST after strict lowering rejection");
     require(std::any_of(result.ast_build.diagnostics.begin(), result.ast_build.diagnostics.end(),
@@ -290,9 +366,10 @@ void verify_no_fabricated_body(const decompiler_entity_key_t& entity_value, cons
 
 void verify_incomplete_ir_diagnostic(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
-    auto hir = straight_line_hir(entity_value, types);
+    const auto provider = provider_ir(entity_value);
+    auto hir = straight_line_hir(entity_value, types, provider);
     hir.blocks.clear();
-    const auto result = decompiler_service_t::render_typed_pseudocode_v2(hir, types);
+    const auto result = decompiler_service_t::render_provider_document_v2(provider, hir, types);
     require(!result.succeeded(), "decompiler service accepted incomplete HIR");
     require(!result.rendering.has_value(), "decompiler service rendered incomplete HIR");
     require(std::any_of(result.ast_build.diagnostics.begin(), result.ast_build.diagnostics.end(),

@@ -54,6 +54,16 @@ internal sealed record WorkerBudget(
     ulong MaxMemoryBytes,
     ulong MaxProviderIrNodes);
 
+internal static class WorkerBudgetLimits
+{
+    internal const ulong MaximumCpuMs = 60_000;
+    internal const ulong MaximumMemoryBytes = 4UL << 30;
+
+    internal static bool IsSane(WorkerBudget? budget) =>
+        budget is not null && budget.MaxCpuMs != 0 && budget.MaxCpuMs <= MaximumCpuMs &&
+        budget.MaxMemoryBytes != 0 && budget.MaxMemoryBytes <= MaximumMemoryBytes;
+}
+
 internal sealed record WorkerProviderExpectation(
     string Version,
     string DecompilerAssemblyHash,

@@ -264,13 +264,20 @@ private:
     bool merge_source_is_rows_ = true;
 };
 
+class navigator_source_allocator_t {
+public:
+    virtual ~navigator_source_allocator_t() = default;
+    virtual view_context_t allocate_copy(const view_context_t& source) const = 0;
+};
+
 class navigator_navigation_model_t final {
 public:
     navigator_navigation_model_t(const navigator_packed_store_adapter_t& adapter,
                                  workspace_id_t workspace,
                                  navigation_event_id_t first_event_id = {1},
                                  std::uint64_t first_sequence = 1,
-                                 bool request_focus = true) noexcept;
+                                 bool request_focus = true,
+                                 const navigator_source_allocator_t* source_allocator = nullptr) noexcept;
 
     navigator_error_t set_source(const view_context_t& source);
     void clear_source() noexcept;
@@ -282,6 +289,7 @@ private:
                             std::uint64_t subject = 0) const noexcept;
 
     const navigator_packed_store_adapter_t* adapter_ = nullptr;
+    const navigator_source_allocator_t* source_allocator_ = nullptr;
     workspace_id_t workspace_;
     view_context_t source_;
     navigation_event_id_t next_event_id_;

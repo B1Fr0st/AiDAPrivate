@@ -42,6 +42,7 @@ internal static class Program
             await ValidateManifestMethodsAsync(repositoryRoot, manifest, inventory, fixturePath, moduleHash).ConfigureAwait(false);
             await ValidateCancellationAsync(firstRequest).ConfigureAwait(false);
             await ValidateResourceLimitsAsync().ConfigureAwait(false);
+            await ValidateResourceBudgetBoundsAsync(firstRequest).ConfigureAwait(false);
             await ValidateSnapshotBindingAsync(firstRequest, fixturePath).ConfigureAwait(false);
             await ValidateMalformedCasesAsync(manifest, firstMethod, fixturePath).ConfigureAwait(false);
             Console.Out.WriteLine("managed CLI worker harness satisfied");
@@ -174,7 +175,7 @@ internal static class Program
             }
         }
 
-        await using var cpuGuard = new ResourceBudgetGuard(new WorkerBudget("balanced", 5_000, 1, 8UL << 30, 1_000));
+        await using var cpuGuard = new ResourceBudgetGuard(new WorkerBudget("balanced", 5_000, 1, WorkerBudgetLimits.MaximumMemoryBytes, 1_000));
         var elapsed = Stopwatch.StartNew();
         while (elapsed.Elapsed < TimeSpan.FromSeconds(5))
         {
@@ -190,6 +191,42 @@ internal static class Program
             }
         }
         throw new InvalidOperationException("managed CLI CPU limit was not enforced");
+    }
+
+    private static async Task ValidateResourceBudgetBoundsAsync(WorkerRequest request)
+    {
+        var tiny = new WorkerBudget("balanced", 1, 1, 1, 1);
+        MetadataAnalysis.ValidateRequest(request with { Budget = tiny });
+
+        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, ulong.MaxValue, 1, 1),
+            "managed CLI accepted UINT64_MAX CPU budget").ConfigureAwait(false);
+        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, WorkerBudgetLimits.MaximumCpuMs + 1, 1, 1),
+            "managed CLI accepted oversized CPU budget").ConfigureAwait(false);
+        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, 1, ulong.MaxValue, 1),
+            "managed CLI accepted UINT64_MAX memory budget").ConfigureAwait(false);
+        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, 1, WorkerBudgetLimits.MaximumMemoryBytes + 1, 1),
+            "managed CLI accepted oversized memory budget").ConfigureAwait(false);
+    }
+
+    private static async Task RequireBudgetRejectedAsync(WorkerRequest request, WorkerBudget budget, string message)
+    {
+        try
+        {
+            MetadataAnalysis.ValidateRequest(request with { Budget = budget });
+            throw new InvalidOperationException(message);
+        }
+        catch (InvalidDataException)
+        {
+        }
+
+        try
+        {
+            await using var guard = new ResourceBudgetGuard(budget);
+            throw new InvalidOperationException(message);
+        }
+        catch (InvalidDataException)
+        {
+        }
     }
 
     private static async Task ValidateSnapshotBindingAsync(WorkerRequest request, string fixturePath)

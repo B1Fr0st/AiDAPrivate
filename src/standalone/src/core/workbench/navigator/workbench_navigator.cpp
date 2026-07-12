@@ -545,8 +545,10 @@ navigator_query_model_t::sorted_rows() const noexcept
 
 navigator_navigation_model_t::navigator_navigation_model_t(
     const navigator_packed_store_adapter_t& adapter, workspace_id_t workspace,
-    navigation_event_id_t first_event_id, std::uint64_t first_sequence, bool request_focus) noexcept
+    navigation_event_id_t first_event_id, std::uint64_t first_sequence, bool request_focus,
+    const navigator_source_allocator_t* source_allocator) noexcept
     : adapter_(&adapter)
+    , source_allocator_(source_allocator)
     , workspace_(workspace)
     , next_event_id_(first_event_id)
     , next_sequence_(first_sequence)
@@ -563,7 +565,9 @@ navigator_error_t navigator_navigation_model_t::set_source(const view_context_t&
                      source.view.value);
     }
     try {
-        view_context_t accepted_source(source);
+        view_context_t accepted_source = source_allocator_ == nullptr
+            ? source
+            : source_allocator_->allocate_copy(source);
         source_ = std::move(accepted_source);
     } catch (const std::bad_alloc&) {
         return error(navigator_error_code_t::resource_exhausted,

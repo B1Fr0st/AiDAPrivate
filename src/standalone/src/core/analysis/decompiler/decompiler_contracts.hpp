@@ -20,6 +20,8 @@ constexpr std::uint32_t k_typed_pseudocode_ast_schema_version = 2;
 constexpr std::uint32_t k_decompiler_document_schema_version = 1;
 constexpr std::uint32_t k_decompiler_cache_key_schema_version = 2;
 constexpr std::uint32_t k_decompiler_worker_protocol_version = 1;
+constexpr std::uint64_t k_decompiler_profile_max_cpu_ms = 60'000;
+constexpr std::uint64_t k_decompiler_profile_max_memory_bytes = 4ULL << 30;
 
 enum class decompiler_entity_kind_t : std::uint8_t {
     native_function = 1,

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -64,6 +65,14 @@ struct row_t final {
     navigator_severity_t severity = navigator_severity_t::none;
     bool selectable = true;
     bool expandable = false;
+};
+
+class failing_source_allocator_t final : public navigator_source_allocator_t {
+public:
+    view_context_t allocate_copy(const view_context_t&) const override
+    {
+        throw std::bad_alloc{};
+    }
 };
 
 class fixture_store_t final : public navigator_packed_store_adapter_t {
@@ -358,6 +367,25 @@ void verify_address_navigation()
     source.selection.entity_key = "navigator-harness-source";
     source.synchronization_group = 0;
     source.synchronization_policy = view_synchronization_policy_t::independent;
+
+    failing_source_allocator_t failing_source_allocator;
+    navigator_navigation_model_t allocation_failure_navigation(
+        store, {7}, {91}, 201, true, &failing_source_allocator);
+    const navigator_error_t source_allocation_failure =
+        allocation_failure_navigation.set_source(source);
+    require(source_allocation_failure.code == navigator_error_code_t::resource_exhausted &&
+                source_allocation_failure.domain == navigator_domain_t::invalid &&
+                source_allocation_failure.subject == source.view.value,
+            "source allocation failure violated the navigation error contract");
+    navigation_event_t allocation_failure_event;
+    const navigator_error_t allocation_failure_rejected =
+        allocation_failure_navigation.make_address_event(page.rows.front(), allocation_failure_event);
+    require(allocation_failure_rejected.code == navigator_error_code_t::navigation_rejected &&
+                allocation_failure_rejected.domain == navigator_domain_t::symbols &&
+                allocation_failure_rejected.subject == 77 && allocation_failure_event.id.value == 0 &&
+                allocation_failure_event.sequence == 0,
+            "source allocation failure retained a navigation source");
+
     require(navigation.set_source(source).ok(), "navigation source rejected");
 
     navigation_event_t event;

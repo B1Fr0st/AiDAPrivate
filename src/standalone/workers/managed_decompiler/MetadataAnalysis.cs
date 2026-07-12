@@ -94,7 +94,7 @@ internal static class MetadataAnalysis
             !Path.IsPathFullyQualified(request.ModulePath) || request.WorkspaceGeneration == 0 || request.MetadataToken == 0 ||
             request.Budget is null || request.Provider is null || !IsLowerHexDigest(request.ModuleHash) ||
             !FixedTimeHexEquals(request.OfflineLockHash, OfflinePackageLock.ManifestHashHex) ||
-            request.Budget.MaxWallClockMs == 0 || request.Budget.MaxCpuMs == 0 || request.Budget.MaxMemoryBytes == 0 ||
+            request.Budget.MaxWallClockMs == 0 || !WorkerBudgetLimits.IsSane(request.Budget) ||
             request.Budget.MaxProviderIrNodes == 0 || request.Budget.Profile is not ("fast" or "balanced" or "thorough") ||
             !string.Equals(request.Provider.Version, "10.1.0.8386", StringComparison.Ordinal) ||
             !FixedTimeHexEquals(request.Provider.DecompilerAssemblyHash, OfflinePackageLock.DecompilerAssemblySha256) ||

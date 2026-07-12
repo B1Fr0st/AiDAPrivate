@@ -1785,6 +1785,9 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/analysis/workspace/decompiler_service.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/decompiler_feedback.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/elf_image.cpp"
+            "${STANDALONE_ROOT}/core/analysis/readers/elf_reader.cpp"
+            "${STANDALONE_ROOT}/core/analysis/readers/pe_coff_reader.cpp"
+            "${STANDALONE_ROOT}/core/analysis/image_layout_index.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/macho_image.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/zip_container.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/apk_container.cpp"
@@ -2028,9 +2031,15 @@ if(WIN32)
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
         target_sources(AiDAStandalone PRIVATE ${AIDA_C03_WAVE_B_STANDALONE_SOURCES})
+        if(NOT Z3_FOUND OR NOT Z3_INCLUDE_DIRS OR NOT Z3_LIBRARIES OR
+           NOT IS_DIRECTORY "${Z3_INCLUDE_DIRS}" OR NOT EXISTS "${Z3_LIBRARIES}")
+            message(FATAL_ERROR "AiDAStandalone requires the pinned local Z3 include and library dependencies")
+        endif()
+        aida_c03_register_native_decompiler_worker_package(AiDAStandalone)
 
         target_include_directories(AiDAStandalone PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            "${Z3_INCLUDE_DIRS}"
             "${STANDALONE_ROOT}"
             "${STANDALONE_ROOT}/core"
             "${STANDALONE_ROOT}/core/arc"
@@ -2265,6 +2274,7 @@ if(WIN32)
             Zydis
             unicorn
             triton
+            "${Z3_LIBRARIES}"
             capstone::capstone
             nlohmann_json_schema_validator::validator
             libdecomp_aida

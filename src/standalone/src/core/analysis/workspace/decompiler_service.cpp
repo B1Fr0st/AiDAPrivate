@@ -10,10 +10,8 @@
 #include "../../disasm/ghidra_decompiler.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <condition_variable>
-#include <functional>
 #include <future>
 #include <list>
 #include <limits>
@@ -386,6 +384,15 @@ bool result_address_in_range(const resolved_function_t& function,
     return address >= image_base && address < image_end;
 }
 
+bool entity_matches_function(const decompiler_entity_key_t& entity,
+                             const resolved_function_t& function) noexcept {
+    const auto* identity = std::get_if<native_decompiler_entity_identity_t>(&entity.identity);
+    return entity.kind == decompiler_entity_kind_t::native_function && identity != nullptr &&
+        identity->function_id == function.function.id &&
+        same_address(identity->entry, function.function.start) &&
+        same_address(identity->end, function.function.end);
+}
+
 struct decompiler_adapter_inputs_t {
     std::shared_ptr<const workspace_image_t> image;
     ghidra_adapter::ghidra_language_catalog_t language_catalog;
@@ -480,12 +487,80 @@ workspace_result_t<sha256_digest_t> hash_function(
     return sha256_provider(*subrange.value(), cancel, 1ULL << 20);
 }
 
+workspace_error_t typed_contract_error(std::string message,
+                                       const char* phase,
+                                       const std::vector<decompiler_diagnostic_t>& diagnostics) {
+    auto error = make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+        std::move(message), phase);
+    constexpr std::size_t max_diagnostics = 16;
+    for (std::size_t index = 0; index < diagnostics.size() && index < max_diagnostics; ++index) {
+        const auto& diagnostic = diagnostics[index];
+        error.details.emplace_back("typed_diagnostic_" + std::to_string(index),
+            std::to_string(static_cast<unsigned int>(diagnostic.code)) + ":" +
+                diagnostic.localization_key);
+    }
+    return error;
+}
+
+workspace_result_t<std::string> make_typed_artifact_cache_identity(
+    const decompiler_typed_artifacts_t& artifacts) {
+    const auto provider_validation = validate_provider_ir(artifacts.provider_ir);
+    const auto hir_validation = validate_hir_function(artifacts.hir);
+    const auto type_validation = validate_type_graph(artifacts.type_graph);
+    std::vector<decompiler_diagnostic_t> diagnostics;
+    diagnostics.insert(diagnostics.end(), provider_validation.diagnostics.begin(), provider_validation.diagnostics.end());
+    diagnostics.insert(diagnostics.end(), hir_validation.diagnostics.begin(), hir_validation.diagnostics.end());
+    diagnostics.insert(diagnostics.end(), type_validation.diagnostics.begin(), type_validation.diagnostics.end());
+    if (!provider_validation.valid() || !hir_validation.valid() || !type_validation.valid() ||
+        !(artifacts.provider_ir.entity == artifacts.hir.entity) ||
+        !(artifacts.provider_ir.entity == artifacts.type_graph.entity) ||
+        artifacts.hir.type_graph_revision != artifacts.type_graph.revision) {
+        if (diagnostics.empty()) {
+            decompiler_diagnostic_t diagnostic;
+            diagnostic.severity = decompiler_diagnostic_severity_t::error;
+            diagnostic.code = decompiler_diagnostic_code_t::malformed_hir;
+            diagnostic.localization_key = "decompiler.service.v2.artifact_binding";
+            diagnostic.ordinal = 1;
+            diagnostics.push_back(std::move(diagnostic));
+        }
+        return workspace_result_t<std::string>::failure(typed_contract_error(
+            "typed decompiler artifacts violate the provider, HIR, or type-graph contract",
+            "decompiler.typed.v2.cache_identity", diagnostics));
+    }
+    try {
+        const auto provider_hash = stable_serialization_hash(artifacts.provider_ir);
+        if (artifacts.hir.provider_ir_hash != provider_hash) {
+            decompiler_diagnostic_t diagnostic;
+            diagnostic.severity = decompiler_diagnostic_severity_t::error;
+            diagnostic.code = decompiler_diagnostic_code_t::malformed_hir;
+            diagnostic.localization_key = "decompiler.service.v2.provider_ir_hash";
+            diagnostic.ordinal = 1;
+            return workspace_result_t<std::string>::failure(typed_contract_error(
+                "typed HIR does not bind to the submitted provider IR",
+                "decompiler.typed.v2.cache_identity", {diagnostic}));
+        }
+        return workspace_result_t<std::string>::success(
+            provider_hash.to_hex() + ":" + stable_serialization_hash(artifacts.hir).to_hex() + ":" +
+            stable_serialization_hash(artifacts.type_graph).to_hex());
+    } catch (const std::exception&) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::malformed_serialization;
+        diagnostic.localization_key = "decompiler.service.v2.artifact_serialization";
+        diagnostic.ordinal = 1;
+        return workspace_result_t<std::string>::failure(typed_contract_error(
+            "typed decompiler artifacts cannot be canonically serialized",
+            "decompiler.typed.v2.cache_identity", {diagnostic}));
+    }
+}
+
 workspace_result_t<decompiler_cache_key_t> make_cache_key(
     const resolved_function_t& function,
     const workspace_database_versions_t& versions,
     const sha256_digest_t& content_hash,
     const std::optional<decompiler_request_context_t>& context,
     const ghidra_decompiler::ghidra_adapter_decompile_cache_key_t& adapter_cache_key,
+    const std::string& typed_artifact_identity,
     const decompiler_service_limits_t& limits) {
     const auto& identity = function.workspace->identity();
     decompiler_cache_key_t key;
@@ -498,7 +573,8 @@ workspace_result_t<decompiler_cache_key_t> make_cache_key(
     key.engine_version = versions.engine_version;
     key.specification_version = versions.specification_version;
     key.analysis_settings_hash = versions.analysis_settings_hash;
-    std::string scope = "|ghidra-adapter-decompile=" + adapter_cache_key.digest.to_hex();
+    std::string scope = "|ghidra-adapter-decompile=" + adapter_cache_key.digest.to_hex() +
+        "|typed-artifacts=" + typed_artifact_identity;
     if (context) {
         scope += std::string{"|decompiler-context:v1|workspace="} +
             context->workspace_id + "|space=" + address_space_text(*context->address_space) +
@@ -540,8 +616,9 @@ json serialize_result(const decompiler_result_t& result) {
     json callees = json::array();
     for (const auto& item : result.callees)
         callees.push_back({item.first, item.second});
+    const std::string document = serialize_pseudocode_document_v2(result.document);
     return json{{"function_name", result.function_name},
-        {"pseudocode", result.pseudocode}, {"annotations", std::move(annotations)},
+        {"document_v2", document}, {"pseudocode", result.pseudocode}, {"annotations", std::move(annotations)},
         {"line_to_address", std::move(lines)}, {"callees", std::move(callees)},
         {"sleigh_id", result.sleigh_id}, {"elapsed_ms", result.elapsed_ms}};
 }
@@ -570,6 +647,11 @@ workspace_result_t<decompiler_result_t> deserialize_result(
         result.function_id = function.function.id;
         result.function_address = function.function.start;
         result.function_name = value.at("function_name").get<std::string>();
+        const auto decoded_document = deserialize_pseudocode_document_v2(
+            value.at("document_v2").get<std::string>());
+        if (!decoded_document.valid())
+            throw std::invalid_argument("typed document is invalid");
+        result.document = *decoded_document.value;
         result.pseudocode = value.at("pseudocode").get<std::string>();
         result.sleigh_id = value.at("sleigh_id").get<std::string>();
         result.elapsed_ms = value.value("elapsed_ms", 0.0);
@@ -577,7 +659,9 @@ workspace_result_t<decompiler_result_t> deserialize_result(
         result.analysis_revision = function.analysis_revision;
         result.overlay_revision = function.overlay_revision;
         if (result.pseudocode.empty() ||
-            result.pseudocode.size() > limits.max_pseudocode_bytes)
+            result.pseudocode.size() > limits.max_pseudocode_bytes ||
+            result.document.rendered_text != result.pseudocode ||
+            !entity_matches_function(result.document.entity, function))
             throw std::length_error("pseudocode exceeds limit");
         const auto& annotations = value.at("annotations");
         if (!annotations.is_array() || annotations.size() > limits.max_annotations)
@@ -636,6 +720,15 @@ workspace_result_t<decompiler_result_t> deserialize_result(
 std::uint64_t result_size(const decompiler_result_t& result) {
     std::uint64_t size = result.pseudocode.size() + result.function_name.size() +
         result.sleigh_id.size();
+    try {
+        const std::string document = serialize_pseudocode_document_v2(result.document);
+        std::uint64_t next = 0;
+        if (!checked_add_u64(size, document.size(), next))
+            return (std::numeric_limits<std::uint64_t>::max)();
+        size = next;
+    } catch (const std::exception&) {
+        return (std::numeric_limits<std::uint64_t>::max)();
+    }
     if (result.context)
         size += result.context->workspace_id.size();
     for (const auto& item : result.annotations)
@@ -659,8 +752,24 @@ workspace_result_t<void> validate_result_size(
         size = next;
         return true;
     };
+    const auto document_validation = validate_decompiler_document(result.document);
+    if (!document_validation.valid() || result.document.rendered_text != result.pseudocode) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "decompiler result does not contain a valid typed document bound to its rendered text",
+            phase));
+    }
+    std::string serialized_document;
+    try {
+        serialized_document = serialize_pseudocode_document_v2(result.document);
+    } catch (const std::exception&) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "decompiler typed document cannot be serialized",
+            phase));
+    }
     if (!add(result.pseudocode.size()) || !add(result.function_name.size()) ||
-        !add(result.sleigh_id.size()) ||
+        !add(result.sleigh_id.size()) || !add(serialized_document.size()) ||
         (result.context && !add(result.context->workspace_id.size()))) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::range_overflow,
@@ -741,8 +850,6 @@ make_adapter_decompile_request(
     const decompiler_adapter_inputs_t& adapter,
     const decompiler_service_limits_t& limits,
     const cancellation_token_t& cancel,
-    std::atomic<bool>* engine_cancel,
-    std::function<bool()> cancel_check,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
     ghidra_decompiler::ghidra_adapter_decompile_request_t request;
     request.workspace_identity = &function.workspace->identity();
@@ -759,95 +866,10 @@ make_adapter_decompile_request(
     request.function = adapter.function;
     request.type_revision = context ? *context->type_revision : function.analysis_revision;
     request.cancellation = cancel;
-    request.engine_cancel = engine_cancel;
-    request.cancel_check = std::move(cancel_check);
     request.deadline = deadline;
     request.result_limits = make_adapter_result_limits(limits);
     return workspace_result_t<ghidra_decompiler::ghidra_adapter_decompile_request_t>::success(
         std::move(request));
-}
-
-const char* adapter_error_code_text(
-    ghidra_decompiler::ghidra_adapter_error_code_t code) noexcept {
-    switch (code) {
-    case ghidra_decompiler::ghidra_adapter_error_code_t::cancelled:
-        return "cancelled";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::deadline_exceeded:
-        return "deadline_exceeded";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::result_limit_exceeded:
-        return "result_limit_exceeded";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::invalid_request:
-        return "invalid_request";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::unsupported_language_family:
-        return "unsupported_language_family";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::language_family_not_staged:
-        return "language_family_not_staged";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::adapter_revision_mismatch:
-        return "adapter_revision_mismatch";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::adapter_cache_key_mismatch:
-        return "adapter_cache_key_mismatch";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::function_not_found:
-        return "function_not_found";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::decompiler_unavailable:
-        return "decompiler_unavailable";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::decompilation_failed:
-        return "decompilation_failed";
-    case ghidra_decompiler::ghidra_adapter_error_code_t::none:
-        return "none";
-    }
-    return "unknown";
-}
-
-workspace_error_t map_adapter_error(
-    const ghidra_decompiler::ghidra_adapter_error_t& adapter_error,
-    const address_t& address) {
-    workspace_error_code_t code = workspace_error_code_t::decode_failure;
-    switch (adapter_error.code) {
-    case ghidra_decompiler::ghidra_adapter_error_code_t::cancelled:
-        code = workspace_error_code_t::cancelled;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::deadline_exceeded:
-        code = workspace_error_code_t::deadline_exceeded;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::result_limit_exceeded:
-        code = workspace_error_code_t::limit_exceeded;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::invalid_request:
-        code = workspace_error_code_t::invalid_argument;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::unsupported_language_family:
-    case ghidra_decompiler::ghidra_adapter_error_code_t::language_family_not_staged:
-        code = workspace_error_code_t::unsupported_format;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::adapter_revision_mismatch:
-    case ghidra_decompiler::ghidra_adapter_error_code_t::adapter_cache_key_mismatch:
-        code = workspace_error_code_t::revision_conflict;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::function_not_found:
-        code = workspace_error_code_t::target_not_found;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::decompiler_unavailable:
-        code = workspace_error_code_t::provider_unavailable;
-        break;
-    case ghidra_decompiler::ghidra_adapter_error_code_t::decompilation_failed:
-    case ghidra_decompiler::ghidra_adapter_error_code_t::none:
-        break;
-    }
-    auto error = make_workspace_error(code,
-        adapter_error.message.empty() ? "Ghidra adapter decompilation failed"
-                                      : adapter_error.message,
-        adapter_error.phase.empty() ? "decompiler.ghidra.adapter" : adapter_error.phase);
-    error.address = address;
-    error.cancellation = adapter_error.code ==
-        ghidra_decompiler::ghidra_adapter_error_code_t::cancelled;
-    error.deadline = adapter_error.code ==
-        ghidra_decompiler::ghidra_adapter_error_code_t::deadline_exceeded;
-    error.details.emplace_back("adapter_code", adapter_error_code_text(adapter_error.code));
-    if (adapter_error.language_family) {
-        error.details.emplace_back("adapter_language_family",
-            std::to_string(static_cast<unsigned int>(*adapter_error.language_family)));
-    }
-    return error;
 }
 
 }
@@ -856,16 +878,107 @@ bool decompiler_service_v2_result_t::succeeded() const noexcept {
     return ast_build.succeeded() && rendering.has_value() && rendering->succeeded();
 }
 
+namespace {
+
+void append_v2_diagnostics(decompiler_service_v2_result_t& result,
+                           const std::vector<decompiler_diagnostic_t>& diagnostics) {
+    result.diagnostics.insert(result.diagnostics.end(), diagnostics.begin(), diagnostics.end());
+}
+
+void append_v2_diagnostic(decompiler_service_v2_result_t& result,
+                          const decompiler_diagnostic_code_t code,
+                          std::string key) {
+    decompiler_diagnostic_t diagnostic;
+    diagnostic.severity = decompiler_diagnostic_severity_t::error;
+    diagnostic.code = code;
+    diagnostic.localization_key = std::move(key);
+    diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
+    result.diagnostics.push_back(std::move(diagnostic));
+}
+
+}
+
 decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
     const hir_function_t& hir,
     const type_graph_t& type_graph,
     const decompiler_service_v2_request_t& request) {
     decompiler_service_v2_result_t result;
     result.ast_build = build_typed_ast_v2(hir, type_graph, request.ast);
+    append_v2_diagnostics(result, result.ast_build.diagnostics);
     if (!result.ast_build.succeeded())
         return result;
     result.rendering = render_pseudocode_v2(*result.ast_build.ast, type_graph, request.renderer);
+    append_v2_diagnostics(result, result.rendering->diagnostics);
     return result;
+}
+
+decompiler_service_v2_result_t decompiler_service_t::render_provider_document_v2(
+    const provider_ir_t& provider_ir,
+    const hir_function_t& hir,
+    const type_graph_t& type_graph,
+    const decompiler_service_v2_request_t& request) {
+    decompiler_service_v2_result_t result;
+    const auto provider_validation = validate_provider_ir(provider_ir);
+    if (!provider_validation.valid()) {
+        append_v2_diagnostics(result, provider_validation.diagnostics);
+        return result;
+    }
+    if (!(provider_ir.entity == hir.entity) || !(provider_ir.entity == type_graph.entity)) {
+        append_v2_diagnostic(result, decompiler_diagnostic_code_t::malformed_hir,
+            "decompiler.service.v2.entity_binding");
+        return result;
+    }
+    if (hir.provider_ir_hash != stable_serialization_hash(provider_ir)) {
+        append_v2_diagnostic(result, decompiler_diagnostic_code_t::malformed_hir,
+            "decompiler.service.v2.provider_ir_hash");
+        return result;
+    }
+    if (hir.type_graph_revision != type_graph.revision) {
+        append_v2_diagnostic(result, decompiler_diagnostic_code_t::malformed_type_graph,
+            "decompiler.service.v2.type_graph_revision");
+        return result;
+    }
+    result = render_typed_pseudocode_v2(hir, type_graph, request);
+    return result;
+}
+
+namespace {
+
+workspace_error_t typed_artifact_error(std::string message,
+                                       const char* phase,
+                                       const decompiler_service_v2_result_t& result) {
+    auto error = make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+        std::move(message), phase);
+    constexpr std::size_t max_diagnostics = 16;
+    for (std::size_t index = 0; index < result.diagnostics.size() && index < max_diagnostics; ++index) {
+        const auto& diagnostic = result.diagnostics[index];
+        error.details.emplace_back("typed_diagnostic_" + std::to_string(index),
+            std::to_string(static_cast<unsigned int>(diagnostic.code)) + ":" +
+                diagnostic.localization_key);
+    }
+    return error;
+}
+
+workspace_result_t<void> validate_typed_artifacts_for_function(
+    const decompiler_typed_artifacts_t& artifacts,
+    const resolved_function_t& function) {
+    if (!entity_matches_function(artifacts.hir.entity, function)) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::provider_binding_mismatch,
+            "typed decompiler artifacts are not bound to the requested native function",
+            "decompiler.typed.v2.binding"));
+    }
+    return workspace_result_t<void>::success();
+}
+
+std::string document_function_name(const decompiler_document_t& document) {
+    const auto root = std::find_if(document.ast.nodes.begin(), document.ast.nodes.end(),
+        [&document](const typed_pseudocode_ast_node_t& node) {
+            return node.id == document.ast.root_node_id;
+        });
+    return root == document.ast.nodes.end() ? std::string{} : root->stable_text;
+}
+
 }
 
 struct decompiler_service_t::state_t {
@@ -1813,6 +1926,21 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
         cancel, workspace_cancel, deadline_token, "decompiler.preflight");
     if (!current)
         return fail(current.error());
+    if (!request.typed_artifacts) {
+        decompiler_service_v2_result_t typed;
+        append_v2_diagnostic(typed, decompiler_diagnostic_code_t::unsupported_provider,
+            "decompiler.service.v2.provider_ir_required");
+        return fail(typed_artifact_error(
+            "decompiler provider did not supply canonical provider IR, HIR, and type graph artifacts",
+            "decompiler.typed.v2.required", typed));
+    }
+    auto typed_binding = validate_typed_artifacts_for_function(*request.typed_artifacts,
+        function.value());
+    if (!typed_binding)
+        return fail(typed_binding.error());
+    auto typed_cache_identity = make_typed_artifact_cache_identity(*request.typed_artifacts);
+    if (!typed_cache_identity)
+        return fail(typed_cache_identity.error());
     auto adapter = prepare_adapter_inputs(function.value(), cancel);
     if (!adapter)
         return fail(adapter.error());
@@ -1820,21 +1948,8 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
         cancel, workspace_cancel, deadline_token, "decompiler.adapter");
     if (!current)
         return fail(current.error());
-    std::atomic<bool> engine_cancel{false};
-    auto service_cancel = state_->cancellation.token();
-    const auto function_value = function.value();
-    const auto context_value = request.context;
-    auto cancel_check = [state = state_, workspace, function_value, context_value,
-                         cancel, workspace_cancel, deadline_token, service_cancel,
-                         &engine_cancel]() {
-        return engine_cancel.load(std::memory_order_acquire) ||
-            cancel.stop_requested() || workspace_cancel.stop_requested() ||
-            service_cancel.stop_requested() || deadline_token.stop_requested() ||
-            !ensure_request_current(state, workspace, function_value, context_value,
-                cancel, workspace_cancel, deadline_token, "decompiler.ghidra.cancel_check");
-    };
     auto adapter_request = make_adapter_decompile_request(function.value(), request.context,
-        adapter.value(), state_->limits, cancel, &engine_cancel, cancel_check, request.deadline);
+        adapter.value(), state_->limits, cancel, request.deadline);
     if (!adapter_request)
         return fail(adapter_request.error());
     auto adapter_decompile_cache_key =
@@ -1855,7 +1970,8 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     if (!current)
         return fail(current.error());
     auto cache_key = make_cache_key(function.value(), state_->versions,
-        content_hash.value(), request.context, adapter_decompile_cache_key.value(), state_->limits);
+        content_hash.value(), request.context, adapter_decompile_cache_key.value(),
+        typed_cache_identity.value(), state_->limits);
     if (!cache_key)
         return fail(cache_key.error());
     const std::string canonical_key = cache_key.value().canonical();
@@ -1975,98 +2091,37 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     }
     context_guard_t context_guard(state_);
 
-    auto adapter_result = ghidra_decompiler::decompile_adapter(adapter_request.value());
-    if (!adapter_result) {
-        current = ensure_request_current(state_, workspace, function.value(), request.context,
-            cancel, workspace_cancel, deadline_token, "decompiler.ghidra.complete");
-        if (!current)
-            return fail(current.error());
-        return fail(adapter_result.error());
+    const auto render_started = std::chrono::steady_clock::now();
+    auto rendered = render_provider_document_v2(request.typed_artifacts->provider_ir,
+        request.typed_artifacts->hir, request.typed_artifacts->type_graph);
+    if (!rendered.succeeded()) {
+        return fail(typed_artifact_error(
+            "decompiler provider artifacts could not be lowered to a typed V2 document",
+            "decompiler.typed.v2.lower", rendered));
     }
-    auto adapter_output = adapter_result.take_value();
     current = ensure_request_current(state_, workspace, function.value(), request.context,
-        cancel, workspace_cancel, deadline_token, "decompiler.ghidra.complete");
+        cancel, workspace_cancel, deadline_token, "decompiler.typed.v2.complete");
     if (!current)
         return fail(current.error());
-    if (adapter_output.cache_key.digest.to_hex() !=
-        adapter_decompile_cache_key.value().digest.to_hex()) {
-        return fail(make_workspace_error(workspace_error_code_t::integrity_failure,
-            "Ghidra adapter returned a decompile cache key that does not match the validated request",
-            "decompiler.ghidra.adapter"));
-    }
-    auto native = std::move(adapter_output.result);
-
-    if (native.is_error || !native.complete || native.pseudocode.empty()) {
-        auto adapter_error = native.adapter_error;
-        if (adapter_error.message.empty()) {
-            adapter_error.message = native.error_text.empty()
-                ? "native decompiler returned no structured result" : native.error_text;
-        }
-        return fail(map_adapter_error(adapter_error, function.value().function.start));
-    }
-    if (native.pseudocode.size() > state_->limits.max_pseudocode_bytes ||
-        native.annotations.size() > state_->limits.max_annotations ||
-        native.line_to_address.size() > state_->limits.max_annotations ||
-        native.callees.size() > state_->limits.max_annotations) {
-        return fail(make_workspace_error(
-            workspace_error_code_t::limit_exceeded,
-            "native decompiler output exceeds the workspace result budget",
-            "decompiler.ghidra"));
-    }
-
-    const std::size_t mapping_budget = state_->limits.max_annotations;
 
     decompiler_result_t result;
     result.binary_id = workspace->identity().binary_id();
     result.context = request.context;
     result.function_id = function.value().function.id;
     result.function_address = function.value().function.start;
-    result.function_name = std::move(native.function_name);
-    result.pseudocode = std::move(native.pseudocode);
-    result.sleigh_id = std::move(native.sleigh_id);
+    result.document = std::move(*rendered.rendering->document);
+    result.function_name = document_function_name(result.document);
+    result.pseudocode = result.document.rendered_text;
+    result.sleigh_id = request.typed_artifacts->provider_ir.language.language_id;
     result.generation = function.value().generation;
     result.analysis_revision = function.value().analysis_revision;
     result.overlay_revision = function.value().overlay_revision;
-    result.elapsed_ms = native.elapsed_ms;
-
-    result.line_to_address.reserve(
-        std::min(native.line_to_address.size(), mapping_budget));
-    for (const auto& entry : native.line_to_address) {
-        if (result.line_to_address.size() >= mapping_budget)
-            break;
-        if (result_address_in_range(function.value(), entry.second))
-            result.line_to_address.push_back(entry);
-    }
-
-    result.callees.reserve(
-        std::min(native.callees.size(), mapping_budget));
-    for (const auto& entry : native.callees) {
-        if (result.callees.size() >= mapping_budget)
-            break;
-        if (result_address_in_range(function.value(), entry.second))
-            result.callees.push_back(entry);
-    }
-
-    result.annotations.reserve(
-        std::min(native.annotations.size(), mapping_budget));
-    for (auto& item : native.annotations) {
-        if (result.annotations.size() >= mapping_budget)
-            break;
-        if (item.start > item.end || item.end > result.pseudocode.size()) {
-            return fail(make_workspace_error(
-                workspace_error_code_t::integrity_failure,
-                "native decompiler produced an invalid annotation range",
-                "decompiler.ghidra"));
-        }
-        decompiler_annotation_t annotation;
-        annotation.kind = static_cast<std::uint8_t>(item.kind);
-        annotation.start = item.start;
-        annotation.end = item.end;
-        annotation.address = item.offset;
-        annotation.name = std::move(item.name);
-        if (!result_address_in_range(function.value(), annotation.address))
-            continue;
-        result.annotations.push_back(std::move(annotation));
+    result.elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - render_started).count();
+    if (result.function_name.empty()) {
+        return fail(make_workspace_error(workspace_error_code_t::integrity_failure,
+            "typed decompiler document does not identify its function",
+            "decompiler.typed.v2.document"));
     }
 
     auto size = validate_result_size(result, state_->limits, "decompiler.output");

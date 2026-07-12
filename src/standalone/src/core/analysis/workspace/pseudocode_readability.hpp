@@ -510,8 +510,5 @@ std::string make_pseudocode_cache_key(const pseudocode_cache_key_material_t& mat
 pseudocode_render_result_t render_typed_pseudocode(
     const typed_pseudocode_ast_t& ast,
     const pseudocode_render_request_t& request);
-pseudocode_render_result_t render_typed_pseudocode(
-    const typed_pseudocode_ast_t* ast,
-    const pseudocode_render_request_t& request);
 
 }

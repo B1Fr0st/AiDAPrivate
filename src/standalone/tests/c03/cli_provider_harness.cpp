@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -374,6 +375,42 @@ void validate_malformed_contracts(
     }
 }
 
+void validate_resource_budget_bounds(
+    const std::filesystem::path& root,
+    const managed_cli::offline_lock_t& lock,
+    const json& manifest)
+{
+    const auto request = fixture_request(root, lock, manifest.at("methods").front(), 0);
+    const auto require_rejected = [&request](const decompiler_profile_budget_t& profile, const char* message) {
+        require(!validate_decompiler_profile(profile).valid(), message);
+        auto candidate = request;
+        candidate.profile = profile;
+        require(!managed_cli::serialize_request(candidate).has_value(), message);
+    };
+
+    auto cpu_uint64_max = request.profile;
+    cpu_uint64_max.max_cpu_ms = (std::numeric_limits<std::uint64_t>::max)();
+    require_rejected(cpu_uint64_max, "managed CLI accepted UINT64_MAX CPU budget");
+
+    auto cpu_oversized = request.profile;
+    cpu_oversized.max_cpu_ms = k_decompiler_profile_max_cpu_ms + 1;
+    require_rejected(cpu_oversized, "managed CLI accepted oversized CPU budget");
+
+    auto memory_uint64_max = request.profile;
+    memory_uint64_max.max_memory_bytes = (std::numeric_limits<std::uint64_t>::max)();
+    require_rejected(memory_uint64_max, "managed CLI accepted UINT64_MAX memory budget");
+
+    auto memory_oversized = request.profile;
+    memory_oversized.max_memory_bytes = k_decompiler_profile_max_memory_bytes + 1;
+    require_rejected(memory_oversized, "managed CLI accepted oversized memory budget");
+
+    auto tiny = request;
+    tiny.profile.max_cpu_ms = 1;
+    tiny.profile.max_memory_bytes = 1;
+    require(validate_decompiler_profile(tiny.profile).valid(), "managed CLI rejected tiny bounded profile");
+    require(managed_cli::serialize_request(tiny).has_value(), "managed CLI rejected tiny bounded request");
+}
+
 }
 
 void run_cli_provider_harness()
@@ -387,6 +424,7 @@ void run_cli_provider_harness()
     for (const auto& fixture : manifest.at("methods"))
         validate_method_contract(root, lock, fixture, index++);
     validate_malformed_contracts(root, lock, manifest);
+    validate_resource_budget_bounds(root, lock, manifest);
 }
 
 }

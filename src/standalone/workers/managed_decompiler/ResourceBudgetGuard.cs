@@ -40,11 +40,9 @@ internal sealed class ResourceBudgetGuard : IAsyncDisposable
 
     internal ResourceBudgetGuard(WorkerBudget budget)
     {
-        if (budget.MaxCpuMs == 0 || budget.MaxMemoryBytes == 0)
+        if (!WorkerBudgetLimits.IsSane(budget))
             throw new InvalidDataException("managed decompiler resource budget is invalid");
-        maximumCpuTicks = budget.MaxCpuMs > (ulong)long.MaxValue / (ulong)TimeSpan.TicksPerMillisecond
-            ? long.MaxValue
-            : checked((long)budget.MaxCpuMs * TimeSpan.TicksPerMillisecond);
+        maximumCpuTicks = checked((long)budget.MaxCpuMs * TimeSpan.TicksPerMillisecond);
         maximumMemoryBytes = budget.MaxMemoryBytes;
         process = Process.GetCurrentProcess();
         process.Refresh();

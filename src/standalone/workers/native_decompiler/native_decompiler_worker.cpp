@@ -1,4 +1,4 @@
-#include "native_worker_runtime.hpp"
+#include "ghidra_native_provider.hpp"
 
 int wmain(int argc, wchar_t** argv)
 {
@@ -19,7 +19,15 @@ int wmain(int argc, wchar_t** argv)
             "decompiler.native_worker.snapshot_integrity");
         return 5;
     }
-    runtime::send_failure(startup, job->job_id, decompiler_diagnostic_code_t::unsupported_provider,
-        "decompiler.native_worker.typed_provider_unavailable");
-    return 0;
+    const auto result = ghidra_native_provider::produce(startup, *job);
+    if (!result.document) {
+        const auto diagnostic = result.diagnostics.empty()
+            ? runtime::failure_diagnostic(decompiler_diagnostic_code_t::provider_failure,
+                "decompiler.native_worker.typed_provider_failed")
+            : result.diagnostics.front();
+        runtime::send_failure(startup, job->job_id, diagnostic.code, diagnostic.localization_key,
+            diagnostic.retryable);
+        return 6;
+    }
+    return runtime::send_document(startup, job->job_id, *result.document) ? 0 : 7;
 }

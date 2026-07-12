@@ -29,6 +29,7 @@
 #include "zydis_disasm.hpp"
 #include "../analysis/pe_parser.hpp"
 #include "../analysis/workspace/analysis_workspace.hpp"
+#include "../analysis/decompiler/providers/ghidra_ir_adapter.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 #include "ghidra_adapters/aida_ghidra_preamble.hpp"
@@ -100,6 +101,7 @@ struct ghidra_adapter_decompile_cache_key_t {
 	uint64_t type_revision = 0;
 	aida::analysis::ghidra_adapter::ghidra_adapter_cache_key_t adapter_cache_key;
 	aida::analysis::ghidra_adapter::ghidra_entity_address_key_t function;
+	std::optional<aida::analysis::decompiler_entity_key_t> typed_entity;
 	ghidra_decompile_result_limits_t result_limits;
 };
 
@@ -135,6 +137,8 @@ struct ghidra_result_t {
 	bool is_error = false;
 	std::string error_text;
 	ghidra_adapter_error_t adapter_error;
+	std::optional<aida::analysis::ghidra_ir_adapter::typed_artifacts_t> typed_artifacts;
+	std::vector<aida::analysis::decompiler_diagnostic_t> typed_diagnostics;
 	double elapsed_ms = 0.0;
 };
 
@@ -701,7 +705,8 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
                                     uint64_t entry_addr,
                                     std::atomic<bool>* cancel = nullptr,
                                     std::optional<std::chrono::steady_clock::time_point> request_deadline = {},
-                                    const ghidra_decompile_result_limits_t& result_limits = {})
+                                    const ghidra_decompile_result_limits_t& result_limits = {},
+                                    const aida::analysis::ghidra_ir_adapter::capture_request_t* typed_request = nullptr)
 {
 	ghidra_result_t result;
 	result.function_addr = entry_addr;
@@ -901,6 +906,13 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 
 	(void)perform_res;
 	(void)perform_ms;
+
+	if (typed_request) {
+		auto typed = aida::analysis::ghidra_ir_adapter::extract(*fd, *typed_request);
+		result.typed_diagnostics = std::move(typed.diagnostics);
+		if (typed.artifacts)
+			result.typed_artifacts = std::move(*typed.artifacts);
+	}
 
 	std::ostringstream xml_oss;
 	bool produced_markup = false;
@@ -1507,7 +1519,8 @@ inline ghidra_result_t decompile_workspace(
 	std::function<bool()> cancel_check,
 	std::vector<aida_ghidra::provider_patch_t> patches = {},
 	std::optional<std::chrono::steady_clock::time_point> deadline = {},
-	const ghidra_decompile_result_limits_t& result_limits = {})
+	const ghidra_decompile_result_limits_t& result_limits = {},
+	const aida::analysis::ghidra_ir_adapter::capture_request_t* typed_request = nullptr)
 {
 	active_decompile_guard_t active_guard(cancel);
 	ghidra_result_t result;
@@ -1556,7 +1569,7 @@ inline ghidra_result_t decompile_workspace(
 			(cancel_check && cancel_check()))
 			throw ghidra::LowlevelError("cancelled");
 		result = detail::do_decompile(prepared.arch.get(), entry_addr, cancel, deadline,
-			result_limits);
+			result_limits, typed_request);
 	}
 	catch (ghidra::LowlevelError& error) {
 		result.is_error = true;
@@ -1658,6 +1671,13 @@ inline aida::analysis::workspace_result_t<void> validate_ghidra_adapter_request(
 				"Ghidra adapter decompile request is incomplete or contains invalid result limits",
 				"ghidra.adapter.validate"));
 	}
+	if (request.typed_entity && !aida::analysis::validate_decompiler_entity_key(*request.typed_entity).valid()) {
+		return aida::analysis::workspace_result_t<void>::failure(
+			aida::analysis::make_workspace_error(
+				aida::analysis::workspace_error_code_t::invalid_argument,
+				"Ghidra adapter typed entity does not satisfy the native provider contract",
+				"ghidra.adapter.validate"));
+	}
 
 	auto image_valid = aida::analysis::validate_workspace_image(
 		*request.normalized_image, {}, true, cancel);
@@ -1696,15 +1716,6 @@ inline aida::analysis::workspace_result_t<void> validate_ghidra_adapter_request(
 		request.language, active_specs_dir(), cancel);
 	if (!staged_files)
 		return staged_files;
-	if (request.language.family !=
-		aida::analysis::ghidra_adapter::ghidra_language_family_t::x86) {
-		return aida::analysis::workspace_result_t<void>::failure(
-			aida::analysis::make_workspace_error(
-				aida::analysis::workspace_error_code_t::unsupported_format,
-				"the selected Ghidra language is staged but native adapter execution is not enabled for this family",
-				"ghidra.adapter.native_gate"));
-	}
-
 	auto expected_revision = aida::analysis::ghidra_adapter::make_ghidra_adapter_revision(
 		*request.workspace_identity, *request.analysis_snapshot, cancel);
 	if (!expected_revision)
@@ -1852,6 +1863,54 @@ make_ghidra_adapter_decompile_cache_key(
 	}
 }
 
+inline aida::analysis::ghidra_ir_adapter::capture_request_t
+make_typed_capture_request(const ghidra_adapter_decompile_request_t& request,
+	const aida::analysis::ghidra_adapter::ghidra_function_record_t& function)
+{
+	aida::analysis::ghidra_ir_adapter::capture_request_t output;
+	output.provider.provider = aida::analysis::decompiler_provider_id_t::ghidra_native;
+	output.provider.provider_name = "aida-ghidra-native";
+	output.provider.provider_version = "1";
+	output.provider.provider_binary_hash = aida::analysis::stable_serialization_hash(
+		"aida-ghidra-native-provider-v1");
+	output.provider.worker_build_id = "aida-ghidra-native-inprocess-v1";
+	output.provider.worker_build_hash = aida::analysis::stable_serialization_hash(
+		"aida-ghidra-native-inprocess-build-v1");
+	output.language.language_id = request.language.language_id;
+	output.language.language_version = "ghidra-staged-v1";
+	output.language.compiler_spec_id = request.language.compiler_spec_id;
+	output.language.language_spec_hash = aida::analysis::stable_serialization_hash(
+		request.language.language_id + "|" + request.language.compiler_spec_id);
+	output.language.architecture = request.workspace_identity->architecture();
+	output.language.mode = request.workspace_identity->architecture_mode();
+	output.language.endian = request.workspace_identity->endian();
+	if (request.typed_entity) {
+		output.entity = *request.typed_entity;
+	} else {
+		aida::analysis::native_decompiler_entity_identity_t identity;
+		identity.function_id = function.key.entity_id;
+		identity.entry = function.key.address;
+		identity.end = function.end;
+		if (identity.end.value <= identity.entry.value)
+			identity.end.value = identity.entry.value + 1U;
+		identity.function_bytes_hash = aida::analysis::stable_serialization_hash(
+			request.adapter_cache_key.digest.to_hex() + ":" + std::to_string(function.key.entity_id));
+		identity.canonical_symbol = function.name.empty()
+			? "sub_" + std::to_string(function.key.address.value) : function.name;
+		output.entity.kind = aida::analysis::decompiler_entity_kind_t::native_function;
+		output.entity.format = request.workspace_identity->format();
+		output.entity.architecture = request.workspace_identity->architecture();
+		output.entity.mode = request.workspace_identity->architecture_mode();
+		output.entity.endian = request.workspace_identity->endian();
+		output.entity.identity = std::move(identity);
+	}
+	output.workspace_generation = request.revision.generation;
+	output.type_graph_revision = request.type_revision == 0 ? request.revision.analysis_revision : request.type_revision;
+	if (output.type_graph_revision == 0)
+		output.type_graph_revision = 1;
+	return output;
+}
+
 inline aida::analysis::workspace_result_t<ghidra_adapter_decompile_result_t>
 decompile_adapter(const ghidra_adapter_decompile_request_t& request)
 {
@@ -1919,9 +1978,15 @@ decompile_adapter(const ghidra_adapter_decompile_request_t& request)
 	};
 	std::shared_ptr<const aida::analysis::byte_provider_t> provider(
 		request.load_image, &request.load_image->provider());
+	auto typed_request = make_typed_capture_request(request, *function);
 	ghidra_result_t result = decompile_workspace(provider, request.analysis_snapshot->image,
 		*request.workspace_identity, request.analysis_snapshot, entry_addr, native_cancel,
-		std::move(cancel_check), {}, deadline, request.result_limits);
+		std::move(cancel_check), {}, deadline, request.result_limits, &typed_request);
+	if (!result.is_error && !result.typed_artifacts) {
+		result.is_error = true;
+		result.complete = false;
+		result.error_text = "Ghidra action completed without canonical typed artifacts";
+	}
 	if (result.is_error) {
 		result.adapter_error = detail::make_adapter_execution_error(request, result);
 	} else if (!detail::decompile_result_within_limits(result, request.result_limits)) {

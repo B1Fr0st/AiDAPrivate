@@ -39,11 +39,18 @@ struct decompiler_request_context_t {
     std::optional<std::uint64_t> type_revision;
 };
 
+struct decompiler_typed_artifacts_t {
+    provider_ir_t provider_ir;
+    hir_function_t hir;
+    type_graph_t type_graph;
+};
+
 struct decompiler_request_t {
     bool use_memory_cache = true;
     bool use_persistent_cache = true;
     std::optional<std::chrono::steady_clock::time_point> deadline;
     std::optional<decompiler_request_context_t> context;
+    std::shared_ptr<const decompiler_typed_artifacts_t> typed_artifacts;
     bool publish_feedback = true;
 };
 
@@ -60,6 +67,7 @@ struct decompiler_result_t {
     entity_id_t function_id = 0;
     address_t function_address;
     std::string function_name;
+    decompiler_document_t document;
     std::string pseudocode;
     std::vector<decompiler_annotation_t> annotations;
     std::vector<std::pair<int, std::uint64_t>> line_to_address;
@@ -110,6 +118,7 @@ struct decompiler_service_v2_request_t {
 struct decompiler_service_v2_result_t {
     typed_ast_v2_build_result_t ast_build;
     std::optional<pseudocode_renderer_v2_result_t> rendering;
+    std::vector<decompiler_diagnostic_t> diagnostics;
 
     bool succeeded() const noexcept;
 };
@@ -131,6 +140,11 @@ public:
         std::shared_ptr<decompiler_feedback_model_t> feedback,
         decompiler_service_limits_t limits);
     static decompiler_service_v2_result_t render_typed_pseudocode_v2(
+        const hir_function_t& hir,
+        const type_graph_t& type_graph,
+        const decompiler_service_v2_request_t& request = {});
+    static decompiler_service_v2_result_t render_provider_document_v2(
+        const provider_ir_t& provider_ir,
         const hir_function_t& hir,
         const type_graph_t& type_graph,
         const decompiler_service_v2_request_t& request = {});

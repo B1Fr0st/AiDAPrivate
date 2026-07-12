@@ -1056,7 +1056,7 @@ namespace mcp_standalone::ida_compat
                 !call.read_text(index, items[index], params, "comment", k_max_comment_bytes, true, true, comment))
                 continue;
             overlay_operation_t operation;
-            operation.kind = overlay_operation_kind_t::comment;
+            operation.kind = overlay_operation_kind_t::comment_update;
             operation.address = make_rva(address);
             operation.text = std::move(comment);
             call.add_operation(index, std::move(operation));
@@ -1123,10 +1123,20 @@ namespace mcp_standalone::ida_compat
             if (!call.read_text(index, items[index], params, "name", k_max_name_bytes, true, false, name) ||
                 !call.read_text(index, items[index], params, "definition", k_max_type_bytes, true, false, definition))
                 continue;
+            bool is_struct = true;
+            if (const json* field = find_field(items[index], params, "is_struct")) {
+                if (!field->is_boolean()) {
+                    call.record_item_error(index, "INVALID_PARAM", "is_struct must be a boolean");
+                    continue;
+                }
+                is_struct = field->get<bool>();
+            }
             overlay_operation_t operation;
-            operation.kind = overlay_operation_kind_t::type_declaration;
+            operation.kind = is_struct ? overlay_operation_kind_t::type_declaration
+                                       : overlay_operation_kind_t::enum_definition;
             operation.name = std::move(name);
-            operation.text = std::move(definition);
+            operation.type = std::move(definition);
+            operation.text = operation.type;
             call.add_operation(index, std::move(operation));
         }
         return call.commit();
@@ -1338,8 +1348,9 @@ namespace mcp_standalone::ida_compat
                 !call.read_text(index, items[index], params, "type", k_max_type_bytes, true, false, type))
                 continue;
             overlay_operation_t operation;
-            operation.kind = overlay_operation_kind_t::type_application;
+            operation.kind = overlay_operation_kind_t::type_update;
             operation.address = make_rva(address);
+            operation.name = "address_" + std::to_string(address);
             operation.type = std::move(type);
             call.add_operation(index, std::move(operation));
         }
@@ -1503,7 +1514,7 @@ namespace mcp_standalone::ida_compat
                 continue;
             }
             overlay_operation_t operation;
-            operation.kind = overlay_operation_kind_t::define_function;
+            operation.kind = overlay_operation_kind_t::reanalysis;
             operation.address = target.value->overlay_start;
             operation.end = target.value->overlay_end;
             call.add_operation(index, std::move(operation));

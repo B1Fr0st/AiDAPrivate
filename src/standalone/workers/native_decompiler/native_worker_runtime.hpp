@@ -203,6 +203,17 @@ inline bool send_failure(startup_t& startup, std::uint64_t job_id, decompiler_di
     return send_message(startup, decompiler_worker_message_t{std::move(failure)}, 8U * 1024U * 1024U);
 }
 
+inline bool send_document(startup_t& startup, std::uint64_t job_id, decompiler_document_t document)
+{
+    decompiler_worker_document_message_t result;
+    result.envelope.kind = decompiler_worker_message_kind_t::document;
+    result.envelope.session_nonce_hash = startup.session.nonce_hash;
+    result.envelope.sequence = startup.next_worker_sequence;
+    result.job_id = job_id;
+    result.document = std::move(document);
+    return send_message(startup, decompiler_worker_message_t{std::move(result)}, 8U * 1024U * 1024U);
+}
+
 inline bool send_hello(startup_t& startup, const decompiler_provider_identity_t& provider, const sha256_digest_t& manifest_hash)
 {
     decompiler_worker_hello_t hello;

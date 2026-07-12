@@ -1593,7 +1593,8 @@ decompiler_contract_validation_t validate_decompiler_profile(const decompiler_pr
 {
     decompiler_contract_validation_t result;
     if (value.schema_version != 1 || value.max_wall_clock_ms == 0 || value.max_cpu_ms == 0 ||
-        value.max_memory_bytes == 0 || value.max_provider_ir_nodes == 0 || value.max_hir_nodes == 0 ||
+        value.max_cpu_ms > k_decompiler_profile_max_cpu_ms || value.max_memory_bytes == 0 ||
+        value.max_memory_bytes > k_decompiler_profile_max_memory_bytes || value.max_provider_ir_nodes == 0 || value.max_hir_nodes == 0 ||
         value.max_ast_nodes == 0)
         result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::invalid_contract, "decompiler.profile.budget"));
     if (value.profile != decompiler_profile_id_t::fast && value.profile != decompiler_profile_id_t::balanced &&

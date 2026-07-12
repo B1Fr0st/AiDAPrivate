@@ -1407,16 +1407,4 @@ pseudocode_render_result_t render_typed_pseudocode(
     return renderer_t(ast, request).run();
 }
 
-pseudocode_render_result_t render_typed_pseudocode(
-    const typed_pseudocode_ast_t* ast,
-    const pseudocode_render_request_t& request) {
-    if (ast)
-        return render_typed_pseudocode(*ast, request);
-    pseudocode_render_result_t result;
-    result.errors.push_back({pseudocode_render_error_code_t::invalid_ast,
-        invalid_pseudocode_node_id, invalid_pseudocode_variable_id, {},
-        "typed pseudocode rendering requires a typed AST"});
-    return result;
-}
-
 }

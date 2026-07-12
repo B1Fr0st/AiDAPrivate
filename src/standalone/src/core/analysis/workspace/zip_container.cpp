@@ -4,6 +4,7 @@
 
 #include "zip_container.hpp"
 
+#include "../container/streaming_member_provider.hpp"
 #include "checked_range.hpp"
 #include "jar_container.hpp"
 
@@ -102,13 +103,6 @@ workspace_error_t malformed_error(std::string message, std::string phase,
                                   std::optional<std::uint64_t> size = {}) {
     return zip_error(workspace_error_code_t::malformed_image, std::move(message),
                      std::move(phase), offset, size);
-}
-
-workspace_error_t integrity_error(std::string message,
-                                  std::optional<std::uint64_t> offset = {},
-                                  std::optional<std::uint64_t> size = {}) {
-    return zip_error(workspace_error_code_t::integrity_failure, std::move(message),
-                     "zip_member_integrity", offset, size);
 }
 
 workspace_error_t limit_error(std::string message, std::string phase,
@@ -1666,329 +1660,43 @@ workspace_result_t<parsed_archive_t> parse_archive(
     return workspace_result_t<parsed_archive_t>::success(std::move(archive));
 }
 
-workspace_result_t<std::vector<std::uint8_t>> allocate_output(
-    std::uint64_t size, const char* phase) {
-    std::size_t allocation = 0;
-    if (!u64_to_size(size, allocation))
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            allocation_error(phase, size));
-    return workspace_result_t<std::vector<std::uint8_t>>::success(
-        std::vector<std::uint8_t>(allocation));
-}
-
-workspace_result_t<std::vector<std::uint8_t>> materialize_stored_member(
-    const byte_provider_t& provider, const zip_member_t& member,
-    work_guard_t& work, const cancellation_token_t& cancel) {
-    auto range = validate_span(member.data_offset, member.compressed_size,
-                               provider.size(), "zip_member_integrity");
-    if (!range)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            std::move(range.error()));
-    auto output_result = allocate_output(
-        member.uncompressed_size, "zip_member_integrity");
-    if (!output_result)
-        return output_result;
-    auto output = output_result.take_value();
-    uLong crc = crc32(0L, Z_NULL, 0);
-    std::uint64_t completed = 0;
-    const std::uint64_t chunk_limit = (std::min)(
-        work.limits().max_io_chunk_size,
-        work.limits().cancellation_poll_bytes);
-    while (completed < member.uncompressed_size) {
-        const std::uint64_t chunk = (std::min)(
-            chunk_limit, member.uncompressed_size - completed);
-        auto input_work = work.consume(chunk, "zip_member_integrity");
-        if (!input_work)
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                std::move(input_work.error()));
-        std::uint64_t source_offset = 0;
-        if (!checked_add_u64(member.data_offset, completed, source_offset))
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                integrity_error("Stored ZIP member offset overflowed",
-                                member.data_offset, member.compressed_size));
-        auto read = provider.read_exact(
-            source_offset,
-            output.data() + static_cast<std::size_t>(completed),
-            chunk, cancel);
-        if (!read)
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                std::move(read.error()));
-        crc = crc32(
-            crc,
-            reinterpret_cast<const Bytef*>(
-                output.data() + static_cast<std::size_t>(completed)),
-            static_cast<uInt>(chunk));
-        auto output_work = work.consume(chunk, "zip_member_integrity");
-        if (!output_work)
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                std::move(output_work.error()));
-        completed += chunk;
-    }
-    if (static_cast<std::uint32_t>(crc) != member.crc32)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            integrity_error("Stored ZIP member CRC verification failed",
-                            member.data_offset, member.compressed_size));
-    return workspace_result_t<std::vector<std::uint8_t>>::success(
-        std::move(output));
-}
-
-class inflate_state_t final {
-public:
-    inflate_state_t() {
-        std::memset(&stream_, 0, sizeof(stream_));
-    }
-
-    ~inflate_state_t() {
-        if (initialized_)
-            inflateEnd(&stream_);
-    }
-
-    workspace_result_t<void> initialize() {
-        const int status = inflateInit2(&stream_, -MAX_WBITS);
-        if (status != Z_OK) {
-            auto error = zip_error(
-                status == Z_MEM_ERROR
-                    ? workspace_error_code_t::limit_exceeded
-                    : workspace_error_code_t::integrity_failure,
-                "ZIP raw-DEFLATE initialization failed",
-                "zip_member_integrity");
-            error.provider_status = status;
-            return workspace_result_t<void>::failure(std::move(error));
-        }
-        initialized_ = true;
-        return workspace_result_t<void>::success();
-    }
-
-    z_stream& stream() noexcept {
-        return stream_;
-    }
-
-private:
-    z_stream stream_{};
-    bool initialized_ = false;
-};
-
-workspace_result_t<std::vector<std::uint8_t>> materialize_deflated_member(
-    const byte_provider_t& provider, const zip_member_t& member,
-    work_guard_t& work, const cancellation_token_t& cancel) {
-    auto range = validate_span(member.data_offset, member.compressed_size,
-                               provider.size(), "zip_member_integrity");
-    if (!range)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            std::move(range.error()));
-    auto output_result = allocate_output(
-        member.uncompressed_size, "zip_member_integrity");
-    if (!output_result)
-        return output_result;
-    auto output = output_result.take_value();
-    inflate_state_t inflater;
-    auto initialized = inflater.initialize();
-    if (!initialized)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            std::move(initialized.error()));
-
-    z_stream& stream = inflater.stream();
-    uLong crc = crc32(0L, Z_NULL, 0);
-    std::uint64_t compressed_cursor = 0;
-    std::uint64_t output_cursor = 0;
-    bool stream_ended = false;
-    std::array<std::uint8_t, 1> overflow_sink{};
-    const std::uint64_t input_chunk_limit = (std::min)(
-        work.limits().max_io_chunk_size,
-        work.limits().cancellation_poll_bytes);
-
-    while (compressed_cursor < member.compressed_size && !stream_ended) {
-        const std::uint64_t chunk = (std::min)(
-            input_chunk_limit, member.compressed_size - compressed_cursor);
-        auto input_work = work.consume(chunk, "zip_member_integrity");
-        if (!input_work)
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                std::move(input_work.error()));
-        std::uint64_t source_offset = 0;
-        if (!checked_add_u64(member.data_offset, compressed_cursor, source_offset))
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                integrity_error("Deflated ZIP member offset overflowed",
-                                member.data_offset, member.compressed_size));
-        auto lease_result = provider.lease(source_offset, chunk, cancel);
-        if (!lease_result)
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                std::move(lease_result.error()));
-        const auto input = lease_result.take_value();
-        if (input.size() != chunk)
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                integrity_error("Deflated ZIP member lease was incomplete",
-                                source_offset, chunk));
-        stream.next_in = const_cast<Bytef*>(
-            reinterpret_cast<const Bytef*>(input.data()));
-        stream.avail_in = static_cast<uInt>(chunk);
-
-        while (!stream_ended) {
-            const bool final_input_chunk =
-                compressed_cursor + chunk == member.compressed_size;
-            if (stream.avail_in == 0 && !final_input_chunk)
-                break;
-            const std::uint64_t output_remaining =
-                member.uncompressed_size - output_cursor;
-            const std::uint64_t output_capacity_u64 = output_remaining == 0
-                ? 1ULL
-                : (std::min)(
-                    output_remaining,
-                    (std::min)(work.limits().cancellation_poll_bytes,
-                               static_cast<std::uint64_t>(
-                                   (std::numeric_limits<uInt>::max)())));
-            Bytef* output_pointer = output_remaining == 0
-                ? reinterpret_cast<Bytef*>(overflow_sink.data())
-                : reinterpret_cast<Bytef*>(
-                    output.data() + static_cast<std::size_t>(output_cursor));
-            stream.next_out = output_pointer;
-            stream.avail_out = static_cast<uInt>(output_capacity_u64);
-            const uInt input_before = stream.avail_in;
-            const uInt output_before = stream.avail_out;
-            const int status = inflate(&stream, Z_NO_FLUSH);
-            const std::uint64_t input_consumed = input_before - stream.avail_in;
-            const std::uint64_t output_produced = output_before - stream.avail_out;
-
-            if (output_remaining == 0 && output_produced != 0)
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    integrity_error(
-                        "Deflated ZIP member exceeds its declared output size",
-                        member.data_offset, member.compressed_size));
-            if (output_produced != 0) {
-                crc = crc32(
-                    crc,
-                    reinterpret_cast<const Bytef*>(
-                        output.data() + static_cast<std::size_t>(output_cursor)),
-                    static_cast<uInt>(output_produced));
-                output_cursor += output_produced;
-                auto output_work = work.consume(
-                    output_produced, "zip_member_integrity");
-                if (!output_work)
-                    return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                        std::move(output_work.error()));
-            }
-
-            if (status == Z_STREAM_END) {
-                const std::uint64_t member_consumed = compressed_cursor +
-                    (chunk - stream.avail_in);
-                if (member_consumed != member.compressed_size ||
-                    stream.avail_in != 0 ||
-                    output_cursor != member.uncompressed_size)
-                    return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                        integrity_error(
-                            "Deflated ZIP stream has trailing input or an incorrect output size",
-                            member.data_offset, member.compressed_size));
-                stream_ended = true;
-                break;
-            }
-            if (status != Z_OK) {
-                auto error = integrity_error(
-                    "Deflated ZIP stream validation failed",
-                    member.data_offset, member.compressed_size);
-                error.provider_status = status;
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    std::move(error));
-            }
-            if (input_consumed == 0 && output_produced == 0)
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    integrity_error("Deflated ZIP stream made no progress",
-                                    member.data_offset,
-                                    member.compressed_size));
-            auto polled = work.poll("zip_member_integrity");
-            if (!polled)
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    std::move(polled.error()));
-        }
-        if (!stream_ended)
-            compressed_cursor += chunk;
-    }
-    if (!stream_ended)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            integrity_error("Deflated ZIP stream ended before its terminator",
-                            member.data_offset, member.compressed_size));
-    if (output_cursor != member.uncompressed_size ||
-        static_cast<std::uint32_t>(crc) != member.crc32)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            integrity_error("Deflated ZIP member size or CRC verification failed",
-                            member.data_offset, member.compressed_size));
-    return workspace_result_t<std::vector<std::uint8_t>>::success(
-        std::move(output));
-}
-
-std::string encode_identity_component(std::string_view value) {
-    constexpr char digits[] = "0123456789ABCDEF";
-    std::string result;
-    result.reserve(value.size());
-    for (const unsigned char byte : value) {
-        if (byte == '%' || byte == '#') {
-            result.push_back('%');
-            result.push_back(digits[byte >> 4U]);
-            result.push_back(digits[byte & 0x0fU]);
-        } else {
-            result.push_back(static_cast<char>(byte));
-        }
-    }
-    return result;
-}
-
-class zip_member_provider_t final : public byte_provider_t {
-public:
-    zip_member_provider_t(std::shared_ptr<const byte_provider_t> source,
-                          std::shared_ptr<byte_provider_t> backing,
-                          byte_provider_identity_t identity)
-        : source_(std::move(source)), backing_(std::move(backing)),
-          identity_(std::move(identity)) {}
-
-    const byte_provider_identity_t& identity() const noexcept override {
-        return identity_;
-    }
-
-    std::uint64_t size() const noexcept override {
-        return identity_.size;
-    }
-
-    workspace_result_t<byte_view_t> lease(
-        std::uint64_t offset, std::uint64_t size,
-        const cancellation_token_t& cancel) const override {
-        return backing_->lease(offset, size, cancel);
-    }
-
-private:
-    std::shared_ptr<const byte_provider_t> source_;
-    std::shared_ptr<byte_provider_t> backing_;
-    byte_provider_identity_t identity_;
-};
-
 workspace_result_t<std::shared_ptr<byte_provider_t>> materialize_member_provider(
-    const std::shared_ptr<const byte_provider_t>& source,
-    const zip_member_t& member, work_guard_t& work,
-    const cancellation_token_t& cancel) {
+    const std::shared_ptr<const byte_provider_t>& source, const zip_member_t& member,
+    work_guard_t& work, const cancellation_token_t& cancel) {
     if (member.kind == zip_member_kind_t::directory)
         return workspace_result_t<std::shared_ptr<byte_provider_t>>::failure(
             zip_error(workspace_error_code_t::invalid_argument,
-                      "ZIP directory member has no byte provider",
-                      "zip_member_open"));
-    workspace_result_t<std::vector<std::uint8_t>> bytes_result =
-        member.compression_method == zip_method_stored
-            ? materialize_stored_member(*source, member, work, cancel)
-            : materialize_deflated_member(*source, member, work, cancel);
-    if (!bytes_result)
+                      "ZIP directory member has no byte provider", "zip_member_open"));
+    container_stream_member_request_t request;
+    request.source = source;
+    request.normalized_path = member.normalized_path;
+    request.provenance = member.provenance;
+    request.data_offset = member.data_offset;
+    request.compressed_size = member.compressed_size;
+    request.uncompressed_size = member.uncompressed_size;
+    request.crc32 = member.crc32;
+    request.codec = member.compression_method == zip_method_stored
+        ? container_stream_codec_t::stored : container_stream_codec_t::raw_deflate;
+    container_stream_limits_t stream_limits;
+    stream_limits.max_compressed_size = work.limits().max_member_compressed_size;
+    stream_limits.max_uncompressed_size = work.limits().max_member_uncompressed_size;
+    stream_limits.max_expansion_ratio = work.limits().max_expansion_ratio;
+    stream_limits.max_spill_bytes = (std::min)(
+        work.limits().max_member_uncompressed_size, 1024ULL * 1024ULL * 1024ULL);
+    stream_limits.max_work_bytes = work.limits().max_work_bytes;
+    stream_limits.max_io_chunk_size = work.limits().max_io_chunk_size;
+    stream_limits.cancellation_poll_bytes = work.limits().cancellation_poll_bytes;
+    stream_limits.max_elapsed = work.limits().max_elapsed;
+    auto streaming = streaming_member_provider_t::open(
+        std::move(request), std::move(stream_limits), cancel,
+        [&work](std::uint64_t amount) {
+            return work.consume(amount, "zip_member_stream");
+        });
+    if (!streaming)
         return workspace_result_t<std::shared_ptr<byte_provider_t>>::failure(
-            std::move(bytes_result.error()));
-    auto identity_component = encode_identity_component(member.normalized_path);
-    auto memory_result = memory_provider_t::create(
-        bytes_result.take_value(), "zip_member:" + identity_component);
-    if (!memory_result)
-        return workspace_result_t<std::shared_ptr<byte_provider_t>>::failure(
-            std::move(memory_result.error()));
-    std::shared_ptr<byte_provider_t> backing = memory_result.take_value();
-    byte_provider_identity_t identity = source->identity();
-    identity.normalized_source += "#member:" + identity_component;
-    identity.size = member.uncompressed_size;
-    identity.immutable_snapshot = true;
-    identity.member = member.provenance;
+            std::move(streaming.error()));
     return workspace_result_t<std::shared_ptr<byte_provider_t>>::success(
-        std::shared_ptr<byte_provider_t>(new zip_member_provider_t(
-            source, std::move(backing), std::move(identity))));
+        std::shared_ptr<byte_provider_t>(streaming.take_value()));
 }
 
 }
