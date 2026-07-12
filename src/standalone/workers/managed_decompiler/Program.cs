@@ -1,9 +1,11 @@
 using System.Text.Json;
+using System.Text;
 
 namespace Aida.ManagedDecompiler;
 
 internal static class Program
 {
+    private const int MaximumWireBytes = 16 * 1024 * 1024;
     private static readonly object ActiveGate = new();
     private static readonly SemaphoreSlim OutputGate = new(1, 1);
     private static ActiveJob? activeJob;
@@ -25,7 +27,7 @@ internal static class Program
         string? line;
         while ((line = await Console.In.ReadLineAsync().ConfigureAwait(false)) is not null)
         {
-            if (line.Length == 0 || line.Length > 16 * 1024 * 1024)
+            if (line.Length == 0 || Encoding.UTF8.GetByteCount(line) > MaximumWireBytes)
             {
                 await WriteLineAsync(WorkerProtocol.Serialize(Failure(0, string.Empty, string.Empty, 0, "invalid_contract", "managed_cli.message_size", 100, false))).ConfigureAwait(false);
                 continue;
@@ -91,6 +93,8 @@ internal static class Program
             using var bounded = CancellationTokenSource.CreateLinkedTokenSource(linked.Token, resources.LimitToken);
             var candidate = await Task.Run(() => MetadataAnalysis.Analyze(job.Request, resources, bounded.Token), bounded.Token).ConfigureAwait(false);
             var candidatePayload = WorkerProtocol.Serialize(candidate);
+            if (Encoding.UTF8.GetByteCount(candidatePayload) > MaximumWireBytes)
+                throw new ResourceLimitException(ResourceLimitKind.Memory);
             resources.Checkpoint(bounded.Token);
             await resources.CompleteAsync().ConfigureAwait(false);
             result = candidate;
