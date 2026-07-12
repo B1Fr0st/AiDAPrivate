@@ -473,8 +473,8 @@ workspace_result_t<request_t> make_request(
     const cancellation_token_t& cancel)
 {
     if (sequence == 0 || request_id.empty() || request_id.size() > 128 || module_path.empty() || module_path.size() > 32768 ||
-        workspace_generation == 0 || worker.provider_version.empty() || worker.provider_version.size() > 64 ||
-        worker.worker_build_id.empty() || worker.worker_build_id.size() > 256)
+        workspace_generation == 0 || std::string_view(worker.provider_version) != k_decompiler_package_version ||
+        worker.worker_build_id.empty() || worker.worker_build_id.size() > 256 || worker.worker_build_hash.empty())
         return failure<request_t>(workspace_error_code_t::invalid_argument, "managed CLI request identity is invalid", "managed_cli.request");
     const auto verified_lock = verify_offline_lock(offline_lock, cancel);
     if (!verified_lock)
@@ -523,7 +523,7 @@ workspace_result_t<std::vector<std::string>> make_worker_startup_arguments(
     if (!checked)
         return workspace_result_t<std::vector<std::string>>::failure(checked.error());
     return workspace_result_t<std::vector<std::string>>::success(
-        {"--offline-package-root", checked.value().offline_lock.package_root});
+        std::vector<std::string>{"--offline-package-root", checked.value().offline_lock.package_root});
 }
 
 workspace_result_t<std::string> serialize_request(const request_t& request)

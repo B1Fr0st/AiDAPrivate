@@ -136,8 +136,13 @@ overlay_operation_kind_v9_t entity_domain(overlay_operation_kind_v9_t kind) noex
 {
     if (kind == overlay_operation_kind_v9_t::comment_update)
         return overlay_operation_kind_v9_t::comment;
+    if (kind == overlay_operation_kind_v9_t::delete_stack_variable)
+        return overlay_operation_kind_v9_t::stack_variable;
     if (kind == overlay_operation_kind_v9_t::type_update)
         return overlay_operation_kind_v9_t::type_application;
+    if (kind == overlay_operation_kind_v9_t::assembly_patch ||
+        kind == overlay_operation_kind_v9_t::integer_patch)
+        return overlay_operation_kind_v9_t::byte_patch;
     return kind;
 }
 
@@ -146,6 +151,11 @@ overlay_entity_key_v9_t make_entity_key(const overlay_operation_v9_t& operation)
     overlay_entity_key_v9_t key;
     key.domain = entity_domain(operation.kind);
     key.range = operation.range;
+    if (key.domain == overlay_operation_kind_v9_t::comment ||
+        key.domain == overlay_operation_kind_v9_t::stack_variable ||
+        key.domain == overlay_operation_kind_v9_t::type_application ||
+        key.domain == overlay_operation_kind_v9_t::byte_patch)
+        key.range.size = 0;
     key.stack_offset = operation.payload.stack_offset;
     switch (operation.kind) {
     case overlay_operation_kind_v9_t::type_declaration:

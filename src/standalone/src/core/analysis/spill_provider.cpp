@@ -19,6 +19,8 @@
 namespace aida::analysis {
 namespace {
 
+static_assert(sizeof(sha256_digest_t) == 32);
+
 constexpr std::uint64_t kMaximumSpillBytes = 1024ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumWriteChunkBytes = 64ULL * 1024ULL * 1024ULL;
 

@@ -39,7 +39,7 @@ internal static class Program
             await ValidateMandatoryOfflineGateAsync(firstRequest).ConfigureAwait(false);
 
             OfflinePackageLock.EstablishStartupGate(Path.Combine(repositoryRoot, OfflinePackageRelativePath));
-            await ValidateManifestMethodsAsync(manifest, inventory, fixturePath, moduleHash).ConfigureAwait(false);
+            await ValidateManifestMethodsAsync(repositoryRoot, manifest, inventory, fixturePath, moduleHash).ConfigureAwait(false);
             await ValidateCancellationAsync(firstRequest).ConfigureAwait(false);
             await ValidateResourceLimitsAsync().ConfigureAwait(false);
             await ValidateSnapshotBindingAsync(firstRequest, fixturePath).ConfigureAwait(false);
@@ -68,11 +68,13 @@ internal static class Program
     }
 
     private static async Task ValidateManifestMethodsAsync(
+        string repositoryRoot,
         FixtureManifest manifest,
         MethodInventory inventory,
         string fixturePath,
         string moduleHash)
     {
+        await using var worker = ManagedWorkerProcess.Start(repositoryRoot);
         ulong sequence = 10;
         foreach (var fixtureCase in manifest.Methods)
         {
@@ -81,7 +83,7 @@ internal static class Program
             string? baseline = null;
             for (var run = 0; run < manifest.Validation.DeterministicRuns; run++)
             {
-                var result = await AnalyzeAsync(request, CancellationToken.None).ConfigureAwait(false);
+                var result = await worker.DecompileAsync(request).ConfigureAwait(false);
                 ValidateMethodResult(fixtureCase, method, request, result);
                 var serialized = WorkerProtocol.Serialize(result);
                 if (baseline is not null)
@@ -291,11 +293,14 @@ internal static class Program
         var provider = new StableSignatureTypeProvider();
         var methods = new Dictionary<string, MethodDescriptor>(StringComparer.Ordinal);
         var typeNames = new HashSet<string>(StringComparer.Ordinal);
+        var fieldNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var typeHandle in reader.TypeDefinitions)
         {
             var typeName = MetadataAnalysis.GetTypeDefinitionName(reader, typeHandle);
             typeNames.Add(typeName);
             var type = reader.GetTypeDefinition(typeHandle);
+            foreach (var fieldHandle in type.GetFields())
+                fieldNames.Add(typeName + "." + reader.GetString(reader.GetFieldDefinition(fieldHandle).Name));
             foreach (var methodHandle in type.GetMethods())
             {
                 var method = reader.GetMethodDefinition(methodHandle);
@@ -305,13 +310,13 @@ internal static class Program
                     unchecked((uint)MetadataTokens.GetToken(methodHandle)),
                     typeName,
                     methodName,
-                    $"{signature.ReturnType}({string.Join(',', signature.ParameterTypes)})",
+                    $"{signature.ReturnType}({string.Join(",", signature.ParameterTypes)})",
                     checked((uint)method.GetGenericParameters().Count));
                 var symbol = typeName + "." + methodName;
                 Require(methods.TryAdd(symbol, descriptor), $"managed CLI fixture symbol is ambiguous: {symbol}");
             }
         }
-        return new MethodInventory(methods, typeNames);
+        return new MethodInventory(methods, typeNames, fieldNames);
     }
 
     private static void ValidateManifestInventory(FixtureManifest manifest, MethodInventory inventory)
@@ -333,6 +338,9 @@ internal static class Program
         }
         foreach (var malformed in manifest.Malformed)
             Require(inventory.Types.Contains(malformed.SourceContract), $"managed CLI malformed source contract is absent: {malformed.SourceContract}");
+        foreach (var field in new[] { "ExpectedFailureCode", "ExpectedFailureKey", "MetadataSignature", "CorruptSignatureMutation", "TruncateRootMutation", "NonMethodToken" })
+            Require(inventory.Fields.Contains("Aida.C03.ManagedCliFixtures.MalformedMetadataContract." + field),
+                $"managed CLI malformed source field is absent: {field}");
     }
 
     private static FixtureManifest LoadManifest(string path)
@@ -414,6 +422,91 @@ internal static class Program
             throw new InvalidOperationException(message);
     }
 
+    private sealed class ManagedWorkerProcess : IAsyncDisposable
+    {
+        private readonly Process process;
+
+        private ManagedWorkerProcess(Process process)
+        {
+            this.process = process;
+        }
+
+        internal static ManagedWorkerProcess Start(string repositoryRoot)
+        {
+            var sdkPath = Path.Combine(repositoryRoot, ".deps/dotnet-sdk-10.0.301-win-x64/dotnet.exe");
+            var workerPath = Path.Combine(AppContext.BaseDirectory, "ManagedDecompilerWorker.dll");
+            var runtimeConfigPath = Path.Combine(AppContext.BaseDirectory, "ManagedCliWorkerHarness.runtimeconfig.json");
+            var dependencyContextPath = Path.Combine(AppContext.BaseDirectory, "ManagedCliWorkerHarness.deps.json");
+            Require(File.Exists(sdkPath), "managed CLI locked SDK is unavailable");
+            Require(File.Exists(workerPath), "managed CLI worker assembly is unavailable");
+            Require(File.Exists(runtimeConfigPath) && File.Exists(dependencyContextPath), "managed CLI harness runtime contract is unavailable");
+            var start = new ProcessStartInfo
+            {
+                FileName = sdkPath,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = AppContext.BaseDirectory
+            };
+            start.ArgumentList.Add("exec");
+            start.ArgumentList.Add("--runtimeconfig");
+            start.ArgumentList.Add(runtimeConfigPath);
+            start.ArgumentList.Add("--depsfile");
+            start.ArgumentList.Add(dependencyContextPath);
+            start.ArgumentList.Add(workerPath);
+            start.ArgumentList.Add("--offline-package-root");
+            start.ArgumentList.Add(Path.Combine(repositoryRoot, OfflinePackageRelativePath));
+            var process = Process.Start(start) ?? throw new InvalidOperationException("managed CLI worker process could not start");
+            return new ManagedWorkerProcess(process);
+        }
+
+        internal async Task<WorkerResult> DecompileAsync(WorkerRequest request)
+        {
+            Require(!process.HasExited, "managed CLI worker exited before accepting a fixture");
+            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(request)).ConfigureAwait(false);
+            await process.StandardInput.FlushAsync().ConfigureAwait(false);
+            var line = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
+            if (line is null)
+            {
+                var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
+                throw new InvalidOperationException("managed CLI worker returned no fixture response: " + error);
+            }
+            using var document = JsonDocument.Parse(line);
+            var kind = document.RootElement.GetProperty("kind").GetString();
+            if (!string.Equals(kind, "result", StringComparison.Ordinal))
+                throw new InvalidOperationException("managed CLI worker rejected a fixture: " + line);
+            return WorkerProtocol.Deserialize<WorkerResult>(line);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            var forced = false;
+            var exitCode = -1;
+            try
+            {
+                process.StandardInput.Close();
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                forced = true;
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                if (process.HasExited)
+                    exitCode = process.ExitCode;
+                process.Dispose();
+            }
+            Require(!forced && exitCode == 0, "managed CLI worker did not shut down cleanly");
+        }
+    }
+
     private sealed record FixtureManifest(
         string Schema,
         int SchemaVersion,
@@ -451,5 +544,6 @@ internal static class Program
 
     private sealed record MethodInventory(
         IReadOnlyDictionary<string, MethodDescriptor> Methods,
-        IReadOnlySet<string> Types);
+        IReadOnlySet<string> Types,
+        IReadOnlySet<string> Fields);
 }

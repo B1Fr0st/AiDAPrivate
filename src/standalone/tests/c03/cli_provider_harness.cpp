@@ -88,7 +88,7 @@ bool coverage_contains(const json& fixture, std::string_view value)
 {
     const auto& coverage = fixture.at("coverage");
     return std::any_of(coverage.begin(), coverage.end(), [value](const json& entry) {
-        return entry.is_string() && entry.get_ref<const std::string&>() == value;
+        return entry.is_string() && std::string_view(entry.get_ref<const std::string&>()) == value;
     });
 }
 
@@ -233,7 +233,7 @@ json fixture_response(const managed_cli::request_t& request, const json& fixture
         {"source", {{"text", source}, {"sha256", digest(source).to_hex()}}},
         {"tokenMap", json::array({{
             {"token", identity.metadata_token},
-            {"stableIdentity", "0x" + std::to_string(identity.metadata_token) + "|" + identity.declaring_type + "|" + identity.method_name + "|" + identity.method_signature},
+            {"stableIdentity", "0x" + std::to_string(identity.metadata_token) + "|" + identity.declaring_type + "|" + identity.method_name + "|" + identity.method_signature + "|" + std::to_string(identity.generic_arity)},
             {"declaringType", identity.declaring_type}, {"methodName", identity.method_name}, {"methodSignature", identity.method_signature},
             {"genericArity", identity.generic_arity}, {"isAsync", coverage_contains(fixture, "async")},
             {"isIterator", coverage_contains(fixture, "iterator") || coverage_contains(fixture, "async_iterator")},

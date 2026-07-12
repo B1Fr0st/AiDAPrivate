@@ -108,16 +108,72 @@ private:
     mutable bool changed_ = false;
 };
 
+class forged_digest_provider_t final : public byte_provider_t {
+public:
+    explicit forged_digest_provider_t(std::shared_ptr<const byte_provider_t> parent)
+        : parent_(std::move(parent)), identity_(parent_->identity()) {
+        if (!identity_.content_sha256)
+            throw std::runtime_error("forged digest provider requires a content identity");
+        identity_.content_sha256->bytes[0] = static_cast<std::uint8_t>(
+            identity_.content_sha256->bytes[0] ^ 1U);
+    }
+
+    const byte_provider_identity_t& identity() const noexcept override { return identity_; }
+    std::uint64_t size() const noexcept override { return parent_->size(); }
+    std::uint64_t maximum_contiguous_lease(std::uint64_t offset) const noexcept override {
+        return parent_->maximum_contiguous_lease(offset);
+    }
+    workspace_result_t<byte_view_t> lease(
+        std::uint64_t offset, std::uint64_t size,
+        const cancellation_token_t& cancel = {}) const override {
+        return parent_->lease(offset, size, cancel);
+    }
+
+private:
+    std::shared_ptr<const byte_provider_t> parent_;
+    byte_provider_identity_t identity_;
+};
+
+class cancel_after_read_provider_t final : public byte_provider_t {
+public:
+    cancel_after_read_provider_t(std::shared_ptr<const byte_provider_t> parent,
+                                 cancellation_source_t& cancellation)
+        : parent_(std::move(parent)), cancellation_(cancellation) {}
+
+    const byte_provider_identity_t& identity() const noexcept override {
+        return parent_->identity();
+    }
+    std::uint64_t size() const noexcept override { return parent_->size(); }
+    std::uint64_t maximum_contiguous_lease(std::uint64_t offset) const noexcept override {
+        return parent_->maximum_contiguous_lease(offset);
+    }
+    workspace_result_t<byte_view_t> lease(
+        std::uint64_t offset, std::uint64_t size,
+        const cancellation_token_t& cancel = {}) const override {
+        auto result = parent_->lease(offset, size, cancel);
+        if (result && !cancelled_) {
+            cancelled_ = true;
+            cancellation_.request_cancel();
+        }
+        return result;
+    }
+
+private:
+    std::shared_ptr<const byte_provider_t> parent_;
+    cancellation_source_t& cancellation_;
+    mutable bool cancelled_ = false;
+};
+
 void verify_production_snapshot_provider(const std::filesystem::path& path,
                                          const std::vector<std::uint8_t>& bytes,
                                          const sha256_digest_t& expected_digest) {
     auto provider = require_value(mapped_file_provider_t::open(path.u8string()),
                                   "production provider open failed");
-    require(provider->identity().immutable_snapshot,
-            "production provider did not expose an immutable snapshot");
-    require(provider->identity().content_sha256 &&
-            *provider->identity().content_sha256 == expected_digest,
-            "production provider content identity diverged");
+    require(!provider->identity().immutable_snapshot,
+            "production static provider was misclassified as a live snapshot");
+    auto computed_digest = require_value(provider->compute_content_sha256(),
+                                         "production provider hashing failed");
+    require(computed_digest == expected_digest, "production provider hash diverged");
     auto readback = require_value(provider->read_vector(0, provider->size(), provider->size()),
                                   "production provider readback failed");
     require(readback == bytes, "production provider readback diverged");
@@ -200,30 +256,33 @@ void verify_concurrent_accounting(const std::filesystem::path& path) {
     std::array<std::optional<byte_view_t>, 2> views;
     std::array<std::optional<workspace_error_code_t>, 2> errors;
     std::atomic<std::uint32_t> ready{0};
-    std::atomic<std::uint32_t> completed{0};
     std::atomic<bool> start{false};
-    std::atomic<bool> release{false};
     std::array<std::thread, 2> workers;
-    for (std::size_t index = 0; index < workers.size(); ++index) {
-        workers[index] = std::thread([&, index]() {
-            ready.fetch_add(1, std::memory_order_release);
-            while (!start.load(std::memory_order_acquire))
-                std::this_thread::yield();
-            auto leased = caches[index]->lease(index * options.window_bytes, 1);
-            if (leased)
-                views[index].emplace(leased.take_value());
-            else
-                errors[index] = leased.error().code;
-            completed.fetch_add(1, std::memory_order_release);
-            while (!release.load(std::memory_order_acquire))
-                std::this_thread::yield();
-        });
+    std::size_t launched = 0;
+    try {
+        for (; launched < workers.size(); ++launched) {
+            workers[launched] = std::thread([&, index = launched]() {
+                ready.fetch_add(1, std::memory_order_release);
+                while (!start.load(std::memory_order_acquire))
+                    std::this_thread::yield();
+                auto leased = caches[index]->lease(index * options.window_bytes, 1);
+                if (leased)
+                    views[index].emplace(leased.take_value());
+                else
+                    errors[index] = leased.error().code;
+            });
+        }
+    } catch (...) {
+        start.store(true, std::memory_order_release);
+        for (std::size_t index = 0; index < launched; ++index)
+            workers[index].join();
+        throw;
     }
     while (ready.load(std::memory_order_acquire) != workers.size())
         std::this_thread::yield();
     start.store(true, std::memory_order_release);
-    while (completed.load(std::memory_order_acquire) != workers.size())
-        std::this_thread::yield();
+    for (auto& worker : workers)
+        worker.join();
     const std::size_t successes = static_cast<std::size_t>(views[0].has_value()) +
                                   static_cast<std::size_t>(views[1].has_value());
     require(successes == 1, "concurrent caches exceeded the global admission budget");
@@ -238,9 +297,6 @@ void verify_concurrent_accounting(const std::filesystem::path& path) {
     require(admitted.global_reserved_window_bytes == 0 &&
             admitted.global_mapped_window_bytes == admitted.global_admitted_window_bytes,
             "settled mapped-window accounting is incoherent");
-    release.store(true, std::memory_order_release);
-    for (auto& worker : workers)
-        worker.join();
     views[0].reset();
     views[1].reset();
     require_success(caches[0]->trim(), "first concurrent cache trim failed");
@@ -368,6 +424,19 @@ void verify_spill_adverse_paths(const std::vector<std::uint8_t>& bytes) {
     require_error(cancelled_append, workspace_error_code_t::cancelled,
                   "cancelled spill append succeeded");
     require(append_sink->appended_bytes() == 0, "cancelled spill append wrote bytes");
+
+    cancellation_source_t stream_cancellation;
+    auto cancelled_stream = spill_provider_t::from_stream(
+        "stream-cancel",
+        [&stream_cancellation, &bytes](std::uint8_t* destination, std::size_t,
+                                       const cancellation_token_t&)
+            -> workspace_result_t<std::size_t> {
+            destination[0] = bytes[0];
+            stream_cancellation.request_cancel();
+            return workspace_result_t<std::size_t>::success(1);
+        }, quota_options, stream_cancellation.token());
+    require_error(cancelled_stream, workspace_error_code_t::cancelled,
+                  "in-flight spill stream cancellation succeeded");
 }
 
 void verify_snapshot_adverse_paths(const std::filesystem::path& path,
@@ -381,11 +450,26 @@ void verify_snapshot_adverse_paths(const std::filesystem::path& path,
         cache, snapshot_options(), cancellation.token());
     require_error(cancelled_materialize, workspace_error_code_t::cancelled,
                   "cancelled snapshot materialization succeeded");
+    cancellation_source_t in_flight_cancellation;
+    auto cancelling_source = std::make_shared<cancel_after_read_provider_t>(
+        cache, in_flight_cancellation);
+    auto in_flight_materialize = provider_snapshot_t::materialize(
+        cancelling_source, snapshot_options(), in_flight_cancellation.token());
+    require_error(in_flight_materialize, workspace_error_code_t::cancelled,
+                  "in-flight snapshot materialization cancellation succeeded");
 
     auto spill = make_spill(bytes, expected_digest);
     auto cancelled_capture = provider_snapshot_t::capture(spill, 0, cancellation.token());
     require_error(cancelled_capture, workspace_error_code_t::cancelled,
                   "cancelled immutable snapshot capture succeeded");
+    auto forged = std::make_shared<forged_digest_provider_t>(spill);
+    auto forged_capture = provider_snapshot_t::capture(forged);
+    require_error(forged_capture, workspace_error_code_t::integrity_failure,
+                  "forged snapshot content identity was accepted");
+    auto forged_materialization = provider_snapshot_t::materialize(forged,
+                                                                    snapshot_options());
+    require_error(forged_materialization, workspace_error_code_t::integrity_failure,
+                  "forged materialization content identity was accepted");
 
     auto stale_source = std::make_shared<stale_after_read_provider_t>(cache);
     auto stale_materialization = provider_snapshot_t::materialize(stale_source,

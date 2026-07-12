@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -311,6 +310,10 @@ void truncation_contract()
 
 void manifest_and_snapshot_contracts()
 {
+    require(k_native_worker_binary_artifact_relative_path == "deps/AiDA_NativeDecompilerWorker.exe" &&
+        k_native_worker_manifest_artifact_relative_path == "deps/AiDA_NativeDecompilerWorker.manifest.bin" &&
+        k_native_worker_manifest_digest_relative_path == "deps/AiDA_NativeDecompilerWorker.manifest.sha256",
+        "native worker production artifact paths drifted from the packaging contract");
     const auto manifest = manifest_fixture();
     const std::string serialized = serialize_native_worker_manifest(manifest);
     require(!serialized.empty(), "manifest did not serialize");

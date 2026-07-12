@@ -239,11 +239,14 @@ live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
                 }
 
                 call_active->store(false, std::memory_order_release);
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->result.emplace(std::move(result));
+                try {
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->result.emplace(std::move(result));
+                    }
+                    state->wake.notify_one();
+                } catch (...) {
                 }
-                state->wake.notify_one();
             });
         release_call = false;
         worker.detach();

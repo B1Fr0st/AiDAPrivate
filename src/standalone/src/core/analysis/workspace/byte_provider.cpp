@@ -20,6 +20,8 @@
 namespace aida::analysis {
 namespace {
 
+static_assert(sizeof(sha256_digest_t) == 32);
+
 struct algorithm_closer_t {
     void operator()(void* value) const noexcept {
         if (value)
@@ -275,7 +277,8 @@ workspace_result_t<sha256_digest_t> byte_provider_t::compute_content_sha256(
         auto view = lease(offset, amount, cancel);
         if (!view)
             return workspace_result_t<sha256_digest_t>::failure(view.error());
-        if (view.value().size() != amount || !view.value().data())
+        if (static_cast<std::uint64_t>(view.value().size()) != amount ||
+            !view.value().data())
             return workspace_result_t<sha256_digest_t>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "provider returned an invalid hash lease",
@@ -312,12 +315,7 @@ mapped_file_provider_t::open(const std::string& utf8_path,
     if (!snapshot)
         return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
             snapshot.error());
-    if (!snapshot.value()->identity().content_sha256)
-        return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
-            make_workspace_error(workspace_error_code_t::integrity_failure,
-                                 "mapped source snapshot has no content identity",
-                                 "byte_provider_open"));
-    identity.immutable_snapshot = true;
+    identity.immutable_snapshot = false;
     identity.content_sha256 = snapshot.value()->identity().content_sha256;
     try {
         auto state = std::make_shared<state_t>();
@@ -357,8 +355,7 @@ workspace_result_t<void> mapped_file_provider_t::revalidate() const {
     auto valid = state_->snapshot->validate_source();
     if (!valid)
         return valid;
-    if (!state_->identity.content_sha256 ||
-        state_->snapshot->identity().content_sha256 != state_->identity.content_sha256)
+    if (state_->snapshot->identity().content_sha256 != state_->identity.content_sha256)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "mapped snapshot content identity diverged",

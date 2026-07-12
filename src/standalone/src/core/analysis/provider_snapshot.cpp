@@ -100,23 +100,24 @@ workspace_result_t<std::shared_ptr<provider_snapshot_t>> provider_snapshot_t::ca
     if (!same_identity(source_identity, source->identity()))
         return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
             stale_error(source_identity, "provider_snapshot_capture"));
-    auto digest = source->compute_content_sha256(cancel);
-    if (!digest)
-        return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(digest.error());
-    if (source_identity.content_sha256 &&
-        *source_identity.content_sha256 != digest.value())
-        return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
-            make_workspace_error(workspace_error_code_t::integrity_failure,
-                                 "snapshot source content identity verification failed",
-                                 "provider_snapshot_capture"));
-    revalidated = revalidate_provider(source);
-    if (!revalidated)
-        return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(revalidated.error());
-    if (!same_identity(source_identity, source->identity()))
-        return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
-            stale_error(source_identity, "provider_snapshot_capture"));
     auto identity = snapshot_identity(source_identity, generation);
-    identity.content_sha256 = digest.take_value();
+    if (source_identity.content_sha256) {
+        auto digest = source->compute_content_sha256(cancel);
+        if (!digest)
+            return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(digest.error());
+        if (*source_identity.content_sha256 != digest.value())
+            return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "snapshot source content identity verification failed",
+                                     "provider_snapshot_capture"));
+        revalidated = revalidate_provider(source);
+        if (!revalidated)
+            return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(revalidated.error());
+        if (!same_identity(source_identity, source->identity()))
+            return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
+                stale_error(source_identity, "provider_snapshot_capture"));
+        identity.content_sha256 = digest.take_value();
+    }
     try {
         return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::success(
             std::shared_ptr<provider_snapshot_t>(new provider_snapshot_t(

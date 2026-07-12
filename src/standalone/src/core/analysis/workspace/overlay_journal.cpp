@@ -222,8 +222,7 @@ json operation_json(const overlay_operation_t& operation,
 
 workspace_result_t<overlay_operation_t> parse_operation(
     const std::string& text,
-    const overlay_target_identity_v9_t* expected_target = nullptr,
-    bool* migrated = nullptr) {
+    const overlay_target_identity_v9_t* expected_target = nullptr) {
     auto value = json::parse(text, nullptr, false);
     if (value.is_discarded() || !value.is_object()) {
         return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
@@ -241,10 +240,9 @@ workspace_result_t<overlay_operation_t> parse_operation(
         }
     }
     const bool versioned = value.contains("schema");
-    if (migrated)
-        *migrated = !versioned;
     if (versioned) {
-        if (!value["schema"].is_number_unsigned() ||
+        if (value.size() != 17 || !value.contains("end") ||
+            !value["schema"].is_number_unsigned() ||
             value["schema"].get<std::uint32_t>() != k_overlay_journal_v9_schema ||
             !value.contains("target") || !value.contains("reanalysis_flags") ||
             !value.contains("remove")) {
@@ -465,6 +463,32 @@ workspace_result_t<std::uint64_t> patch_provider_offset(
                 return workspace_result_t<std::uint64_t>::failure(rva.error());
             return image->rva_to_file_offset(rva.value(), size);
         }
+        if (const auto normalized = workspace.normalized_image()) {
+            std::uint64_t rva = operation.address.value;
+            if (operation.address.space == address_space_id_t::virtual_address) {
+                if (rva < normalized->image_base)
+                    return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                        workspace_error_code_t::out_of_range,
+                        "patch virtual address precedes the image base",
+                        "overlay_journal.validate"));
+                rva -= normalized->image_base;
+            }
+            if (operation.address.space == address_space_id_t::relative_virtual ||
+                operation.address.space == address_space_id_t::virtual_address) {
+                for (const auto& mapping : normalized->address_mappings) {
+                    if (mapping.source_space != address_space_id_t::file_offset ||
+                        mapping.target_space != address_space_id_t::relative_virtual ||
+                        rva < mapping.target_start)
+                        continue;
+                    const auto delta = rva - mapping.target_start;
+                    if (delta > mapping.size || size > mapping.size - delta)
+                        continue;
+                    std::uint64_t offset = 0;
+                    if (checked_add_u64(mapping.source_start, delta, offset))
+                        return workspace_result_t<std::uint64_t>::success(offset);
+                }
+            }
+        }
     } else if (operation.address.space == address_space_id_t::live_virtual) {
         const std::uint64_t base = workspace.identity().module()
             ? workspace.identity().module()->base : workspace.identity().image_base();
@@ -481,10 +505,7 @@ workspace_result_t<void> validate_workspace_address(
     const address_t& address,
     const analysis_workspace_t& workspace,
     const char* phase) {
-    const auto expected_mode = workspace.identity().architecture() == architecture_id_t::x86
-        ? architecture_mode_t::x86_32
-        : (workspace.identity().architecture() == architecture_id_t::x86_64
-            ? architecture_mode_t::x86_64 : architecture_mode_t::unknown);
+    const auto expected_mode = workspace.identity().architecture_mode();
     if (address.architecture != workspace.identity().architecture() ||
         address.mode == architecture_mode_t::unknown || address.mode != expected_mode ||
         static_cast<unsigned>(address.space) >
@@ -527,7 +548,8 @@ workspace_result_t<void> validate_workspace_address(
         }
         return workspace_result_t<void>::success();
     }
-    if (!image) {
+    const auto normalized = workspace.normalized_image();
+    if (!image && !normalized) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::provider_unavailable,
             "static virtual overlay address requires a parsed image",
@@ -535,12 +557,21 @@ workspace_result_t<void> validate_workspace_address(
     }
     std::uint64_t rva = address.value;
     if (address.space == address_space_id_t::virtual_address) {
-        auto translated = image->va_to_rva(address.value);
-        if (!translated)
-            return workspace_result_t<void>::failure(translated.error());
-        rva = translated.value();
+        if (image) {
+            auto translated = image->va_to_rva(address.value);
+            if (!translated)
+                return workspace_result_t<void>::failure(translated.error());
+            rva = translated.value();
+        } else if (address.value < normalized->image_base) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::out_of_range,
+                "overlay virtual address precedes the image base", phase));
+        } else {
+            rva = address.value - normalized->image_base;
+        }
     }
-    if (rva >= image->image_size()) {
+    const std::uint64_t image_size = image ? image->image_size() : normalized->image_size;
+    if (rva >= image_size) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::out_of_range,
             "overlay virtual address is outside the image",
@@ -549,11 +580,316 @@ workspace_result_t<void> validate_workspace_address(
     return workspace_result_t<void>::success();
 }
 
+std::optional<overlay_architecture_v9_t> overlay_architecture(
+    architecture_id_t architecture) noexcept {
+    switch (architecture) {
+    case architecture_id_t::x86: return overlay_architecture_v9_t::x86;
+    case architecture_id_t::x86_64: return overlay_architecture_v9_t::x86_64;
+    case architecture_id_t::arm: return overlay_architecture_v9_t::arm;
+    case architecture_id_t::aarch64:
+    case architecture_id_t::arm64ec:
+        return overlay_architecture_v9_t::arm64;
+    case architecture_id_t::mips:
+    case architecture_id_t::mips64:
+        return overlay_architecture_v9_t::mips;
+    case architecture_id_t::ppc:
+    case architecture_id_t::ppc64:
+        return overlay_architecture_v9_t::ppc;
+    case architecture_id_t::riscv:
+    case architecture_id_t::riscv32:
+    case architecture_id_t::riscv64:
+        return overlay_architecture_v9_t::riscv;
+    case architecture_id_t::jvm_bytecode: return overlay_architecture_v9_t::jvm;
+    case architecture_id_t::dalvik_bytecode: return overlay_architecture_v9_t::dalvik;
+    case architecture_id_t::unknown: return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::uint8_t overlay_address_width(const analysis_workspace_t& workspace) noexcept {
+    if (const auto image = workspace.normalized_image()) {
+        if (image->address_width_bits == 32 || image->address_width_bits == 64)
+            return static_cast<std::uint8_t>(image->address_width_bits / 8);
+    }
+    switch (workspace.identity().architecture_mode()) {
+    case architecture_mode_t::x86_64:
+    case architecture_mode_t::aarch64:
+    case architecture_mode_t::mips64:
+    case architecture_mode_t::ppc64:
+    case architecture_mode_t::riscv64:
+        return 8;
+    case architecture_mode_t::x86_16:
+    case architecture_mode_t::x86_32:
+    case architecture_mode_t::arm_a32:
+    case architecture_mode_t::arm_thumb:
+    case architecture_mode_t::mips32:
+    case architecture_mode_t::ppc32:
+    case architecture_mode_t::riscv32:
+    case architecture_mode_t::jvm:
+    case architecture_mode_t::dalvik:
+        return 4;
+    case architecture_mode_t::unknown:
+        return 0;
+    }
+    return 0;
+}
+
+workspace_result_t<overlay_target_identity_v9_t> make_fixed_target_identity(
+    const analysis_workspace_t& workspace) {
+    const auto architecture = overlay_architecture(workspace.identity().architecture());
+    overlay_target_identity_v9_t target;
+    if (!architecture) {
+        return workspace_result_t<overlay_target_identity_v9_t>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "workspace architecture cannot be represented by overlay v9",
+            "overlay_journal.target"));
+    }
+    target.image_hash = workspace.identity().content_hash().bytes;
+    target.provenance_hash = workspace.identity().load_profile_hash().bytes;
+    target.image_base = workspace.identity().image_base();
+    target.image_size = workspace.provider().size();
+    if (const auto normalized = workspace.normalized_image()) {
+        target.image_base = normalized->image_base;
+        target.image_size = normalized->image_size;
+    } else if (const auto image = workspace.image()) {
+        target.image_size = image->image_size();
+    }
+    if (workspace.target_kind() == target_kind_t::live_snapshot && workspace.identity().module()) {
+        target.image_base = workspace.identity().module()->base;
+        target.image_size = workspace.identity().module()->size;
+    }
+    target.generation = workspace.generation();
+    target.kind = workspace.target_kind() == target_kind_t::static_file
+        ? overlay_target_kind_v9_t::static_image : overlay_target_kind_v9_t::live_image;
+    target.architecture = *architecture;
+    target.address_width = overlay_address_width(workspace);
+    if (!target.valid()) {
+        return workspace_result_t<overlay_target_identity_v9_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "workspace cannot produce a valid fixed overlay v9 target identity",
+            "overlay_journal.target"));
+    }
+    return workspace_result_t<overlay_target_identity_v9_t>::success(target);
+}
+
+workspace_result_t<std::uint64_t> overlay_static_offset(
+    const address_t& address, const analysis_workspace_t& workspace,
+    const char* phase) {
+    if (address.space == address_space_id_t::relative_virtual)
+        return workspace_result_t<std::uint64_t>::success(address.value);
+    const auto image = workspace.image();
+    if (image && address.space == address_space_id_t::virtual_address)
+        return image->va_to_rva(address.value);
+    if (image && address.space == address_space_id_t::file_offset)
+        return image->file_offset_to_rva(address.value, 1);
+    if (const auto normalized = workspace.normalized_image()) {
+        if (address.space == address_space_id_t::virtual_address &&
+            address.value >= normalized->image_base &&
+            address.value - normalized->image_base < normalized->image_size) {
+            return workspace_result_t<std::uint64_t>::success(
+                address.value - normalized->image_base);
+        }
+        if (address.space == address_space_id_t::file_offset) {
+            for (const auto& mapping : normalized->address_mappings) {
+                if (mapping.source_space != address_space_id_t::file_offset ||
+                    mapping.target_space != address_space_id_t::relative_virtual ||
+                    address.value < mapping.source_start ||
+                    address.value - mapping.source_start >= mapping.size)
+                    continue;
+                std::uint64_t converted = 0;
+                if (checked_add_u64(mapping.target_start,
+                                    address.value - mapping.source_start, converted))
+                    return workspace_result_t<std::uint64_t>::success(converted);
+                break;
+            }
+        }
+    }
+    return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+        workspace_error_code_t::unsupported_address_space,
+        "overlay v9 requires a static address space", phase));
+}
+
+workspace_result_t<overlay_operation_v9_t> operation_to_v9(
+    const overlay_operation_t& operation, const analysis_workspace_t& workspace,
+    const overlay_target_identity_v9_t& target, const char* phase) {
+    const auto ordinal = static_cast<std::uint8_t>(operation.kind);
+    const auto kind = overlay_operation_kind_from_ordinal(ordinal);
+    if (!kind) {
+        return workspace_result_t<overlay_operation_v9_t>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "overlay operation kind cannot be adapted to v9", phase));
+    }
+    overlay_operation_v9_t result;
+    result.kind = *kind;
+    result.payload.name = operation.name;
+    result.payload.text = operation.text;
+    result.payload.type = operation.type;
+    result.payload.variable = operation.variable;
+    result.payload.signature = operation.signature;
+    result.payload.assembly = operation.assembly;
+    result.payload.integer_type = operation.integer_type;
+    result.payload.integer_value = operation.integer_value;
+    result.payload.bytes = operation.bytes;
+    result.payload.reanalysis_flags = operation.reanalysis_flags;
+    result.payload.stack_offset = operation.stack_offset;
+    result.remove = removes_value(operation);
+    if (*kind == overlay_operation_kind_v9_t::type_declaration ||
+        *kind == overlay_operation_kind_v9_t::enum_definition)
+        return workspace_result_t<overlay_operation_v9_t>::success(std::move(result));
+    auto start = overlay_static_offset(operation.address, workspace, phase);
+    if (!start)
+        return workspace_result_t<overlay_operation_v9_t>::failure(start.error());
+    result.range.offset = start.value();
+    if (operation.end) {
+        if (operation.end->value <= operation.address.value) {
+            return workspace_result_t<overlay_operation_v9_t>::failure(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "overlay v9 range is not increasing", phase));
+        }
+        result.range.size = operation.end->value - operation.address.value;
+    } else if (!operation.bytes.empty()) {
+        result.range.size = static_cast<std::uint64_t>(operation.bytes.size());
+    } else {
+        result.range.size = 1;
+    }
+    if (result.range.offset >= target.image_size ||
+        result.range.size > target.image_size - result.range.offset) {
+        return workspace_result_t<overlay_operation_v9_t>::failure(make_workspace_error(
+            workspace_error_code_t::out_of_range,
+            "overlay v9 range exceeds the fixed target", phase));
+    }
+    return workspace_result_t<overlay_operation_v9_t>::success(std::move(result));
+}
+
+workspace_result_t<overlay_operation_t> operation_from_v9(
+    const overlay_operation_v9_t& operation, const analysis_workspace_t& workspace,
+    const overlay_target_identity_v9_t& target) {
+    const auto ordinal = static_cast<std::uint8_t>(operation.kind);
+    if (!overlay_operation_kind_from_ordinal(ordinal)) {
+        return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "overlay v9 operation kind is invalid", "overlay_journal.adapter"));
+    }
+    overlay_operation_t result;
+    result.kind = static_cast<overlay_operation_kind_t>(ordinal);
+    result.name = operation.payload.name;
+    result.text = operation.payload.text;
+    result.type = operation.payload.type;
+    result.variable = operation.payload.variable;
+    result.signature = operation.payload.signature;
+    result.assembly = operation.payload.assembly;
+    result.integer_type = operation.payload.integer_type;
+    result.integer_value = operation.payload.integer_value;
+    result.bytes = operation.payload.bytes;
+    result.reanalysis_flags = operation.payload.reanalysis_flags;
+    result.stack_offset = operation.payload.stack_offset;
+    result.remove = operation.remove;
+    result.address.space = address_space_id_t::relative_virtual;
+    result.address.architecture = workspace.identity().architecture();
+    result.address.mode = workspace.identity().architecture_mode();
+    if (operation.kind == overlay_operation_kind_v9_t::type_declaration ||
+        operation.kind == overlay_operation_kind_v9_t::enum_definition) {
+        if (operation.range.offset != 0 || operation.range.size != 0) {
+            return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "global overlay v9 operation contains a range", "overlay_journal.adapter"));
+        }
+        return workspace_result_t<overlay_operation_t>::success(std::move(result));
+    }
+    if (operation.range.size == 0 || operation.range.offset >= target.image_size ||
+        operation.range.size > target.image_size - operation.range.offset) {
+        return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
+            workspace_error_code_t::out_of_range,
+            "overlay v9 operation range exceeds the fixed target",
+            "overlay_journal.adapter"));
+    }
+    result.address.value = operation.range.offset;
+    auto end = result.address;
+    if (!checked_add_u64(operation.range.offset, operation.range.size, end.value)) {
+        return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "overlay v9 operation range overflows", "overlay_journal.adapter"));
+    }
+    result.end = end;
+    return workspace_result_t<overlay_operation_t>::success(std::move(result));
+}
+
+workspace_error_t overlay_apply_error(overlay_apply_code_v9_t code, const char* phase) {
+    workspace_error_code_t mapped = workspace_error_code_t::integrity_failure;
+    switch (code) {
+    case overlay_apply_code_v9_t::ok: mapped = workspace_error_code_t::none; break;
+    case overlay_apply_code_v9_t::invalid_target:
+    case overlay_apply_code_v9_t::static_target_required:
+        mapped = workspace_error_code_t::target_conflict;
+        break;
+    case overlay_apply_code_v9_t::stale_generation:
+        mapped = workspace_error_code_t::stale_generation;
+        break;
+    case overlay_apply_code_v9_t::revision_conflict:
+    case overlay_apply_code_v9_t::duplicate_entity:
+        mapped = workspace_error_code_t::revision_conflict;
+        break;
+    case overlay_apply_code_v9_t::revision_overflow:
+    case overlay_apply_code_v9_t::transaction_overflow:
+    case overlay_apply_code_v9_t::history_overflow:
+        mapped = workspace_error_code_t::range_overflow;
+        break;
+    case overlay_apply_code_v9_t::invalid_operation:
+        mapped = workspace_error_code_t::invalid_argument;
+        break;
+    case overlay_apply_code_v9_t::limit_exceeded:
+        mapped = workspace_error_code_t::limit_exceeded;
+        break;
+    case overlay_apply_code_v9_t::no_undo:
+    case overlay_apply_code_v9_t::no_redo:
+        mapped = workspace_error_code_t::target_not_found;
+        break;
+    case overlay_apply_code_v9_t::state_not_initialized:
+    case overlay_apply_code_v9_t::state_already_initialized:
+        mapped = workspace_error_code_t::integrity_failure;
+        break;
+    case overlay_apply_code_v9_t::storage_failure:
+        mapped = workspace_error_code_t::persistence_failure;
+        break;
+    }
+    auto error = make_workspace_error(mapped, "overlay v9 apply engine rejected the operation", phase);
+    error.details.emplace_back("overlay_apply_code", std::to_string(static_cast<unsigned>(code)));
+    return error;
+}
+
+workspace_result_t<overlay_static_state_v9_t> make_v9_preflight_state(
+    const overlay_snapshot_t& snapshot, const analysis_workspace_t& workspace,
+    const overlay_target_identity_v9_t& target) {
+    overlay_static_state_v9_t state;
+    const auto initialized = overlay_apply_engine_v9_t::initialize(state, target);
+    if (!initialized.ok()) {
+        return workspace_result_t<overlay_static_state_v9_t>::failure(
+            overlay_apply_error(initialized.code, "overlay_journal.preflight"));
+    }
+    state.revision = snapshot.revision;
+    state.history_epoch = snapshot.history_epoch == 0 ? 1 : snapshot.history_epoch;
+    for (const auto& item : snapshot.items) {
+        auto operation = operation_to_v9(item.second, workspace, target,
+                                         "overlay_journal.preflight");
+        if (!operation)
+            return workspace_result_t<overlay_static_state_v9_t>::failure(operation.error());
+        operation.value().remove = false;
+        const auto key = overlay_entity_key_for_operation_v9(operation.value());
+        if (!state.items.emplace(key, operation.value().payload).second) {
+            return workspace_result_t<overlay_static_state_v9_t>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "persisted overlay items alias the same v9 entity",
+                "overlay_journal.preflight"));
+        }
+    }
+    return workspace_result_t<overlay_static_state_v9_t>::success(std::move(state));
+}
+
 workspace_result_t<void> validate_operation(
     const overlay_operation_t& operation, const overlay_limits_t& limits,
     const analysis_workspace_t& workspace, std::size_t& total_patch_bytes) {
     const unsigned kind_value = static_cast<unsigned>(operation.kind);
-    if (kind_value > static_cast<unsigned>(overlay_operation_kind_t::integer_patch)) {
+    if (kind_value > static_cast<unsigned>(overlay_operation_kind_t::reanalysis)) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::invalid_argument,
             "overlay operation kind is invalid", "overlay_journal.validate"));
@@ -579,7 +915,8 @@ workspace_result_t<void> validate_operation(
             workspace_error_code_t::limit_exceeded,
             "overlay text exceeds configured limit", "overlay_journal.validate"));
     }
-    if (operation.kind != overlay_operation_kind_t::type_declaration) {
+    if (operation.kind != overlay_operation_kind_t::type_declaration &&
+        operation.kind != overlay_operation_kind_t::enum_definition) {
         auto address_result = validate_workspace_address(
             operation.address, workspace, "overlay_journal.validate");
         if (!address_result)
@@ -602,11 +939,19 @@ workspace_result_t<void> validate_operation(
         if (!end_result)
             return end_result;
     }
+    const bool removal = removes_value(operation);
     if (operation.kind == overlay_operation_kind_t::type_declaration &&
-        (operation.name.empty() || operation.type.empty())) {
+        (operation.name.empty() || (!removal && operation.type.empty()))) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::invalid_argument,
             "type declaration requires a name and declaration text",
+            "overlay_journal.validate"));
+    }
+    if (operation.kind == overlay_operation_kind_t::enum_definition &&
+        (operation.name.empty() || (!removal && operation.type.empty()))) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "enum definition requires a name and declaration text",
             "overlay_journal.validate"));
     }
     if ((operation.kind == overlay_operation_kind_t::stack_variable ||
@@ -616,15 +961,39 @@ workspace_result_t<void> validate_operation(
             workspace_error_code_t::invalid_argument,
             "stack variable operation requires a name", "overlay_journal.validate"));
     }
-    if (operation.kind == overlay_operation_kind_t::stack_variable && operation.type.empty()) {
+    if (operation.kind == overlay_operation_kind_t::stack_variable &&
+        !removal && operation.type.empty()) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::invalid_argument,
             "stack variable declaration requires a type", "overlay_journal.validate"));
     }
+    if ((operation.kind == overlay_operation_kind_t::type_application ||
+         operation.kind == overlay_operation_kind_t::type_update) &&
+        (operation.name.empty() && operation.variable.empty())) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "type operation requires an entity name or variable",
+            "overlay_journal.validate"));
+    }
+    if ((operation.kind == overlay_operation_kind_t::type_application ||
+         operation.kind == overlay_operation_kind_t::type_update) &&
+        !removal && operation.type.empty()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "type operation requires a type",
+            "overlay_journal.validate"));
+    }
+    if (operation.kind == overlay_operation_kind_t::comment_update &&
+        !removal && operation.text.empty()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "comment update requires text",
+            "overlay_journal.validate"));
+    }
     const bool patch = operation.kind == overlay_operation_kind_t::byte_patch ||
                        operation.kind == overlay_operation_kind_t::assembly_patch ||
                        operation.kind == overlay_operation_kind_t::integer_patch;
-    if (patch) {
+    if (patch && !removal) {
         if (operation.bytes.empty()) {
             return workspace_result_t<void>::failure(make_workspace_error(
                 workspace_error_code_t::invalid_argument,
@@ -804,6 +1173,91 @@ workspace_result_t<void> apply_item(sqlite3* database, const std::string& entity
     return upsert.step_done();
 }
 
+workspace_result_t<void> migrate_operation_payloads(
+    sqlite3* database, const overlay_target_identity_v9_t& target) {
+    struct migration_t {
+        std::uint64_t transaction_id = 0;
+        std::uint64_t operation_index = 0;
+        std::optional<std::string> before;
+        std::string after;
+    };
+    std::vector<migration_t> migrations;
+    overlay_statement_t query;
+    auto current = query.prepare(database,
+        "SELECT transaction_id,operation_index,before_json,after_json FROM overlay_operations ORDER BY transaction_id,operation_index",
+        "overlay_journal.migrate_v9");
+    if (!current)
+        return current;
+    for (;;) {
+        const int status = sqlite3_step(query.get());
+        if (status == SQLITE_DONE)
+            break;
+        if (status != SQLITE_ROW) {
+            auto error = make_workspace_error(workspace_error_code_t::persistence_failure,
+                "unable to read overlay operations for v9 migration",
+                "overlay_journal.migrate_v9");
+            error.sqlite_status = status;
+            return workspace_result_t<void>::failure(std::move(error));
+        }
+        migration_t migration;
+        migration.transaction_id = static_cast<std::uint64_t>(
+            sqlite3_column_int64(query.get(), 0));
+        migration.operation_index = static_cast<std::uint64_t>(
+            sqlite3_column_int64(query.get(), 1));
+        bool changed = false;
+        try {
+            if (sqlite3_column_type(query.get(), 2) != SQLITE_NULL) {
+                const std::string persisted_before = overlay_column_text(query.get(), 2);
+                auto parsed = parse_operation(persisted_before, &target);
+                if (!parsed)
+                    return workspace_result_t<void>::failure(parsed.error());
+                migration.before = operation_json(parsed.value(), &target).dump();
+                changed = *migration.before != persisted_before;
+            }
+            const std::string after = overlay_column_text(query.get(), 3);
+            if (after == "null") {
+                migration.after = after;
+            } else {
+                auto parsed = parse_operation(after, &target);
+                if (!parsed)
+                    return workspace_result_t<void>::failure(parsed.error());
+                migration.after = operation_json(parsed.value(), &target).dump();
+                changed = changed || migration.after != after;
+            }
+        } catch (...) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "overlay operation cannot be canonicalized as schema v9",
+                "overlay_journal.migrate_v9"));
+        }
+        if (changed)
+            migrations.push_back(std::move(migration));
+    }
+    overlay_statement_t update;
+    current = update.prepare(database,
+        "UPDATE overlay_operations SET before_json=?1,after_json=?2 WHERE transaction_id=?3 AND operation_index=?4",
+        "overlay_journal.migrate_v9");
+    if (!current)
+        return current;
+    for (const auto& migration : migrations) {
+        current = migration.before ? update.bind_text(1, *migration.before) : update.bind_null(1);
+        if (current)
+            current = update.bind_text(2, migration.after);
+        if (current)
+            current = update.bind_uint(3, migration.transaction_id);
+        if (current)
+            current = update.bind_uint(4, migration.operation_index);
+        if (current)
+            current = update.step_done();
+        if (!current)
+            return current;
+        current = update.reset();
+        if (!current)
+            return current;
+    }
+    return workspace_result_t<void>::success();
+}
+
 struct overlay_db_state_t {
     std::uint64_t revision = 0;
     std::uint64_t cursor = 0;
@@ -848,12 +1302,87 @@ workspace_result_t<overlay_db_state_t> read_overlay_state(sqlite3* database,
 
 overlay_journal_t::overlay_journal_t(std::shared_ptr<analysis_workspace_t> workspace,
                                      std::shared_ptr<workspace_database_t> database,
-                                     overlay_limits_t limits)
-    : workspace_(std::move(workspace)), database_(std::move(database)), limits_(limits) {
+                                     overlay_limits_t limits,
+                                     overlay_target_identity_v9_t fixed_target)
+    : workspace_(std::move(workspace)), database_(std::move(database)), limits_(limits),
+      fixed_target_(fixed_target) {
 }
 
 overlay_journal_t::~overlay_journal_t() {
     request_cancel();
+}
+
+workspace_result_t<void> overlay_journal_t::ensure_fixed_target_binding(
+    const cancellation_token_t& cancel) {
+    std::string serialized;
+    try {
+        serialized = serialize_overlay_target_identity_v9(fixed_target_);
+    } catch (...) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "fixed overlay target identity cannot be serialized",
+            "overlay_journal.target"));
+    }
+    const auto target = fixed_target_;
+    auto ticket = database_->enqueue_write("analysis.overlay.target",
+        [serialized, target](sqlite3* writer,
+                             const cancellation_token_t& token) -> workspace_result_t<void> {
+            if (token.stop_requested()) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    token.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                                              : workspace_error_code_t::cancelled,
+                    "overlay target binding was cancelled", "overlay_journal.target"));
+            }
+            auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.target");
+            if (!begin)
+                return begin;
+            overlay_statement_t query;
+            auto current = query.prepare(writer,
+                "SELECT value FROM metadata WHERE key='overlay_v9_fixed_target'",
+                "overlay_journal.target");
+            if (!current) {
+                overlay_exec(writer, "ROLLBACK", "overlay_journal.target");
+                return current;
+            }
+            const int status = sqlite3_step(query.get());
+            if (status == SQLITE_ROW) {
+                const auto persisted = deserialize_overlay_target_identity_v9(
+                    overlay_column_text(query.get(), 0));
+                if (!persisted || *persisted != target) {
+                    overlay_exec(writer, "ROLLBACK", "overlay_journal.target");
+                    return workspace_result_t<void>::failure(make_workspace_error(
+                        workspace_error_code_t::target_conflict,
+                        "persisted overlay target identity does not match the workspace",
+                        "overlay_journal.target"));
+                }
+            } else if (status == SQLITE_DONE) {
+                overlay_statement_t insert;
+                current = insert.prepare(writer,
+                    "INSERT INTO metadata(key,value) VALUES('overlay_v9_fixed_target',?1)",
+                    "overlay_journal.target");
+                if (current)
+                    current = insert.bind_text(1, serialized);
+                if (current)
+                    current = insert.step_done();
+                if (!current) {
+                    overlay_exec(writer, "ROLLBACK", "overlay_journal.target");
+                    return current;
+                }
+            } else {
+                overlay_exec(writer, "ROLLBACK", "overlay_journal.target");
+                auto error = make_workspace_error(
+                    workspace_error_code_t::persistence_failure,
+                    "unable to read the fixed overlay target identity",
+                    "overlay_journal.target");
+                error.sqlite_status = status;
+                return workspace_result_t<void>::failure(std::move(error));
+            }
+            auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.target");
+            if (!committed)
+                overlay_exec(writer, "ROLLBACK", "overlay_journal.target");
+            return committed;
+        }, cancel);
+    return wait_ticket(ticket, cancel);
 }
 
 workspace_result_t<std::shared_ptr<overlay_journal_t>> overlay_journal_t::open(
@@ -875,8 +1404,17 @@ workspace_result_t<std::shared_ptr<overlay_journal_t>> overlay_journal_t::open(
                                  "overlay database identity does not match the workspace",
                                  "overlay_journal.open"));
     }
+    auto fixed_target = make_fixed_target_identity(*workspace);
+    if (!fixed_target)
+        return workspace_result_t<std::shared_ptr<overlay_journal_t>>::failure(
+            fixed_target.error());
     auto journal = std::shared_ptr<overlay_journal_t>(
-        new overlay_journal_t(std::move(workspace), std::move(database), limits));
+        new overlay_journal_t(std::move(workspace), std::move(database), limits,
+                              fixed_target.take_value()));
+    auto target_bound = journal->ensure_fixed_target_binding(journal->cancellation_.token());
+    if (!target_bound)
+        return workspace_result_t<std::shared_ptr<overlay_journal_t>>::failure(
+            target_bound.error());
     auto recovered = journal->recover_and_load(journal->cancellation_.token());
     if (!recovered)
         return workspace_result_t<std::shared_ptr<overlay_journal_t>>::failure(recovered.error());
@@ -942,7 +1480,7 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
     if (!integrity) return integrity;
     auto database = database_;
     auto ticket = database_->enqueue_write("analysis.overlay.recover",
-        [](sqlite3* writer, const cancellation_token_t& token) {
+        [target = fixed_target_](sqlite3* writer, const cancellation_token_t& token) {
             if (token.stop_requested()) {
                 return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::cancelled,
@@ -950,6 +1488,11 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
             }
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.recovery");
             if (!begin) return begin;
+            auto migrated = migrate_operation_payloads(writer, target);
+            if (!migrated) {
+                overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery");
+                return migrated;
+            }
             auto cleared = overlay_exec(writer, "DELETE FROM overlay_items",
                                         "overlay_journal.recovery");
             if (!cleared) { overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery"); return cleared; }
@@ -1017,7 +1560,8 @@ workspace_result_t<void> overlay_journal_t::reload_items() {
                 return workspace_result_t<void>::failure(std::move(error));
             }
             const std::string key = overlay_column_text(statement.get(), 0);
-            auto operation = parse_operation(overlay_column_text(statement.get(), 1));
+            auto operation = parse_operation(overlay_column_text(statement.get(), 1),
+                                             &fixed_target_);
             if (!operation) return workspace_result_t<void>::failure(operation.error());
             auto owner = workspace_.lock();
             if (!owner) {
@@ -1115,6 +1659,16 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     std::size_t total_patch_bytes = 0;
     std::vector<std::string> keys;
     keys.reserve(request.operations.size());
+    const bool static_v9 = fixed_target_.kind == overlay_target_kind_v9_t::static_image;
+    if (static_v9 && workspace->generation() != fixed_target_.generation) {
+        return workspace_result_t<overlay_transaction_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::stale_generation,
+            "workspace generation no longer matches the fixed overlay target",
+            "overlay_journal.transact"));
+    }
+    std::vector<overlay_operation_v9_t> v9_operations;
+    if (static_v9)
+        v9_operations.reserve(request.operations.size());
     std::unordered_map<std::string, std::pair<std::uint64_t, std::uint64_t>> patch_ranges;
     for (const auto& operation : request.operations) {
         auto validated = validate_operation(operation, limits_, *workspace, total_patch_bytes);
@@ -1128,6 +1682,14 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 "overlay_journal.transact"));
         }
         keys.push_back(key);
+        if (static_v9) {
+            auto adapted = operation_to_v9(operation, *workspace, fixed_target_,
+                                           "overlay_journal.transact");
+            if (!adapted)
+                return workspace_result_t<overlay_transaction_result_t>::failure(
+                    adapted.error());
+            v9_operations.push_back(adapted.take_value());
+        }
         if (!operation.bytes.empty()) {
             auto patch_offset = patch_provider_offset(operation, *workspace);
             if (!patch_offset)
@@ -1160,7 +1722,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             ? json(*request.idempotency_key) : json(nullptr);
         request_json["operations"] = json::array();
         for (const auto& operation : request.operations)
-            request_json["operations"].push_back(operation_json(operation));
+            request_json["operations"].push_back(operation_json(operation, &fixed_target_));
         auto request_hash_result = sha256_text(request_json.dump(), cancel);
         if (!request_hash_result)
             return workspace_result_t<overlay_transaction_result_t>::failure(
@@ -1279,6 +1841,31 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             "overlay_journal.transact"));
     }
 
+    if (static_v9) {
+        auto preflight_state = make_v9_preflight_state(snapshot(), *workspace, fixed_target_);
+        if (!preflight_state) {
+            return workspace_result_t<overlay_transaction_result_t>::failure(
+                preflight_state.error());
+        }
+        overlay_transaction_v9_t transaction;
+        transaction.target = fixed_target_;
+        transaction.expected_revision = local_revision;
+        transaction.operations = v9_operations;
+        overlay_apply_limits_v9_t engine_limits;
+        engine_limits.max_operations_per_transaction = limits_.max_operations;
+        engine_limits.max_text_bytes = (std::max)(limits_.max_comment_bytes,
+            (std::max)(limits_.max_name_bytes, limits_.max_assembly_bytes));
+        engine_limits.max_type_bytes = limits_.max_type_bytes;
+        engine_limits.max_patch_bytes_per_operation = limits_.max_patch_bytes_per_item;
+        engine_limits.max_patch_bytes_per_transaction = limits_.max_patch_bytes_per_transaction;
+        const auto preflight = overlay_apply_engine_v9_t::apply(
+            preflight_state.value(), transaction, engine_limits);
+        if (!preflight.ok()) {
+            return workspace_result_t<overlay_transaction_result_t>::failure(
+                overlay_apply_error(preflight.code, "overlay_journal.transact"));
+        }
+    }
+
     overlay_transaction_result_t dry_result;
     dry_result.revision = local_revision;
     dry_result.dry_run = request.dry_run;
@@ -1293,7 +1880,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     const auto idempotency = request.idempotency_key;
     auto ticket = database_->enqueue_write("analysis.overlay.commit",
         [operations, keys, idempotency, request_hash, request_expected = request.expected_revision,
-         result_holder](sqlite3* writer, const cancellation_token_t& token) -> workspace_result_t<void> {
+         target = fixed_target_, result_holder](sqlite3* writer,
+                                                const cancellation_token_t& token) -> workspace_result_t<void> {
             if (token.stop_requested())
                 return workspace_result_t<void>::failure(make_workspace_error(
                     token.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
@@ -1413,7 +2001,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 }
                 current = prior_query.reset(); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 const std::string after = removes_value(operations[index])
-                    ? std::string("null") : operation_json(operations[index]).dump();
+                    ? std::string("null") : operation_json(operations[index], &target).dump();
                 current = operation_statement.bind_uint(1, transaction_id); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = operation_statement.bind_uint(2, index); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = operation_statement.bind_int(3, static_cast<std::int64_t>(operations[index].kind)); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
@@ -1470,6 +2058,51 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             return workspace_result_t<overlay_transaction_result_t>::failure(loaded.error());
     }
     return workspace_result_t<overlay_transaction_result_t>::success(*result_holder);
+}
+
+workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact_v9(
+    const overlay_transaction_v9_t& transaction,
+    bool dry_run,
+    std::optional<std::string> idempotency_key,
+    const cancellation_token_t& cancel) {
+    auto workspace = workspace_.lock();
+    if (!workspace || workspace->closing()) {
+        return workspace_result_t<overlay_transaction_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::workspace_closing,
+            "overlay workspace is closing", "overlay_journal.adapter"));
+    }
+    if (fixed_target_.kind != overlay_target_kind_v9_t::static_image) {
+        return workspace_result_t<overlay_transaction_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::target_conflict,
+            "overlay v9 transactions require a static workspace",
+            "overlay_journal.adapter"));
+    }
+    if (!transaction.target.valid() || transaction.target != fixed_target_) {
+        return workspace_result_t<overlay_transaction_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::stale_generation,
+            "overlay v9 transaction target does not match the fixed workspace target",
+            "overlay_journal.adapter"));
+    }
+    overlay_transaction_request_t request;
+    request.dry_run = dry_run;
+    request.expected_revision = transaction.expected_revision;
+    request.idempotency_key = std::move(idempotency_key);
+    request.operations.reserve(transaction.operations.size());
+    for (const auto& operation : transaction.operations) {
+        try {
+            (void)serialize_overlay_operation_record_v9({fixed_target_, operation});
+        } catch (...) {
+            return workspace_result_t<overlay_transaction_result_t>::failure(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "overlay v9 transaction contains an invalid operation",
+                "overlay_journal.adapter"));
+        }
+        auto adapted = operation_from_v9(operation, *workspace, fixed_target_);
+        if (!adapted)
+            return workspace_result_t<overlay_transaction_result_t>::failure(adapted.error());
+        request.operations.push_back(adapted.take_value());
+    }
+    return transact(request, cancel);
 }
 
 workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_action(

@@ -8,6 +8,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <Deterministic>true</Deterministic>
     <AssemblyName>ManagedCliWorkerHarness</AssemblyName>
+    <RestoreIgnoreFailedSources>false</RestoreIgnoreFailedSources>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\..\..\workers\managed_decompiler\ManagedDecompilerWorker.csproj" />

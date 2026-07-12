@@ -315,6 +315,10 @@ struct mapped_window_cache_t::state_t {
             error.size = bytes;
             error.details.emplace_back("global_mapped_window_bytes",
                 std::to_string(global_mapped_window_bytes().load(std::memory_order_acquire)));
+            error.details.emplace_back("global_reserved_window_bytes",
+                std::to_string(global_reserved_window_bytes().load(std::memory_order_acquire)));
+            error.details.emplace_back("global_admitted_window_bytes",
+                std::to_string(global_admitted_window_bytes().load(std::memory_order_acquire)));
             error.details.emplace_back("max_global_mapped_window_bytes",
                                        std::to_string(options.max_global_mapped_window_bytes));
             return workspace_result_t<void>::failure(std::move(error));
@@ -443,9 +447,9 @@ struct mapped_window_cache_t::state_t {
     mapped_window_cache_statistics_t statistics() const noexcept {
         mapped_window_cache_statistics_t result;
         result.source_bytes = file->identity.size;
-        result.cached_window_bytes = cached_window_bytes.load(std::memory_order_acquire);
         {
             std::lock_guard<std::mutex> admission(admission_mutex);
+            result.cached_window_bytes = cached_window_bytes.load(std::memory_order_acquire);
             result.reserved_window_bytes = reserved_window_bytes;
         }
         result.global_mapped_window_bytes =

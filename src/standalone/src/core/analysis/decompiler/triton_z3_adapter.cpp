@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cctype>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -12,6 +11,16 @@
 #include <thread>
 #include <unordered_set>
 #include <utility>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#endif
 
 #if defined(__has_include)
 #if __has_include(<triton/context.hpp>) && __has_include(<triton/version.hpp>)
@@ -72,19 +81,49 @@ bool valid_domain(triton_z3_semantic_domain_t value) noexcept
     return false;
 }
 
+bool ascii_alpha(char value) noexcept
+{
+    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+}
+
+bool ascii_digit(char value) noexcept
+{
+    return value >= '0' && value <= '9';
+}
+
+bool valid_stable_text(const std::string& value, std::size_t maximum) noexcept
+{
+    if (value.empty() || value.size() > maximum)
+        return false;
+    return std::all_of(value.begin(), value.end(), [](char character) {
+        return character >= 0x21 && character <= 0x7E;
+    });
+}
+
+bool valid_diagnostic_key(const std::string& value) noexcept
+{
+    if (value.empty())
+        return true;
+    if (value.size() > k_max_diagnostic_key)
+        return false;
+    return std::all_of(value.begin(), value.end(), [](char character) {
+        return ascii_alpha(character) || ascii_digit(character) || character == '.' ||
+               character == '_' || character == '-';
+    });
+}
+
 bool valid_symbol(const std::string& value) noexcept
 {
     if (value.empty() || value.size() > k_max_symbol_length)
         return false;
-    const auto first = static_cast<unsigned char>(value.front());
-    if (std::isalpha(first) == 0 && value.front() != '_')
+    if (!ascii_alpha(value.front()))
         return false;
     for (const char character : value) {
-        const auto byte = static_cast<unsigned char>(character);
-        if (std::isalnum(byte) == 0 && character != '_')
+        if (!ascii_alpha(character) && !ascii_digit(character) && character != '_')
             return false;
     }
-    return true;
+    return value != "true" && value != "false" && value != "let" && value != "forall" &&
+           value != "exists" && value != "assert";
 }
 
 bool valid_bit_width(std::uint32_t value) noexcept
@@ -228,6 +267,44 @@ std::uint64_t elapsed_milliseconds(
     return static_cast<std::uint64_t>((nanoseconds + per_millisecond - 1) / per_millisecond);
 }
 
+bool current_thread_cpu_milliseconds(std::uint64_t& result) noexcept
+{
+#if defined(_WIN32)
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) == 0)
+        return false;
+    ULARGE_INTEGER kernel_ticks{};
+    kernel_ticks.LowPart = kernel.dwLowDateTime;
+    kernel_ticks.HighPart = kernel.dwHighDateTime;
+    ULARGE_INTEGER user_ticks{};
+    user_ticks.LowPart = user.dwLowDateTime;
+    user_ticks.HighPart = user.dwHighDateTime;
+    const auto ticks = kernel_ticks.QuadPart + user_ticks.QuadPart;
+    result = ticks == 0 ? 0 : (ticks + 9999ULL) / 10000ULL;
+    return true;
+#else
+    result = 0;
+    return false;
+#endif
+}
+
+struct adapter_measurement_t {
+    std::chrono::steady_clock::time_point wall_begin;
+    std::uint64_t cpu_begin_ms = 0;
+    bool cpu_valid = false;
+};
+
+adapter_measurement_t begin_adapter_measurement() noexcept
+{
+    adapter_measurement_t result;
+    result.wall_begin = std::chrono::steady_clock::now();
+    result.cpu_valid = current_thread_cpu_milliseconds(result.cpu_begin_ms);
+    return result;
+}
+
 unsigned bounded_unsigned(std::uint64_t value) noexcept
 {
     return value > std::numeric_limits<unsigned>::max()
@@ -260,14 +337,20 @@ triton_z3_proof_response_t terminal_response(
     triton_z3_proof_status_t status,
     triton_z3_unknown_reason_t reason,
     std::string diagnostic_key,
-    std::chrono::steady_clock::time_point begin,
+    const adapter_measurement_t& measurement,
     std::uint64_t peak_memory_bytes = 0)
 {
     triton_z3_proof_response_t result;
     result.status = status;
     result.unknown_reason = reason;
     result.diagnostic_key = std::move(diagnostic_key);
-    result.elapsed_wall_clock_ms = elapsed_milliseconds(begin, std::chrono::steady_clock::now());
+    result.elapsed_wall_clock_ms = elapsed_milliseconds(
+        measurement.wall_begin, std::chrono::steady_clock::now());
+    std::uint64_t cpu_end_ms = 0;
+    result.elapsed_cpu_ms = measurement.cpu_valid && current_thread_cpu_milliseconds(cpu_end_ms) &&
+                                    cpu_end_ms >= measurement.cpu_begin_ms
+        ? cpu_end_ms - measurement.cpu_begin_ms
+        : std::numeric_limits<std::uint64_t>::max();
     result.peak_memory_bytes = peak_memory_bytes;
     return result;
 }
@@ -295,15 +378,15 @@ public:
         const triton_z3_proof_request_t& request,
         const cancellation_token_t& cancel) override
     {
-        const auto begin = std::chrono::steady_clock::now();
+        const auto measurement = begin_adapter_measurement();
         if (!valid_triton_z3_proof_request(request))
             return terminal_response(triton_z3_proof_status_t::denied,
                 triton_z3_unknown_reason_t::unsupported_semantics,
-                "semantic_refiner.adapter.invalid_request", begin);
+                "semantic_refiner.adapter.invalid_request", measurement);
         if (cancel.stop_requested())
             return terminal_response(triton_z3_proof_status_t::cancelled,
                 triton_z3_unknown_reason_t::none,
-                "semantic_refiner.adapter.cancelled", begin);
+                "semantic_refiner.adapter.cancelled", measurement);
 
         try {
             triton::Context triton_context(triton::arch::ARCH_X86_64);
@@ -319,7 +402,8 @@ public:
                     expression = ast->bv(node.literal, node.bit_width);
                     break;
                 case triton_z3_ir_opcode_t::symbolic_variable: {
-                    const auto variable = triton_context.newSymbolicVariable(node.bit_width, node.symbol);
+                    const auto variable = triton_context.newSymbolicVariable(
+                        node.bit_width, "aida_semantic_" + node.symbol);
                     expression = ast->variable(variable);
                     variables.push_back(expression);
                     break;
@@ -370,7 +454,7 @@ public:
                 if (!expression || expression->getBitvectorSize() != node.bit_width)
                     return terminal_response(triton_z3_proof_status_t::unknown,
                         triton_z3_unknown_reason_t::unsupported_semantics,
-                        "semantic_refiner.adapter.triton_ir_rejected", begin);
+                        "semantic_refiner.adapter.triton_ir_rejected", measurement);
                 expressions[node.id] = std::move(expression);
             }
 
@@ -382,7 +466,7 @@ public:
             if (smt.size() > request.limits.max_memory_bytes)
                 return terminal_response(triton_z3_proof_status_t::unknown,
                     triton_z3_unknown_reason_t::resource_limit,
-                    "semantic_refiner.adapter.memory_limit", begin, smt.size());
+                    "semantic_refiner.adapter.memory_limit", measurement, smt.size());
 
             z3::context z3_context;
             z3::solver solver(z3_context);
@@ -397,7 +481,7 @@ public:
             if (assertions.empty())
                 return terminal_response(triton_z3_proof_status_t::unknown,
                     triton_z3_unknown_reason_t::unsupported_semantics,
-                    "semantic_refiner.adapter.empty_formula", begin);
+                    "semantic_refiner.adapter.empty_formula", measurement);
             for (unsigned index = 0; index < assertions.size(); ++index)
                 solver.add(assertions[index]);
 
@@ -438,38 +522,53 @@ public:
             if (cancel.stop_requested())
                 return terminal_response(triton_z3_proof_status_t::cancelled,
                     triton_z3_unknown_reason_t::none,
-                    "semantic_refiner.adapter.cancelled", begin, peak_memory);
+                    "semantic_refiner.adapter.cancelled", measurement, peak_memory);
             if (peak_memory > request.limits.max_memory_bytes)
                 return terminal_response(triton_z3_proof_status_t::unknown,
                     triton_z3_unknown_reason_t::resource_limit,
-                    "semantic_refiner.adapter.memory_limit", begin, peak_memory);
+                    "semantic_refiner.adapter.memory_limit", measurement, peak_memory);
             if (checked == z3::unsat) {
                 auto result = terminal_response(triton_z3_proof_status_t::proved,
-                    triton_z3_unknown_reason_t::none, {}, begin, peak_memory);
+                    triton_z3_unknown_reason_t::none, {}, measurement, peak_memory);
                 result.refinement_key = request.refinement_key;
                 return result;
             }
             if (checked == z3::sat)
                 return terminal_response(triton_z3_proof_status_t::disproved,
-                    triton_z3_unknown_reason_t::none, {}, begin, peak_memory);
+                    triton_z3_unknown_reason_t::none, {}, measurement, peak_memory);
 
             const auto reason = solver.reason_unknown();
             if (reason.find("timeout") != std::string::npos || reason.find("max. memory") != std::string::npos)
                 return terminal_response(triton_z3_proof_status_t::timeout,
                     triton_z3_unknown_reason_t::resource_limit,
-                    "semantic_refiner.adapter.resource_limit", begin, peak_memory);
+                    "semantic_refiner.adapter.resource_limit", measurement, peak_memory);
             return terminal_response(triton_z3_proof_status_t::unknown,
                 triton_z3_unknown_reason_t::solver_unknown,
-                "semantic_refiner.adapter.solver_unknown", begin, peak_memory);
+                "semantic_refiner.adapter.solver_unknown", measurement, peak_memory);
+        } catch (const z3::exception& error) {
+            if (cancel.stop_requested())
+                return terminal_response(triton_z3_proof_status_t::cancelled,
+                    triton_z3_unknown_reason_t::none,
+                    "semantic_refiner.adapter.cancelled", measurement);
+            const std::string reason = error.msg();
+            if (reason.find("max. memory") != std::string::npos ||
+                reason.find("timeout") != std::string::npos)
+                return terminal_response(triton_z3_proof_status_t::timeout,
+                    triton_z3_unknown_reason_t::resource_limit,
+                    "semantic_refiner.adapter.resource_limit", measurement,
+                    request.limits.max_memory_bytes);
+            return terminal_response(triton_z3_proof_status_t::unknown,
+                triton_z3_unknown_reason_t::unsupported_semantics,
+                "semantic_refiner.adapter.backend_failure", measurement);
         } catch (const std::bad_alloc&) {
             return terminal_response(triton_z3_proof_status_t::unknown,
                 triton_z3_unknown_reason_t::resource_limit,
-                "semantic_refiner.adapter.memory_limit", begin,
+                "semantic_refiner.adapter.memory_limit", measurement,
                 request.limits.max_memory_bytes);
         } catch (...) {
             return terminal_response(triton_z3_proof_status_t::unknown,
                 triton_z3_unknown_reason_t::unsupported_semantics,
-                "semantic_refiner.adapter.backend_failure", begin);
+                "semantic_refiner.adapter.backend_failure", measurement);
         }
     }
 };
@@ -481,12 +580,13 @@ public:
 bool triton_z3_adapter_capabilities_t::valid() const noexcept
 {
     if (!valid_availability(availability) || !local_dependencies_only || !static_hir_only ||
-        target_execution_supported || triton_version.size() > k_max_stable_text ||
-        z3_version.size() > k_max_stable_text)
+        target_execution_supported)
         return false;
     if (availability == triton_z3_adapter_availability_t::ready)
-        return !triton_version.empty() && !z3_version.empty();
-    return true;
+        return valid_stable_text(triton_version, k_max_stable_text) &&
+               valid_stable_text(z3_version, k_max_stable_text);
+    return (triton_version.empty() || valid_stable_text(triton_version, k_max_stable_text)) &&
+           (z3_version.empty() || valid_stable_text(z3_version, k_max_stable_text));
 }
 
 bool triton_z3_adapter_capabilities_t::available() const noexcept
@@ -497,48 +597,48 @@ bool triton_z3_adapter_capabilities_t::available() const noexcept
 bool valid_triton_z3_static_ir(const triton_z3_static_ir_t& value)
 {
     try {
-    if (!valid_domain(value.domain) || value.nodes.empty() || value.nodes.size() > k_max_ir_nodes ||
-        value.root_node_id != value.nodes.size())
-        return false;
-
-    std::unordered_set<std::string> symbols;
-    bool has_symbol = false;
-    bool has_stack_symbol = false;
-    bool has_stack_arithmetic = false;
-    for (std::size_t index = 0; index < value.nodes.size(); ++index) {
-        const auto& node = value.nodes[index];
-        if (node.id != index + 1 || !valid_bit_width(node.bit_width))
+        if (!valid_domain(value.domain) || value.nodes.empty() || value.nodes.size() > k_max_ir_nodes ||
+            value.root_node_id != value.nodes.size())
             return false;
-        if (node.opcode == triton_z3_ir_opcode_t::bitvector_constant) {
-            if (!node.symbol.empty() || node.lhs_id != 0 || node.rhs_id != 0 ||
-                !literal_fits(node.literal, node.bit_width))
-                return false;
-            continue;
-        }
-        if (node.opcode == triton_z3_ir_opcode_t::symbolic_variable) {
-            if (!valid_symbol(node.symbol) || node.literal != 0 || node.lhs_id != 0 || node.rhs_id != 0 ||
-                !symbols.insert(node.symbol).second)
-                return false;
-            has_symbol = true;
-            has_stack_symbol = has_stack_symbol || (node.symbol == "sp_entry" && node.bit_width == 64);
-            continue;
-        }
-        if (!node.symbol.empty() || node.literal != 0 ||
-            !node_references_valid(node, value.nodes))
-            return false;
-        has_stack_arithmetic = has_stack_arithmetic || node.opcode == triton_z3_ir_opcode_t::add ||
-                               node.opcode == triton_z3_ir_opcode_t::subtract;
-    }
 
-    const auto& root = value.nodes.back();
-    if (root.bit_width != 1 || (!comparison_opcode(root.opcode) && !logical_opcode(root.opcode)))
-        return false;
-    if (value.domain == triton_z3_semantic_domain_t::constant && has_symbol)
-        return false;
-    if (value.domain == triton_z3_semantic_domain_t::stack_effect &&
-        (!has_stack_symbol || !has_stack_arithmetic))
-        return false;
-    return all_nodes_reachable(value);
+        std::unordered_set<std::string> symbols;
+        bool has_symbol = false;
+        bool has_stack_symbol = false;
+        bool has_stack_arithmetic = false;
+        for (std::size_t index = 0; index < value.nodes.size(); ++index) {
+            const auto& node = value.nodes[index];
+            if (node.id != index + 1 || !valid_bit_width(node.bit_width))
+                return false;
+            if (node.opcode == triton_z3_ir_opcode_t::bitvector_constant) {
+                if (!node.symbol.empty() || node.lhs_id != 0 || node.rhs_id != 0 ||
+                    !literal_fits(node.literal, node.bit_width))
+                    return false;
+                continue;
+            }
+            if (node.opcode == triton_z3_ir_opcode_t::symbolic_variable) {
+                if (!valid_symbol(node.symbol) || node.literal != 0 || node.lhs_id != 0 || node.rhs_id != 0 ||
+                    !symbols.insert(node.symbol).second)
+                    return false;
+                has_symbol = true;
+                has_stack_symbol = has_stack_symbol || (node.symbol == "sp_entry" && node.bit_width == 64);
+                continue;
+            }
+            if (!node.symbol.empty() || node.literal != 0 ||
+                !node_references_valid(node, value.nodes))
+                return false;
+            has_stack_arithmetic = has_stack_arithmetic || node.opcode == triton_z3_ir_opcode_t::add ||
+                                   node.opcode == triton_z3_ir_opcode_t::subtract;
+        }
+
+        const auto& root = value.nodes.back();
+        if (root.bit_width != 1 || (!comparison_opcode(root.opcode) && !logical_opcode(root.opcode)))
+            return false;
+        if (value.domain == triton_z3_semantic_domain_t::constant && has_symbol)
+            return false;
+        if (value.domain == triton_z3_semantic_domain_t::stack_effect &&
+            (!has_stack_symbol || !has_stack_arithmetic))
+            return false;
+        return all_nodes_reachable(value);
     } catch (...) {
         return false;
     }
@@ -553,8 +653,8 @@ bool valid_triton_z3_proof_limits(const triton_z3_proof_limits_t& value) noexcep
 
 bool valid_triton_z3_proof_request(const triton_z3_proof_request_t& value)
 {
-    return value.ordinal != 0 && !value.stable_id.empty() && value.stable_id.size() <= k_max_stable_text &&
-           !value.refinement_key.empty() && value.refinement_key.size() <= k_max_stable_text &&
+    return value.ordinal != 0 && valid_stable_text(value.stable_id, k_max_stable_text) &&
+           valid_stable_text(value.refinement_key, k_max_stable_text) &&
            valid_triton_z3_static_ir(value.static_ir) &&
            value.static_ir.nodes.size() <= value.limits.max_ir_nodes &&
            valid_triton_z3_proof_limits(value.limits) && validate_decompiler_entity_key(value.entity).valid() &&
@@ -564,7 +664,8 @@ bool valid_triton_z3_proof_request(const triton_z3_proof_request_t& value)
 
 bool valid_triton_z3_proof_response(const triton_z3_proof_response_t& value) noexcept
 {
-    if (value.refinement_key.size() > k_max_stable_text || value.diagnostic_key.size() > k_max_diagnostic_key)
+    if ((!value.refinement_key.empty() && !valid_stable_text(value.refinement_key, k_max_stable_text)) ||
+        !valid_diagnostic_key(value.diagnostic_key))
         return false;
     switch (value.status) {
     case triton_z3_proof_status_t::proved:

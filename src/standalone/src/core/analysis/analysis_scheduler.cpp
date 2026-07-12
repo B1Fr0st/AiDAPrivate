@@ -78,7 +78,7 @@ struct analysis_scheduler_state_t final {
           ledger(configuration.budget),
           policy(analysis_priority_reservation_policy(configuration.budget)),
           metrics(input_metrics ? std::move(input_metrics)
-                                : std::make_shared<analysis_resource_metrics_t>(configuration.scheduler_id))
+                                : std::make_shared<analysis_resource_metrics_t>())
     {
         if (!clock) {
             configuration_error = make_scheduler_error(analysis_scheduler_error_code_t::invalid_clock);

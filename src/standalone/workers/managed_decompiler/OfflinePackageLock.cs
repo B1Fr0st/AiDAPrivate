@@ -28,8 +28,8 @@ internal static class OfflinePackageLock
 
     internal static void EstablishStartupGate(string packageRoot)
     {
-        var normalizedRoot = ValidatePackageRoot(packageRoot);
-        ValidateLoadedDecompilerAssembly();
+        var normalizedRoot = ValidatePackageRoot(packageRoot, null, CancellationToken.None);
+        ValidateLoadedDecompilerAssembly(null, CancellationToken.None);
         lock (StartupGate)
         {
             if (verifiedPackageRoot is not null && !string.Equals(verifiedPackageRoot, normalizedRoot, StringComparison.OrdinalIgnoreCase))
@@ -38,20 +38,28 @@ internal static class OfflinePackageLock
         }
     }
 
-    internal static void RequireRuntimeGate(string offlineLockHash)
+    internal static void RequireRuntimeGate(
+        string offlineLockHash,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
     {
+        resourceBudget.Checkpoint(cancellationToken);
         string packageRoot;
         lock (StartupGate)
             packageRoot = verifiedPackageRoot ?? throw new OfflineIntegrityException("offline package startup gate is not established");
         if (!FixedTimeHexEquals(offlineLockHash, ManifestHashHex))
             throw new OfflineIntegrityException("offline package lock hash does not match the startup gate");
-        var normalizedRoot = ValidatePackageRoot(packageRoot);
+        var normalizedRoot = ValidatePackageRoot(packageRoot, resourceBudget, cancellationToken);
         if (!string.Equals(packageRoot, normalizedRoot, StringComparison.OrdinalIgnoreCase))
             throw new OfflineIntegrityException("offline package root identity changed after startup verification");
-        ValidateLoadedDecompilerAssembly();
+        ValidateLoadedDecompilerAssembly(resourceBudget, cancellationToken);
+        resourceBudget.Checkpoint(cancellationToken);
     }
 
-    private static string ValidatePackageRoot(string packageRoot)
+    private static string ValidatePackageRoot(
+        string packageRoot,
+        ResourceBudgetGuard? resourceBudget,
+        CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(packageRoot))
             throw new OfflineIntegrityException("offline package root is empty");
@@ -75,7 +83,7 @@ internal static class OfflinePackageLock
             try
             {
                 using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
-                var actual = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+                var actual = HashStream(stream, resourceBudget, cancellationToken);
                 if (!FixedTimeHexEquals(actual, package.Sha256))
                     throw new OfflineIntegrityException($"offline package hash mismatch: {package.Id}");
             }
@@ -87,7 +95,9 @@ internal static class OfflinePackageLock
         return normalizedRoot;
     }
 
-    private static void ValidateLoadedDecompilerAssembly()
+    private static void ValidateLoadedDecompilerAssembly(
+        ResourceBudgetGuard? resourceBudget,
+        CancellationToken cancellationToken)
     {
         var path = typeof(ICSharpCode.Decompiler.CSharp.CSharpDecompiler).Assembly.Location;
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
@@ -95,7 +105,7 @@ internal static class OfflinePackageLock
         try
         {
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
-            var actual = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+            var actual = HashStream(stream, resourceBudget, cancellationToken);
             if (!FixedTimeHexEquals(actual, DecompilerAssemblySha256))
                 throw new OfflineIntegrityException("offline decompiler assembly hash mismatch");
         }
@@ -111,9 +121,39 @@ internal static class OfflinePackageLock
         return Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
     }
 
-    private static bool FixedTimeHexEquals(string left, string right)
+    private static string HashStream(
+        Stream stream,
+        ResourceBudgetGuard? resourceBudget,
+        CancellationToken cancellationToken)
     {
-        if (left.Length != 64 || right.Length != 64)
+        const int BufferSize = 1024 * 1024;
+        resourceBudget?.EnsureAllocationFits(BufferSize, cancellationToken);
+        byte[] buffer;
+        try
+        {
+            buffer = GC.AllocateUninitializedArray<byte>(BufferSize);
+        }
+        catch (OutOfMemoryException) when (resourceBudget is not null)
+        {
+            throw new ResourceLimitException(ResourceLimitKind.Memory);
+        }
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            resourceBudget?.Checkpoint(cancellationToken);
+            var read = stream.Read(buffer, 0, buffer.Length);
+            if (read == 0)
+                break;
+            hash.AppendData(buffer, 0, read);
+        }
+        resourceBudget?.Checkpoint(cancellationToken);
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static bool FixedTimeHexEquals(string? left, string? right)
+    {
+        if (left is null || right is null || left.Length != 64 || right.Length != 64)
             return false;
         try
         {

@@ -328,7 +328,6 @@ public:
         const triton_z3_proof_request_t& request_value,
         const cancellation_token_t&) override
     {
-        entered.store(true, std::memory_order_release);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         finished.store(true, std::memory_order_release);
         triton_z3_proof_response_t result;
@@ -340,7 +339,6 @@ public:
         return result;
     }
 
-    std::atomic<bool> entered{false};
     std::atomic<bool> finished{false};
 };
 
@@ -666,19 +664,28 @@ void verify_production_semantic_fixtures()
     fixtures.push_back(stack_effect_ir());
     semantic_refiner_t refiner(adapter);
     for (std::size_t index = 0; index < fixtures.size(); ++index) {
-        auto value = request(1);
-        value.profile.max_wall_clock_ms = 2000;
-        value.profile.max_cpu_ms = 1000;
-        value.profile.max_semantic_queries = 1;
-        value.queries[0].static_ir = std::move(fixtures[index]);
-        value.queries[0].refinement_key = "production." + std::to_string(index + 1);
-        const auto result = refiner.refine(value);
-        require(result.status == semantic_refinement_status_t::completed,
-            "production semantic fixture did not complete");
-        require(result.adapter_invocations == 1 && result.facts.size() == 1,
-            "production semantic fixture did not produce exactly one proof");
-        require(result.facts.front().refinement_key == value.queries[0].refinement_key,
-            "production semantic fixture returned the wrong refinement key");
+        std::string expected_signature;
+        for (std::uint32_t run = 0; run < 3; ++run) {
+            auto value = request(1);
+            value.profile.max_wall_clock_ms = 2000;
+            value.profile.max_cpu_ms = 1000;
+            value.profile.max_semantic_queries = 1;
+            value.queries[0].static_ir = fixtures[index];
+            value.queries[0].refinement_key = "production." + std::to_string(index + 1);
+            const auto result = refiner.refine(value);
+            require(result.status == semantic_refinement_status_t::completed,
+                "production semantic fixture did not complete");
+            require(result.adapter_invocations == 1 && result.facts.size() == 1,
+                "production semantic fixture did not produce exactly one proof");
+            require(result.facts.front().refinement_key == value.queries[0].refinement_key,
+                "production semantic fixture returned the wrong refinement key");
+            const auto signature = stable_result_signature(result);
+            if (run == 0)
+                expected_signature = signature;
+            else
+                require(signature == expected_signature,
+                    "production semantic fixture changed across repeated runs");
+        }
     }
 }
 

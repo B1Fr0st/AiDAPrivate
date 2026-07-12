@@ -563,22 +563,26 @@ semantic_refinement_result_t semantic_refiner_t::refine(
             result.status = semantic_refinement_status_t::cancelled;
             return result;
         }
+        const bool function_wall_exhausted = worker.terminal == proof_worker_terminal_t::completed &&
+                                             std::chrono::steady_clock::now() >= function_deadline;
         if (worker.terminal == proof_worker_terminal_t::wall_limit ||
-            worker.terminal == proof_worker_terminal_t::cpu_limit) {
+            worker.terminal == proof_worker_terminal_t::cpu_limit || function_wall_exhausted) {
+            const bool wall_limit = worker.terminal == proof_worker_terminal_t::wall_limit ||
+                                    function_wall_exhausted;
             result.unknowns.push_back(make_unknown(query,
-                worker.terminal == proof_worker_terminal_t::wall_limit
+                wall_limit
                     ? decompiler_unknown_reason_t::semantic_timeout
                     : decompiler_unknown_reason_t::bounded_analysis_limit,
-                worker.terminal == proof_worker_terminal_t::wall_limit
+                wall_limit
                     ? "semantic_timeout:" + query.stable_id
                     : "semantic_cpu_limit:" + query.stable_id));
             append_pending_unknowns(result, request.queries, index + 1,
                 decompiler_unknown_reason_t::bounded_analysis_limit, "semantic_budget_exhausted");
             result.diagnostics.push_back(make_diagnostic(
-                worker.terminal == proof_worker_terminal_t::wall_limit
+                wall_limit
                     ? decompiler_diagnostic_code_t::deadline_exceeded
                     : decompiler_diagnostic_code_t::resource_limit,
-                worker.terminal == proof_worker_terminal_t::wall_limit
+                wall_limit
                     ? "semantic_refiner.worker.deadline"
                     : "semantic_refiner.worker.cpu_limit",
                 &query.coordinate,

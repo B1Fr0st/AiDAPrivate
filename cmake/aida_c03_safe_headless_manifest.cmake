@@ -89,7 +89,6 @@ function(aida_c03_configure_safe_headless_target target package mode)
         "${STANDALONE_ROOT}/core/mcp"
         "${STANDALONE_ROOT}/core/mcp/compat"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs"
-        "${CMAKE_CURRENT_SOURCE_DIR}/driver"
     )
     target_compile_definitions(${target} PRIVATE
         __NT__

@@ -40,6 +40,7 @@ internal static class Program
                 if (string.Equals(kind, "decompile", StringComparison.Ordinal))
                 {
                     var request = WorkerProtocol.Deserialize<WorkerRequest>(line);
+                    MetadataAnalysis.ValidateRequest(request);
                     var job = new ActiveJob(request);
                     lock (ActiveGate)
                     {
@@ -78,6 +79,7 @@ internal static class Program
     {
         WorkerResult? result = null;
         WorkerFailure? failure = null;
+        string? payload = null;
         ResourceBudgetGuard? resources = null;
         using var deadline = new CancellationTokenSource();
         var deadlineMs = Math.Min(job.Request.Budget.MaxWallClockMs, (ulong)int.MaxValue);
@@ -88,8 +90,11 @@ internal static class Program
             resources = new ResourceBudgetGuard(job.Request.Budget);
             using var bounded = CancellationTokenSource.CreateLinkedTokenSource(linked.Token, resources.LimitToken);
             var candidate = await Task.Run(() => MetadataAnalysis.Analyze(job.Request, resources, bounded.Token), bounded.Token).ConfigureAwait(false);
+            var candidatePayload = WorkerProtocol.Serialize(candidate);
+            resources.Checkpoint(bounded.Token);
             await resources.CompleteAsync().ConfigureAwait(false);
             result = candidate;
+            payload = candidatePayload;
         }
         catch (OperationCanceledException)
         {
@@ -107,6 +112,11 @@ internal static class Program
             }
         }
         catch (ResourceLimitException)
+        {
+            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
+                "resource_limit", "managed_cli.resource_limit", 100, false);
+        }
+        catch (OutOfMemoryException)
         {
             failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
                 "resource_limit", "managed_cli.resource_limit", 100, false);
@@ -157,7 +167,7 @@ internal static class Program
             }
         }
 
-        await WriteLineAsync(WorkerProtocol.Serialize(result ?? failure!)).ConfigureAwait(false);
+        await WriteLineAsync(payload ?? WorkerProtocol.Serialize(result ?? failure!)).ConfigureAwait(false);
     }
 
     private static void ValidateCancellation(WorkerCancellation cancellation)

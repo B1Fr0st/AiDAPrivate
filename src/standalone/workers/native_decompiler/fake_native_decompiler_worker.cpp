@@ -5,6 +5,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -86,9 +87,20 @@ bool write_rejected_header(HANDLE handle, const wire::session_material_t& sessio
 
 bool network_denied()
 {
+    HANDLE token = nullptr;
+    DWORD is_app_container = 0;
+    DWORD returned = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    const bool app_container = GetTokenInformation(token, TokenIsAppContainer, &is_app_container,
+        sizeof(is_app_container), &returned) != FALSE && returned == sizeof(is_app_container) && is_app_container != 0;
+    CloseHandle(token);
+    if (!app_container)
+        return false;
     WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
-        return true;
+    const int startup_status = WSAStartup(MAKEWORD(2, 2), &data);
+    if (startup_status != 0)
+        return startup_status == WSAEACCES;
     SOCKET socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (socket_handle == INVALID_SOCKET) {
         const int error = WSAGetLastError();
@@ -108,10 +120,14 @@ bool network_denied()
 
 bool child_creation_denied()
 {
+    PROCESS_MITIGATION_CHILD_PROCESS_POLICY policy{};
+    if (!GetProcessMitigationPolicy(GetCurrentProcess(), ProcessChildProcessPolicy, &policy, sizeof(policy)) ||
+        policy.NoChildProcessCreation == 0)
+        return false;
     std::array<wchar_t, 32768> path{};
     const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     if (length == 0 || length >= path.size())
-        return true;
+        return false;
     std::wstring command = L"\"";
     command.append(path.data(), length);
     command.append(L"\" --fixture=child_probe");
@@ -218,9 +234,24 @@ bool only_declared_handles(const runtime::startup_t& startup)
         return !value || value == INVALID_HANDLE_VALUE || GetHandleInformation(value, &local_flags) == FALSE;
     };
     DWORD handle_count = 0;
+    BOOL in_job = FALSE;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits{};
+    JOBOBJECT_BASIC_UI_RESTRICTIONS ui_limits{};
+    const DWORD required_job_limits = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION |
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY |
+        JOB_OBJECT_LIMIT_PROCESS_TIME;
+    const DWORD required_ui_limits = JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS |
+        JOB_OBJECT_UILIMIT_DESKTOP | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS | JOB_OBJECT_UILIMIT_EXITWINDOWS;
     return read && write && snapshot && identity && restricted_pipe_acl(startup.read_handle) && restricted_pipe_acl(startup.write_handle) &&
         inaccessible(standard_input) && inaccessible(standard_output) && inaccessible(standard_error) &&
-        GetProcessHandleCount(GetCurrentProcess(), &handle_count) != FALSE && handle_count == 4;
+        GetProcessHandleCount(GetCurrentProcess(), &handle_count) != FALSE && handle_count == 4 &&
+        IsProcessInJob(GetCurrentProcess(), nullptr, &in_job) != FALSE && in_job != FALSE &&
+        QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &job_limits, sizeof(job_limits), nullptr) != FALSE &&
+        QueryInformationJobObject(nullptr, JobObjectBasicUIRestrictions, &ui_limits, sizeof(ui_limits), nullptr) != FALSE &&
+        (job_limits.BasicLimitInformation.LimitFlags & required_job_limits) == required_job_limits &&
+        (ui_limits.UIRestrictionsClass & required_ui_limits) == required_ui_limits &&
+        job_limits.BasicLimitInformation.ActiveProcessLimit == 1 && job_limits.ProcessMemoryLimit != 0 &&
+        job_limits.JobMemoryLimit != 0 && job_limits.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart > 0;
 }
 
 }

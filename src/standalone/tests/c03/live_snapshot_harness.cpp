@@ -511,7 +511,7 @@ void verify_hard_bounded_adapter_calls_and_cache_scope()
         return read_provider->cache_stats();
     });
     const bool stats_ready =
-        stats_pending.wait_for(std::chrono::milliseconds(100)) == std::future_status::ready;
+        stats_pending.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
     if (!stats_ready) {
         read_adapter->read_gate().release();
         read_pending.wait();

@@ -35,12 +35,13 @@ internal sealed record ModuleSnapshot(byte[] Bytes, string Sha256);
 
 internal static class MetadataAnalysis
 {
-    private const long MaximumModuleBytes = 8L * 1024L * 1024L * 1024L;
+    private const long MaximumModuleBytes = int.MaxValue;
+    private const int MaximumSourceBytes = 8 * 1024 * 1024;
 
     internal static WorkerResult Analyze(WorkerRequest request, ResourceBudgetGuard resourceBudget, CancellationToken cancellationToken)
     {
         ValidateRequest(request);
-        OfflinePackageLock.RequireRuntimeGate(request.OfflineLockHash);
+        OfflinePackageLock.RequireRuntimeGate(request.OfflineLockHash, resourceBudget, cancellationToken);
         resourceBudget.Checkpoint(cancellationToken);
 
         var snapshot = ReadVerifiedSnapshot(request, resourceBudget, cancellationToken);
@@ -56,6 +57,10 @@ internal static class MetadataAnalysis
         var parsed = ParseMethod(reader, peReader, methodHandle, declaringTypes, request, resourceBudget, cancellationToken);
         var source = DecompileMethod(module, request.MetadataToken, cancellationToken);
         resourceBudget.Checkpoint(cancellationToken);
+        var sourceByteCount = Encoding.UTF8.GetByteCount(source);
+        if (sourceByteCount > MaximumSourceBytes)
+            throw new ResourceLimitException(ResourceLimitKind.Memory);
+        resourceBudget.EnsureAllocationFits(checked((ulong)sourceByteCount), cancellationToken);
         var sourceHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source))).ToLowerInvariant();
 
         return new WorkerResult(
@@ -77,18 +82,21 @@ internal static class MetadataAnalysis
             parsed.Diagnostics);
     }
 
-    private static void ValidateRequest(WorkerRequest request)
+    internal static void ValidateRequest(WorkerRequest request)
     {
         if (!string.Equals(request.Schema, WorkerProtocol.Schema, StringComparison.Ordinal) || request.SchemaVersion != WorkerProtocol.Version ||
             !string.Equals(request.Kind, "decompile", StringComparison.Ordinal) || request.Sequence == 0 || string.IsNullOrWhiteSpace(request.RequestId) ||
             request.RequestId.Length > 128 || string.IsNullOrWhiteSpace(request.ModulePath) || request.ModulePath.Length > 32768 ||
             !Path.IsPathFullyQualified(request.ModulePath) || request.WorkspaceGeneration == 0 || request.MetadataToken == 0 ||
-            !IsLowerHexDigest(request.ModuleHash) || !FixedTimeHexEquals(request.OfflineLockHash, OfflinePackageLock.ManifestHashHex) ||
+            request.Budget is null || request.Provider is null || !IsLowerHexDigest(request.ModuleHash) ||
+            !FixedTimeHexEquals(request.OfflineLockHash, OfflinePackageLock.ManifestHashHex) ||
             request.Budget.MaxWallClockMs == 0 || request.Budget.MaxCpuMs == 0 || request.Budget.MaxMemoryBytes == 0 ||
-            request.Budget.MaxProviderIrNodes == 0 || string.IsNullOrWhiteSpace(request.Budget.Profile) ||
-            string.IsNullOrWhiteSpace(request.Provider.Version) ||
+            request.Budget.MaxProviderIrNodes == 0 || request.Budget.Profile is not ("fast" or "balanced" or "thorough") ||
+            !string.Equals(request.Provider.Version, "10.1.0.8386", StringComparison.Ordinal) ||
             !FixedTimeHexEquals(request.Provider.DecompilerAssemblyHash, OfflinePackageLock.DecompilerAssemblySha256) ||
-            string.IsNullOrWhiteSpace(request.Provider.WorkerBuildId) || !IsLowerHexDigest(request.Provider.WorkerBuildHash))
+            string.IsNullOrWhiteSpace(request.Provider.WorkerBuildId) || request.Provider.WorkerBuildId.Length > 256 ||
+            !IsLowerHexDigest(request.Provider.WorkerBuildHash) ||
+            request.Provider.WorkerBuildHash.All(character => character == '0'))
             throw new InvalidDataException("managed decompiler request violates the offline contract");
 
     }
@@ -100,7 +108,7 @@ internal static class MetadataAnalysis
     {
         using var stream = new FileStream(request.ModulePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
         var length = stream.Length;
-        if (length <= 0 || length > MaximumModuleBytes || length > int.MaxValue)
+        if (length <= 0 || length > MaximumModuleBytes)
             throw new ResourceLimitException(ResourceLimitKind.Memory);
         resourceBudget.EnsureAllocationFits(checked((ulong)length), cancellationToken);
         byte[] bytes;
@@ -197,7 +205,7 @@ internal static class MetadataAnalysis
                 }, -1)
             };
             unknowns.Add(new WorkerUnknown("unsupported_metadata", "cli.method.no_body", -1, 0, 0, "loader_metadata"));
-            diagnostics.Add(new WorkerDiagnostic("warning", "unresolved_symbol", "managed_cli.method_body_absent", Array.Empty<string>(), null, 0, false, 1));
+            diagnostics.Add(new WorkerDiagnostic("warning", "unresolved_reference", "managed_cli.method_body_absent", Array.Empty<string>(), null, 0, false, 1));
         }
 
         return new ParsedMethod(identity, tokenMap, typeGraph, new WorkerIr(blocks[0].Id, blocks), unknowns, diagnostics);
@@ -724,9 +732,9 @@ internal static class MetadataAnalysis
         return string.IsNullOrEmpty(@namespace) ? name : $"{@namespace}.{name}";
     }
 
-    private static bool IsLowerHexDigest(string value)
+    private static bool IsLowerHexDigest(string? value)
     {
-        if (value.Length != 64)
+        if (value is null || value.Length != 64)
             return false;
         foreach (var character in value)
         {
@@ -736,9 +744,9 @@ internal static class MetadataAnalysis
         return true;
     }
 
-    private static bool FixedTimeHexEquals(string left, string right)
+    private static bool FixedTimeHexEquals(string? left, string? right)
     {
-        if (!IsLowerHexDigest(left) || !IsLowerHexDigest(right))
+        if (left is null || right is null || !IsLowerHexDigest(left) || !IsLowerHexDigest(right))
             return false;
         return CryptographicOperations.FixedTimeEquals(Convert.FromHexString(left), Convert.FromHexString(right));
     }
