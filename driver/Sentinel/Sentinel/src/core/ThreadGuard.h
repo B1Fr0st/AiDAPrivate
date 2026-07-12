@@ -208,7 +208,6 @@ namespace thread_guard {
             heartbeat::send_command(heartbeat::BRIDGE_CMD_SENTINEL_THREAD_INJECT,
                 static_cast<ULONG>((ULONG_PTR)caller_pid & 0xFFFFFFFF));
 
-#ifndef AIDA_DEV_MODE
             if (_KeBugCheckEx) {
                 _KeBugCheckEx(0xA1DA0006,
                     (ULONG_PTR)ProcessId,
@@ -216,7 +215,6 @@ namespace thread_guard {
                     (ULONG_PTR)start_addr,
                     0);
             }
-#endif
         }
     }
 

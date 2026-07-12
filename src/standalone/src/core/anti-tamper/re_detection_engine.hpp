@@ -2248,6 +2248,11 @@ inline void worker_loop()
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 webhook::write_log("re_worker", "ce_hash_refresh_exception");
             }
+            __try {
+                re_tool_preflight::refresh_werfault_hashes();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                webhook::write_log("re_worker", "werfault_hash_refresh_exception");
+            }
         }
         Sleep(TICK_INTERVAL_MS);
     }

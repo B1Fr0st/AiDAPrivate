@@ -87,7 +87,8 @@ typedef struct _RTL_PROCESS_MODULES {
 typedef enum _SYSTEM_INFORMATION_CLASS_INTERNAL {
     SystemModuleInformationInternal = 11,
     SystemProcessInformationInternal = 5,
-    SystemHandleInformationInternal = 16
+    SystemHandleInformationInternal = 16,
+    SystemExtendedHandleInformationInternal = 64
 } SYSTEM_INFORMATION_CLASS_INTERNAL;
 
 typedef struct _SYSTEM_PROCESS_INFORMATION_ENTRY {
@@ -116,6 +117,21 @@ typedef struct _SYSTEM_HANDLE_INFORMATION_X {
     SYSTEM_HANDLE_TABLE_ENTRY_INFO_X Handles[1];
 } SYSTEM_HANDLE_INFORMATION_X, *PSYSTEM_HANDLE_INFORMATION_X;
 
+typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
+    PVOID Object;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR HandleValue;
+    ULONG GrantedAccess;
+    USHORT HandleAttributes;
+    USHORT Reserved;
+    PVOID ObjectCreatorInfo;
+} SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
+
+typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    ULONG_PTR NumberOfHandles;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
+} SYSTEM_HANDLE_INFORMATION_EX, *PSYSTEM_HANDLE_INFORMATION_EX;
+
 typedef struct _UM_PEB_LDR_DATA_X {
     ULONG Length;
     UCHAR Initialized;
@@ -138,6 +154,7 @@ typedef struct _UM_LDR_DATA_TABLE_ENTRY_X {
 } UM_LDR_DATA_TABLE_ENTRY_X, *PUM_LDR_DATA_TABLE_ENTRY_X;
 
 constexpr ULONG_PTR AIDA_WATERMARK_MAGIC = 0xA1DA71A5u;
+constexpr ULONGLONG AIDA_WATERMARK_MAGIC_64 = 0xA1DA71A5A1DA71A5ULL;
 constexpr ULONG_PTR AIDA_WATERMARK_OPT_HDR_OFFSET = 0x70;
 constexpr ULONG BUGCHECK_MODULE_CROSSCHECK = 0xA1DA0001u;
 constexpr ULONG BUGCHECK_SSDT_HOOK         = 0xA1DA000Au;

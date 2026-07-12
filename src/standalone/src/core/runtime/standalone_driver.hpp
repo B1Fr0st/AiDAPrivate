@@ -636,6 +636,7 @@ namespace driver_bridge
     bool trigger_dma_countermeasure(uint32_t action, uint32_t reason);
 
     bool update_re_tool_hashes(const uint8_t* hashes, uint32_t count);
+    bool update_werfault_hashes(const uint8_t* hashes, uint32_t count);
     bool update_ce_driver_hashes(const uint8_t* hashes, uint32_t count);
 
     struct anti_debug_result_t {

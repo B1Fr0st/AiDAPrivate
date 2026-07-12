@@ -884,6 +884,253 @@ namespace re_tool_preflight {
 
         if (!hashes.empty())
             push_hashes_to_kernel(hashes);
+
+        auto wf_hashes = fetch_werfault_hashes(server_host, license_key, session_token);
+        diag::log_tagged_fmt("re_tool_preflight",
+            "refresh_werfault_hashes_fetched count=%zu",
+            wf_hashes.size());
+
+        if (!wf_hashes.empty())
+            push_werfault_hashes_to_kernel(wf_hashes);
+    }
+
+    __forceinline std::vector<std::string> fetch_werfault_hashes(const std::string& server_host,
+                                                                 const std::string& license_key,
+                                                                 const std::string& session_token) {
+        std::vector<std::string> hashes;
+        if (server_host.empty() || license_key.empty() || session_token.empty())
+            return hashes;
+
+        HINTERNET hSession = WinHttpOpen(L"AiDA/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession)
+            return hashes;
+
+        WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+
+        HINTERNET hConnect = nullptr;
+        std::wstring w_host(server_host.begin(), server_host.end());
+        bool is_https = false;
+
+        if (server_host.substr(0, 8) == "https://") {
+            is_https = true;
+            std::string host_part = server_host.substr(8);
+            size_t slash_pos = host_part.find('/');
+            if (slash_pos != std::string::npos)
+                host_part = host_part.substr(0, slash_pos);
+            size_t colon_pos = host_part.find(':');
+            if (colon_pos != std::string::npos)
+                host_part = host_part.substr(0, colon_pos);
+            std::wstring wh(host_part.begin(), host_part.end());
+            hConnect = WinHttpConnect(hSession, wh.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+        } else if (server_host.substr(0, 7) == "http://") {
+            std::string host_part = server_host.substr(7);
+            size_t slash_pos = host_part.find('/');
+            if (slash_pos != std::string::npos)
+                host_part = host_part.substr(0, slash_pos);
+            int port = INTERNET_DEFAULT_HTTP_PORT;
+            size_t colon_pos = host_part.find(':');
+            if (colon_pos != std::string::npos) {
+                port = std::stoi(host_part.substr(colon_pos + 1));
+                host_part = host_part.substr(0, colon_pos);
+            }
+            std::wstring wh(host_part.begin(), host_part.end());
+            hConnect = WinHttpConnect(hSession, wh.c_str(), static_cast<INTERNET_PORT>(port), 0);
+        } else {
+            std::wstring wh(server_host.begin(), server_host.end());
+            hConnect = WinHttpConnect(hSession, wh.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+            is_https = true;
+        }
+
+        if (!hConnect) {
+            WinHttpCloseHandle(hSession);
+            return hashes;
+        }
+
+        std::string path = "/api/license/werfault-hashes?license_key=" + license_key + "&session_token=" + session_token;
+        std::wstring w_path(path.begin(), path.end());
+
+        DWORD flags = is_https ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", w_path.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return hashes;
+        }
+
+        BOOL bResults = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0,
+            WINHTTP_NO_OPTION, 0);
+
+        if (bResults)
+            bResults = WinHttpReceiveResponse(hRequest, nullptr);
+
+        if (bResults) {
+            DWORD dwSize = 0;
+            std::string response_body;
+
+            do {
+                dwSize = 0;
+                if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                    break;
+                if (dwSize == 0)
+                    break;
+
+                std::vector<char> buf(dwSize + 1, 0);
+                DWORD dwRead = 0;
+                if (WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead)) {
+                    if (dwRead > 0)
+                        response_body.append(buf.data(), dwRead);
+                }
+            } while (dwSize > 0);
+
+            if (!response_body.empty()) {
+                size_t status_pos = response_body.find("\"status\"");
+                if (status_pos != std::string::npos) {
+                    size_t ok_pos = response_body.find("\"ok\"", status_pos);
+                    if (ok_pos != std::string::npos) {
+                        size_t hashes_pos = response_body.find("\"hashes\"", ok_pos);
+                        if (hashes_pos != std::string::npos) {
+                            size_t arr_start = response_body.find('[', hashes_pos);
+                            size_t arr_end = response_body.find(']', arr_start);
+                            if (arr_start != std::string::npos && arr_end != std::string::npos) {
+                                std::string arr_str = response_body.substr(arr_start + 1, arr_end - arr_start - 1);
+                                size_t pos = 0;
+                                while (pos < arr_str.size()) {
+                                    size_t quote_start = arr_str.find('"', pos);
+                                    if (quote_start == std::string::npos)
+                                        break;
+                                    size_t quote_end = arr_str.find('"', quote_start + 1);
+                                    if (quote_end == std::string::npos)
+                                        break;
+                                    std::string hash = arr_str.substr(quote_start + 1, quote_end - quote_start - 1);
+                                    if (hash.size() == 64) {
+                                        bool valid = true;
+                                        for (char c : hash) {
+                                            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                                                valid = false;
+                                                break;
+                                            }
+                                        }
+                                        if (valid)
+                                            hashes.push_back(hash);
+                                    }
+                                    pos = quote_end + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!hashes.empty()) {
+                std::string signature;
+                size_t sig_pos = response_body.find("\"signature\"");
+                if (sig_pos != std::string::npos) {
+                    size_t sig_colon = response_body.find(':', sig_pos);
+                    if (sig_colon != std::string::npos) {
+                        size_t sig_quote_start = response_body.find('"', sig_colon);
+                        if (sig_quote_start != std::string::npos) {
+                            size_t sig_quote_end = response_body.find('"', sig_quote_start + 1);
+                            if (sig_quote_end != std::string::npos)
+                                signature = response_body.substr(sig_quote_start + 1, sig_quote_end - sig_quote_start - 1);
+                        }
+                    }
+                }
+
+                std::string timestamp_str;
+                size_t ts_pos = response_body.find("\"timestamp\"");
+                if (ts_pos != std::string::npos) {
+                    size_t ts_colon = response_body.find(':', ts_pos);
+                    if (ts_colon != std::string::npos) {
+                        size_t ts_start = ts_colon + 1;
+                        while (ts_start < response_body.size() && (response_body[ts_start] == ' ' || response_body[ts_start] == '\t'))
+                            ts_start++;
+                        size_t ts_end = ts_start;
+                        while (ts_end < response_body.size() && response_body[ts_end] >= '0' && response_body[ts_end] <= '9')
+                            ts_end++;
+                        timestamp_str = response_body.substr(ts_start, ts_end - ts_start);
+                    }
+                }
+
+                if (signature.empty() || timestamp_str.empty()) {
+                    diag::log_tagged_critical_fmt("re_tool_preflight",
+                        "wf_hmac_verify_missing_fields has_sig=%d has_ts=%d sig_len=%zu ts_len=%zu",
+                        !signature.empty() ? 1 : 0,
+                        !timestamp_str.empty() ? 1 : 0,
+                        signature.size(), timestamp_str.size());
+                    hashes.clear();
+                } else {
+                    std::string hash_concat;
+                    for (const auto& h : hashes)
+                        hash_concat += h;
+
+                    std::string hmac_message = "werfault-hashes|" + license_key + "|" + timestamp_str + "|" + hash_concat;
+                    std::string computed_hmac = compute_hmac_sha256_hex(session_token, hmac_message);
+
+                    bool sig_match = false;
+                    if (computed_hmac.size() == signature.size() && computed_hmac.size() == 64) {
+                        uint8_t computed_bytes[32];
+                        uint8_t provided_bytes[32];
+                        if (hex_string_to_bytes(computed_hmac, computed_bytes, 32) &&
+                            hex_string_to_bytes(signature, provided_bytes, 32)) {
+                            sig_match = constant_time_compare(computed_bytes, provided_bytes, 32);
+                        }
+                    }
+
+                    if (!sig_match) {
+                        diag::log_tagged_critical_fmt("re_tool_preflight",
+                            "wf_hmac_verify_mismatch computed=%.64s provided=%.64s ts=%s hash_count=%zu",
+                            computed_hmac.c_str(), signature.c_str(),
+                            timestamp_str.c_str(), hashes.size());
+                        hashes.clear();
+                    } else {
+                        diag::log_tagged_fmt("re_tool_preflight",
+                            "wf_hmac_verify_ok hash_count=%zu ts=%s",
+                            hashes.size(), timestamp_str.c_str());
+                    }
+                }
+            }
+        }
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return hashes;
+    }
+
+    __forceinline bool push_werfault_hashes_to_kernel(const std::vector<std::string>& hashes) {
+        if (hashes.empty())
+            return false;
+
+        if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver()) {
+            diag::log_tagged("re_tool_preflight", "push_werfault_hashes_to_kernel skipped driver_not_loaded");
+            return false;
+        }
+
+        constexpr uint32_t kMaxKernelHashes = 16;
+        uint32_t count = static_cast<uint32_t>(hashes.size());
+        if (count > kMaxKernelHashes)
+            count = kMaxKernelHashes;
+
+        std::vector<uint8_t> binary_hashes(static_cast<size_t>(count) * 32);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!hex_string_to_bytes(hashes[i], &binary_hashes[static_cast<size_t>(i) * 32], 32)) {
+                diag::log_tagged_critical_fmt("re_tool_preflight",
+                    "push_werfault_hashes_to_kernel hex_decode_failed index=%u hash=%.64s",
+                    i, hashes[i].c_str());
+                return false;
+            }
+        }
+
+        bool ok = driver_bridge::update_werfault_hashes(binary_hashes.data(), count);
+        diag::log_tagged_fmt("re_tool_preflight",
+            "push_werfault_hashes_to_kernel ok=%d count=%u",
+            ok ? 1 : 0, count);
+        return ok;
     }
 
     __forceinline std::vector<std::string> fetch_ce_driver_hashes(const std::string& server_host,
@@ -1147,6 +1394,30 @@ namespace re_tool_preflight {
 
         if (!hashes.empty())
             push_ce_driver_hashes_to_kernel(hashes);
+    }
+
+    __forceinline void refresh_werfault_hashes() {
+        if (!g_refresh_initialized.load(std::memory_order_acquire)) {
+            diag::log_tagged("re_tool_preflight", "refresh_werfault_hashes skipped not_initialized");
+            return;
+        }
+
+        std::string server_host = g_refresh_creds.server_host;
+        std::string license_key = g_refresh_creds.license_key;
+        std::string session_token = standalone_license::get_session_token();
+
+        if (server_host.empty() || license_key.empty() || session_token.empty()) {
+            diag::log_tagged("re_tool_preflight", "refresh_werfault_hashes skipped no_credentials");
+            return;
+        }
+
+        auto hashes = fetch_werfault_hashes(server_host, license_key, session_token);
+        diag::log_tagged_fmt("re_tool_preflight",
+            "refresh_werfault_hashes_fetched count=%zu",
+            hashes.size());
+
+        if (!hashes.empty())
+            push_werfault_hashes_to_kernel(hashes);
     }
 
 }

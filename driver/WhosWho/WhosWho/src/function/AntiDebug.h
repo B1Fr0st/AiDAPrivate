@@ -1521,7 +1521,10 @@ namespace anti_debug {
                     return STATUS_SUCCESS;
                 }
 #ifndef AIDA_DEV_MODE
+                WW_LOG("anti_debug: non-allowlisted debugger detected pid=%u -- BSOD", pid);
                 KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)debug_port_offset, 0, 0);
+#else
+                WW_LOG("anti_debug: AIDA_DEV_MODE -- skipping BSOD for debug attach pid=%u", pid);
 #endif
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1831,9 +1834,7 @@ namespace anti_debug {
                             begin_addr,
                             static_cast<unsigned long long>(module_base),
                             i);
-#ifndef AIDA_DEV_MODE
                         KeBugCheckEx(0xA1DA0002, (ULONG_PTR)begin_addr, 0xCC, 0, 0);
-#endif
                         status = STATUS_DEBUGGER_INACTIVE;
                         break;
                     }
@@ -1850,6 +1851,10 @@ namespace anti_debug {
 }
 
 namespace continuous_anti_debug {
+
+    namespace process_guard_fwd {
+        void auto_unhide_on_detection_clear();
+    }
 
     inline KTIMER   g_timer = {};
     inline KDPC     g_dpc   = {};
@@ -1977,7 +1982,10 @@ namespace continuous_anti_debug {
                                     sentinel_bridge::g_bridge.sentinel_cmd = sentinel_bridge::BRIDGE_CMD_DEBUGGER_FOUND;
                                     sentinel_bridge::g_bridge.sentinel_cmd_param = (ULONG)pid;
 #ifndef AIDA_DEV_MODE
+                                    WW_LOG("[CONT-ADBG] non-allowlisted debugger detected pid=%u -- BSOD", pid);
                                     KeBugCheckEx(0xA1DA0005, (ULONG_PTR)pid, (ULONG_PTR)debug_port_offset, 0, 0);
+#else
+                                    WW_LOG("[CONT-ADBG] AIDA_DEV_MODE -- skipping BSOD for debug attach pid=%u", pid);
 #endif
                                 }
                             }
@@ -2018,6 +2026,8 @@ namespace continuous_anti_debug {
             anti_debug::hide_all_process_threads(pid);
             anti_debug::enumerate_foreign_thread_handles(pid);
         }
+
+        process_guard_fwd::auto_unhide_on_detection_clear();
 
         _InterlockedExchange(&g_work_item_queued, 0);
     }
@@ -2541,5 +2551,263 @@ namespace context_guard {
         g_set_ssn = 0xFFFFFFFFu;
         g_get_saved_entry = 0;
         g_set_saved_entry = 0;
+    }
+}
+
+namespace memory_guard {
+
+    typedef ssdt_resolver::fn_NtReadVirtualMemory fn_NtReadVirtualMemory_t;
+    typedef ssdt_resolver::fn_NtWriteVirtualMemory fn_NtWriteVirtualMemory_t;
+
+    inline volatile LONG g_installed = 0;
+    inline fn_NtReadVirtualMemory_t g_orig_NtReadVirtualMemory = nullptr;
+    inline fn_NtWriteVirtualMemory_t g_orig_NtWriteVirtualMemory = nullptr;
+    inline ULONG g_read_ssn = 0xFFFFFFFFu;
+    inline ULONG g_write_ssn = 0xFFFFFFFFu;
+    inline LONG g_read_saved_entry = 0;
+    inline LONG g_write_saved_entry = 0;
+
+    __forceinline void disable_write_protect()
+    {
+        ULONG_PTR cr0 = __readcr0();
+        cr0 &= ~(1ULL << 16);
+        __writecr0(cr0);
+    }
+
+    __forceinline void enable_write_protect()
+    {
+        ULONG_PTR cr0 = __readcr0();
+        cr0 |= (1ULL << 16);
+        __writecr0(cr0);
+    }
+
+    __forceinline BOOLEAN is_installed()
+    {
+        return _InterlockedCompareExchange(&g_installed, 0, 0) == 1;
+    }
+
+    NTSTATUS NTAPI hooked_NtReadVirtualMemory(
+        HANDLE ProcessHandle,
+        PVOID BaseAddress,
+        PVOID Buffer,
+        SIZE_T Size,
+        PSIZE_T NumberOfBytesRead)
+    {
+        if (g_orig_NtReadVirtualMemory &&
+            ExGetPreviousMode() == UserMode &&
+            caller_validation::g_registered_client_pid != nullptr) {
+
+            HANDLE caller_pid = PsGetCurrentProcessId();
+            if (caller_pid != caller_validation::g_registered_client_pid) {
+                PEPROCESS target_proc = nullptr;
+                NTSTATUS ref_status = ObReferenceObjectByHandle(
+                    ProcessHandle,
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                    *PsProcessType,
+                    ExGetPreviousMode(),
+                    reinterpret_cast<PVOID*>(&target_proc),
+                    nullptr);
+
+                if (NT_SUCCESS(ref_status) && target_proc) {
+                    HANDLE target_pid = PsGetProcessId(target_proc);
+                    ObDereferenceObject(target_proc);
+                    if (target_pid == caller_validation::g_registered_client_pid) {
+                        WW_LOG("[MEMGUARD] blocked NtReadVirtualMemory caller_pid=%llu target_pid=%llu base=%p size=%llu",
+                            (UINT64)(ULONG_PTR)caller_pid,
+                            (UINT64)(ULONG_PTR)target_pid,
+                            BaseAddress,
+                            (UINT64)Size);
+                        if (NumberOfBytesRead)
+                            *NumberOfBytesRead = 0;
+                        return STATUS_ACCESS_DENIED;
+                    }
+                }
+            }
+        }
+
+        if (!g_orig_NtReadVirtualMemory)
+            return STATUS_PROCEDURE_NOT_FOUND;
+
+        return g_orig_NtReadVirtualMemory(ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
+    }
+
+    NTSTATUS NTAPI hooked_NtWriteVirtualMemory(
+        HANDLE ProcessHandle,
+        PVOID BaseAddress,
+        PVOID Buffer,
+        SIZE_T Size,
+        PSIZE_T NumberOfBytesWritten)
+    {
+        if (g_orig_NtWriteVirtualMemory &&
+            ExGetPreviousMode() == UserMode &&
+            caller_validation::g_registered_client_pid != nullptr) {
+
+            HANDLE caller_pid = PsGetCurrentProcessId();
+            if (caller_pid != caller_validation::g_registered_client_pid) {
+                PEPROCESS target_proc = nullptr;
+                NTSTATUS ref_status = ObReferenceObjectByHandle(
+                    ProcessHandle,
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                    *PsProcessType,
+                    ExGetPreviousMode(),
+                    reinterpret_cast<PVOID*>(&target_proc),
+                    nullptr);
+
+                if (NT_SUCCESS(ref_status) && target_proc) {
+                    HANDLE target_pid = PsGetProcessId(target_proc);
+                    ObDereferenceObject(target_proc);
+                    if (target_pid == caller_validation::g_registered_client_pid) {
+                        WW_LOG("[MEMGUARD] blocked NtWriteVirtualMemory caller_pid=%llu target_pid=%llu base=%p size=%llu",
+                            (UINT64)(ULONG_PTR)caller_pid,
+                            (UINT64)(ULONG_PTR)target_pid,
+                            BaseAddress,
+                            (UINT64)Size);
+                        if (NumberOfBytesWritten)
+                            *NumberOfBytesWritten = 0;
+                        return STATUS_ACCESS_DENIED;
+                    }
+                }
+            }
+        }
+
+        if (!g_orig_NtWriteVirtualMemory)
+            return STATUS_PROCEDURE_NOT_FOUND;
+
+        return g_orig_NtWriteVirtualMemory(ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesWritten);
+    }
+
+    __forceinline NTSTATUS install()
+    {
+        if (_InterlockedCompareExchange(&g_installed, 1, 0) != 0)
+            return STATUS_ALREADY_REGISTERED;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+
+        if (!ssdt_resolver::find_ssdt() || !ssdt_resolver::g_ssdt) {
+            WW_LOG("[MEMGUARD] install failed: ssdt not found");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        ssdt_resolver::ntdll_lookup_result_t ntdll{};
+        if (!ssdt_resolver::locate_current_ntdll(&ntdll)) {
+            WW_LOG("[MEMGUARD] install failed: ntdll not found reason=%s", ntdll.reason);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        CHAR read_name[] = { 'N','t','R','e','a','d','V','i','r','t','u','a','l','M','e','m','o','r','y',0 };
+        CHAR write_name[] = { 'N','t','W','r','i','t','e','V','i','r','t','u','a','l','M','e','m','o','r','y',0 };
+        PUCHAR read_stub = static_cast<PUCHAR>(GetProcAddress(ntdll.ntdll_base, read_name));
+        PUCHAR write_stub = static_cast<PUCHAR>(GetProcAddress(ntdll.ntdll_base, write_name));
+
+        if (!read_stub || !write_stub) {
+            WW_LOG("[MEMGUARD] install failed: ntdll export missing read=%p write=%p", read_stub, write_stub);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        if (read_stub[0] != 0x4C || read_stub[1] != 0x8B || read_stub[2] != 0xD1 || read_stub[3] != 0xB8 ||
+            write_stub[0] != 0x4C || write_stub[1] != 0x8B || write_stub[2] != 0xD1 || write_stub[3] != 0xB8) {
+            WW_LOG("[MEMGUARD] install failed: unexpected stub bytes");
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        g_read_ssn = *reinterpret_cast<PULONG>(&read_stub[4]);
+        g_write_ssn = *reinterpret_cast<PULONG>(&write_stub[4]);
+
+        if (g_read_ssn >= static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit) ||
+            g_write_ssn >= static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit)) {
+            WW_LOG("[MEMGUARD] install failed: ssn out of range read=%lu write=%lu limit=%lu",
+                g_read_ssn, g_write_ssn, static_cast<ULONG>(ssdt_resolver::g_ssdt->ServiceLimit));
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        g_read_saved_entry = ssdt_resolver::g_ssdt->ServiceTable[g_read_ssn];
+        g_write_saved_entry = ssdt_resolver::g_ssdt->ServiceTable[g_write_ssn];
+
+        g_orig_NtReadVirtualMemory = reinterpret_cast<fn_NtReadVirtualMemory_t>(
+            ssdt_resolver::get_ssdt_entry(g_read_ssn));
+        g_orig_NtWriteVirtualMemory = reinterpret_cast<fn_NtWriteVirtualMemory_t>(
+            ssdt_resolver::get_ssdt_entry(g_write_ssn));
+
+        if (!g_orig_NtReadVirtualMemory || !g_orig_NtWriteVirtualMemory) {
+            WW_LOG("[MEMGUARD] install failed: original function null read=%p write=%p",
+                g_orig_NtReadVirtualMemory, g_orig_NtWriteVirtualMemory);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_FOUND;
+        }
+
+        ULONG_PTR table_base = reinterpret_cast<ULONG_PTR>(ssdt_resolver::g_ssdt->ServiceTable);
+
+        ULONG_PTR read_hook_addr = reinterpret_cast<ULONG_PTR>(&hooked_NtReadVirtualMemory);
+        LONG64 read_offset = static_cast<LONG64>(read_hook_addr - table_base);
+        if (read_offset > 0x07FFFFFFLL || read_offset < -0x08000000LL) {
+            WW_LOG("[MEMGUARD] install failed: read hook offset out of range offset=%lld", read_offset);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+        LONG read_new_entry = static_cast<LONG>((read_offset << 4) | (g_read_saved_entry & 0xF));
+
+        ULONG_PTR write_hook_addr = reinterpret_cast<ULONG_PTR>(&hooked_NtWriteVirtualMemory);
+        LONG64 write_offset = static_cast<LONG64>(write_hook_addr - table_base);
+        if (write_offset > 0x07FFFFFFLL || write_offset < -0x08000000LL) {
+            WW_LOG("[MEMGUARD] install failed: write hook offset out of range offset=%lld", write_offset);
+            _InterlockedExchange(&g_installed, 0);
+            return STATUS_NOT_SUPPORTED;
+        }
+        LONG write_new_entry = static_cast<LONG>((write_offset << 4) | (g_write_saved_entry & 0xF));
+
+        disable_write_protect();
+        ssdt_resolver::g_ssdt->ServiceTable[g_read_ssn] = read_new_entry;
+        ssdt_resolver::g_ssdt->ServiceTable[g_write_ssn] = write_new_entry;
+        enable_write_protect();
+
+        WW_LOG("[MEMGUARD] installed read_ssn=%lu write_ssn=%lu table=%p read_orig=%p read_hook=%p write_orig=%p write_hook=%p read_saved=0x%08lX read_new=0x%08lX write_saved=0x%08lX write_new=0x%08lX",
+            g_read_ssn, g_write_ssn,
+            reinterpret_cast<PVOID>(table_base),
+            reinterpret_cast<PVOID>(g_orig_NtReadVirtualMemory),
+            reinterpret_cast<PVOID>(read_hook_addr),
+            reinterpret_cast<PVOID>(g_orig_NtWriteVirtualMemory),
+            reinterpret_cast<PVOID>(write_hook_addr),
+            static_cast<ULONG>(g_read_saved_entry),
+            static_cast<ULONG>(read_new_entry),
+            static_cast<ULONG>(g_write_saved_entry),
+            static_cast<ULONG>(write_new_entry));
+
+        return STATUS_SUCCESS;
+    }
+
+    __forceinline void uninstall()
+    {
+        if (_InterlockedCompareExchange(&g_installed, 0, 1) != 1)
+            return;
+
+        if (!ssdt_resolver::g_ssdt)
+            return;
+
+        disable_write_protect();
+        if (g_read_ssn != 0xFFFFFFFFu)
+            ssdt_resolver::g_ssdt->ServiceTable[g_read_ssn] = g_read_saved_entry;
+        if (g_write_ssn != 0xFFFFFFFFu)
+            ssdt_resolver::g_ssdt->ServiceTable[g_write_ssn] = g_write_saved_entry;
+        enable_write_protect();
+
+        WW_LOG("[MEMGUARD] uninstalled read_ssn=%lu write_ssn=%lu read_restored=0x%08lX write_restored=0x%08lX",
+            g_read_ssn, g_write_ssn,
+            static_cast<ULONG>(g_read_saved_entry),
+            static_cast<ULONG>(g_write_saved_entry));
+
+        g_orig_NtReadVirtualMemory = nullptr;
+        g_orig_NtWriteVirtualMemory = nullptr;
+        g_read_ssn = 0xFFFFFFFFu;
+        g_write_ssn = 0xFFFFFFFFu;
+        g_read_saved_entry = 0;
+        g_write_saved_entry = 0;
     }
 }

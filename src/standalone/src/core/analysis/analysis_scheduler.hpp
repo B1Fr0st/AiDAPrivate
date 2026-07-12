@@ -91,7 +91,6 @@ std::string_view analysis_task_state_name(analysis_task_state_t state) noexcept;
 std::string_view analysis_scheduler_error_code_name(analysis_scheduler_error_code_t code) noexcept;
 bool is_valid_analysis_execution_domain(analysis_execution_domain_t domain) noexcept;
 analysis_priority_t analysis_priority_for_domain(analysis_execution_domain_t domain) noexcept;
-bool analysis_priority_precedes(analysis_priority_t left, analysis_priority_t right) noexcept;
 analysis_priority_reservation_policy_t analysis_priority_reservation_policy(const analysis_budget_t& budget) noexcept;
 analysis_task_id_t make_analysis_task_id(std::uint32_t scheduler_id, std::uint32_t ordinal) noexcept;
 
@@ -99,11 +98,6 @@ class analysis_clock_t {
 public:
     virtual ~analysis_clock_t() = default;
     virtual std::uint64_t now_milliseconds() const noexcept = 0;
-};
-
-class steady_analysis_clock_t final : public analysis_clock_t {
-public:
-    std::uint64_t now_milliseconds() const noexcept override;
 };
 
 struct analysis_scheduler_configuration_t final {
@@ -119,7 +113,6 @@ struct analysis_scheduler_state_t;
 struct analysis_checkpoint_result_t final {
     bool cancellation_requested = false;
     bool interval_exceeded = false;
-    std::uint64_t elapsed_milliseconds = 0;
     analysis_scheduler_error_t error;
 };
 

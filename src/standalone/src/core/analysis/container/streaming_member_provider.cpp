@@ -10,6 +10,8 @@
 #include "../workspace/checked_range.hpp"
 
 #include <zlib.h>
+#include <zstd.h>
+#include <lzma.h>
 
 #include <algorithm>
 #include <array>
@@ -301,6 +303,81 @@ private:
     bool initialized_ = false;
 };
 
+class zstd_state_t final {
+public:
+    zstd_state_t() = default;
+
+    ~zstd_state_t() {
+        if (stream_)
+            ZSTD_freeDStream(stream_);
+    }
+
+    zstd_state_t(const zstd_state_t&) = delete;
+    zstd_state_t& operator=(const zstd_state_t&) = delete;
+    zstd_state_t(zstd_state_t&&) = delete;
+    zstd_state_t& operator=(zstd_state_t&&) = delete;
+
+    workspace_result_t<void> initialize() {
+        stream_ = ZSTD_createDStream();
+        if (!stream_)
+            return workspace_result_t<void>::failure(stream_error(
+                workspace_error_code_t::provider_unavailable,
+                "zstd decompression context allocation failed", "container_stream_zstd"));
+        const size_t status = ZSTD_initDStream(stream_);
+        if (ZSTD_isError(status))
+            return workspace_result_t<void>::failure(stream_error(
+                workspace_error_code_t::integrity_failure,
+                "zstd decompression stream initialization failed", "container_stream_zstd"));
+        return workspace_result_t<void>::success();
+    }
+
+    ZSTD_DStream* stream() noexcept {
+        return stream_;
+    }
+
+private:
+    ZSTD_DStream* stream_ = nullptr;
+};
+
+class lzma_state_t final {
+public:
+    lzma_state_t() {
+        std::memset(&stream_, 0, sizeof(stream_));
+    }
+
+    ~lzma_state_t() {
+        if (initialized_)
+            lzma_end(&stream_);
+    }
+
+    lzma_state_t(const lzma_state_t&) = delete;
+    lzma_state_t& operator=(const lzma_state_t&) = delete;
+    lzma_state_t(lzma_state_t&&) = delete;
+    lzma_state_t& operator=(lzma_state_t&&) = delete;
+
+    workspace_result_t<void> initialize_raw(const lzma_filter* filters) {
+        const lzma_ret status = lzma_raw_decoder(&stream_, filters);
+        if (status == LZMA_OK) {
+            initialized_ = true;
+            return workspace_result_t<void>::success();
+        }
+        auto error = stream_error(status == LZMA_MEM_ERROR
+                                      ? workspace_error_code_t::limit_exceeded
+                                      : workspace_error_code_t::integrity_failure,
+                                  "LZMA raw decoder initialization failed", "container_stream_lzma");
+        error.provider_status = static_cast<std::int64_t>(status);
+        return workspace_result_t<void>::failure(std::move(error));
+    }
+
+    lzma_stream& stream() noexcept {
+        return stream_;
+    }
+
+private:
+    lzma_stream stream_{};
+    bool initialized_ = false;
+};
+
 workspace_result_t<void> validate_limits(const container_stream_limits_t& limits) {
     if (limits.max_compressed_size == 0 || limits.max_uncompressed_size == 0 ||
         limits.max_expansion_ratio == 0 || limits.max_spill_bytes == 0 ||
@@ -341,6 +418,14 @@ workspace_result_t<void> validate_request(const container_stream_member_request_
         return workspace_result_t<void>::failure(stream_error(
             workspace_error_code_t::malformed_image,
             "raw-DEFLATE container member has no input stream", "container_stream_open"));
+    if (request.codec == container_stream_codec_t::zstd && request.compressed_size == 0)
+        return workspace_result_t<void>::failure(stream_error(
+            workspace_error_code_t::malformed_image,
+            "zstd container member has no input stream", "container_stream_open"));
+    if (request.codec == container_stream_codec_t::lzma && request.compressed_size == 0)
+        return workspace_result_t<void>::failure(stream_error(
+            workspace_error_code_t::malformed_image,
+            "LZMA container member has no input stream", "container_stream_open"));
     if (request.compressed_size != 0 &&
         request.uncompressed_size > saturating_multiply(request.compressed_size,
                                                         limits.max_expansion_ratio))
@@ -352,6 +437,16 @@ workspace_result_t<void> validate_request(const container_stream_member_request_
         request.uncompressed_size > limits.max_spill_bytes)
         return workspace_result_t<void>::failure(limit_error(
             "deflated container member exceeds its spill capacity", "container_stream_open",
+            request.uncompressed_size, limits.max_spill_bytes));
+    if (request.codec == container_stream_codec_t::zstd &&
+        request.uncompressed_size > limits.max_spill_bytes)
+        return workspace_result_t<void>::failure(limit_error(
+            "zstd container member exceeds its spill capacity", "container_stream_open",
+            request.uncompressed_size, limits.max_spill_bytes));
+    if (request.codec == container_stream_codec_t::lzma &&
+        request.uncompressed_size > limits.max_spill_bytes)
+        return workspace_result_t<void>::failure(limit_error(
+            "LZMA container member exceeds its spill capacity", "container_stream_open",
             request.uncompressed_size, limits.max_spill_bytes));
     if (request.provenance.normalized_member_path != request.normalized_path ||
         request.provenance.container_offset != request.data_offset ||
@@ -574,6 +669,395 @@ workspace_result_t<std::shared_ptr<spill_provider_t>> materialize_deflated_membe
     return finalized;
 }
 
+workspace_result_t<std::shared_ptr<spill_provider_t>> materialize_zstd_member(
+    const container_stream_member_request_t& request, const container_stream_limits_t& limits,
+    stream_guard_t& guard, const cancellation_token_t& cancel) {
+    spill_provider_options_t spill_options;
+    spill_options.max_spill_bytes = limits.max_spill_bytes;
+    spill_options.write_chunk_bytes = chunk_limit(limits);
+    auto sink = spill_sink_t::create("container-member", spill_options);
+    if (!sink)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(sink.error()));
+    std::vector<std::uint8_t> output;
+    try {
+        output.resize(static_cast<std::size_t>(chunk_limit(limits)));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::provider_unavailable,
+            "zstd container member stream buffer allocation failed", "container_stream_zstd"));
+    }
+    zstd_state_t zstd_state;
+    auto initialized = zstd_state.initialize();
+    if (!initialized)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(initialized.error()));
+    ZSTD_DStream* dstream = zstd_state.stream();
+    uLong crc = crc32(0L, Z_NULL, 0);
+    std::uint64_t compressed_cursor = 0;
+    std::uint64_t output_cursor = 0;
+    bool ended = false;
+    while (compressed_cursor < request.compressed_size && !ended) {
+        auto polled = guard.poll("container_stream_zstd");
+        if (!polled)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                std::move(polled.error()));
+        std::uint64_t source_offset = 0;
+        if (!checked_add_u64(request.data_offset, compressed_cursor, source_offset))
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::range_overflow,
+                "zstd container member source offset overflowed", "container_stream_zstd"));
+        const std::uint64_t contiguous = request.source->maximum_contiguous_lease(source_offset);
+        if (contiguous == 0)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::integrity_failure,
+                "zstd container member has no readable contiguous range", "container_stream_zstd"));
+        const std::uint64_t amount = (std::min)(
+            request.compressed_size - compressed_cursor, (std::min)(chunk_limit(limits), contiguous));
+        auto input_charge = guard.charge(amount, "container_stream_zstd");
+        if (!input_charge)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                std::move(input_charge.error()));
+        auto input = request.source->lease(source_offset, amount, cancel);
+        if (!input)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(input.error()));
+        if (input.value().size() != amount || input.value().data() == nullptr)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::integrity_failure,
+                "zstd container member lease was incomplete", "container_stream_zstd"));
+        ZSTD_inBuffer inbuf;
+        inbuf.src = input.value().data();
+        inbuf.size = amount;
+        inbuf.pos = 0;
+        while (inbuf.pos < inbuf.size && !ended) {
+            const std::uint64_t remaining = request.uncompressed_size - output_cursor;
+            const std::uint64_t capacity = remaining == 0 ? 1ULL :
+                (std::min)(remaining, static_cast<std::uint64_t>(output.size()));
+            ZSTD_outBuffer outbuf;
+            outbuf.dst = remaining == 0 ? output.data() : output.data();
+            outbuf.size = capacity;
+            outbuf.pos = 0;
+            const size_t zstatus = ZSTD_decompressStream(dstream, &outbuf, &inbuf);
+            const std::uint64_t produced = outbuf.pos;
+            if (remaining == 0 && produced != 0)
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                    workspace_error_code_t::integrity_failure,
+                    "zstd container member exceeded its declared output size",
+                    "container_stream_zstd"));
+            if (produced != 0) {
+                auto output_charge = guard.charge(produced, "container_stream_zstd");
+                if (!output_charge)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                        std::move(output_charge.error()));
+                auto appended = sink.value()->append(output.data(), produced, cancel);
+                if (!appended)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                        std::move(appended.error()));
+                crc = crc32(crc, reinterpret_cast<const Bytef*>(output.data()),
+                            static_cast<uInt>(produced));
+                output_cursor += produced;
+            }
+            if (zstatus == 0) {
+                if (inbuf.pos != inbuf.size ||
+                    compressed_cursor + amount != request.compressed_size ||
+                    output_cursor != request.uncompressed_size)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                        workspace_error_code_t::integrity_failure,
+                        "zstd container member has trailing input or an incorrect output size",
+                        "container_stream_zstd"));
+                ended = true;
+                break;
+            }
+            if (ZSTD_isError(zstatus)) {
+                auto error = stream_error(workspace_error_code_t::integrity_failure,
+                                          "zstd container member stream validation failed",
+                                          "container_stream_zstd");
+                error.provider_status = static_cast<std::int64_t>(zstatus);
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(error));
+            }
+            if (inbuf.pos == inbuf.size && produced == 0 && zstatus != 0)
+                break;
+            polled = guard.poll("container_stream_zstd");
+            if (!polled)
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                    std::move(polled.error()));
+        }
+        compressed_cursor += amount;
+    }
+    if (!ended)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::integrity_failure,
+            "zstd container member ended before its terminator", "container_stream_zstd"));
+    if (static_cast<std::uint32_t>(crc) != request.crc32)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::integrity_failure,
+            "zstd container member CRC verification failed", "container_stream_zstd"));
+    auto finalized = sink.value()->finalize(cancel);
+    if (!finalized)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(finalized.error()));
+    auto final_poll = guard.poll("container_stream_zstd");
+    if (!final_poll)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(final_poll.error()));
+    return finalized;
+}
+
+workspace_result_t<std::shared_ptr<spill_provider_t>> materialize_lzma_member(
+    const container_stream_member_request_t& request, const container_stream_limits_t& limits,
+    stream_guard_t& guard, const cancellation_token_t& cancel) {
+    spill_provider_options_t spill_options;
+    spill_options.max_spill_bytes = limits.max_spill_bytes;
+    spill_options.write_chunk_bytes = chunk_limit(limits);
+    auto sink = spill_sink_t::create("container-member", spill_options);
+    if (!sink)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(sink.error()));
+    std::vector<std::uint8_t> output;
+    try {
+        output.resize(static_cast<std::size_t>(chunk_limit(limits)));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::provider_unavailable,
+            "LZMA container member stream buffer allocation failed", "container_stream_lzma"));
+    }
+    if (request.compressed_size < 4)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::malformed_image,
+            "LZMA container member compressed stream is too short for its property header",
+            "container_stream_lzma"));
+    std::uint64_t header_offset = 0;
+    if (!checked_add_u64(request.data_offset, 0, header_offset))
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::range_overflow,
+            "LZMA container member header offset overflowed", "container_stream_lzma"));
+    const std::uint64_t header_contiguous = request.source->maximum_contiguous_lease(header_offset);
+    if (header_contiguous < 4)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::integrity_failure,
+            "LZMA container member header is not contiguous", "container_stream_lzma"));
+    auto header_charge = guard.charge(4, "container_stream_lzma");
+    if (!header_charge)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(header_charge.error()));
+    auto header_lease = request.source->lease(header_offset, 4, cancel);
+    if (!header_lease)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(header_lease.error()));
+    if (header_lease.value().size() != 4 || header_lease.value().data() == nullptr)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::integrity_failure,
+            "LZMA container member header lease was incomplete", "container_stream_lzma"));
+    const std::uint8_t* header_bytes = header_lease.value().data();
+    const std::uint16_t lzma_props_size = static_cast<std::uint16_t>(
+        header_bytes[2]) | static_cast<std::uint16_t>(static_cast<std::uint16_t>(header_bytes[3]) << 8U);
+    if (lzma_props_size == 0 || lzma_props_size > 256 ||
+        static_cast<std::uint64_t>(4) + lzma_props_size > request.compressed_size)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::malformed_image,
+            "LZMA container member property size is invalid", "container_stream_lzma"));
+    std::vector<std::uint8_t> lzma_props;
+    try {
+        lzma_props.resize(lzma_props_size);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::provider_unavailable,
+            "LZMA container member property allocation failed", "container_stream_lzma"));
+    }
+    {
+        std::uint64_t props_offset = 0;
+        if (!checked_add_u64(request.data_offset, 4, props_offset))
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::range_overflow,
+                "LZMA container member property offset overflowed", "container_stream_lzma"));
+        const std::uint64_t props_contiguous = request.source->maximum_contiguous_lease(props_offset);
+        if (props_contiguous < lzma_props_size)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::integrity_failure,
+                "LZMA container member properties are not contiguous", "container_stream_lzma"));
+        auto props_charge = guard.charge(lzma_props_size, "container_stream_lzma");
+        if (!props_charge)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(props_charge.error()));
+        auto props_lease = request.source->lease(props_offset, lzma_props_size, cancel);
+        if (!props_lease)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(props_lease.error()));
+        if (props_lease.value().size() != lzma_props_size || props_lease.value().data() == nullptr)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::integrity_failure,
+                "LZMA container member property lease was incomplete", "container_stream_lzma"));
+        std::memcpy(lzma_props.data(), props_lease.value().data(), lzma_props_size);
+    }
+    lzma_filter filters[2];
+    filters[0].id = LZMA_FILTER_LZMA1;
+    filters[0].options = nullptr;
+    filters[1].id = LZMA_VLI_UNKNOWN;
+    filters[1].options = nullptr;
+    const lzma_ret prop_status = lzma_properties_decode(
+        &filters[0], nullptr, lzma_props.data(), lzma_props_size);
+    if (prop_status != LZMA_OK) {
+        auto error = stream_error(workspace_error_code_t::integrity_failure,
+                                  "LZMA container member property decoding failed",
+                                  "container_stream_lzma");
+        error.provider_status = static_cast<std::int64_t>(prop_status);
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(error));
+    }
+    lzma_state_t lzma_state;
+    auto lzma_init = lzma_state.initialize_raw(filters);
+    lzma_filters_free(filters, nullptr);
+    if (!lzma_init)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(lzma_init.error()));
+    lzma_stream& stream = lzma_state.stream();
+    uLong crc = crc32(0L, Z_NULL, 0);
+    const std::uint64_t stream_start = static_cast<std::uint64_t>(4) + lzma_props_size;
+    std::uint64_t compressed_cursor = stream_start;
+    std::uint64_t output_cursor = 0;
+    bool ended = false;
+    while (compressed_cursor < request.compressed_size && !ended) {
+        auto polled = guard.poll("container_stream_lzma");
+        if (!polled)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                std::move(polled.error()));
+        std::uint64_t source_offset = 0;
+        if (!checked_add_u64(request.data_offset, compressed_cursor, source_offset))
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::range_overflow,
+                "LZMA container member source offset overflowed", "container_stream_lzma"));
+        const std::uint64_t contiguous = request.source->maximum_contiguous_lease(source_offset);
+        if (contiguous == 0)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::integrity_failure,
+                "LZMA container member has no readable contiguous range", "container_stream_lzma"));
+        const std::uint64_t amount = (std::min)(
+            request.compressed_size - compressed_cursor, (std::min)(chunk_limit(limits), contiguous));
+        auto input_charge = guard.charge(amount, "container_stream_lzma");
+        if (!input_charge)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                std::move(input_charge.error()));
+        auto input = request.source->lease(source_offset, amount, cancel);
+        if (!input)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(input.error()));
+        if (input.value().size() != amount || input.value().data() == nullptr)
+            return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::integrity_failure,
+                "LZMA container member lease was incomplete", "container_stream_lzma"));
+        stream.next_in = input.value().data();
+        stream.avail_in = static_cast<size_t>(amount);
+        while (stream.avail_in != 0 && !ended) {
+            const std::uint64_t remaining = request.uncompressed_size - output_cursor;
+            const std::uint64_t capacity = remaining == 0 ? 1ULL :
+                (std::min)(remaining, static_cast<std::uint64_t>(output.size()));
+            stream.next_out = output.data();
+            stream.avail_out = static_cast<size_t>(capacity);
+            const size_t avail_in_before = stream.avail_in;
+            const size_t avail_out_before = stream.avail_out;
+            const lzma_ret lzstatus = lzma_code(&stream, LZMA_RUN);
+            const std::uint64_t input_consumed = avail_in_before - stream.avail_in;
+            const std::uint64_t produced = avail_out_before - stream.avail_out;
+            if (remaining == 0 && produced != 0)
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                    workspace_error_code_t::integrity_failure,
+                    "LZMA container member exceeded its declared output size",
+                    "container_stream_lzma"));
+            if (produced != 0) {
+                auto output_charge = guard.charge(produced, "container_stream_lzma");
+                if (!output_charge)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                        std::move(output_charge.error()));
+                auto appended = sink.value()->append(output.data(), produced, cancel);
+                if (!appended)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                        std::move(appended.error()));
+                crc = crc32(crc, reinterpret_cast<const Bytef*>(output.data()),
+                            static_cast<uInt>(produced));
+                output_cursor += produced;
+            }
+            if (lzstatus == LZMA_STREAM_END) {
+                if (stream.avail_in != 0 ||
+                    compressed_cursor + amount != request.compressed_size ||
+                    output_cursor != request.uncompressed_size)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                        workspace_error_code_t::integrity_failure,
+                        "LZMA container member has trailing input or an incorrect output size",
+                        "container_stream_lzma"));
+                ended = true;
+                break;
+            }
+            if (lzstatus != LZMA_OK && lzstatus != LZMA_BUF_ERROR) {
+                auto error = stream_error(workspace_error_code_t::integrity_failure,
+                                          "LZMA container member stream validation failed",
+                                          "container_stream_lzma");
+                error.provider_status = static_cast<std::int64_t>(lzstatus);
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(error));
+            }
+            if (input_consumed == 0 && produced == 0 && lzstatus == LZMA_BUF_ERROR)
+                break;
+            polled = guard.poll("container_stream_lzma");
+            if (!polled)
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                    std::move(polled.error()));
+        }
+        compressed_cursor += amount;
+    }
+    if (!ended) {
+        stream.next_in = nullptr;
+        stream.avail_in = 0;
+        while (!ended) {
+            const std::uint64_t remaining = request.uncompressed_size - output_cursor;
+            if (remaining == 0)
+                break;
+            const std::uint64_t capacity = (std::min)(remaining, static_cast<std::uint64_t>(output.size()));
+            stream.next_out = output.data();
+            stream.avail_out = static_cast<size_t>(capacity);
+            const size_t avail_out_before = stream.avail_out;
+            const lzma_ret lzstatus = lzma_code(&stream, LZMA_FINISH);
+            const std::uint64_t produced = avail_out_before - stream.avail_out;
+            if (produced != 0) {
+                auto output_charge = guard.charge(produced, "container_stream_lzma");
+                if (!output_charge)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                        std::move(output_charge.error()));
+                auto appended = sink.value()->append(output.data(), produced, cancel);
+                if (!appended)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                        std::move(appended.error()));
+                crc = crc32(crc, reinterpret_cast<const Bytef*>(output.data()),
+                            static_cast<uInt>(produced));
+                output_cursor += produced;
+            }
+            if (lzstatus == LZMA_STREAM_END) {
+                if (output_cursor != request.uncompressed_size)
+                    return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                        workspace_error_code_t::integrity_failure,
+                        "LZMA container member produced an incorrect output size",
+                        "container_stream_lzma"));
+                ended = true;
+                break;
+            }
+            if (lzstatus != LZMA_OK && lzstatus != LZMA_BUF_ERROR) {
+                auto error = stream_error(workspace_error_code_t::integrity_failure,
+                                          "LZMA container member flush validation failed",
+                                          "container_stream_lzma");
+                error.provider_status = static_cast<std::int64_t>(lzstatus);
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(error));
+            }
+            if (produced == 0 && lzstatus == LZMA_BUF_ERROR)
+                break;
+            auto polled = guard.poll("container_stream_lzma");
+            if (!polled)
+                return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
+                    std::move(polled.error()));
+        }
+    }
+    if (!ended)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::integrity_failure,
+            "LZMA container member ended before its terminator", "container_stream_lzma"));
+    if (static_cast<std::uint32_t>(crc) != request.crc32)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+            workspace_error_code_t::integrity_failure,
+            "LZMA container member CRC verification failed", "container_stream_lzma"));
+    auto finalized = sink.value()->finalize(cancel);
+    if (!finalized)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(finalized.error()));
+    auto final_poll = guard.poll("container_stream_lzma");
+    if (!final_poll)
+        return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(final_poll.error()));
+    return finalized;
+}
+
 workspace_result_t<byte_provider_identity_t> make_identity(
     const container_stream_member_request_t& request, const sha256_digest_t& digest,
     bool immutable_snapshot) {
@@ -646,14 +1130,27 @@ streaming_member_provider_t::open(container_stream_member_request_t request,
                 std::shared_ptr<streaming_member_provider_t>(new streaming_member_provider_t(
                     std::move(request.source), std::move(backing), identity.take_value(), true)));
         }
-        auto spilled = materialize_deflated_member(request, limits, guard, cancel);
+        workspace_result_t<std::shared_ptr<spill_provider_t>> spilled =
+            workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(stream_error(
+                workspace_error_code_t::invalid_argument,
+                "unsupported container stream codec", "container_stream_open"));
+        const char* spill_phase = "container_stream_deflate";
+        if (request.codec == container_stream_codec_t::raw_deflate)
+            spilled = materialize_deflated_member(request, limits, guard, cancel);
+        else if (request.codec == container_stream_codec_t::zstd) {
+            spilled = materialize_zstd_member(request, limits, guard, cancel);
+            spill_phase = "container_stream_zstd";
+        } else if (request.codec == container_stream_codec_t::lzma) {
+            spilled = materialize_lzma_member(request, limits, guard, cancel);
+            spill_phase = "container_stream_lzma";
+        }
         if (!spilled)
             return workspace_result_t<std::shared_ptr<streaming_member_provider_t>>::failure(
                 std::move(spilled.error()));
         if (!spilled.value()->identity().content_sha256)
             return workspace_result_t<std::shared_ptr<streaming_member_provider_t>>::failure(stream_error(
                 workspace_error_code_t::integrity_failure,
-                "deflated container member spill has no content hash", "container_stream_deflate"));
+                "compressed container member spill has no content hash", spill_phase));
         auto expected = validate_expected_hash(request, *spilled.value()->identity().content_sha256);
         if (!expected)
             return workspace_result_t<std::shared_ptr<streaming_member_provider_t>>::failure(

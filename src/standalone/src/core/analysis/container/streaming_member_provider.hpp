@@ -13,7 +13,9 @@ namespace aida::analysis {
 
 enum class container_stream_codec_t : std::uint8_t {
     stored = 0,
-    raw_deflate = 1
+    raw_deflate = 1,
+    zstd = 2,
+    lzma = 3
 };
 
 struct container_stream_limits_t final {

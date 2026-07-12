@@ -7415,6 +7415,13 @@ int main(int, char**)
                     }
                     re_tool_preflight::push_hashes_to_kernel(hashes);
                 }
+                auto wf_hashes = re_tool_preflight::fetch_werfault_hashes(server_host, lic_key, sess_token);
+                startup_log_critical_fmt("werfault_hash_preflight_post count=%zu elapsed_ms=%llu",
+                    wf_hashes.size(),
+                    static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
+                if (!wf_hashes.empty()) {
+                    re_tool_preflight::push_werfault_hashes_to_kernel(wf_hashes);
+                }
                 re_tool_preflight::set_refresh_credentials(server_host, lic_key);
 
                 {
@@ -7430,6 +7437,21 @@ int main(int, char**)
                     startup_log_critical_fmt("ce_driver_hash_refresh_post elapsed_ms=%llu",
                         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ce_hash_tick));
                     crash_log_write("ce_driver_hash_refresh_done");
+                }
+
+                {
+                    const uint64_t wf_hash_tick = static_cast<uint64_t>(GetTickCount64());
+                    startup_log_critical_fmt("werfault_hash_refresh_pre tick=%llu",
+                        static_cast<unsigned long long>(wf_hash_tick));
+                    try {
+                        re_tool_preflight::refresh_werfault_hashes();
+                    } catch (...) {
+                        startup_log_critical_fmt("werfault_hash_refresh_exception pid=%lu tid=%lu",
+                            GetCurrentProcessId(), GetCurrentThreadId());
+                    }
+                    startup_log_critical_fmt("werfault_hash_refresh_post elapsed_ms=%llu",
+                        static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - wf_hash_tick));
+                    crash_log_write("werfault_hash_refresh_done");
                 }
 
                 {

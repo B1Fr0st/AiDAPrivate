@@ -173,14 +173,12 @@ namespace vad_text_guard {
                     0x5A4D,
                     0, 0
                 );
-#ifndef AIDA_DEV_MODE
                 if (_KeBugCheckEx)
                     _KeBugCheckEx(0xA1DA0002,
                         reinterpret_cast<ULONG_PTR>(base),
                         0x5A4D,
                         reinterpret_cast<ULONG_PTR>(client_pid),
                         0);
-#endif
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
 

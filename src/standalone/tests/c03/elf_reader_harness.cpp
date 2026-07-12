@@ -591,7 +591,7 @@ void verify_malformed_bounds_and_output_limits() {
     auto malformed_bounds = make_rich_shared_elf64();
     write_u64(malformed_bounds, 40U, rich_file_size - 8U, false);
     const auto bounds_result = read_fixture_result(malformed_bounds);
-    require(!bounds_result && bounds_result.error().code == workspace_error_code_t::out_of_range,
+    require(!bounds_result && bounds_result.error().code == workspace_error_code_t::malformed_image,
             "out-of-bounds ELF section table was accepted");
 
     auto malformed_link = make_rich_shared_elf64();

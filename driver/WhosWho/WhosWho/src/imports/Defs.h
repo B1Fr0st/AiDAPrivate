@@ -336,6 +336,8 @@ namespace ssdt_resolver {
     typedef NTSTATUS (NTAPI* fn_PsGetUserContextThread)(PETHREAD, PCONTEXT);
     typedef NTSTATUS (NTAPI* fn_PspGetContextThreadInternal)(PETHREAD, PCONTEXT, KPROCESSOR_MODE, KPROCESSOR_MODE, BOOLEAN);
     typedef NTSTATUS (NTAPI* fn_PspSetContextThreadInternal)(PETHREAD, PCONTEXT, KPROCESSOR_MODE, KPROCESSOR_MODE, BOOLEAN);
+    typedef NTSTATUS (NTAPI* fn_NtReadVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+    typedef NTSTATUS (NTAPI* fn_NtWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 
     inline PKSERVICE_TABLE_DESCRIPTOR g_ssdt = nullptr;
     inline fn_NtSuspendThread g_NtSuspendThread = nullptr;

@@ -5091,6 +5091,80 @@ router.get('/re-tool-hashes', async (req, res) => {
     }
 });
 
+router.get('/werfault-hashes', async (req, res) => {
+    const dispatchStartedAt = Date.now();
+    const licenseKey = typeof req.query.license_key === 'string' ? req.query.license_key.trim() : '';
+    const sessionToken = typeof req.query.session_token === 'string' ? req.query.session_token.trim() :
+        (typeof req.headers['authorization'] === 'string' ? req.headers['authorization'].replace(/^Bearer\s+/i, '').trim() : '');
+
+    if (!licenseKey || !sessionToken) {
+        return sendEauth(res, dispatchStartedAt, 'werfault_hashes_missing_credentials');
+    }
+
+    try {
+        const normalizedKey = keyFormat.normalizeForLookup(licenseKey);
+        if (!normalizedKey) {
+            return sendEauth(res, dispatchStartedAt, 'werfault_hashes_invalid_key');
+        }
+
+        const session = await getSession(normalizedKey);
+        if (!session) {
+            return sendEauth(res, dispatchStartedAt, 'werfault_hashes_no_session');
+        }
+        if (session.kill_flag) {
+            return sendEauth(res, dispatchStartedAt, 'werfault_hashes_session_killed');
+        }
+        if (!sessionTokenMatches(session.session_token || '', sessionToken)) {
+            return sendEauth(res, dispatchStartedAt, 'werfault_hashes_token_mismatch');
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const issuedAt = Number(session.issued_at || 0);
+        const ttl = Number(session.ttl || 0);
+        if (issuedAt > 0 && ttl > 0 && now > issuedAt + Math.floor(ttl * SESSION_TTL_GRACE_FACTOR)) {
+            return sendEauth(res, dispatchStartedAt, 'werfault_hashes_session_expired');
+        }
+
+        let hashes = [];
+        try {
+            const { rows } = await pool.query(
+                'SELECT hash FROM werfault_hashes WHERE active = true ORDER BY created_at DESC'
+            );
+            hashes = (rows || []).map(r => String(r.hash || '').toLowerCase()).filter(h => /^[0-9a-f]{64}$/.test(h));
+        } catch (err) {
+            if (err && (err.code === '42P01' || (err.message && err.message.includes('werfault_hashes')))) {
+                hashes = [];
+            } else {
+                throw err;
+            }
+        }
+
+        const timestamp = now;
+        const hashConcat = hashes.join('');
+        const signKey = String(session.session_token || '');
+        const signature = crypto.createHmac('sha256', signKey)
+            .update(`werfault-hashes|${normalizedKey}|${timestamp}|${hashConcat}`)
+            .digest('hex');
+
+        return res.status(200).json({
+            status: 'ok',
+            hashes,
+            timestamp,
+            signature,
+            count: hashes.length,
+        });
+    } catch (err) {
+        console.error('[werfault-hashes] Error:', err && err.message ? err.message : err);
+        return res.status(200).json({
+            status: 'ok',
+            hashes: [],
+            timestamp: Math.floor(Date.now() / 1000),
+            signature: '',
+            count: 0,
+        });
+    }
+});
+
 router.get('/prologue-hashes', async (req, res) => {
     const dispatchStartedAt = Date.now();
     const licenseKey = typeof req.query.license_key === 'string' ? req.query.license_key.trim() : '';

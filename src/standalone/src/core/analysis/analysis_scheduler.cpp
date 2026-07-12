@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <deque>
 #include <limits>
 #include <map>
@@ -263,22 +262,22 @@ analysis_checkpoint_result_t checkpoint_task(const std::shared_ptr<analysis_sche
                                              analysis_task_id_t task_id) noexcept
 {
     if (!state)
-        return {false, false, 0, make_scheduler_error(analysis_scheduler_error_code_t::task_not_active, task_id)};
+        return {false, false, make_scheduler_error(analysis_scheduler_error_code_t::task_not_active, task_id)};
 
     std::lock_guard<std::mutex> lock(state->mutex);
     const auto task = state->tasks.find(task_id);
     if (task == state->tasks.end()) {
-        return {false, false, 0,
+        return {false, false,
                 make_scheduler_error(analysis_scheduler_error_code_t::task_not_found, task_id)};
     }
     if (task->second.state != analysis_task_state_t::running) {
-        return {task->second.cancellation_requested->load(std::memory_order_acquire), false, 0,
+        return {task->second.cancellation_requested->load(std::memory_order_acquire), false,
                 make_scheduler_error(analysis_scheduler_error_code_t::task_not_active, task_id)};
     }
 
     const auto now = scheduler_now(*state);
     if (now < task->second.last_checkpoint_milliseconds) {
-        return {task->second.cancellation_requested->load(std::memory_order_acquire), false, 0,
+        return {task->second.cancellation_requested->load(std::memory_order_acquire), false,
                 make_scheduler_error(analysis_scheduler_error_code_t::clock_regressed, task_id)};
     }
 
@@ -289,7 +288,7 @@ analysis_checkpoint_result_t checkpoint_task(const std::shared_ptr<analysis_sche
                            ? make_scheduler_error(analysis_scheduler_error_code_t::checkpoint_interval_exceeded,
                                                   task_id)
                            : analysis_scheduler_error_t{};
-    return {task->second.cancellation_requested->load(std::memory_order_acquire), interval_exceeded, elapsed, error};
+    return {task->second.cancellation_requested->load(std::memory_order_acquire), interval_exceeded, error};
 }
 
 void execute_dispatch(const std::shared_ptr<analysis_task_dispatch_state_t>& dispatch) noexcept(false)
@@ -448,11 +447,6 @@ analysis_priority_t analysis_priority_for_domain(analysis_execution_domain_t dom
     return static_cast<analysis_priority_t>(static_cast<std::uint8_t>(domain));
 }
 
-bool analysis_priority_precedes(analysis_priority_t left, analysis_priority_t right) noexcept
-{
-    return static_cast<std::uint8_t>(left) < static_cast<std::uint8_t>(right);
-}
-
 analysis_priority_reservation_policy_t analysis_priority_reservation_policy(const analysis_budget_t& budget) noexcept
 {
     return {true, true, true, false, budget.reserved_control_worker_slots};
@@ -461,13 +455,6 @@ analysis_priority_reservation_policy_t analysis_priority_reservation_policy(cons
 analysis_task_id_t make_analysis_task_id(std::uint32_t scheduler_id, std::uint32_t ordinal) noexcept
 {
     return (static_cast<analysis_task_id_t>(scheduler_id) << 32U) | ordinal;
-}
-
-std::uint64_t steady_analysis_clock_t::now_milliseconds() const noexcept
-{
-    const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
 analysis_task_context_t::analysis_task_context_t(std::shared_ptr<analysis_task_context_state_t> state)
@@ -489,7 +476,7 @@ bool analysis_task_context_t::cancellation_requested() const noexcept
 analysis_checkpoint_result_t analysis_task_context_t::checkpoint() const noexcept
 {
     if (!state_) {
-        return {false, false, 0,
+        return {false, false,
                 make_scheduler_error(analysis_scheduler_error_code_t::task_not_active)};
     }
     return checkpoint_task(state_->scheduler, state_->task_id);

@@ -7900,6 +7900,26 @@ bool voyager::device_t::update_re_tool_hashes(const std::uint8_t* hashes, std::u
     return true;
 }
 
+bool voyager::device_t::update_werfault_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept
+{
+    if (!is_connected()) return false;
+    if (!hashes || count == 0) return false;
+    if (count > 16) count = 16;
+
+    std::shared_lock<voyager::detail::writer_priority_shared_mutex> rotation_guard(seed_rotation_mtx_);
+    detail::re_tool_hash_update_request req{};
+    req.magic = session_key_ ^ dynamic_key::get() ^ 0x5A4E0B02u;
+    req.session_key = session_key_;
+    req.werfault_hash_count = count;
+    req.timestamp = static_cast<std::uint64_t>(__rdtsc());
+    std::memcpy(req.werfault_hashes, hashes, static_cast<std::size_t>(count) * 32u);
+
+    if (!send_request_in_lock(ioctl_codes::RTHS(), &req, static_cast<DWORD>(sizeof(req)))) {
+        return false;
+    }
+    return true;
+}
+
 bool voyager::device_t::update_ce_driver_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept
 {
     if (!is_connected()) return false;

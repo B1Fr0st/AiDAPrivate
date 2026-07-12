@@ -11255,6 +11255,32 @@ namespace driver_bridge
         return ok;
     }
 
+    bool update_werfault_hashes(const uint8_t* hashes, uint32_t count)
+    {
+        bool kernel_mode = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            kernel_mode = g_kernel_mode && device && device->is_connected();
+        }
+        if (!kernel_mode) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        if (!hashes || count == 0) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bool ok = device->update_werfault_hashes(hashes, count);
+        DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+        driver_critical_fmt("update_werfault_hashes_post ok=%d err=%lu count=%u",
+            ok ? 1 : 0,
+            static_cast<unsigned long>(err),
+            count);
+        return ok;
+    }
+
     bool update_ce_driver_hashes(const uint8_t* hashes, uint32_t count)
     {
         bool kernel_mode = false;

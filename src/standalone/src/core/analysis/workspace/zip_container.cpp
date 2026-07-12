@@ -42,10 +42,13 @@ constexpr std::uint16_t zip64_extra_id = 0x0001U;
 constexpr std::uint16_t unicode_path_extra_id = 0x7075U;
 constexpr std::uint16_t zip_method_stored = 0U;
 constexpr std::uint16_t zip_method_deflate = 8U;
+constexpr std::uint16_t zip_method_lzma = 14U;
+constexpr std::uint16_t zip_method_zstd = 93U;
 constexpr std::uint16_t zip_flag_data_descriptor = 0x0008U;
 constexpr std::uint16_t zip_flag_utf8 = 0x0800U;
 constexpr std::uint16_t zip_allowed_stored_flags = zip_flag_data_descriptor | zip_flag_utf8;
 constexpr std::uint16_t zip_allowed_deflate_flags = zip_allowed_stored_flags | 0x0006U;
+constexpr std::uint16_t zip_allowed_compressed_flags = zip_allowed_stored_flags;
 constexpr std::uint64_t zip_eocd_fixed_size = 22U;
 constexpr std::uint64_t zip64_locator_size = 20U;
 constexpr std::uint64_t zip64_eocd_minimum_size = 56U;
@@ -870,7 +873,9 @@ workspace_result_t<void> validate_member_encoding(
     std::uint16_t compression_method, bool uses_zip64,
     std::uint64_t offset) {
     if (compression_method != zip_method_stored &&
-        compression_method != zip_method_deflate) {
+        compression_method != zip_method_deflate &&
+        compression_method != zip_method_zstd &&
+        compression_method != zip_method_lzma) {
         auto error = zip_error(workspace_error_code_t::unsupported_format,
                                "ZIP member compression method is unsupported",
                                "zip_central_directory", offset);
@@ -879,7 +884,10 @@ workspace_result_t<void> validate_member_encoding(
         return workspace_result_t<void>::failure(std::move(error));
     }
     const std::uint16_t allowed = compression_method == zip_method_stored
-        ? zip_allowed_stored_flags : zip_allowed_deflate_flags;
+        ? zip_allowed_stored_flags
+        : compression_method == zip_method_deflate
+            ? zip_allowed_deflate_flags
+            : zip_allowed_compressed_flags;
     if ((flags & static_cast<std::uint16_t>(~allowed)) != 0) {
         auto error = zip_error(workspace_error_code_t::unsupported_format,
                                "ZIP member uses encryption or unsupported flags",
@@ -889,6 +897,8 @@ workspace_result_t<void> validate_member_encoding(
     }
     std::uint16_t minimum_version = 10;
     if (compression_method == zip_method_deflate ||
+        compression_method == zip_method_zstd ||
+        compression_method == zip_method_lzma ||
         (flags & zip_flag_data_descriptor) != 0)
         minimum_version = 20;
     if (uses_zip64)
@@ -1510,6 +1520,16 @@ workspace_result_t<parsed_archive_t> parse_archive(
             return workspace_result_t<parsed_archive_t>::failure(malformed_error(
                 "Deflated ZIP member has no compressed stream",
                 "zip_central_directory", cursor));
+        if (parsed.member.compression_method == zip_method_zstd &&
+            parsed.member.compressed_size == 0)
+            return workspace_result_t<parsed_archive_t>::failure(malformed_error(
+                "Zstd-compressed ZIP member has no compressed stream",
+                "zip_central_directory", cursor));
+        if (parsed.member.compression_method == zip_method_lzma &&
+            parsed.member.compressed_size == 0)
+            return workspace_result_t<parsed_archive_t>::failure(malformed_error(
+                "LZMA-compressed ZIP member has no compressed stream",
+                "zip_central_directory", cursor));
         if (expansion_ratio_exceeded(
                 parsed.member.uncompressed_size, parsed.member.compressed_size,
                 limits.max_expansion_ratio))
@@ -1675,8 +1695,14 @@ workspace_result_t<std::shared_ptr<byte_provider_t>> materialize_member_provider
     request.compressed_size = member.compressed_size;
     request.uncompressed_size = member.uncompressed_size;
     request.crc32 = member.crc32;
-    request.codec = member.compression_method == zip_method_stored
-        ? container_stream_codec_t::stored : container_stream_codec_t::raw_deflate;
+    if (member.compression_method == zip_method_stored)
+        request.codec = container_stream_codec_t::stored;
+    else if (member.compression_method == zip_method_zstd)
+        request.codec = container_stream_codec_t::zstd;
+    else if (member.compression_method == zip_method_lzma)
+        request.codec = container_stream_codec_t::lzma;
+    else
+        request.codec = container_stream_codec_t::raw_deflate;
     container_stream_limits_t stream_limits;
     stream_limits.max_compressed_size = work.limits().max_member_compressed_size;
     stream_limits.max_uncompressed_size = work.limits().max_member_uncompressed_size;

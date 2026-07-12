@@ -5,6 +5,8 @@
 #include "../../src/core/analysis/workspace/zip_container.hpp"
 
 #include <zlib.h>
+#include <zstd.h>
+#include <lzma.h>
 
 #include <algorithm>
 #include <array>
@@ -23,10 +25,17 @@
 namespace aida::analysis::c03 {
 namespace {
 
+enum class fixture_compression : std::uint8_t {
+    none = 0,
+    deflate = 1,
+    zstd = 2,
+    lzma = 3
+};
+
 struct zip_fixture_member_t final {
     std::string path;
     std::vector<std::uint8_t> bytes;
-    bool deflate = false;
+    fixture_compression compression = fixture_compression::none;
 };
 
 struct deflate_ender_t final {
@@ -106,6 +115,65 @@ std::vector<std::uint8_t> raw_deflate(const std::vector<std::uint8_t>& bytes) {
     return output;
 }
 
+std::vector<std::uint8_t> zstd_compress(const std::vector<std::uint8_t>& bytes) {
+    const size_t bound = ZSTD_compressBound(bytes.size());
+    if (ZSTD_isError(bound))
+        throw std::runtime_error("zstd compressBound failed");
+    std::vector<std::uint8_t> output(bound);
+    const size_t actual = ZSTD_compress(
+        output.data(), bound,
+        bytes.empty() ? nullptr : bytes.data(), bytes.size(), 3);
+    if (ZSTD_isError(actual))
+        throw std::runtime_error("zstd compress failed");
+    output.resize(actual);
+    return output;
+}
+
+std::vector<std::uint8_t> lzma_compress(const std::vector<std::uint8_t>& bytes) {
+    lzma_options_lzma opt;
+    if (lzma_lzma_preset(&opt, LZMA_PRESET_DEFAULT))
+        throw std::runtime_error("lzma preset failed");
+    lzma_filter filters[2];
+    filters[0].id = LZMA_FILTER_LZMA1;
+    filters[0].options = &opt;
+    filters[1].id = LZMA_VLI_UNKNOWN;
+    filters[1].options = nullptr;
+    uint32_t prop_size = 0;
+    if (lzma_properties_size(&prop_size, &filters[0]) != LZMA_OK)
+        throw std::runtime_error("lzma properties_size failed");
+    std::vector<std::uint8_t> props(prop_size);
+    if (lzma_properties_encode(&filters[0], props.data()) != LZMA_OK)
+        throw std::runtime_error("lzma properties_encode failed");
+    lzma_stream strm = LZMA_STREAM_INIT;
+    if (lzma_raw_encoder(&strm, filters) != LZMA_OK)
+        throw std::runtime_error("lzma raw encoder init failed");
+    std::vector<std::uint8_t> compressed;
+    std::array<std::uint8_t, 16384> chunk{};
+    strm.next_in = bytes.empty() ? nullptr : const_cast<uint8_t*>(bytes.data());
+    strm.avail_in = bytes.size();
+    for (;;) {
+        strm.next_out = chunk.data();
+        strm.avail_out = chunk.size();
+        const lzma_ret status = lzma_code(&strm, LZMA_FINISH);
+        const size_t produced = chunk.size() - strm.avail_out;
+        compressed.insert(compressed.end(), chunk.begin(), chunk.begin() + produced);
+        if (status == LZMA_STREAM_END)
+            break;
+        if (status != LZMA_OK)
+            throw std::runtime_error("lzma encode failed");
+    }
+    lzma_end(&strm);
+    std::vector<std::uint8_t> output;
+    output.reserve(4 + props.size() + compressed.size());
+    output.push_back(static_cast<std::uint8_t>(0x00));
+    output.push_back(static_cast<std::uint8_t>(0x03));
+    output.push_back(static_cast<std::uint8_t>(prop_size & 0xff));
+    output.push_back(static_cast<std::uint8_t>((prop_size >> 8) & 0xff));
+    output.insert(output.end(), props.begin(), props.end());
+    output.insert(output.end(), compressed.begin(), compressed.end());
+    return output;
+}
+
 std::vector<std::uint8_t> build_zip(const std::vector<zip_fixture_member_t>& members,
                                     bool zip64 = false) {
     struct record_t final {
@@ -122,11 +190,27 @@ std::vector<std::uint8_t> build_zip(const std::vector<zip_fixture_member_t>& mem
     for (const auto& member : members) {
         record_t record;
         record.path = member.path;
-        record.compressed = member.deflate ? raw_deflate(member.bytes) : member.bytes;
+        switch (member.compression) {
+        case fixture_compression::none:
+            record.compressed = member.bytes;
+            record.method = 0U;
+            break;
+        case fixture_compression::deflate:
+            record.compressed = raw_deflate(member.bytes);
+            record.method = 8U;
+            break;
+        case fixture_compression::zstd:
+            record.compressed = zstd_compress(member.bytes);
+            record.method = 93U;
+            break;
+        case fixture_compression::lzma:
+            record.compressed = lzma_compress(member.bytes);
+            record.method = 14U;
+            break;
+        }
         record.crc = crc_of(member.bytes);
         record.local_offset = output.size();
         record.uncompressed_size = member.bytes.size();
-        record.method = member.deflate ? 8U : 0U;
         const std::uint16_t extra_size = zip64 ? 20U : 0U;
         append_u32(output, 0x04034b50U);
         append_u16(output, zip64 ? 45U : 20U);
@@ -236,10 +320,10 @@ void verify_streaming_paths(const std::filesystem::path& root) {
         large_stored[index] = static_cast<std::uint8_t>((index * 29U + 11U) & 0xffU);
     std::vector<std::uint8_t> deflated(65536, 0x5aU);
     const auto archive_bytes = build_zip({
-        {"classes.dex", large_stored, false},
-        {"base/dex/classes2.dex", deflated, true},
-        {"Payload/App.app/App", {0xcf, 0xfa, 0xed, 0xfe}, false},
-        {"com/example/Main.class", {0xca, 0xfe, 0xba, 0xbe}, true},
+        {"classes.dex", large_stored, fixture_compression::none},
+        {"base/dex/classes2.dex", deflated, fixture_compression::deflate},
+        {"Payload/App.app/App", {0xcf, 0xfa, 0xed, 0xfe}, fixture_compression::none},
+        {"com/example/Main.class", {0xca, 0xfe, 0xba, 0xbe}, fixture_compression::deflate},
     });
     const auto path = root / "streaming.zip";
     write_fixture(path, archive_bytes);
@@ -276,12 +360,12 @@ void verify_streaming_paths(const std::filesystem::path& root) {
 
 void verify_zip64_and_rejections(const std::filesystem::path& root) {
     const auto zip64_path = root / "zip64.zip";
-    write_fixture(zip64_path, build_zip({{"classes.dex", {1, 2, 3, 4}, false}}, true));
+    write_fixture(zip64_path, build_zip({{"classes.dex", {1, 2, 3, 4}, fixture_compression::none}}, true));
     auto zip64 = open_zip(zip64_path);
     require(zip64->uses_zip64(), "ZIP64 archive was not recognized");
     require_value(zip64->open_member_provider("classes.dex"), "ZIP64 member open failed");
 
-    auto truncated = build_zip({{"classes.dex", {1, 2, 3}, false}});
+    auto truncated = build_zip({{"classes.dex", {1, 2, 3}, fixture_compression::none}});
     truncated.pop_back();
     const auto truncated_path = root / "truncated.zip";
     write_fixture(truncated_path, truncated);
@@ -289,16 +373,16 @@ void verify_zip64_and_rejections(const std::filesystem::path& root) {
 
     const auto duplicate_path = root / "duplicate.zip";
     write_fixture(duplicate_path, build_zip({
-        {"classes.dex", {1}, false}, {"classes.dex", {2}, false}}));
+        {"classes.dex", {1}, fixture_compression::none}, {"classes.dex", {2}, fixture_compression::none}}));
     require(!zip_container_t::open(open_fixture(duplicate_path)), "duplicate ZIP path was accepted");
 
     const auto traversal_path = root / "traversal.zip";
-    write_fixture(traversal_path, build_zip({{"../classes.dex", {1}, false}}));
+    write_fixture(traversal_path, build_zip({{"../classes.dex", {1}, fixture_compression::none}}));
     require(!zip_container_t::open(open_fixture(traversal_path)), "traversal ZIP path was accepted");
 
     std::vector<std::uint8_t> bomb_bytes(262144, 0);
     const auto bomb_path = root / "bomb.zip";
-    write_fixture(bomb_path, build_zip({{"classes.dex", bomb_bytes, true}}));
+    write_fixture(bomb_path, build_zip({{"classes.dex", bomb_bytes, fixture_compression::deflate}}));
     zip_container_limits_t bomb_limits;
     bomb_limits.max_expansion_ratio = 4;
     require(!zip_container_t::open(open_fixture(bomb_path), bomb_limits),
@@ -306,7 +390,7 @@ void verify_zip64_and_rejections(const std::filesystem::path& root) {
 }
 
 void verify_crc_hash_nesting_and_cancellation(const std::filesystem::path& root) {
-    auto bad_crc = build_zip({{"classes.dex", {1, 2, 3, 4}, false}});
+    auto bad_crc = build_zip({{"classes.dex", {1, 2, 3, 4}, fixture_compression::none}});
     const std::uint32_t incorrect_crc = 0x7f3a2c19U;
     const std::array<std::uint8_t, 4> crc_bytes{{
         static_cast<std::uint8_t>(incorrect_crc),
@@ -342,9 +426,9 @@ void verify_crc_hash_nesting_and_cancellation(const std::filesystem::path& root)
                   workspace_error_code_t::integrity_failure,
                   "incorrect member SHA-256 was accepted");
 
-    const auto nested_bytes = build_zip({{"Inner.class", {0xca, 0xfe, 0xba, 0xbe}, false}});
+    const auto nested_bytes = build_zip({{"Inner.class", {0xca, 0xfe, 0xba, 0xbe}, fixture_compression::none}});
     const auto nested_path = root / "nested.zip";
-    write_fixture(nested_path, build_zip({{"nested.jar", nested_bytes, false}}));
+    write_fixture(nested_path, build_zip({{"nested.jar", nested_bytes, fixture_compression::none}}));
     zip_container_limits_t nested_limits;
     nested_limits.max_nesting_depth = 1;
     auto outer = open_zip(nested_path, nested_limits);
@@ -355,13 +439,78 @@ void verify_crc_hash_nesting_and_cancellation(const std::filesystem::path& root)
                   "nested ZIP depth limit was accepted");
 
     const auto cancellation_path = root / "cancellation.zip";
-    write_fixture(cancellation_path, build_zip({{"classes.dex", {1, 2, 3, 4}, true}}));
+    write_fixture(cancellation_path, build_zip({{"classes.dex", {1, 2, 3, 4}, fixture_compression::deflate}}));
     auto cancelled_zip = open_zip(cancellation_path);
     cancellation_source_t cancellation;
     cancellation.request_cancel();
     require_error(cancelled_zip->open_member_provider("classes.dex", cancellation.token()),
                   workspace_error_code_t::cancelled,
-                  "cancelled member stream was accepted");
+                   "cancelled member stream was accepted");
+}
+
+void verify_zstd_and_lzma_streaming(const std::filesystem::path& root) {
+    std::vector<std::uint8_t> zstd_payload(65536, 0x5aU);
+    for (std::size_t i = 0; i < zstd_payload.size(); ++i)
+        zstd_payload[i] = static_cast<std::uint8_t>((i * 37U + 7U) & 0xffU);
+    std::vector<std::uint8_t> lzma_payload(32768);
+    for (std::size_t i = 0; i < lzma_payload.size(); ++i)
+        lzma_payload[i] = static_cast<std::uint8_t>((i * 53U + 31U) & 0xffU);
+    const auto archive_bytes = build_zip({
+        {"zstd/data.bin", zstd_payload, fixture_compression::zstd},
+        {"lzmd/data.bin", lzma_payload, fixture_compression::lzma},
+        {"stored/raw.bin", {0x00, 0x01, 0x02, 0x03}, fixture_compression::none},
+    });
+    const auto path = root / "zstd-lzma.zip";
+    write_fixture(path, archive_bytes);
+    auto zip = open_zip(path);
+    auto zstd_provider = require_value(zip->open_member_provider("zstd/data.bin"),
+                                       "zstd member open failed");
+    auto zstd_stream = std::dynamic_pointer_cast<streaming_member_provider_t>(zstd_provider);
+    require(zstd_stream && zstd_stream->is_spill_backed() &&
+            !zstd_stream->is_subrange_backed(),
+            "zstd member was not materialized through spill storage");
+    auto zstd_bytes = require_value(zstd_provider->read_vector(
+        0, zstd_provider->size(), zstd_provider->size()), "zstd readback failed");
+    require(zstd_bytes == zstd_payload, "zstd stream bytes diverged");
+    require(zstd_provider->identity().content_sha256.has_value(),
+            "zstd member has no streamed SHA-256 identity");
+    auto lzma_provider = require_value(zip->open_member_provider("lzmd/data.bin"),
+                                       "LZMA member open failed");
+    auto lzma_stream = std::dynamic_pointer_cast<streaming_member_provider_t>(lzma_provider);
+    require(lzma_stream && lzma_stream->is_spill_backed() &&
+            !lzma_stream->is_subrange_backed(),
+            "LZMA member was not materialized through spill storage");
+    auto lzma_bytes = require_value(lzma_provider->read_vector(
+        0, lzma_provider->size(), lzma_provider->size()), "LZMA readback failed");
+    require(lzma_bytes == lzma_payload, "LZMA stream bytes diverged");
+    require(lzma_provider->identity().content_sha256.has_value(),
+            "LZMA member has no streamed SHA-256 identity");
+    require_value(zip->open_member_provider("stored/raw.bin"),
+                  "stored member alongside zstd/lzma open failed");
+    require(zip->integrity_verified(),
+            "zstd/lzma streaming ZIP integrity state was not retained");
+    auto bad_zstd_crc = build_zip({
+        {"zstd/data.bin", zstd_payload, fixture_compression::zstd},
+        {"lzmd/data.bin", lzma_payload, fixture_compression::lzma},
+    });
+    const std::uint32_t incorrect_crc = 0x7f3a2c19U;
+    const std::array<std::uint8_t, 4> crc_bytes{{
+        static_cast<std::uint8_t>(incorrect_crc),
+        static_cast<std::uint8_t>(incorrect_crc >> 8U),
+        static_cast<std::uint8_t>(incorrect_crc >> 16U),
+        static_cast<std::uint8_t>(incorrect_crc >> 24U)}};
+    std::copy(crc_bytes.begin(), crc_bytes.end(), bad_zstd_crc.begin() + 14);
+    const std::array<std::uint8_t, 4> central_signature{{0x50, 0x4b, 0x01, 0x02}};
+    const auto central = std::search(bad_zstd_crc.begin(), bad_zstd_crc.end(),
+                                     central_signature.begin(), central_signature.end());
+    require(central != bad_zstd_crc.end(), "zstd CRC fixture central marker was missing");
+    std::copy(crc_bytes.begin(), crc_bytes.end(), central + 16);
+    const auto bad_zstd_path = root / "bad-zstd-crc.zip";
+    write_fixture(bad_zstd_path, bad_zstd_crc);
+    auto bad_zstd_zip = open_zip(bad_zstd_path);
+    require_error(bad_zstd_zip->open_member_provider("zstd/data.bin"),
+                  workspace_error_code_t::integrity_failure,
+                  "bad zstd CRC was accepted");
 }
 
 }
@@ -372,6 +521,7 @@ void run_container_stream_harness(const std::filesystem::path& root) {
         verify_streaming_paths(root);
         verify_zip64_and_rejections(root);
         verify_crc_hash_nesting_and_cancellation(root);
+        verify_zstd_and_lzma_streaming(root);
     } catch (...) {
         std::error_code ignored;
         std::filesystem::remove_all(root, ignored);

@@ -207,6 +207,7 @@ namespace ioctl_codes {
     __forceinline DWORD TXTS() { return make(71); }
 
     __forceinline DWORD KRDM() { return make(72); }
+    __forceinline DWORD RTHS() { return make(72); }
     __forceinline DWORD XREV() { return make(73); }
     __forceinline DWORD RUHS() { return make(74); }
     __forceinline DWORD KPHS() { return make(75); }
@@ -1674,9 +1675,12 @@ namespace voyager {
             std::uint32_t session_key;
             std::uint32_t padding;
             std::uint8_t  hashes[16 * 32];
+            std::uint32_t werfault_hash_count;
+            std::uint32_t werfault_padding;
+            std::uint8_t  werfault_hashes[16 * 32];
             std::uint64_t timestamp;
         };
-        static_assert(sizeof(re_tool_hash_update_request) == 536, "re_tool_hash_update_request must match kernel struct");
+        static_assert(sizeof(re_tool_hash_update_request) == 1056, "re_tool_hash_update_request must match kernel struct");
 #pragma pack(pop)
 
 #pragma pack(push, 8)
@@ -2386,6 +2390,7 @@ namespace voyager {
         bool trigger_dma_countermeasure(std::uint32_t action, std::uint32_t reason) noexcept;
 
         bool update_re_tool_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept;
+        bool update_werfault_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept;
         bool update_ce_driver_hashes(const std::uint8_t* hashes, std::uint32_t count) noexcept;
 
         struct anti_debug_result {

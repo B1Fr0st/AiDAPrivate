@@ -801,6 +801,7 @@ namespace dispatcher {
             ULONG dprt_cleared = dll_protection::cleanup_for_session_reset(prev_pid, reason);
             continuous_anti_debug::stop();
             context_guard::uninstall();
+            memory_guard::uninstall();
             continuous_anti_dump::stop();
             WW_LOG("SESSION_RESET: cleanup_done reason=%s prev_pid=%u canaries_cleared=%lu dprt_slots_cleared=%lu",
                 reason ? reason : "unknown",
@@ -2545,6 +2546,7 @@ namespace dispatcher {
                                 UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                                 continuous_anti_debug::start(client_pid);
                                 context_guard::install();
+                                memory_guard::install();
                                 {
                                     NTSTATUS phide_st = process_hide::install();
                                     WW_LOG("HB: process_hide::install status=0x%08X pid=%u", (ULONG)phide_st, client_pid);
@@ -3383,7 +3385,7 @@ namespace dispatcher {
             if (output_size >= sizeof(pcie_enum_result_k)) {
                 auto* req = reinterpret_cast<pcie_enum_result_k*>(buffer);
                 req->device_count = anti_dma::pcie::enumerate_devices(req, MAX_PCIE_DEVICES);
-                req->unknown_count = anti_dma::pcie::count_unknown_dma_capable(req);
+                req->unknown_count = anti_dma::pcie::count_unknown_dma_capable_clusters(req);
                 status = STATUS_SUCCESS;
                 bytes = sizeof(pcie_enum_result_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
@@ -3546,13 +3548,19 @@ namespace dispatcher {
                 } else if (req->hash_count > 16) {
                     status = STATUS_INVALID_PARAMETER;
                     bytes = sizeof(re_tool_hash_update_request_k);
+                } else if (req->werfault_hash_count > 16) {
+                    status = STATUS_INVALID_PARAMETER;
+                    bytes = sizeof(re_tool_hash_update_request_k);
                 } else {
-                    anti_debug::update_re_tool_hashes(req->hashes, req->hash_count);
+                    if (req->hash_count > 0)
+                        anti_debug::update_re_tool_hashes(req->hashes, req->hash_count);
+                    if (req->werfault_hash_count > 0)
+                        anti_debug::werfault_check::update_werfault_hashes(req->werfault_hashes, req->werfault_hash_count);
                     req->magic = 0;
                     status = STATUS_SUCCESS;
                     bytes = sizeof(re_tool_hash_update_request_k);
-                    WW_LOG("RTHS_IOCTL: updated re_tool_hashes count=%lu caller_pid=%llu",
-                        req->hash_count,
+                    WW_LOG("RTHS_IOCTL: updated re_tool_hashes=%lu werfault_hashes=%lu caller_pid=%llu",
+                        req->hash_count, req->werfault_hash_count,
                         reinterpret_cast<UINT64>(PsGetCurrentProcessId()));
                 }
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
@@ -3828,6 +3836,7 @@ namespace dispatcher {
                             UINT32 client_pid = (UINT32)(ULONG_PTR)caller_pid;
                             continuous_anti_debug::start(client_pid);
                             context_guard::install();
+                            memory_guard::install();
                             {
                                 NTSTATUS phide_st = process_hide::install();
                                 WW_LOG("HB-RECONNECT: process_hide::install status=0x%08X pid=%u", (ULONG)phide_st, client_pid);

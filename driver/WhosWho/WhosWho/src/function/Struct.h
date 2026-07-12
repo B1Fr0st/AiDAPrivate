@@ -1223,8 +1223,9 @@ typedef struct _PTE_PROTECTION_ENTRY {
     UINT64 current_pte;
     UINT32 page_size;
     UINT32 active;
+    UINT64 last_restore_timestamp;
 } pte_protection_entry_k, *p_pte_protection_entry_k;
-static_assert(sizeof(pte_protection_entry_k) == 40, "pte_protection_entry_k must be 40 bytes");
+static_assert(sizeof(pte_protection_entry_k) == 48, "pte_protection_entry_k must be 48 bytes");
 
 
 #define MAX_PTE_PROTECTION_ENTRIES 64
@@ -1282,10 +1283,13 @@ typedef struct _RE_TOOL_HASH_UPDATE_REQUEST_K {
     UINT32 session_key;
     UINT32 padding;
     UINT8  hashes[16 * 32];
+    UINT32 werfault_hash_count;
+    UINT32 werfault_padding;
+    UINT8  werfault_hashes[16 * 32];
     UINT64 timestamp;
 } re_tool_hash_update_request_k, *p_re_tool_hash_update_request_k;
 #pragma pack(pop)
-static_assert(sizeof(re_tool_hash_update_request_k) == (16 + 512 + 8), "re_tool_hash_update_request_k size mismatch");
+static_assert(sizeof(re_tool_hash_update_request_k) == (16 + 512 + 8 + 512 + 8), "re_tool_hash_update_request_k size mismatch");
 
 #pragma pack(push, 8)
 typedef struct _CE_DRIVER_HASH_UPDATE_REQUEST_K {

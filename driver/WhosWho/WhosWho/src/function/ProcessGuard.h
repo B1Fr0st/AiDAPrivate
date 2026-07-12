@@ -182,6 +182,121 @@ namespace process_guard {
         return false;
     }
 
+    struct validated_kernel_module_t {
+        PVOID base;
+        SIZE_T size;
+    };
+
+    inline validated_kernel_module_t g_validated_kernel_modules[64] = {};
+    inline volatile LONG g_validated_kernel_module_count = 0;
+    inline KSPIN_LOCK g_validated_kernel_modules_lock = {};
+    inline volatile LONG g_validated_kernel_modules_lock_init = 0;
+    inline volatile LONG g_kernel_module_load_callback_registered = 0;
+
+    __forceinline void ensure_validated_kernel_modules_lock() {
+        if (_InterlockedCompareExchange(&g_validated_kernel_modules_lock_init, 1, 0) == 0) {
+            KeInitializeSpinLock(&g_validated_kernel_modules_lock);
+        }
+    }
+
+    __forceinline void add_validated_kernel_module(PVOID base, SIZE_T size) {
+        if (!base || size == 0)
+            return;
+        ensure_validated_kernel_modules_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_validated_kernel_modules_lock, &old_irql);
+        LONG count = g_validated_kernel_module_count;
+        if (count > 64) count = 64;
+        for (LONG i = 0; i < count; ++i) {
+            if (g_validated_kernel_modules[i].base == base) {
+                g_validated_kernel_modules[i].size = size;
+                KeReleaseSpinLock(&g_validated_kernel_modules_lock, old_irql);
+                return;
+            }
+        }
+        if (count < 64) {
+            g_validated_kernel_modules[count].base = base;
+            g_validated_kernel_modules[count].size = size;
+            _InterlockedIncrement(&g_validated_kernel_module_count);
+        }
+        KeReleaseSpinLock(&g_validated_kernel_modules_lock, old_irql);
+    }
+
+    __forceinline bool is_image_base_in_validated_array(PVOID image_base) {
+        if (!image_base)
+            return false;
+        ensure_validated_kernel_modules_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_validated_kernel_modules_lock, &old_irql);
+        bool found = false;
+        LONG count = g_validated_kernel_module_count;
+        if (count > 64) count = 64;
+        UINT64 addr = reinterpret_cast<UINT64>(image_base);
+        for (LONG i = 0; i < count; ++i) {
+            UINT64 base = reinterpret_cast<UINT64>(g_validated_kernel_modules[i].base);
+            SIZE_T size = g_validated_kernel_modules[i].size;
+            if (base != 0 && size != 0 && addr >= base && addr < base + size) {
+                found = true;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_validated_kernel_modules_lock, old_irql);
+        return found;
+    }
+
+    __forceinline bool validate_kernel_module_signature(PVOID image_base) {
+        if (image_base && is_image_base_in_validated_array(image_base))
+            return true;
+
+        LONG count = _InterlockedCompareExchange(&g_validated_kernel_module_count, 0, 0);
+        if (count == 0 || !image_base)
+            return true;
+
+        return false;
+    }
+
+    inline VOID NTAPI kernel_module_load_callback(
+        PUNICODE_STRING FullImageName,
+        HANDLE ProcessId,
+        PIMAGE_INFO ImageInfo)
+    {
+        if (!ImageInfo || !ImageInfo->SystemModeImage)
+            return;
+
+        if (!FullImageName || !FullImageName->Buffer || FullImageName->Length == 0)
+            return;
+
+        char filename[16] = {};
+        __try {
+            const WCHAR* src = FullImageName->Buffer;
+            USHORT chars = FullImageName->Length / sizeof(WCHAR);
+            int name_start = 0;
+            for (USHORT i = 0; i < chars; ++i) {
+                if (src[i] == L'\\' || src[i] == L'/')
+                    name_start = static_cast<int>(i + 1);
+            }
+            int fi = 0;
+            for (int i = name_start; i < static_cast<int>(chars) && fi < 15; ++i) {
+                WCHAR wc = src[i];
+                if (wc >= 32 && wc < 127)
+                    filename[fi++] = static_cast<char>(wc);
+            }
+            filename[fi] = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return;
+        }
+
+        if (!filename[0])
+            return;
+
+        if (!is_allowlisted_kernel_module(filename))
+            return;
+
+        add_validated_kernel_module(ImageInfo->ImageBase, (SIZE_T)ImageInfo->ImageSize);
+        WW_LOG("kernel_module_load_callback: validated kernel module '%s' base=%p size=%llu",
+            filename, ImageInfo->ImageBase, (UINT64)ImageInfo->ImageSize);
+    }
+
     __forceinline bool is_system_process_allowlisted_kernel_caller(HANDLE caller_pid) {
         if (reinterpret_cast<UINT64>(caller_pid) != 4)
             return false;
@@ -829,6 +944,37 @@ namespace process_guard {
             targeting_confirmed ? 1 : 0, (UINT32)family_mask, pid, (UINT32)st);
     }
 
+    inline void auto_unhide_on_detection_clear() {
+        if (_InterlockedCompareExchange(&g_process_hidden, 0, 0) == 0)
+            return;
+
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return;
+
+        bool targeting_confirmed = _InterlockedCompareExchange(
+            &targeting_latch::g_targeting_confirmed, 0, 0) != 0;
+
+        if (targeting_confirmed)
+            return;
+
+        UINT32 family_mask = sentinel_bridge::evidence_accumulator::active_family_mask();
+
+        if (family_mask != 0)
+            return;
+
+        HANDLE client_pid = caller_validation::g_registered_client_pid;
+        if (!client_pid)
+            return;
+
+        UINT32 pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(client_pid));
+        if (pid == 0 || pid == 4)
+            return;
+
+        NTSTATUS st = unhide_process_from_list(pid);
+        WW_LOG("auto_unhide_on_detection_clear: targeting_confirmed=0 family_mask=0x%08X pid=%u status=0x%08X",
+            (UINT32)family_mask, pid, (UINT32)st);
+    }
+
     inline OB_PREOP_CALLBACK_STATUS NTAPI process_pre_callback(
         PVOID,
         POB_PRE_OPERATION_INFORMATION Info)
@@ -908,7 +1054,26 @@ namespace process_guard {
             if (!kh_allowlisted && is_system_process_allowlisted_kernel_caller(kh_caller))
                 kh_allowlisted = true;
 
-            if (kh_allowlisted) {
+            bool kh_is_kernel_caller = (reinterpret_cast<UINT64>(kh_caller) == 4);
+
+            PVOID kh_caller_image_base = nullptr;
+            if (kh_allowlisted && kh_is_kernel_caller && _PsGetProcessSectionBaseAddress) {
+                PEPROCESS kh_caller_proc = nullptr;
+                if (NT_SUCCESS(PsLookupProcessByProcessId(kh_caller, &kh_caller_proc)) && kh_caller_proc) {
+                    __try {
+                        kh_caller_image_base = _PsGetProcessSectionBaseAddress(kh_caller_proc);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        kh_caller_image_base = nullptr;
+                    }
+                    _ObfDereferenceObject(kh_caller_proc);
+                }
+            }
+
+            bool kh_signature_validated = true;
+            if (kh_is_kernel_caller)
+                kh_signature_validated = validate_kernel_module_signature(kh_caller_image_base);
+
+            if (kh_allowlisted && kh_signature_validated) {
                 constexpr ACCESS_MASK KH_ALLOWLIST_STRIP =
                     PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION;
 
@@ -934,8 +1099,9 @@ namespace process_guard {
                         sentinel_bridge::RE_REASON_FOREIGN_HND,
                         (UINT64)(ULONG_PTR)kh_caller,
                         (UINT64)kh_requested, 0, 0);
-                    WW_LOG("[THREAT] kernel_handle_strip caller=%llu requested=0x%08X stripped=0x%08X allowlisted=0",
-                        (UINT64)(ULONG_PTR)kh_caller, (UINT32)kh_requested, (UINT32)KH_FULL_STRIP);
+                    WW_LOG("[THREAT] kernel_handle_strip caller=%llu requested=0x%08X stripped=0x%08X allowlisted=%d signature_validated=%d",
+                        (UINT64)(ULONG_PTR)kh_caller, (UINT32)kh_requested, (UINT32)KH_FULL_STRIP,
+                        kh_allowlisted ? 1 : 0, kh_signature_validated ? 1 : 0);
                 }
             }
             return OB_PREOP_SUCCESS;
@@ -1013,6 +1179,10 @@ namespace process_guard {
         constexpr ACCESS_MASK BASE_HOSTILE =
             PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
             PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION | PROCESS_SET_INFORMATION;
+        constexpr ACCESS_MASK HOSTILE_PROC =
+            PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
+            PROCESS_SUSPEND_RESUME | PROCESS_VM_OPERATION |
+            PROCESS_SET_INFORMATION | PROCESS_DUP_HANDLE;
         constexpr ACCESS_MASK STRIP_READ = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION;
 
         constexpr ACCESS_MASK TIER_ALLOW = 0x0400;
@@ -1553,6 +1723,8 @@ namespace process_guard {
                     continuous_anti_debug::stop_if_target(dying_pid);
                 if (registered_client)
                     context_guard::uninstall();
+                if (registered_client)
+                    memory_guard::uninstall();
                 if (admp_target)
                     continuous_anti_dump::stop_if_target(dying_pid);
                 if (antidump_protected)
@@ -1759,11 +1931,25 @@ namespace process_guard {
             }
         }
 
+        if (NT_SUCCESS(status) && _PsSetLoadImageNotifyRoutine) {
+            NTSTATUS kml_st = _PsSetLoadImageNotifyRoutine(kernel_module_load_callback);
+            if (NT_SUCCESS(kml_st)) {
+                _InterlockedExchange(&g_kernel_module_load_callback_registered, 1);
+                WW_LOG("process_guard::init: PsSetLoadImageNotifyRoutine OK for kernel module validation");
+            } else {
+                WW_LOG("process_guard::init: PsSetLoadImageNotifyRoutine FAILED 0x%08lx for kernel module validation", kml_st);
+            }
+        }
+
         return status;
     }
 
     inline void cleanup()
     {
+        if (_InterlockedCompareExchange(&g_kernel_module_load_callback_registered, 0, 1) == 1) {
+            if (_PsRemoveLoadImageNotifyRoutine)
+                _PsRemoveLoadImageNotifyRoutine(kernel_module_load_callback);
+        }
         if (_InterlockedCompareExchange(&g_thread_notify_registered, 0, 1) == 1) {
             PsRemoveCreateThreadNotifyRoutine(thread_create_notify);
         }
@@ -1789,3 +1975,9 @@ namespace anti_debug { namespace process_guard_fwd {
         process_guard::register_re_tool_pid(pid);
     }
 }}
+
+namespace anti_debug { namespace continuous_anti_debug { namespace process_guard_fwd {
+    __forceinline void auto_unhide_on_detection_clear() {
+        process_guard::auto_unhide_on_detection_clear();
+    }
+}}}

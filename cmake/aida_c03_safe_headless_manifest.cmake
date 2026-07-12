@@ -340,6 +340,9 @@ function(aida_c03_register_safe_headless_targets)
             "${zydis_BINARY_DIR}/zycore"
         LINK_LIBRARIES Zydis bcrypt
     )
+    aida_c03_require_components(zydis Zydis)
+    aida_c03_require_components(zstd zstd_static)
+    aida_c03_require_components(liblzma_minimal liblzma)
     aida_c03_register_safe_headless_target(
         TARGET aida_c03_b07_container_stream_harness
         PACKAGE B07
@@ -357,7 +360,9 @@ function(aida_c03_register_safe_headless_targets)
             "${STANDALONE_ROOT}/../tests/c03"
             "${zlib_SOURCE_DIR}"
             "${zlib_BINARY_DIR}"
-        LINK_LIBRARIES zlibstatic bcrypt
+            "${zstd_SOURCE_DIR}/../lib"
+            "${xz_SOURCE_DIR}/src/liblzma/api"
+        LINK_LIBRARIES zlibstatic libzstd_static liblzma bcrypt
     )
     aida_c03_register_safe_headless_target(
         TARGET aida_c03_b13_metrics_contract_harness

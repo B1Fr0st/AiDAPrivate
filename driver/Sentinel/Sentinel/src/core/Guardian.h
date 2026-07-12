@@ -507,7 +507,8 @@ namespace guardian {
                     heartbeat::bridge_encrypt_cmd(dma_cmd, dma_param);
                     if (dma_cmd == heartbeat::BRIDGE_CMD_DMA_KEY_SCRUB ||
                         dma_cmd == heartbeat::BRIDGE_CMD_DMA_BSOD ||
-                        dma_cmd == heartbeat::BRIDGE_CMD_DMA_ATTACK_REPORT) {
+                        dma_cmd == heartbeat::BRIDGE_CMD_DMA_ATTACK_REPORT ||
+                        dma_cmd == heartbeat::BRIDGE_CMD_CANARY_FOREIGN_PT) {
 
                         SN_LOG("guardian::dpc: DMA bridge command cmd=0x%lx param=0x%lx cycle=%ld",
                             dma_cmd, dma_param, cycle);
@@ -518,7 +519,8 @@ namespace guardian {
                         wsk_transport::queue_dma_report(dma_cmd, dma_param);
                         dma_cmd_processed = TRUE;
 
-                        if (dma_cmd == heartbeat::BRIDGE_CMD_DMA_BSOD) {
+                        if (dma_cmd == heartbeat::BRIDGE_CMD_DMA_BSOD ||
+                            dma_cmd == heartbeat::BRIDGE_CMD_CANARY_FOREIGN_PT) {
                             SN_LOG("guardian::dpc: DMA_BSOD triggered cmd=0x%lx param=0x%lx - KeBugCheckEx NOW",
                                 dma_cmd, dma_param);
                             if (_KeBugCheckEx)

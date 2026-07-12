@@ -63,6 +63,7 @@
 #include "../runtime/loader_header_invariant.hpp"
 #include "../runtime/reason_ids.hpp"
 #include "dr_check.hpp"
+#include "../runtime/vbs_enforcement.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -1429,7 +1430,14 @@ inline bool check_dma_preflight()
 
     uint32_t unknown_clusters = pcie.unknown_count;
 
-    bool iommu_off = iommu.iommu_present && !iommu.vtd_enabled && !iommu.amd_vi_enabled;
+    bool hvci_active = hv_preflight::g_hvci_enabled || vbs_enforcement::hvci_active();
+
+    if (hvci_active)
+    {
+        webhook::write_log_critical("dma_preflight", "hvci_bypass_active iommu_off_check_skipped");
+    }
+
+    bool iommu_off = hvci_active ? false : (iommu.iommu_present && !iommu.vtd_enabled && !iommu.amd_vi_enabled);
     bool iommu_bypassed = iommu.iommu_present && iommu.remapping_bypassed;
 
     if (unknown_clusters >= 2)

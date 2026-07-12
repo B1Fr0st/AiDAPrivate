@@ -707,6 +707,31 @@ set(zlib_SOURCE_DIR "${DEPS_DIR}/zlib")
 set(zlib_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zlib")
 add_subdirectory("${zlib_SOURCE_DIR}" "${zlib_BINARY_DIR}")
 
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+set(zstd_SOURCE_DIR "${DEPS_DIR}/zstd-1.5.7/build/cmake")
+set(zstd_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zstd")
+add_subdirectory("${zstd_SOURCE_DIR}" "${zstd_BINARY_DIR}")
+
+set(BUILD_SHARED_LIBS_SAVED_XZ "${BUILD_SHARED_LIBS}")
+set(BUILD_SHARED_LIBS OFF)
+set(XZ_THREADS no CACHE STRING "" FORCE)
+set(XZ_NLS OFF CACHE BOOL "" FORCE)
+set(XZ_TOOL_XZ OFF CACHE BOOL "" FORCE)
+set(XZ_TOOL_XZDEC OFF CACHE BOOL "" FORCE)
+set(XZ_TOOL_LZMADEC OFF CACHE BOOL "" FORCE)
+set(XZ_TOOL_LZMAINFO OFF CACHE BOOL "" FORCE)
+set(XZ_DOC OFF CACHE BOOL "" FORCE)
+set(XZ_DOXYGEN OFF CACHE BOOL "" FORCE)
+set(xz_SOURCE_DIR "${DEPS_DIR}/xz-5.8.3")
+set(xz_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/xz")
+add_subdirectory("${xz_SOURCE_DIR}" "${xz_BINARY_DIR}")
+set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_XZ}")
+target_include_directories(liblzma PUBLIC "${xz_SOURCE_DIR}/src/liblzma/api")
+
 # zlib manages its own include dirs; expose them for our consumers via a convenience variable
 # but do NOT set PUBLIC includes on zlibstatic (causes CMP0070 errors with newer CMake)
 
@@ -2217,6 +2242,8 @@ if(WIN32)
             libdecomp_aida
             zlibstatic
             zlib
+            libzstd_static
+            liblzma
             brotlidec
             brotlienc
             brotlicommon
@@ -2280,6 +2307,8 @@ if(WIN32)
             libdecomp_aida
             freetype
             zlibstatic
+            libzstd_static
+            liblzma
             brotlidec
             brotlienc
             brotlicommon

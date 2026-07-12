@@ -852,6 +852,11 @@ namespace anti_dma_canary {
         }
 
         LONG64 batch_id = _InterlockedIncrement64(&g_scan_batch_id);
+
+        if ((batch_id & 1) == 0) {
+            anti_dma::pte_protect::verify_all_protections();
+        }
+
         ULONG batch_budget = READ_BUDGET_PER_BATCH;
 
         ULONG own_pid = registered_pid;
@@ -1098,6 +1103,22 @@ namespace anti_dma_canary {
                         static_cast<UINT64>(hit_info.owner_pid),
                         0
                     );
+
+                    UINT64 evidence_hash = __rdtsc() ^ hit_info.canary_pa ^ ((UINT64)hit_pid << 32);
+                    ULONG attack_cmd = BRIDGE_CMD_DMA_ATTACK_REPORT;
+                    ULONG attack_param = 0x04;
+                    sentinel_bridge::bridge_encrypt_cmd(attack_cmd, attack_param);
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                        static_cast<LONG>(attack_cmd));
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                        static_cast<LONG>(attack_param));
+                    WW_LOG("dma_canary::foreign_pt_countermeasure id=%lld pid=%lu canary_pa=0x%llx evidence_hash=0x%llx",
+                        batch_id, hit_pid,
+                        static_cast<unsigned long long>(hit_info.canary_pa),
+                        static_cast<unsigned long long>(evidence_hash));
+                    anti_dma::countermeasure::scrub_keys_then_bsod(0x04, hit_info.canary_pa, hit_pid, evidence_hash);
                 }
             } else {
                 WW_LOG("dma_canary::bridge_not_armed id=%lld pid=%lu strikes=%ld threshold=%lu",
