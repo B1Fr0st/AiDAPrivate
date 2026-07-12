@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -75,7 +76,7 @@ std::string path_text(const std::filesystem::path& path)
 
 json load_manifest(const std::filesystem::path& root)
 {
-    std::ifstream stream(root / k_fixture_manifest, std::ios::binary);
+    std::ifstream stream(root / std::string(k_fixture_manifest), std::ios::binary);
     require(stream.is_open(), "managed CLI fixture manifest is unavailable");
     json manifest;
     stream >> manifest;
@@ -93,8 +94,8 @@ bool coverage_contains(const json& fixture, std::string_view value)
 
 void validate_manifest(const json& manifest)
 {
-    require(manifest.is_object() && manifest.value("schema", "") == "aida.c03.managed-cli-fixtures" &&
-        manifest.value("schema_version", 0) == 1 && manifest.value("assembly", "") == "ManagedCliFixtures",
+    require(manifest.is_object() && manifest.value("schema", std::string{}) == "aida.c03.managed-cli-fixtures" &&
+        manifest.value("schema_version", 0) == 1 && manifest.value("assembly", std::string{}) == "ManagedCliFixtures",
         "managed CLI fixture manifest header is invalid");
     const auto& methods = manifest.at("methods");
     require(methods.is_array() && methods.size() >= 6, "managed CLI fixture method inventory is incomplete");
@@ -118,8 +119,9 @@ void validate_manifest(const json& manifest)
     require(malformed.is_array() && malformed.size() >= 3, "managed CLI malformed fixture inventory is incomplete");
     std::set<std::string> mutations;
     for (const auto& value : malformed) {
-        require(value.is_object() && value.value("expected_code", "") == "malformed_metadata" &&
-            value.value("expected_key", "") == "managed_cli.malformed_metadata" && !value.value("source_contract", "").empty(),
+        require(value.is_object() && value.value("expected_code", std::string{}) == "malformed_metadata" &&
+            value.value("expected_key", std::string{}) == "managed_cli.malformed_metadata" &&
+            !value.value("source_contract", std::string{}).empty(),
             "managed CLI malformed fixture contract is invalid");
         mutations.insert(value.at("mutation").get<std::string>());
     }
