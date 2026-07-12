@@ -82,7 +82,8 @@ bool valid_query(const semantic_refinement_query_t& query,
 std::uint32_t profile_ir_limit(const decompiler_profile_budget_t& profile) noexcept
 {
     constexpr auto adapter_limit = static_cast<std::uint64_t>(4096);
-    return static_cast<std::uint32_t>(std::min(profile.max_hir_nodes, adapter_limit));
+    return static_cast<std::uint32_t>(
+        std::min(std::min(profile.max_hir_nodes, profile.max_ast_nodes), adapter_limit));
 }
 
 bool query_sequence_valid(const std::vector<semantic_refinement_query_t>& queries,

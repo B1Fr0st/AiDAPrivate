@@ -6,7 +6,6 @@
 #include "spill_provider.hpp"
 
 #include <algorithm>
-#include <array>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -270,16 +269,17 @@ workspace_result_t<std::shared_ptr<spill_sink_t>> spill_sink_t::create(
         DeleteFileW(path_result.value().c_str());
         return workspace_result_t<std::shared_ptr<spill_sink_t>>::failure(std::move(error));
     }
+    unique_handle_t file(raw_file);
     auto path_utf8 = wide_to_utf8(path_result.value());
     if (!path_utf8) {
-        CloseHandle(raw_file);
         DeleteFileW(path_result.value().c_str());
         return workspace_result_t<std::shared_ptr<spill_sink_t>>::failure(path_utf8.error());
     }
+    std::wstring path = path_result.take_value();
     try {
         auto storage = std::make_shared<spill_storage_t>();
-        storage->writer.reset(raw_file);
-        storage->path = path_result.take_value();
+        storage->writer = std::move(file);
+        storage->path = path;
         storage->path_utf8 = path_utf8.take_value();
         storage->source_label = std::move(source_label);
         storage->options = options;
@@ -289,8 +289,8 @@ workspace_result_t<std::shared_ptr<spill_sink_t>> spill_sink_t::create(
         return workspace_result_t<std::shared_ptr<spill_sink_t>>::success(
             std::shared_ptr<spill_sink_t>(new spill_sink_t(std::move(state))));
     } catch (const std::bad_alloc&) {
-        CloseHandle(raw_file);
-        DeleteFileW(path_result.value().c_str());
+        file.reset();
+        DeleteFileW(path.c_str());
         return workspace_result_t<std::shared_ptr<spill_sink_t>>::failure(
             make_workspace_error(workspace_error_code_t::provider_unavailable,
                                  "spill provider allocation failed", "spill_create"));

@@ -517,7 +517,7 @@ void verify_mid_call_cancellation_and_deadline()
     canceller.join();
     require(cancelled.status == semantic_refinement_status_t::cancelled,
         "mid-call cancellation completed semantic work");
-    require(cancellation_adapter->observed_stop.load(std::memory_order_acquire),
+    require(wait_until_true(cancellation_adapter->observed_stop, std::chrono::milliseconds(100)),
         "mid-call cancellation did not reach the adapter token");
     require(contains_diagnostic(cancelled.diagnostics, "semantic_refiner.cancelled"),
         "mid-call cancellation diagnostic missing");
@@ -529,7 +529,7 @@ void verify_mid_call_cancellation_and_deadline()
     const auto deadline = deadline_refiner.refine(value, deadline_source.token());
     require(deadline.status == semantic_refinement_status_t::cancelled,
         "caller deadline completed semantic work");
-    require(deadline_adapter->observed_stop.load(std::memory_order_acquire),
+    require(wait_until_true(deadline_adapter->observed_stop, std::chrono::milliseconds(100)),
         "caller deadline did not reach the adapter token");
     require(contains_diagnostic(deadline.diagnostics, "semantic_refiner.cancelled.deadline"),
         "caller deadline diagnostic missing");

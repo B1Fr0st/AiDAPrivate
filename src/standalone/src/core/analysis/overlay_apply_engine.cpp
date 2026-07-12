@@ -27,7 +27,7 @@ bool has_nonzero_bytes(const std::array<std::uint8_t, 32>& value) noexcept
 bool valid_architecture(overlay_architecture_v9_t architecture) noexcept
 {
     return architecture >= overlay_architecture_v9_t::x86 &&
-        architecture <= overlay_architecture_v9_t::riscv;
+        architecture <= overlay_architecture_v9_t::dalvik;
 }
 
 bool valid_utf8(const std::string& value) noexcept
@@ -459,7 +459,7 @@ std::optional<overlay_target_identity_v9_t> parse_target_json_v9(const json& val
         const auto kind = value["kind"].get<unsigned>();
         const auto reserved = value["reserved"].get<unsigned>();
         if (address_width > (std::numeric_limits<std::uint8_t>::max)() ||
-            architecture > static_cast<unsigned>(overlay_architecture_v9_t::riscv) ||
+            architecture > static_cast<unsigned>(overlay_architecture_v9_t::dalvik) ||
             kind > static_cast<unsigned>(overlay_target_kind_v9_t::live_image) ||
             reserved > (std::numeric_limits<std::uint8_t>::max)())
             return std::nullopt;

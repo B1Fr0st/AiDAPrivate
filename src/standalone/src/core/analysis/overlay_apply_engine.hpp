@@ -28,7 +28,9 @@ enum class overlay_architecture_v9_t : std::uint8_t {
     arm64 = 4,
     mips = 5,
     ppc = 6,
-    riscv = 7
+    riscv = 7,
+    jvm = 8,
+    dalvik = 9
 };
 
 enum class overlay_operation_kind_v9_t : std::uint8_t {
