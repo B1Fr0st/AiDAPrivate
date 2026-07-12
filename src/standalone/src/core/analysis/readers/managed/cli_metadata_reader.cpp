@@ -1129,9 +1129,8 @@ private:
                         clause.handler_length = data_[clause_offset + 13];
                         clause.class_token_or_filter_offset = read_u32_le(data_.data() + clause_offset + 16) & 0x00FFFFFFu;
                     }
-                    clause.is_finally = (clause.flags & 0x00u) == 0x00u && clause.class_token_or_filter_offset == 0;
                     clause.is_filter = clause.flags == 0x01u;
-                    clause.is_catch_all = clause.flags == 0x02u;
+                    clause.is_catch_all = (clause.flags == 0x00u && clause.class_token_or_filter_offset == 0u);
                     if (clause.flags == 0x00u && clause.class_token_or_filter_offset != 0) {
                         clause.catch_type_token = clause.class_token_or_filter_offset;
                         const auto type_def_row = clause.class_token_or_filter_offset & 0x00FFFFFFu;
@@ -1296,10 +1295,8 @@ build_cli_artifact(const cli_metadata_t& metadata,
         artifact.module_identity.assembly_name = metadata.module.name;
     }
     artifact.module_identity.entry_point_token = metadata.entry_point_token;
-    if (metadata.pe_image) {
-        artifact.module_identity.runtime_major = metadata.pe_image->machine();
-        artifact.module_identity.runtime_minor = 0;
-    }
+    artifact.module_identity.runtime_major = metadata.header.major_version;
+    artifact.module_identity.runtime_minor = metadata.header.minor_version;
     auto hash_result = provider.compute_content_sha256(cancel);
     if (hash_result)
         artifact.module_identity.artifact_hash = hash_result.value();

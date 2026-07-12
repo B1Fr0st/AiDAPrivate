@@ -129,6 +129,7 @@ struct block_view_t {
     const basic_block_record_t* record = nullptr;
     const instruction_record_t* terminal_instruction = nullptr;
     bool instructions_complete = false;
+    bool shared = false;
 };
 
 struct function_view_t {
@@ -237,11 +238,40 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
                         block_heap_order_t> selected;
     function_view_t view;
     view.function = function;
+    std::unordered_set<entity_id_t> membership_block_ids;
+    if (function->block_membership_count != 0) {
+        const auto first = static_cast<std::uint64_t>(function->first_block_membership);
+        const auto end = first + function->block_membership_count;
+        if (end > snapshot.function_block_memberships.size()) {
+            return workspace_result_t<function_view_t>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "function block-membership range is invalid",
+                "advanced_cfg.block_selection"));
+        }
+        membership_block_ids.reserve(function->block_membership_count);
+        for (std::uint64_t index = first; index < end; ++index) {
+            auto stopped = poller.poll("advanced_cfg.membership_selection");
+            if (!stopped)
+                return workspace_result_t<function_view_t>::failure(stopped.error());
+            const auto& membership =
+                snapshot.function_block_memberships[static_cast<std::size_t>(index)];
+            if (membership.function_id != function->id ||
+                membership.block_index >= snapshot.blocks.size() ||
+                snapshot.blocks[membership.block_index].id != membership.block_id ||
+                !membership_block_ids.insert(membership.block_id).second) {
+                return workspace_result_t<function_view_t>::failure(make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "function block membership is malformed or duplicated",
+                    "advanced_cfg.block_selection"));
+            }
+        }
+    }
     for (const auto& block : snapshot.blocks) {
         auto stopped = poller.poll("advanced_cfg.block_selection");
         if (!stopped)
             return workspace_result_t<function_view_t>::failure(stopped.error());
-        if (block.function_id != function->id)
+        if (block.function_id != function->id &&
+            membership_block_ids.find(block.id) == membership_block_ids.end())
             continue;
         ++view.input_block_count;
         if (selected.size() < static_cast<std::size_t>(budget.max_blocks)) {
@@ -261,6 +291,7 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
     while (!selected.empty()) {
         block_view_t block;
         block.record = selected.top();
+        block.shared = block.record->function_id != function->id;
         selected.pop();
         view.blocks.push_back(block);
     }
@@ -348,9 +379,22 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
         if (block.instruction_count <= remaining_instructions) {
             remaining_instructions -= block.instruction_count;
             selected_block.instructions_complete = true;
+            const auto first_instruction =
+                static_cast<std::size_t>(block.first_instruction);
+            const auto instruction_end =
+                first_instruction + block.instruction_count;
             selected_block.terminal_instruction =
-                &snapshot.instructions[static_cast<std::size_t>(block.first_instruction) +
-                                       block.instruction_count - 1];
+                &snapshot.instructions[instruction_end - 1];
+            for (std::size_t instruction = instruction_end;
+                 instruction > first_instruction; --instruction) {
+                const auto& candidate = snapshot.instructions[instruction - 1];
+                if ((candidate.flow_flags &
+                     (flow_branch | flow_call | flow_return |
+                      flow_interrupt | flow_terminal)) != 0) {
+                    selected_block.terminal_instruction = &candidate;
+                    break;
+                }
+            }
         } else {
             remaining_instructions = 0;
             view.instructions_truncated = true;
@@ -1322,12 +1366,12 @@ workspace_result_t<void> derive_thunks(const function_view_t& view,
     return workspace_result_t<void>::success();
 }
 
-workspace_result_t<void> derive_exception_regions(const analysis_workspace_t& workspace,
+workspace_result_t<void> derive_exception_regions(const analysis_snapshot_t& snapshot,
                                                    const function_view_t& view,
                                                    cfg_analysis_result_t& result,
                                                    evidence_writer_t& writer,
                                                    cfg_poller_t& poller) {
-    const auto image = workspace.image();
+    const auto& image = snapshot.image;
     if (image) {
         for (const auto& runtime : image->runtime_functions()) {
             auto stopped = poller.poll("advanced_cfg.exception_metadata");
@@ -1405,11 +1449,15 @@ workspace_result_t<void> derive_exception_regions(const analysis_workspace_t& wo
 
 }
 
+namespace {
+
 workspace_result_t<cfg_analysis_result_t>
-    analyze_advanced_cfg(const analysis_workspace_t& workspace,
-                         std::uint64_t function_rva,
-                         const advanced_cfg_budget_t& budget,
-                         const cancellation_token_t& cancel) {
+    analyze_advanced_cfg_snapshot_impl(const analysis_snapshot_t& snapshot,
+                                       std::uint64_t function_rva,
+                                       const advanced_cfg_budget_t& budget,
+                                       architecture_id_t fallback_architecture,
+                                       architecture_mode_t fallback_mode,
+                                       const cancellation_token_t& cancel) {
     auto valid_budget = validate_budget(budget);
     if (!valid_budget)
         return workspace_result_t<cfg_analysis_result_t>::failure(valid_budget.error());
@@ -1417,27 +1465,15 @@ workspace_result_t<cfg_analysis_result_t>
     auto stopped = poller.poll("advanced_cfg.start", true);
     if (!stopped)
         return workspace_result_t<cfg_analysis_result_t>::failure(stopped.error());
-    const auto snapshot = workspace.snapshot();
-    if (!snapshot) {
-        return workspace_result_t<cfg_analysis_result_t>::failure(make_workspace_error(
-            workspace_error_code_t::target_not_found,
-            "advanced CFG requires a published analysis snapshot", "advanced_cfg.start"));
-    }
-    if (!snapshot->baseline_complete) {
+    if (!snapshot.baseline_complete) {
         return workspace_result_t<cfg_analysis_result_t>::failure(make_workspace_error(
             workspace_error_code_t::decode_failure,
             "advanced CFG requires a complete baseline snapshot", "advanced_cfg.start"));
     }
-    if (snapshot->binary_id != workspace.identity().binary_id() ||
-        snapshot->load_profile_hash != workspace.identity().load_profile_hash()) {
-        return workspace_result_t<cfg_analysis_result_t>::failure(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "analysis snapshot identity does not match its workspace", "advanced_cfg.start"));
-    }
-    auto catalog = build_function_catalog(*snapshot, poller);
+    auto catalog = build_function_catalog(snapshot, poller);
     if (!catalog)
         return workspace_result_t<cfg_analysis_result_t>::failure(catalog.error());
-    auto view = extract_function_view(*snapshot, function_rva, budget, poller);
+    auto view = extract_function_view(snapshot, function_rva, budget, poller);
     if (!view)
         return workspace_result_t<cfg_analysis_result_t>::failure(view.error());
 
@@ -1448,17 +1484,17 @@ workspace_result_t<cfg_analysis_result_t>
     result.function_noreturn = view.value().function->noreturn;
     result.bounded = view.value().blocks_truncated || view.value().edges_truncated ||
                      view.value().instructions_truncated;
-    result.key.binary_id = snapshot->binary_id;
-    result.key.load_profile_hash = snapshot->load_profile_hash;
+    result.key.binary_id = snapshot.binary_id;
+    result.key.load_profile_hash = snapshot.load_profile_hash;
     result.key.function_address = view.value().function->start;
     result.key.architecture = view.value().function->start.architecture == architecture_id_t::unknown
-        ? workspace.identity().architecture() : view.value().function->start.architecture;
+        ? fallback_architecture : view.value().function->start.architecture;
     result.key.architecture_mode = view.value().function->start.mode == architecture_mode_t::unknown
-        ? workspace.identity().architecture_mode() : view.value().function->start.mode;
+        ? fallback_mode : view.value().function->start.mode;
     result.key.address_space = view.value().function->start.space;
-    result.key.generation = snapshot->generation;
-    result.key.analysis_revision = snapshot->analysis_revision;
-    result.key.overlay_revision = snapshot->overlay_revision;
+    result.key.generation = snapshot.generation;
+    result.key.analysis_revision = snapshot.analysis_revision;
+    result.key.overlay_revision = snapshot.overlay_revision;
     evidence_writer_t writer{result, budget};
     if (result.bounded) {
         advanced_cfg_conflict_t conflict;
@@ -1469,7 +1505,8 @@ workspace_result_t<cfg_analysis_result_t>
     for (const auto& block_view : view.value().blocks) {
         basic_block_fact_t block;
         block.id = block_view.record->id;
-        block.function_id = block_view.record->function_id;
+        block.function_id = view.value().function->id;
+        block.primary_function_id = block_view.record->function_id;
         block.start = block_view.record->start;
         block.end = block_view.record->end;
         block.instruction_count = block_view.record->instruction_count;
@@ -1477,11 +1514,12 @@ workspace_result_t<cfg_analysis_result_t>
         const auto* terminal = block_view.terminal_instruction;
         block.terminal = terminal != nullptr &&
             (terminal->flow_flags & (flow_return | flow_terminal | flow_interrupt)) != 0;
+        block.shared = block_view.shared;
         result.basic_blocks.push_back(std::move(block));
     }
     result.block_count = result.basic_blocks.size();
 
-    auto built_edges = build_cfg_edges(*snapshot, view.value(), catalog.value(), budget, result, writer, poller);
+    auto built_edges = build_cfg_edges(snapshot, view.value(), catalog.value(), budget, result, writer, poller);
     if (!built_edges)
         return workspace_result_t<cfg_analysis_result_t>::failure(built_edges.error());
     result.edge_count = result.cfg_edges.size();
@@ -1546,10 +1584,10 @@ workspace_result_t<cfg_analysis_result_t>
             }
         }
     }
-    auto switches = derive_switches(*snapshot, view.value(), result, writer, poller);
+    auto switches = derive_switches(snapshot, view.value(), result, writer, poller);
     if (!switches)
         return workspace_result_t<cfg_analysis_result_t>::failure(switches.error());
-    auto calls = derive_calls(*snapshot, view.value(), catalog.value(), result, writer, poller);
+    auto calls = derive_calls(snapshot, view.value(), catalog.value(), result, writer, poller);
     if (!calls)
         return workspace_result_t<cfg_analysis_result_t>::failure(calls.error());
     auto effects = derive_tail_calls_and_noreturns(result, writer, poller);
@@ -1558,7 +1596,7 @@ workspace_result_t<cfg_analysis_result_t>
     auto thunks = derive_thunks(view.value(), result, result, writer, poller);
     if (!thunks)
         return workspace_result_t<cfg_analysis_result_t>::failure(thunks.error());
-    auto exceptions = derive_exception_regions(workspace, view.value(), result, writer, poller);
+    auto exceptions = derive_exception_regions(snapshot, view.value(), result, writer, poller);
     if (!exceptions)
         return workspace_result_t<cfg_analysis_result_t>::failure(exceptions.error());
     std::sort(result.conflicts.begin(), result.conflicts.end(), [](const advanced_cfg_conflict_t& lhs,
@@ -1574,11 +1612,57 @@ workspace_result_t<cfg_analysis_result_t>
     return workspace_result_t<cfg_analysis_result_t>::success(std::move(result));
 }
 
+}
+
+workspace_result_t<cfg_analysis_result_t>
+    analyze_advanced_cfg(const analysis_workspace_t& workspace,
+                         std::uint64_t function_rva,
+                         const advanced_cfg_budget_t& budget,
+                         const cancellation_token_t& cancel) {
+    const auto snapshot = workspace.snapshot();
+    if (!snapshot) {
+        return workspace_result_t<cfg_analysis_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::target_not_found,
+            "advanced CFG requires a published analysis snapshot", "advanced_cfg.start"));
+    }
+    if (snapshot->binary_id != workspace.identity().binary_id() ||
+        snapshot->load_profile_hash != workspace.identity().load_profile_hash()) {
+        return workspace_result_t<cfg_analysis_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "analysis snapshot identity does not match its workspace", "advanced_cfg.start"));
+    }
+    return analyze_advanced_cfg_snapshot_impl(*snapshot, function_rva, budget,
+        workspace.identity().architecture(), workspace.identity().architecture_mode(),
+        cancel);
+}
+
 workspace_result_t<cfg_analysis_result_t>
     analyze_advanced_cfg(const analysis_workspace_t& workspace,
                          std::uint64_t function_rva,
                          const cancellation_token_t& cancel) {
     return analyze_advanced_cfg(workspace, function_rva, advanced_cfg_budget_t{}, cancel);
+}
+
+workspace_result_t<cfg_analysis_result_t>
+    analyze_advanced_cfg(const analysis_snapshot_t& snapshot,
+                         std::uint64_t function_rva,
+                         const advanced_cfg_budget_t& budget,
+                         const cancellation_token_t& cancel) {
+    architecture_id_t architecture = architecture_id_t::unknown;
+    architecture_mode_t mode = architecture_mode_t::unknown;
+    if (snapshot.normalized_image) {
+        architecture = snapshot.normalized_image->architecture;
+        mode = snapshot.normalized_image->architecture_mode;
+    }
+    return analyze_advanced_cfg_snapshot_impl(snapshot, function_rva, budget,
+        architecture, mode, cancel);
+}
+
+workspace_result_t<cfg_analysis_result_t>
+    analyze_advanced_cfg(const analysis_snapshot_t& snapshot,
+                         std::uint64_t function_rva,
+                         const cancellation_token_t& cancel) {
+    return analyze_advanced_cfg(snapshot, function_rva, advanced_cfg_budget_t{}, cancel);
 }
 
 }

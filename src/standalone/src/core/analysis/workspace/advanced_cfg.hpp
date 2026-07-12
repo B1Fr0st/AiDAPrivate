@@ -69,6 +69,7 @@ struct advanced_cfg_conflict_t {
 struct basic_block_fact_t {
     entity_id_t id = 0;
     entity_id_t function_id = 0;
+    entity_id_t primary_function_id = 0;
     address_t start;
     address_t end;
     std::uint32_t instruction_count = 0;
@@ -76,6 +77,7 @@ struct basic_block_fact_t {
     bool reachable = false;
     bool terminal = false;
     bool noreturn_terminator = false;
+    bool shared = false;
 };
 
 struct cfg_edge_fact_t {
@@ -246,6 +248,17 @@ workspace_result_t<cfg_analysis_result_t>
 
 workspace_result_t<cfg_analysis_result_t>
     analyze_advanced_cfg(const analysis_workspace_t& workspace,
+                         std::uint64_t function_rva,
+                         const cancellation_token_t& cancel);
+
+workspace_result_t<cfg_analysis_result_t>
+    analyze_advanced_cfg(const analysis_snapshot_t& snapshot,
+                         std::uint64_t function_rva,
+                         const advanced_cfg_budget_t& budget,
+                         const cancellation_token_t& cancel);
+
+workspace_result_t<cfg_analysis_result_t>
+    analyze_advanced_cfg(const analysis_snapshot_t& snapshot,
                          std::uint64_t function_rva,
                          const cancellation_token_t& cancel);
 

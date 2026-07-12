@@ -203,8 +203,6 @@ build_dex_artifact(const dex_metadata_t& metadata,
     managed_artifact_t artifact;
     artifact.kind = managed_artifact_kind_t::dex;
     artifact.module_identity.kind = managed_artifact_kind_t::dex;
-    artifact.module_identity.assembly_name = metadata.image.managed_identity.version;
-    artifact.module_identity.module_name = metadata.image.managed_identity.version;
     artifact.module_identity.version = metadata.image.managed_identity.version;
     artifact.module_identity.artifact_offset = metadata.image.dex_offset;
     artifact.module_identity.artifact_size = metadata.image.header.file_size;
@@ -212,6 +210,18 @@ build_dex_artifact(const dex_metadata_t& metadata,
     auto hash_result = provider.compute_content_sha256(cancel);
     if (hash_result)
         artifact.module_identity.artifact_hash = hash_result.value();
+
+    std::string dex_name;
+    if (hash_result) {
+        const auto hex = hash_result.value().to_hex();
+        dex_name = "dex_" + hex.substr(0, 16);
+    } else if (!metadata.image.classes.empty()) {
+        dex_name = metadata.image.classes[0].class_descriptor;
+    } else {
+        dex_name = "dex_unknown";
+    }
+    artifact.module_identity.assembly_name = dex_name;
+    artifact.module_identity.module_name = dex_name;
 
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(metadata.image.classes.size()); ++i) {
         if (cancel.stop_requested())

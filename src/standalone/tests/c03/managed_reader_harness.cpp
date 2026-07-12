@@ -19,7 +19,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace aida::analysis::c03_test {
@@ -118,81 +117,68 @@ std::vector<std::uint8_t> make_minimal_classfile() {
     write_be32(bytes, offset, 0xCAFEBABE); offset += 4;
     write_be16(bytes, offset, 0); offset += 2;
     write_be16(bytes, offset, 52); offset += 2;
+    write_be16(bytes, offset, 15); offset += 2;
 
-    write_be16(bytes, offset, 14); offset += 2;
-
-    write_be16(bytes, offset, 1); offset += 2;
     bytes[offset++] = 1;
     write_be16(bytes, offset, 5); offset += 2;
     std::memcpy(&bytes[offset], "Hello", 5); offset += 5;
 
-    write_be16(bytes, offset, 2); offset += 2;
     bytes[offset++] = 7;
     write_be16(bytes, offset, 1); offset += 2;
 
-    write_be16(bytes, offset, 3); offset += 2;
-    bytes[offset++] = 7;
-    write_be16(bytes, offset, 1); offset += 2;
-
-    write_be16(bytes, offset, 4); offset += 2;
     bytes[offset++] = 1;
     write_be16(bytes, offset, 16); offset += 2;
     std::memcpy(&bytes[offset], "java/lang/Object", 16); offset += 16;
 
-    write_be16(bytes, offset, 5); offset += 2;
+    bytes[offset++] = 7;
+    write_be16(bytes, offset, 3); offset += 2;
+
     bytes[offset++] = 1;
     write_be16(bytes, offset, 6); offset += 2;
     std::memcpy(&bytes[offset], "<init>", 6); offset += 6;
 
-    write_be16(bytes, offset, 6); offset += 2;
     bytes[offset++] = 1;
     write_be16(bytes, offset, 3); offset += 2;
     std::memcpy(&bytes[offset], "()V", 3); offset += 3;
 
-    write_be16(bytes, offset, 7); offset += 2;
-    bytes[offset++] = 10;
-    write_be16(bytes, offset, 3); offset += 2;
-    write_be16(bytes, offset, 5); offset += 2;
-    write_be16(bytes, offset, 6); offset += 2;
-
-    write_be16(bytes, offset, 8); offset += 2;
     bytes[offset++] = 12;
     write_be16(bytes, offset, 5); offset += 2;
     write_be16(bytes, offset, 6); offset += 2;
 
-    write_be16(bytes, offset, 9); offset += 2;
+    bytes[offset++] = 10;
+    write_be16(bytes, offset, 4); offset += 2;
+    write_be16(bytes, offset, 7); offset += 2;
+
     bytes[offset++] = 1;
     write_be16(bytes, offset, 5); offset += 2;
     std::memcpy(&bytes[offset], "value", 5); offset += 5;
 
-    write_be16(bytes, offset, 10); offset += 2;
     bytes[offset++] = 1;
     write_be16(bytes, offset, 1); offset += 2;
     std::memcpy(&bytes[offset], "I", 1); offset += 1;
 
-    write_be16(bytes, offset, 11); offset += 2;
+    bytes[offset++] = 12;
+    write_be16(bytes, offset, 9); offset += 2;
+    write_be16(bytes, offset, 10); offset += 2;
+
     bytes[offset++] = 9;
     write_be16(bytes, offset, 2); offset += 2;
-    write_be16(bytes, offset, 8); offset += 2;
+    write_be16(bytes, offset, 11); offset += 2;
 
-    write_be16(bytes, offset, 12); offset += 2;
     bytes[offset++] = 1;
     write_be16(bytes, offset, 4); offset += 2;
     std::memcpy(&bytes[offset], "test", 4); offset += 4;
 
-    write_be16(bytes, offset, 13); offset += 2;
-    bytes[offset++] = 10;
-    write_be16(bytes, offset, 2); offset += 2;
-    write_be16(bytes, offset, 12); offset += 2;
-    write_be16(bytes, offset, 6); offset += 2;
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 4); offset += 2;
+    std::memcpy(&bytes[offset], "Code", 4); offset += 4;
 
     write_be16(bytes, offset, 0x0021); offset += 2;
     write_be16(bytes, offset, 2); offset += 2;
-    write_be16(bytes, offset, 3); offset += 2;
+    write_be16(bytes, offset, 4); offset += 2;
     write_be16(bytes, offset, 0); offset += 2;
     write_be16(bytes, offset, 1); offset += 2;
 
-    write_be16(bytes, offset, 1); offset += 2;
     write_be16(bytes, offset, 0x0019); offset += 2;
     write_be16(bytes, offset, 9); offset += 2;
     write_be16(bytes, offset, 10); offset += 2;
@@ -205,35 +191,143 @@ std::vector<std::uint8_t> make_minimal_classfile() {
     write_be16(bytes, offset, 6); offset += 2;
     write_be16(bytes, offset, 1); offset += 2;
 
-    write_be16(bytes, offset, 0x0011); offset += 2;
-    write_be16(bytes, offset, 12); offset += 2;
-    write_be16(bytes, offset, 6); offset += 2;
-    write_be16(bytes, offset, 2); offset += 2;
-
-    write_be16(bytes, offset, 0x0001); offset += 2;
-    write_be16(bytes, offset, 0x0011); offset += 2;
-    write_be16(bytes, offset, 12); offset += 2;
-    write_be16(bytes, offset, 6); offset += 2;
-    write_be16(bytes, offset, 2); offset += 2;
-    write_be32(bytes, offset, 17); offset += 4;
-
+    write_be16(bytes, offset, 14); offset += 2;
+    write_be32(bytes, offset, 25); offset += 4;
     write_be16(bytes, offset, 1); offset += 2;
     write_be16(bytes, offset, 0); offset += 2;
-    write_be16(bytes, offset, 1); offset += 2;
     write_be32(bytes, offset, 5); offset += 4;
     bytes[offset++] = 0x2A;
     bytes[offset++] = 0xB7;
     bytes[offset++] = 0x00;
-    bytes[offset++] = 0x07;
+    bytes[offset++] = 0x08;
     bytes[offset++] = 0xB1;
-    write_be16(bytes, offset, 0); offset += 2;
-    write_be16(bytes, offset, 1); offset += 2;
-
-    write_be16(bytes, offset, 13); offset += 2;
-    write_be32(bytes, offset, 2); offset += 4;
     write_be16(bytes, offset, 1); offset += 2;
     write_be16(bytes, offset, 0); offset += 2;
     write_be16(bytes, offset, 5); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+
+    write_be16(bytes, offset, 0x0001); offset += 2;
+    write_be16(bytes, offset, 13); offset += 2;
+    write_be16(bytes, offset, 6); offset += 2;
+    write_be16(bytes, offset, 1); offset += 2;
+
+    write_be16(bytes, offset, 14); offset += 2;
+    write_be32(bytes, offset, 13); offset += 4;
+    write_be16(bytes, offset, 1); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be32(bytes, offset, 1); offset += 4;
+    bytes[offset++] = 0xB1;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+
+    write_be16(bytes, offset, 0); offset += 2;
+
+    bytes.resize(offset);
+    return bytes;
+}
+
+std::vector<std::uint8_t> make_classfile_with_duplicate_methods() {
+    std::vector<std::uint8_t> bytes(256, 0);
+    std::size_t offset = 0;
+
+    write_be32(bytes, offset, 0xCAFEBABE); offset += 4;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be16(bytes, offset, 52); offset += 2;
+    write_be16(bytes, offset, 15); offset += 2;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 5); offset += 2;
+    std::memcpy(&bytes[offset], "Hello", 5); offset += 5;
+
+    bytes[offset++] = 7;
+    write_be16(bytes, offset, 1); offset += 2;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 16); offset += 2;
+    std::memcpy(&bytes[offset], "java/lang/Object", 16); offset += 16;
+
+    bytes[offset++] = 7;
+    write_be16(bytes, offset, 3); offset += 2;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 6); offset += 2;
+    std::memcpy(&bytes[offset], "<init>", 6); offset += 6;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 3); offset += 2;
+    std::memcpy(&bytes[offset], "()V", 3); offset += 3;
+
+    bytes[offset++] = 12;
+    write_be16(bytes, offset, 5); offset += 2;
+    write_be16(bytes, offset, 6); offset += 2;
+
+    bytes[offset++] = 10;
+    write_be16(bytes, offset, 4); offset += 2;
+    write_be16(bytes, offset, 7); offset += 2;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 5); offset += 2;
+    std::memcpy(&bytes[offset], "value", 5); offset += 5;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 1); offset += 2;
+    std::memcpy(&bytes[offset], "I", 1); offset += 1;
+
+    bytes[offset++] = 12;
+    write_be16(bytes, offset, 9); offset += 2;
+    write_be16(bytes, offset, 10); offset += 2;
+
+    bytes[offset++] = 9;
+    write_be16(bytes, offset, 2); offset += 2;
+    write_be16(bytes, offset, 11); offset += 2;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 4); offset += 2;
+    std::memcpy(&bytes[offset], "test", 4); offset += 4;
+
+    bytes[offset++] = 1;
+    write_be16(bytes, offset, 4); offset += 2;
+    std::memcpy(&bytes[offset], "Code", 4); offset += 4;
+
+    write_be16(bytes, offset, 0x0021); offset += 2;
+    write_be16(bytes, offset, 2); offset += 2;
+    write_be16(bytes, offset, 4); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+
+    write_be16(bytes, offset, 2); offset += 2;
+
+    write_be16(bytes, offset, 0x0001); offset += 2;
+    write_be16(bytes, offset, 5); offset += 2;
+    write_be16(bytes, offset, 6); offset += 2;
+    write_be16(bytes, offset, 1); offset += 2;
+
+    write_be16(bytes, offset, 14); offset += 2;
+    write_be32(bytes, offset, 13); offset += 4;
+    write_be16(bytes, offset, 1); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be32(bytes, offset, 1); offset += 4;
+    bytes[offset++] = 0xB1;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+
+    write_be16(bytes, offset, 0x0001); offset += 2;
+    write_be16(bytes, offset, 5); offset += 2;
+    write_be16(bytes, offset, 6); offset += 2;
+    write_be16(bytes, offset, 1); offset += 2;
+
+    write_be16(bytes, offset, 14); offset += 2;
+    write_be32(bytes, offset, 13); offset += 4;
+    write_be16(bytes, offset, 1); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be32(bytes, offset, 1); offset += 4;
+    bytes[offset++] = 0xB1;
+    write_be16(bytes, offset, 0); offset += 2;
+    write_be16(bytes, offset, 0); offset += 2;
+
+    write_be16(bytes, offset, 0); offset += 2;
 
     bytes.resize(offset);
     return bytes;
@@ -436,6 +530,14 @@ void test_classfile_reader() {
     }
     require(has_code_range, "classfile should have code ranges");
 
+    for (const auto& region : artifact.exception_regions) {
+        has_exception_region = true;
+        require(region.end_offset > region.start_offset,
+                "classfile exception region end should be after start");
+        require(region.is_catch_all, "classfile exception region should be catch-all");
+    }
+    require(has_exception_region, "classfile should have at least one exception region");
+
     std::cout << "  [classfile] Building JVM decompiler entity identity..." << std::endl;
     auto jvm_identity = mr::build_jvm_entity_identity(artifact, 0);
     require(jvm_identity.class_internal_name == "Hello",
@@ -634,53 +736,27 @@ void test_malformed_index_handling() {
 void test_duplicate_identity_detection() {
     std::cout << "  [duplicate] Testing duplicate identity detection..." << std::endl;
 
-    mr::managed_artifact_t artifact;
-    artifact.kind = mr::managed_artifact_kind_t::java_classfile;
+    auto classfile_bytes = make_classfile_with_duplicate_methods();
+    temp_fixture_t fixture(classfile_bytes, ".class");
+    auto provider = fixture.open_provider();
 
-    mr::managed_method_identity_t method1;
-    method1.declaring_type_name = "Test";
-    method1.method_name = "doSomething";
-    method1.method_signature = "()V";
-    method1.method_index = 0;
-    artifact.methods.push_back(method1);
+    auto artifact = require_value(
+        mr::read_classfile(*provider), "read_classfile should succeed for duplicate-method fixture");
 
-    mr::managed_method_identity_t method2;
-    method2.declaring_type_name = "Test";
-    method2.method_name = "doSomething";
-    method2.method_signature = "()V";
-    method2.method_index = 1;
-    artifact.methods.push_back(method2);
+    require(!artifact.duplicate_identities.empty(),
+            "reader should detect duplicate method identities");
 
-    std::unordered_set<std::string> seen;
-    bool found_dup = false;
-    for (const auto& m : artifact.methods) {
-        const auto key = m.declaring_type_name + "." + m.method_name + m.method_signature;
-        if (!seen.insert(key).second) {
-            found_dup = true;
+    bool found_method_dup = false;
+    for (const auto& dup : artifact.duplicate_identities) {
+        if (dup.description.find("Duplicate JVM method identity") != std::string::npos) {
+            found_method_dup = true;
+            require(!dup.identity_key.empty(),
+                    "duplicate method identity key should not be empty");
             break;
         }
     }
-    require(found_dup, "duplicate method identity should be detected");
-
-    mr::managed_type_identity_t type1;
-    type1.fully_qualified_name = "Test.Duplicate";
-    type1.metadata_token = 0x02000001;
-    artifact.types.push_back(std::move(type1));
-
-    mr::managed_type_identity_t type2;
-    type2.fully_qualified_name = "Test.Duplicate";
-    type2.metadata_token = 0x02000002;
-    artifact.types.push_back(std::move(type2));
-
-    std::unordered_set<std::string> seen_types;
-    bool found_type_dup = false;
-    for (const auto& t : artifact.types) {
-        if (!seen_types.insert(t.fully_qualified_name).second) {
-            found_type_dup = true;
-            break;
-        }
-    }
-    require(found_type_dup, "duplicate type identity should be detected");
+    require(found_method_dup,
+            "reader should populate duplicate_identities with duplicate method identity");
 
     std::cout << "  [duplicate] PASS" << std::endl;
 }
