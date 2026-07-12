@@ -269,6 +269,12 @@ live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
             }
 
             const auto wall_now = live_request_budget_t::clock_t::now();
+            if (wall_now >= context.wall_deadline) {
+                call_cancellation.request_stop();
+                return live_snapshot_result_t<value_t>::failure(
+                    make_live_snapshot_error(live_snapshot_error_code_t::deadline_exceeded,
+                                             phase));
+            }
             const auto delay = (std::min)(context.wall_deadline - wall_now,
                                           adapter_wait_quantum());
             std::unique_lock<std::mutex> lock(state->mutex);
