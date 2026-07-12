@@ -1260,3 +1260,36 @@ namespace secure_comm {
         _InterlockedExchange(&g_comm_initialized, 0);
     }
 }
+
+namespace handshake_auth {
+    inline volatile LONG g_handshake_verified = 0;
+    inline volatile UINT8 g_session_hmac_key[32] = {};
+    inline volatile LONG64 g_handshake_counter = 0;
+    inline volatile UINT8 g_expected_hmac[32] = {};
+    inline volatile LONG g_ioctl_hmac_fail_count = 0;
+
+    __forceinline void set_verified(const UINT8* challenge, SIZE_T challenge_len) {
+        const UINT8 hs_label[] = { 'a','i','d','a','-','h','s','-','s','e','s','s','i','o','n' };
+        UINT8 derived_key[32];
+        kernel_crypto::sw_hkdf_sha256(
+            nullptr, 0,
+            challenge, static_cast<ULONG>(challenge_len),
+            hs_label, sizeof(hs_label),
+            derived_key, sizeof(derived_key));
+        for (ULONG i = 0; i < 32; ++i)
+            g_session_hmac_key[i] = derived_key[i];
+        RtlSecureZeroMemory(derived_key, sizeof(derived_key));
+        _InterlockedExchange64(&g_handshake_counter, 0);
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_handshake_verified, 1);
+    }
+
+    __forceinline void reset() {
+        _InterlockedExchange(&g_handshake_verified, 0);
+        _InterlockedExchange64(&g_handshake_counter, 0);
+        _InterlockedExchange(&g_ioctl_hmac_fail_count, 0);
+        RtlSecureZeroMemory(const_cast<UINT8*>(static_cast<const volatile UINT8*>(g_session_hmac_key)), 32);
+        RtlSecureZeroMemory(const_cast<UINT8*>(static_cast<const volatile UINT8*>(g_expected_hmac)), 32);
+        KeMemoryBarrier();
+    }
+}

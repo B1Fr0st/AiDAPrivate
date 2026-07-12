@@ -215,6 +215,7 @@ namespace ioctl_codes {
 
     __forceinline DWORD HSHK() { return make(78); }
     __forceinline DWORD HRES() { return make(79); }
+    __forceinline DWORD WMRK() { return make(80); }
     __forceinline DWORD CEDH() { return make(81); }
 
     __forceinline DWORD HWID() {
@@ -318,7 +319,7 @@ namespace voyager {
             if (encoded < base)
                 return false;
             const std::uint32_t candidate = encoded - base;
-            if (candidate > 79u)
+            if (candidate > 80u)
                 return false;
             offset = candidate;
             return true;
@@ -1752,6 +1753,17 @@ namespace voyager {
         };
         static_assert(sizeof(callback_scan_query) == 8, "callback_scan_query must match kernel struct");
 
+#pragma pack(push, 1)
+        struct watermark_verify_request {
+            std::uint8_t  expected_watermark[16];
+            std::uint32_t watermark_rva;
+            std::uint32_t pad;
+            std::uint8_t  actual_watermark[16];
+            std::uint8_t  verified;
+        };
+#pragma pack(pop)
+        static_assert(sizeof(watermark_verify_request) == 41, "watermark_verify_request must be 41 bytes");
+
 #pragma pack(pop)
     }
 
@@ -2423,6 +2435,9 @@ namespace voyager {
         bool kernel_read_prologue_hash(std::uint64_t va, std::uint32_t size, std::uint64_t& out_hash) noexcept;
         bool query_sentinel_dispatch_guard(std::uint8_t& out_hook_detected, std::uint64_t& out_hook_target) noexcept;
         bool query_sentinel_callback_scan(std::uint8_t& out_hostile_drivers, std::uint8_t& out_modified_callbacks) noexcept;
+
+        bool verify_watermark(const std::uint8_t expected[16], std::uint32_t watermark_rva,
+                              std::uint8_t actual_out[16], std::uint8_t& verified_out) noexcept;
 
         enum class debug_event_type_e : std::uint32_t {
             invalid         = 0,

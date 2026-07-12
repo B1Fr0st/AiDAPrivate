@@ -2005,6 +2005,8 @@ inline bool tm_verify_template(pe_file::pe_image_t& pe,
     uint32_t packed_off = packed_section_rva - sec->virtual_address;
 
     std::vector<uint32_t> site_starts;
+    uint32_t type2_rejected = 0;
+
     for (const auto& site : sites.sites) {
         uint32_t abs_off = packed_off + (site.rva - sec->virtual_address - packed_off);
         uint32_t site_size = static_cast<uint32_t>(site.encoding_a.size());
@@ -2020,18 +2022,98 @@ inline bool tm_verify_template(pe_file::pe_image_t& pe,
         }
         site_starts.push_back(abs_off);
 
-        if (site.type == 1) {
-            if (site.encoding_a.size() >= 2 &&
-                sec->data[abs_off] == site.encoding_a[0] &&
-                sec->data[abs_off + 1] == site.encoding_a[1]) {
-            } else {
-                char buf[128];
-                std::snprintf(buf, sizeof(buf),
-                              "NOP site at offset 0x%X encoding_a mismatch", abs_off);
-                detail_out = buf;
+        bool enc_a_ok = true;
+        for (size_t k = 0; k < site.encoding_a.size(); ++k) {
+            if (sec->data[abs_off + k] != site.encoding_a[k]) { enc_a_ok = false; break; }
+        }
+        if (!enc_a_ok) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "site at offset 0x%X type %u encoding_a mismatch", abs_off, site.type);
+            detail_out = buf;
+            return false;
+        }
+
+        if (site.type == 0) {
+            if (site.encoding_a.size() < 2 || site.encoding_b.size() < 2) {
+                detail_out = "branch watermark site encoding too short";
                 return false;
             }
+            if (site.encoding_a[0] != 0x75 || site.encoding_b[0] != 0x74) {
+                detail_out = "branch watermark site encoding pattern mismatch";
+                return false;
+            }
+        } else if (site.type == 1) {
+            if (site.encoding_a.size() < 2 || site.encoding_b.size() < 2) {
+                detail_out = "NOP watermark site encoding too short";
+                return false;
+            }
+            if (site.encoding_a[0] != 0x90 || site.encoding_a[1] != 0x90 ||
+                site.encoding_b[0] != 0x87 || site.encoding_b[1] != 0xC0) {
+                detail_out = "NOP watermark site encoding pattern mismatch";
+                return false;
+            }
+        } else if (site.type == 2) {
+            if (site.encoding_a.size() < 2 || site.encoding_b.size() < 2) {
+                detail_out = "reg_alloc watermark site encoding too short";
+                return false;
+            }
+            if (site.encoding_a[0] != 0x49 || site.encoding_a[1] != 0xBA ||
+                site.encoding_b[0] != 0x49 || site.encoding_b[1] != 0xBB) {
+                detail_out = "reg_alloc watermark site encoding pattern mismatch";
+                return false;
+            }
+
+            constexpr uint32_t kRegRefScanWindow = 32;
+            size_t scan_start = static_cast<size_t>(abs_off) + site_size;
+            size_t scan_end = (std::min)(scan_start + kRegRefScanWindow, sec->data.size());
+            bool r10_conflict = false;
+            bool r11_conflict = false;
+            for (size_t j = scan_start; j + 1 < scan_end; ++j) {
+                uint8_t b = sec->data[j];
+                if (b >= 0x40 && b <= 0x4F) {
+                    uint8_t next = sec->data[j + 1];
+                    bool rex_b = (b & 0x01) != 0;
+                    bool rex_r = (b & 0x04) != 0;
+                    if (rex_b) {
+                        if ((next & 0x07) == 0x02) { r10_conflict = true; }
+                        if ((next & 0x07) == 0x03) { r11_conflict = true; }
+                        if (next == 0xBA) { r10_conflict = true; }
+                        if (next == 0xBB) { r11_conflict = true; }
+                    }
+                    if (rex_r) {
+                        if ((next & 0x38) == 0x10) { r10_conflict = true; }
+                        if ((next & 0x38) == 0x18) { r11_conflict = true; }
+                    }
+                }
+            }
+            if (r10_conflict || r11_conflict) {
+                ++type2_rejected;
+            }
+        } else if (site.type == 3) {
+            if (site.encoding_a.size() < 4 || site.encoding_b.size() < 4) {
+                detail_out = "bb_order watermark site encoding too short";
+                return false;
+            }
+            if (site.encoding_a[0] != 0x00 || site.encoding_b[0] != 0x02) {
+                detail_out = "bb_order watermark site encoding pattern mismatch";
+                return false;
+            }
+        } else {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "unknown watermark site type %u", site.type);
+            detail_out = buf;
+            return false;
         }
+    }
+
+    if (type2_rejected > 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "watermark site register conflict: %u type 2 sites rejected",
+                      type2_rejected);
+        detail_out = buf;
+        return false;
     }
 
     auto read_u32 = [&](size_t abs_off) -> uint32_t {
@@ -2094,6 +2176,28 @@ inline bool tm_verify_template(pe_file::pe_image_t& pe,
         detail_out = "PE DOS signature invalid";
         return false;
     }
+
+    {
+        uint32_t e_lfanew_rich = static_cast<uint32_t>(pe.dos_header.e_lfanew);
+        if (e_lfanew_rich > sizeof(IMAGE_DOS_HEADER) &&
+            pe.raw_file.size() >= e_lfanew_rich) {
+            const uint8_t* dos_area = pe.raw_file.data();
+            size_t scan_end_rich = static_cast<size_t>(e_lfanew_rich) - 4;
+            for (size_t i = sizeof(IMAGE_DOS_HEADER); i <= scan_end_rich; ++i) {
+                uint32_t val = 0;
+                std::memcpy(&val, dos_area + i, 4);
+                if (val == 0x68636952) {
+                    detail_out = "Rich header not stripped from template";
+                    return false;
+                }
+            }
+        }
+        if (pe.has_rich_header) {
+            detail_out = "Rich header flag indicates Rich header present";
+            return false;
+        }
+    }
+
     if (pe.pe_signature != IMAGE_NT_SIGNATURE) {
         detail_out = "PE NT signature invalid";
         return false;

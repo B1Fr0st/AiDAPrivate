@@ -554,6 +554,22 @@ namespace mba {
                         "mba_verify_fail plain_neg_b idx=%d b=0x%016llX",
                         i, (unsigned long long)b);
             }
+            if (mba_not_plain(a) != (~s_mba_test_vectors[i].a))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_not_a idx=%d a=0x%016llX",
+                        i, (unsigned long long)a);
+            }
+            if (mba_not_plain(b) != (~s_mba_test_vectors[i].b))
+            {
+                ++fail_count;
+                if (fail_count <= 4)
+                    webhook::write_log_critical_fmt("metamorphic",
+                        "mba_verify_fail plain_not_b idx=%d b=0x%016llX",
+                        i, (unsigned long long)b);
+            }
         }
 
         for (int e = 0; e < 42; ++e)
@@ -604,6 +620,26 @@ namespace mba {
                             e, i, (unsigned long long)ent,
                             (unsigned long long)a, (unsigned long long)b);
                 }
+                if (keyed_not(a, ent) != (~s_mba_test_vectors[i].a))
+                {
+                    ++fail_count;
+                    if (fail_count <= 4)
+                        webhook::write_log_critical_fmt("metamorphic",
+                            "mba_verify_fail keyed_not ent_idx=%d vec_idx=%d "
+                            "ent=0x%016llX a=0x%016llX",
+                            e, i, (unsigned long long)ent,
+                            (unsigned long long)a);
+                }
+                if (keyed_neg(a, ent) != (0ULL - s_mba_test_vectors[i].a))
+                {
+                    ++fail_count;
+                    if (fail_count <= 4)
+                        webhook::write_log_critical_fmt("metamorphic",
+                            "mba_verify_fail keyed_neg ent_idx=%d vec_idx=%d "
+                            "ent=0x%016llX a=0x%016llX",
+                            e, i, (unsigned long long)ent,
+                            (unsigned long long)a);
+                }
             }
         }
 
@@ -611,7 +647,7 @@ namespace mba {
         {
             webhook::write_log_critical_fmt("metamorphic",
                 "mba_verify_complete failures=%u total_tests=%d",
-                fail_count, 12000 + 42 * 4000);
+                fail_count, 14000 + 42 * 6000);
         }
         else
         {

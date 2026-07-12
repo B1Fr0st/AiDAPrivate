@@ -886,10 +886,9 @@ inline bool check_unicorn_page_fault_behavior()
         volatile uint64_t val = *static_cast<volatile uint64_t*>(page);
         (void)val;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
-        exception_code = GetExceptionCode();
     }
 
     VirtualFree(page, 0, MEM_RELEASE);
@@ -932,10 +931,9 @@ inline bool check_unicorn_no_tlb()
         volatile uint64_t val = *ptr;
         (void)val;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
-        exception_code = GetExceptionCode();
     }
 
     VirtualProtect(page, page_size, PAGE_READWRITE, &old_prot);
@@ -974,10 +972,9 @@ inline bool check_unicorn_invlpg_no_ud()
     {
         fn();
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
-        exception_code = GetExceptionCode();
     }
 
     VirtualFree(code_pg, 0, MEM_RELEASE);
@@ -1014,10 +1011,9 @@ inline bool check_unicorn_wbinvd_no_ud()
     {
         fn();
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
-        exception_code = GetExceptionCode();
     }
 
     VirtualFree(code_pg, 0, MEM_RELEASE);
@@ -1060,10 +1056,9 @@ inline bool check_unicorn_vmx_unmodeled()
     {
         fn();
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
-        exception_code = GetExceptionCode();
     }
 
     VirtualFree(code_pg, 0, MEM_RELEASE);
@@ -1105,10 +1100,9 @@ inline bool check_unicorn_sgx_unmodeled()
     {
         fn();
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
+    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
-        exception_code = GetExceptionCode();
     }
 
     VirtualFree(code_pg, 0, MEM_RELEASE);
@@ -1248,6 +1242,10 @@ inline bool check_unicorn_rdpmc_zeros()
 
 inline bool check_unicorn_endbr_behavior()
 {
+    int regs[4] = {};
+    __cpuidex(regs, 7, 0);
+    if (!((regs[3] >> 20) & 1)) return false;
+
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
     DWORD page_size = si.dwPageSize ? si.dwPageSize : 0x1000;
@@ -1372,6 +1370,7 @@ inline void run_diagnostic_probes()
         {"rdpid", check_unicorn_rdpid_zeros},
         {"rdpmc", check_unicorn_rdpmc_zeros},
         {"endbr", check_unicorn_endbr_behavior},
+        {"rdseed", check_unicorn_rdseed_deterministic},
     };
 
     for (const auto& p : probes)

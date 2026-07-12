@@ -952,7 +952,7 @@ namespace anti_minidump
     {
         HMODULE dbghelp = GetModuleHandleW(WOBFSTR(L"dbghelp.dll").c_str());
         if (!dbghelp)
-            dbghelp = LoadLibraryW(L"dbghelp.dll");
+            dbghelp = LoadLibraryW(WOBFSTR(L"dbghelp.dll").c_str());
         if (!dbghelp) return false;
 
         auto* target = reinterpret_cast<uint8_t*>(
@@ -1037,7 +1037,7 @@ namespace anti_minidump
     {
         HMODULE dbghelp = GetModuleHandleW(WOBFSTR(L"dbghelp.dll").c_str());
         if (!dbghelp)
-            dbghelp = LoadLibraryW(L"dbghelp.dll");
+            dbghelp = LoadLibraryW(WOBFSTR(L"dbghelp.dll").c_str());
         if (!dbghelp) return false;
 
         auto* target = reinterpret_cast<uint8_t*>(
@@ -1568,6 +1568,33 @@ namespace working_set {
         std::vector<region_spec_t> regions;
 
         regions.push_back({"main_module", base, 4096});
+
+        {
+            std::lock_guard<std::mutex> hk(anti_tamper::heap_encrypt::heap_mtx());
+            auto& allocs = anti_tamper::heap_encrypt::heap_allocations();
+            for (size_t i = 0; i < allocs.size(); ++i) {
+                auto* hdr = allocs[i];
+                if (!hdr || hdr->magic != anti_tamper::heap_encrypt::SHEAP_MAGIC) continue;
+                SIZE_T lock_sz = hdr->alloc_size;
+                if (lock_sz == 0) lock_sz = 4096;
+                regions.push_back({"secure_heap", hdr, lock_sz});
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> rk(detail::region_mutex());
+            auto& v = detail::encrypted_regions();
+            if (!v.empty() && v.data()) {
+                SIZE_T data_sz = v.size() * sizeof(detail::region_t);
+                regions.push_back({"encrypted_regions_vec", v.data(), data_sz});
+            }
+        }
+
+        regions.push_back({"xor_key", &detail::xor_key(), sizeof(uint64_t)});
+        regions.push_back({"active_flag", &detail::active(), sizeof(std::atomic<bool>)});
+        regions.push_back({"monitors_flag", &detail::monitors_running(), sizeof(std::atomic<bool>)});
+        regions.push_back({"veh_handle", &read_intercept::veh_handle, sizeof(PVOID)});
+        regions.push_back({"trap_page_state", &read_intercept::trap_page_base, 64});
 
         for (auto& spec : regions) {
             if (!spec.base || spec.size == 0) continue;

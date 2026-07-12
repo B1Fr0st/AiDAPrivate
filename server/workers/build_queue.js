@@ -56,6 +56,14 @@ function templatePath(version) {
     return path.join(TEMPLATE_DIR, templateFilename(version));
 }
 
+function templateMetadataFilename(version) {
+    return `template_metadata_v${version}.json`;
+}
+
+function templateMetadataPath(version) {
+    return path.join(TEMPLATE_DIR, templateMetadataFilename(version));
+}
+
 function parsePeSections(buf) {
     if (!Buffer.isBuffer(buf) || buf.length < 0x100) return [];
     if (buf.readUInt16LE(0) !== 0x5A4D) return [];
@@ -172,14 +180,13 @@ function runPersonalizer(buildRow) {
     return new Promise((resolve) => {
         const tmplPath = templatePath(buildRow.template_version);
         const outPath = outputPath(buildRow.build_id);
+        const metadataPath = templateMetadataPath(buildRow.template_version);
         const watermarkHex = String(buildRow.watermark_id || '').replace(/-/g, '');
-        const customerId = String(buildRow.license_key || '');
         const args = [
-            '--template', tmplPath,
-            '--watermark', watermarkHex,
-            '--customer-id', customerId,
-            '--template-version', String(buildRow.template_version),
+            '--input', tmplPath,
             '--output', outPath,
+            '--template-metadata', metadataPath,
+            '--customer-uuid', watermarkHex,
         ];
         const env = {
             AIDA_MASTER_KEY_B64: String(process.env.AIDA_BUILD_MASTER_KEY_B64 || process.env.SERVER_MASTER_KEY_B64 || ''),
@@ -357,6 +364,13 @@ async function processBuild(buildRow) {
         return;
     }
 
+    const metadataPath = templateMetadataPath(buildRow.template_version);
+    if (!fs.existsSync(metadataPath)) {
+        logError(`build ${buildId}: template metadata not found at ${metadataPath}`);
+        await markBuildFailed(buildId, 'template_metadata_not_found');
+        return;
+    }
+
     const result = await runPersonalizer(buildRow);
 
     if (!result.ok) {
@@ -506,7 +520,7 @@ async function cleanupOldTemplates() {
                 if (row.file_path && fs.existsSync(row.file_path)) {
                     fs.unlinkSync(row.file_path);
                 }
-                const metadataPath = path.join(TEMPLATE_DIR, `template_metadata_v${row.version}.json`);
+                const metadataPath = templateMetadataPath(row.version);
                 if (fs.existsSync(metadataPath)) {
                     fs.unlinkSync(metadataPath);
                 }
@@ -594,6 +608,8 @@ module.exports = {
         outputPath,
         templateFilename,
         templatePath,
+        templateMetadataFilename,
+        templateMetadataPath,
         nowSec,
         PACKED_MAGIC,
         BUILD_TIMEOUT_SECONDS,

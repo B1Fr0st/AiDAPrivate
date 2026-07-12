@@ -510,6 +510,7 @@ namespace anti_dma_canary {
         if (ok) {
             LONG64 now = static_cast<LONG64>(KeQueryInterruptTime());
             _InterlockedCompareExchange64(&g_first_canary_time, now, 0);
+            _InterlockedExchange(&anti_dma::g_dma_tier2_bsod_armed, 1);
             refresh_canary_slot(slot);
             WW_LOG("dma_canary::register_ok slot=%lu owner=%lu va=0x%llx size=0x%llx pa=0x%llx page_pa=0x%llx count=%lu",
                 slot,
@@ -836,7 +837,16 @@ namespace anti_dma_canary {
                         snapshot[ci].pa, r1, r2,
                         g_canary_poisons[slot].poison_signature,
                         g_canary_poisons[slot].original_value);
-                    anti_dma::countermeasure::trigger_bsod(0x01, snapshot[ci].pa, 0, evidence_hash);
+                    ULONG attack_cmd = BRIDGE_CMD_DMA_ATTACK_REPORT;
+                    ULONG attack_param = 0x01;
+                    sentinel_bridge::bridge_encrypt_cmd(attack_cmd, attack_param);
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                        static_cast<LONG>(attack_cmd));
+                    _InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                        static_cast<LONG>(attack_param));
+                    anti_dma::countermeasure::scrub_keys_then_bsod(0x01, snapshot[ci].pa, 0, evidence_hash);
                 }
             }
         }
@@ -951,7 +961,16 @@ namespace anti_dma_canary {
                 _InterlockedExchangeAdd(reinterpret_cast<volatile LONG*>(&g_canary_accessed_hits), accessed_hits);
                 UINT64 evidence_hash = __rdtsc() ^ snapshot[0].pa;
                 WW_LOG("dma_canary::accessed_bit_dma_attack detected_hits=%lu", accessed_hits);
-                anti_dma::countermeasure::trigger_bsod(0x03, snapshot[0].pa, 0, evidence_hash);
+                ULONG attack_cmd = BRIDGE_CMD_DMA_ATTACK_REPORT;
+                ULONG attack_param = 0x03;
+                sentinel_bridge::bridge_encrypt_cmd(attack_cmd, attack_param);
+                _InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                    static_cast<LONG>(attack_cmd));
+                _InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                    static_cast<LONG>(attack_param));
+                anti_dma::countermeasure::scrub_keys_then_bsod(0x03, snapshot[0].pa, 0, evidence_hash);
             }
         }
 

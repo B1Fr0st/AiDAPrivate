@@ -486,6 +486,7 @@ router.post('/verify', async (req, res) => {
         }
 
         let buildValidationResult = null;
+        let serverExpectedWatermark = '';
 
         if (typeof clientTimestamp !== 'undefined' && clientTimestamp !== null) {
             const tsValue = typeof clientTimestamp === 'number'
@@ -536,6 +537,10 @@ router.post('/verify', async (req, res) => {
                 verified: true,
                 retired: buildInfo.retired,
             };
+
+            if (typeof buildInfo.watermark === 'string' && buildInfo.watermark.length > 0) {
+                serverExpectedWatermark = buildInfo.watermark;
+            }
 
             let watermarkVerified = false;
             let watermarkMatched = true;
@@ -649,6 +654,8 @@ router.post('/verify', async (req, res) => {
             dma_attack_flagged: dmaStateResult !== null && (dmaStateResult.canaryHits > 0 || dmaStateResult.eptAnomaly || dmaStateResult.pcieUnknown >= 2) && !dmaStateResult.tier2BsodArmed,
             build_validation: buildValidationResult,
             watermark_verified: typeof watermarkState === 'string' && watermarkState.length > 0,
+            expected_watermark: serverExpectedWatermark,
+            watermark_rva: 0,
             driver_proof_verified: typeof driverProof === 'string' && driverProof.length > 0,
         };
 

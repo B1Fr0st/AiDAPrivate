@@ -100,6 +100,11 @@ namespace functions {
 
             case ADMP_OP_REGISTER_MODULE_RANGE:
             {
+                auto* mod_req = reinterpret_cast<p_admp_module_range_req>(request);
+                UINT32 count = mod_req->range_count;
+                if (count > 16) count = 16;
+                process_guard::register_module_ranges(
+                    mod_req->bases, mod_req->sizes, count);
                 request->result = 1;
                 status = STATUS_SUCCESS;
             }

@@ -336,6 +336,7 @@ async function buildRequest(req) {
             build_id: buildId,
             estimated_seconds: estimatedSeconds,
             template_version: templateVersion,
+            watermark_id: wmResult.watermarkId,
         },
     };
 }

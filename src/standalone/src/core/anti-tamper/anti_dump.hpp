@@ -515,6 +515,117 @@ namespace pe_header
         return true;
     }
 
+    inline uint8_t g_encrypted_header_backup[1024] = {};
+    inline uint8_t g_header_backup_iv[12] = {};
+    inline uint8_t g_header_backup_tag[16] = {};
+    inline uint32_t g_header_backup_size = 0;
+    inline uint64_t g_header_backup_key_material = 0;
+    inline std::atomic<bool> g_header_backup_saved{false};
+
+    inline bool save_header_backup()
+    {
+        if (g_header_backup_saved.load(std::memory_order_acquire)) return true;
+
+        HMODULE mod = GetModuleHandleW(nullptr);
+        if (!mod) {
+            webhook::write_log("anti_dump", "save_header_backup: no module");
+            return false;
+        }
+
+        auto* base = reinterpret_cast<uint8_t*>(mod);
+        auto* nt = safe_resolve_self_nt(base, "save_header_backup");
+        if (!nt) return false;
+
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        uint32_t nt_offset = static_cast<uint32_t>(dos->e_lfanew);
+
+        uint8_t header_data[968] = {};
+        uint32_t offset = 0;
+
+        constexpr uint32_t dos_hdr_size = sizeof(IMAGE_DOS_HEADER);
+        memcpy(header_data + offset, base, dos_hdr_size);
+        offset += dos_hdr_size;
+
+        constexpr uint32_t nt_hdr_size = sizeof(IMAGE_NT_HEADERS64);
+        if (nt_offset == 0 || nt_offset + nt_hdr_size > 0x10000u) {
+            webhook::write_log("anti_dump", "save_header_backup: nt_offset out of range");
+            return false;
+        }
+        memcpy(header_data + offset, base + nt_offset, nt_hdr_size);
+        offset += nt_hdr_size;
+
+        WORD num_sections = nt->FileHeader.NumberOfSections;
+        if (num_sections > 16) num_sections = 16;
+        uint32_t sections_size = num_sections * static_cast<uint32_t>(sizeof(IMAGE_SECTION_HEADER));
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        memcpy(header_data + offset, sec, sections_size);
+        offset += sections_size;
+
+        uint64_t tsc1 = __rdtsc();
+        uint64_t pid_val = static_cast<uint64_t>(GetCurrentProcessId());
+        uint64_t mod_val = reinterpret_cast<uint64_t>(base);
+        uint64_t tsc2 = __rdtsc();
+        g_header_backup_key_material = tsc1 ^ (tsc2 << 16) ^ (pid_val << 32) ^ (mod_val & 0xFFFFFFFFFFFFULL);
+
+        detail::fill_secure_random(g_header_backup_iv, 12);
+
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        BCRYPT_KEY_HANDLE key = nullptr;
+        bool ok = false;
+
+        if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) == 0) {
+            BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+                reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+                sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+
+            uint8_t key_bytes[32] = {};
+            memcpy(key_bytes, &g_header_backup_key_material, sizeof(g_header_backup_key_material));
+            memcpy(key_bytes + 8, &g_header_backup_key_material, sizeof(g_header_backup_key_material));
+            memcpy(key_bytes + 16, g_header_backup_iv, 8);
+            memcpy(key_bytes + 24, &pid_val, sizeof(pid_val));
+
+            if (BCryptGenerateSymmetricKey(alg, &key, key_bytes, sizeof(key_bytes),
+                key_bytes, sizeof(key_bytes), 0) == 0) {
+                BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth_info{};
+                BCRYPT_INIT_AUTH_MODE_INFO(auth_info);
+                auth_info.pbNonce = g_header_backup_iv;
+                auth_info.cbNonce = 12;
+                auth_info.pbTag = g_header_backup_tag;
+                auth_info.cbTag = 16;
+
+                ULONG cipher_len = 0;
+                NTSTATUS status = BCryptEncrypt(key,
+                    header_data, offset,
+                    &auth_info, nullptr, 0,
+                    g_encrypted_header_backup, sizeof(g_encrypted_header_backup),
+                    &cipher_len, 0);
+
+                if (status == 0 && cipher_len > 0) {
+                    g_header_backup_size = cipher_len;
+                    g_header_backup_saved.store(true, std::memory_order_release);
+                    ok = true;
+                }
+
+                BCryptDestroyKey(key);
+            }
+            BCryptCloseAlgorithmProvider(alg, 0);
+        }
+
+        SecureZeroMemory(header_data, sizeof(header_data));
+
+        {
+            char buf[160];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                "save_header_backup: ok=%d dos=%u nt=%u sec=%u total=%u cipher=%u",
+                ok ? 1 : 0,
+                dos_hdr_size, nt_hdr_size, sections_size,
+                offset, g_header_backup_size);
+            webhook::write_log("anti_dump", buf);
+        }
+
+        return ok;
+    }
+
     struct header_verify_result_t {
         bool dos_zeroed;
         bool nt_zeroed;
@@ -2476,6 +2587,9 @@ inline bool initialize()
 
     detail::xor_key() = detail::generate_session_key();
     webhook::write_log("anti_dump", "xor_key_ok");
+
+    pe_header::save_header_backup();
+    webhook::write_log("anti_dump", "save_header_backup_ok");
 
     dump_poison::corrupt_debug_directory();
     webhook::write_log("anti_dump", "corrupt_debug_dir_ok");

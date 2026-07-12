@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <nmmintrin.h>
 
 #include "webhook.hpp"
 #include "state.hpp"
@@ -66,6 +67,8 @@ struct hook_report_t
 };
 
 namespace detail {
+
+    constexpr size_t k_prologue_bytes = 32;
 
     inline BCRYPT_ALG_HANDLE get_sha256_alg()
     {
@@ -294,6 +297,78 @@ namespace detail {
         }
     }
 
+    __declspec(noinline) inline bool safe_copy_bytes(void* dst, const void* src, size_t len)
+    {
+        __try {
+            memcpy(dst, src, len);
+            return true;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    __declspec(noinline) inline bool safe_write_bytes(void* dst, const void* src, size_t len)
+    {
+        __try {
+            memcpy(dst, src, len);
+            return true;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    __declspec(noinline) inline bool safe_hook_destination(uint64_t func_va, uint64_t* out_dest)
+    {
+        *out_dest = 0;
+        const auto* bytes = reinterpret_cast<const uint8_t*>(func_va);
+        __try
+        {
+            if (bytes[0] == 0xFF && bytes[1] == 0x25)
+            {
+                int32_t disp = *reinterpret_cast<const int32_t*>(bytes + 2);
+                uint64_t slot = func_va + 6 + disp;
+                *out_dest = *reinterpret_cast<const uint64_t*>(slot);
+            }
+            else if (bytes[0] == 0xE9)
+            {
+                int32_t disp = *reinterpret_cast<const int32_t*>(bytes + 1);
+                *out_dest = func_va + 5 + disp;
+            }
+            else if (bytes[0] == 0x48 && bytes[1] == 0xB8)
+            {
+                *out_dest = *reinterpret_cast<const uint64_t*>(bytes + 2);
+            }
+            else if (bytes[0] == 0x68 && bytes[5] == 0xC3)
+            {
+                uint32_t imm32 = *reinterpret_cast<const uint32_t*>(bytes + 1);
+                *out_dest = static_cast<uint64_t>(imm32);
+            }
+            return true;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            *out_dest = 0;
+            return false;
+        }
+    }
+
+    __declspec(noinline) inline bool crc32_bytes(const uint8_t* bytes, size_t len, uint32_t* out_crc)
+    {
+        uint32_t crc = 0xFFFFFFFFu;
+        __try
+        {
+            for (size_t i = 0; i < len; ++i)
+                crc = _mm_crc32_u8(crc, bytes[i]);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            *out_crc = 0;
+            return false;
+        }
+        *out_crc = crc ^ 0xFFFFFFFFu;
+        return true;
+    }
+
     inline const char* const k_critical_ntdll_funcs[] = {
         "NtQueryInformationProcess",
         "NtQuerySystemInformation",
@@ -319,8 +394,6 @@ namespace detail {
         "VirtualAlloc",
         "VirtualFree",
     };
-
-    constexpr size_t k_prologue_bytes = 32;
 
     struct prologue_baseline_t
     {
@@ -1399,32 +1472,9 @@ inline bool is_self_hooked(uint64_t func_va)
         if (e.hooked_va != func_va)
             continue;
 
-        auto* bytes = reinterpret_cast<const uint8_t*>(func_va);
         uint64_t current_dest = 0;
-        __try
-        {
-            if (bytes[0] == 0xFF && bytes[1] == 0x25)
-            {
-                int32_t disp = *reinterpret_cast<const int32_t*>(bytes + 2);
-                uint64_t slot = func_va + 6 + disp;
-                current_dest = *reinterpret_cast<const uint64_t*>(slot);
-            }
-            else if (bytes[0] == 0xE9)
-            {
-                int32_t disp = *reinterpret_cast<const int32_t*>(bytes + 1);
-                current_dest = func_va + 5 + disp;
-            }
-            else if (bytes[0] == 0x48 && bytes[1] == 0xB8)
-            {
-                current_dest = *reinterpret_cast<const uint64_t*>(bytes + 2);
-            }
-            else if (bytes[0] == 0x68 && bytes[5] == 0xC3)
-            {
-                uint32_t imm32 = *reinterpret_cast<const uint32_t*>(bytes + 1);
-                current_dest = static_cast<uint64_t>(imm32);
-            }
-        }
-        __except(1) { return false; }
+        if (!detail::safe_hook_destination(func_va, &current_dest))
+            return false;
 
         if (current_dest == 0)
             return false;
@@ -1461,15 +1511,8 @@ inline bool capture_self_prologues()
         b.cached_va = entry.address;
 
         uint8_t hash[32];
-        __try
-        {
-            if (!detail::sha256_hash(addr, detail::k_prologue_bytes, hash))
-                continue;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
+        if (!baseline::seh_hash_prologue(addr, hash))
             continue;
-        }
 
         memcpy(b.hash, hash, 32);
         baselines.push_back(std::move(b));
@@ -1490,15 +1533,7 @@ inline bool verify_self_prologue_hashes(std::string& mismatched_name)
         auto* addr = reinterpret_cast<const uint8_t*>(b.cached_va);
         uint8_t hash[32]{};
 
-        __try
-        {
-            if (!detail::sha256_hash(addr, detail::k_prologue_bytes, hash))
-            {
-                mismatched_name = b.name;
-                return false;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        if (!baseline::seh_hash_prologue(addr, hash))
         {
             mismatched_name = b.name;
             return false;
@@ -1583,7 +1618,8 @@ namespace self_heal {
         e.byte_count = static_cast<uint32_t>(detail::k_prologue_bytes);
 
         uint8_t plain[32];
-        __try { memcpy(plain, fn, 32); } __except(1) { return; }
+        if (!detail::safe_copy_bytes(plain, fn, 32))
+            return;
 
         uint64_t k0 = 0, k1 = 0;
         __try {
@@ -1727,9 +1763,8 @@ namespace self_heal {
             return false;
         }
 
-        __try {
-            memcpy(reinterpret_cast<void*>(function_va), plain, byte_count);
-        } __except(1) {
+        if (!detail::safe_write_bytes(reinterpret_cast<void*>(function_va), plain, byte_count))
+        {
             if (syscall::is_initialized())
                 syscall::call_NtResumeProcess(GetCurrentProcess());
             SecureZeroMemory(plain, sizeof(plain));
@@ -2214,6 +2249,109 @@ inline bool verify_prologue_hashes(std::string& mismatched_name)
     return true;
 }
 
+inline bool verify_prologue_hashes_kernel(std::string& mismatched_name)
+{
+    if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
+        return verify_prologue_hashes(mismatched_name);
+
+    if (!detail::baselines_captured().load())
+        baseline::capture_all();
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE k32   = GetModuleHandleW(L"kernel32.dll");
+
+    const std::vector<detail::prologue_baseline_t>* sets[2] = {
+        &detail::ntdll_baselines(), &detail::kernel32_baselines()
+    };
+    HMODULE mods[2] = { ntdll, k32 };
+
+    {
+        std::lock_guard<std::mutex> lk(detail::baseline_mtx());
+
+        for (size_t s = 0; s < 2; ++s)
+        {
+            if (!mods[s]) continue;
+            for (const auto& b : *sets[s])
+            {
+                auto* addr = reinterpret_cast<const uint8_t*>(
+                    GetProcAddress(mods[s], b.name.c_str()));
+                if (!addr) continue;
+
+                uint64_t kernel_hash = 0;
+                if (!driver_bridge::kernel_read_prologue_hash(
+                        b.cached_va,
+                        static_cast<uint32_t>(detail::k_prologue_bytes),
+                        kernel_hash))
+                    continue;
+
+                uint32_t um_crc = 0;
+                if (!detail::crc32_bytes(addr, detail::k_prologue_bytes, &um_crc))
+                {
+                    continue;
+                }
+
+                if (static_cast<uint64_t>(um_crc) != kernel_hash)
+                {
+                    if (s == 0 && detail::system_owned_nt_export_wrapper(b.name.c_str(), addr))
+                        continue;
+                    mismatched_name = b.name;
+                    char dbg[256];
+                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                        "kernel_prologue_hash_mismatch name=%s um_crc=0x%08X kernel_hash=0x%016llX va=0x%llX",
+                        b.name.c_str(), um_crc,
+                        static_cast<unsigned long long>(kernel_hash),
+                        static_cast<unsigned long long>(b.cached_va));
+                    webhook::write_log_critical("prologue_kernel", dbg);
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (detail::self_prologues_captured().load())
+    {
+        std::lock_guard<std::mutex> slk(detail::self_func_mtx());
+        for (const auto& b : detail::self_baselines())
+        {
+            uint64_t kernel_hash = 0;
+            if (!driver_bridge::kernel_read_prologue_hash(
+                    b.cached_va,
+                    static_cast<uint32_t>(detail::k_prologue_bytes),
+                    kernel_hash))
+                continue;
+
+            auto* addr = reinterpret_cast<const uint8_t*>(b.cached_va);
+            uint32_t um_crc = 0;
+            if (!detail::crc32_bytes(addr, detail::k_prologue_bytes, &um_crc))
+            {
+                mismatched_name = b.name;
+                char dbg[256];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "kernel_self_prologue_seh name=%s va=0x%llX",
+                    b.name.c_str(),
+                    static_cast<unsigned long long>(b.cached_va));
+                webhook::write_log_critical("prologue_kernel", dbg);
+                return false;
+            }
+
+            if (static_cast<uint64_t>(um_crc) != kernel_hash)
+            {
+                mismatched_name = b.name;
+                char dbg[256];
+                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                    "kernel_self_prologue_hash_mismatch name=%s um_crc=0x%08X kernel_hash=0x%016llX va=0x%llX",
+                    b.name.c_str(), um_crc,
+                    static_cast<unsigned long long>(kernel_hash),
+                    static_cast<unsigned long long>(b.cached_va));
+                webhook::write_log_critical("prologue_kernel", dbg);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 inline bool verify_disk_image(std::string& mismatched_name)
 {
     if (!detail::disk_image_loaded().load())
@@ -2524,7 +2662,10 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
         webhook::send_debug_log("eat_hook", "ntdll_eat_rva_outside_module", true);
 
     std::string proem;
-    report.prologue_hash_mismatch = !verify_prologue_hashes(proem);
+    if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
+        report.prologue_hash_mismatch = !verify_prologue_hashes_kernel(proem);
+    else
+        report.prologue_hash_mismatch = !verify_prologue_hashes(proem);
     if (report.prologue_hash_mismatch)
     {
         report.hooked_function = proem;
@@ -2901,7 +3042,7 @@ inline void fetch_server_prologue_hashes(const std::string& server_host,
     BOOL bResults = WinHttpSendRequest(hRequest,
         WINHTTP_NO_ADDITIONAL_HEADERS, 0,
         WINHTTP_NO_REQUEST_DATA, 0,
-        WINHTTP_NO_OPTION, 0);
+        0, 0);
 
     if (bResults)
         bResults = WinHttpReceiveResponse(hRequest, nullptr);

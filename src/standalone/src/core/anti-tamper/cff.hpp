@@ -275,6 +275,7 @@ namespace detail {
 
 
 }
+}
 #define CFF_TAG_HASH_(tag)                                                       \
     (::anti_tamper::cff::detail::multi_tag_fnv1a(__FILE__, __LINE__, #tag))
 

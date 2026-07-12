@@ -10,6 +10,7 @@
 #include "ProcessNotify.h"
 #include "BridgeV2.h"
 #include "Heartbeat.h"
+#include <core/Attestation.h>
 
 namespace wsk_transport
 {
@@ -2477,7 +2478,16 @@ namespace wsk_transport
         append_str("\"n\":\""); append_hex(nonce_val); append_str("\",");
         append_str("\"seq\":"); append_dec_ll(seq); append_char(',');
         append_str("\"qpc\":"); append_dec(static_cast<ULONG>(perf.LowPart)); append_char(',');
-        append_str("\"build\":"); append_dec(nt_build);
+        append_str("\"build\":"); append_dec(nt_build); append_char(',');
+        append_str("\"watermark_state\":\"");
+        if (attestation::g_watermark_state.verification_timestamp == 0) {
+            append_str("0");
+        } else if (attestation::g_watermark_state.watermark_verified) {
+            append_str("1");
+        } else {
+            append_str("-1");
+        }
+        append_str("\"");
         append_char('}');
 
         *out_len = static_cast<ULONG>(len);
@@ -2574,6 +2584,92 @@ namespace wsk_transport
                         sizeof(sess->scratch_resp), &resp_len, sess, TRUE);
                     SN_LOG("attest_report_work_thread: recv_record status=0x%08lx type=0x%02X resp_len=%lu",
                         rst, (UINT32)type, resp_len);
+
+                    if (NT_SUCCESS(rst) && resp_len > 0 && resp_len <= sizeof(sess->scratch_resp))
+                    {
+                        const UINT8* resp = sess->scratch_resp;
+                        ULONG resp_sz = resp_len;
+
+                        const UINT8* body = resp;
+                        ULONG body_len = resp_sz;
+                        for (ULONG i = 0; i + 3 < resp_sz; ++i) {
+                            if (resp[i] == '\r' && resp[i + 1] == '\n' && resp[i + 2] == '\r' && resp[i + 3] == '\n') {
+                                body = resp + i + 4;
+                                body_len = resp_sz - (i + 4);
+                                break;
+                            }
+                        }
+
+                        if (body_len > 0) {
+                            const char* needle_wm = "\"expected_watermark\":\"";
+                            ULONG needle_wm_len = 22;
+                            for (ULONG i = 0; i + needle_wm_len <= body_len; ++i) {
+                                BOOLEAN match = TRUE;
+                                for (ULONG j = 0; j < needle_wm_len; ++j) {
+                                    if (static_cast<char>(body[i + j]) != needle_wm[j]) { match = FALSE; break; }
+                                }
+                                if (match) {
+                                    ULONG val_start = i + needle_wm_len;
+                                    ULONG val_end = val_start;
+                                    while (val_end < body_len && body[val_end] != '"' && (val_end - val_start) < 64) {
+                                        ++val_end;
+                                    }
+                                    ULONG hex_len = val_end - val_start;
+                                    if (hex_len > 0 && hex_len <= 32 && (hex_len % 2) == 0) {
+                                        UINT8 wm_bytes[16] = {};
+                                        BOOLEAN hex_ok = TRUE;
+                                        for (ULONG k = 0; k < hex_len; k += 2) {
+                                            char hi = static_cast<char>(body[val_start + k]);
+                                            char lo = static_cast<char>(body[val_start + k + 1]);
+                                            auto hex_val = [](char c) -> int {
+                                                if (c >= '0' && c <= '9') return c - '0';
+                                                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                                                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                                                return -1;
+                                            };
+                                            int hv = hex_val(hi);
+                                            int lv = hex_val(lo);
+                                            if (hv < 0 || lv < 0) { hex_ok = FALSE; break; }
+                                            wm_bytes[k / 2] = static_cast<UINT8>((hv << 4) | lv);
+                                        }
+                                        if (hex_ok) {
+                                            RtlCopyMemory(attestation::g_watermark_state.expected_watermark, wm_bytes, hex_len / 2);
+                                            SN_LOG("attest_report_work_thread: parsed expected_watermark hex_len=%lu bytes=%lu",
+                                                hex_len, hex_len / 2);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+
+                            const char* needle_rva = "\"watermark_rva\":";
+                            ULONG needle_rva_len = 16;
+                            for (ULONG i = 0; i + needle_rva_len <= body_len; ++i) {
+                                BOOLEAN match = TRUE;
+                                for (ULONG j = 0; j < needle_rva_len; ++j) {
+                                    if (static_cast<char>(body[i + j]) != needle_rva[j]) { match = FALSE; break; }
+                                }
+                                if (match) {
+                                    ULONG val_start = i + needle_rva_len;
+                                    ULONG val_end = val_start;
+                                    while (val_end < body_len && body[val_end] >= '0' && body[val_end] <= '9' && (val_end - val_start) < 12) {
+                                        ++val_end;
+                                    }
+                                    if (val_end > val_start) {
+                                        UINT32 rva_val = 0;
+                                        for (ULONG k = val_start; k < val_end; ++k) {
+                                            rva_val = rva_val * 10 + (body[k] - '0');
+                                        }
+                                        if (rva_val > 0) {
+                                            attestation::g_watermark_state.watermark_rva = rva_val;
+                                            SN_LOG("attest_report_work_thread: parsed watermark_rva=%lu", rva_val);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             else

@@ -152,7 +152,7 @@ router.post('/honeypot-access', async (req, res) => {
             [hwid, licenseKey, watermark,
              `honeypot_string_access rip=${rip} addr=${accessedAddr}`,
              `pid=${pid}`,
-             -1, bugCode, 1, '', '',
+             -1, bugCode, 2, '', '',
              now, nowIso, ip, false]
         );
     } catch (err) {

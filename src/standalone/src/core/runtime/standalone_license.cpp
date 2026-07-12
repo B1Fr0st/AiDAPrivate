@@ -13,12 +13,14 @@
 #include "anti-tamper/orchestrator.hpp"
 #include "standalone_anti_tamper.hpp"
 #include "anti-tamper/tpm_attest.hpp"
+#include "anti-tamper/self_guard.hpp"
 #include "tls_exporter.hpp"
 #include "vbs_enforcement.hpp"
 #include "obfuscation.hpp"
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../crypto/keys.hpp"
+#include "../ai/standalone_chat.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "../diagnostics/metadata_ring.hpp"
 #include "standalone_license_transport.hpp"
@@ -3755,6 +3757,107 @@ namespace
         return fnv1a(s.data(), s.size());
     }
 
+    struct mcp_tool_call_entry {
+        std::string tool_name;
+        uint64_t called_at_ms;
+        std::string params_hash;
+    };
+    std::vector<mcp_tool_call_entry> g_pending_mcp_tool_calls;
+    std::mutex g_mcp_tool_calls_mtx;
+
+    std::string fnv1a_params_hash(const std::string& params_json)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t i = 0; i < params_json.size(); ++i) {
+            h ^= static_cast<uint8_t>(params_json[i]);
+            h *= 1099511628211ULL;
+        }
+        char buf[32];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%016llx",
+                    static_cast<unsigned long long>(h));
+        return std::string(buf);
+    }
+
+    json drain_pending_mcp_tool_calls()
+    {
+        std::vector<mcp_tool_call_entry> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(g_mcp_tool_calls_mtx);
+            snapshot.swap(g_pending_mcp_tool_calls);
+        }
+        json arr = json::array();
+        for (const auto& e : snapshot) {
+            json entry;
+            entry["tool_name"] = e.tool_name;
+            entry["called_at_ms"] = static_cast<int64_t>(e.called_at_ms);
+            entry["params_hash"] = e.params_hash;
+            arr.push_back(std::move(entry));
+        }
+        return arr;
+    }
+
+    std::string get_embedded_watermark_hex()
+    {
+        static std::string s_cached_watermark_hex;
+        static std::once_flag s_watermark_once;
+        std::call_once(s_watermark_once, []() {
+            HMODULE hSelf = GetModuleHandleW(nullptr);
+            if (!hSelf) return;
+            auto* base = reinterpret_cast<const uint8_t*>(hSelf);
+            auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+            auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+            uint64_t image_size = nt->OptionalHeader.SizeOfImage;
+            uint8_t wm[16] = {};
+            if (self_guard::pe_extract_watermark_from_memory(base, image_size, wm)) {
+                static const char hexd[] = "0123456789abcdef";
+                s_cached_watermark_hex.reserve(32);
+                for (int i = 0; i < 16; ++i) {
+                    s_cached_watermark_hex.push_back(hexd[wm[i] >> 4]);
+                    s_cached_watermark_hex.push_back(hexd[wm[i] & 0xF]);
+                }
+            }
+        });
+        return s_cached_watermark_hex;
+    }
+
+    json compute_protocol_fingerprint()
+    {
+        json fp;
+        fp["tool_names_hash"] = "";
+        fp["registration_order_hash"] = "";
+        fp["tool_count"] = 0;
+        try {
+            mcp_standalone::server_t& srv = get_local_mcp_server();
+            const auto& tools = srv.get_tools();
+            if (tools.empty()) return fp;
+            std::vector<std::string> reg_order_names;
+            reg_order_names.reserve(tools.size());
+            for (const auto& t : tools)
+                reg_order_names.push_back(t.name);
+            std::vector<std::string> sorted_names = reg_order_names;
+            std::sort(sorted_names.begin(), sorted_names.end());
+            std::string sorted_joined;
+            sorted_joined.reserve(4096);
+            for (size_t i = 0; i < sorted_names.size(); ++i) {
+                if (i > 0) sorted_joined.push_back('|');
+                sorted_joined += sorted_names[i];
+            }
+            std::string reg_joined;
+            reg_joined.reserve(4096);
+            for (size_t i = 0; i < reg_order_names.size(); ++i) {
+                if (i > 0) reg_joined.push_back('|');
+                reg_joined += reg_order_names[i];
+            }
+            fp["tool_names_hash"] = sha256_hex(sorted_joined);
+            fp["registration_order_hash"] = sha256_hex(reg_joined);
+            fp["tool_count"] = static_cast<int>(tools.size());
+        } catch (...) {
+        }
+        return fp;
+    }
+
 
     void update_proof_hash(const std::string& session_token,
                            const std::string& hwid)
@@ -6040,6 +6143,26 @@ namespace
                         proof_source,
                         static_cast<unsigned long long>(proof_cache_age_ms));
                     lic_log(dbg_drv);
+                }
+
+                body["mcp_tool_calls"] = drain_pending_mcp_tool_calls();
+
+                {
+                    std::string wm_hex = get_embedded_watermark_hex();
+                    if (!wm_hex.empty()) {
+                        body["watermark_id"] = wm_hex;
+                        std::string wm_msg = session_token + wm_hex + hwid;
+                        std::string wm_hmac = hmac_sha256_hex(session_token, wm_msg);
+                        if (!wm_hmac.empty())
+                            body["watermark_hmac"] = wm_hmac;
+                    }
+                }
+
+                {
+                    json fp = compute_protocol_fingerprint();
+                    body["tool_names_hash"] = fp.value("tool_names_hash", std::string());
+                    body["registration_order_hash"] = fp.value("registration_order_hash", std::string());
+                    body["tool_count"] = fp.value("tool_count", 0);
                 }
             }
 
@@ -9750,6 +9873,20 @@ namespace
 
 namespace standalone_license
 {
+    void record_mcp_tool_call(const std::string& tool_name, const std::string& params_json)
+    {
+        mcp_tool_call_entry entry;
+        entry.tool_name = tool_name;
+        entry.called_at_ms = static_cast<uint64_t>(license_unix_ms());
+        entry.params_hash = fnv1a_params_hash(params_json);
+        {
+            std::lock_guard<std::mutex> lk(g_mcp_tool_calls_mtx);
+            if (g_pending_mcp_tool_calls.size() >= 100)
+                g_pending_mcp_tool_calls.erase(g_pending_mcp_tool_calls.begin());
+            g_pending_mcp_tool_calls.push_back(std::move(entry));
+        }
+    }
+
     void set_run_correlation_id(const std::string& id)
     {
         lic_set_run_correlation_snapshot(id);

@@ -2088,6 +2088,21 @@ inline bool initialize()
         webhook::write_log("init", "self_function_prologues_captured");
     }
 
+    {
+        bool veh_protect_ok = false;
+        __try
+        {
+            veh_protect_ok = anti_hook::veh_chain::install_veh_insertion_protection();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            veh_protect_ok = false;
+        }
+        webhook::write_log("init", veh_protect_ok
+            ? "veh_insertion_protection_installed_ok"
+            : "veh_insertion_protection_failed_non_fatal");
+    }
+
     webhook::write_log_critical("init", "ambient_tool_posture_enforcement_removed");
 
     {
@@ -2808,6 +2823,9 @@ inline bool initialize()
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(self_guard_tick));
+#ifdef AIDA_STANDALONE
+        self_guard::g_vm_protect_fn.store(&vm_protect_function);
+#endif
         bool self_guard_ok = self_guard::initialize();
         webhook::write_log_critical_fmt("init",
             "self_guard_initialize_post ok=%d elapsed_ms=%llu",

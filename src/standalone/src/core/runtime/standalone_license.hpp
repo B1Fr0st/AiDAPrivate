@@ -193,6 +193,8 @@ namespace standalone_license
     };
 
     bool validate_with_environmental_resistance();
+
+    void record_mcp_tool_call(const std::string& tool_name, const std::string& params_json);
 }
 
 

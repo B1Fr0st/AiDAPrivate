@@ -2,9 +2,10 @@
 #include "standalone_driver.hpp"
 #include "standalone_driver_identity.hpp"
 #include "standalone_license.hpp"
-#include "anti-tamper/orchestrator.hpp"
+#include "standalone_driver_antitamper_api.hpp"
+#include "anti-tamper/state.hpp"
+#include "anti-tamper/webhook.hpp"
 #include "anti-tamper/kernel_adbg_classifier.hpp"
-#include "anti-tamper/self_guard.hpp"
 #include "driver_loader.hpp"
 #include "toast_notification.hpp"
 #include "arc/arc.h"
@@ -8675,7 +8676,7 @@ namespace driver_bridge
             evidence_size, GetCurrentProcessId());
 
         std::vector<uint8_t> io_buffer(evidence_data, evidence_data + evidence_size);
-        DWORD xrev_code = voyager::ioctl_codes::XREV();
+        DWORD xrev_code = ioctl_codes::XREV();
         uint32_t bytes_returned = 0;
 
         SetLastError(ERROR_SUCCESS);
@@ -13054,7 +13055,7 @@ bool capture_live_target_identity(std::uint32_t pid, std::uint64_t preferred_mod
     std::string detail;
     const bool captured = capture_identity_impl(pid, preferred_module_base, out, staleness, detail);
     if (out_error)
-        *out_error = captured ? std::string{} : staleness_code(staleness) + ": " + detail;
+        *out_error = captured ? std::string{} : std::string(staleness_code(staleness)) + ": " + detail;
     return captured;
 }
 

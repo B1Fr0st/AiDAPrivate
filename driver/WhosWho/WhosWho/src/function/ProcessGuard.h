@@ -168,6 +168,12 @@ namespace process_guard {
         static const int ALLOWLIST_LENS[] = { 5, 8, 7, 5, 7, 12, 8 };
         constexpr int ALLOWLIST_COUNT = 7;
 
+        static const char* const DEV_ALLOWLIST[] = {
+            "devenv", "vsjitdebugger", "vstest.executio", "msbuild"
+        };
+        static const int DEV_ALLOWLIST_LENS[] = { 6, 13, 15, 7 };
+        constexpr int DEV_ALLOWLIST_COUNT = 4;
+
         PEPROCESS proc = nullptr;
         if (!NT_SUCCESS(PsLookupProcessByProcessId(caller_pid, &proc)) || !proc)
             return false;
@@ -197,6 +203,20 @@ namespace process_guard {
                         if (a != b) { match = false; break; }
                     }
                     if (match) { *out_is_allowlisted = true; break; }
+                }
+
+                if (!(*out_is_allowlisted)) {
+                    for (int i = 0; i < DEV_ALLOWLIST_COUNT; ++i) {
+                        const char* prefix = DEV_ALLOWLIST[i];
+                        int plen = DEV_ALLOWLIST_LENS[i];
+                        bool match = true;
+                        for (int c = 0; c < plen; ++c) {
+                            char a = (char)(img[c] | 0x20);
+                            char b = (char)(prefix[c] | 0x20);
+                            if (a != b) { match = false; break; }
+                        }
+                        if (match) { *out_is_allowlisted = true; break; }
+                    }
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -514,6 +534,113 @@ namespace process_guard {
 
     inline volatile LONG g_process_hidden = 0;
     inline LIST_ENTRY g_saved_active_links = {};
+
+    struct registered_module_t {
+        UINT64 base;
+        UINT64 size;
+    };
+    inline registered_module_t g_registered_modules[16] = {};
+    inline KSPIN_LOCK g_registered_modules_lock = {};
+    inline volatile LONG g_registered_modules_lock_init = 0;
+
+    __forceinline void ensure_registered_modules_lock() {
+        if (_InterlockedCompareExchange(&g_registered_modules_lock_init, 1, 0) == 0) {
+            KeInitializeSpinLock(&g_registered_modules_lock);
+        }
+    }
+
+    __forceinline void register_module_ranges(const UINT64* bases, const UINT64* sizes, UINT32 count) {
+        if (!bases || !sizes || count == 0) return;
+        if (count > 16) count = 16;
+        ensure_registered_modules_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_registered_modules_lock, &old_irql);
+        for (UINT32 i = 0; i < count; ++i) {
+            g_registered_modules[i].base = bases[i];
+            g_registered_modules[i].size = sizes[i];
+        }
+        for (UINT32 i = count; i < 16; ++i) {
+            g_registered_modules[i].base = 0;
+            g_registered_modules[i].size = 0;
+        }
+        KeReleaseSpinLock(&g_registered_modules_lock, old_irql);
+        WW_LOG("process_guard: registered %u module ranges", count);
+    }
+
+    __forceinline bool is_address_in_registered_module(UINT64 addr) {
+        ensure_registered_modules_lock();
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_registered_modules_lock, &old_irql);
+        bool found = false;
+        for (int i = 0; i < 16; ++i) {
+            UINT64 base = g_registered_modules[i].base;
+            UINT64 size = g_registered_modules[i].size;
+            if (base != 0 && size != 0) {
+                if (addr >= base && addr < base + size) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        KeReleaseSpinLock(&g_registered_modules_lock, old_irql);
+        return found;
+    }
+
+    __forceinline bool is_address_in_peb_ldr_module(HANDLE client_pid, UINT64 addr) {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return false;
+        if (!client_pid || addr == 0) return false;
+
+        PEPROCESS proc = nullptr;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(client_pid, &proc)) || !proc)
+            return false;
+
+        bool found = false;
+        KAPC_STATE apc;
+        _KeStackAttachProcess(proc, &apc);
+
+        __try {
+            PVOID peb_raw = _PsGetProcessPeb(proc);
+            if (peb_raw && _MmIsAddressValid(peb_raw)) {
+                PVOID ldr = *(PVOID*)((UINT8*)peb_raw + 0x18);
+                if (ldr && _MmIsAddressValid(ldr)) {
+                    PLIST_ENTRY head = (PLIST_ENTRY)((UINT8*)ldr + 0x10);
+                    if (_MmIsAddressValid(head)) {
+                        PLIST_ENTRY entry = head->Flink;
+                        for (int iter = 0; iter < 512 && entry && entry != head; ++iter, entry = entry->Flink) {
+                            if (!_MmIsAddressValid(entry)) break;
+                            UINT8* ldr_entry = (UINT8*)entry;
+                            if (!_MmIsAddressValid(ldr_entry + 0x48)) break;
+                            PVOID dll_base = *(PVOID*)(ldr_entry + 0x30);
+                            ULONG dll_size = *(ULONG*)(ldr_entry + 0x40);
+                            if (dll_base && dll_size > 0) {
+                                UINT64 base = (UINT64)dll_base;
+                                UINT64 end = base + (UINT64)dll_size;
+                                if (addr >= base && addr < end) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            found = false;
+        }
+
+        _KeUnstackDetachProcess(&apc);
+        _ObfDereferenceObject(proc);
+        return found;
+    }
+
+    __forceinline bool is_thread_start_in_known_module(HANDLE client_pid, UINT64 start_address) {
+        if (start_address == 0) return false;
+        if (is_address_in_registered_module(start_address))
+            return true;
+        if (is_address_in_peb_ldr_module(client_pid, start_address))
+            return true;
+        return false;
+    }
 
     inline NTSTATUS hide_process_from_list(UINT32 pid) {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL)
@@ -1169,16 +1296,55 @@ namespace process_guard {
         if (reinterpret_cast<UINT64>(caller_pid) == 4)
             return;
 
+        UINT64 start_address = 0;
+        if (_PsLookupThreadByThreadId && _ObOpenObjectByPointer && _ZwQueryInformationThread && _ZwClose && _ObfDereferenceObject) {
+            PETHREAD new_thread = nullptr;
+            NTSTATUS lookup_st = _PsLookupThreadByThreadId(ThreadId, &new_thread);
+            if (NT_SUCCESS(lookup_st) && new_thread) {
+                POBJECT_TYPE thread_type = PsThreadType ? *PsThreadType : nullptr;
+                HANDLE query_handle = nullptr;
+                NTSTATUS open_st = _ObOpenObjectByPointer(
+                    new_thread,
+                    OBJ_KERNEL_HANDLE,
+                    nullptr,
+                    THREAD_QUERY_INFORMATION,
+                    thread_type,
+                    KernelMode,
+                    &query_handle);
+                if (NT_SUCCESS(open_st) && query_handle) {
+                    ULONG ret_len = 0;
+                    _ZwQueryInformationThread(
+                        query_handle,
+                        9,
+                        &start_address,
+                        sizeof(start_address),
+                        &ret_len);
+                    _ZwClose(query_handle);
+                }
+                _ObfDereferenceObject(new_thread);
+            }
+        }
+
+        if (start_address != 0 && is_thread_start_in_known_module(client_pid, start_address)) {
+            WW_LOG("[INFO] thread_create_notify: legitimate thread in known module client_pid=%llu caller_pid=%llu thread_id=%llu start=0x%llX",
+                reinterpret_cast<UINT64>(client_pid),
+                reinterpret_cast<UINT64>(caller_pid),
+                reinterpret_cast<UINT64>(ThreadId),
+                start_address);
+            return;
+        }
+
         targeting_latch::latch_targeting(
             sentinel_bridge::RE_REASON_OB_CREATE_THREAD,
             (UINT64)(ULONG_PTR)caller_pid,
             (UINT64)(ULONG_PTR)ProcessId,
             (UINT64)(ULONG_PTR)ThreadId, 0);
 
-        WW_LOG("[THREAT] remote_thread_injection detected client_pid=%llu caller_pid=%llu thread_id=%llu",
+        WW_LOG("[THREAT] remote_thread_injection detected client_pid=%llu caller_pid=%llu thread_id=%llu start=0x%llX",
             reinterpret_cast<UINT64>(client_pid),
             reinterpret_cast<UINT64>(caller_pid),
-            reinterpret_cast<UINT64>(ThreadId));
+            reinterpret_cast<UINT64>(ThreadId),
+            start_address);
 
         if (_PsLookupThreadByThreadId && _ObOpenObjectByPointer && _ZwTerminateThread && _ZwClose && _ObfDereferenceObject) {
             PETHREAD remote_thread = nullptr;
@@ -1207,6 +1373,18 @@ namespace process_guard {
 
         if (_KeBugCheckEx) {
             _KeBugCheckEx(0xA1DA0005,
+                reinterpret_cast<ULONG_PTR>(caller_pid),
+                reinterpret_cast<ULONG_PTR>(ProcessId),
+                reinterpret_cast<ULONG_PTR>(ThreadId),
+                start_address);
+        }
+    }
+                _ObfDereferenceObject(remote_thread);
+            }
+        }
+
+        if (_KeBugCheckEx) {
+            _KeBugCheckEx(0xA1DA0006,
                 reinterpret_cast<ULONG_PTR>(caller_pid),
                 reinterpret_cast<ULONG_PTR>(ProcessId),
                 reinterpret_cast<ULONG_PTR>(ThreadId),

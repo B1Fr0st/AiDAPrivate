@@ -400,6 +400,15 @@ namespace guardian {
                 static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
         }
 
+        if ((cycle % 10) == 0 && session.active) {
+            step = perf_mark();
+            vad_text_guard::monitor_text_page_access(protected_pid);
+            SN_LOG("guardian::step cycle=%ld name=monitor_text_page_access elapsed_us=%lu protected_pid=%llu",
+                cycle,
+                perf_elapsed_us(step),
+                static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)));
+        }
+
         step = perf_mark();
         bool module_present = heartbeat::verify_module_presence();
         if (!module_present) {
@@ -617,11 +626,13 @@ namespace guardian {
                             SN_LOG("guardian::watermark_mismatch: BSOD pid=%llu magic=0x%08lx",
                                 static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(protected_pid)),
                                 static_cast<ULONG>(AIDA_WATERMARK_MAGIC));
+#ifndef AIDA_DEV_MODE
                             if (_KeBugCheckEx)
                                 _KeBugCheckEx(static_cast<ULONG>(BUGCHECK_MODULE_CROSSCHECK),
                                     (ULONG_PTR)protected_pid,
                                     (ULONG_PTR)AIDA_WATERMARK_MAGIC,
                                     0, 0);
+#endif
                         }
                     } else {
                         SN_LOG("guardian::step cycle=%ld name=watermark_verify elapsed_us=%lu result=lookup_failed status=0x%08lx pid=%llu",

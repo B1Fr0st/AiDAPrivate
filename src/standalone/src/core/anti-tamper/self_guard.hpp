@@ -645,13 +645,17 @@ inline bool blocklist_matches(const std::string& name,
         if (entry.expires_at != 0) {
             if (now > entry.expires_at + kSevenDaysSeconds) continue;
         }
+        bool hash_matched = false;
+        bool watermark_matched = false;
+        bool name_matched = false;
+
         if (entry.flags & BL_MATCH_HASH) {
             if (image_hash && constant_time_compare(image_hash, entry.image_hash, 32))
-                return true;
+                hash_matched = true;
         }
         if (entry.flags & BL_MATCH_WATERMARK) {
             if (watermark && constant_time_compare(watermark, entry.watermark, 16))
-                return true;
+                watermark_matched = true;
         }
         if (entry.flags & BL_MATCH_NAME) {
             if (!name.empty()) {
@@ -659,9 +663,14 @@ inline bool blocklist_matches(const std::string& name,
                 std::string lower_pattern = to_lower_str(std::string(entry.name_pattern));
                 if (!lower_pattern.empty() &&
                     lower_name.find(lower_pattern) != std::string::npos)
-                    return true;
+                    name_matched = true;
             }
         }
+
+        if (hash_matched || watermark_matched)
+            return true;
+        if (name_matched && (hash_matched || watermark_matched))
+            return true;
     }
     return false;
 }

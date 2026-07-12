@@ -1172,6 +1172,128 @@ namespace anti_dump_kernel {
         ExFreePoolWithTag(buf, 'hDSW');
         return status;
     }
+
+    __forceinline int canary_access_allowlist_check(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return -1;
+        if (pid == 0) return -1;
+
+        PEPROCESS protected_proc = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &protected_proc);
+        if (!NT_SUCCESS(status)) return -1;
+
+        ULONG buf_size = 4 * 1024 * 1024;
+        PVOID buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'aCAW');
+        if (!buf) {
+            ObDereferenceObject(protected_proc);
+            return -1;
+        }
+
+        ULONG ret_len = 0;
+        status = ZwQuerySystemInformation(
+            (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+            buf, buf_size, &ret_len);
+
+        if (status == STATUS_INFO_LENGTH_MISMATCH && ret_len > buf_size) {
+            ExFreePoolWithTag(buf, 'aCAW');
+            buf_size = ret_len + 65536;
+            buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'aCAW');
+            if (!buf) {
+                ObDereferenceObject(protected_proc);
+                return -1;
+            }
+            status = ZwQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+                buf, buf_size, &ret_len);
+        }
+
+        if (!NT_SUCCESS(status)) {
+            ExFreePoolWithTag(buf, 'aCAW');
+            ObDereferenceObject(protected_proc);
+            return -1;
+        }
+
+        auto* info = (SYSTEM_HANDLE_INFORMATION_EX_AD*)buf;
+
+        static const char* const canary_allowlist[] = {
+            "csrss", "services", "wininit", "lsass",
+            "msmpeng", "securityheal", "werfault"
+        };
+        constexpr int canary_allowlist_count = sizeof(canary_allowlist) / sizeof(canary_allowlist[0]);
+
+        bool any_vm_read = false;
+        bool any_non_allowlisted = false;
+
+        __try {
+            for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+                auto& h = info->Handles[i];
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId == pid) continue;
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId <= 4) continue;
+
+                if (!_MmIsAddressValid || !_MmIsAddressValid(h.Object)) continue;
+                if (h.Object != protected_proc) continue;
+
+                if (h.GrantedAccess & PROCESS_VM_READ) {
+                    any_vm_read = true;
+                    UINT32 owner_pid = (UINT32)h.UniqueProcessId;
+
+                    if (is_permitted_pid(owner_pid))
+                        continue;
+
+                    PEPROCESS owner_proc = nullptr;
+                    NTSTATUS lookup_st = PsLookupProcessByProcessId(
+                        (HANDLE)(ULONG_PTR)owner_pid, &owner_proc);
+                    if (!NT_SUCCESS(lookup_st) || !owner_proc) {
+                        any_non_allowlisted = true;
+                        WW_LOG("anti_dump: canary_access_non_allowlisted owner_pid=%u pid=%u access=0x%08X reason=lookup_failed",
+                            owner_pid, pid, (UINT32)h.GrantedAccess);
+                        continue;
+                    }
+
+                    UCHAR* img_name = nullptr;
+                    __try {
+                        img_name = PsGetProcessImageFileName(owner_proc);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        img_name = nullptr;
+                    }
+
+                    bool is_allowlisted = false;
+                    if (img_name && _MmIsAddressValid(img_name)) {
+                        for (int a = 0; a < canary_allowlist_count; ++a) {
+                            if (image_file_name_equals_ascii(img_name, canary_allowlist[a])) {
+                                is_allowlisted = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!is_allowlisted) {
+                        any_non_allowlisted = true;
+                        WW_LOG("anti_dump: canary_access_non_allowlisted owner_pid=%u pid=%u access=0x%08X image=%.15s",
+                            owner_pid, pid, (UINT32)h.GrantedAccess,
+                            img_name ? (const char*)img_name : "<null>");
+                    } else {
+                        WW_LOG("anti_dump: canary_access_allowlisted owner_pid=%u pid=%u access=0x%08X image=%.15s",
+                            owner_pid, pid, (UINT32)h.GrantedAccess,
+                            img_name ? (const char*)img_name : "<null>");
+                    }
+
+                    ObDereferenceObject(owner_proc);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            ExFreePoolWithTag(buf, 'aCAW');
+            ObDereferenceObject(protected_proc);
+            return -1;
+        }
+
+        ExFreePoolWithTag(buf, 'aCAW');
+        ObDereferenceObject(protected_proc);
+
+        if (!any_vm_read) return 0;
+        if (any_non_allowlisted) return 2;
+        return 1;
+    }
 }
 
 namespace continuous_anti_dump {
@@ -1240,8 +1362,22 @@ namespace continuous_anti_dump {
                 NTSTATUS cs = anti_dump_kernel::check_canary_page(pid, canary_intact, canary_accessed);
                 if (NT_SUCCESS(cs) && canary_accessed && !canary_intact) {
                     WW_LOG("continuous_admp: CANARY_CORRUPTION detected pid=%u", pid);
-                    if (_KeBugCheckEx) {
-                        _KeBugCheckEx(0xA1DA0002u, pid, 0, 0, 0);
+                    int allowlist_result = anti_dump_kernel::canary_access_allowlist_check(pid);
+                    if (allowlist_result == 1) {
+                        WW_LOG("continuous_admp: canary_access_allowlisted pid=%u -- AV scan, clearing canary without BSOD", pid);
+                        _InterlockedExchange(&anti_dump_kernel::g_canary_initialized, 0);
+                        anti_dump_kernel::place_canary_page(pid);
+                    } else {
+                        if (allowlist_result == 0) {
+                            WW_LOG("continuous_admp: canary_kernel_read pid=%u no_vm_read_handles -- BSOD", pid);
+                        } else if (allowlist_result == 2) {
+                            WW_LOG("continuous_admp: canary_stripping_bypass pid=%u non_allowlisted_vm_read -- BSOD", pid);
+                        } else {
+                            WW_LOG("continuous_admp: canary_check_error pid=%u result=%d -- BSOD fail_closed", pid, allowlist_result);
+                        }
+                        if (_KeBugCheckEx) {
+                            _KeBugCheckEx(0xA1DA0002u, pid, 0, 0, 0);
+                        }
                     }
                 }
                 anti_dump_kernel::detect_mmcopyvirtualmemory(pid);

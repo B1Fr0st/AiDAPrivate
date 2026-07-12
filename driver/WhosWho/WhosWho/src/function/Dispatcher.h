@@ -791,6 +791,7 @@ namespace dispatcher {
         process_hide::uninstall();
         caller_validation::unregister_client();
         secure_comm::reset();
+        handshake_auth::reset();
 
         if (cleanup_client && prev_client) {
             UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
@@ -1604,6 +1605,27 @@ namespace dispatcher {
                 elapsed_us_from_qpc(hvdt_dispatch_start, hvdt_dispatch_freq),
                 KeGetCurrentProcessorNumber(),
                 (ULONG)KeGetCurrentIrql());
+        }
+
+        if (code != ioctl_codes::HB() &&
+            code != ioctl_codes::SRVT() && code != ioctl_codes::SRV2() &&
+            code != ioctl_codes::HSHK() && code != ioctl_codes::HRES() &&
+            _InterlockedCompareExchange(&handshake_auth::g_handshake_verified, 0, 0) == 0) {
+            _InterlockedIncrement(&handshake_auth::g_ioctl_hmac_fail_count);
+            WW_LOG("HANDSHAKE_GATE_REJECT code=0x%08lx handshake_verified=0 fail_count=%ld pid=%llu",
+                code,
+                _InterlockedCompareExchange(&handshake_auth::g_ioctl_hmac_fail_count, 0, 0),
+                handle_to_u64(PsGetCurrentProcessId()));
+            if (secure_work_buffer)
+                ExFreePoolWithTag(secure_work_buffer, 'mocS');
+            irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+            irp->IoStatus.Information = 0;
+            if (startup_trace)
+                log_startup_ioctl_completion(startup_trace_id, "handshake_gate_reject", startup_name, code, startup_expected_code, early_decode, input_size, output_size, STATUS_ACCESS_DENIED, 0, secure_wrapped, startup_handler_reached, irp, hvdt_dispatch_start, hvdt_dispatch_freq);
+            if (hvdt_trace)
+                complete_hvdt_trace_irp(irp, STATUS_ACCESS_DENIED, 0, hvdt_trace_id, "handshake_gate_reject", hvdt_dispatch_start, hvdt_dispatch_freq);
+            _IofCompleteRequest(irp, IO_NO_INCREMENT);
+            return STATUS_ACCESS_DENIED;
         }
 
         if (code == ioctl_codes::PRW()) {
@@ -2567,6 +2589,8 @@ namespace dispatcher {
                 auto* admp = (p_anti_dump_request)buffer;
                 if (admp->operation == ADMP_OP_LOCK_PAGES && input_size < sizeof(admp_lock_pages_req)) {
                     status = STATUS_INFO_LENGTH_MISMATCH;
+                } else if (admp->operation == ADMP_OP_REGISTER_MODULE_RANGE && input_size < sizeof(admp_module_range_req)) {
+                    status = STATUS_INFO_LENGTH_MISMATCH;
                 } else {
                     status = functions::handle_anti_dump((p_anti_dump_request)buffer);
                     bytes = sizeof(anti_dump_request);
@@ -3417,7 +3441,7 @@ namespace dispatcher {
             if (input_size >= sizeof(pte_protection_entry_k)) {
                 auto* req = reinterpret_cast<pte_protection_entry_k*>(buffer);
                 if (req->active == 1) {
-                    BOOLEAN ok = anti_dma::pte_protect::protect_page(req->va, req->pa);
+                    BOOLEAN ok = anti_dma::pte_protect::protect_page(req->va, req->pa, TRUE);
                     req->active = ok ? 1u : 0u;
                 } else {
                     anti_dma::pte_protect::unprotect_page(req->va);
@@ -3691,7 +3715,8 @@ namespace dispatcher {
 
                     if (match) {
                         hs->verified = 1;
-                        WW_LOG("HRES: accepted session=0x%08X usermode_verified=1", hs->session_key);
+                        handshake_auth::set_verified(hs->challenge, 32);
+                        WW_LOG("HRES: accepted session=0x%08X usermode_verified=1 handshake_auth_set=1", hs->session_key);
                         status = STATUS_SUCCESS;
                     } else {
                         hs->verified = 0;

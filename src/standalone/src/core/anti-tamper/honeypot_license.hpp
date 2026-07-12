@@ -686,6 +686,8 @@ inline volatile const char* g_license_honeypot_strings[] = {
         return r;
     }
 
+    constexpr int HONEYPOT_FAKE_IMPORT_COUNT = 8;
+
     struct honeypot_fake_iat_entry_t {
         const char* name;
         void*       addr;
@@ -981,7 +983,7 @@ inline volatile const char* g_license_honeypot_strings[] = {
         anchor_honeypot_graph();
 
         volatile uintptr_t hp_sink = 0;
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < HONEYPOT_FAKE_IMPORT_COUNT; ++i)
             hp_sink += reinterpret_cast<uintptr_t>(g_honeypot_fake_imports[i].addr);
         (void)hp_sink;
 

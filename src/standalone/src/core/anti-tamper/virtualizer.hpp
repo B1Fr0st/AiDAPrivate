@@ -29,6 +29,8 @@ namespace anti_tamper {
 namespace virtualizer
 {
 
+inline uint64_t g_server_poly_seed = 0;
+
 namespace detail
 {
 
@@ -38,6 +40,8 @@ namespace detail
     static constexpr uint64_t HANDLER_CRYPT_MAGIC = 0x3C6EF372FE94F82BULL;
 
     struct handler_pool_t;
+    struct vm_entangled_state_t;
+    struct handler_hash_table_t;
 
 
     struct vm_continuation_t
@@ -158,8 +162,8 @@ namespace detail
         uint32_t taint_ring_size;
         uint32_t taint_seq;
 
-        struct vm_entangled_state_t* entangled;
-        struct handler_hash_table_t* hash_table;
+        vm_entangled_state_t* entangled;
+        handler_hash_table_t* hash_table;
         uint8_t* scratch_buffer;
         uint8_t* discard_buffer;
         uint64_t invocation_key;
@@ -245,6 +249,102 @@ namespace detail
         OP_IRREDUCIBLE_LOOP = 0x3D,
         OP_MAX
     };
+
+    using handler_fn = void(*)(vm_state_t& vm, const uint8_t* bc, uint32_t bc_size);
+
+    struct handler_slot_t
+    {
+        handler_fn  fn;
+        uint64_t    encrypted_next;
+        uint64_t    decrypt_key;
+        uint8_t     variant_id;
+        bool        is_decrypted;
+    };
+
+    struct poly_dispatch_t
+    {
+        handler_fn variants[4];
+        uint8_t    count;
+    };
+
+    struct handler_set_t
+    {
+        uint8_t     variant_order[256][4];
+        uint8_t     variant_count[256];
+        uint64_t    dispatch_xor_table[256];
+        uint64_t    dispatch_hmac_key[4];
+        uint64_t    uf_table[64];
+        uint32_t    crc_accumulator;
+        uint32_t    set_generation;
+        bool        initialized;
+    };
+
+    struct handler_pool_t
+    {
+        handler_slot_t   slots[HANDLER_POOL_SIZE];
+        poly_dispatch_t  poly_table[256];
+        handler_fn       dispatch_table[256];
+        uint32_t         active_slots;
+        uint32_t         regen_counter;
+        uint64_t         pool_guard;
+        bool             poly_initialized;
+        uint8_t          opcode_map[256];
+        uint8_t          reverse_map[256];
+        uint64_t         pool_seed;
+        uint32_t         generation;
+        uint32_t         child_pool_count;
+        handler_pool_t*  child_pools[8];
+        std::unordered_map<uint32_t, uint32_t>* hot_block_counts;
+        handler_set_t    handler_set;
+    };
+
+    struct vm_entangled_state_t
+    {
+        uint64_t shared_regs[48];
+        uint64_t shared_rolling_key;
+        uint64_t shared_handler_chain;
+        uint32_t active_vm_mask;
+        uint32_t sync_counter;
+        uint8_t  shared_vflags;
+        uint8_t  pad[7];
+        SRWLOCK  lock;
+        uint32_t stored_crc32;
+        uint8_t  stored_hmac[32];
+        bool     integrity_failed;
+        uint8_t  ent_pad[3];
+    };
+
+    static_assert(sizeof(vm_entangled_state_t) >= 424,
+        "vm_entangled_state_t must be at least 424 bytes");
+
+    struct handler_hash_entry_t
+    {
+        handler_fn  fn;
+        uint32_t    next_entry;
+        uint32_t    opcode_hash;
+        uint64_t    entry_key;
+    };
+
+    static_assert(sizeof(handler_hash_entry_t) == 24,
+        "handler_hash_entry_t must be 24 bytes");
+
+    struct handler_hash_table_t
+    {
+        handler_hash_entry_t* blocks[4];
+        uint32_t bucket_heads[64];
+        uint64_t table_seed;
+        uint32_t entry_count;
+        uint32_t generation;
+        bool     scattered;
+        uint8_t  ht_pad[7];
+        handler_hash_entry_t* contiguous;
+    };
+
+    inline uint64_t g_build_seed = 0x9E3779B97F4A7C15ULL ^ 0x428A2F98D728AE22ULL;
+    inline handler_pool_t g_default_pool{};
+
+    inline uint64_t xorshift_advance(uint64_t& state);
+    __forceinline void write_vreg(vm_state_t& vm, uint8_t logical, uint64_t val);
 
     inline bool bcrypt_random(uint8_t* buf, uint32_t len)
     {
@@ -963,7 +1063,7 @@ namespace detail
         }
 
         uint8_t digest[32];
-        sha256_oneshot(reinterpret_cast<const uint8_t*>(es), 416, digest);
+        hmac_sha256(reinterpret_cast<const uint8_t*>(es), 416, reinterpret_cast<const uint8_t*>(es), 416, digest);
         memcpy(es->stored_hmac, digest, 32);
         es->stored_crc32 = _mm_crc32_u32(0, static_cast<uint32_t>(seed));
         for (int i = 0; i < 48; ++i)
@@ -1049,100 +1149,6 @@ namespace detail
         SecureZeroMemory(buf, 32);
         return seed;
     }
-
-    using handler_fn = void(*)(vm_state_t& vm, const uint8_t* bc, uint32_t bc_size);
-
-    struct handler_slot_t
-    {
-        handler_fn  fn;
-        uint64_t    encrypted_next;
-        uint64_t    decrypt_key;
-        uint8_t     variant_id;
-        bool        is_decrypted;
-    };
-
-    struct poly_dispatch_t
-    {
-        handler_fn variants[4];
-        uint8_t    count;
-    };
-
-    struct handler_set_t
-    {
-        uint8_t     variant_order[256][4];
-        uint8_t     variant_count[256];
-        uint64_t    dispatch_xor_table[256];
-        uint64_t    dispatch_hmac_key[4];
-        uint64_t    uf_table[64];
-        uint32_t    crc_accumulator;
-        uint32_t    set_generation;
-        bool        initialized;
-    };
-
-    struct handler_pool_t
-    {
-        handler_slot_t   slots[HANDLER_POOL_SIZE];
-        poly_dispatch_t  poly_table[256];
-        handler_fn       dispatch_table[256];
-        uint32_t         active_slots;
-        uint32_t         regen_counter;
-        uint64_t         pool_guard;
-        bool             poly_initialized;
-        uint8_t          opcode_map[256];
-        uint8_t          reverse_map[256];
-        uint64_t         pool_seed;
-        uint32_t         generation;
-        uint32_t         child_pool_count;
-        handler_pool_t*  child_pools[8];
-        std::unordered_map<uint32_t, uint32_t>* hot_block_counts;
-        handler_set_t    handler_set;
-    };
-
-    struct vm_entangled_state_t
-    {
-        uint64_t shared_regs[48];
-        uint64_t shared_rolling_key;
-        uint64_t shared_handler_chain;
-        uint32_t active_vm_mask;
-        uint32_t sync_counter;
-        uint8_t  shared_vflags;
-        uint8_t  pad[7];
-        SRWLOCK  lock;
-        uint32_t stored_crc32;
-        uint8_t  stored_hmac[32];
-        bool     integrity_failed;
-        uint8_t  ent_pad[3];
-    };
-
-    static_assert(sizeof(vm_entangled_state_t) >= 424,
-        "vm_entangled_state_t must be at least 424 bytes");
-
-    struct handler_hash_entry_t
-    {
-        handler_fn  fn;
-        uint32_t    next_entry;
-        uint32_t    opcode_hash;
-        uint64_t    entry_key;
-    };
-
-    static_assert(sizeof(handler_hash_entry_t) == 24,
-        "handler_hash_entry_t must be 24 bytes");
-
-    struct handler_hash_table_t
-    {
-        handler_hash_entry_t* blocks[4];
-        uint32_t bucket_heads[64];
-        uint64_t table_seed;
-        uint32_t entry_count;
-        uint32_t generation;
-        bool     scattered;
-        uint8_t  ht_pad[7];
-        handler_hash_entry_t* contiguous;
-    };
-
-    inline uint64_t g_build_seed = 0x9E3779B97F4A7C15ULL ^ 0x428A2F98D728AE22ULL;
-
-    inline handler_pool_t g_default_pool{};
 
     inline auto& g_handler_pool    = g_default_pool.slots;
     inline auto& g_active_slots    = g_default_pool.active_slots;
@@ -5681,8 +5687,6 @@ namespace junk
     }
 
 }
-
-inline uint64_t g_server_poly_seed = 0;
 
 inline void reseed_from_server(uint64_t server_nonce)
 {

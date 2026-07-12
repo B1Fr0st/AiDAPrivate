@@ -439,7 +439,10 @@ namespace attestation
             return FALSE;
         }
 
-        BOOLEAN match = static_cast<BOOLEAN>(RtlEqualMemory(actual, expected, 16));
+        volatile UINT8 diff = 0;
+        for (int i = 0; i < 16; i++)
+            diff |= actual[i] ^ expected[i];
+        BOOLEAN match = (diff == 0) ? TRUE : FALSE;
 
         RtlCopyMemory(g_watermark_state.expected_watermark, expected, 16);
         RtlCopyMemory(g_watermark_state.actual_watermark, actual, 16);

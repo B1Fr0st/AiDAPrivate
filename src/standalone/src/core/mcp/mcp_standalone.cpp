@@ -12960,6 +12960,7 @@ tool_result_t server_t::call_registered_tool(const std::string& name, const json
         record_tool_audit_event(name, arguments, "rejected", false, details, validation_failure.text, call_begin, diag_id, request_id);
         return validation_failure;
     }
+    standalone_license::record_mcp_tool_call(name, arguments.dump());
     tool_invocation_metrics_t metrics;
     metrics.lane = predicted_tool_lane(found, arguments);
     const tool_timeout_resolution_t timeout_resolution = resolve_tool_timeout(name, arguments);
@@ -14018,6 +14019,7 @@ json server_t::handle_tools_call(const json& id, const json& params)
 
     std::string tool_name = early_name;
     json arguments = params.contains("arguments") ? params["arguments"] : json::object();
+    standalone_license::record_mcp_tool_call(tool_name, arguments.dump());
     const std::string payload_shape = payload_shape_summary(arguments);
     const std::uint32_t target_pid = target_pid_from_args(arguments);
     const tool_timeout_resolution_t timeout_resolution = resolve_tool_timeout(tool_name, arguments);

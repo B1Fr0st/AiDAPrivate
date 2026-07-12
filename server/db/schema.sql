@@ -610,9 +610,16 @@ ALTER TABLE builds ADD COLUMN IF NOT EXISTS retired              BOOLEAN NOT NUL
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS created_at           BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT);
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS last_session_at     BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS retired_at           BIGINT;
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS expected_watermark   TEXT    NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_builds_retired ON builds (retired) WHERE retired = false;
 CREATE INDEX IF NOT EXISTS idx_builds_last_session ON builds (last_session_at);
+
+ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS watermark_state VARCHAR(64);
+ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS watermark_verified BOOLEAN;
+ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS driver_proof VARCHAR(128);
+ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS driver_proof_verified BOOLEAN;
+ALTER TABLE attestation_records ADD COLUMN IF NOT EXISTS clone_flagged BOOLEAN;
 
 CREATE TABLE IF NOT EXISTS mcp_tool_calls (
     id              BIGSERIAL   PRIMARY KEY,
