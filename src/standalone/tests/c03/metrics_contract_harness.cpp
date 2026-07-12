@@ -399,6 +399,8 @@ void verify_metrics_accumulation()
         require(snapshot.value(expected_metrics[index].metric) == expected_values[index],
             "metric value projection changed");
     }
+    require(snapshot.value(analysis_resource_metric_t::count) == 0,
+        "out-of-range metric value projection changed");
 
     metrics.record_sla_receipt_validity(false);
     snapshot = metrics.snapshot();

@@ -496,6 +496,7 @@ bool triton_z3_adapter_capabilities_t::available() const noexcept
 
 bool valid_triton_z3_static_ir(const triton_z3_static_ir_t& value)
 {
+    try {
     if (!valid_domain(value.domain) || value.nodes.empty() || value.nodes.size() > k_max_ir_nodes ||
         value.root_node_id != value.nodes.size())
         return false;
@@ -538,6 +539,9 @@ bool valid_triton_z3_static_ir(const triton_z3_static_ir_t& value)
         (!has_stack_symbol || !has_stack_arithmetic))
         return false;
     return all_nodes_reachable(value);
+    } catch (...) {
+        return false;
+    }
 }
 
 bool valid_triton_z3_proof_limits(const triton_z3_proof_limits_t& value) noexcept
