@@ -89,6 +89,15 @@ struct python_worker_launch_contract_t final {
     std::filesystem::path approved_script_root;
 };
 
+struct python_worker_launch_contract_resolution_t final {
+    std::optional<python_worker_launch_contract_t> value;
+    std::string error;
+
+    bool valid() const noexcept {
+        return value.has_value() && error.empty();
+    }
+};
+
 struct python_worker_limits_t final {
     std::size_t max_script_bytes = 512U * 1024U;
     std::size_t max_frame_bytes = 1024U * 1024U;
@@ -146,9 +155,14 @@ struct python_worker_execution_result_t final {
 
 constexpr std::uint32_t k_python_worker_manifest_schema_version = 1;
 constexpr std::uint32_t k_python_worker_capability_execute_file = 1U;
+inline constexpr std::string_view k_python_worker_binary_artifact_relative_path = "deps/AiDA_AnalysisPythonWorker.exe";
+inline constexpr std::string_view k_python_worker_manifest_artifact_relative_path = "deps/AiDA_AnalysisPythonWorker.manifest.bin";
+inline constexpr std::string_view k_python_worker_manifest_digest_relative_path = "deps/AiDA_AnalysisPythonWorker.manifest.sha256";
 
 std::string serialize_python_worker_manifest(const python_worker_manifest_t& value);
 python_worker_manifest_decode_t deserialize_python_worker_manifest(const std::string& value);
+python_worker_launch_contract_resolution_t resolve_python_worker_launch_contract(
+    const std::filesystem::path& package_root, const std::filesystem::path& approved_script_root);
 bool python_workspace_operation_allowed(std::string_view operation) noexcept;
 bool python_worker_requires_replacement(python_worker_status_t status) noexcept;
 

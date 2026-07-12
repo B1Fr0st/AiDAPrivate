@@ -2,8 +2,10 @@
 
 #include "../../src/core/analysis/decompiler/providers/ghidra_ir_adapter.hpp"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -82,15 +84,25 @@ capture_t fixture(const std::string& language_id,
     void_type.display_name = "void";
     void_type.alignment = 1;
     result.types.push_back(std::move(void_type));
+    capture_type_t pointer;
+    pointer.id = 3;
+    pointer.kind = decompiler_type_kind_t::pointer;
+    pointer.canonical_name = "int32_t*";
+    pointer.display_name = "int*";
+    pointer.byte_size = architecture == architecture_id_t::x86 ? 4U : 8U;
+    pointer.alignment = static_cast<std::uint32_t>(*pointer.byte_size);
+    pointer.edges.push_back({1, decompiler_type_edge_kind_t::pointee, "pointee", std::nullopt});
+    result.types.push_back(std::move(pointer));
 
     capture_block_t entry;
     entry.id = 1;
     entry.successor_ids = {2};
     entry.address = 0x1000;
     entry.values = {
-        {1, capture_value_kind_t::parameter, 0, 1, {}, 0x1000, {}, "arg0"},
-        {2, capture_value_kind_t::pcode, k_pcode_int_add, 1, {1}, 0x1004, {}, "INT_ADD"},
-        {3, capture_value_kind_t::pcode, k_pcode_call, 2, {2}, 0x1008, {}, "CALL"}
+        {1, capture_value_kind_t::parameter, 0, 3, {}, 0x1000, {}, "arg0"},
+        {2, capture_value_kind_t::local, 0, 1, {}, 0x1004, {}, "defined_output"},
+        {3, capture_value_kind_t::pcode, k_pcode_int_add, 1, {1, 2}, 0x1004, {}, "INT_ADD"},
+        {4, capture_value_kind_t::pcode, k_pcode_call, 2, {3}, 0x1008, {}, "CALL"}
     };
     result.blocks.push_back(std::move(entry));
     capture_block_t exit;
@@ -98,7 +110,7 @@ capture_t fixture(const std::string& language_id,
     exit.predecessor_ids = {1};
     exit.address = 0x1010;
     exit.values = {
-        {4, capture_value_kind_t::pcode, k_pcode_return, 2, {}, 0x1010, {}, "RETURN"}
+        {5, capture_value_kind_t::pcode, k_pcode_return, 2, {}, 0x1010, {}, "RETURN"}
     };
     result.blocks.push_back(std::move(exit));
     result.entry_block_id = 1;
@@ -134,18 +146,41 @@ void verify_supported_languages()
         require(stable_serialization_hash(first.artifacts->type_graph) == stable_serialization_hash(second.artifacts->type_graph),
             "type graph normalization is not deterministic");
         const auto bytes = ghidra_ir_adapter::serialize_artifacts(*first.artifacts);
+        require(!bytes.empty(), "typed artifact serialization returned an empty payload");
         std::vector<decompiler_diagnostic_t> diagnostics;
         const auto restored = ghidra_ir_adapter::deserialize_artifacts(bytes, diagnostics);
         require(restored.has_value() && diagnostics.empty(), "typed artifact wire round trip failed");
         require(stable_serialization_hash(restored->provider_ir) == stable_serialization_hash(first.artifacts->provider_ir),
             "typed artifact wire round trip changed provider IR");
+        require(stable_serialization_hash(restored->hir) == stable_serialization_hash(first.artifacts->hir),
+            "typed artifact wire round trip changed HIR");
+        require(stable_serialization_hash(restored->type_graph) == stable_serialization_hash(first.artifacts->type_graph),
+            "typed artifact wire round trip changed the type graph");
+        require(serialize_provider_ir(restored->provider_ir) == serialize_provider_ir(first.artifacts->provider_ir),
+            "provider IR serialization is not byte-stable after artifact round trip");
+        require(serialize_hir_function(restored->hir) == serialize_hir_function(first.artifacts->hir),
+            "HIR serialization is not byte-stable after artifact round trip");
+        require(serialize_type_graph(restored->type_graph) == serialize_type_graph(first.artifacts->type_graph),
+            "type graph serialization is not byte-stable after artifact round trip");
+        require(std::any_of(first.artifacts->type_graph.edges.begin(), first.artifacts->type_graph.edges.end(),
+            [](const decompiler_type_edge_t& edge) {
+                return edge.kind == decompiler_type_edge_kind_t::pointee && edge.source_type_id == 3 &&
+                    edge.target_type_id == 1 && edge.stable_name == "pointee";
+            }), "typed artifact normalization dropped the provider type edge");
+        const auto local = std::find_if(first.artifacts->hir.blocks.front().values.begin(),
+            first.artifacts->hir.blocks.front().values.end(), [](const hir_value_t& value) {
+                return value.id == 2 && value.kind == hir_node_kind_t::local &&
+                    value.stable_value == "defined_output";
+            });
+        require(local != first.artifacts->hir.blocks.front().values.end(),
+            "typed artifact normalization dropped the defined output varnode");
     }
 }
 
 void verify_unsupported_pcode()
 {
     auto source = fixture("x86:LE:64:default", architecture_id_t::x86_64, architecture_mode_t::x86_64, endian_t::little);
-    source.blocks.front().values[1].pcode_opcode = k_pcode_callother;
+    source.blocks.front().values[2].pcode_opcode = k_pcode_callother;
     const auto result = ghidra_ir_adapter::normalize(source);
     require(result.succeeded(), "unknown p-code must remain representable in typed artifacts");
     require(!result.artifacts->provider_ir.unknowns.empty(), "unknown p-code is missing an explicit unknown record");

@@ -5,6 +5,7 @@
 #include "../workspace/pe_image.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -119,6 +120,7 @@ struct pe_coff_reader_limits_t {
 struct pe_coff_metadata_result_t {
     pe_coff_normalized_record_t record;
     image_layout_index_t layout;
+    std::shared_ptr<const pe_image_t> pe_adapter;
 };
 
 workspace_result_t<pe_coff_metadata_result_t>

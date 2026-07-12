@@ -3,6 +3,8 @@
 #include "checked_range.hpp"
 #include "persistence_queue.hpp"
 #include "workspace_database.hpp"
+#include "../decode/x86_tile_decoder.hpp"
+#include "../provider_snapshot.hpp"
 
 #include <algorithm>
 #include <array>
@@ -158,6 +160,16 @@ bool executable_rva(const workspace_image_t& image, std::uint64_t rva) {
         return false;
     const auto& range = *std::prev(found);
     return rva >= range.start && rva < range.end;
+}
+
+bool supports_x86_tile_decode(const arch_decoder_registration_t& registration) noexcept {
+    const auto& key = registration.key;
+    if (key.architecture == architecture_id_t::x86 &&
+        (key.mode == architecture_mode_t::x86_16 || key.mode == architecture_mode_t::x86_32))
+        return registration.implementation_id == "zydis.x86";
+    return key.architecture == architecture_id_t::x86_64 &&
+           key.mode == architecture_mode_t::x86_64 &&
+           registration.implementation_id == "zydis.x86_64";
 }
 
 std::optional<image_file_mapping_t> file_mapping(const workspace_image_t& image,
@@ -432,6 +444,8 @@ struct pe_baseline_analyzer_t::impl_t {
     bool decode_stop = false;
     std::optional<workspace_error_t> decode_error;
     std::vector<decode_lane_output_t> lane_outputs;
+    std::shared_ptr<provider_snapshot_t> x86_tile_snapshot;
+    std::mutex x86_tile_snapshot_mutex;
     std::atomic<std::uint64_t> decode_candidate_count{0};
     std::atomic<std::uint64_t> decode_storage_bytes{0};
     std::vector<std::uint64_t> undecodable_rvas;
@@ -825,14 +839,41 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
     budget.max_target_facts = saturated_product(impl_->settings.max_decoded_instructions,
         registration.value().limits.maximum_target_facts,
         arch_decode_budget_t::hard_max_target_facts);
-    auto decoder_result = default_arch_decoder_registry().create_worker(impl_->decoder_key,
-        budget, impl_->cancellation.token());
-    if (!decoder_result)
-        return workspace_result_t<void>::failure(decoder_result.error());
-    auto decoder = decoder_result.take_value();
+    const bool use_x86_tile_decoder = supports_x86_tile_decode(registration.value());
+    std::unique_ptr<worker_owned_arch_decoder_t> decoder;
+    std::unique_ptr<decode::worker_owned_x86_tile_decoder_t> x86_tile_decoder;
+    std::shared_ptr<provider_snapshot_t> x86_tile_snapshot;
+    if (use_x86_tile_decoder) {
+        std::lock_guard<std::mutex> lock(impl_->x86_tile_snapshot_mutex);
+        if (!impl_->x86_tile_snapshot) {
+            const auto& provider = impl_->workspace->provider_handle();
+            auto snapshot = provider->identity().immutable_snapshot
+                ? provider_snapshot_t::capture(provider, impl_->expected_generation,
+                    impl_->cancellation.token())
+                : provider_snapshot_t::materialize(provider, {}, impl_->cancellation.token());
+            if (!snapshot)
+                return workspace_result_t<void>::failure(snapshot.error());
+            impl_->x86_tile_snapshot = snapshot.take_value();
+        }
+        x86_tile_snapshot = impl_->x86_tile_snapshot;
+        auto tile_decoder = decode::worker_owned_x86_tile_decoder_t::create(
+            impl_->decoder_key.mode);
+        if (!tile_decoder)
+            return workspace_result_t<void>::failure(tile_decoder.error());
+        x86_tile_decoder = tile_decoder.take_value();
+    } else {
+        auto decoder_result = default_arch_decoder_registry().create_worker(impl_->decoder_key,
+            budget, impl_->cancellation.token());
+        if (!decoder_result)
+            return workspace_result_t<void>::failure(decoder_result.error());
+        decoder = decoder_result.take_value();
+    }
     arch_decode_result_t decoded;
     auto& output = impl_->lane_outputs[lane];
     std::uint64_t requested = 0;
+    std::uint64_t tile_input_bytes = 0;
+    std::uint64_t tile_decoded_bytes = 0;
+    std::uint64_t tile_instructions = 0;
     std::uint64_t checks = 0;
     for (;;) {
         decode_work_t work;
@@ -874,6 +915,106 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
         };
         auto current = work.rva;
         std::uint32_t trace = 0;
+        const auto accept_decoded = [&](const arch_decode_result_t& value,
+            const image_file_mapping_t& mapping, const arch_decode_request_t& request) -> bool {
+            decoded_candidate_t candidate;
+            candidate.instruction = value.instruction;
+            candidate.rva = current;
+            candidate.source_lane = lane;
+            if (candidate.instruction.length == 0 || !checked_add_u64(current,
+                    candidate.instruction.length, candidate.end_rva) ||
+                !workspace_image_span_within(current, candidate.instruction.length,
+                    impl_->image->image_size) ||
+                candidate.instruction.length > mapping.available_bytes) {
+                std::lock_guard<std::mutex> lock(impl_->undecodable_mutex);
+                impl_->undecodable_rvas.push_back(current);
+                return false;
+            }
+            for (std::uint16_t index = 0; index < value.target_count; ++index) {
+                const auto& target = value.targets[index];
+                if (!target.direct || (target.kind != target_kind_record_t::branch &&
+                    target.kind != target_kind_record_t::call))
+                    continue;
+                const auto target_rva = to_rva(*impl_->image, target.target);
+                if (!target_rva)
+                    continue;
+                const auto target_provenance = target.kind == target_kind_record_t::call
+                    ? fact_provenance_t::call_target : fact_provenance_t::recursive_decode;
+                const auto source_id = stable_mix(request.stable_source_id, *target_rva);
+                if (!impl_->enqueue_decode({*target_rva, target_provenance,
+                        target.kind == target_kind_record_t::call ? 90U : 95U, source_id}))
+                    return false;
+                if (target.kind == target_kind_record_t::call) {
+                    function_seed_t seed;
+                    seed.address = rva_address(*impl_->image, *target_rva);
+                    seed.kind = function_seed_kind_t::direct_call_target;
+                    seed.provenance = fact_provenance_t::call_target;
+                    seed.confidence = 90;
+                    seed.stable_source_id = source_id;
+                    if (!impl_->add_function_seed(std::move(seed))) {
+                        std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+                        impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                            "dynamic function seeds exceed analysis budget", "decode");
+                        impl_->decode_stop = true;
+                        return false;
+                    }
+                }
+            }
+            if (impl_->current_decode_error())
+                return false;
+            if (value.operand_count > value.operands.size() ||
+                value.target_count > value.targets.size() ||
+                output.operands.size() > std::numeric_limits<std::uint32_t>::max() -
+                    value.operand_count ||
+                output.targets.size() > std::numeric_limits<std::uint32_t>::max() -
+                    value.target_count) {
+                std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+                impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "decode output exceeds analysis budget", "decode");
+                impl_->decode_stop = true;
+                return false;
+            }
+            std::uint64_t batch_bytes = sizeof(decoded_candidate_t) * 2ULL;
+            std::uint64_t fact_bytes = 0;
+            if (!checked_mul_u64(value.operand_count, sizeof(operand_fact_t), fact_bytes) ||
+                !checked_add_u64(batch_bytes, fact_bytes, batch_bytes) ||
+                !checked_mul_u64(value.target_count, sizeof(target_fact_t), fact_bytes) ||
+                !checked_add_u64(batch_bytes, fact_bytes, batch_bytes) ||
+                !impl_->reserve_decode_storage(batch_bytes)) {
+                std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+                impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "decode fact storage exceeds analysis memory budget", "decode");
+                impl_->decode_stop = true;
+                return false;
+            }
+            const auto count = impl_->decode_candidate_count.fetch_add(1, std::memory_order_acq_rel);
+            if (count >= impl_->settings.max_decoded_instructions) {
+                impl_->decode_candidate_count.fetch_sub(1, std::memory_order_acq_rel);
+                std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+                impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "decoded instruction count exceeds analysis budget", "decode");
+                impl_->decode_stop = true;
+                return false;
+            }
+            candidate.instruction.operand_fact_begin = static_cast<std::uint32_t>(output.operands.size());
+            candidate.instruction.operand_fact_count = value.operand_count;
+            candidate.instruction.target_fact_begin = static_cast<std::uint32_t>(output.targets.size());
+            candidate.instruction.target_fact_count = value.target_count;
+            output.operands.insert(output.operands.end(), value.operands.begin(),
+                value.operands.begin() + value.operand_count);
+            output.targets.insert(output.targets.end(), value.targets.begin(),
+                value.targets.begin() + value.target_count);
+            output.candidates.push_back(std::move(candidate));
+            const auto flags = output.candidates.back().instruction.flow_flags;
+            if ((flags & (flow_return | flow_interrupt | flow_terminal)) != 0 ||
+                ((flags & flow_branch) != 0 && (flags & flow_fallthrough) == 0))
+                return false;
+            current = output.candidates.back().end_rva;
+            work.provenance = fact_provenance_t::recursive_decode;
+            work.confidence = std::min<std::uint8_t>(work.confidence, 95);
+            work.stable_source_id = stable_mix(work.stable_source_id, current);
+            return true;
+        };
         for (;;) {
             if (++checks >= impl_->settings.cancellation_check_interval) {
                 checks = 0;
@@ -910,10 +1051,161 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
             if (!executable_rva(*impl_->image, current))
                 break;
             const auto mapping = file_mapping(*impl_->image, current);
-            if (!mapping || mapping->available_bytes < decoder->registration().limits.minimum_instruction_bytes) {
+            if (!mapping || mapping->available_bytes <
+                registration.value().limits.minimum_instruction_bytes) {
                 std::lock_guard<std::mutex> lock(impl_->undecodable_mutex);
                 impl_->undecodable_rvas.push_back(current);
                 break;
+            }
+            if (use_x86_tile_decoder) {
+                const auto tile_bytes = std::min({mapping->available_bytes,
+                    impl_->settings.decode_read_window_bytes,
+                    decode::x86_tile_decode_limits_t::hard_maximum_window_bytes,
+                    decode::x86_tile_decode_limits_t::hard_maximum_instructions});
+                if (tile_bytes == 0) {
+                    std::lock_guard<std::mutex> lock(impl_->undecodable_mutex);
+                    impl_->undecodable_rvas.push_back(current);
+                    break;
+                }
+                decode::x86_tile_decode_request_t tile_request;
+                tile_request.start_address = rva_address(*impl_->image, current);
+                tile_request.provider_offset = mapping->provider_offset;
+                tile_request.byte_count = tile_bytes;
+                tile_request.image_base = impl_->image->image_base;
+                tile_request.image_size = impl_->image->image_size;
+                tile_request.provenance = work.provenance;
+                tile_request.confidence = work.confidence;
+                tile_request.stable_source_id = stable_mix(work.stable_source_id, current);
+                tile_request.limits.maximum_window_bytes = tile_bytes;
+                tile_request.limits.maximum_decode_attempts = tile_bytes;
+                tile_request.limits.maximum_instructions = tile_bytes;
+                tile_request.limits.maximum_operand_facts = tile_bytes * 10ULL;
+                tile_request.limits.maximum_target_facts = tile_bytes * 11ULL;
+                tile_request.limits.maximum_invalid_bytes = tile_bytes;
+                tile_request.limits.maximum_coverage_spans = tile_bytes;
+                auto tile = x86_tile_decoder->decode_tile(*x86_tile_snapshot, tile_request,
+                    impl_->cancellation.token());
+                if (!tile) {
+                    finish();
+                    return workspace_result_t<void>::failure(tile.error());
+                }
+                requested += tile.value().usage.snapshot_window_bytes;
+                tile_input_bytes += tile.value().usage.input_bytes;
+                tile_decoded_bytes += tile.value().usage.decoded_bytes;
+                tile_instructions += tile.value().usage.instructions;
+                std::uint64_t tile_end = 0;
+                if (!checked_add_u64(current, tile_bytes, tile_end)) {
+                    finish();
+                    return workspace_result_t<void>::failure(make_workspace_error(
+                        workspace_error_code_t::range_overflow,
+                        "x86 tile decode range overflowed", "decode"));
+                }
+                bool tile_stopped = false;
+                for (std::size_t index = 0; index < tile.value().instructions.size(); ++index) {
+                    if (index != 0) {
+                        if (++checks >= impl_->settings.cancellation_check_interval) {
+                            checks = 0;
+                            active = impl_->ensure_active(runtime_cancel, "decode");
+                            if (!active) {
+                                finish();
+                                return active;
+                            }
+                        }
+                        if (++trace > impl_->settings.max_trace_instructions) {
+                            auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                "recursive decode trace exceeds analysis budget", "decode");
+                            {
+                                std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+                                impl_->decode_error = error;
+                                impl_->decode_stop = true;
+                            }
+                            tile_stopped = true;
+                            break;
+                        }
+                    }
+                    if (!executable_rva(*impl_->image, current)) {
+                        tile_stopped = true;
+                        break;
+                    }
+                    if (index != 0) {
+                        std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+                        const auto claimed = impl_->claimed.find(current);
+                        if (claimed != impl_->claimed.end() &&
+                            !stronger_decode_work(work, claimed->second)) {
+                            tile_stopped = true;
+                            break;
+                        }
+                        if (impl_->claimed.size() >= impl_->settings.max_decoded_instructions ||
+                            !impl_->reserve_decode_storage(sizeof(decode_work_t) * 2ULL)) {
+                            impl_->decode_error = make_workspace_error(
+                                workspace_error_code_t::limit_exceeded,
+                                "decode claim storage exceeds analysis budget", "decode");
+                            impl_->decode_stop = true;
+                            tile_stopped = true;
+                            break;
+                        }
+                        impl_->claimed[current] = work;
+                    }
+                    const auto& instruction = tile.value().instructions[index];
+                    if (instruction.address != rva_address(*impl_->image, current)) {
+                        std::lock_guard<std::mutex> lock(impl_->undecodable_mutex);
+                        impl_->undecodable_rvas.push_back(current);
+                        tile_stopped = true;
+                        break;
+                    }
+                    const auto operand_end = static_cast<std::uint64_t>(
+                        instruction.operand_fact_begin) + instruction.operand_fact_count;
+                    const auto target_end = static_cast<std::uint64_t>(
+                        instruction.target_fact_begin) + instruction.target_fact_count;
+                    if (operand_end > tile.value().operand_facts.size() ||
+                        target_end > tile.value().target_facts.size() ||
+                        instruction.operand_fact_count > decoded.operands.size() ||
+                        instruction.target_fact_count > decoded.targets.size()) {
+                        finish();
+                        return workspace_result_t<void>::failure(make_workspace_error(
+                            workspace_error_code_t::integrity_failure,
+                            "x86 tile decoder returned invalid Compact IR ranges", "decode"));
+                    }
+                    decoded = {};
+                    decoded.instruction = instruction;
+                    decoded.instruction.provenance = work.provenance;
+                    decoded.instruction.confidence = work.confidence;
+                    decoded.instruction.stable_source_id = stable_mix(work.stable_source_id,
+                        current);
+                    decoded.operand_count = instruction.operand_fact_count;
+                    decoded.target_count = instruction.target_fact_count;
+                    std::copy_n(tile.value().operand_facts.begin() + instruction.operand_fact_begin,
+                        decoded.operand_count, decoded.operands.begin());
+                    std::copy_n(tile.value().target_facts.begin() + instruction.target_fact_begin,
+                        decoded.target_count, decoded.targets.begin());
+                    arch_decode_request_t request;
+                    request.address = decoded.instruction.address;
+                    if (!checked_add_u64(mapping->provider_offset,
+                            current - tile_request.start_address.value, request.provider_offset)) {
+                        finish();
+                        return workspace_result_t<void>::failure(make_workspace_error(
+                            workspace_error_code_t::range_overflow,
+                            "x86 tile provider offset overflowed", "decode"));
+                    }
+                    request.image_base = impl_->image->image_base;
+                    request.image_size = impl_->image->image_size;
+                    request.available_bytes = decoded.instruction.length;
+                    request.provenance = work.provenance;
+                    request.confidence = work.confidence;
+                    request.stable_source_id = decoded.instruction.stable_source_id;
+                    if (!accept_decoded(decoded, *mapping, request)) {
+                        tile_stopped = true;
+                        break;
+                    }
+                }
+                if (!tile_stopped && current < tile_end) {
+                    std::lock_guard<std::mutex> lock(impl_->undecodable_mutex);
+                    impl_->undecodable_rvas.push_back(current);
+                    tile_stopped = true;
+                }
+                if (tile_stopped)
+                    break;
+                continue;
             }
             const auto available = std::min<std::uint64_t>(mapping->available_bytes,
                 std::min<std::uint64_t>(impl_->settings.decode_read_window_bytes,
@@ -948,108 +1240,22 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
                 impl_->undecodable_rvas.push_back(current);
                 break;
             }
-            decoded_candidate_t candidate;
-            candidate.instruction = decoded.instruction;
-            candidate.rva = current;
-            candidate.source_lane = lane;
-            if (candidate.instruction.length == 0 || !checked_add_u64(current,
-                    candidate.instruction.length, candidate.end_rva) ||
-                !workspace_image_span_within(current, candidate.instruction.length,
-                    impl_->image->image_size) ||
-                candidate.instruction.length > mapping->available_bytes) {
-                std::lock_guard<std::mutex> lock(impl_->undecodable_mutex);
-                impl_->undecodable_rvas.push_back(current);
+            if (!accept_decoded(decoded, *mapping, request))
                 break;
-            }
-            for (std::uint16_t index = 0; index < decoded.target_count; ++index) {
-                const auto& target = decoded.targets[index];
-                if (!target.direct || (target.kind != target_kind_record_t::branch &&
-                    target.kind != target_kind_record_t::call))
-                    continue;
-                const auto target_rva = to_rva(*impl_->image, target.target);
-                if (!target_rva)
-                    continue;
-                const auto target_provenance = target.kind == target_kind_record_t::call
-                    ? fact_provenance_t::call_target : fact_provenance_t::recursive_decode;
-                const auto source_id = stable_mix(request.stable_source_id, *target_rva);
-                if (!impl_->enqueue_decode({*target_rva, target_provenance,
-                        target.kind == target_kind_record_t::call ? 90U : 95U, source_id}))
-                    break;
-                if (target.kind == target_kind_record_t::call) {
-                    function_seed_t seed;
-                    seed.address = rva_address(*impl_->image, *target_rva);
-                    seed.kind = function_seed_kind_t::direct_call_target;
-                    seed.provenance = fact_provenance_t::call_target;
-                    seed.confidence = 90;
-                    seed.stable_source_id = source_id;
-                    if (!impl_->add_function_seed(std::move(seed))) {
-                        std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-                        impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
-                            "dynamic function seeds exceed analysis budget", "decode");
-                        impl_->decode_stop = true;
-                        break;
-                    }
-                }
-            }
-            if (impl_->current_decode_error())
-                break;
-            if (output.operands.size() > std::numeric_limits<std::uint32_t>::max() - decoded.operand_count ||
-                output.targets.size() > std::numeric_limits<std::uint32_t>::max() - decoded.target_count) {
-                std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-                impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
-                    "decode output exceeds analysis budget", "decode");
-                impl_->decode_stop = true;
-                break;
-            }
-            std::uint64_t batch_bytes = sizeof(decoded_candidate_t) * 2ULL;
-            std::uint64_t fact_bytes = 0;
-            if (!checked_mul_u64(decoded.operand_count, sizeof(operand_fact_t), fact_bytes) ||
-                !checked_add_u64(batch_bytes, fact_bytes, batch_bytes) ||
-                !checked_mul_u64(decoded.target_count, sizeof(target_fact_t), fact_bytes) ||
-                !checked_add_u64(batch_bytes, fact_bytes, batch_bytes) ||
-                !impl_->reserve_decode_storage(batch_bytes)) {
-                std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-                impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
-                    "decode fact storage exceeds analysis memory budget", "decode");
-                impl_->decode_stop = true;
-                break;
-            }
-            const auto count = impl_->decode_candidate_count.fetch_add(1, std::memory_order_acq_rel);
-            if (count >= impl_->settings.max_decoded_instructions) {
-                impl_->decode_candidate_count.fetch_sub(1, std::memory_order_acq_rel);
-                std::lock_guard<std::mutex> lock(impl_->decode_mutex);
-                impl_->decode_error = make_workspace_error(workspace_error_code_t::limit_exceeded,
-                    "decoded instruction count exceeds analysis budget", "decode");
-                impl_->decode_stop = true;
-                break;
-            }
-            candidate.instruction.operand_fact_begin = static_cast<std::uint32_t>(output.operands.size());
-            candidate.instruction.operand_fact_count = decoded.operand_count;
-            candidate.instruction.target_fact_begin = static_cast<std::uint32_t>(output.targets.size());
-            candidate.instruction.target_fact_count = decoded.target_count;
-            output.operands.insert(output.operands.end(), decoded.operands.begin(),
-                decoded.operands.begin() + decoded.operand_count);
-            output.targets.insert(output.targets.end(), decoded.targets.begin(),
-                decoded.targets.begin() + decoded.target_count);
-            output.candidates.push_back(std::move(candidate));
-            const auto flags = output.candidates.back().instruction.flow_flags;
-            if ((flags & (flow_return | flow_interrupt | flow_terminal)) != 0 ||
-                ((flags & flow_branch) != 0 && (flags & flow_fallthrough) == 0))
-                break;
-            current = output.candidates.back().end_rva;
-            work.provenance = fact_provenance_t::recursive_decode;
-            work.confidence = std::min<std::uint8_t>(work.confidence, 95);
-            work.stable_source_id = stable_mix(work.stable_source_id, current);
         }
         finish();
         if (const auto error = impl_->current_decode_error())
             return workspace_result_t<void>::failure(*error);
     }
-    const auto& usage = decoder->usage();
-    impl_->metrics->add(analysis_metric_t::read_bytes, usage.input_bytes);
+    const auto input_bytes = use_x86_tile_decoder ? tile_input_bytes : decoder->usage().input_bytes;
+    const auto decoded_bytes = use_x86_tile_decoder ? tile_decoded_bytes : decoder->usage().decoded_bytes;
+    const auto instruction_count = use_x86_tile_decoder
+        ? tile_instructions : decoder->usage().instructions;
+    const auto cancellation_polls = use_x86_tile_decoder ? checks : decoder->usage().cancellation_polls;
+    impl_->metrics->add(analysis_metric_t::read_bytes, input_bytes);
     impl_->metrics->add(analysis_metric_t::mapped_bytes, requested);
-    impl_->metrics->end_phase(measurement, usage.input_bytes, usage.decoded_bytes,
-        usage.instructions, usage.cancellation_polls, false);
+    impl_->metrics->end_phase(measurement, input_bytes, decoded_bytes,
+        instruction_count, cancellation_polls, false);
     return workspace_result_t<void>::success();
 }
 

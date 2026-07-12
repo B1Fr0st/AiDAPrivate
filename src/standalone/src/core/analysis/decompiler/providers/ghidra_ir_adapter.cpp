@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -10,7 +11,9 @@
 #include <utility>
 
 #include "funcdata.hh"
+#include "fspec.hh"
 #include "opcodes.hh"
+#include "type.hh"
 #include "variable.hh"
 
 namespace aida::analysis::ghidra_ir_adapter {
@@ -470,7 +473,8 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
     capture_t capture;
     capture.request = request;
     std::map<const ghidra::Datatype*, std::uint64_t> types;
-    const auto ensure_type = [&capture, &types](const ghidra::Datatype* type) {
+    std::function<std::uint64_t(const ghidra::Datatype*)> ensure_type;
+    ensure_type = [&capture, &types, &ensure_type](const ghidra::Datatype* type) {
         if (!type)
             return std::uint64_t{0};
         const auto found = types.find(type);
@@ -488,6 +492,71 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         value.alignment = type->getAlignment() > 0 ? static_cast<std::uint32_t>(type->getAlignment()) : 1U;
         value.is_signed = type->getMetatype() == ghidra::TYPE_INT;
         capture.types.push_back(std::move(value));
+        const auto append_edge = [&](const ghidra::Datatype* target,
+                                     const decompiler_type_edge_kind_t kind,
+                                     std::string stable_name,
+                                     std::optional<std::uint64_t> byte_offset = std::nullopt) {
+            const auto target_id = ensure_type(target);
+            if (target_id == 0 || target_id == id)
+                return;
+            auto& source = capture.types.at(static_cast<std::size_t>(id - 1U));
+            const auto duplicate = std::find_if(source.edges.begin(), source.edges.end(),
+                [&](const capture_type_edge_t& edge) {
+                    return edge.target_type_id == target_id && edge.kind == kind &&
+                        edge.stable_name == stable_name && edge.byte_offset == byte_offset;
+                });
+            if (duplicate == source.edges.end())
+                source.edges.push_back({target_id, kind, std::move(stable_name), byte_offset});
+        };
+        if (const auto* alias = type->getTypedef(); alias && alias != type)
+            append_edge(alias, decompiler_type_edge_kind_t::alias, "typedef");
+        if (const auto* pointer = dynamic_cast<const ghidra::TypePointer*>(type)) {
+            append_edge(pointer->getPtrTo(), decompiler_type_edge_kind_t::pointee, "pointee");
+            return id;
+        }
+        if (const auto* array = dynamic_cast<const ghidra::TypeArray*>(type)) {
+            append_edge(array->getBase(), decompiler_type_edge_kind_t::element, "element", 0U);
+            return id;
+        }
+        if (const auto* structure = dynamic_cast<const ghidra::TypeStruct*>(type)) {
+            std::uint32_t index = 0;
+            for (auto field = structure->beginField(); field != structure->endField(); ++field, ++index) {
+                const std::string name = field->name.empty()
+                    ? "member." + std::to_string(index) : field->name;
+                append_edge(field->type, decompiler_type_edge_kind_t::member, name,
+                    field->offset >= 0 ? std::optional<std::uint64_t>{static_cast<std::uint64_t>(field->offset)}
+                                       : std::nullopt);
+            }
+            return id;
+        }
+        if (const auto* union_type = dynamic_cast<const ghidra::TypeUnion*>(type)) {
+            for (ghidra::int4 index = 0; index < union_type->numDepend(); ++index) {
+                const auto* field = union_type->getField(index);
+                if (!field)
+                    continue;
+                const std::string name = field->name.empty()
+                    ? "member." + std::to_string(index) : field->name;
+                append_edge(field->type, decompiler_type_edge_kind_t::member, name,
+                    field->offset >= 0 ? std::optional<std::uint64_t>{static_cast<std::uint64_t>(field->offset)}
+                                       : std::nullopt);
+            }
+            return id;
+        }
+        if (const auto* code = dynamic_cast<const ghidra::TypeCode*>(type)) {
+            const auto* prototype = code->getPrototype();
+            if (prototype) {
+                append_edge(prototype->getOutputType(), decompiler_type_edge_kind_t::return_type, "return");
+                for (ghidra::int4 index = 0; index < prototype->numParams(); ++index) {
+                    const auto* parameter = prototype->getParam(index);
+                    append_edge(parameter ? parameter->getType() : nullptr,
+                        decompiler_type_edge_kind_t::parameter, "parameter." + std::to_string(index));
+                }
+            }
+            return id;
+        }
+        for (ghidra::int4 index = 0; index < type->numDepend(); ++index)
+            append_edge(type->getDepend(index), decompiler_type_edge_kind_t::alias,
+                "dependency." + std::to_string(index));
         return id;
     };
     capture.request.return_type_id = ensure_type(function.getFuncProto().getOutputType());
@@ -495,6 +564,7 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
     std::map<const ghidra::PcodeOp*, std::uint64_t> operation_ids;
     std::map<std::uint64_t, std::vector<const ghidra::PcodeOp*>> operations_by_block;
     std::map<const ghidra::Varnode*, std::uint64_t> input_ids;
+    std::map<const ghidra::Varnode*, std::uint64_t> defined_ids;
     std::map<const ghidra::HighVariable*, std::uint64_t> high_ids;
     std::uint64_t next_value_id = 1;
     const auto& graph = function.getBasicBlocks();
@@ -543,9 +613,38 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         }
     }
     for (const auto& entry_pair : operations_by_block) {
-        for (const auto* operation : entry_pair.second)
-            operation_ids.at(operation) = next_value_id++;
+        for (const auto* operation : entry_pair.second) {
+            const auto operation_id = next_value_id++;
+            operation_ids.at(operation) = operation_id;
+            const auto* output = operation->getOut();
+            if (output && !defined_ids.emplace(output, operation_id).second) {
+                extraction_result_t result;
+                result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.duplicate_output_varnode", 1));
+                return result;
+            }
+        }
     }
+    const auto collect_high = [&capture, &high_ids, &ensure_type](const ghidra::Varnode* node) {
+        if (!node || !node->getHigh())
+            return true;
+        const auto* high = node->getHigh();
+        if (high_ids.find(high) != high_ids.end())
+            return true;
+        const auto type_id = ensure_type(high->getType());
+        if (type_id == 0)
+            return false;
+        const auto id = static_cast<std::uint64_t>(high_ids.size() + 1U);
+        high_ids.emplace(high, id);
+        capture_high_variable_t variable;
+        variable.id = id;
+        variable.parameter = high->isInput();
+        variable.stable_name = "high_" + std::to_string(id);
+        variable.type_id = type_id;
+        variable.address = node->getAddr().getOffset();
+        capture.high_variables.push_back(std::move(variable));
+        return true;
+    };
     for (const auto& pair : input_ids) {
         const auto* input = pair.first;
         capture_value_t value;
@@ -558,6 +657,12 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         value.address = input->getAddr().getOffset();
         value.stable_immediate = input->isConstant() ? std::to_string(input->getOffset()) : std::string{};
         entry->second.values.push_back(std::move(value));
+        if (!collect_high(input)) {
+            extraction_result_t result;
+            result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.input_varnode_type", 1));
+            return result;
+        }
     }
     for (const auto& entry_pair : operations_by_block) {
         auto block = blocks.find(entry_pair.first);
@@ -565,47 +670,56 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             continue;
         for (const auto* operation : entry_pair.second) {
             const auto value_id = operation_ids.at(operation);
-        capture_value_t value;
-        value.id = value_id;
-        value.kind = capture_value_kind_t::pcode;
-        value.pcode_opcode = static_cast<std::uint16_t>(operation->code());
-        const auto* output = operation->getOut();
-        value.type_id = ensure_type(output ? output->getHighTypeDefFacing() : function.getFuncProto().getOutputType());
-        if (value.type_id == 0)
-            value.type_id = ensure_type(output ? output->getTypeDefFacing() : function.getFuncProto().getOutputType());
-        value.address = operation->getSeqNum().getAddr().getOffset();
-        value.stable_symbol = ghidra::get_opname(operation->code());
-        for (ghidra::int4 index = 0; index < operation->numInput(); ++index) {
-            const auto* input = operation->getIn(index);
-            if (!input)
-                continue;
-            const auto defined = input->getDef();
-            const auto operation_id = defined ? operation_ids.find(defined) : operation_ids.end();
-            if (operation_id != operation_ids.end())
-                value.operand_ids.push_back(operation_id->second);
-            else if (const auto input_id = input_ids.find(input); input_id != input_ids.end())
-                value.operand_ids.push_back(input_id->second);
-        }
-        block->second.values.push_back(std::move(value));
-        const auto collect_high = [&capture, &high_ids, &ensure_type](const ghidra::Varnode* node) {
-            if (!node || !node->getHigh())
-                return;
-            const auto* high = node->getHigh();
-            if (high_ids.find(high) != high_ids.end())
-                return;
-            const auto id = static_cast<std::uint64_t>(high_ids.size() + 1U);
-            high_ids.emplace(high, id);
-            capture_high_variable_t variable;
-            variable.id = id;
-            variable.parameter = high->isInput();
-            variable.stable_name = "high_" + std::to_string(id);
-            variable.type_id = ensure_type(high->getType());
-            variable.address = node->getAddr().getOffset();
-            capture.high_variables.push_back(std::move(variable));
-        };
-        collect_high(output);
-        for (ghidra::int4 index = 0; index < operation->numInput(); ++index)
-            collect_high(operation->getIn(index));
+            capture_value_t value;
+            value.id = value_id;
+            value.kind = capture_value_kind_t::pcode;
+            value.pcode_opcode = static_cast<std::uint16_t>(operation->code());
+            const auto* output = operation->getOut();
+            if (output && defined_ids.find(output) == defined_ids.end()) {
+                extraction_result_t result;
+                result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.output_varnode_binding", 1));
+                return result;
+            }
+            value.type_id = ensure_type(output ? output->getHighTypeDefFacing() : function.getFuncProto().getOutputType());
+            if (value.type_id == 0)
+                value.type_id = ensure_type(output ? output->getTypeDefFacing() : function.getFuncProto().getOutputType());
+            if (value.type_id == 0) {
+                extraction_result_t result;
+                result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.output_varnode_type", 1));
+                return result;
+            }
+            value.address = operation->getSeqNum().getAddr().getOffset();
+            value.stable_symbol = ghidra::get_opname(operation->code());
+            for (ghidra::int4 index = 0; index < operation->numInput(); ++index) {
+                const auto* input = operation->getIn(index);
+                if (!input)
+                    continue;
+                if (const auto defined = defined_ids.find(input); defined != defined_ids.end()) {
+                    value.operand_ids.push_back(defined->second);
+                } else if (const auto input_id = input_ids.find(input); input_id != input_ids.end()) {
+                    value.operand_ids.push_back(input_id->second);
+                } else {
+                    extraction_result_t result;
+                    result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                        decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.input_varnode_binding", 1));
+                    return result;
+                }
+                if (!collect_high(input)) {
+                    extraction_result_t result;
+                    result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                        decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.input_varnode_type", 1));
+                    return result;
+                }
+            }
+            if (!collect_high(output)) {
+                extraction_result_t result;
+                result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.output_varnode_high_type", 1));
+                return result;
+            }
+            block->second.values.push_back(std::move(value));
         }
     }
     for (auto& pair : blocks) {

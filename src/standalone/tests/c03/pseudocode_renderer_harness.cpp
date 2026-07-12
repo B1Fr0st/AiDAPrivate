@@ -250,6 +250,16 @@ void require_source_map_coverage(const decompiler_document_t& document)
         require(value, "renderer source maps do not cover the rendered document");
 }
 
+void require_deterministic_document(const decompiler_document_t& first,
+                                    const decompiler_document_t& second)
+{
+    const auto first_bytes = serialize_pseudocode_document_v2(first);
+    const auto second_bytes = serialize_pseudocode_document_v2(second);
+    require(first_bytes == second_bytes, "V2 document serialization is nondeterministic");
+    require(stable_serialization_hash(first) == stable_serialization_hash(second),
+        "V2 document hash is nondeterministic");
+}
+
 void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto provider = provider_ir(entity_value);
@@ -269,6 +279,7 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
         "typed AST serialization hash drifted");
 
     const auto& rendered = *first.rendering;
+    const auto& rendered_second = *second.rendering;
     const std::string expected =
         "int renderer_fixture(int arg0) {\n"
         "    int result;\n"
@@ -276,6 +287,8 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
         "    return result;\n"
         "}\n";
     require(rendered.document->rendered_text == expected, "generated AST golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second generated AST render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
     require_source_map_coverage(*rendered.document);
     const auto encoded_document = serialize_pseudocode_document_v2(*rendered.document);
     const auto decoded_document = deserialize_pseudocode_document_v2(encoded_document);
@@ -326,7 +339,9 @@ void verify_structured_semantic_fixture(const decompiler_entity_key_t& entity_va
     pseudocode_renderer_v2_request_t request;
     request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
     const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
     require(rendered.succeeded(), "renderer rejected structured control flow and exceptions");
+    require(rendered_second.succeeded(), "second renderer pass rejected structured control flow and exceptions");
     const std::string expected =
         "int structured_fixture() {\n"
         "    if (ready) {\n"
@@ -346,6 +361,8 @@ void verify_structured_semantic_fixture(const decompiler_entity_key_t& entity_va
         "    }\n"
         "}\n";
     require(rendered.document->rendered_text == expected, "structured semantic golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second structured semantic render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
     require_source_map_coverage(*rendered.document);
 }
 

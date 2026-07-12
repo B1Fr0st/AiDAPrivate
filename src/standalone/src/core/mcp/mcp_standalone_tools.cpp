@@ -4,6 +4,8 @@
 #include "mcp_standalone.hpp"
 #include "standalone_tools_fwd.hpp"
 #include "calculator_tool.hpp"
+#include "compat/effect_policy.hpp"
+#include "compat/python_worker_host.hpp"
 #include "ida_compat_mut.hpp"
 #include "ida_compat_read.hpp"
 #include "schema_validator.hpp"
@@ -3395,6 +3397,8 @@ namespace mcp_standalone
 {
     namespace
     {
+        namespace python_compat = aida::standalone::mcp::compat;
+
         workspace_request_context_t targetless_ida_compat_context()
         {
             workspace_request_context_t context;
@@ -3404,6 +3408,239 @@ namespace mcp_standalone
             context.request_id = current_call_request_id();
             context.tool_name = current_call_tool_name();
             return context;
+        }
+
+        std::optional<fs::path> standalone_package_root()
+        {
+            std::vector<wchar_t> path(32768U, L'\0');
+            const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+            if (length == 0 || length >= path.size())
+                return std::nullopt;
+            path.resize(length);
+            const fs::path executable(path);
+            if (executable.parent_path().empty())
+                return std::nullopt;
+            return executable.parent_path();
+        }
+
+        std::optional<fs::path> isolated_python_script_path(const json& params, const fs::path& script_root)
+        {
+            const auto file_path = params.find("file_path");
+            if (script_root.empty() || file_path == params.end() || !file_path->is_string())
+                return std::nullopt;
+            const std::string raw = file_path->get<std::string>();
+            if (raw.empty() || raw.size() > 4096U || raw.find('\0') != std::string::npos)
+                return std::nullopt;
+            const fs::path relative = fs::u8path(raw);
+            if (relative.empty() || relative.is_absolute() || relative.has_root_name() || relative.has_root_directory())
+                return std::nullopt;
+            std::wstring extension = relative.extension().wstring();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+            if (extension != L".py")
+                return std::nullopt;
+            return (script_root / relative).lexically_normal();
+        }
+
+        std::optional<std::uint64_t> json_nonnegative_u64(const json& value)
+        {
+            if (value.is_number_unsigned())
+                return value.get<std::uint64_t>();
+            if (value.is_number_integer()) {
+                const auto signed_value = value.get<std::int64_t>();
+                if (signed_value >= 0)
+                    return static_cast<std::uint64_t>(signed_value);
+            }
+            return std::nullopt;
+        }
+
+        python_compat::python_workspace_response_t isolated_python_workspace_error(
+            std::string code, std::string message)
+        {
+            python_compat::python_workspace_response_t response;
+            response.error_code = std::move(code);
+            response.error_message = std::move(message);
+            return response;
+        }
+
+        python_compat::python_workspace_response_t isolated_python_workspace_api(
+            const python_compat::python_workspace_query_t& query,
+            const workspace_request_context_t& context)
+        {
+            if (context.cancellation_requested())
+                return isolated_python_workspace_error("CANCELLED", "workspace request was cancelled");
+            if (!context.workspace || context.kind != aida::analysis::target_kind_t::static_file)
+                return isolated_python_workspace_error("LIVE_TARGET_DENIED", "isolated Python worker requires a static workspace target");
+            if (!query.arguments.is_object())
+                return isolated_python_workspace_error("INVALID_ARGUMENTS", "workspace API arguments must be an object");
+            tool_result_t tool_result;
+            if (query.operation == "read_bytes") {
+                const auto offset = query.arguments.find("offset");
+                const auto size = query.arguments.find("size");
+                if (query.arguments.size() != 2U || offset == query.arguments.end() || size == query.arguments.end())
+                    return isolated_python_workspace_error("INVALID_ARGUMENTS", "read_bytes requires offset and size only");
+                const auto offset_value = json_nonnegative_u64(*offset);
+                const auto size_value = json_nonnegative_u64(*size);
+                if (!offset_value || !size_value || *size_value == 0 || *size_value > 65536U)
+                    return isolated_python_workspace_error("INVALID_ARGUMENTS", "read_bytes arguments exceed the approved limit");
+                tool_result = ida_compat::tool_get_bytes(
+                    json{{"address", "file:" + std::to_string(*offset_value)}, {"size", *size_value}}, context);
+            } else if (query.operation == "find") {
+                const auto text = query.arguments.find("query");
+                const auto limit = query.arguments.find("limit");
+                if ((query.arguments.size() != 1U && query.arguments.size() != 2U) || text == query.arguments.end() ||
+                    !text->is_string() || text->get<std::string>().empty() || text->get<std::string>().size() > 4096U)
+                    return isolated_python_workspace_error("INVALID_ARGUMENTS", "find requires a bounded query string");
+                std::uint64_t limit_value = 100;
+                if (limit != query.arguments.end()) {
+                    const auto parsed = json_nonnegative_u64(*limit);
+                    if (!parsed || *parsed == 0 || *parsed > 1000U)
+                        return isolated_python_workspace_error("INVALID_ARGUMENTS", "find limit exceeds the approved limit");
+                    limit_value = *parsed;
+                }
+                tool_result = ida_compat::tool_find(
+                    json{{"query", text->get<std::string>()}, {"limit", limit_value}}, context);
+            } else if (query.operation == "list_functions") {
+                const auto offset = query.arguments.find("offset");
+                const auto limit = query.arguments.find("limit");
+                if ((query.arguments.size() != 0U && query.arguments.size() != 1U && query.arguments.size() != 2U) ||
+                    (offset != query.arguments.end() && !json_nonnegative_u64(*offset)) ||
+                    (limit != query.arguments.end() && !json_nonnegative_u64(*limit)))
+                    return isolated_python_workspace_error("INVALID_ARGUMENTS", "list_functions arguments are invalid");
+                const std::uint64_t offset_value = offset == query.arguments.end()
+                    ? 0U : *json_nonnegative_u64(*offset);
+                const std::uint64_t limit_value = limit == query.arguments.end()
+                    ? 100U : *json_nonnegative_u64(*limit);
+                if (limit_value == 0 || limit_value > 1000U)
+                    return isolated_python_workspace_error("INVALID_ARGUMENTS", "list_functions limit exceeds the approved limit");
+                tool_result = ida_compat::tool_list_funcs(
+                    json{{"offset", offset_value}, {"limit", limit_value}}, context);
+            } else {
+                return isolated_python_workspace_error("WORKSPACE_OPERATION_DENIED", "workspace operation is not approved");
+            }
+            if (!tool_result.success)
+                return isolated_python_workspace_error(
+                    tool_result.error_code.empty() ? "WORKSPACE_API_REJECTED" : tool_result.error_code,
+                    tool_result.text.empty() ? "approved workspace API rejected request" : tool_result.text);
+            python_compat::python_workspace_response_t response;
+            response.success = true;
+            response.data = std::move(tool_result.data);
+            return response;
+        }
+
+        json isolated_python_workspace_metadata(const workspace_request_context_t& context)
+        {
+            return {
+                {"binary_id", context.binary_id.to_hex()},
+                {"binary_name", context.workspace->identity().bin_name()},
+                {"analysis_revision", context.analysis_revision},
+                {"overlay_revision", context.overlay_revision},
+                {"target_kind", "static_file"}
+            };
+        }
+
+        std::optional<std::chrono::steady_clock::time_point> isolated_python_deadline(
+            const workspace_request_context_t& context)
+        {
+            if (context.deadline_ms == 0)
+                return std::nullopt;
+            const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+            const std::uint64_t remaining = context.deadline_ms > now ? context.deadline_ms - now : 0;
+            return std::chrono::steady_clock::now() + std::chrono::milliseconds(remaining);
+        }
+
+        tool_result_t handle_py_exec_file(const json& params, const workspace_request_context_t& context)
+        {
+            const auto* descriptor = python_compat::find_contract("py_exec_file");
+            const auto policy = descriptor ? python_compat::effect_policy_for(*descriptor)
+                                           : python_compat::effect_policy_resolution_t{};
+            if (!descriptor || !policy || descriptor->read_only || !descriptor->unsafe ||
+                !descriptor->target_dependent || policy.value().mutates_workspace ||
+                !policy.value().target_required ||
+                policy.value().contract_lock != python_compat::contract_lock_t::python_worker) {
+                return tool_result_t::error("isolated Python worker contract is unavailable", "PYTHON_WORKER_POLICY_REJECTED");
+            }
+            if (!params.contains("approve_unsafe") || !params["approve_unsafe"].is_boolean() ||
+                !params["approve_unsafe"].get<bool>()) {
+                return tool_result_t::error("explicit unsafe approval is required", "PYTHON_WORKER_UNSAFE_APPROVAL_REQUIRED");
+            }
+            if (!context.workspace || context.kind != aida::analysis::target_kind_t::static_file) {
+                return tool_result_t::error("isolated Python execution is unavailable for live workspace targets",
+                    "PYTHON_WORKER_LIVE_TARGET_DENIED");
+            }
+            if (context.cancellation_requested())
+                return tool_result_t::error("isolated Python execution was cancelled before launch", "CANCELLED");
+            const fs::path script_root = active_workspace_root();
+            const auto script_path = isolated_python_script_path(params, script_root);
+            if (!script_path) {
+                return tool_result_t::error("file_path must be a workspace-relative .py script path",
+                    "PYTHON_WORKER_SCRIPT_REJECTED");
+            }
+            const auto package_root = standalone_package_root();
+            if (!package_root) {
+                return tool_result_t::error("standalone package root cannot be resolved", "PYTHON_WORKER_PACKAGE_REJECTED");
+            }
+            auto launch_contract = python_compat::resolve_python_worker_launch_contract(*package_root, script_root);
+            if (!launch_contract.valid() || !launch_contract.value) {
+                return tool_result_t::error(launch_contract.error.empty() ? "isolated Python worker package is invalid" : launch_contract.error,
+                    "PYTHON_WORKER_PACKAGE_REJECTED");
+            }
+            python_compat::python_worker_limits_t limits;
+            const auto request_deadline = isolated_python_deadline(context);
+            const auto lock_deadline = request_deadline.value_or(
+                std::chrono::steady_clock::now() + limits.max_wall_clock);
+            static std::timed_mutex worker_mutex;
+            std::unique_lock<std::timed_mutex> worker_lock(worker_mutex, std::defer_lock);
+            while (!worker_lock.try_lock_for(std::chrono::milliseconds(10))) {
+                if (context.cancellation_requested())
+                    return tool_result_t::error("isolated Python execution was cancelled before launch", "CANCELLED");
+                if (std::chrono::steady_clock::now() >= lock_deadline)
+                    return tool_result_t::error("isolated Python worker lane is unavailable before the request deadline",
+                        "PYTHON_WORKER_LOCK_BUSY");
+            }
+            static std::atomic<std::uint64_t> next_job_id{1};
+            std::uint64_t job_id = next_job_id.fetch_add(1, std::memory_order_relaxed);
+            if (job_id == 0)
+                job_id = next_job_id.fetch_add(1, std::memory_order_relaxed);
+            python_compat::python_worker_execution_request_t request;
+            request.job_id = job_id;
+            request.script_path = *script_path;
+            request.workspace_metadata = isolated_python_workspace_metadata(context);
+            request.workspace_api = [&context](const python_compat::python_workspace_query_t& query,
+                                               const std::atomic<bool>*) {
+                return isolated_python_workspace_api(query, context);
+            };
+            request.unsafe_approved = true;
+            request.cancellation = context.cancellation;
+            request.deadline = request_deadline;
+            python_compat::python_worker_host_t host(std::move(*launch_contract.value), limits);
+            const auto execution = host.execute(request);
+            json diagnostics = json::array();
+            for (const auto& diagnostic : execution.diagnostics) {
+                diagnostics.push_back({
+                    {"code", static_cast<std::uint32_t>(diagnostic.code)},
+                    {"phase", diagnostic.phase},
+                    {"detail", diagnostic.detail},
+                    {"win32_error", diagnostic.win32_error},
+                    {"worker_replaced", diagnostic.replacement}
+                });
+            }
+            if (!execution.completed()) {
+                return tool_result_t::error("isolated Python worker did not complete",
+                    execution.error_code.empty() ? "PYTHON_WORKER_FAILED" : execution.error_code,
+                    {{"worker_generation", execution.worker_generation},
+                     {"worker_process_id", execution.worker_process_id},
+                     {"worker_replaced", execution.worker_replaced},
+                     {"diagnostics", std::move(diagnostics)}});
+            }
+            return tool_result_t::ok(json{
+                {"result", execution.result},
+                {"stdout", execution.stdout_text},
+                {"stderr", execution.stderr_text},
+                {"worker_generation", execution.worker_generation},
+                {"worker_process_id", execution.worker_process_id},
+                {"diagnostics", std::move(diagnostics)}
+            });
         }
 
         bool configure_ida_compat_tool(tool_def_t& tool, const char* name, const char* description)
@@ -3496,6 +3733,32 @@ namespace mcp_standalone
                         definition.name);
                     return false;
                 }
+            }
+
+            const auto* python_schema = ida_compat::find_schema("py_exec_file");
+            const auto* python_descriptor = python_compat::find_contract("py_exec_file");
+            const auto python_policy = python_descriptor
+                ? python_compat::effect_policy_for(*python_descriptor)
+                : python_compat::effect_policy_resolution_t{};
+            if (!python_schema || !python_descriptor || !python_policy || python_descriptor->read_only ||
+                !python_descriptor->unsafe || !python_descriptor->target_dependent ||
+                python_policy.value().mutates_workspace || !python_policy.value().target_required ||
+                python_policy.value().contract_lock != python_compat::contract_lock_t::python_worker) {
+                diag::log_tagged_fmt("mcp_tools",
+                    "ida_compat registration blocked file='python_worker_host.cpp' symbol='python_worker_host_t::execute' reason='descriptor_or_policy_rejected'");
+                return false;
+            }
+            tool_def_t python_tool;
+            python_tool.name = "py_exec_file";
+            python_tool.description = std::string(python_descriptor->description);
+            python_tool.read_only = false;
+            python_tool.visibility = tool_visibility_t::external_visible;
+            python_tool.input_schema = *python_schema;
+            python_tool.workspace_handler = handle_py_exec_file;
+            if (!server.register_tool(std::move(python_tool))) {
+                diag::log_tagged_fmt("mcp_tools",
+                    "ida_compat registration blocked file='python_worker_host.cpp' symbol='python_worker_host_t::execute' reason='register_tool_failed'");
+                return false;
             }
 
             for (const char* name : {"calculator", "calculate"}) {

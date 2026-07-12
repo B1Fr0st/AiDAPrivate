@@ -19,14 +19,9 @@ int wmain(int argc, wchar_t** argv)
             "decompiler.native_worker.snapshot_integrity");
         return 5;
     }
-    const auto result = ghidra_native_provider::produce(startup, *job);
+    auto result = ghidra_native_provider::produce(startup, *job);
     if (!result.document) {
-        const auto diagnostic = result.diagnostics.empty()
-            ? runtime::failure_diagnostic(decompiler_diagnostic_code_t::provider_failure,
-                "decompiler.native_worker.typed_provider_failed")
-            : result.diagnostics.front();
-        runtime::send_failure(startup, job->job_id, diagnostic.code, diagnostic.localization_key,
-            diagnostic.retryable);
+        runtime::send_failures(startup, job->job_id, std::move(result.diagnostics));
         return 6;
     }
     return runtime::send_document(startup, job->job_id, *result.document) ? 0 : 7;

@@ -13,6 +13,7 @@
 #include "jar_container.hpp"
 #include "macho_image.hpp"
 #include "zip_container.hpp"
+#include "../readers/pe_coff_reader.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -451,7 +452,34 @@ struct parsed_static_image_t {
     std::shared_ptr<const byte_provider_t> provider;
     std::shared_ptr<const workspace_image_t> normalized;
     std::shared_ptr<const pe_image_t> pe_adapter;
+    std::shared_ptr<const pe_coff_metadata_result_t> pe_coff_metadata;
 };
+
+workspace_result_t<parsed_static_image_t> read_pe_coff_static_image(
+    std::shared_ptr<const byte_provider_t> provider, const pe_parse_limits_t& pe_limits,
+    const cancellation_token_t& cancel) {
+    pe_coff_reader_limits_t limits;
+    limits.pe_limits = pe_limits;
+    auto reader_result = read_pe_coff_metadata(*provider, limits, cancel);
+    if (!reader_result)
+        return workspace_result_t<parsed_static_image_t>::failure(reader_result.error());
+    try {
+        std::shared_ptr<const pe_coff_metadata_result_t> metadata =
+            std::make_shared<pe_coff_metadata_result_t>(reader_result.take_value());
+        parsed_static_image_t result;
+        result.provider = std::move(provider);
+        result.normalized = std::shared_ptr<const workspace_image_t>(metadata,
+                                                                      &metadata->record.image);
+        result.pe_adapter = metadata->pe_adapter;
+        result.pe_coff_metadata = std::move(metadata);
+        return workspace_result_t<parsed_static_image_t>::success(std::move(result));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<parsed_static_image_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "PE/COFF admission metadata allocation failed",
+                                 "workspace_open.detect"));
+    }
+}
 
 struct resolved_container_member_t {
     std::shared_ptr<const byte_provider_t> provider;
@@ -555,17 +583,7 @@ workspace_result_t<parsed_static_image_t> parse_static_image(
         return workspace_result_t<parsed_static_image_t>::success(std::move(result));
     };
     if (probe_starts_with(probe, {'M', 'Z'})) {
-        auto image = parse_pe_image(*provider, pe_limits, cancel);
-        if (!image)
-            return workspace_result_t<parsed_static_image_t>::failure(image.error());
-        auto normalized_image = normalize_pe_image(*image.value(), *provider, cancel);
-        if (!normalized_image)
-            return workspace_result_t<parsed_static_image_t>::failure(normalized_image.error());
-        parsed_static_image_t result;
-        result.provider = provider;
-        result.normalized = normalized_image.take_value();
-        result.pe_adapter = image.take_value();
-        return workspace_result_t<parsed_static_image_t>::success(std::move(result));
+        return read_pe_coff_static_image(std::move(provider), pe_limits, cancel);
     }
     if (probe_starts_with(probe, {0x7f, 'E', 'L', 'F'})) {
         auto image = parse_elf(*provider, cancel);
@@ -624,13 +642,7 @@ workspace_result_t<parsed_static_image_t> parse_static_image(
         return normalized(normalized_image.take_value());
     }
     if (probe_starts_with(probe, {'!', '<', 'a', 'r', 'c', 'h', '>', '\n'})) {
-        auto image = parse_coff(*provider, cancel);
-        if (!image)
-            return workspace_result_t<parsed_static_image_t>::failure(image.error());
-        auto normalized_image = make_normalized_image(image.take_value());
-        if (!normalized_image)
-            return workspace_result_t<parsed_static_image_t>::failure(normalized_image.error());
-        return normalized(normalized_image.take_value());
+        return read_pe_coff_static_image(std::move(provider), pe_limits, cancel);
     }
     if (probe_is_zip(probe))
         return workspace_result_t<parsed_static_image_t>::failure(
@@ -640,15 +652,8 @@ workspace_result_t<parsed_static_image_t> parse_static_image(
     auto coff = is_coff_file(*provider, cancel);
     if (!coff)
         return workspace_result_t<parsed_static_image_t>::failure(coff.error());
-    if (coff.value()) {
-        auto image = parse_coff(*provider, cancel);
-        if (!image)
-            return workspace_result_t<parsed_static_image_t>::failure(image.error());
-        auto normalized_image = make_normalized_image(image.take_value());
-        if (!normalized_image)
-            return workspace_result_t<parsed_static_image_t>::failure(normalized_image.error());
-        return normalized(normalized_image.take_value());
-    }
+    if (coff.value())
+        return read_pe_coff_static_image(std::move(provider), pe_limits, cancel);
     return workspace_result_t<parsed_static_image_t>::failure(
         make_workspace_error(workspace_error_code_t::unsupported_format,
                              "workspace bytes do not identify a supported format",
@@ -876,7 +881,7 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
             source_binding.error());
     workspace_result_t<parsed_static_image_t> parsed = pre_parsed_image
         ? workspace_result_t<parsed_static_image_t>::success(
-            parsed_static_image_t{request.provider, std::move(pre_parsed_image), {}})
+            parsed_static_image_t{request.provider, std::move(pre_parsed_image), {}, {}})
         : parse_static_image(request.provider, request.pe_limits, cancel);
     if (!parsed)
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(parsed.error());
@@ -942,7 +947,8 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
     if (!workspace_result)
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
             workspace_result.error());
-    return insert_or_get(workspace_result.take_value());
+    return insert_or_get(workspace_result.take_value(),
+                         std::move(parsed.value().pe_coff_metadata));
 }
 
 workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::open_live(
@@ -1343,7 +1349,8 @@ bool workspace_registry_t::cancel_admission(workspace_admission_handle_t& handle
 }
 
 workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::insert_or_get(
-    std::shared_ptr<analysis_workspace_t> workspace) {
+    std::shared_ptr<analysis_workspace_t> workspace,
+    std::shared_ptr<const pe_coff_metadata_result_t> pe_coff_metadata) {
     if (!workspace)
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -1359,6 +1366,9 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
         if (!binding_check)
             return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
                 binding_check.error());
+        if (pe_coff_metadata && pe_coff_metadata_.find(workspace->identity().binary_id()) ==
+                                    pe_coff_metadata_.end())
+            pe_coff_metadata_.emplace(workspace->identity().binary_id(), std::move(pe_coff_metadata));
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::success(exact->second);
     }
     if (workspace->identity().process() && workspace->identity().module()) {
@@ -1387,7 +1397,10 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
                                  "open workspace limit is reached", "workspace_open"));
+    pe_coff_metadata_.erase(workspace->identity().binary_id());
     workspaces_[workspace->identity().binary_id()] = workspace;
+    if (pe_coff_metadata)
+        pe_coff_metadata_.emplace(workspace->identity().binary_id(), std::move(pe_coff_metadata));
     if (!ui_selection_)
         ui_selection_ = workspace->identity().binary_id();
     return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::success(std::move(workspace));
@@ -1410,8 +1423,10 @@ workspace_result_t<void> workspace_registry_t::close(
         return close_result;
     std::unique_lock lock(mutex_);
     const auto iterator = workspaces_.find(id);
-    if (iterator != workspaces_.end() && iterator->second == workspace)
+    if (iterator != workspaces_.end() && iterator->second == workspace) {
         workspaces_.erase(iterator);
+        pe_coff_metadata_.erase(id);
+    }
     if (ui_selection_ && *ui_selection_ == id)
         ui_selection_.reset();
     return workspace_result_t<void>::success();
@@ -1423,6 +1438,14 @@ std::shared_ptr<analysis_workspace_t> workspace_registry_t::find_by_binary_id(
     const auto iterator = workspaces_.find(id);
     return iterator == workspaces_.end() ? std::shared_ptr<analysis_workspace_t>{}
                                          : iterator->second;
+}
+
+std::shared_ptr<const pe_coff_metadata_result_t>
+workspace_registry_t::find_pe_coff_metadata(const binary_id_t& id) const {
+    std::shared_lock lock(mutex_);
+    const auto iterator = pe_coff_metadata_.find(id);
+    return iterator == pe_coff_metadata_.end()
+        ? std::shared_ptr<const pe_coff_metadata_result_t>{} : iterator->second;
 }
 
 std::vector<std::shared_ptr<analysis_workspace_t>>

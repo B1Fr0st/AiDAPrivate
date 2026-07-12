@@ -474,7 +474,7 @@ workspace_result_t<pe_coff_metadata_result_t> read_pe_metadata(
     if (!layout)
         return workspace_result_t<pe_coff_metadata_result_t>::failure(layout.error());
     return workspace_result_t<pe_coff_metadata_result_t>::success(
-        {std::move(record), layout.take_value()});
+        {std::move(record), layout.take_value(), parsed.take_value()});
 }
 
 workspace_result_t<pe_coff_metadata_result_t> read_coff_metadata(
@@ -495,7 +495,7 @@ workspace_result_t<pe_coff_metadata_result_t> read_coff_metadata(
     if (!layout)
         return workspace_result_t<pe_coff_metadata_result_t>::failure(layout.error());
     return workspace_result_t<pe_coff_metadata_result_t>::success(
-        {std::move(record), layout.take_value()});
+        {std::move(record), layout.take_value(), {}});
 }
 
 }

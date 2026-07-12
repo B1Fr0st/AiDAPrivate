@@ -16,8 +16,12 @@ using namespace aida::workbench;
 
 static_assert(k_document_host_contract_schema_version == 1,
               "document host contract schema version changed");
+static_assert(static_cast<std::uint8_t>(document_host_dispatch_kind_t::toolbar) == 9,
+              "document host toolbar dispatch value changed");
 static_assert(static_cast<std::uint8_t>(document_host_dispatch_kind_t::keyboard) == 10,
               "document host dispatch values changed");
+static_assert(static_cast<std::uint8_t>(document_host_toolbar_action_t::close_document) == 6,
+              "document host toolbar action values changed");
 static_assert(static_cast<std::uint8_t>(document_host_presentation_kind_t::empty) == 3,
               "document host presentation values changed");
 
@@ -146,6 +150,31 @@ workbench_command_result_t split(document_host_t& host, workspace_id_t workspace
     input.view = view;
     input.document = document;
     return host.dispatch(input);
+}
+
+workbench_command_result_t dispatch_toolbar(document_host_t& host, workspace_id_t workspace,
+                                            workspace_revision_t revision,
+                                            document_host_toolbar_action_t action,
+                                            std::uint16_t ratio_basis_points =
+                                                k_split_ratio_default_basis_points,
+                                            document_id_t document = {})
+{
+    document_host_dispatch_t input;
+    input.kind = document_host_dispatch_kind_t::toolbar;
+    input.workspace = workspace;
+    input.expected_revision = revision;
+    input.toolbar_action = action;
+    input.ratio_basis_points = ratio_basis_points;
+    input.document = document;
+    return host.dispatch(input);
+}
+
+void require_next_revision(const workbench_command_result_t& result,
+                           workspace_revision_t previous_revision, const char* message)
+{
+    require(result.error.ok() && result.changed && result.snapshot &&
+                result.snapshot->revision().value == previous_revision.value + 1U,
+            message);
 }
 
 void verify_desktop_chrome_and_presentation()
@@ -302,6 +331,143 @@ void verify_dispatch_and_keyboard_routing()
             "Ctrl+W did not route to B25 document close");
 }
 
+void verify_toolbar_dispatch_mapping_and_revisions()
+{
+    workbench_model_t model;
+    const workspace_id_t workspace{76};
+    const auto snapshot = create(model, workspace);
+    navigation_adapter_t navigation;
+    document_host_t host(model, {nullptr, &navigation, nullptr});
+
+    document_host_dispatch_t navigate;
+    navigate.kind = document_host_dispatch_kind_t::navigate;
+    navigate.workspace = workspace;
+    navigate.expected_revision = snapshot->revision();
+    navigate.navigation.workspace = workspace;
+    navigate.navigation.target.document = snapshot->persistence().documents.front().identity;
+    navigate.navigation.target.selection.kind = selection_kind_t::address;
+    navigate.navigation.target.selection.has_address = true;
+    navigate.navigation.target.selection.address = 0x401020;
+    navigate.navigation.target.cursor.has_position = true;
+    navigate.navigation.target.cursor.position = 0x401020;
+    navigate.navigation.origin = navigation_origin_t::navigator;
+    auto result = host.dispatch(navigate);
+    require_next_revision(result, snapshot->revision(),
+                          "toolbar history fixture navigation did not advance revision");
+    require(result.snapshot->persistence().history.back.size() == 1 &&
+                result.snapshot->persistence().history.forward.empty(),
+            "toolbar history fixture did not establish B25 history state");
+
+    auto previous_revision = result.snapshot->revision();
+    result = dispatch_toolbar(host, workspace, previous_revision,
+                              document_host_toolbar_action_t::history_back);
+    require_next_revision(result, previous_revision,
+                          "toolbar history-back did not commit through B25");
+    require(result.snapshot->persistence().history.back.empty() &&
+                result.snapshot->persistence().history.forward.size() == 1,
+            "toolbar history-back did not transfer the history entry");
+
+    previous_revision = result.snapshot->revision();
+    result = dispatch_toolbar(host, workspace, previous_revision,
+                              document_host_toolbar_action_t::history_forward);
+    require_next_revision(result, previous_revision,
+                          "toolbar history-forward did not commit through B25");
+    require(result.snapshot->persistence().history.back.size() == 1 &&
+                result.snapshot->persistence().history.forward.empty(),
+            "toolbar history-forward did not restore the history entry");
+
+    previous_revision = result.snapshot->revision();
+    result = dispatch_toolbar(host, workspace, previous_revision,
+                              document_host_toolbar_action_t::split_horizontal, 4200);
+    require_next_revision(result, previous_revision,
+                          "toolbar horizontal split did not commit through B25");
+    const auto& horizontal_persistence = result.snapshot->persistence();
+    const auto horizontal_branch = std::find_if(
+        horizontal_persistence.split_tree.nodes.begin(), horizontal_persistence.split_tree.nodes.end(),
+        [branch = result.split.branch](const split_node_dto_t& node) { return node.id == branch; });
+    require(result.view.valid() && result.split.branch.valid() && result.split.leaf.valid() &&
+                horizontal_persistence.views.size() == 2 &&
+                horizontal_branch != horizontal_persistence.split_tree.nodes.end() &&
+                horizontal_branch->kind == split_node_kind_t::branch &&
+                horizontal_branch->orientation == split_orientation_t::horizontal &&
+                horizontal_branch->ratio_basis_points == 4200,
+            "toolbar horizontal split did not preserve B25 split state");
+
+    previous_revision = result.snapshot->revision();
+    result = dispatch_toolbar(host, workspace, previous_revision,
+                              document_host_toolbar_action_t::split_vertical, 5800);
+    require_next_revision(result, previous_revision,
+                          "toolbar vertical split did not commit through B25");
+    const auto& vertical_persistence = result.snapshot->persistence();
+    const auto vertical_branch = std::find_if(
+        vertical_persistence.split_tree.nodes.begin(), vertical_persistence.split_tree.nodes.end(),
+        [branch = result.split.branch](const split_node_dto_t& node) { return node.id == branch; });
+    require(result.view.valid() && result.split.branch.valid() && result.split.leaf.valid() &&
+                vertical_persistence.views.size() == 3 && vertical_persistence.split_tree.nodes.size() == 5 &&
+                vertical_branch != vertical_persistence.split_tree.nodes.end() &&
+                vertical_branch->kind == split_node_kind_t::branch &&
+                vertical_branch->orientation == split_orientation_t::vertical &&
+                vertical_branch->ratio_basis_points == 5800,
+            "toolbar vertical split did not preserve B25 split state");
+
+    previous_revision = result.snapshot->revision();
+    result = dispatch_toolbar(host, workspace, previous_revision,
+                              document_host_toolbar_action_t::next_view);
+    require_next_revision(result, previous_revision,
+                          "toolbar next-view did not commit through B25");
+    require(result.view == view_id_t{2} && result.snapshot->focused_view() == view_id_t{2},
+            "toolbar next-view did not focus the next B25 view");
+
+    const auto stale_revision = previous_revision;
+    previous_revision = result.snapshot->revision();
+    result = dispatch_toolbar(host, workspace, previous_revision,
+                              document_host_toolbar_action_t::previous_view);
+    require_next_revision(result, previous_revision,
+                          "toolbar previous-view did not commit through B25");
+    require(result.view == view_id_t{1} && result.snapshot->focused_view() == view_id_t{1},
+            "toolbar previous-view did not focus the previous B25 view");
+
+    const auto revision_after_focus = result.snapshot->revision();
+    const auto stale = dispatch_toolbar(host, workspace, stale_revision,
+                                        document_host_toolbar_action_t::next_view);
+    require(stale.error.code == workbench_error_code_t::revision_mismatch && !stale.changed &&
+                stale.snapshot && stale.snapshot->revision() == revision_after_focus,
+            "stale toolbar dispatch mutated B25 state");
+
+    const auto closing_document = result.snapshot->persistence().active_document;
+    result = dispatch_toolbar(host, workspace, revision_after_focus,
+                              document_host_toolbar_action_t::close_document,
+                              k_split_ratio_default_basis_points, {999});
+    require_next_revision(result, revision_after_focus,
+                          "toolbar close-document did not commit through B25");
+    const auto& closed_persistence = result.snapshot->persistence();
+    require(result.document == closing_document && closed_persistence.documents.size() == 2 &&
+                closed_persistence.views.size() == 1 &&
+                closed_persistence.active_document != closing_document &&
+                std::none_of(closed_persistence.documents.begin(), closed_persistence.documents.end(),
+                             [closing_document](const document_persistence_dto_t& document) {
+                                 return document.id == closing_document;
+                             }),
+            "toolbar close-document did not remove the active B25 document state");
+
+    document_host_dispatch_t invalid_action;
+    invalid_action.kind = document_host_dispatch_kind_t::toolbar;
+    invalid_action.workspace = workspace;
+    invalid_action.expected_revision = result.snapshot->revision();
+    invalid_action.toolbar_action = static_cast<document_host_toolbar_action_t>(0xffU);
+    const auto rejected_action = host.dispatch(invalid_action);
+    require(rejected_action.error.code == workbench_error_code_t::invalid_persistence &&
+                !rejected_action.changed && rejected_action.snapshot &&
+                rejected_action.snapshot->revision() == result.snapshot->revision(),
+            "invalid toolbar action changed B25 state");
+
+    const auto invalid_workspace = dispatch_toolbar(host, {999}, result.snapshot->revision(),
+                                                    document_host_toolbar_action_t::next_view);
+    require(invalid_workspace.error.code == workbench_error_code_t::invalid_workspace &&
+                !invalid_workspace.changed && !invalid_workspace.snapshot,
+            "toolbar dispatch accepted an unknown workspace");
+}
+
 void verify_workspace_isolation_and_adapter_failure()
 {
     workbench_model_t model;
@@ -349,6 +515,7 @@ bool run_document_host_harness(std::string& failure)
         verify_desktop_chrome_and_presentation();
         verify_compact_and_constrained_layouts();
         verify_dispatch_and_keyboard_routing();
+        verify_toolbar_dispatch_mapping_and_revisions();
         verify_workspace_isolation_and_adapter_failure();
         failure.clear();
         return true;

@@ -10,6 +10,8 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string_view>
@@ -143,6 +145,32 @@ bool valid_manifest(const python_worker_manifest_t& manifest) {
         manifest.worker_binary_hash.empty() == false &&
         manifest.protocol_hash == python_worker::wire::protocol_hash() &&
         manifest.capabilities == k_python_worker_capability_execute_file;
+}
+
+bool decode_hex_digest(std::string_view value, digest_t& output) noexcept {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+        value.remove_prefix(1);
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+        value.remove_suffix(1);
+    if (value.size() != output.bytes.size() * 2U)
+        return false;
+    const auto nibble = [](char character) noexcept -> std::optional<std::uint8_t> {
+        if (character >= '0' && character <= '9')
+            return static_cast<std::uint8_t>(character - '0');
+        if (character >= 'a' && character <= 'f')
+            return static_cast<std::uint8_t>(character - 'a' + 10);
+        if (character >= 'A' && character <= 'F')
+            return static_cast<std::uint8_t>(character - 'A' + 10);
+        return std::nullopt;
+    };
+    for (std::size_t index = 0; index < output.bytes.size(); ++index) {
+        const auto high = nibble(value[index * 2U]);
+        const auto low = nibble(value[index * 2U + 1U]);
+        if (!high || !low)
+            return false;
+        output.bytes[index] = static_cast<std::uint8_t>((*high << 4U) | *low);
+    }
+    return !output.empty();
 }
 
 class manifest_writer_t final {
@@ -914,6 +942,59 @@ python_worker_manifest_decode_t deserialize_python_worker_manifest(const std::st
         return result;
     }
     result.value = std::move(manifest);
+    return result;
+}
+
+python_worker_launch_contract_resolution_t resolve_python_worker_launch_contract(
+    const std::filesystem::path& package_root, const std::filesystem::path& approved_script_root) {
+    python_worker_launch_contract_resolution_t result;
+    if (package_root.empty() || approved_script_root.empty()) {
+        result.error = "analysis Python worker package or script root is empty";
+        return result;
+    }
+    std::error_code ec;
+    const auto root = std::filesystem::absolute(package_root, ec).lexically_normal();
+    if (ec || !std::filesystem::is_directory(root, ec) || ec) {
+        result.error = "analysis Python worker package root is unavailable";
+        return result;
+    }
+    const DWORD root_attributes = GetFileAttributesW(root.c_str());
+    if (root_attributes == INVALID_FILE_ATTRIBUTES ||
+        (root_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        result.error = "analysis Python worker package root is not a regular directory";
+        return result;
+    }
+    const auto manifest_path = root / std::filesystem::path(
+        std::string(k_python_worker_manifest_artifact_relative_path));
+    const auto digest_path = root / std::filesystem::path(
+        std::string(k_python_worker_manifest_digest_relative_path));
+    const DWORD digest_attributes = GetFileAttributesW(digest_path.c_str());
+    if (digest_attributes == INVALID_FILE_ATTRIBUTES ||
+        (digest_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        result.error = "analysis Python worker manifest digest is unavailable";
+        return result;
+    }
+    std::ifstream input(digest_path, std::ios::binary);
+    if (!input) {
+        result.error = "analysis Python worker manifest digest cannot be opened";
+        return result;
+    }
+    std::string encoded((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (!input.eof() || encoded.size() > 256U) {
+        result.error = "analysis Python worker manifest digest is invalid";
+        return result;
+    }
+    python_worker::wire::digest_t expected_manifest_hash;
+    if (!decode_hex_digest(encoded, expected_manifest_hash)) {
+        result.error = "analysis Python worker manifest digest is malformed";
+        return result;
+    }
+    result.value = python_worker_launch_contract_t{
+        root,
+        manifest_path,
+        expected_manifest_hash,
+        approved_script_root
+    };
     return result;
 }
 

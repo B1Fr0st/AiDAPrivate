@@ -111,6 +111,14 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
         return result;
     }
     result.document = std::move(*rendered.document);
+    if (!(result.document->entity == job.cache_key.entity) ||
+        !(result.document->ast.entity == job.cache_key.entity) ||
+        result.document->type_graph_hash != stable_serialization_hash(artifacts->type_graph)) {
+        result.document.reset();
+        result.diagnostics.push_back(failure(decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.native_worker.typed_document_binding"));
+        return result;
+    }
     result.document->diagnostics.insert(result.document->diagnostics.end(), artifacts->provider_ir.diagnostics.begin(),
         artifacts->provider_ir.diagnostics.end());
     result.document->diagnostics.insert(result.document->diagnostics.end(), artifacts->hir.diagnostics.begin(),

@@ -962,10 +962,14 @@ workspace_error_t typed_artifact_error(std::string message,
 workspace_result_t<void> validate_typed_artifacts_for_function(
     const decompiler_typed_artifacts_t& artifacts,
     const resolved_function_t& function) {
-    if (!entity_matches_function(artifacts.hir.entity, function)) {
+    if (!(artifacts.provider_ir.entity == artifacts.hir.entity) ||
+        !(artifacts.provider_ir.entity == artifacts.type_graph.entity) ||
+        !entity_matches_function(artifacts.provider_ir.entity, function) ||
+        !entity_matches_function(artifacts.hir.entity, function) ||
+        !entity_matches_function(artifacts.type_graph.entity, function)) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::provider_binding_mismatch,
-            "typed decompiler artifacts are not bound to the requested native function",
+            "typed decompiler provider IR, HIR, and type graph are not bound to the requested native function",
             "decompiler.typed.v2.binding"));
     }
     return workspace_result_t<void>::success();
@@ -1926,21 +1930,6 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
         cancel, workspace_cancel, deadline_token, "decompiler.preflight");
     if (!current)
         return fail(current.error());
-    if (!request.typed_artifacts) {
-        decompiler_service_v2_result_t typed;
-        append_v2_diagnostic(typed, decompiler_diagnostic_code_t::unsupported_provider,
-            "decompiler.service.v2.provider_ir_required");
-        return fail(typed_artifact_error(
-            "decompiler provider did not supply canonical provider IR, HIR, and type graph artifacts",
-            "decompiler.typed.v2.required", typed));
-    }
-    auto typed_binding = validate_typed_artifacts_for_function(*request.typed_artifacts,
-        function.value());
-    if (!typed_binding)
-        return fail(typed_binding.error());
-    auto typed_cache_identity = make_typed_artifact_cache_identity(*request.typed_artifacts);
-    if (!typed_cache_identity)
-        return fail(typed_cache_identity.error());
     auto adapter = prepare_adapter_inputs(function.value(), cancel);
     if (!adapter)
         return fail(adapter.error());
@@ -1952,6 +1941,9 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
         adapter.value(), state_->limits, cancel, request.deadline);
     if (!adapter_request)
         return fail(adapter_request.error());
+    adapter_request.value().cancel_check = [workspace_cancel, deadline_token] {
+        return workspace_cancel.stop_requested() || deadline_token.stop_requested();
+    };
     auto adapter_decompile_cache_key =
         ghidra_decompiler::make_ghidra_adapter_decompile_cache_key(
             adapter_request.value(), cancel);
@@ -1962,6 +1954,51 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
             return fail(current.error());
         return fail(adapter_decompile_cache_key.error());
     }
+    std::shared_ptr<const decompiler_typed_artifacts_t> typed_artifacts = request.typed_artifacts;
+    if (!typed_artifacts) {
+        auto acquired = acquire_context(state_, cancel, workspace_cancel, deadline_token);
+        if (!acquired)
+            return fail(acquired.error());
+        {
+            context_guard_t adapter_context_guard(state_);
+            auto adapter_decompile = ghidra_decompiler::decompile_adapter(adapter_request.value());
+            if (!adapter_decompile)
+                return fail(adapter_decompile.error());
+            auto adapter_output = adapter_decompile.take_value();
+            auto& adapter_result = adapter_output.result;
+            if (adapter_result.is_error || !adapter_result.typed_artifacts) {
+                auto diagnostics = std::move(adapter_result.typed_diagnostics);
+                if (diagnostics.empty()) {
+                    decompiler_diagnostic_t diagnostic;
+                    diagnostic.severity = decompiler_diagnostic_severity_t::error;
+                    diagnostic.code = decompiler_diagnostic_code_t::unsupported_provider;
+                    diagnostic.localization_key = "decompiler.service.v2.adapter_typed_artifact_required";
+                    diagnostic.confidence = 100;
+                    diagnostic.ordinal = 1;
+                    diagnostics.push_back(std::move(diagnostic));
+                }
+                return fail(typed_contract_error(
+                    "Ghidra adapter did not produce canonical provider IR, HIR, and type graph artifacts",
+                    "decompiler.typed.v2.adapter", diagnostics));
+            }
+            typed_artifacts = std::make_shared<decompiler_typed_artifacts_t>(
+                decompiler_typed_artifacts_t{
+                    std::move(adapter_result.typed_artifacts->provider_ir),
+                    std::move(adapter_result.typed_artifacts->hir),
+                    std::move(adapter_result.typed_artifacts->type_graph)});
+        }
+        current = ensure_request_current(state_, workspace, function.value(), request.context,
+            cancel, workspace_cancel, deadline_token, "decompiler.adapter.typed_artifacts");
+        if (!current)
+            return fail(current.error());
+    }
+    auto typed_binding = validate_typed_artifacts_for_function(*typed_artifacts,
+        function.value());
+    if (!typed_binding)
+        return fail(typed_binding.error());
+    auto typed_cache_identity = make_typed_artifact_cache_identity(*typed_artifacts);
+    if (!typed_cache_identity)
+        return fail(typed_cache_identity.error());
     auto content_hash = hash_function(function.value(), cancel);
     if (!content_hash)
         return fail(content_hash.error());
@@ -2092,8 +2129,8 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     context_guard_t context_guard(state_);
 
     const auto render_started = std::chrono::steady_clock::now();
-    auto rendered = render_provider_document_v2(request.typed_artifacts->provider_ir,
-        request.typed_artifacts->hir, request.typed_artifacts->type_graph);
+    auto rendered = render_provider_document_v2(typed_artifacts->provider_ir,
+        typed_artifacts->hir, typed_artifacts->type_graph);
     if (!rendered.succeeded()) {
         return fail(typed_artifact_error(
             "decompiler provider artifacts could not be lowered to a typed V2 document",
@@ -2112,7 +2149,7 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     result.document = std::move(*rendered.rendering->document);
     result.function_name = document_function_name(result.document);
     result.pseudocode = result.document.rendered_text;
-    result.sleigh_id = request.typed_artifacts->provider_ir.language.language_id;
+    result.sleigh_id = typed_artifacts->provider_ir.language.language_id;
     result.generation = function.value().generation;
     result.analysis_revision = function.value().analysis_revision;
     result.overlay_revision = function.value().overlay_revision;

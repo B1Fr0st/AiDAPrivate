@@ -94,38 +94,145 @@ x86_tile_decode_request_t request_for(address_t address, std::uint64_t byte_coun
     return request;
 }
 
-std::uint64_t hash_bytes(std::uint64_t hash, const void* data, std::size_t size)
+std::uint64_t hash_byte(std::uint64_t hash, std::uint8_t value)
 {
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    for (std::size_t index = 0; index < size; ++index) {
-        hash ^= bytes[index];
-        hash *= 1099511628211ULL;
-    }
+    hash ^= value;
+    return hash * 1099511628211ULL;
+}
+
+template <typename unsigned_t>
+std::uint64_t hash_unsigned(std::uint64_t hash, unsigned_t value)
+{
+    static_assert(std::is_unsigned_v<unsigned_t>);
+    for (std::size_t index = 0; index < sizeof(value); ++index)
+        hash = hash_byte(hash, static_cast<std::uint8_t>(value >> (index * 8U)));
     return hash;
 }
 
-template <typename value_t>
-std::uint64_t hash_vector(std::uint64_t hash, const std::vector<value_t>& values)
+std::uint64_t hash_address(std::uint64_t hash, const address_t& address)
 {
-    const auto size = values.size();
-    hash = hash_bytes(hash, &size, sizeof(size));
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(address.space));
+    hash = hash_unsigned(hash, address.value);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(address.architecture));
+    return hash_unsigned(hash, static_cast<std::uint8_t>(address.mode));
+}
+
+std::uint64_t hash_instruction(std::uint64_t hash, const instruction_record_t& instruction)
+{
+    hash = hash_unsigned(hash, instruction.id);
+    hash = hash_address(hash, instruction.address);
+    hash = hash_unsigned(hash, instruction.length);
+    hash = hash_unsigned(hash, instruction.mnemonic_id);
+    hash = hash_unsigned(hash, instruction.opcode_id);
+    hash = hash_unsigned(hash, instruction.flow_flags);
+    hash = hash_unsigned(hash, instruction.operand_fact_begin);
+    hash = hash_unsigned(hash, instruction.operand_fact_count);
+    hash = hash_unsigned(hash, instruction.target_fact_begin);
+    hash = hash_unsigned(hash, instruction.target_fact_count);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(instruction.provenance));
+    hash = hash_unsigned(hash, instruction.confidence);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(instruction.coverage));
+    return hash_unsigned(hash, instruction.stable_source_id);
+}
+
+std::uint64_t hash_operand(std::uint64_t hash, const operand_fact_t& operand)
+{
+    hash = hash_unsigned(hash, operand.id);
+    hash = hash_unsigned(hash, operand.instruction_id);
+    hash = hash_unsigned(hash, operand.address_expression_id);
+    hash = hash_unsigned(hash, operand.operand_index);
+    hash = hash_unsigned(hash, operand.decoder_operand_id);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(operand.kind));
+    hash = hash_unsigned(hash, operand.access);
+    hash = hash_unsigned(hash, operand.visibility);
+    hash = hash_unsigned(hash, operand.encoding);
+    hash = hash_unsigned(hash, operand.memory_type);
+    hash = hash_unsigned(hash, operand.access_width);
+    hash = hash_unsigned(hash, operand.bit_width);
+    hash = hash_unsigned(hash, operand.access_width_bits);
+    hash = hash_unsigned(hash, operand.access_count);
+    hash = hash_unsigned(hash, operand.element_width_bits);
+    hash = hash_unsigned(hash, operand.element_count);
+    hash = hash_unsigned(hash, operand.address_width_bits);
+    hash = hash_unsigned(hash, operand.reg);
+    hash = hash_unsigned(hash, operand.segment_reg);
+    hash = hash_unsigned(hash, operand.base_reg);
+    hash = hash_unsigned(hash, operand.index_reg);
+    hash = hash_unsigned(hash, operand.scale);
+    hash = hash_byte(hash, operand.relative ? 1U : 0U);
+    hash = hash_byte(hash, operand.signed_value ? 1U : 0U);
+    hash = hash_byte(hash, operand.has_displacement ? 1U : 0U);
+    hash = hash_byte(hash, operand.has_resolved_expression_value ? 1U : 0U);
+    hash = hash_unsigned(hash, static_cast<std::uint64_t>(operand.displacement));
+    hash = hash_unsigned(hash, operand.immediate);
+    hash = hash_unsigned(hash, operand.resolved_expression_value);
+    hash = hash_unsigned(hash, operand.address_components);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(operand.address_expression));
+    return hash_unsigned(hash, static_cast<std::uint8_t>(operand.address_resolution));
+}
+
+std::uint64_t hash_target(std::uint64_t hash, const target_fact_t& target)
+{
+    hash = hash_unsigned(hash, target.instruction_id);
+    hash = hash_unsigned(hash, target.operand_fact_id);
+    hash = hash_unsigned(hash, target.address_expression_id);
+    hash = hash_address(hash, target.target);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(target.kind));
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(target.resolution));
+    hash = hash_unsigned(hash, target.operand_index);
+    hash = hash_unsigned(hash, target.access_width_bits);
+    hash = hash_unsigned(hash, target.access_count);
+    hash = hash_byte(hash, target.direct ? 1U : 0U);
+    return hash_byte(hash, target.is_external ? 1U : 0U);
+}
+
+std::uint64_t hash_coverage(std::uint64_t hash, const coverage_span_t& coverage)
+{
+    hash = hash_address(hash, coverage.start);
+    hash = hash_unsigned(hash, coverage.size);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(coverage.reason));
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(coverage.provenance));
+    hash = hash_unsigned(hash, coverage.confidence);
+    return hash_unsigned(hash, coverage.detail_code);
+}
+
+std::uint64_t hash_usage(std::uint64_t hash, const decode::x86_tile_decode_usage_t& usage)
+{
+    hash = hash_unsigned(hash, usage.input_bytes);
+    hash = hash_unsigned(hash, usage.bytes_consumed);
+    hash = hash_unsigned(hash, usage.decoded_bytes);
+    hash = hash_unsigned(hash, usage.decode_attempts);
+    hash = hash_unsigned(hash, usage.instructions);
+    hash = hash_unsigned(hash, usage.operand_facts);
+    hash = hash_unsigned(hash, usage.target_facts);
+    hash = hash_unsigned(hash, usage.invalid_bytes);
+    hash = hash_unsigned(hash, usage.coverage_spans);
+    hash = hash_unsigned(hash, usage.snapshot_window_leases);
+    return hash_unsigned(hash, usage.snapshot_window_bytes);
+}
+
+template <typename value_t>
+std::uint64_t hash_vector(std::uint64_t hash, const std::vector<value_t>& values,
+                          std::uint64_t (*hash_value)(std::uint64_t, const value_t&))
+{
+    hash = hash_unsigned(hash, static_cast<std::uint64_t>(values.size()));
     for (const auto& value : values)
-        hash = hash_bytes(hash, &value, sizeof(value));
+        hash = hash_value(hash, value);
     return hash;
 }
 
 std::uint64_t result_fingerprint(const x86_tile_decode_result_t& result)
 {
     std::uint64_t hash = 1469598103934665603ULL;
-    hash = hash_bytes(hash, &result.mode, sizeof(result.mode));
-    hash = hash_bytes(hash, &result.start_address, sizeof(result.start_address));
-    hash = hash_bytes(hash, &result.provider_offset, sizeof(result.provider_offset));
-    hash = hash_bytes(hash, &result.byte_count, sizeof(result.byte_count));
-    hash = hash_bytes(hash, &result.usage, sizeof(result.usage));
-    hash = hash_vector(hash, result.instructions);
-    hash = hash_vector(hash, result.operand_facts);
-    hash = hash_vector(hash, result.target_facts);
-    return hash_vector(hash, result.coverage);
+    hash = hash_unsigned(hash, static_cast<std::uint8_t>(result.mode));
+    hash = hash_address(hash, result.start_address);
+    hash = hash_unsigned(hash, result.provider_offset);
+    hash = hash_unsigned(hash, result.byte_count);
+    hash = hash_usage(hash, result.usage);
+    hash = hash_vector(hash, result.instructions, &hash_instruction);
+    hash = hash_vector(hash, result.operand_facts, &hash_operand);
+    hash = hash_vector(hash, result.target_facts, &hash_target);
+    return hash_vector(hash, result.coverage, &hash_coverage);
 }
 
 const operand_fact_t* first_memory_operand(const x86_tile_decode_result_t& result)
@@ -186,15 +293,21 @@ void verify_x64_fixture(const std::filesystem::path& root)
         0xC7, 0xC7, 0xC7,
         0x90
     };
-    const auto snapshot = materialize_fixture(root / "x64_tile.bin", bytes);
-    auto decoder = require_value(worker_owned_x86_tile_decoder_t::create(
+    const auto equivalent_bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+    const auto first_snapshot = materialize_fixture(root / "x64_tile_first.bin", bytes);
+    const auto second_snapshot = materialize_fixture(root / "x64_tile_second.bin", equivalent_bytes);
+    auto first_decoder = require_value(worker_owned_x86_tile_decoder_t::create(
         architecture_mode_t::x86_64), "x64 tile worker could not be created");
-    const auto request = request_for(relative_address(0x1000, architecture_mode_t::x86_64),
-                                     bytes.size(), 0x140000000ULL, 0x4000);
-    const auto first = require_value(decoder->decode_tile(*snapshot, request),
-                                     "x64 tile decode failed");
-    const auto second = require_value(decoder->decode_tile(*snapshot, request),
-                                      "repeat x64 tile decode failed");
+    auto second_decoder = require_value(worker_owned_x86_tile_decoder_t::create(
+        architecture_mode_t::x86_64), "independent x64 tile worker could not be created");
+    const auto first_request = request_for(relative_address(0x1000, architecture_mode_t::x86_64),
+                                      bytes.size(), 0x140000000ULL, 0x4000);
+    const auto second_request = request_for(relative_address(0x1000, architecture_mode_t::x86_64),
+        equivalent_bytes.size(), 0x140000000ULL, 0x4000);
+    const auto first = require_value(first_decoder->decode_tile(*first_snapshot, first_request),
+                                      "x64 tile decode failed");
+    const auto second = require_value(second_decoder->decode_tile(*second_snapshot, second_request),
+                                       "independent x64 tile decode failed");
     require(first.usage.snapshot_window_leases == 1 &&
                 first.usage.snapshot_window_bytes == bytes.size(),
             "x64 tile did not use exactly one snapshot window lease");
@@ -208,7 +321,7 @@ void verify_x64_fixture(const std::filesystem::path& root)
                 first.usage.decoded_bytes + first.usage.invalid_bytes == bytes.size(),
             "x64 tile did not make deterministic forward progress");
     require(result_fingerprint(first) == result_fingerprint(second),
-            "x64 tile normalized records are not stable across repeated decode");
+            "x64 tile normalized records are not stable across equivalent independent inputs");
     require(first.instructions.size() == 5, "x64 tile instruction count is unexpected");
     verify_normalized_record_links(first);
 
@@ -237,31 +350,33 @@ void verify_x64_fixture(const std::filesystem::path& root)
                 (flow_return | flow_terminal | flow_indirect),
             "x64 return control flow was not normalized");
 
-    auto bounded = request;
+    auto bounded = first_request;
     bounded.limits.maximum_invalid_bytes = 2;
     bounded.limits.maximum_coverage_spans = 2;
-    const auto exhausted = decoder->decode_tile(*snapshot, bounded);
+    const auto exhausted = first_decoder->decode_tile(*first_snapshot, bounded);
     require(!exhausted && exhausted.error().code == workspace_error_code_t::limit_exceeded,
             "x64 invalid-byte bound did not fail closed");
 
-    auto instruction_bounded = request;
+    auto instruction_bounded = first_request;
     instruction_bounded.limits.maximum_instructions = 4;
     instruction_bounded.limits.maximum_operand_facts = 40;
     instruction_bounded.limits.maximum_target_facts = 44;
-    const auto instruction_exhausted = decoder->decode_tile(*snapshot, instruction_bounded);
+    const auto instruction_exhausted = first_decoder->decode_tile(*first_snapshot,
+        instruction_bounded);
     require(!instruction_exhausted &&
                 instruction_exhausted.error().code == workspace_error_code_t::limit_exceeded,
             "x64 instruction resource bound did not fail closed");
 
-    auto mismatched = request;
+    auto mismatched = first_request;
     mismatched.start_address = relative_address(0x1000, architecture_mode_t::x86_32);
-    const auto rejected = decoder->decode_tile(*snapshot, mismatched);
+    const auto rejected = first_decoder->decode_tile(*first_snapshot, mismatched);
     require(!rejected && rejected.error().code == workspace_error_code_t::invalid_argument,
             "x64 worker accepted a mismatched x86 tile mode");
 
     cancellation_source_t cancellation;
     cancellation.request_cancel();
-    const auto cancelled = decoder->decode_tile(*snapshot, request, cancellation.token());
+    const auto cancelled = first_decoder->decode_tile(*first_snapshot, first_request,
+        cancellation.token());
     require(!cancelled && cancelled.error().code == workspace_error_code_t::cancelled &&
                 cancelled.error().cancellation,
             "x64 tile cancellation was not propagated before leasing");

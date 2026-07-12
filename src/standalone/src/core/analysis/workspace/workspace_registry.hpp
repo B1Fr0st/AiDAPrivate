@@ -3,6 +3,7 @@
 #include "analysis_workspace.hpp"
 #include "live_snapshot_provider.hpp"
 #include "pe_baseline_analyzer.hpp"
+#include "../readers/pe_coff_reader.hpp"
 #include "../../infra/taskflow_runtime.hpp"
 
 #include <chrono>
@@ -118,6 +119,8 @@ public:
     std::shared_ptr<analysis_workspace_t>
         find_by_pid(std::uint32_t pid,
                     std::optional<std::uint64_t> creation_time_100ns = {}) const;
+    std::shared_ptr<const pe_coff_metadata_result_t>
+        find_pe_coff_metadata(const binary_id_t& id) const;
     workspace_result_t<std::shared_ptr<analysis_workspace_t>>
         resolve(const target_selector_t& selector,
                 const target_resolution_options_t& options = {}) const;
@@ -129,7 +132,8 @@ public:
 
 private:
     workspace_result_t<std::shared_ptr<analysis_workspace_t>>
-        insert_or_get(std::shared_ptr<analysis_workspace_t> workspace);
+        insert_or_get(std::shared_ptr<analysis_workspace_t> workspace,
+                      std::shared_ptr<const pe_coff_metadata_result_t> pe_coff_metadata = {});
     workspace_result_t<std::shared_ptr<analysis_workspace_t>> admit_provider_impl(
         const open_provider_workspace_request_t& request,
         const cancellation_token_t& cancel,
@@ -138,6 +142,8 @@ private:
 
     mutable std::shared_mutex mutex_;
     std::unordered_map<binary_id_t, std::shared_ptr<analysis_workspace_t>, binary_id_hash_t> workspaces_;
+    std::unordered_map<binary_id_t, std::shared_ptr<const pe_coff_metadata_result_t>, binary_id_hash_t>
+        pe_coff_metadata_;
     std::optional<binary_id_t> ui_selection_;
 };
 

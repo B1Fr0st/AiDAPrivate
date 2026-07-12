@@ -68,6 +68,10 @@ void verify_manifest_contract() {
     manifest.worker_binary_hash.bytes[0] = 1;
     manifest.protocol_hash = worker_wire::protocol_hash();
     manifest.capabilities = k_python_worker_capability_execute_file;
+    require(k_python_worker_binary_artifact_relative_path == "deps/AiDA_AnalysisPythonWorker.exe" &&
+        k_python_worker_manifest_artifact_relative_path == "deps/AiDA_AnalysisPythonWorker.manifest.bin" &&
+        k_python_worker_manifest_digest_relative_path == "deps/AiDA_AnalysisPythonWorker.manifest.sha256",
+        "analysis Python worker package paths changed");
     const std::string encoded = serialize_python_worker_manifest(manifest);
     const auto decoded = deserialize_python_worker_manifest(encoded);
     require(decoded.valid() && decoded.value && decoded.value->worker_relative_path == manifest.worker_relative_path &&
@@ -113,9 +117,15 @@ struct package_fixture_t final {
         output.close();
         require(static_cast<bool>(output), "fake worker manifest cannot be written");
         require(worker_wire::sha256(encoded.data(), encoded.size(), contract.expected_manifest_hash), "fake manifest hash failed");
-        contract.approved_root = root;
-        contract.manifest_path = manifest_path;
-        contract.approved_script_root = scripts;
+        const auto digest_path = root / "deps/AiDA_AnalysisPythonWorker.manifest.sha256";
+        std::ofstream digest_output(digest_path, std::ios::binary | std::ios::trunc);
+        digest_output << contract.expected_manifest_hash.to_hex() << '\n';
+        digest_output.close();
+        require(static_cast<bool>(digest_output), "fake worker manifest digest cannot be written");
+        const auto resolved_contract = resolve_python_worker_launch_contract(root, scripts);
+        require(resolved_contract.valid() && resolved_contract.value,
+            "production worker launch contract cannot be resolved from the fixture package");
+        contract = *resolved_contract.value;
     }
 
     ~package_fixture_t() {
@@ -204,10 +214,18 @@ void verify_runtime_contract(const std::filesystem::path& fake_worker) {
 
 bool run_python_worker_harness(std::string& failure, const std::filesystem::path& fake_worker_path) {
     try {
+        if (fake_worker_path.empty()) {
+            failure = "python worker harness requires a fake-worker path";
+            return false;
+        }
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(fake_worker_path, ec) || ec) {
+            failure = "python worker harness fake-worker path is not a regular file";
+            return false;
+        }
         verify_source_contract();
         verify_manifest_contract();
-        if (!fake_worker_path.empty())
-            verify_runtime_contract(fake_worker_path);
+        verify_runtime_contract(fake_worker_path);
     } catch (const std::exception& error) {
         failure.assign(error.what());
         return false;

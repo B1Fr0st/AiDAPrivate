@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace aida::analysis::native_worker::runtime {
 
@@ -191,16 +192,29 @@ inline decompiler_diagnostic_t failure_diagnostic(decompiler_diagnostic_code_t c
     return result;
 }
 
-inline bool send_failure(startup_t& startup, std::uint64_t job_id, decompiler_diagnostic_code_t code,
-                         std::string key, bool retryable = false)
+inline bool send_failures(startup_t& startup, std::uint64_t job_id,
+                          std::vector<decompiler_diagnostic_t> diagnostics)
 {
     decompiler_worker_failure_message_t failure;
     failure.envelope.kind = decompiler_worker_message_kind_t::failure;
     failure.envelope.session_nonce_hash = startup.session.nonce_hash;
     failure.envelope.sequence = startup.next_worker_sequence;
     failure.job_id = job_id;
-    failure.diagnostics.push_back(failure_diagnostic(code, std::move(key), retryable));
+    if (diagnostics.empty())
+        diagnostics.push_back(failure_diagnostic(decompiler_diagnostic_code_t::provider_failure,
+            "decompiler.native_worker.typed_provider_failed"));
+    for (std::uint32_t index = 0; index < diagnostics.size(); ++index)
+        diagnostics[index].ordinal = index + 1U;
+    failure.diagnostics = std::move(diagnostics);
     return send_message(startup, decompiler_worker_message_t{std::move(failure)}, 8U * 1024U * 1024U);
+}
+
+inline bool send_failure(startup_t& startup, std::uint64_t job_id, decompiler_diagnostic_code_t code,
+                         std::string key, bool retryable = false)
+{
+    std::vector<decompiler_diagnostic_t> diagnostics;
+    diagnostics.push_back(failure_diagnostic(code, std::move(key), retryable));
+    return send_failures(startup, job_id, std::move(diagnostics));
 }
 
 inline bool send_document(startup_t& startup, std::uint64_t job_id, decompiler_document_t document)

@@ -88,6 +88,7 @@ struct ghidra_decompile_result_limits_t {
 	size_t max_line_mappings = 1U << 20;
 	size_t max_callees = 65536;
 	uint64_t max_result_bytes = 16ULL * 1024ULL * 1024ULL;
+	bool capture_printc_evidence = false;
 };
 
 struct ghidra_adapter_decompile_cache_key_t {
@@ -128,7 +129,7 @@ struct ghidra_adapter_decompile_request_t {
 struct ghidra_result_t {
 	uint64_t function_addr = 0;
 	std::string function_name;
-	std::string pseudocode;
+	std::optional<std::string> printc_evidence;
 	std::vector<aida_ghidra::code_annotation_t> annotations;
 	std::vector<std::pair<int, uint64_t>> line_to_address;
 	std::vector<std::pair<std::string, uint64_t>> callees;
@@ -662,7 +663,7 @@ inline bool decompile_result_within_limits(
 	const ghidra_result_t& result, const ghidra_decompile_result_limits_t& limits) noexcept
 {
 	if (!valid_decompile_result_limits(limits) ||
-		result.pseudocode.size() > limits.max_pseudocode_bytes ||
+		(result.printc_evidence && result.printc_evidence->size() > limits.max_pseudocode_bytes) ||
 		result.annotations.size() > limits.max_annotations ||
 		result.line_to_address.size() > limits.max_line_mappings ||
 		result.callees.size() > limits.max_callees) {
@@ -677,7 +678,7 @@ inline bool decompile_result_within_limits(
 		return true;
 	};
 	if (!consume(static_cast<uint64_t>(result.function_name.size())) ||
-		!consume(static_cast<uint64_t>(result.pseudocode.size())) ||
+		!consume(static_cast<uint64_t>(result.printc_evidence ? result.printc_evidence->size() : 0)) ||
 		!consume(static_cast<uint64_t>(result.sleigh_id.size())) ||
 		!consume(static_cast<uint64_t>(result.error_text.size()))) {
 		return false;
@@ -910,61 +911,59 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 	if (typed_request) {
 		auto typed = aida::analysis::ghidra_ir_adapter::extract(*fd, *typed_request);
 		result.typed_diagnostics = std::move(typed.diagnostics);
-		if (typed.artifacts)
-			result.typed_artifacts = std::move(*typed.artifacts);
-	}
-
-	std::ostringstream xml_oss;
-	bool produced_markup = false;
-	try {
-		if (cancel && cancel->load(std::memory_order_acquire))
-			throw ghidra::LowlevelError("cancelled");
-		arch->setPrintLanguage("aida-c-language");
-		arch->print->setOutputStream(&xml_oss);
-		arch->print->setMarkup(true);
-		arch->print->docFunction(fd);
-		produced_markup = true;
-	}
-	catch (...) {
-		produced_markup = false;
-	}
-
-	if (produced_markup) {
-		std::string xml = xml_oss.str();
-		aida_ghidra::annotated_code_t parsed;
-		if (aida_ghidra::parse_code_xml(fd, xml, parsed,
-		                                result_limits.max_annotations,
-		                                result_limits.max_line_mappings,
-		                                cancel) && !parsed.code.empty()) {
-			result.pseudocode = std::move(parsed.code);
-			result.annotations = std::move(parsed.annotations);
-			result.line_to_address = std::move(parsed.line_to_address);
+		if (!typed.artifacts) {
+			result.is_error = true;
+			result.error_text = "Ghidra action completed without canonical typed artifacts";
+			auto end_time = std::chrono::high_resolution_clock::now();
+			result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+			return result;
 		}
+		result.typed_artifacts = std::move(*typed.artifacts);
 	}
 
-	if (result.pseudocode.empty()) {
-		std::ostringstream plain_oss;
+	if (result_limits.capture_printc_evidence) {
+		std::ostringstream xml_oss;
+		bool produced_markup = false;
 		try {
 			if (cancel && cancel->load(std::memory_order_acquire))
 				throw ghidra::LowlevelError("cancelled");
-			arch->print->setMarkup(false);
-			arch->print->setOutputStream(&plain_oss);
+			arch->setPrintLanguage("aida-c-language");
+			arch->print->setOutputStream(&xml_oss);
+			arch->print->setMarkup(true);
 			arch->print->docFunction(fd);
-			result.pseudocode = plain_oss.str();
-		}
-		catch (ghidra::LowlevelError& e) {
-			result.is_error = true;
-			result.error_text = std::string("emit failed: ") + e.explain;
-			auto end_time = std::chrono::high_resolution_clock::now();
-			result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-			return result;
+			produced_markup = true;
 		}
 		catch (...) {
-			result.is_error = true;
-			result.error_text = "emit failed (unknown)";
-			auto end_time = std::chrono::high_resolution_clock::now();
-			result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-			return result;
+			produced_markup = false;
+		}
+
+		if (produced_markup) {
+			std::string xml = xml_oss.str();
+			aida_ghidra::annotated_code_t parsed;
+			if (aida_ghidra::parse_code_xml(fd, xml, parsed,
+			                                result_limits.max_annotations,
+			                                result_limits.max_line_mappings,
+			                                cancel) && !parsed.code.empty()) {
+				result.printc_evidence = std::move(parsed.code);
+				result.annotations = std::move(parsed.annotations);
+				result.line_to_address = std::move(parsed.line_to_address);
+			}
+		}
+
+		if (!result.printc_evidence) {
+			std::ostringstream plain_oss;
+			try {
+				if (cancel && cancel->load(std::memory_order_acquire))
+					throw ghidra::LowlevelError("cancelled");
+				arch->print->setMarkup(false);
+				arch->print->setOutputStream(&plain_oss);
+				arch->print->docFunction(fd);
+				const auto plain = plain_oss.str();
+				if (!plain.empty())
+					result.printc_evidence = plain;
+			}
+			catch (...) {
+			}
 		}
 	}
 
@@ -982,10 +981,11 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 	result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
 	diag::log_tagged_critical_fmt("dec",
-		"do_decompile_exit addr=0x%llx outcome=ok total_ms=%.2f pseudocode_bytes=%zu annot=%zu",
+		"do_decompile_exit addr=0x%llx outcome=ok total_ms=%.2f typed=%d printc_evidence_bytes=%zu annot=%zu",
 		static_cast<unsigned long long>(entry_addr),
 		result.elapsed_ms,
-		result.pseudocode.size(),
+		result.typed_artifacts ? 1 : 0,
+		result.printc_evidence ? result.printc_evidence->size() : 0,
 		result.annotations.size());
 
 	return result;
@@ -1678,6 +1678,24 @@ inline aida::analysis::workspace_result_t<void> validate_ghidra_adapter_request(
 				"Ghidra adapter typed entity does not satisfy the native provider contract",
 				"ghidra.adapter.validate"));
 	}
+	if (request.typed_entity) {
+		const auto* function = request.function_database->find_function(request.function);
+		const auto* identity = std::get_if<aida::analysis::native_decompiler_entity_identity_t>(
+			&request.typed_entity->identity);
+		if (!function || request.typed_entity->kind != aida::analysis::decompiler_entity_kind_t::native_function ||
+			request.typed_entity->format != request.workspace_identity->format() ||
+			request.typed_entity->architecture != request.workspace_identity->architecture() ||
+			request.typed_entity->mode != request.workspace_identity->architecture_mode() ||
+			request.typed_entity->endian != request.workspace_identity->endian() || !identity ||
+			identity->function_id != function->key.entity_id || identity->entry != function->key.address ||
+			identity->end != function->end) {
+			return aida::analysis::workspace_result_t<void>::failure(
+				aida::analysis::make_workspace_error(
+					aida::analysis::workspace_error_code_t::provider_binding_mismatch,
+					"Ghidra adapter typed entity is not bound to the requested native function",
+					"ghidra.adapter.validate"));
+		}
+	}
 
 	auto image_valid = aida::analysis::validate_workspace_image(
 		*request.normalized_image, {}, true, cancel);
@@ -1826,11 +1844,15 @@ make_ghidra_adapter_decompile_cache_key(
 		append_number(request.function.address.value);
 		append_number(static_cast<uint64_t>(request.function.address.architecture));
 		append_number(static_cast<uint64_t>(request.function.address.mode));
+		append_text(request.typed_entity
+			? aida::analysis::stable_serialization_hash(*request.typed_entity).to_hex()
+			: std::string("auto"));
 		append_number(request.result_limits.max_pseudocode_bytes);
 		append_number(static_cast<uint64_t>(request.result_limits.max_annotations));
 		append_number(static_cast<uint64_t>(request.result_limits.max_line_mappings));
 		append_number(static_cast<uint64_t>(request.result_limits.max_callees));
 		append_number(request.result_limits.max_result_bytes);
+		append_number(request.result_limits.capture_printc_evidence ? 1U : 0U);
 		auto digest = aida::analysis::sha256_text(material, cancel);
 		if (!digest) {
 			return aida::analysis::workspace_result_t<ghidra_adapter_decompile_cache_key_t>::failure(
@@ -1852,6 +1874,7 @@ make_ghidra_adapter_decompile_cache_key(
 		key.type_revision = request.type_revision;
 		key.adapter_cache_key = request.adapter_cache_key;
 		key.function = request.function;
+		key.typed_entity = request.typed_entity;
 		key.result_limits = request.result_limits;
 		return aida::analysis::workspace_result_t<ghidra_adapter_decompile_cache_key_t>::success(
 			std::move(key));
@@ -2273,8 +2296,11 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 				}
 
 				try {
-					results[idx] = detail::do_decompile(ta->arch.get(), entries[idx], cancel);
-					if (results[idx].complete && !results[idx].is_error && !results[idx].pseudocode.empty())
+					ghidra_decompile_result_limits_t evidence_limits;
+					evidence_limits.capture_printc_evidence = true;
+					results[idx] = detail::do_decompile(ta->arch.get(), entries[idx], cancel, {}, evidence_limits);
+					if (results[idx].complete && !results[idx].is_error && results[idx].printc_evidence &&
+						!results[idx].printc_evidence->empty())
 						++ok_count;
 					else
 						++error_count;
@@ -2338,7 +2364,7 @@ inline void batch_decompile(const uint8_t* buffer, size_t buf_size, uint64_t bas
 	int ok_total = 0;
 	int err_total = 0;
 	for (const auto& r : results) {
-		if (r.complete && !r.is_error && !r.pseudocode.empty())
+		if (r.complete && !r.is_error && r.printc_evidence && !r.printc_evidence->empty())
 			++ok_total;
 		else
 			++err_total;
