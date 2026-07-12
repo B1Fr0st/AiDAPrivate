@@ -175,62 +175,58 @@ struct adapter_call_state_t final {
 
 template <typename value_t, typename operation_t>
 live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
-    std::timed_mutex* call_mutex, std::shared_ptr<const live_snapshot_clock_t> clock,
+    std::atomic_bool* call_active, std::shared_ptr<const live_snapshot_clock_t> clock,
     live_request_budget_t& budget, const live_snapshot_operation_context_t& context,
     std::string_view phase, operation_t&& operation) noexcept
 {
-    const auto initial = checkpoint_request(budget, context, *clock, phase);
-    if (!initial)
-        return live_snapshot_result_t<value_t>::failure(initial.error());
+    for (;;) {
+        const auto checkpoint = checkpoint_request(budget, context, *clock, phase);
+        if (!checkpoint)
+            return live_snapshot_result_t<value_t>::failure(checkpoint.error());
 
+        bool expected = false;
+        if (call_active->compare_exchange_weak(expected, true, std::memory_order_acq_rel,
+                                               std::memory_order_acquire))
+            break;
+
+        const auto wall_now = live_request_budget_t::clock_t::now();
+        if (wall_now >= context.wall_deadline) {
+            return live_snapshot_result_t<value_t>::failure(
+                make_live_snapshot_error(live_snapshot_error_code_t::deadline_exceeded, phase));
+        }
+        const auto delay = (std::min)(context.wall_deadline - wall_now,
+                                      adapter_wait_quantum());
+        std::this_thread::sleep_for(delay);
+    }
+
+    bool release_call = true;
     try {
         auto state = std::make_shared<adapter_call_state_t<value_t>>();
         live_snapshot_cancellation_source_t call_cancellation;
         auto call_context = context;
         call_context.cancellation = call_cancellation.token();
+        const auto caller_cancellation = context.cancellation;
         using operation_value_t = std::decay_t<operation_t>;
 
         std::thread worker(
-            [state, call_mutex, call_context,
+            [state, call_active, call_context, caller_cancellation,
              operation = operation_value_t(std::forward<operation_t>(operation))]() mutable {
                 auto result = live_snapshot_result_t<value_t>::failure(
                     make_live_snapshot_error(live_snapshot_error_code_t::adapter_failure,
                                              "adapter_call"));
                 try {
-                    std::unique_lock<std::timed_mutex> call_lock(*call_mutex, std::defer_lock);
-                    for (;;) {
-                        if (call_context.cancellation.stop_requested()) {
-                            result = live_snapshot_result_t<value_t>::failure(
-                                make_live_snapshot_error(live_snapshot_error_code_t::cancelled,
-                                                         "adapter_call"));
-                            break;
-                        }
-                        const auto wall_now = live_request_budget_t::clock_t::now();
-                        if (wall_now >= call_context.wall_deadline) {
-                            result = live_snapshot_result_t<value_t>::failure(
-                                make_live_snapshot_error(
-                                    live_snapshot_error_code_t::deadline_exceeded,
-                                    "adapter_call"));
-                            break;
-                        }
-                        const auto delay = (std::min)(call_context.wall_deadline - wall_now,
-                                                      adapter_wait_quantum());
-                        if (!call_lock.try_lock_for(delay))
-                            continue;
-                        if (call_context.cancellation.stop_requested()) {
-                            result = live_snapshot_result_t<value_t>::failure(
-                                make_live_snapshot_error(live_snapshot_error_code_t::cancelled,
-                                                         "adapter_call"));
-                        } else if (live_request_budget_t::clock_t::now() >=
-                                   call_context.wall_deadline) {
-                            result = live_snapshot_result_t<value_t>::failure(
-                                make_live_snapshot_error(
-                                    live_snapshot_error_code_t::deadline_exceeded,
-                                    "adapter_call"));
-                        } else {
-                            result = operation(call_context);
-                        }
-                        break;
+                    if (caller_cancellation.stop_requested() ||
+                        call_context.cancellation.stop_requested()) {
+                        result = live_snapshot_result_t<value_t>::failure(
+                            make_live_snapshot_error(live_snapshot_error_code_t::cancelled,
+                                                     "adapter_call"));
+                    } else if (live_request_budget_t::clock_t::now() >=
+                               call_context.wall_deadline) {
+                        result = live_snapshot_result_t<value_t>::failure(
+                            make_live_snapshot_error(live_snapshot_error_code_t::deadline_exceeded,
+                                                     "adapter_call"));
+                    } else {
+                        result = operation(call_context);
                     }
                 } catch (const std::bad_alloc&) {
                     result = live_snapshot_result_t<value_t>::failure(
@@ -242,12 +238,14 @@ live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
                                                  "adapter_call"));
                 }
 
+                call_active->store(false, std::memory_order_release);
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     state->result.emplace(std::move(result));
                 }
                 state->wake.notify_one();
             });
+        release_call = false;
         worker.detach();
 
         for (;;) {
@@ -277,9 +275,13 @@ live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
             state->wake.wait_for(lock, delay, [&state] { return state->result.has_value(); });
         }
     } catch (const std::bad_alloc&) {
+        if (release_call)
+            call_active->store(false, std::memory_order_release);
         return live_snapshot_result_t<value_t>::failure(
             make_live_snapshot_error(live_snapshot_error_code_t::allocation_failed, phase));
     } catch (...) {
+        if (release_call)
+            call_active->store(false, std::memory_order_release);
         return live_snapshot_result_t<value_t>::failure(
             make_live_snapshot_error(live_snapshot_error_code_t::adapter_failure, phase));
     }
@@ -452,7 +454,7 @@ live_snapshot_provider_t::query_process_bounded(
 {
     const auto adapter = adapter_;
     return invoke_adapter_call_bounded<live_process_identity_t>(
-        &adapter->call_mutex_, clock_, budget, context, "process_query",
+        &adapter->call_active_, clock_, budget, context, "process_query",
         [adapter, pid = request_.process.pid](const live_snapshot_operation_context_t& call_context) {
             return adapter->query_process(pid, call_context);
         });
@@ -466,7 +468,7 @@ live_snapshot_provider_t::query_module_bounded(
     const auto adapter = adapter_;
     const auto module_base = request_.module.base;
     return invoke_adapter_call_bounded<live_module_identity_t>(
-        &adapter->call_mutex_, clock_, budget, context, "module_query",
+        &adapter->call_active_, clock_, budget, context, "module_query",
         [adapter, process, module_base](const live_snapshot_operation_context_t& call_context) {
             return adapter->query_module(process, module_base, call_context);
         });
@@ -481,7 +483,7 @@ live_snapshot_provider_t::read_page_bounded(
     const auto process = request_.process;
     const auto module = request_.module;
     return invoke_adapter_call_bounded<live_snapshot_adapter_page_t>(
-        &adapter->call_mutex_, clock_, budget, context, "read_adapter",
+        &adapter->call_active_, clock_, budget, context, "read_adapter",
         [adapter, process, module, address, size](
             const live_snapshot_operation_context_t& call_context) {
             return adapter->read_page(process, module, address, size, call_context);

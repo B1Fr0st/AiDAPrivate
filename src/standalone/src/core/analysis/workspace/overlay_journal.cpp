@@ -196,7 +196,8 @@ workspace_result_t<std::vector<std::uint8_t>> hex_decode(const std::string& text
     return workspace_result_t<std::vector<std::uint8_t>>::success(std::move(result));
 }
 
-json operation_json(const overlay_operation_t& operation) {
+json operation_json(const overlay_operation_t& operation,
+                    const overlay_target_identity_v9_t* target = nullptr) {
     json result{{"address", address_json(operation.address)},
                 {"assembly", operation.assembly},
                 {"bytes", hex_encode(operation.bytes)},
@@ -204,16 +205,25 @@ json operation_json(const overlay_operation_t& operation) {
                 {"integer_value", operation.integer_value},
                 {"kind", static_cast<unsigned>(operation.kind)},
                 {"name", operation.name},
+                {"reanalysis_flags", operation.reanalysis_flags},
+                {"remove", operation.remove},
                 {"signature", operation.signature},
                 {"stack_offset", std::to_string(operation.stack_offset)},
                 {"text", operation.text},
                 {"type", operation.type},
                 {"variable", operation.variable}};
     result["end"] = operation.end ? address_json(*operation.end) : json(nullptr);
+    if (target) {
+        result["schema"] = k_overlay_journal_v9_schema;
+        result["target"] = json::parse(serialize_overlay_target_identity_v9(*target));
+    }
     return result;
 }
 
-workspace_result_t<overlay_operation_t> parse_operation(const std::string& text) {
+workspace_result_t<overlay_operation_t> parse_operation(
+    const std::string& text,
+    const overlay_target_identity_v9_t* expected_target = nullptr,
+    bool* migrated = nullptr) {
     auto value = json::parse(text, nullptr, false);
     if (value.is_discarded() || !value.is_object()) {
         return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
@@ -230,6 +240,27 @@ workspace_result_t<overlay_operation_t> parse_operation(const std::string& text)
                 "overlay_journal.recovery"));
         }
     }
+    const bool versioned = value.contains("schema");
+    if (migrated)
+        *migrated = !versioned;
+    if (versioned) {
+        if (!value["schema"].is_number_unsigned() ||
+            value["schema"].get<std::uint32_t>() != k_overlay_journal_v9_schema ||
+            !value.contains("target") || !value.contains("reanalysis_flags") ||
+            !value.contains("remove")) {
+            return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "overlay operation schema is invalid",
+                "overlay_journal.recovery"));
+        }
+        auto serialized_target = deserialize_overlay_target_identity_v9(value["target"].dump());
+        if (!serialized_target || (expected_target && *serialized_target != *expected_target)) {
+            return workspace_result_t<overlay_operation_t>::failure(make_workspace_error(
+                workspace_error_code_t::target_conflict,
+                "overlay operation target identity does not match the workspace",
+                "overlay_journal.recovery"));
+        }
+    }
     overlay_operation_t operation;
     auto address = parse_address(value["address"]);
     if (!address) return workspace_result_t<overlay_operation_t>::failure(address.error());
@@ -240,11 +271,21 @@ workspace_result_t<overlay_operation_t> parse_operation(const std::string& text)
         operation.end = end.take_value();
     }
     try {
-        operation.kind = static_cast<overlay_operation_kind_t>(value["kind"].get<unsigned>());
+        if (!value["kind"].is_number_unsigned())
+            throw std::invalid_argument("invalid overlay operation kind");
+        const auto ordinal = value["kind"].get<unsigned>();
+        if (ordinal > static_cast<unsigned>(overlay_operation_kind_t::reanalysis) ||
+            (!versioned && ordinal > static_cast<unsigned>(overlay_operation_kind_t::integer_patch)))
+            throw std::invalid_argument("invalid overlay operation kind");
+        operation.kind = static_cast<overlay_operation_kind_t>(ordinal);
         operation.assembly = value["assembly"].get<std::string>();
         operation.integer_type = value["integer_type"].get<std::string>();
         operation.integer_value = value["integer_value"].get<std::string>();
         operation.name = value["name"].get<std::string>();
+        if (versioned) {
+            operation.reanalysis_flags = value["reanalysis_flags"].get<std::uint32_t>();
+            operation.remove = value["remove"].get<bool>();
+        }
         operation.signature = value["signature"].get<std::string>();
         const std::string stack_offset = value["stack_offset"].get<std::string>();
         const auto parsed_stack = std::from_chars(stack_offset.data(),
@@ -277,10 +318,14 @@ std::string address_key(const address_t& address) {
 std::string entity_key(const overlay_operation_t& operation) {
     std::string prefix;
     switch (operation.kind) {
-    case overlay_operation_kind_t::comment: prefix = "comment"; break;
+    case overlay_operation_kind_t::comment:
+    case overlay_operation_kind_t::comment_update:
+        prefix = "comment";
+        break;
     case overlay_operation_kind_t::name: prefix = "name"; break;
     case overlay_operation_kind_t::bookmark: prefix = "bookmark"; break;
     case overlay_operation_kind_t::type_declaration: return "type_declaration:" + operation.name;
+    case overlay_operation_kind_t::enum_definition: return "enum_definition:" + operation.name;
     case overlay_operation_kind_t::define_function: prefix = "define_function"; break;
     case overlay_operation_kind_t::define_code: prefix = "define_code"; break;
     case overlay_operation_kind_t::define_data: prefix = "define_data"; break;
@@ -290,6 +335,7 @@ std::string entity_key(const overlay_operation_t& operation) {
         return "stack_variable:" + address_key(operation.address) + ":" +
                std::to_string(operation.stack_offset) + ":" + operation.name;
     case overlay_operation_kind_t::type_application:
+    case overlay_operation_kind_t::type_update:
         return "type_application:" + address_key(operation.address) + ":" +
                operation.variable + ":" + operation.name;
     case overlay_operation_kind_t::byte_patch:
@@ -297,12 +343,18 @@ std::string entity_key(const overlay_operation_t& operation) {
     case overlay_operation_kind_t::integer_patch:
         prefix = "patch";
         break;
+    case overlay_operation_kind_t::reanalysis:
+        prefix = "reanalysis";
+        break;
     }
     return prefix + ":" + address_key(operation.address);
 }
 
 bool removes_value(const overlay_operation_t& operation) {
-    if (operation.kind == overlay_operation_kind_t::comment)
+    if (operation.remove)
+        return true;
+    if (operation.kind == overlay_operation_kind_t::comment ||
+        operation.kind == overlay_operation_kind_t::comment_update)
         return operation.text.empty();
     if (operation.kind == overlay_operation_kind_t::name ||
         operation.kind == overlay_operation_kind_t::bookmark)

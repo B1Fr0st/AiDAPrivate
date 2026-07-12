@@ -210,7 +210,7 @@ public:
 
 private:
     friend class live_snapshot_provider_t;
-    mutable std::timed_mutex call_mutex_;
+    mutable std::atomic_bool call_active_{false};
 };
 
 class live_snapshot_clock_t {

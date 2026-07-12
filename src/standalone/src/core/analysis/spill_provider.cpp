@@ -5,8 +5,6 @@
 
 #include "spill_provider.hpp"
 
-#include "workspace/workspace_identity.hpp"
-
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -437,8 +435,8 @@ workspace_result_t<std::shared_ptr<spill_provider_t>> spill_sink_t::finalize(
         fail_storage(*storage);
         return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(error));
     }
-    auto actual_digest = sha256_provider(*cache.value(), cancel,
-                                         storage->options.write_chunk_bytes);
+    auto actual_digest = cache.value()->compute_content_sha256(
+        cancel, storage->options.write_chunk_bytes);
     if (!actual_digest) {
         auto error = actual_digest.error();
         fail_storage(*storage);
@@ -584,8 +582,8 @@ workspace_result_t<void> spill_provider_t::verify_content(
     if (!valid)
         return valid;
     const auto storage = state_->storage;
-    auto digest = sha256_provider(*storage->cache, cancel,
-                                  storage->options.write_chunk_bytes);
+    auto digest = storage->cache->compute_content_sha256(
+        cancel, storage->options.write_chunk_bytes);
     if (!digest)
         return workspace_result_t<void>::failure(digest.error());
     valid = revalidate();

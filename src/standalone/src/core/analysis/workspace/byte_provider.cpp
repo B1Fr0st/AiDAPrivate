@@ -258,6 +258,7 @@ workspace_result_t<sha256_digest_t> byte_provider_t::compute_content_sha256(
     auto accumulator = sha256_accumulator_t::create();
     if (!accumulator)
         return workspace_result_t<sha256_digest_t>::failure(accumulator.error());
+    auto builder = accumulator.take_value();
     std::uint64_t offset = 0;
     while (offset < size()) {
         if (cancel.stop_requested())
@@ -279,13 +280,12 @@ workspace_result_t<sha256_digest_t> byte_provider_t::compute_content_sha256(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "provider returned an invalid hash lease",
                                      "provider_hash"));
-        auto updated = accumulator.value().update(
-            view.value().data(), view.value().size());
+        auto updated = builder.update(view.value().data(), view.value().size());
         if (!updated)
             return workspace_result_t<sha256_digest_t>::failure(updated.error());
         offset += amount;
     }
-    return accumulator.value().finish();
+    return builder.finish();
 }
 
 workspace_result_t<std::shared_ptr<mapped_file_provider_t>>
