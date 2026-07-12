@@ -1,0 +1,37 @@
+{
+  "schema": "aida.c03.external-sla-slot",
+  "schema_version": 2,
+  "slot_id": "c03-release-sla-300-500mb",
+  "tier": "release_sla_external",
+  "approval": {
+    "approval_id": "aida.c03.release-sla.external-slot.2026-07-12.v1",
+    "policy_version": 1,
+    "status": "approved"
+  },
+  "generator_source": {
+    "path": "src/standalone/tests/c03/fixtures/corpus_generator_recipes.json",
+    "sha256": "1ab887cc868b81e3cbc30c3fd840d287d8c68dc67b4047682d69d1dc5e4053d5"
+  },
+  "license": {
+    "policy_id": "aida.c03.license-clean-redistributable.v1",
+    "policy_version": 1,
+    "allowed_spdx": ["CC0-1.0", "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib"],
+    "redistribution_required": true
+  },
+  "size_bytes": {
+    "minimum": 300000000,
+    "maximum": 500000000
+  },
+  "receipt_requirements": {
+    "artifact_sha256": true,
+    "source_provenance": true,
+    "license": true,
+    "hardware": true,
+    "cache": true,
+    "matrix": true,
+    "raw_samples": true,
+    "resource_quotas": true,
+    "pressure_telemetry": true,
+    "slot_binding": true
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "$id": "aida.c03.worker-manifest.schema.json",
+  "title": "AiDA C03 Protected Worker Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "distribution", "workers", "camoufox", "notices"],
+  "properties": {
+    "schema": { "const": "aida.c03.worker-manifest" },
+    "schema_version": { "const": 1 },
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disk_backed", "protected", "arc_license_gates_required", "raw_standalone_download_forbidden", "fileless_launch_forbidden"],
+      "properties": {
+        "disk_backed": { "const": true },
+        "protected": { "const": true },
+        "arc_license_gates_required": { "const": true },
+        "raw_standalone_download_forbidden": { "const": true },
+        "fileless_launch_forbidden": { "const": true }
+      }
+    },
+    "workers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "relative_path", "sha256", "signature", "pipe", "containment", "target_execution_forbidden"],
+        "properties": {
+          "id": { "enum": ["native_decompiler", "managed_cli_decompiler", "analysis_python"] },
+          "relative_path": { "type": "string", "pattern": "^deps/[A-Za-z0-9_.-]+\\.exe$" },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "signature": { "type": "object", "additionalProperties": false, "required": ["verified", "manifest_bound"], "properties": { "verified": { "const": true }, "manifest_bound": { "const": true } } },
+          "pipe": { "type": "object", "additionalProperties": false, "required": ["acl_restricted", "session_nonce", "monotonic_sequence"], "properties": { "acl_restricted": { "const": true }, "session_nonce": { "const": true }, "monotonic_sequence": { "const": true } } },
+          "containment": { "type": "object", "additionalProperties": false, "required": ["job_object", "kill_on_parent_close", "restricted_token", "network_denied", "child_process_denied", "unrelated_handles_denied", "process_mitigations", "cpu_quota", "memory_quota", "deadline_ms", "cancellation_replaces_worker"], "properties": { "job_object": { "const": true }, "kill_on_parent_close": { "const": true }, "restricted_token": { "const": true }, "network_denied": { "const": true }, "child_process_denied": { "const": true }, "unrelated_handles_denied": { "const": true }, "process_mitigations": { "const": true }, "cpu_quota": { "type": "integer", "minimum": 1 }, "memory_quota": { "type": "integer", "minimum": 1 }, "deadline_ms": { "type": "integer", "minimum": 1 }, "cancellation_replaces_worker": { "const": true } } },
+          "target_execution_forbidden": { "const": true }
+        }
+      }
+    },
+    "camoufox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["only_supported_browser", "browser_relative_path", "browser_sha256", "reverse_mcp_relative_path", "reverse_mcp_sha256", "developer_source_shipped", "loose_python_shipped", "stock_browser_fallback", "environment"],
+      "properties": {
+        "only_supported_browser": { "const": "camoufox" },
+        "browser_relative_path": { "const": "deps/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe" },
+        "browser_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "reverse_mcp_relative_path": { "const": "deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe" },
+        "reverse_mcp_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "developer_source_shipped": { "const": false },
+        "loose_python_shipped": { "const": false },
+        "stock_browser_fallback": { "const": false },
+        "environment": { "type": "object", "additionalProperties": false, "required": ["AIDA_CAMOUFOX_EXECUTABLE", "AIDA_CAMOUFOX_MCP_EXECUTABLE", "AIDA_CAMOUFOX_PYTHON"], "properties": { "AIDA_CAMOUFOX_EXECUTABLE": { "const": "verified-browser" }, "AIDA_CAMOUFOX_MCP_EXECUTABLE": { "const": "verified-frozen-sidecar" }, "AIDA_CAMOUFOX_PYTHON": { "const": "unset-unless-verified-sidecar-runtime" } } }
+      }
+    },
+    "notices": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ledger_relative_path", "managed_package_notices"],
+      "properties": {
+        "ledger_relative_path": { "const": "notices/THIRD_PARTY_NOTICES.md" },
+        "managed_package_notices": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "license_relative_path", "license_sha256", "third_party_notices_relative_path", "third_party_notices_sha256"],
+            "properties": {
+              "id": { "enum": ["System.Collections.Immutable", "System.Reflection.Metadata"] },
+              "license_relative_path": { "type": "string", "pattern": "^notices/managed/[A-Za-z0-9_.-]+/LICENSE\\.TXT$" },
+              "license_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+              "third_party_notices_relative_path": { "type": "string", "pattern": "^notices/managed/[A-Za-z0-9_.-]+/THIRD-PARTY-NOTICES\\.TXT$" },
+              "third_party_notices_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1436,6 +1436,8 @@ if(WIN32)
 
     if(BUILD_AIDA_STANDALONE)
         set(STANDALONE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src")
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_dependencies.cmake")
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_safe_headless_manifest.cmake")
 
         set(IMGUI_WRAPPER_DIR "${CMAKE_BINARY_DIR}/_imgui_wrapper/imgui")
         file(MAKE_DIRECTORY "${IMGUI_WRAPPER_DIR}")
@@ -2025,6 +2027,7 @@ if(WIN32)
             $<TARGET_OBJECTS:AiDAStandalone_asm>
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
+        target_sources(AiDAStandalone PRIVATE ${AIDA_C03_WAVE_B_STANDALONE_SOURCES})
 
         target_include_directories(AiDAStandalone PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -2110,6 +2113,12 @@ if(WIN32)
             /Zp8
             /bigobj
         )
+
+        option(AIDA_BUILD_C03_SAFE_HEADLESS_HARNESSES "Build and register C03 safe-headless Wave B harness targets" ON)
+        if(AIDA_BUILD_C03_SAFE_HEADLESS_HARNESSES)
+            enable_testing()
+            aida_c03_register_safe_headless_targets()
+        endif()
 
         set(AIDA_WORKSPACE_HARNESS_SOURCES
             workspace_core_harness
@@ -2281,6 +2290,7 @@ if(WIN32)
             bcrypt
             Shlwapi
             advapi32
+            userenv
             wintrust
             setupapi
             cfgmgr32

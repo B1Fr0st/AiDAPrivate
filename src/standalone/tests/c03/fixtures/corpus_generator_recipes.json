@@ -1,0 +1,31 @@
+{
+  "schema": "aida.c03.corpus-generator-recipes",
+  "schema_version": 1,
+  "license": {
+    "spdx": "CC0-1.0",
+    "redistribution": "permitted"
+  },
+  "recipes": [
+    {"id": "pe32-x86", "generator": "deterministic_minimal_image", "format": "pe32", "architecture": "x86", "mode": "32", "endian": "little"},
+    {"id": "pe32plus-x64", "generator": "deterministic_minimal_image", "format": "pe32plus", "architecture": "x64", "mode": "64", "endian": "little"},
+    {"id": "coff-x64", "generator": "deterministic_object", "format": "coff", "architecture": "x64", "mode": "64", "endian": "little"},
+    {"id": "elf32-x86-le", "generator": "deterministic_minimal_image", "format": "elf32", "architecture": "x86", "mode": "32", "endian": "little"},
+    {"id": "elf64-x64-le", "generator": "deterministic_minimal_image", "format": "elf64", "architecture": "x64", "mode": "64", "endian": "little"},
+    {"id": "elf32-mips-be", "generator": "deterministic_minimal_image", "format": "elf32", "architecture": "mips", "mode": "32", "endian": "big"},
+    {"id": "macho64-arm64", "generator": "deterministic_minimal_image", "format": "macho_thin", "architecture": "aarch64", "mode": "64", "endian": "little"},
+    {"id": "macho-fat-x64-arm64", "generator": "deterministic_container", "format": "macho_fat", "architecture": "multi", "mode": "mixed", "endian": "mixed"},
+    {"id": "zip64-x64", "generator": "deterministic_container", "format": "zip64", "architecture": "x64", "mode": "64", "endian": "little"},
+    {"id": "apk-multidex", "generator": "deterministic_container", "format": "apk", "architecture": "dalvik", "mode": "register", "endian": "little"},
+    {"id": "aab-multidex", "generator": "deterministic_container", "format": "aab", "architecture": "dalvik", "mode": "register", "endian": "little"},
+    {"id": "ipa-objc-swift", "generator": "deterministic_container", "format": "ipa", "architecture": "aarch64", "mode": "64", "endian": "little"},
+    {"id": "jar-jvm", "generator": "deterministic_container", "format": "jar", "architecture": "jvm", "mode": "stack", "endian": "big"},
+    {"id": "classfile-jvm", "generator": "deterministic_classfile", "format": "classfile", "architecture": "jvm", "mode": "stack", "endian": "big"},
+    {"id": "dex-dalvik", "generator": "deterministic_dex", "format": "dex", "architecture": "dalvik", "mode": "register", "endian": "little"},
+    {"id": "oat-arm64", "generator": "deterministic_artifact", "format": "oat", "architecture": "aarch64", "mode": "64", "endian": "little"},
+    {"id": "vdex-arm64", "generator": "deterministic_artifact", "format": "vdex", "architecture": "aarch64", "mode": "64", "endian": "little"},
+    {"id": "cli-x64", "generator": "deterministic_cli_assembly", "format": "cli", "architecture": "cli", "mode": "il", "endian": "little"},
+    {"id": "arm-thumb", "generator": "deterministic_code_fragment", "format": "raw_code", "architecture": "arm", "mode": "thumb", "endian": "little"},
+    {"id": "ppc32-be", "generator": "deterministic_code_fragment", "format": "raw_code", "architecture": "ppc", "mode": "32", "endian": "big"},
+    {"id": "riscv64-le", "generator": "deterministic_code_fragment", "format": "raw_code", "architecture": "riscv", "mode": "64", "endian": "little"}
+  ]
+}

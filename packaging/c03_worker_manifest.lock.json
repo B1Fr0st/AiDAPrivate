@@ -1,0 +1,71 @@
+{
+  "schema": "aida.c03.worker-manifest-lock",
+  "schema_version": 1,
+  "no_network_fetch": true,
+  "offline_managed_restore": {
+    "locked_mode_required": true,
+    "network_sources_forbidden": true,
+    "local_source": ".deps/nuget-offline",
+    "sdk": { "path": ".deps/dotnet-sdk-10.0.301-win-x64/dotnet.exe", "sha256": "a5ccdc3a41d5e5c6014ff64509aed176db39f4f14caffff3dd1997f8907e94d7", "shipped": false },
+    "packages": [
+      { "id": "ICSharpCode.Decompiler", "version": "10.1.0.8386", "path": ".deps/nuget-offline/ICSharpCode.Decompiler.10.1.0.8386.nupkg", "sha256": "a6fb2e9be86c1b73e54231e20640d4d566c52f21cba9ad99c3e9100d67e8f5af", "license": "MIT" },
+      { "id": "System.Collections.Immutable", "version": "9.0.0", "path": ".deps/nuget-offline/System.Collections.Immutable.9.0.0.nupkg", "sha256": "fbaab954c7a87396e6e1616ca15ea705703d755e696bf3b8c96fa039d8bcc9a7", "license": "MIT" },
+      { "id": "System.Reflection.Metadata", "version": "9.0.0", "path": ".deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg", "sha256": "6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634", "license": "MIT" }
+    ]
+  },
+  "notice_artifacts": {
+    "ledger_source_path": "licenses/c03/THIRD_PARTY_NOTICES.md",
+    "customer_ledger_relative_path": "notices/THIRD_PARTY_NOTICES.md",
+    "managed_package_notices": [
+      {
+        "id": "System.Collections.Immutable",
+        "archive": ".deps/nuget-offline/System.Collections.Immutable.9.0.0.nupkg",
+        "license_entry": "LICENSE.TXT",
+        "license_relative_path": "notices/managed/System.Collections.Immutable-9.0.0/LICENSE.TXT",
+        "license_sha256": "d7a68596ab69b06f51ca278a6545148e4269a9381c26d597c13df5d88e08cf5b",
+        "third_party_notices_entry": "THIRD-PARTY-NOTICES.TXT",
+        "third_party_notices_relative_path": "notices/managed/System.Collections.Immutable-9.0.0/THIRD-PARTY-NOTICES.TXT",
+        "third_party_notices_sha256": "40686c6447a7d5b5d3693068e4571b5f483d7ed335aeee773ef662440de4c5d5"
+      },
+      {
+        "id": "System.Reflection.Metadata",
+        "archive": ".deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg",
+        "license_entry": "LICENSE.TXT",
+        "license_relative_path": "notices/managed/System.Reflection.Metadata-9.0.0/LICENSE.TXT",
+        "license_sha256": "d7a68596ab69b06f51ca278a6545148e4269a9381c26d597c13df5d88e08cf5b",
+        "third_party_notices_entry": "THIRD-PARTY-NOTICES.TXT",
+        "third_party_notices_relative_path": "notices/managed/System.Reflection.Metadata-9.0.0/THIRD-PARTY-NOTICES.TXT",
+        "third_party_notices_sha256": "40686c6447a7d5b5d3693068e4571b5f483d7ed335aeee773ef662440de4c5d5"
+      }
+    ],
+    "evidence_only_notices": [
+      { "id": "lief", "license_source": ".deps/LIEF-0.17.6/LICENSE", "license_sha256": "94a5b753e8d799c7aa0c0c4899c5d5f9be1a940cba73f61c6396f32db790a0be" },
+      { "id": "remill", "license_source": ".deps/remill-6.0.1/remill-6.0.1/LICENSE", "license_sha256": "59899c6091b540582ed617e8eeaac4919dc985ccfc35459ee9752b699be5205b" }
+    ]
+  },
+  "dependency_decisions": {
+    "production": ["zydis", "zycore", "capstone", "taskflow", "ghidra_worker", "triton_thorough_only", "z3_thorough_only", "sqlite", "imgui", "zlib", "zstd", "liblzma_minimal", "minizip_ng_read_only", "pcre2_8bit_no_jit", "nlohmann_json", "json_schema_validator", "llvm_demangle_support", "managed_worker_packages"],
+    "evidence_only": ["lief", "remill"],
+    "non_use": ["lmdb", "unicorn"],
+    "llvm_component_allowlist": ["Demangle", "Support"],
+    "production_link_denylist": ["lmdb", "unicorn", "remill"]
+  },
+  "customer_sidecars": {
+    "distribution": "protected-disk-backed",
+    "raw_standalone_download_forbidden": true,
+    "fileless_launch_forbidden": true,
+    "camoufox": {
+      "only_supported_browser": "camoufox",
+      "browser_source_path": "camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe",
+      "browser_relative_path": "deps/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe",
+      "browser_sha256": "768937fa6a6df581d0cdc88ecffe1cf651ffebe1ad1d5667a5f75100e96acfe0",
+      "reverse_mcp_source_path": ".deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe",
+      "reverse_mcp_relative_path": "deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe",
+      "reverse_mcp_sha256": "2443649a43c92b048b7f013434d169889b41f494f391359d9cc72111c6e0ee4c",
+      "developer_source_shipped": false,
+      "loose_python_shipped": false,
+      "stock_browser_fallback": false,
+      "environment": { "AIDA_CAMOUFOX_EXECUTABLE": "verified-browser", "AIDA_CAMOUFOX_MCP_EXECUTABLE": "verified-frozen-sidecar", "AIDA_CAMOUFOX_PYTHON": "unset-unless-verified-sidecar-runtime" }
+    }
+  }
+}

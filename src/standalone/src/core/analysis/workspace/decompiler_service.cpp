@@ -2,7 +2,6 @@
 
 #include "advanced_cfg.hpp"
 #include "calling_convention.hpp"
-#include "pseudocode_readability.hpp"
 #include "semantic_fusion.hpp"
 #include "type_recovery.hpp"
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
@@ -853,6 +852,22 @@ workspace_error_t map_adapter_error(
 
 }
 
+bool decompiler_service_v2_result_t::succeeded() const noexcept {
+    return ast_build.succeeded() && rendering.has_value() && rendering->succeeded();
+}
+
+decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
+    const hir_function_t& hir,
+    const type_graph_t& type_graph,
+    const decompiler_service_v2_request_t& request) {
+    decompiler_service_v2_result_t result;
+    result.ast_build = build_typed_ast_v2(hir, type_graph, request.ast);
+    if (!result.ast_build.succeeded())
+        return result;
+    result.rendering = render_pseudocode_v2(*result.ast_build.ast, type_graph, request.renderer);
+    return result;
+}
+
 struct decompiler_service_t::state_t {
     struct cache_item_t {
         decompiler_cache_key_t key;
@@ -1460,19 +1475,9 @@ workspace_result_t<decompiler_quality_result_t> run_decompiler_quality(
     if (!gate)
         return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
 
-    const typed_pseudocode_ast_t* typed_ast = nullptr;
-    const auto readability = render_typed_pseudocode(typed_ast, {});
-    if (readability.succeeded() || readability.errors.size() != 1 ||
-        readability.errors.front().code != pseudocode_render_error_code_t::invalid_ast) {
-        return workspace_result_t<decompiler_quality_result_t>::failure(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "typed pseudocode renderer did not report the expected missing-AST state",
-            "decompiler.quality.readability"));
-    }
-    append_quality_error(quality, function, type_revision, "readability",
-        decompiler_feedback_error_class_t::integration,
-        "ghidra_adapter_decompile_result_t supplies text, annotations, mappings, and callees but no typed_pseudocode_ast_t; " +
-            readability.errors.front().detail);
+    append_quality_abstention(quality, function, type_revision, "readability",
+        decompiler_feedback_abstention_reason_t::unsupported_encoding,
+        "native Ghidra output has no canonical HIR/type-graph artifact; typed AST V2 rendering abstained without fabricating a body");
     gate = current("decompiler.quality.readability.complete");
     if (!gate)
         return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());

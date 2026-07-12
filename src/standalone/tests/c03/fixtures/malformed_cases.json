@@ -1,0 +1,20 @@
+{
+  "schema": "aida.c03.malformed-cases",
+  "schema_version": 1,
+  "source": {
+    "path": "src/standalone/tests/c03/fixtures/corpus_generator_recipes.json",
+    "sha256": "1ab887cc868b81e3cbc30c3fd840d287d8c68dc67b4047682d69d1dc5e4053d5"
+  },
+  "license": {
+    "spdx": "CC0-1.0",
+    "redistribution": true
+  },
+  "cases": [
+    {"id":"pe32-x86-truncated","source_fixture_id":"pe32-x86","kind":"truncated","mutation":"truncate_after_dos_header","expected_error_codes":["pe_truncated_header"],"max_wall_ms":250,"max_private_bytes":67108864},
+    {"id":"zip64-bomb","source_fixture_id":"zip64-x64","kind":"zip_bomb","mutation":"inflate_ratio_exceeds_contract","expected_error_codes":["container_resource_limit"],"max_wall_ms":500,"max_private_bytes":134217728},
+    {"id":"dex-overflow","source_fixture_id":"dex-dalvik","kind":"integer_overflow","mutation":"string_data_offset_plus_size_overflow","expected_error_codes":["dex_offset_overflow"],"max_wall_ms":250,"max_private_bytes":67108864},
+    {"id":"cli-invalid-signature","source_fixture_id":"cli-x64","kind":"invalid_signature","mutation":"clear_cli_metadata_signature","expected_error_codes":["cli_invalid_metadata_signature"],"max_wall_ms":250,"max_private_bytes":67108864},
+    {"id":"macho-fat-invalid-offset","source_fixture_id":"macho-fat-x64-arm64","kind":"invalid_offset","mutation":"fat_arch_offset_out_of_range","expected_error_codes":["macho_offset_out_of_range"],"max_wall_ms":250,"max_private_bytes":67108864},
+    {"id":"apk-invalid-length","source_fixture_id":"apk-multidex","kind":"invalid_length","mutation":"zip_member_length_exceeds_container","expected_error_codes":["container_member_length_invalid"],"max_wall_ms":500,"max_private_bytes":134217728}
+  ]
+}

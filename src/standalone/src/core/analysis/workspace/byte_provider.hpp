@@ -3,6 +3,7 @@
 #include "checked_range.hpp"
 #include "workspace_types.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -13,6 +14,9 @@
 
 namespace aida::analysis {
 
+class mapped_window_cache_t;
+class subrange_provider_t;
+
 struct byte_provider_identity_t {
     std::string normalized_source;
     std::uint64_t size = 0;
@@ -20,6 +24,7 @@ struct byte_provider_identity_t {
     std::array<std::uint8_t, 16> file_id{};
     std::uint64_t last_write_time_100ns = 0;
     bool immutable_snapshot = false;
+    std::optional<sha256_digest_t> content_sha256;
     std::optional<provider_member_metadata_t> member;
 };
 
@@ -47,6 +52,7 @@ private:
     std::size_t size_ = 0;
 
     friend class mapped_file_provider_t;
+    friend class mapped_window_cache_t;
     friend class subrange_provider_t;
     friend class live_snapshot_provider_t;
     friend class memory_provider_t;
@@ -58,6 +64,10 @@ public:
 
     virtual const byte_provider_identity_t& identity() const noexcept = 0;
     virtual std::uint64_t size() const noexcept = 0;
+    virtual std::uint64_t maximum_contiguous_lease(std::uint64_t offset) const noexcept {
+        static_cast<void>(offset);
+        return (std::numeric_limits<std::uint64_t>::max)();
+    }
     virtual workspace_result_t<byte_view_t> lease(std::uint64_t offset, std::uint64_t size,
                                                   const cancellation_token_t& cancel = {}) const = 0;
 
@@ -74,6 +84,9 @@ public:
                                                               std::uint64_t size,
                                                               std::uint64_t hard_limit,
                                                               const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<sha256_digest_t> compute_content_sha256(
+        const cancellation_token_t& cancel = {},
+        std::uint64_t chunk_limit = 4ULL * 1024ULL * 1024ULL) const;
 };
 
 struct mapped_file_provider_options_t {
@@ -92,6 +105,7 @@ public:
 
     const byte_provider_identity_t& identity() const noexcept override;
     std::uint64_t size() const noexcept override;
+    std::uint64_t maximum_contiguous_lease(std::uint64_t offset) const noexcept override;
     workspace_result_t<byte_view_t> lease(std::uint64_t offset, std::uint64_t size,
                                           const cancellation_token_t& cancel = {}) const override;
     workspace_result_t<void> revalidate() const;
@@ -104,31 +118,6 @@ private:
     friend class byte_provider_t;
 };
 
-class subrange_provider_t final : public byte_provider_t {
-public:
-    static workspace_result_t<std::shared_ptr<subrange_provider_t>>
-        create(std::shared_ptr<const byte_provider_t> parent, std::uint64_t base,
-               std::uint64_t length, std::string identity_suffix);
-    static workspace_result_t<std::shared_ptr<subrange_provider_t>>
-        create_member(std::shared_ptr<const byte_provider_t> parent, std::uint64_t base,
-                      std::uint64_t length, provider_member_metadata_t member);
-
-    const byte_provider_identity_t& identity() const noexcept override { return identity_; }
-    std::uint64_t size() const noexcept override { return length_; }
-    workspace_result_t<byte_view_t> lease(std::uint64_t offset, std::uint64_t size,
-                                          const cancellation_token_t& cancel = {}) const override;
-
-    std::uint64_t parent_base() const noexcept { return base_; }
-    const std::shared_ptr<const byte_provider_t>& parent() const noexcept { return parent_; }
-
-private:
-    subrange_provider_t(std::shared_ptr<const byte_provider_t> parent, std::uint64_t base,
-                        std::uint64_t length, byte_provider_identity_t identity);
-
-    std::shared_ptr<const byte_provider_t> parent_;
-    std::uint64_t base_ = 0;
-    std::uint64_t length_ = 0;
-    byte_provider_identity_t identity_;
-};
-
 }
+
+#include "../subrange_provider.hpp"

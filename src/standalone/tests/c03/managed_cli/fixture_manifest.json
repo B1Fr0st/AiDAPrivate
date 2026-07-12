@@ -1,0 +1,73 @@
+{
+  "schema": "aida.c03.managed-cli-fixtures",
+  "schema_version": 1,
+  "assembly": "ManagedCliFixtures",
+  "methods": [
+    {
+      "symbol": "Aida.C03.ManagedCliFixtures.GenericAsyncIteratorFixture`1.ComposeAsync",
+      "method_generic_arity": 1,
+      "coverage": ["generic", "async", "cancellation"],
+      "expected_source_fragments": ["ComposeAsync", "async", "await"]
+    },
+    {
+      "symbol": "Aida.C03.ManagedCliFixtures.GenericAsyncIteratorFixture`1.StreamAsync",
+      "method_generic_arity": 0,
+      "coverage": ["generic", "async", "async_iterator", "cancellation"],
+      "expected_source_fragments": ["StreamAsync", "async", "yield return"]
+    },
+    {
+      "symbol": "Aida.C03.ManagedCliFixtures.GenericAsyncIteratorFixture`1.Stream",
+      "method_generic_arity": 0,
+      "coverage": ["generic", "iterator"],
+      "expected_source_fragments": ["Stream", "yield return"]
+    },
+    {
+      "symbol": "Aida.C03.ManagedCliFixtures.ExceptionAndTokenFixture.Filtered",
+      "method_generic_arity": 0,
+      "coverage": ["exceptions", "filters", "finally"],
+      "expected_source_fragments": ["Filtered", "catch", "when", "finally"]
+    },
+    {
+      "symbol": "Aida.C03.ManagedCliFixtures.ExceptionAndTokenFixture.Echo",
+      "method_generic_arity": 1,
+      "coverage": ["generic", "stable_token"],
+      "expected_source_fragments": ["Echo", "where"]
+    },
+    {
+      "symbol": "Aida.C03.ManagedCliFixtures.ExceptionAndTokenFixture.SwitchAndThrow",
+      "method_generic_arity": 0,
+      "coverage": ["switch", "throw"],
+      "expected_source_fragments": ["SwitchAndThrow", "switch", "throw"]
+    }
+  ],
+  "malformed": [
+    {
+      "id": "corrupt_metadata_signature",
+      "source_contract": "Aida.C03.ManagedCliFixtures.MalformedMetadataContract",
+      "mutation": "corrupt_metadata_signature",
+      "expected_code": "malformed_metadata",
+      "expected_key": "managed_cli.malformed_metadata"
+    },
+    {
+      "id": "truncate_metadata_root",
+      "source_contract": "Aida.C03.ManagedCliFixtures.MalformedMetadataContract",
+      "mutation": "truncate_metadata_root",
+      "expected_code": "malformed_metadata",
+      "expected_key": "managed_cli.malformed_metadata"
+    },
+    {
+      "id": "non_method_token",
+      "source_contract": "Aida.C03.ManagedCliFixtures.MalformedMetadataContract",
+      "mutation": "non_method_token",
+      "expected_code": "malformed_metadata",
+      "expected_key": "managed_cli.malformed_metadata"
+    }
+  ],
+  "validation": {
+    "deterministic_runs": 2,
+    "cancellation": true,
+    "resource_limits": ["maxCpuMs", "maxMemoryBytes"],
+    "offline_startup_gate": true,
+    "snapshot_binding": true
+  }
+}

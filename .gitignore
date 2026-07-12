@@ -20,6 +20,14 @@
 !build-host.ps1
 !build-host.cmd
 !CMakePresets.json
+!/licenses/
+/licenses/*
+!/licenses/c03/
+!/licenses/c03/**
+!/packaging/
+/packaging/*
+!/packaging/c03_worker_manifest.schema.json
+!/packaging/c03_worker_manifest.lock.json
 
 # ==========================================
 # 2. EXCLUSIONS (These override the allows)

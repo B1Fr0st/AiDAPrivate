@@ -1,0 +1,92 @@
+{
+  "schema": "aida.c03.authority-surface-ledger.v1",
+  "authority": {
+    "c02_completion_receipt": {
+      "path": "plans/ida_clone_receipts/receipt_c02_multi_format_arch.json",
+      "sha256": "C6485B5AA9ECBB9092D0885D32E05053C82CD6A533C788F7E5552386AA759B07"
+    },
+    "pinned_ida_pro_mcp_archive": {
+      "path": "C:/Users/ruar1337/ida-pro-mcp.zip",
+      "version": "2.0.0",
+      "sha256": "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7",
+      "inspection_mode": "zip_data_only_no_archive_code_execution"
+    }
+  },
+  "mcp_compatibility": {
+    "upstream_tool_count": 88,
+    "upstream_tool_names": [
+      "add_bookmark", "analyze_batch", "analyze_component", "analyze_function", "append_comments", "basic_blocks", "callees", "callgraph", "dbg_add_bp", "dbg_bps", "dbg_continue", "dbg_delete_bp", "dbg_exit", "dbg_gpregs", "dbg_gpregs_remote", "dbg_read", "dbg_regs", "dbg_regs_all", "dbg_regs_named", "dbg_regs_named_remote", "dbg_regs_remote", "dbg_run_to", "dbg_set_bp_condition", "dbg_stacktrace", "dbg_start", "dbg_status", "dbg_step_into", "dbg_step_over", "dbg_toggle_bp", "dbg_write", "declare_stack", "declare_type", "decompile", "define_code", "define_func", "delete_stack", "diff_before_after", "disasm", "entity_query", "enum_upsert", "export_funcs", "find", "find_bytes", "find_regex", "find_xref_signatures", "force_recompile", "func_profile", "func_query", "get_bytes", "get_global_value", "get_int", "get_string", "idb_save", "imports", "imports_query", "infer_types", "insn_query", "int_convert", "list_funcs", "list_globals", "lookup_funcs", "make_data", "make_signature", "make_signature_for_function", "make_signature_for_range", "patch", "patch_asm", "put_int", "py_eval", "py_exec_file", "read_struct", "rename", "search_structs", "search_text", "server_health", "set_comments", "set_op_type", "set_type", "stack_frame", "survey_binary", "trace_data_flow", "type_apply_batch", "type_inspect", "type_query", "undefine", "xref_query", "xrefs_to", "xrefs_to_field"
+    ],
+    "explicit_excluded_tools": ["py_eval"],
+    "proxy_local_compatibility_tools": ["list_instances"],
+    "required_compatibility_count": 88,
+    "required_compatibility_names": [
+      "add_bookmark", "analyze_batch", "analyze_component", "analyze_function", "append_comments", "basic_blocks", "callees", "callgraph", "dbg_add_bp", "dbg_bps", "dbg_continue", "dbg_delete_bp", "dbg_exit", "dbg_gpregs", "dbg_gpregs_remote", "dbg_read", "dbg_regs", "dbg_regs_all", "dbg_regs_named", "dbg_regs_named_remote", "dbg_regs_remote", "dbg_run_to", "dbg_set_bp_condition", "dbg_stacktrace", "dbg_start", "dbg_status", "dbg_step_into", "dbg_step_over", "dbg_toggle_bp", "dbg_write", "declare_stack", "declare_type", "decompile", "define_code", "define_func", "delete_stack", "diff_before_after", "disasm", "entity_query", "enum_upsert", "export_funcs", "find", "find_bytes", "find_regex", "find_xref_signatures", "force_recompile", "func_profile", "func_query", "get_bytes", "get_global_value", "get_int", "get_string", "idb_save", "imports", "imports_query", "infer_types", "insn_query", "int_convert", "list_funcs", "list_globals", "list_instances", "lookup_funcs", "make_data", "make_signature", "make_signature_for_function", "make_signature_for_range", "patch", "patch_asm", "put_int", "py_exec_file", "read_struct", "rename", "search_structs", "search_text", "server_health", "set_comments", "set_op_type", "set_type", "stack_frame", "survey_binary", "trace_data_flow", "type_apply_batch", "type_inspect", "type_query", "undefine", "xref_query", "xrefs_to", "xrefs_to_field"
+    ],
+    "preserved_aida_extensions": ["analyze_funcs", "find_insns", "calculator", "calculate"],
+    "compatibility_extension_union_count": 92
+  },
+  "explicit_exclusions": [
+    {
+      "surface": "mcp_tool",
+      "value": "py_eval",
+      "reason": "C03 MCP compatibility excludes exactly this pinned upstream tool."
+    },
+    {
+      "surface": "mcp_resource_scheme",
+      "value": "ida://",
+      "reason": "Legacy IDA resources remain absent."
+    },
+    {
+      "surface": "artifact_format",
+      "value": "IDB/I64",
+      "reason": "C03 accepts neither proprietary database format as an input or output surface."
+    },
+    {
+      "surface": "upstream_checkout",
+      "value": "C:/Users/ruar1337/ida-pro-mcp",
+      "reason": "The dirty checkout is inspection-only and is never a compatibility authority."
+    }
+  ],
+  "preservation_baseline": {
+    "source_manifest": {
+      "path": "src/standalone/tests/analysis_workspace/standalone_surface_final.json",
+      "sha256": "4028170F80D8B19B09BC879766D5AE032C2790D493F30EE763020B97AF5FB2C4",
+      "schema_version": 2
+    },
+    "aida_mcp": {
+      "registration_count": 331,
+      "unique_name_count": 331,
+      "sorted_name_list_sha256": "B76BA1D9D4BF00D1612C61367D757E0067D2FAB7590F41E489767339EC19A473",
+      "resources": [
+        { "uri": "standalone://loaded-file", "name": "Loaded File Info", "mime_type": "application/json" },
+        { "uri": "standalone://driver-status", "name": "Driver Status", "mime_type": "application/json" }
+      ],
+      "resource_list_sha256": "475C666B972CCB952E6D5A0A6612725A570B726AEA702A22AF6D6C9FEB053F49"
+    },
+    "ui": {
+      "center_views": [
+        "analysis_hub", "aob_generator", "binary_map", "code_editor", "crypto_scanner", "debugger_view", "decrypt_oracle", "deobfuscation_view", "disassembly", "fuzzer_view", "graph_view", "hex_view", "image_view", "integrity_hunter", "memory_scanner", "network_view", "pointer_scanner", "pseudocode", "scan_hub", "settings_view", "snapshot_diff", "stealth_view", "struct_recon", "symbolic_view", "taint_view", "test_lab", "types_hub", "welcome", "xref_browser"
+      ],
+      "center_view_list_sha256": "F4EA876411760EC130705115D9BC051E66750EC9F09EF4FDEA39C43817C6FA09",
+      "action_labels": ["Test Lab"],
+      "action_label_list_sha256": "6685DC5FBD3CBB44A41A0BDEACCB33466C97F4FAF1BB384538D7C538AE33C8A3",
+      "shortcut_expression_count": 50,
+      "shortcut_expression_list_sha256": "0C383C6BCC03982E9930669263DC2D22D6F44DBB255F6C9025C85142100F1EE9"
+    },
+    "commands": {
+      "builtin_names": [
+        "init", "review", "compact", "help", "title", "clear", "settings", "view:editor", "view:disassembly", "view:hex", "view:network", "view:scanner", "view:analysis", "view:debugger", "view:decompiler", "view:struct", "view:crypto", "view:aob", "view:fuzzer", "view:xrefs", "view:snapshot", "view:pointer", "view:decrypt-oracle", "view:integrity", "view:symbolic", "view:taint", "view:deobfuscation", "view:stealth", "view:types", "view:binary-map", "view:memory-scanner", "panel:left", "panel:right", "panel:bottom"
+      ],
+      "builtin_name_list_sha256": "6447534960D697B708919AFA5D8034BB7A44C26F77E38DFBAA7B1590101AE2B8",
+      "dynamic_sources": ["skills", "mcp_prompts", "mcp_tools", "agents"]
+    },
+    "test_lab": {
+      "registered_feature_count": 68,
+      "feature_id_list_sha256": "A88B3C53B54A2E5B6F94F35C6D6E1CFCC5EF60E53B81B7395EC60989CBA51D19",
+      "feature_ids": [
+        "anti-debug:ADBG", "anti-debug:DBGA", "anti-debug:EVTS", "anti-dump:ADMP", "debug-attach:DBGA", "dll:DPRT", "dma-canary:CANQ", "dma-canary:CANR", "evidence:RECU", "hv-detect:HVDT", "memory:AM - allocate memory in target process", "memory:BASE - get section base address by PID", "memory:DTB - solve DirectoryTableBase", "memory:ER - enumerate committed regions", "memory:FM - free memory in target process", "memory:MEX - resolve module export address", "memory:PHYS - read process memory via phys translation", "memory:PM - protect memory in target process", "memory:QM - query memory (MEMORY_BASIC_INFORMATION)", "memory:RPEB - read remote PEB", "memory:SDF - spoof debug flags", "memory:V2P - virtual to physical translation", "module:DPIN", "module:IHLD", "module:PINJ", "module:PMOD", "net-logging:NLOG", "net-logging:NPKT", "network-action:BWMN", "network-action:CKIL", "network-action:DNSS", "network-action:PCEX", "network-action:PRED", "network-action:STRM", "network-query:DTCP - dump TCPIP connection table", "network-query:EWFP - enumerate WFP callouts", "network-query:GSKT - enumerate socket handles per pid", "network-query:NCAP - control packet capture (WFP)", "network-query:NCON - enumerate active network connections", "network-query:NCPG - drain captured packets", "network-query:NDNS - DNS query log stimulus", "network-query:NFLT - add/remove/clear network filter rule", "network-query:NFPR - passive TCP/IP fingerprint", "network-query:NIFS - enumerate network interfaces", "network-query:NSTS - aggregated network stats", "network-query:SNBF - drain sniffed NDIS NET_BUFFER captures", "remote-call:CR", "remote-call:RC", "sandbox:PSBX", "sandbox:USBX", "sentinel:Sentinel Evidence Ring", "sentinel:Sentinel HB / TSC", "sentinel:Sentinel HV Detect", "sentinel:Sentinel Tier-A Health", "session:HB", "tamper:ABRT", "tamper:RELA", "tamper:SRV2", "tamper:SRVT", "target-latch:TIRA", "thread:TCTX", "thread:TENUM", "thread:TSR", "verify:DNS query log round-trip", "verify:Memory alloc/write/read/free round-trip", "verify:Network capture round-trip", "verify:Network stats sanity", "verify:TCPIP connection table sanity"
+      ]
+    }
+  }
+}

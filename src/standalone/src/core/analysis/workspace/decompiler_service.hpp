@@ -3,6 +3,7 @@
 #include "analysis_workspace.hpp"
 #include "decompiler_feedback.hpp"
 #include "workspace_database.hpp"
+#include "../decompiler/pseudocode_renderer_v2.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -101,6 +102,18 @@ struct decompiler_service_snapshot_t {
     std::uint64_t feedback_no_change = 0;
 };
 
+struct decompiler_service_v2_request_t {
+    typed_ast_v2_build_request_t ast;
+    pseudocode_renderer_v2_request_t renderer;
+};
+
+struct decompiler_service_v2_result_t {
+    typed_ast_v2_build_result_t ast_build;
+    std::optional<pseudocode_renderer_v2_result_t> rendering;
+
+    bool succeeded() const noexcept;
+};
+
 class decompiler_service_t final : public workspace_lifecycle_participant_t,
                                    public std::enable_shared_from_this<decompiler_service_t> {
 public:
@@ -117,6 +130,10 @@ public:
         workspace_database_versions_t versions,
         std::shared_ptr<decompiler_feedback_model_t> feedback,
         decompiler_service_limits_t limits);
+    static decompiler_service_v2_result_t render_typed_pseudocode_v2(
+        const hir_function_t& hir,
+        const type_graph_t& type_graph,
+        const decompiler_service_v2_request_t& request = {});
 
     ~decompiler_service_t() override;
     decompiler_service_t(const decompiler_service_t&) = delete;
