@@ -145,22 +145,36 @@ public:
         if (!analysis_workspace_ || analysis_workspace_->closing() ||
             analysis_workspace_->closed())
             return false;
-        auto publication = analysis_workspace_->analysis_publication();
-        if (!publication || !publication->snapshot || publication->generation == 0)
+        std::shared_ptr<const analysis::analysis_publication_t> publication;
+        analysis::overlay_snapshot_t overlay_snapshot;
+        bool captured = false;
+        for (std::uint32_t attempt = 0; attempt < 2U; ++attempt) {
+            publication = analysis_workspace_->analysis_publication();
+            if (!publication || !publication->snapshot ||
+                publication->generation == 0)
+                return false;
+            auto overlay = analysis_workspace_->overlay();
+            if (overlay) {
+                try {
+                    overlay_snapshot = overlay->snapshot();
+                } catch (...) {
+                    return false;
+                }
+            } else {
+                overlay_snapshot = {};
+                overlay_snapshot.revision =
+                    analysis_workspace_->overlay_revision();
+            }
+            const auto confirmed =
+                analysis_workspace_->analysis_publication();
+            if (same_publication(publication, confirmed)) {
+                captured = true;
+                break;
+            }
+        }
+        if (!captured)
             return false;
         const auto generation = publication->generation;
-
-        analysis::overlay_snapshot_t overlay_snapshot;
-        auto overlay = analysis_workspace_->overlay();
-        if (overlay) {
-            try {
-                overlay_snapshot = overlay->snapshot();
-            } catch (...) {
-                return false;
-            }
-        } else {
-            overlay_snapshot.revision = analysis_workspace_->overlay_revision();
-        }
 
         std::lock_guard<std::mutex> lock(mutex_);
         const auto publication_match = std::find_if(
@@ -210,7 +224,9 @@ public:
             [generation](const auto& publication) {
                 return publication->generation == generation;
             });
-        return found == publications_.end() ? nullptr : *found;
+        if (found == publications_.end())
+            return {};
+        return *found;
     }
 
     std::shared_ptr<const analysis::analysis_publication_t> publication(
@@ -223,7 +239,9 @@ public:
             [generation](const auto& publication) {
                 return publication->generation == generation;
             });
-        return found == publications_.end() ? nullptr : *found;
+        if (found == publications_.end())
+            return {};
+        return *found;
     }
 
     bool publication_current(
@@ -233,11 +251,7 @@ public:
             analysis_workspace_->closed())
             return false;
         const auto current = analysis_workspace_->analysis_publication();
-        return current && current->snapshot &&
-               current->generation == bound->generation &&
-               current->analysis_revision == bound->analysis_revision &&
-               current->binary_id == bound->binary_id &&
-               current->load_profile_hash == bound->load_profile_hash;
+        return same_publication(bound, current);
     }
 
     std::uint64_t current_generation() const noexcept
@@ -403,6 +417,18 @@ public:
     }
 
 private:
+    static bool same_publication(
+        const std::shared_ptr<const analysis::analysis_publication_t>& lhs,
+        const std::shared_ptr<const analysis::analysis_publication_t>& rhs)
+    {
+        return lhs && rhs && lhs->snapshot && rhs->snapshot &&
+               lhs->snapshot == rhs->snapshot &&
+               lhs->generation == rhs->generation &&
+               lhs->analysis_revision == rhs->analysis_revision &&
+               lhs->binary_id == rhs->binary_id &&
+               lhs->load_profile_hash == rhs->load_profile_hash;
+    }
+
     std::uint64_t current_generation_locked() const noexcept
     {
         if (!analysis_workspace_)
@@ -1522,8 +1548,7 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
     output->function_address = function_address;
     const auto& snapshot = *publication->snapshot;
 
-    std::size_t first_block = 0;
-    std::size_t block_count = snapshot.blocks.size();
+    std::vector<std::size_t> block_indices;
     if (function_address != 0) {
         const analysis::function_record_t* function = nullptr;
         std::size_t traversed_functions = 0;
@@ -1544,29 +1569,78 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
                     graph_document::k_graph_document_max_nodes + 1U;
             return output;
         }
-        first_block = function->first_block;
-        block_count = function->block_count;
-        if (first_block > snapshot.blocks.size() ||
-            block_count > snapshot.blocks.size() - first_block) {
-            output->total_nodes =
-                graph_document::k_graph_document_max_nodes + 1U;
+        if (function->block_membership_count != 0) {
+            const auto first = static_cast<std::size_t>(
+                function->first_block_membership);
+            const auto count = static_cast<std::size_t>(
+                function->block_membership_count);
+            if (count > graph_document::k_graph_document_max_nodes ||
+                first > snapshot.function_block_memberships.size() ||
+                count > snapshot.function_block_memberships.size() - first) {
+                output->total_nodes =
+                    graph_document::k_graph_document_max_nodes + 1U;
+                return output;
+            }
+            block_indices.reserve(count);
+            std::unordered_set<analysis::entity_id_t> membership_ids;
+            membership_ids.reserve(count);
+            for (std::size_t offset = 0; offset < count; ++offset) {
+                const auto& membership =
+                    snapshot.function_block_memberships[first + offset];
+                const auto block_index =
+                    static_cast<std::size_t>(membership.block_index);
+                if (membership.function_id != function->id ||
+                    membership.ordinal != static_cast<std::uint32_t>(offset) ||
+                    block_index >= snapshot.blocks.size() ||
+                    snapshot.blocks[block_index].id != membership.block_id ||
+                    !membership_ids.insert(membership.block_id).second) {
+                    output->total_nodes =
+                        graph_document::k_graph_document_max_nodes + 1U;
+                    return output;
+                }
+                block_indices.push_back(block_index);
+            }
+        } else {
+            const auto first = static_cast<std::size_t>(function->first_block);
+            const auto count = static_cast<std::size_t>(function->block_count);
+            if (count > graph_document::k_graph_document_max_nodes ||
+                first > snapshot.blocks.size() ||
+                count > snapshot.blocks.size() - first) {
+                output->total_nodes =
+                    graph_document::k_graph_document_max_nodes + 1U;
+                return output;
+            }
+            block_indices.reserve(count);
+            for (std::size_t offset = 0; offset < count; ++offset)
+                block_indices.push_back(first + offset);
+        }
+    } else {
+        if (snapshot.blocks.size() >
+            graph_document::k_graph_document_max_nodes) {
+            output->total_nodes = snapshot.blocks.size();
+            output->total_edges = snapshot.edges.size();
             return output;
         }
+        block_indices.reserve(snapshot.blocks.size());
+        for (std::size_t index = 0; index < snapshot.blocks.size(); ++index)
+            block_indices.push_back(index);
     }
+
+    std::sort(block_indices.begin(), block_indices.end(),
+        [&snapshot](std::size_t lhs, std::size_t rhs) {
+            const auto& left = snapshot.blocks[lhs];
+            const auto& right = snapshot.blocks[rhs];
+            return std::tie(left.start.value, left.end.value, left.id, lhs) <
+                   std::tie(right.start.value, right.end.value, right.id, rhs);
+        });
 
     std::unordered_map<analysis::entity_id_t,
                        graph_document::graph_node_id_t> block_nodes;
     std::unordered_set<std::uint64_t> stable_node_ids;
-    stable_node_ids.reserve((std::min)(
-        block_count,
-        static_cast<std::size_t>(
-            graph_document::k_graph_document_max_nodes + 1U)));
-    const auto block_end = first_block + block_count;
-    for (auto block_index = first_block; block_index < block_end; ++block_index) {
+    stable_node_ids.reserve(block_indices.size());
+    output->total_nodes = block_indices.size();
+    for (const auto block_index : block_indices) {
         const auto& block = snapshot.blocks[block_index];
-        ++output->total_nodes;
-        if (output->total_nodes > graph_document::k_graph_document_max_nodes)
-            break;
         graph_document::graph_node_view_t node;
         node.id = graph_node_identity(block.id, block.start.value, "cfg");
         node.kind = graph_document::graph_node_kind_t::basic_block;
@@ -1576,7 +1650,10 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
         if (!stable_node_ids.insert(node.id.value).second) {
             output->total_nodes =
                 graph_document::k_graph_document_max_nodes + 1U;
-            break;
+            output->nodes.clear();
+            output->ranges.clear();
+            output->total_edges = snapshot.edges.size();
+            return output;
         }
         if (block.id != 0)
             block_nodes.emplace(block.id, node.id);
@@ -1586,12 +1663,6 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
         range.end = graph_range_end(block.start.value, block.end.value);
         range.node = output->nodes.back().id;
         output->ranges.push_back(range);
-    }
-    if (output->total_nodes > graph_document::k_graph_document_max_nodes) {
-        output->nodes.clear();
-        output->ranges.clear();
-        output->total_edges = snapshot.edges.size();
-        return output;
     }
     sort_graph_ranges(output->ranges);
 
@@ -1998,22 +2069,48 @@ public:
                 publication->snapshot->call_graph.nodes.size() >
                     graph_document::k_graph_document_max_nodes)
                 return false;
-            for (const auto& block : publication->snapshot->blocks) {
-                if (graph_node_identity(block.id, block.start.value, "cfg") == node) {
-                    address = block.start.value;
-                    return true;
+
+            std::lock_guard<std::mutex> lock(node_address_mutex_);
+            if (node_address_generation_ != generation) {
+                std::unordered_map<std::uint64_t, std::uint64_t> addresses;
+                addresses.reserve(publication->snapshot->blocks.size() +
+                                  publication->snapshot->call_graph.nodes.size());
+                for (const auto& block : publication->snapshot->blocks) {
+                    const auto id = graph_node_identity(
+                        block.id, block.start.value, "cfg");
+                    if (!id.valid() ||
+                        !addresses.emplace(id.value, block.start.value).second) {
+                        node_addresses_.clear();
+                        node_address_generation_ = generation;
+                        node_address_index_valid_ = false;
+                        return false;
+                    }
                 }
-            }
-            for (const auto& source_node :
-                 publication->snapshot->call_graph.nodes) {
-                if (graph_node_identity(source_node.function_id,
-                                        source_node.address.value,
-                                        "call") == node) {
-                    address = source_node.address.value;
-                    return true;
+                for (const auto& source_node :
+                     publication->snapshot->call_graph.nodes) {
+                    const auto id = graph_node_identity(
+                        source_node.function_id, source_node.address.value,
+                        "call");
+                    if (!id.valid() ||
+                        !addresses.emplace(id.value,
+                                           source_node.address.value).second) {
+                        node_addresses_.clear();
+                        node_address_generation_ = generation;
+                        node_address_index_valid_ = false;
+                        return false;
+                    }
                 }
+                node_addresses_ = std::move(addresses);
+                node_address_generation_ = generation;
+                node_address_index_valid_ = true;
             }
-            return false;
+            if (!node_address_index_valid_)
+                return false;
+            const auto found = node_addresses_.find(node.value);
+            if (found == node_addresses_.end())
+                return false;
+            address = found->second;
+            return true;
         } catch (...) {
             address = 0;
             return false;
@@ -2077,6 +2174,10 @@ private:
     std::size_t cache_limit_;
     mutable std::mutex cache_mutex_;
     mutable std::deque<cache_entry_t> cache_;
+    mutable std::mutex node_address_mutex_;
+    mutable std::unordered_map<std::uint64_t, std::uint64_t> node_addresses_;
+    mutable std::uint64_t node_address_generation_ = 0;
+    mutable bool node_address_index_valid_ = false;
 };
 
 class production_graph_overlay_t final
@@ -2092,48 +2193,10 @@ public:
     std::uint32_t overlay_count(std::uint64_t generation) const noexcept override
     {
         try {
-            analysis::overlay_snapshot_t snapshot;
-            if (!source_->current_overlay_snapshot(generation, snapshot))
-                return 0;
-            const auto publication = source_->publication(generation);
-            if (!publication || !publication->snapshot)
-                return 0;
-            if (publication->snapshot->blocks.size() >
-                    graph_document::k_graph_document_max_nodes ||
-                publication->snapshot->call_graph.nodes.size() >
-                    graph_document::k_graph_document_max_nodes) {
-                return graph_document::k_graph_document_max_overlays + 1U;
-            }
-            std::unordered_set<std::uint64_t> graph_addresses;
-            graph_addresses.reserve(publication->snapshot->blocks.size() +
-                                    publication->snapshot->call_graph.nodes.size());
-            for (const auto& block : publication->snapshot->blocks) {
-                graph_addresses.insert(block.start.value);
-            }
-            for (const auto& source_node :
-                 publication->snapshot->call_graph.nodes) {
-                graph_addresses.insert(source_node.address.value);
-            }
-            std::size_t count = 0;
-            for (const auto& [entity_key, operation] : snapshot.items) {
-                static_cast<void>(entity_key);
-                if (operation.remove ||
-                    graph_addresses.find(operation.address.value) ==
-                        graph_addresses.end())
-                    continue;
-                if (operation.kind == analysis::overlay_operation_kind_t::name ||
-                    operation.kind == analysis::overlay_operation_kind_t::comment ||
-                    operation.kind ==
-                        analysis::overlay_operation_kind_t::comment_update) {
-                    ++count;
-                    if (count > graph_document::k_graph_document_max_overlays)
-                        return graph_document::k_graph_document_max_overlays + 1U;
-                }
-            }
-            return static_cast<std::uint32_t>((std::min)(
-                count,
-                static_cast<std::size_t>(
-                    (std::numeric_limits<std::uint32_t>::max)())));
+            const auto projection = refresh_projection(generation);
+            return projection
+                ? projection->count
+                : graph_document::k_graph_document_max_overlays + 1U;
         } catch (...) {
             return graph_document::k_graph_document_max_overlays + 1U;
         }
@@ -2145,36 +2208,19 @@ public:
     {
         text.clear();
         try {
+            auto projection = cached_projection(generation);
+            if (!projection)
+                projection = refresh_projection(generation);
+            if (!projection || projection->exhausted)
+                return false;
             std::uint64_t address = 0;
             if (!graph_->address_for_node(generation, node, address))
                 return false;
-            analysis::overlay_snapshot_t snapshot;
-            if (!source_->current_overlay_snapshot(generation, snapshot))
+            const auto found = projection->labels.find(address);
+            if (found == projection->labels.end())
                 return false;
-            for (auto iterator = snapshot.items.rbegin();
-                 iterator != snapshot.items.rend(); ++iterator) {
-                const auto& operation = iterator->second;
-                if (operation.address.value != address || operation.remove)
-                    continue;
-                if (operation.kind == analysis::overlay_operation_kind_t::name &&
-                    !operation.name.empty()) {
-                    text = operation.name;
-                    return true;
-                }
-            }
-            for (auto iterator = snapshot.items.rbegin();
-                 iterator != snapshot.items.rend(); ++iterator) {
-                const auto& operation = iterator->second;
-                if (operation.address.value != address || operation.remove)
-                    continue;
-                if ((operation.kind == analysis::overlay_operation_kind_t::comment ||
-                     operation.kind == analysis::overlay_operation_kind_t::comment_update) &&
-                    !operation.text.empty()) {
-                    text = operation.text;
-                    return true;
-                }
-            }
-            return false;
+            text = found->second;
+            return true;
         } catch (...) {
             text.clear();
             return false;
@@ -2182,8 +2228,133 @@ public:
     }
 
 private:
+    struct projection_t final {
+        std::uint64_t generation = 0;
+        std::uint64_t revision = 0;
+        std::uint32_t count = 0;
+        bool exhausted = false;
+        std::unordered_map<std::uint64_t, std::string> labels;
+    };
+
+    std::shared_ptr<const projection_t> cached_projection(
+        std::uint64_t generation) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = std::find_if(
+            projections_.begin(), projections_.end(),
+            [generation](const auto& projection) {
+                return projection->generation == generation;
+            });
+        if (found == projections_.end())
+            return {};
+        return *found;
+    }
+
+    std::shared_ptr<const projection_t> refresh_projection(
+        std::uint64_t generation) const
+    {
+        analysis::overlay_snapshot_t snapshot;
+        if (!source_->current_overlay_snapshot(generation, snapshot))
+            return {};
+        const auto publication = source_->publication(generation);
+        if (!publication || !publication->snapshot ||
+            publication->snapshot->blocks.size() >
+                graph_document::k_graph_document_max_nodes ||
+            publication->snapshot->call_graph.nodes.size() >
+                graph_document::k_graph_document_max_nodes)
+            return {};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = std::find_if(
+                projections_.begin(), projections_.end(),
+                [generation, &snapshot](const auto& projection) {
+                    return projection->generation == generation &&
+                           projection->revision == snapshot.revision;
+                });
+            if (found != projections_.end())
+                return *found;
+        }
+
+        auto projection = std::make_shared<projection_t>();
+        projection->generation = generation;
+        projection->revision = snapshot.revision;
+        std::unordered_set<std::uint64_t> graph_addresses;
+        graph_addresses.reserve(publication->snapshot->blocks.size() +
+                                publication->snapshot->call_graph.nodes.size());
+        for (const auto& block : publication->snapshot->blocks)
+            graph_addresses.insert(block.start.value);
+        for (const auto& source_node :
+             publication->snapshot->call_graph.nodes)
+            graph_addresses.insert(source_node.address.value);
+
+        std::unordered_map<std::uint64_t, std::string> names;
+        std::size_t count = 0;
+        for (auto iterator = snapshot.items.rbegin();
+             iterator != snapshot.items.rend(); ++iterator) {
+            const auto& operation = iterator->second;
+            if (operation.remove ||
+                graph_addresses.find(operation.address.value) ==
+                    graph_addresses.end())
+                continue;
+            const auto is_name =
+                operation.kind == analysis::overlay_operation_kind_t::name;
+            const auto is_comment =
+                operation.kind == analysis::overlay_operation_kind_t::comment ||
+                operation.kind ==
+                    analysis::overlay_operation_kind_t::comment_update;
+            if (!is_name && !is_comment)
+                continue;
+            ++count;
+            if (count > graph_document::k_graph_document_max_overlays) {
+                projection->count =
+                    graph_document::k_graph_document_max_overlays + 1U;
+                projection->exhausted = true;
+                projection->labels.clear();
+                break;
+            }
+            if ((is_name && operation.name.size() >
+                    graph_document::k_graph_document_max_label_bytes) ||
+                (is_comment && operation.text.size() >
+                    graph_document::k_graph_document_max_label_bytes)) {
+                projection->count =
+                    graph_document::k_graph_document_max_overlays + 1U;
+                projection->exhausted = true;
+                projection->labels.clear();
+                break;
+            }
+            if (is_name && !operation.name.empty())
+                names.emplace(operation.address.value, operation.name);
+            if (is_comment && !operation.text.empty())
+                projection->labels.emplace(operation.address.value,
+                                           operation.text);
+        }
+        if (!projection->exhausted) {
+            projection->count = static_cast<std::uint32_t>(count);
+            for (auto& [address, name] : names)
+                projection->labels.insert_or_assign(address, std::move(name));
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto existing = std::find_if(
+            projections_.begin(), projections_.end(),
+            [generation](const auto& candidate) {
+                return candidate->generation == generation;
+            });
+        if (existing != projections_.end()) {
+            if ((*existing)->revision > projection->revision)
+                return *existing;
+            projections_.erase(existing);
+        }
+        projections_.push_back(projection);
+        while (projections_.size() > 2U)
+            projections_.pop_front();
+        return projection;
+    }
+
     std::shared_ptr<workbench_analysis_source_t> source_;
     production_graph_source_t* graph_;
+    mutable std::mutex mutex_;
+    mutable std::deque<std::shared_ptr<const projection_t>> projections_;
 };
 
 struct diff_entity_value_t final {
@@ -2217,15 +2388,13 @@ bool append_diff_entity(diff_entity_map_t& output,
     if (key.empty() ||
         key.size() > diff_document::k_diff_document_max_entity_key_bytes)
         return false;
-    const auto existing = output.find(key);
-    if (existing == output.end() && output.size() >= limit)
+    if (output.find(key) != output.end() || output.size() >= limit)
         return false;
     diff_entity_value_t record;
     record.domain = domain;
     record.address = address;
     record.value = bounded_diff_value(value);
-    output[std::move(key)] = std::move(record);
-    return true;
+    return output.emplace(std::move(key), std::move(record)).second;
 }
 
 bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot,
@@ -2297,8 +2466,12 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
             return false;
     }
     for (const auto& type : snapshot.rich_facts.type_candidates) {
+        const auto fallback_identity =
+            std::to_string(type.source_key.size()) + ":" + type.source_key +
+            ":" + std::to_string(type.display_name.size()) + ":" +
+            type.display_name;
         const auto identity = type.id != 0
-            ? type.id : stable_hash(type.source_key + type.display_name);
+            ? type.id : stable_hash(fallback_identity);
         std::ostringstream value;
         value << "kind=" << static_cast<std::uint32_t>(type.kind)
               << ";confidence=" << static_cast<std::uint32_t>(type.confidence)
@@ -3679,15 +3852,16 @@ workbench_shell_integration_t::integrate_analysis_workspace(
     std::shared_ptr<workbench_persistence_adapter_t> persistence;
     if (impl_->state.config.integrate_persistence) {
         const auto database = analysis_workspace->database();
-        if (database) {
-            try {
-                persistence = std::make_shared<
-                    workspace_database_workbench_persistence_adapter_t>(
-                        database, workspace);
-            } catch (...) {
-                return shell_error(workbench_error_code_t::adapter_rejected,
-                                   workspace.value);
-            }
+        if (!database)
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               workspace.value);
+        try {
+            persistence = std::make_shared<
+                workspace_database_workbench_persistence_adapter_t>(
+                    database, workspace);
+        } catch (...) {
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               workspace.value);
         }
     }
     auto workspace_state = impl_->ensure_state(workspace);
@@ -3750,15 +3924,16 @@ workbench_shell_integration_t::refresh_analysis_documents(
     std::shared_ptr<workbench_persistence_adapter_t> persistence;
     if (impl_->state.config.integrate_persistence) {
         const auto database = analysis_workspace->database();
-        if (database) {
-            try {
-                persistence = std::make_shared<
-                    workspace_database_workbench_persistence_adapter_t>(
-                        database, workspace);
-            } catch (...) {
-                return shell_error(workbench_error_code_t::adapter_rejected,
-                                   workspace.value);
-            }
+        if (!database)
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               workspace.value);
+        try {
+            persistence = std::make_shared<
+                workspace_database_workbench_persistence_adapter_t>(
+                    database, workspace);
+        } catch (...) {
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               workspace.value);
         }
     }
     if (!impl_->state.config.integrate_analysis_documents) {

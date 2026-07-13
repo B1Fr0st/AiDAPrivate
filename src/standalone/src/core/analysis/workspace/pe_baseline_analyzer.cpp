@@ -73,6 +73,23 @@ std::optional<std::uint64_t> to_rva(const workspace_image_t& image,
     return std::nullopt;
 }
 
+std::optional<std::uint64_t> to_rva_endpoint(const workspace_image_t& image,
+                                             const address_t& address) noexcept {
+    if (address.architecture != image.architecture ||
+        address.mode != image.architecture_mode)
+        return std::nullopt;
+    if (address.space == address_space_id_t::relative_virtual)
+        return address.value <= image.image_size ? std::optional<std::uint64_t>(address.value)
+                                                 : std::nullopt;
+    if ((address.space == address_space_id_t::virtual_address ||
+         address.space == address_space_id_t::live_virtual) &&
+        address.value >= image.image_base) {
+        const auto rva = address.value - image.image_base;
+        return rva <= image.image_size ? std::optional<std::uint64_t>(rva) : std::nullopt;
+    }
+    return std::nullopt;
+}
+
 std::vector<image_range_t> image_ranges(const workspace_image_t& image) {
     std::vector<image_range_t> ranges;
     const auto append = [&ranges, &image](const auto& region) {
@@ -711,6 +728,46 @@ workspace_result_t<std::uint64_t> snapshot_memory_bytes(const analysis_snapshot_
     return workspace_result_t<std::uint64_t>::success(total);
 }
 
+workspace_result_t<std::uint64_t> tile_decode_memory_bytes(
+    const tile_decode_orchestration_result_t& result)
+{
+    if (!result.packed_store) {
+        return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "tile decode packed publication is unavailable", "memory_budget"));
+    }
+    std::uint64_t total = sizeof(result);
+    if (!checked_add_u64(total, sizeof(packed_analysis_store_t), total) ||
+        !checked_add_u64(total,
+            result.packed_store->size_accounting().reserved_bytes, total)) {
+        return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "tile decode memory accounting overflows", "memory_budget"));
+    }
+    const auto add = [&total](std::uint64_t count, std::uint64_t width)
+        -> workspace_result_t<void> {
+        std::uint64_t bytes = 0;
+        if (!checked_mul_u64(count, width, bytes) ||
+            !checked_add_u64(total, bytes, total)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::range_overflow,
+                "tile decode memory accounting overflows", "memory_budget"));
+        }
+        return workspace_result_t<void>::success();
+    };
+    const std::pair<std::uint64_t, std::uint64_t> allocations[] = {
+        {result.delay_slot_counts.capacity(), sizeof(std::uint8_t)},
+        {result.coverage.capacity(), sizeof(coverage_span_t)},
+        {result.cross_tile_edges.capacity(), sizeof(tile_decode_cross_tile_edge_t)},
+        {result.shards.capacity(), sizeof(tile_decode_shard_summary_t)}};
+    for (const auto& allocation : allocations) {
+        auto added = add(allocation.first, allocation.second);
+        if (!added)
+            return workspace_result_t<std::uint64_t>::failure(added.error());
+    }
+    return workspace_result_t<std::uint64_t>::success(total);
+}
+
 std::uint64_t saturated_product(std::uint64_t lhs, std::uint64_t rhs,
                                 std::uint64_t ceiling) noexcept {
     std::uint64_t value = 0;
@@ -1170,7 +1227,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
         function_seed_t seed;
         seed.address = rva_address(*impl_->image, *rva);
         if (known_end) {
-            const auto end = to_rva(*impl_->image, *known_end);
+            const auto end = to_rva_endpoint(*impl_->image, *known_end);
             if (end && *end > *rva)
                 seed.known_end = rva_address(*impl_->image, *end);
         }
@@ -1199,6 +1256,32 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
             fact_provenance_t::image_entry, 100, source++, std::nullopt, entry.provenance, false);
         if (!added)
             return added;
+    }
+    if (const auto pe_image = impl_->workspace->image()) {
+        std::uint32_t checks = 0;
+        for (const auto& runtime_function : pe_image->runtime_functions()) {
+            if (++checks >= impl_->settings.cancellation_check_interval) {
+                checks = 0;
+                const auto token = impl_->cancellation.token();
+                if (token.stop_requested()) {
+                    return workspace_result_t<void>::failure(
+                        cancellation_error(token, token, "seed"));
+                }
+            }
+            if (runtime_function.end_rva <= runtime_function.begin_rva) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "PE runtime function range is invalid", "seed"));
+            }
+            auto added = add(rva_address(*impl_->image,
+                    runtime_function.begin_rva),
+                function_seed_kind_t::unwind_range,
+                fact_provenance_t::unwind_metadata, 98, source++,
+                std::optional<address_t>{rva_address(*impl_->image,
+                    runtime_function.end_rva)}, {}, false);
+            if (!added)
+                return added;
+        }
     }
     for (const auto& exported : impl_->image->exports) {
         if (exported.forwarder)
@@ -1380,16 +1463,17 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
             workspace_error_code_t::integrity_failure,
             "tile decode omitted its packed publication", "decode"));
     }
-    const auto accounting = result.packed_store->size_accounting();
-    if (accounting.reserved_bytes > impl_->settings.max_analysis_memory_bytes) {
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::limit_exceeded,
-            "tile decode packed publication exceeds analysis memory budget", "decode"));
+    auto retained = tile_decode_memory_bytes(result);
+    if (!retained || retained.value() > impl_->settings.max_analysis_memory_bytes) {
+        return workspace_result_t<void>::failure(retained
+            ? make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "tile decode publication exceeds analysis memory budget", "decode")
+            : retained.error());
     }
     const auto decoded_count = result.statistics.accepted_instructions;
     const auto initialized_bytes = result.statistics.initialized_executable_bytes;
     impl_->tile_result.emplace(std::move(result));
-    impl_->metrics->end_phase(measurement, initialized_bytes, accounting.reserved_bytes,
+    impl_->metrics->end_phase(measurement, initialized_bytes, retained.value(),
         decoded_count, 1, false);
     return impl_->update_progress("decode", decoded_count, decoded_count,
         initialized_bytes, impl_->executable_bytes());

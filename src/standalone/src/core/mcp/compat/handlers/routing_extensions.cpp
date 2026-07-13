@@ -801,7 +801,8 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
                 {"attach_generation", target.attach_generation},
                 {"live", target.live},
                 {"retired", known.retired},
-                {"snapshot_stale", target.live && !target.live_snapshot_permitted},
+                {"snapshot_stale", target.live &&
+                    (known.retired || !target.live_snapshot_permitted)},
                 {"process_creation_identity", target.process_creation_identity},
                 {"revision", target.revision},
             });

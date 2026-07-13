@@ -2,9 +2,7 @@
 
 #include "workbench_model.h"
 #include "workbench_contracts.h"
-#include "workbench_persistence.hpp"
 #include "document_registry.h"
-#include "split_tree.h"
 #include "navigator/workbench_navigator.hpp"
 #include "inspector/workbench_inspector_contracts.hpp"
 #include "document_host/document_host.hpp"
