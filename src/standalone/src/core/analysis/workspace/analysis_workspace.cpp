@@ -9,6 +9,7 @@
 #include <limits>
 #include <new>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -360,6 +361,370 @@ void workspace_analysis_run_t::release() noexcept {
         workspace->release_analysis_run(generation);
 }
 
+workspace_result_t<void> validate_rich_fact_publication(
+    const analysis_snapshot_t& snapshot,
+    const analysis_rich_fact_publication_t& publication,
+    const cancellation_token_t& cancel)
+{
+    std::uint64_t visits = 0;
+    const auto poll = [&]() -> workspace_result_t<void> {
+        if ((visits++ & 255U) == 0 && cancel.stop_requested())
+            return workspace_result_t<void>::failure(
+                workspace_stop_error(cancel, "rich_fact_validate"));
+        return workspace_result_t<void>::success();
+    };
+    const auto address_in_snapshot = [&](const address_t& address,
+                                         std::uint64_t size = 1) noexcept {
+        if (!valid_address(address))
+            return false;
+        if (!snapshot.normalized_image)
+            return true;
+        if (address.space == address_space_id_t::file_offset)
+            return workspace_image_span_within(address.value, size,
+                snapshot.normalized_image->provider_size);
+        return workspace_image_contains(*snapshot.normalized_image, address, size);
+    };
+    const auto expected_id = [](entity_id_t id, std::uint8_t domain,
+                                std::size_t index) noexcept {
+        return entity_domain(id) == domain &&
+            entity_ordinal(id) == static_cast<std::uint64_t>(index + 1);
+    };
+    std::unordered_set<entity_id_t> type_ids;
+    type_ids.reserve(publication.type_candidates.size());
+    for (std::size_t index = 0; index < publication.data_candidates.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& candidate = publication.data_candidates[index];
+        if (!expected_id(candidate.id, 8, index) || candidate.size == 0 ||
+            candidate.kind > data_candidate_kind_t::in_image_pointer ||
+            !address_in_snapshot(candidate.address, candidate.size) ||
+            !valid_provenance(candidate.provenance) || candidate.confidence > 100 ||
+            (candidate.target && (!address_in_snapshot(*candidate.target) ||
+                candidate.target->architecture != candidate.address.architecture ||
+                candidate.target->mode != candidate.address.mode)))
+            return integrity_failure("published data candidate is invalid");
+    }
+    for (std::size_t index = 0; index < publication.data_pointer_facts.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& pointer = publication.data_pointer_facts[index];
+        if (!expected_id(pointer.id, 12, index) ||
+            pointer.candidate_kind > data_candidate_kind_t::in_image_pointer ||
+            pointer.encoding > data_pointer_encoding_t::signed_relative_to_next ||
+            (pointer.width_bytes != 1 && pointer.width_bytes != 2 &&
+             pointer.width_bytes != 4 && pointer.width_bytes != 8) ||
+            !address_in_snapshot(pointer.slot, pointer.width_bytes) ||
+            !address_in_snapshot(pointer.target) ||
+            pointer.slot.architecture != pointer.target.architecture ||
+            pointer.slot.mode != pointer.target.mode ||
+            !valid_provenance(pointer.provenance) || pointer.confidence > 100)
+            return integrity_failure("published data pointer fact is invalid");
+    }
+    for (std::size_t index = 0; index < publication.data_conflicts.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& conflict = publication.data_conflicts[index];
+        if (!expected_id(conflict.id, 13, index) ||
+            conflict.kind > data_candidate_kind_t::in_image_pointer ||
+            !address_in_snapshot(conflict.address) ||
+            !valid_provenance(conflict.selected_provenance) ||
+            !valid_provenance(conflict.rejected_provenance) ||
+            conflict.selected_confidence > 100 || conflict.rejected_confidence > 100 ||
+            conflict.selected_target == conflict.rejected_target ||
+            (conflict.selected_target && !address_in_snapshot(*conflict.selected_target)) ||
+            (conflict.rejected_target && !address_in_snapshot(*conflict.rejected_target)))
+            return integrity_failure("published data conflict is invalid");
+    }
+    for (std::size_t index = 0; index < publication.type_candidates.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& candidate = publication.type_candidates[index];
+        if (!expected_id(candidate.id, 10, index) ||
+            candidate.kind > symbol_type_candidate_kind_t::metadata_region ||
+            candidate.provenance > metadata_provenance_t::managed_metadata ||
+            candidate.confidence > 100 || candidate.display_name.empty() ||
+            candidate.source_key.empty() ||
+            (!candidate.explicitly_unknown && candidate.canonical_type.empty()) ||
+            (candidate.address && !address_in_snapshot(*candidate.address)) ||
+            (candidate.related_address &&
+                !address_in_snapshot(*candidate.related_address)) ||
+            !type_ids.insert(candidate.id).second)
+            return integrity_failure("published symbol type candidate is invalid");
+    }
+    for (std::size_t index = 0; index < publication.type_references.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& reference = publication.type_references[index];
+        if (!expected_id(reference.id, 9, index) ||
+            reference.kind > type_reference_kind_t::managed_reference ||
+            reference.provenance > metadata_provenance_t::managed_metadata ||
+            reference.confidence > 100 || reference.source_key.empty() ||
+            (!reference.source && !reference.target && reference.source_entity == 0 &&
+                reference.target_entity == 0) ||
+            (reference.source && !address_in_snapshot(*reference.source)) ||
+            (reference.target && !address_in_snapshot(*reference.target)) ||
+            (reference.source_entity != 0 &&
+                type_ids.find(reference.source_entity) == type_ids.end()) ||
+            (reference.target_entity != 0 &&
+                type_ids.find(reference.target_entity) == type_ids.end()))
+            return integrity_failure("published type reference fact is invalid");
+    }
+    for (std::size_t index = 0; index < publication.metadata_conflicts.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& conflict = publication.metadata_conflicts[index];
+        if (!expected_id(conflict.id, 14, index) ||
+            conflict.kind > metadata_conflict_kind_t::related_address ||
+            conflict.selected_provenance > metadata_provenance_t::managed_metadata ||
+            conflict.rejected_provenance > metadata_provenance_t::managed_metadata ||
+            conflict.selected_confidence > 100 || conflict.rejected_confidence > 100 ||
+            conflict.identity.empty() ||
+            conflict.selected_value == conflict.rejected_value ||
+            (conflict.address && !address_in_snapshot(*conflict.address)))
+            return integrity_failure("published metadata conflict is invalid");
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> validate_call_graph_publication(
+    const analysis_snapshot_t& snapshot,
+    const call_graph_publication_t& publication,
+    const cancellation_token_t& cancel)
+{
+    if (publication.nodes.empty() && publication.call_sites.empty() &&
+        publication.candidates.empty() && publication.edges.empty() &&
+        publication.conflicts.empty()) {
+        if (publication.indirect_site_count != 0 ||
+            publication.unresolved_site_count != 0 || publication.bounded)
+            return integrity_failure("empty call graph publication has nonempty state");
+        return workspace_result_t<void>::success();
+    }
+    std::uint64_t visits = 0;
+    const auto poll = [&]() -> workspace_result_t<void> {
+        if ((visits++ & 255U) == 0 && cancel.stop_requested())
+            return workspace_result_t<void>::failure(
+                workspace_stop_error(cancel, "call_graph_validate"));
+        return workspace_result_t<void>::success();
+    };
+    const auto valid_quality = [](const call_graph_quality_t& quality) noexcept {
+        return valid_provenance(quality.provenance) && quality.confidence <= 100 &&
+            quality.contributor_count != 0;
+    };
+    const auto expected_id = [](entity_id_t id, std::uint8_t domain,
+                                std::size_t index) noexcept {
+        return entity_domain(id) == domain &&
+            entity_ordinal(id) == static_cast<std::uint64_t>(index + 1);
+    };
+    std::unordered_map<entity_id_t, const function_record_t*> functions;
+    std::unordered_map<entity_id_t, const basic_block_record_t*> blocks;
+    std::unordered_map<entity_id_t, std::size_t> instructions;
+    std::unordered_map<entity_id_t, std::unordered_set<entity_id_t>> block_functions;
+    functions.reserve(snapshot.functions.size());
+    blocks.reserve(snapshot.blocks.size());
+    instructions.reserve(snapshot.instructions.size());
+    block_functions.reserve(snapshot.blocks.size());
+    for (const auto& function : snapshot.functions)
+        functions.emplace(function.id, &function);
+    for (const auto& block : snapshot.blocks) {
+        blocks.emplace(block.id, &block);
+        block_functions[block.id].insert(block.function_id);
+    }
+    for (const auto& membership : snapshot.function_block_memberships)
+        block_functions[membership.block_id].insert(membership.function_id);
+    for (std::size_t index = 0; index < snapshot.instructions.size(); ++index)
+        instructions.emplace(snapshot.instructions[index].id, index);
+    if (publication.nodes.size() != snapshot.functions.size())
+        return integrity_failure("published call graph node catalog is incomplete");
+    std::unordered_map<entity_id_t, std::size_t> node_indices;
+    node_indices.reserve(publication.nodes.size());
+    for (std::size_t index = 0; index < publication.nodes.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& node = publication.nodes[index];
+        const auto function = functions.find(node.function_id);
+        if (function == functions.end() || node.address != function->second->start ||
+            !node_indices.emplace(node.function_id, index).second ||
+            (index != 0 && !(publication.nodes[index - 1].address < node.address)))
+            return integrity_failure("published call graph node is invalid");
+    }
+    std::unordered_map<entity_id_t, const recovered_call_site_t*> sites;
+    sites.reserve(publication.call_sites.size());
+    std::uint64_t expected_candidate = 0;
+    std::uint64_t indirect_sites = 0;
+    std::uint64_t unresolved_sites = 0;
+    for (std::size_t index = 0; index < publication.call_sites.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& site = publication.call_sites[index];
+        const auto instruction = instructions.find(site.instruction_id);
+        const auto block = blocks.find(site.source_block_id);
+        const auto membership = block_functions.find(site.source_block_id);
+        std::uint64_t candidate_end = 0;
+        if (!expected_id(site.id, 15, index) ||
+            functions.find(site.source_function_id) == functions.end() ||
+            block == blocks.end() || instruction == instructions.end() ||
+            membership == block_functions.end() ||
+            membership->second.find(site.source_function_id) == membership->second.end() ||
+            snapshot.instructions[instruction->second].address != site.address ||
+            instruction->second < block->second->first_instruction ||
+            instruction->second >= static_cast<std::uint64_t>(
+                block->second->first_instruction) + block->second->instruction_count ||
+            site.first_candidate != expected_candidate ||
+            !checked_add_u64(site.first_candidate, site.candidate_count, candidate_end) ||
+            candidate_end > publication.candidates.size() ||
+            site.unresolved != (site.candidate_count == 0) ||
+            !sites.emplace(site.id, &site).second)
+            return integrity_failure("published call site is invalid");
+        expected_candidate = candidate_end;
+        if (site.indirect)
+            ++indirect_sites;
+        if (site.unresolved)
+            ++unresolved_sites;
+    }
+    if (expected_candidate != publication.candidates.size() ||
+        indirect_sites != publication.indirect_site_count ||
+        unresolved_sites != publication.unresolved_site_count)
+        return integrity_failure("published call graph site counters are inconsistent");
+    for (std::size_t index = 0; index < publication.candidates.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& candidate = publication.candidates[index];
+        const auto site = sites.find(candidate.call_site_id);
+        if (!expected_id(candidate.id, 16, index) || site == sites.end() ||
+            candidate.kind > indirect_call_candidate_kind_t::decompiler ||
+            !valid_address(candidate.target) || !valid_quality(candidate.quality) ||
+            candidate.rank >= site->second->candidate_count ||
+            index != static_cast<std::size_t>(site->second->first_candidate) +
+                candidate.rank ||
+            candidate.external_target != !candidate.target_function_id.has_value() ||
+            (candidate.target_function_id &&
+                (functions.find(*candidate.target_function_id) == functions.end() ||
+                 functions[*candidate.target_function_id]->start != candidate.target)))
+            return integrity_failure("published call candidate is invalid");
+    }
+    struct node_counts_t {
+        std::uint64_t incoming = 0;
+        std::uint64_t outgoing = 0;
+        std::uint64_t indirect = 0;
+        std::uint64_t unresolved = 0;
+    };
+    std::unordered_map<entity_id_t, node_counts_t> counts;
+    counts.reserve(publication.nodes.size());
+    std::unordered_map<entity_id_t, std::uint64_t> edge_counts;
+    edge_counts.reserve(publication.call_sites.size());
+    for (const auto& site : publication.call_sites) {
+        counts[site.source_function_id].unresolved += site.unresolved ? 1 : 0;
+        edge_counts.emplace(site.id, 0);
+    }
+    for (std::size_t index = 0; index < publication.edges.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& edge = publication.edges[index];
+        const auto site = sites.find(edge.call_site_id);
+        if (!expected_id(edge.id, 17, index) || site == sites.end() ||
+            edge.source_function_id != site->second->source_function_id ||
+            edge.source_block_id != site->second->source_block_id ||
+            edge.call_site != site->second->address ||
+            edge.resolution > call_graph_resolution_t::unresolved ||
+            !valid_address(edge.call_site) || !valid_address(edge.target) ||
+            !valid_quality(edge.quality) ||
+            (site->second->unresolved !=
+                (edge.resolution == call_graph_resolution_t::unresolved)))
+            return integrity_failure("published call graph edge is invalid");
+        if (site->second->unresolved) {
+            if (edge.candidate_rank != 0 || edge.target.value != 0 ||
+                edge.target_function_id || edge.external_target || edge.target_noreturn)
+                return integrity_failure("published unresolved call edge is invalid");
+        } else {
+            std::uint64_t candidate_index = 0;
+            if (edge.candidate_rank >= site->second->candidate_count ||
+                !checked_add_u64(site->second->first_candidate,
+                    edge.candidate_rank, candidate_index) ||
+                candidate_index >= publication.candidates.size())
+                return integrity_failure("published call edge candidate is invalid");
+            const auto& candidate = publication.candidates[
+                static_cast<std::size_t>(candidate_index)];
+            const auto expected_resolution = site->second->tail_call
+                ? call_graph_resolution_t::tail_call
+                : (site->second->indirect
+                    ? call_graph_resolution_t::indirect_candidate
+                    : call_graph_resolution_t::direct);
+            const bool quality_matches =
+                edge.quality.provenance == candidate.quality.provenance &&
+                edge.quality.confidence == candidate.quality.confidence &&
+                edge.quality.contributor_count == candidate.quality.contributor_count &&
+                edge.quality.conflicted == candidate.quality.conflicted;
+            bool expected_noreturn = false;
+            if (candidate.target_function_id) {
+                const auto target = functions.find(*candidate.target_function_id);
+                if (target == functions.end())
+                    return integrity_failure("published call edge target is invalid");
+                expected_noreturn = target->second->noreturn;
+            }
+            if (candidate.call_site_id != edge.call_site_id ||
+                candidate.rank != edge.candidate_rank ||
+                candidate.target != edge.target ||
+                candidate.target_function_id != edge.target_function_id ||
+                candidate.external_target != edge.external_target ||
+                edge.external_target != !edge.target_function_id.has_value() ||
+                edge.resolution != expected_resolution || !quality_matches ||
+                edge.target_noreturn != expected_noreturn)
+                return integrity_failure("published call edge does not match its candidate");
+        }
+        ++edge_counts[edge.call_site_id];
+        auto& source = counts[edge.source_function_id];
+        ++source.outgoing;
+        if (site->second->indirect)
+            ++source.indirect;
+        if (edge.target_function_id)
+            ++counts[*edge.target_function_id].incoming;
+    }
+    for (const auto& site : publication.call_sites) {
+        const auto expected = site.unresolved ? 1ULL : site.candidate_count;
+        if (edge_counts[site.id] != expected)
+            return integrity_failure("published call graph edge ranges are inconsistent");
+    }
+    for (const auto& node : publication.nodes) {
+        const auto& actual = counts[node.function_id];
+        if (node.incoming_edges != actual.incoming ||
+            node.outgoing_edges != actual.outgoing ||
+            node.indirect_edges != actual.indirect ||
+            node.unresolved_sites != actual.unresolved)
+            return integrity_failure("published call graph node counters are inconsistent");
+    }
+    for (std::size_t index = 0; index < publication.conflicts.size(); ++index) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        const auto& conflict = publication.conflicts[index];
+        if (!expected_id(conflict.id, 18, index) ||
+            conflict.kind > call_graph_conflict_kind_t::orphan_candidate ||
+            (conflict.kind != call_graph_conflict_kind_t::orphan_candidate &&
+                conflict.instruction_id != 0 &&
+                instructions.find(conflict.instruction_id) == instructions.end()) ||
+            (conflict.source_function_id != 0 &&
+                functions.find(conflict.source_function_id) == functions.end()) ||
+            (conflict.selected_target_function_id != 0 &&
+                functions.find(conflict.selected_target_function_id) == functions.end()) ||
+            (conflict.kind != call_graph_conflict_kind_t::orphan_candidate &&
+                conflict.kind != call_graph_conflict_kind_t::candidate_identity_mismatch &&
+                conflict.competing_target_function_id != 0 &&
+                functions.find(conflict.competing_target_function_id) == functions.end()))
+            return integrity_failure("published call graph conflict is invalid");
+    }
+    return workspace_result_t<void>::success();
+}
+
 workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& snapshot,
                                                      bool require_complete_coverage,
                                                      const cancellation_token_t& cancel) {
@@ -429,10 +794,51 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
         if (!(snapshot.instructions[index - 1].address < snapshot.instructions[index].address))
             return integrity_failure("instructions are not in deterministic unique order");
     }
+    if (!snapshot.delay_slot_counts.empty()) {
+        if (snapshot.delay_slot_counts.size() != snapshot.instructions.size())
+            return integrity_failure("delay-slot column does not align with instructions");
+        std::vector<std::uint8_t> claimed_delay_slots(snapshot.instructions.size(), 0);
+        constexpr std::uint32_t transfer_mask = flow_branch | flow_call | flow_return |
+            flow_interrupt | flow_terminal;
+        for (std::size_t index = 0; index < snapshot.instructions.size(); ++index) {
+            auto stopped = poll();
+            if (!stopped)
+                return stopped;
+            const auto count = snapshot.delay_slot_counts[index];
+            if (count == 0)
+                continue;
+            if (count > 2 || claimed_delay_slots[index] != 0 ||
+                (snapshot.instructions[index].flow_flags & transfer_mask) == 0 ||
+                index + count >= snapshot.instructions.size())
+                return integrity_failure("delay-slot metadata is malformed");
+            auto expected = snapshot.instructions[index].address.value;
+            if (!checked_add_u64(expected, snapshot.instructions[index].length, expected))
+                return integrity_failure("delay-slot instruction range overflowed");
+            for (std::size_t offset = 1; offset <= count; ++offset) {
+                const auto slot_index = index + offset;
+                const auto& slot = snapshot.instructions[slot_index];
+                if (claimed_delay_slots[slot_index] != 0 ||
+                    slot.address.value != expected ||
+                    !same_address_domain(snapshot.instructions[index].address, slot.address) ||
+                    (slot.flow_flags & transfer_mask) != 0)
+                    return integrity_failure("delay-slot instruction sequence is malformed");
+                claimed_delay_slots[slot_index] = 1;
+                if (!checked_add_u64(expected, slot.length, expected))
+                    return integrity_failure("delay-slot instruction range overflowed");
+            }
+        }
+    }
     std::uint64_t entity_count = snapshot.instructions.size();
-    const std::array<std::uint64_t, 7> additional_counts{{
+    const std::array<std::uint64_t, 17> additional_counts{{
         snapshot.blocks.size(), snapshot.function_chunks.size(), snapshot.functions.size(), snapshot.edges.size(),
-        snapshot.xrefs.size(), snapshot.strings.size(), snapshot.symbols.size()
+        snapshot.xrefs.size(), snapshot.strings.size(), snapshot.symbols.size(),
+        snapshot.call_graph.call_sites.size(), snapshot.call_graph.candidates.size(),
+        snapshot.call_graph.edges.size(), snapshot.call_graph.conflicts.size(),
+        snapshot.rich_facts.data_candidates.size(),
+        snapshot.rich_facts.data_pointer_facts.size(),
+        snapshot.rich_facts.data_conflicts.size(), snapshot.rich_facts.type_candidates.size(),
+        snapshot.rich_facts.type_references.size(),
+        snapshot.rich_facts.metadata_conflicts.size()
     }};
     for (const auto count : additional_counts) {
         if (!checked_add_u64(entity_count, count, entity_count) ||
@@ -473,6 +879,26 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
     appended = append_ids(snapshot.strings, false);
     if (!appended) return appended;
     appended = append_ids(snapshot.symbols, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.call_graph.call_sites, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.call_graph.candidates, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.call_graph.edges, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.call_graph.conflicts, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.rich_facts.data_candidates, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.rich_facts.data_pointer_facts, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.rich_facts.data_conflicts, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.rich_facts.type_candidates, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.rich_facts.type_references, false);
+    if (!appended) return appended;
+    appended = append_ids(snapshot.rich_facts.metadata_conflicts, false);
     if (!appended) return appended;
     std::sort(entity_ids.begin(), entity_ids.end());
     for (std::size_t index = 1; index < entity_ids.size(); ++index) {
@@ -595,6 +1021,10 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
                 !checked_add_u64(cursor, instruction.length, cursor) ||
                 cursor > block.end.value)
                 return integrity_failure("basic block instruction range is inconsistent");
+            if (!snapshot.delay_slot_counts.empty() &&
+                index + snapshot.delay_slot_counts[static_cast<std::size_t>(index)] >=
+                    instruction_end)
+                return integrity_failure("basic block splits a delay-slot sequence");
         }
         if (cursor != block.end.value)
             return integrity_failure("basic block end does not match its instruction range");
@@ -605,10 +1035,9 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
             return stopped;
         const auto& previous = snapshot.blocks[index - 1];
         const auto& current = snapshot.blocks[index];
-        if (previous.function_id == current.function_id &&
-            same_address_domain(previous.end, current.start) &&
+        if (same_address_domain(previous.end, current.start) &&
             previous.end.value > current.start.value)
-            return integrity_failure("basic blocks overlap within a function");
+            return integrity_failure("basic block records overlap");
     }
     std::unordered_set<entity_id_t> function_ids;
     function_ids.reserve(snapshot.functions.size());
@@ -668,7 +1097,8 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
         if (function.first_chunk != expected_first_chunk ||
             function.first_block_membership != expected_first_membership ||
             chunk_end > snapshot.function_chunks.size() ||
-            membership_end > snapshot.function_block_memberships.size())
+            membership_end > snapshot.function_block_memberships.size() ||
+            function.chunks.size() != function.chunk_count)
             return integrity_failure("function compact-IR ranges are inconsistent");
         const auto& primary_chunk = snapshot.function_chunks[function.first_chunk];
         if (primary_chunk.start != function.start ||
@@ -693,7 +1123,15 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
                 static_cast<std::uint64_t>(chunk.first_block) + chunk.block_count >
                     snapshot.blocks.size())
                 return integrity_failure("function chunk record is invalid");
-            if (previous_chunk && previous_chunk->end.value >= chunk.start.value)
+            const auto& range = function.chunks[static_cast<std::size_t>(
+                chunk_index - function.first_chunk)];
+            const auto expected_kind = static_cast<std::uint8_t>(
+                (chunk.shared ? function_chunk_shared : function_chunk_none) |
+                (chunk.cold ? function_chunk_cold : function_chunk_none));
+            if (range.rva_start != chunk.start.value ||
+                range.rva_end != chunk.end.value || range.chunk_kind != expected_kind)
+                return integrity_failure("function chunk compatibility range is inconsistent");
+            if (previous_chunk && previous_chunk->end.value > chunk.start.value)
                 return integrity_failure("function chunks are not in deterministic range order");
             std::uint64_t cursor = chunk.start.value;
             bool chunk_has_shared_block = false;
@@ -743,15 +1181,62 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
         if (function_ids.find(block.function_id) == function_ids.end())
             return integrity_failure("basic block references an unknown function");
     }
-    for (std::size_t index = 1; index < snapshot.functions.size(); ++index) {
+    struct function_extent_t {
+        address_t start;
+        address_t end;
+        bool explicit_membership = false;
+    };
+    std::vector<function_extent_t> function_extents;
+    function_extents.reserve(snapshot.function_chunks.size() + snapshot.functions.size());
+    for (const auto& function : snapshot.functions) {
         auto stopped = poll();
         if (!stopped)
             return stopped;
-        const auto& previous = snapshot.functions[index - 1];
-        const auto& current = snapshot.functions[index];
-        if (same_address_domain(previous.end, current.start) &&
-            previous.end.value > current.start.value)
-            return integrity_failure("function ranges overlap");
+        if (function.chunk_count == 0) {
+            function_extents.push_back({function.start, function.end, false});
+            continue;
+        }
+        const auto end = static_cast<std::uint64_t>(function.first_chunk) +
+            function.chunk_count;
+        for (std::uint64_t index = function.first_chunk; index < end; ++index) {
+            const auto& chunk = snapshot.function_chunks[static_cast<std::size_t>(index)];
+            function_extents.push_back({chunk.start, chunk.end, true});
+        }
+    }
+    std::sort(function_extents.begin(), function_extents.end(),
+        [](const function_extent_t& lhs, const function_extent_t& rhs) {
+            return std::tie(lhs.start, lhs.end, lhs.explicit_membership) <
+                std::tie(rhs.start, rhs.end, rhs.explicit_membership);
+        });
+    address_t maximum_end;
+    address_t maximum_legacy_end;
+    bool have_extent = false;
+    bool have_legacy_extent = false;
+    for (const auto& current : function_extents) {
+        auto stopped = poll();
+        if (!stopped)
+            return stopped;
+        if (!have_extent || !same_address_domain(maximum_end, current.start)) {
+            maximum_end = current.end;
+            have_extent = true;
+            have_legacy_extent = !current.explicit_membership;
+            if (have_legacy_extent)
+                maximum_legacy_end = current.end;
+            continue;
+        }
+        const bool overlaps_any = maximum_end.value > current.start.value;
+        const bool overlaps_legacy = have_legacy_extent &&
+            maximum_legacy_end.value > current.start.value;
+        if ((!current.explicit_membership && overlaps_any) ||
+            (current.explicit_membership && overlaps_legacy))
+            return integrity_failure("function extents overlap without shared-tail ownership");
+        if (current.end.value > maximum_end.value)
+            maximum_end = current.end;
+        if (!current.explicit_membership &&
+            (!have_legacy_extent || current.end.value > maximum_legacy_end.value)) {
+            maximum_legacy_end = current.end;
+            have_legacy_extent = true;
+        }
     }
     for (const auto& edge : snapshot.edges) {
         auto stopped = poll();
@@ -799,6 +1284,12 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
             !valid_provenance(symbol.provenance) || symbol.confidence > 100)
             return integrity_failure("symbol record is invalid");
     }
+    auto rich_facts = validate_rich_fact_publication(snapshot, snapshot.rich_facts, cancel);
+    if (!rich_facts)
+        return rich_facts;
+    auto call_graph = validate_call_graph_publication(snapshot, snapshot.call_graph, cancel);
+    if (!call_graph)
+        return call_graph;
     for (const auto& span : snapshot.coverage) {
         auto stopped = poll();
         if (!stopped)
@@ -1423,10 +1914,23 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
     std::shared_ptr<search_index_t> search_index_value,
     bool require_complete_coverage,
     std::function<workspace_result_t<void>()> finalizer) {
-    if (!snapshot_value || !search_index_value)
+    if (!snapshot_value)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "analysis bundle requires a snapshot and search index",
+                                 "analysis bundle requires a snapshot",
+                                 "workspace_publish"));
+    const bool overlay_generation_publication =
+        expected_generation != (std::numeric_limits<std::uint64_t>::max)() &&
+        snapshot_value->generation == expected_generation + 1;
+    if (overlay_generation_publication && !finalizer)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "overlay generation publication requires an atomic finalizer",
+                                 "workspace_publish"));
+    if (!overlay_generation_publication && !search_index_value)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "analysis bundle requires a search index",
                                  "workspace_publish"));
     if (closing() || closed())
         return workspace_result_t<void>::failure(
@@ -1457,11 +1961,12 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
                                                  workspace_cancel);
     if (!validation)
         return validation;
-    if (!search_index_value->matches(snapshot_value) ||
-        !search_index_value->matches(identity_->binary_id(), identity_->load_profile_hash(),
-                                     snapshot_value->generation,
-                                     snapshot_value->analysis_revision,
-                                     snapshot_value->overlay_revision))
+    if (search_index_value &&
+        (!search_index_value->matches(snapshot_value) ||
+         !search_index_value->matches(identity_->binary_id(), identity_->load_profile_hash(),
+                                      snapshot_value->generation,
+                                      snapshot_value->analysis_revision,
+                                      snapshot_value->overlay_revision)))
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "search index does not match the analysis snapshot",
@@ -1489,14 +1994,22 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
     }
     const auto readiness = snapshot_value->baseline_complete
         ? workspace_readiness_t::baseline_ready
-        : workspace_readiness_t::partial;
+        : snapshot_value->analysis_revision != 0
+            ? workspace_readiness_t::partial
+            : snapshot_value->normalized_image
+                ? workspace_readiness_t::parsed
+                : workspace_readiness_t::provider_ready;
     const auto replacement = std::make_shared<const analysis_publication_t>(
         snapshot_value, search_index_value, readiness);
     workspace_progress_t replacement_progress;
     replacement_progress.readiness = readiness;
-    replacement_progress.phase = snapshot_value->baseline_complete
+    replacement_progress.phase = readiness == workspace_readiness_t::baseline_ready
         ? "baseline_ready"
-        : "partial";
+        : readiness == workspace_readiness_t::partial
+            ? "partial"
+            : readiness == workspace_readiness_t::parsed
+                ? "parsed"
+                : "provider_ready";
     replacement_progress.completed_units = 1;
     replacement_progress.total_units = 1;
     replacement_progress.completed_bytes = executable_bytes;
@@ -1517,19 +2030,10 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
         if (workspace_cancel.stop_requested())
             return workspace_result_t<void>::failure(
                 workspace_stop_error(workspace_cancel, "workspace_publish"));
-        if (generation() != expected_generation ||
-            snapshot_value->generation != expected_generation)
+        if (generation() != expected_generation)
             return workspace_result_t<void>::failure(
                 make_workspace_error(workspace_error_code_t::stale_generation,
                                      "analysis bundle generation is stale",
-                                     "workspace_publish"));
-        if (analysis_revision() != expected_analysis_revision ||
-            expected_analysis_revision == std::numeric_limits<std::uint64_t>::max() ||
-            snapshot_value->analysis_revision != expected_analysis_revision + 1 ||
-            snapshot_value->overlay_revision != overlay_revision())
-            return workspace_result_t<void>::failure(
-                make_workspace_error(workspace_error_code_t::revision_conflict,
-                                     "analysis bundle revision conflicts with workspace state",
                                      "workspace_publish"));
         const auto current_publication = analysis_publication();
         if (!current_publication || !current_publication->snapshot ||
@@ -1539,6 +2043,58 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "analysis bundle image does not match the workspace",
                                      "workspace_publish"));
+        if (overlay_generation_publication) {
+            const auto current_overlay_revision = overlay_revision();
+            const bool reset_snapshot_has_facts =
+                !snapshot_value->instructions.empty() ||
+                !snapshot_value->delay_slot_counts.empty() ||
+                !snapshot_value->operand_facts.empty() ||
+                !snapshot_value->target_facts.empty() ||
+                !snapshot_value->blocks.empty() ||
+                !snapshot_value->function_chunks.empty() ||
+                !snapshot_value->function_block_memberships.empty() ||
+                !snapshot_value->functions.empty() ||
+                !snapshot_value->edges.empty() ||
+                !snapshot_value->call_graph.call_sites.empty() ||
+                !snapshot_value->call_graph.candidates.empty() ||
+                !snapshot_value->call_graph.edges.empty() ||
+                !snapshot_value->call_graph.conflicts.empty() ||
+                !snapshot_value->xrefs.empty() ||
+                !snapshot_value->strings.empty() ||
+                !snapshot_value->symbols.empty() ||
+                !snapshot_value->rich_facts.data_candidates.empty() ||
+                !snapshot_value->rich_facts.data_pointer_facts.empty() ||
+                !snapshot_value->rich_facts.data_conflicts.empty() ||
+                !snapshot_value->rich_facts.type_candidates.empty() ||
+                !snapshot_value->rich_facts.type_references.empty() ||
+                !snapshot_value->rich_facts.metadata_conflicts.empty() ||
+                !snapshot_value->coverage.empty();
+            if (active_analysis_generation_.load(std::memory_order_acquire) != 0 ||
+                analysis_revision() != expected_analysis_revision ||
+                current_overlay_revision ==
+                    (std::numeric_limits<std::uint64_t>::max)() ||
+                snapshot_value->overlay_revision != current_overlay_revision + 1 ||
+                snapshot_value->image != current_publication->snapshot->image ||
+                (snapshot_value->analysis_revision != 0 &&
+                 snapshot_value->analysis_revision != expected_analysis_revision) ||
+                (snapshot_value->analysis_revision == 0 &&
+                 (snapshot_value->baseline_complete || search_index_value ||
+                  reset_snapshot_has_facts)))
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::revision_conflict,
+                                         "overlay generation publication conflicts with workspace state",
+                                         "workspace_publish"));
+        } else if (analysis_revision() != expected_analysis_revision ||
+                   expected_analysis_revision ==
+                       (std::numeric_limits<std::uint64_t>::max)() ||
+                   snapshot_value->generation != expected_generation ||
+                   snapshot_value->analysis_revision != expected_analysis_revision + 1 ||
+                   snapshot_value->overlay_revision != overlay_revision()) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::revision_conflict,
+                                     "analysis bundle revision conflicts with workspace state",
+                                     "workspace_publish"));
+        }
     }
     if (finalizer) {
         publication_finalizer_active_.store(true, std::memory_order_release);
@@ -1559,9 +2115,18 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
         std::lock_guard state_lock(state_mutex_);
         replacement_progress.cancellation_requested =
             cancellation_.token().stop_requested();
+        if (overlay_generation_publication) {
+            cancellation_source_t replacement_cancellation;
+            cancellation_.request_cancel();
+            cancellation_ = std::move(replacement_cancellation);
+            replacement_progress.cancellation_requested = false;
+        }
         progress_ = std::move(replacement_progress);
         std::atomic_store_explicit(&publication_, replacement,
                                    std::memory_order_release);
+        if (overlay_generation_publication)
+            overlay_revision_.store(snapshot_value->overlay_revision,
+                                    std::memory_order_release);
     }
     return workspace_result_t<void>::success();
 }
@@ -1618,27 +2183,11 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
 
 workspace_result_t<std::uint64_t> analysis_workspace_t::advance_overlay_revision(
     std::uint64_t expected_revision) {
-    if (publication_finalizer_active_.load(std::memory_order_acquire))
-        return workspace_result_t<std::uint64_t>::failure(
-            publication_finalizer_conflict("workspace_overlay"));
-    std::shared_lock publication_lock(publication_mutex_);
-    if (closing())
-        return workspace_result_t<std::uint64_t>::failure(
-            make_workspace_error(workspace_error_code_t::workspace_closing,
-                                 "workspace is closing", "workspace_overlay"));
-    std::uint64_t expected = expected_revision;
-    if (expected == std::numeric_limits<std::uint64_t>::max())
-        return workspace_result_t<std::uint64_t>::failure(
-            make_workspace_error(workspace_error_code_t::range_overflow,
-                                 "overlay revision overflowed", "workspace_overlay"));
-    if (!overlay_revision_.compare_exchange_strong(expected, expected_revision + 1,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_acquire))
-        return workspace_result_t<std::uint64_t>::failure(
-            make_workspace_error(workspace_error_code_t::revision_conflict,
-                                 "overlay revision conflicts with the expected value",
-                                 "workspace_overlay"));
-    return workspace_result_t<std::uint64_t>::success(expected_revision + 1);
+    static_cast<void>(expected_revision);
+    return workspace_result_t<std::uint64_t>::failure(
+        make_workspace_error(workspace_error_code_t::service_conflict,
+                             "isolated overlay revision publication is unsupported",
+                             "workspace_overlay"));
 }
 
 workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision(
@@ -1684,15 +2233,13 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
     const auto replacement = std::make_shared<const analysis_publication_t>(
         std::static_pointer_cast<const analysis_snapshot_t>(restored), nullptr,
         current_publication->readiness);
-    std::uint64_t expected = expected_current;
-    if (!overlay_revision_.compare_exchange_strong(expected, persisted_revision,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_acquire))
+    if (overlay_revision_.load(std::memory_order_acquire) != expected_current)
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::revision_conflict,
                                  "overlay revision changed during restoration",
                                  "workspace_overlay_restore"));
     std::atomic_store_explicit(&publication_, replacement, std::memory_order_release);
+    overlay_revision_.store(persisted_revision, std::memory_order_release);
     return workspace_result_t<std::uint64_t>::success(persisted_revision);
 }
 

@@ -13,14 +13,14 @@
 namespace aida::analysis {
 
 struct packed_page_header_t {
+    std::uint64_t generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
     std::uint32_t magic = packed_page_magic;
     std::uint32_t version = packed_page_blob_version;
     std::uint32_t page_type = 0;
     std::uint32_t page_index = 0;
     std::uint32_t page_count = 0;
-    std::uint64_t generation = 0;
-    std::uint64_t analysis_revision = 0;
-    std::uint64_t overlay_revision = 0;
     std::uint32_t payload_length = 0;
     std::uint32_t checksum = 0;
     std::array<std::uint8_t, 12> reserved{};
@@ -32,7 +32,7 @@ struct packed_page_header_t {
         const std::uint8_t* data, std::size_t size) noexcept;
 };
 
-static_assert(sizeof(packed_page_header_t) <= packed_page_header_size);
+static_assert(sizeof(packed_page_header_t) == packed_page_header_size);
 
 struct packed_page_t {
     packed_page_header_t header;
@@ -45,7 +45,7 @@ struct packed_page_checkpoint_t {
     std::uint64_t total_payload_bytes = 0;
     std::uint64_t created_utc_ms = 0;
 
-    std::array<std::uint8_t, 24> encode() const noexcept;
+    std::array<std::uint8_t, 28> encode() const noexcept;
     static std::optional<packed_page_checkpoint_t> decode(
         const std::uint8_t* data, std::size_t size) noexcept;
 };
@@ -75,8 +75,9 @@ struct packed_page_encode_options_t {
 };
 
 std::uint32_t crc32c(const std::uint8_t* data, std::size_t size) noexcept;
-std::uint32_t crc32c_combine(std::uint32_t crc1, std::uint32_t crc2,
-                              std::size_t length2) noexcept;
+workspace_result_t<std::uint32_t> crc32c_cancellable(
+    const std::uint8_t* data, std::size_t size,
+    const packed_stop_predicate_t& stop_requested);
 
 class packed_page_codec_t final {
 public:
@@ -86,14 +87,21 @@ public:
         const packed_page_encode_options_t& options);
 
     static workspace_result_t<std::vector<std::uint8_t>> decode_batch(
-        const packed_page_batch_t& batch);
+        const packed_page_batch_t& batch,
+        const packed_stop_predicate_t& stop_requested = {});
 
-    static workspace_result_t<void> verify_page(const packed_page_t& page);
+    static workspace_result_t<void> verify_page(
+        const packed_page_t& page,
+        const packed_stop_predicate_t& stop_requested = {});
 
-    static workspace_result_t<void> verify_batch(const packed_page_batch_t& batch);
+    static workspace_result_t<void> verify_batch(
+        const packed_page_batch_t& batch,
+        const packed_stop_predicate_t& stop_requested = {});
 
     static workspace_result_t<std::vector<packed_page_index_entry_t>>
-        build_warm_open_index(const packed_page_batch_t& batch);
+        build_warm_open_index(
+            const packed_page_batch_t& batch,
+            const packed_stop_predicate_t& stop_requested = {});
 
     static workspace_result_t<packed_page_t> encode_checkpoint_page(
         std::uint64_t generation,

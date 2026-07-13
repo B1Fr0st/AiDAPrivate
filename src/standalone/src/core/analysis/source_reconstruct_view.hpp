@@ -636,19 +636,26 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 					source_reconstructor::cancel_workspace(st.recon_state);
 			} else {
 				const auto& last = source_reconstructor::get_last_result_workspace(st.recon_state);
-				const char* done_lbl = last.success ? "Complete!" : "Failed";
+				const char* done_lbl = last.success
+					? "Complete!"
+					: last.decompiled_functions > 0 ? "Incomplete" : "Failed";
 				const auto& th_done = aida::ui::resolved();
 				ImU32 done_col = last.success ? aida::ui::with_alpha(th_done.success, 0.86f * fa)
 				                              : aida::ui::with_alpha(th_done.error,   0.86f * fa);
 				dl->AddText(ImVec2(dx + pad, btn_area_y + 6.f), done_col, done_lbl);
 
-				if (last.success) {
-					char summary[128];
-					snprintf(summary, sizeof(summary), "%d functions, %d modules, %d files",
-						last.decompiled_functions, last.modules_created,
-						static_cast<int>(last.files_created.size()));
-					dl->AddText(ImVec2(dx + pad + ImGui::CalcTextSize(done_lbl).x + 12.f,
-					                    btn_area_y + 6.f), text_secondary, summary);
+				char summary[160];
+				snprintf(summary, sizeof(summary), "%d / %d functions, %d diagnostics, %d files",
+					last.decompiled_functions, last.total_functions,
+					static_cast<int>(last.diagnostics.size()),
+					static_cast<int>(last.files_created.size()));
+				const float summary_x = dx + pad + ImGui::CalcTextSize(done_lbl).x + 12.f;
+				const float summary_right = dx + sw - pad - 92.f;
+				if (summary_right > summary_x) {
+					dl->PushClipRect(ImVec2(summary_x, btn_area_y),
+						ImVec2(summary_right, btn_area_y + 30.f), true);
+					dl->AddText(ImVec2(summary_x, btn_area_y + 6.f), text_secondary, summary);
+					dl->PopClipRect();
 				}
 
 				float close_btn_w = 80.f;

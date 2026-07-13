@@ -375,6 +375,12 @@ pseudocode_readability_result_t analyze_pseudocode_readability(
             "decompiler.readability.v2.resource_limit", ordinal));
         return result;
     }
+    if (!typed_ast_has_proven_function_body(*ast)) {
+        result.diagnostics.push_back(readability_diagnostic(
+            decompiler_diagnostic_code_t::malformed_ast,
+            "decompiler.readability.v2.fabricated_body", ordinal));
+        return result;
+    }
     const auto ast_validation = validate_typed_pseudocode_ast(*ast);
     const auto document_validation = validate_decompiler_document(*document);
     if (!ast_validation.valid() || !document_validation.valid()) {

@@ -8,13 +8,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace aida::standalone::mcp::compat::handlers {
@@ -112,10 +113,6 @@ struct undo_entry_t final {
         declare_type,
         enum_upsert,
         set_type,
-        delete_type,
-        rename_type,
-        batch_begin,
-        batch_end,
     };
     action_t action = action_t::declare_type;
     std::string target_name;
@@ -142,6 +139,8 @@ public:
         const adapter_call_context_t& context,
         const adapter_request_t& request);
 
+    std::shared_ptr<types_overlay_store_t> target_scope(const target_record_t& target);
+
     std::uint64_t revision() const noexcept;
     bool undo();
     std::size_t type_count() const noexcept;
@@ -155,6 +154,17 @@ public:
     void clear();
 
 private:
+    using target_scope_key_t =
+        std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t>;
+
+    static target_scope_key_t target_scope_key(const target_record_t& target) noexcept;
+    adapter_result_t<adapter_response_t> handle_query_local(
+        const adapter_call_context_t& context,
+        const adapter_request_t& request);
+    adapter_result_t<adapter_response_t> handle_overlay_local(
+        const adapter_call_context_t& context,
+        const adapter_request_t& request);
+
     protocol::json do_declare_type(const protocol::json& args);
     protocol::json do_enum_upsert(const protocol::json& args);
     protocol::json do_read_struct(const protocol::json& args);
@@ -197,6 +207,8 @@ private:
     std::uint64_t revision_ = 0;
     std::uint32_t next_ordinal_ = 0;
     mutable std::mutex mutex_;
+    std::map<target_scope_key_t, std::shared_ptr<types_overlay_store_t>> target_scopes_;
+    mutable std::mutex target_scopes_mutex_;
     types_handler_limits_t limits_;
 };
 

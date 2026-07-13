@@ -128,6 +128,7 @@ struct edge_heap_order_t {
 struct block_view_t {
     const basic_block_record_t* record = nullptr;
     const instruction_record_t* terminal_instruction = nullptr;
+    std::uint8_t delay_slot_count = 0;
     bool instructions_complete = false;
     bool shared = false;
 };
@@ -214,6 +215,13 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
                                                            std::uint64_t function_rva,
                                                            const advanced_cfg_budget_t& budget,
                                                            cfg_poller_t& poller) {
+    if (!snapshot.delay_slot_counts.empty() &&
+        snapshot.delay_slot_counts.size() != snapshot.instructions.size()) {
+        return workspace_result_t<function_view_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "delay-slot column does not align with the instruction table",
+            "advanced_cfg.instruction_validation"));
+    }
     const function_record_t* function = nullptr;
     for (const auto& candidate : snapshot.functions) {
         auto stopped = poller.poll("advanced_cfg.function_lookup");
@@ -392,6 +400,9 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
                      (flow_branch | flow_call | flow_return |
                       flow_interrupt | flow_terminal)) != 0) {
                     selected_block.terminal_instruction = &candidate;
+                    if (!snapshot.delay_slot_counts.empty())
+                        selected_block.delay_slot_count =
+                            snapshot.delay_slot_counts[instruction - 1];
                     break;
                 }
             }
@@ -1509,7 +1520,13 @@ workspace_result_t<cfg_analysis_result_t>
         block.primary_function_id = block_view.record->function_id;
         block.start = block_view.record->start;
         block.end = block_view.record->end;
+        block.transfer_instruction_id = block_view.terminal_instruction &&
+            (block_view.terminal_instruction->flow_flags &
+             (flow_branch | flow_call | flow_return |
+              flow_interrupt | flow_terminal)) != 0
+            ? block_view.terminal_instruction->id : 0;
         block.instruction_count = block_view.record->instruction_count;
+        block.delay_slot_count = block_view.delay_slot_count;
         block.quality = quality_from(block_view.record->provenance, block_view.record->confidence);
         const auto* terminal = block_view.terminal_instruction;
         block.terminal = terminal != nullptr &&

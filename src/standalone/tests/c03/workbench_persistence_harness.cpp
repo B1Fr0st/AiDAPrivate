@@ -1,17 +1,28 @@
 #include "workbench_persistence_harness.hpp"
 
+#include "../../src/core/analysis/workspace/workspace_database.hpp"
+#include "../../src/core/analysis/workspace/workspace_identity.hpp"
+#include "../../src/core/infra/taskflow_runtime.hpp"
 #include "../../src/core/workbench/workbench_persistence.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -39,16 +50,52 @@ document_identity_t make_identity(workspace_id_t workspace, std::uint64_t object
     return identity;
 }
 
-document_persistence_dto_t make_document_record(workspace_id_t workspace,
-                                                 std::uint64_t document_id,
-                                                 std::uint64_t object_id)
+document_persistence_dto_t make_document_record(
+    workspace_id_t workspace, std::uint64_t document_id,
+    std::uint64_t object_id, std::string title, std::string state_token)
 {
     document_persistence_dto_t document;
     document.id = {document_id};
     document.identity = make_identity(workspace, object_id);
-    document.title = "doc-" + std::to_string(document_id);
-    document.state_token = "state-" + std::to_string(document_id);
+    document.title = std::move(title);
+    document.state_token = std::move(state_token);
     return document;
+}
+
+selection_context_t make_address_selection(std::uint64_t address,
+                                           std::uint64_t extent = 0)
+{
+    selection_context_t selection;
+    selection.kind = extent == 0 ? selection_kind_t::address
+                                 : selection_kind_t::range;
+    selection.has_address = true;
+    selection.address = address;
+    selection.extent = extent;
+    return selection;
+}
+
+navigation_event_t make_navigation_event(
+    workspace_id_t workspace, navigation_event_id_t id,
+    std::uint64_t sequence, document_id_t source_document,
+    view_id_t source_view, document_identity_t target_document,
+    std::uint64_t source_address, std::uint64_t target_address)
+{
+    navigation_event_t event;
+    event.id = id;
+    event.workspace = workspace;
+    event.has_source = true;
+    event.source.workspace = workspace;
+    event.source.document = source_document;
+    event.source.view = source_view;
+    event.source.selection = make_address_selection(source_address);
+    event.source.cursor = {true, source_address};
+    event.target.document = std::move(target_document);
+    event.target.selection = make_address_selection(target_address, 16);
+    event.target.cursor = {true, target_address};
+    event.origin = navigation_origin_t::history;
+    event.sequence = sequence;
+    event.request_focus = true;
+    return event;
 }
 
 workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
@@ -58,17 +105,19 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
     dto.revision = {1};
     dto.history.workspace = workspace;
 
-    document_persistence_dto_t first;
-    first.id = {1};
-    first.identity = make_identity(workspace, 1);
-    first.title = "primary";
-    first.state_token = "primary-state";
+    auto first = make_document_record(
+        workspace, 1, 1, "primary", "primary-state");
+    first.title.append("\xE2\x82\xAC", 3);
+    first.local_state.cursor = {true, 0x401011U};
+    first.local_state.selection = make_address_selection(0x401010U, 24);
+    first.pinned = true;
+    first.closeable = false;
 
-    document_persistence_dto_t second;
-    second.id = {2};
-    second.identity = make_identity(workspace, 2);
-    second.title = "secondary";
-    second.state_token = "secondary-state";
+    auto second = make_document_record(
+        workspace, 2, 2, "secondary", "secondary-state");
+    second.local_state.cursor = {true, 0x402022U};
+    second.local_state.selection.kind = selection_kind_t::entity;
+    second.local_state.selection.entity_key = "function:secondary";
 
     dto.documents = {first, second};
     dto.active_document = first.id;
@@ -84,6 +133,9 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
     second_view.workspace = workspace;
     second_view.document = second.id;
     second_view.role = view_role_t::secondary;
+    second_view.synchronization_group = 71;
+    second_view.synchronization_policy =
+        view_synchronization_policy_t::cursor_and_selection;
 
     dto.views = {first_view, second_view};
 
@@ -100,8 +152,8 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
     split_node_dto_t root;
     root.id = {103};
     root.kind = split_node_kind_t::branch;
-    root.orientation = split_orientation_t::horizontal;
-    root.ratio_basis_points = k_split_ratio_default_basis_points;
+    root.orientation = split_orientation_t::vertical;
+    root.ratio_basis_points = 6200;
     root.first = first_leaf.id;
     root.second = second_leaf.id;
 
@@ -115,8 +167,132 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
     panel.extent_pixels = dto.layout.navigator_pixels;
     panel.revision = dto.revision;
     panel.selected_document = first.id;
-    dto.panels = {panel};
+    panel.pinned = true;
+    panel.state_token = "navigator:expanded=imports";
+
+    panel_state_dto_t inspector;
+    inspector.id = {402};
+    inspector.workspace = workspace;
+    inspector.kind = panel_kind_t::inspector;
+    inspector.visible = false;
+    inspector.extent_pixels = dto.layout.inspector_pixels;
+    inspector.selected_document = second.id;
+    inspector.state_token = "inspector:tab=types";
+    inspector.revision = dto.revision;
+    dto.panels = {panel, inspector};
+
+    dto.history.capacity = 8;
+    dto.history.back.push_back(make_navigation_event(
+        workspace, {501}, 1001, first.id, first_view.id,
+        second.identity, 0x401010U, 0x402020U));
+    auto forward = make_navigation_event(
+        workspace, {502}, 1002, second.id, second_view.id,
+        first.identity, 0x402020U, 0x401030U);
+    forward.source.synchronization_group = second_view.synchronization_group;
+    forward.source.synchronization_policy = second_view.synchronization_policy;
+    forward.origin = navigation_origin_t::adapter;
+    forward.request_focus = false;
+    dto.history.forward.push_back(std::move(forward));
     return dto;
+}
+
+std::filesystem::path unique_fixture_path(const char* suffix)
+{
+    std::error_code error;
+    auto root = std::filesystem::temp_directory_path(error);
+    require(!error, "adapter: temporary directory lookup failed");
+    root /= "AiDA";
+    root /= "workbench_persistence_v9";
+    std::filesystem::create_directories(root, error);
+    require(!error, "adapter: temporary directory creation failed");
+    static std::atomic<std::uint64_t> counter{1};
+    const auto serial = counter.fetch_add(1, std::memory_order_relaxed);
+    return root / ("workbench_" + std::to_string(serial) + suffix);
+}
+
+void remove_database_files(const std::string& path) noexcept
+{
+    std::error_code error;
+    std::filesystem::remove(std::filesystem::u8path(path), error);
+    error.clear();
+    std::filesystem::remove(std::filesystem::u8path(path + "-wal"), error);
+    error.clear();
+    std::filesystem::remove(std::filesystem::u8path(path + "-shm"), error);
+}
+
+struct database_fixture_t final {
+    std::shared_ptr<analysis::workspace_database_t> database;
+    std::string database_path;
+    std::filesystem::path source_path;
+
+    ~database_fixture_t()
+    {
+        close();
+    }
+
+    void close() noexcept
+    {
+        if (database) {
+            database->request_cancel();
+            static_cast<void>(database->drain(
+                std::chrono::steady_clock::now() + std::chrono::seconds(10)));
+            database.reset();
+        }
+        if (!database_path.empty()) {
+            remove_database_files(database_path);
+            database_path.clear();
+        }
+        if (!source_path.empty()) {
+            std::error_code error;
+            std::filesystem::remove(source_path, error);
+            source_path.clear();
+        }
+    }
+};
+
+void open_database_fixture(database_fixture_t& fixture)
+{
+    fixture.source_path = unique_fixture_path(".bin");
+    {
+        std::ofstream source(fixture.source_path,
+                             std::ios::binary | std::ios::trunc);
+        require(source.good(), "adapter: source fixture open failed");
+        const std::string bytes = "AiDA workbench persistence schema v9";
+        source.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        require(source.good(), "adapter: source fixture write failed");
+    }
+
+    const auto source_utf8 = fixture.source_path.u8string();
+    auto content_hash = analysis::sha256_text("content:" + source_utf8);
+    auto profile_hash = analysis::sha256_text("profile:" + source_utf8);
+    require(content_hash.has_value() && profile_hash.has_value(),
+            "adapter: identity hash creation failed");
+
+    analysis::workspace_identity_input_t identity_input;
+    identity_input.bin_name = fixture.source_path.filename().u8string();
+    identity_input.source_path = source_utf8;
+    identity_input.content_hash = content_hash.take_value();
+    identity_input.load_profile_hash = profile_hash.take_value();
+    identity_input.target_kind = analysis::target_kind_t::static_file;
+    identity_input.format = analysis::format_id_t::pe32_plus;
+    identity_input.architecture = analysis::architecture_id_t::x86_64;
+    identity_input.architecture_mode = analysis::architecture_mode_t::x86_64;
+    identity_input.abi = analysis::abi_id_t::windows_x64;
+    identity_input.endian = analysis::endian_t::little;
+    identity_input.image_base = 0x140000000ULL;
+    auto identity = analysis::make_workspace_identity(std::move(identity_input));
+    require(identity.has_value(), "adapter: workspace identity creation failed");
+
+    analysis::workspace_database_options_t options;
+    options.identity = identity.take_value();
+    options.versions.engine_version = "workbench-persistence-harness";
+    options.versions.specification_version = "schema-v9";
+    options.versions.analysis_settings_hash = "workbench-persistence-settings";
+    options.candidate_operation_timeout_ms = 10000;
+    auto opened = analysis::workspace_database_t::open(std::move(options));
+    require(opened.has_value(), "adapter: workspace database open failed");
+    fixture.database = opened.take_value();
+    fixture.database_path = fixture.database->path();
 }
 
 std::string make_v8_payload(workspace_id_t workspace)
@@ -170,6 +346,10 @@ void verify_golden_round_trips()
 {
     const workspace_id_t workspace{5001};
     auto dto = make_workspace(workspace);
+    require(dto.validate().ok(), "golden: DTO member validation must succeed");
+    const auto member_fingerprint = dto.fingerprint();
+    require(member_fingerprint.value != 0,
+            "golden: DTO member fingerprint must be non-zero");
 
     std::string encoded;
     auto encode_result = workbench_persistence_codec_t::encode(dto, encoded);
@@ -187,11 +367,15 @@ void verify_golden_round_trips()
             "golden: decode fingerprint must be non-zero");
     require(decode_result.fingerprint == encode_result.fingerprint,
             "golden: encode and decode fingerprints must match");
+    require(member_fingerprint == encode_result.fingerprint,
+            "golden: DTO member fingerprint must match encoded fingerprint");
     require(decode_result.decoded_schema == k_persistence_codec_schema_v9,
             "golden: decode schema must be v9");
 
     require(persistence_dto_equal(dto, decoded),
             "golden: DTOs must be equal after round trip");
+    require(dto.equivalent(decoded),
+            "golden: DTO member equivalence must survive round trip");
     require(decoded.workspace == workspace, "golden: workspace must match");
     require(decoded.revision == dto.revision, "golden: revision must match");
     require(decoded.documents.size() == dto.documents.size(),
@@ -202,6 +386,27 @@ void verify_golden_round_trips()
             "golden: panel count must match");
     require(decoded.split_tree.nodes.size() == dto.split_tree.nodes.size(),
             "golden: split tree node count must match");
+    require(decoded.documents.front().local_state.cursor.has_position &&
+                decoded.documents.front().local_state.selection.extent == 24,
+            "golden: document local state must survive round trip");
+    require(decoded.panels.size() == 2 && !decoded.panels.back().visible &&
+                decoded.panels.back().state_token == "inspector:tab=types",
+            "golden: complete panel state must survive round trip");
+    require(decoded.history.back.size() == 1 &&
+                decoded.history.forward.size() == 1 &&
+                decoded.history.back.front().target.selection.extent == 16 &&
+                decoded.history.forward.front().source.synchronization_group == 71 &&
+                !decoded.history.forward.front().request_focus,
+            "golden: navigation history must survive round trip");
+
+    auto member_normalized = dto;
+    std::reverse(member_normalized.documents.begin(),
+                 member_normalized.documents.end());
+    std::reverse(member_normalized.views.begin(), member_normalized.views.end());
+    require(member_normalized.normalize().ok(),
+            "golden: DTO member normalization must succeed");
+    require(member_normalized.equivalent(dto),
+            "golden: member normalization must preserve DTO equivalence");
 
     persistence_fingerprint_t rt_encode_fp;
     persistence_fingerprint_t rt_decode_fp;
@@ -217,7 +422,6 @@ void verify_golden_round_trips()
     std::string encoded2;
     require(workbench_persistence_codec_t::encode(dto2, encoded2).ok(),
             "golden: second workspace encode must succeed");
-    persistence_fingerprint_t fp2;
     workbench_persistence_dto_t decoded2;
     require(workbench_persistence_codec_t::decode(
                 encoded2, {5002}, decoded2, {}).ok(),
@@ -226,6 +430,106 @@ void verify_golden_round_trips()
             "golden: second workspace must be isolated from first");
     require(persistence_dto_equal(dto2, decoded2),
             "golden: second workspace round trip must be equal");
+}
+
+void verify_untrusted_collection_bounds()
+{
+    const workspace_id_t workspace{5025};
+    auto dto = make_workspace(workspace);
+    std::string encoded;
+    require(workbench_persistence_codec_t::encode(dto, encoded).ok(),
+            "bounds: source DTO must encode");
+
+    const auto source = json::parse(encoded.begin(), encoded.end(), nullptr, false);
+    require(!source.is_discarded(), "bounds: source envelope must parse");
+    const auto decode_fixture = [&](json envelope,
+                                    persistence_codec_code_t expected_code,
+                                    const char* message) {
+        workbench_persistence_dto_t decoded;
+        const auto payload = envelope.dump();
+        const auto result = workbench_persistence_codec_t::decode(
+            payload, workspace, decoded);
+        require(result.code == expected_code, message);
+    };
+
+    auto excessive_documents = source;
+    excessive_documents["payload"]["documents"] = json::array();
+    for (std::size_t index = 0;
+         index <= static_cast<std::size_t>(k_max_documents_per_workspace);
+         ++index)
+        excessive_documents["payload"]["documents"].push_back(json::object());
+    decode_fixture(std::move(excessive_documents),
+                   persistence_codec_code_t::corrupt_payload,
+                   "bounds: document count must be rejected before reserve");
+
+    auto excessive_views = source;
+    excessive_views["payload"]["views"] = json::array();
+    for (std::size_t index = 0;
+         index <= static_cast<std::size_t>(k_max_views_per_workspace);
+         ++index)
+        excessive_views["payload"]["views"].push_back(json::object());
+    decode_fixture(std::move(excessive_views),
+                   persistence_codec_code_t::corrupt_payload,
+                   "bounds: view count must be rejected before reserve");
+
+    auto excessive_panels = source;
+    excessive_panels["payload"]["panels"] = json::array();
+    for (std::size_t index = 0;
+         index <= static_cast<std::size_t>(k_max_panels_per_workspace);
+         ++index)
+        excessive_panels["payload"]["panels"].push_back(json::object());
+    decode_fixture(std::move(excessive_panels),
+                   persistence_codec_code_t::corrupt_payload,
+                   "bounds: panel count must be rejected before reserve");
+
+    auto excessive_split_nodes = source;
+    excessive_split_nodes["payload"]["split_tree"]["nodes"] = json::array();
+    for (std::size_t index = 0;
+         index <= static_cast<std::size_t>(k_max_split_nodes_per_workspace);
+         ++index) {
+        excessive_split_nodes["payload"]["split_tree"]["nodes"].push_back(
+            json::object());
+    }
+    decode_fixture(std::move(excessive_split_nodes),
+                   persistence_codec_code_t::oversized_payload,
+                   "bounds: split-node count must be rejected before reserve");
+
+    auto excessive_aggregate = source;
+    for (const char* field : {"array_budget_a", "array_budget_b",
+                              "array_budget_c"}) {
+        excessive_aggregate[field] = json::array();
+        for (std::size_t index = 0;
+             index < static_cast<std::size_t>(k_max_split_nodes_per_workspace);
+             ++index)
+            excessive_aggregate[field].push_back(0);
+    }
+    decode_fixture(std::move(excessive_aggregate),
+                   persistence_codec_code_t::oversized_payload,
+                   "bounds: aggregate collection count must be rejected before DOM allocation");
+
+    auto excessive_history = source;
+    excessive_history["payload"]["history"]["capacity"] =
+        std::to_string(k_max_history_capacity);
+    excessive_history["payload"]["history"]["back"] = json::array();
+    excessive_history["payload"]["history"]["forward"] = json::array();
+    for (std::size_t index = 0;
+         index <= static_cast<std::size_t>(k_max_history_capacity);
+         ++index) {
+        excessive_history["payload"]["history"]["back"].push_back(
+            json::object());
+    }
+    decode_fixture(std::move(excessive_history),
+                   persistence_codec_code_t::corrupt_payload,
+                   "bounds: history count must be rejected before reserve");
+
+    persistence_codec_limits_t inflated_limits;
+    inflated_limits.max_serialized_bytes =
+        k_persistence_codec_max_serialized_bytes + 1U;
+    workbench_persistence_dto_t decoded;
+    auto inflated_result = workbench_persistence_codec_t::decode(
+        encoded, workspace, decoded, inflated_limits);
+    require(inflated_result.code == persistence_codec_code_t::oversized_payload,
+            "bounds: caller must not raise hard serialized-byte limit");
 }
 
 void verify_corrupt_and_oversized_payloads()
@@ -241,6 +545,9 @@ void verify_corrupt_and_oversized_payloads()
     require(workbench_persistence_codec_t::is_corrupt(
                 "{\"schema\":7,\"payload\":{}}"),
             "corrupt: wrong schema must be corrupt");
+    require(workbench_persistence_codec_t::is_corrupt(
+                "{\"schema\":4294967305,\"payload\":{}}"),
+            "corrupt: narrowing-equivalent schema must be corrupt");
     require(workbench_persistence_codec_t::is_corrupt(
                 "{\"schema\":\"9\",\"payload\":{}}"),
             "corrupt: non-numeric schema must be corrupt");
@@ -293,6 +600,23 @@ void verify_corrupt_and_oversized_payloads()
         {5020}, decoded);
     require(wrong_schema_result.code == persistence_codec_code_t::schema_mismatch,
             "corrupt: decode must reject wrong schema");
+
+    auto narrowing_schema_result = workbench_persistence_codec_t::decode(
+        "{\"schema\":4294967305,\"kind\":\"workbench_persistence_v9\",\"payload\":{}}",
+        {5020}, decoded);
+    require(narrowing_schema_result.code ==
+                persistence_codec_code_t::schema_mismatch,
+            "corrupt: decode must reject narrowing-equivalent schema");
+
+    auto oversized_ordinal = json::parse(
+        encoded.begin(), encoded.end(), nullptr, false);
+    oversized_ordinal["payload"]["documents"][0]["identity"]["kind"] = 271;
+    auto oversized_ordinal_payload = oversized_ordinal.dump();
+    auto oversized_ordinal_result = workbench_persistence_codec_t::decode(
+        oversized_ordinal_payload, {5020}, decoded);
+    require(oversized_ordinal_result.code ==
+                persistence_codec_code_t::corrupt_payload,
+            "corrupt: decode must reject narrowing-equivalent enum ordinal");
 
     auto wrong_kind_result = workbench_persistence_codec_t::decode(
         "{\"schema\":9,\"kind\":\"wrong_kind\",\"payload\":{}}",
@@ -793,6 +1117,70 @@ void verify_envelope_peeking_and_edge_cases()
             "edge: maximum revision mismatch must be detected");
 }
 
+void verify_database_adapter_queue_and_close()
+{
+    infra::taskflow_runtime::initialize();
+    database_fixture_t fixture;
+    open_database_fixture(fixture);
+
+    const workspace_id_t workspace{5100};
+    workspace_database_workbench_persistence_adapter_t adapter(
+        fixture.database, workspace);
+    workbench_persistence_dto_t missing;
+    auto missing_result = adapter.load(workspace, missing);
+    require(missing_result.code == workbench_error_code_t::adapter_rejected,
+            "adapter: empty database load must be rejected");
+
+    auto first = make_workspace(workspace);
+    require(adapter.store(first).ok(),
+            "adapter: queued first revision store must succeed");
+    workbench_persistence_dto_t loaded_first;
+    require(adapter.load(workspace, loaded_first).ok(),
+            "adapter: first revision load must succeed");
+    require(first.equivalent(loaded_first),
+            "adapter: first revision must retain complete DTO state");
+    require(first.fingerprint() == loaded_first.fingerprint(),
+            "adapter: first revision fingerprint must survive storage");
+
+    auto second = first;
+    second.revision = {2};
+    second.documents.front().state_token = "primary-state-revision-2";
+    second.documents.back().local_state.cursor = {true, 0x402099U};
+    second.panels.back().visible = true;
+    second.panels.back().state_token = "inspector:tab=decompiler";
+    for (auto& panel : second.panels)
+        panel.revision = second.revision;
+    require(second.validate().ok(),
+            "adapter: second revision DTO must validate");
+    require(adapter.store(second).ok(),
+            "adapter: queued second revision store must succeed");
+
+    workbench_persistence_dto_t loaded_second;
+    require(adapter.load(workspace, loaded_second).ok(),
+            "adapter: second revision load must succeed");
+    require(second.equivalent(loaded_second),
+            "adapter: split, document, panel, and history DTO state must persist");
+    require(loaded_second.revision == workspace_revision_t{2},
+            "adapter: second revision must replace first revision atomically");
+
+    auto stale = first;
+    auto stale_result = adapter.store(stale);
+    require(stale_result.code == workbench_error_code_t::revision_mismatch,
+            "adapter: stale queued revision must be rejected");
+
+    workbench_persistence_dto_t wrong_workspace;
+    auto isolation_result = adapter.load({5101}, wrong_workspace);
+    require(isolation_result.code == workbench_error_code_t::workspace_mismatch,
+            "adapter: cross-workspace load must be rejected");
+
+    fixture.database->request_cancel();
+    workbench_persistence_dto_t after_close;
+    auto closed_result = adapter.load(workspace, after_close);
+    require(closed_result.code == workbench_error_code_t::adapter_rejected,
+            "adapter: closed database must reject new reads");
+    fixture.close();
+}
+
 }
 
 bool run_workbench_persistence_harness(std::string& failure)
@@ -800,12 +1188,14 @@ bool run_workbench_persistence_harness(std::string& failure)
     try {
         verify_golden_round_trips();
         verify_corrupt_and_oversized_payloads();
+        verify_untrusted_collection_bounds();
         verify_v8_default_creation();
         verify_deterministic_normalization();
         verify_workspace_isolation();
         verify_unknown_document_recovery();
         verify_workspace_revision_conflicts();
         verify_envelope_peeking_and_edge_cases();
+        verify_database_adapter_queue_and_close();
         failure.clear();
         return true;
     } catch (const std::exception& exception) {

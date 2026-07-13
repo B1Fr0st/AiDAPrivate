@@ -2,6 +2,9 @@
 
 #include "workspace_schema_v9.hpp"
 #include "packed_page_codec.hpp"
+#include "workspace_database.hpp"
+#include "workspace_identity.hpp"
+#include "../../src/core/infra/taskflow_runtime.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -9,18 +12,22 @@
 
 #include <sqlite3.h>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
+#include <memory>
 #include <numeric>
-#include <random>
 #include <sstream>
 #include <string>
+#include <system_error>
+#include <unordered_set>
+#include <utility>
 
 namespace aida::analysis {
 
@@ -46,29 +53,10 @@ public:
 
     sqlite3_stmt* get() const noexcept { return stmt_; }
 
-    bool bind_int(int index, std::int64_t value) {
-        return sqlite3_bind_int64(stmt_, index, value) == SQLITE_OK;
-    }
-
-    bool bind_uint(int index, std::uint64_t value) {
-        std::int64_t encoded = 0;
-        std::memcpy(&encoded, &value, sizeof(encoded));
-        return bind_int(index, encoded);
-    }
-
     bool bind_text(int index, const std::string& value) {
         return sqlite3_bind_text(stmt_, index, value.data(),
                                  static_cast<int>(value.size()),
                                  SQLITE_TRANSIENT) == SQLITE_OK;
-    }
-
-    bool bind_blob(int index, const void* data, std::size_t size) {
-        return sqlite3_bind_blob(stmt_, index, data,
-                                 static_cast<int>(size), SQLITE_TRANSIENT) == SQLITE_OK;
-    }
-
-    bool step_done() {
-        return sqlite3_step(stmt_) == SQLITE_DONE;
     }
 
     int step_row() {
@@ -124,10 +112,25 @@ bool index_exists(sqlite3* db, const char* index_name) {
     return stmt.step_row() == SQLITE_ROW;
 }
 
+std::uint32_t user_version(sqlite3* db) {
+    harness_statement_t stmt;
+    if (!stmt.prepare(db, "PRAGMA user_version") || stmt.step_row() != SQLITE_ROW)
+        return (std::numeric_limits<std::uint32_t>::max)();
+    return static_cast<std::uint32_t>(sqlite3_column_int64(stmt.get(), 0));
+}
+
+int deny_user_version_write(void*, int action, const char* name,
+                            const char* value, const char*, const char*) {
+    if (action == SQLITE_PRAGMA && name && value &&
+        std::strcmp(name, "user_version") == 0)
+        return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
 bool create_v8_schema(sqlite3* db) {
     if (!exec_sql(db, R"SQL(
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),binary_id BLOB NOT NULL UNIQUE,bin_name TEXT NOT NULL,source_path TEXT NOT NULL,member_path TEXT,content_hash BLOB NOT NULL,load_profile_hash BLOB NOT NULL,target_kind INTEGER NOT NULL,format INTEGER NOT NULL,architecture INTEGER NOT NULL,abi INTEGER NOT NULL,endian INTEGER NOT NULL,image_base INTEGER NOT NULL,process_pid INTEGER,process_creation INTEGER,process_path TEXT,module_base INTEGER,module_size INTEGER,module_name TEXT,module_path TEXT,module_hash BLOB);
+CREATE TABLE IF NOT EXISTS workspace_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),binary_id BLOB NOT NULL UNIQUE,bin_name TEXT NOT NULL,source_path TEXT NOT NULL,member_path TEXT,content_hash BLOB NOT NULL,load_profile_hash BLOB NOT NULL,target_kind INTEGER NOT NULL,format INTEGER NOT NULL,architecture INTEGER NOT NULL,architecture_mode INTEGER NOT NULL DEFAULT 0,abi INTEGER NOT NULL,endian INTEGER NOT NULL,image_base INTEGER NOT NULL,process_pid INTEGER,process_creation INTEGER,process_path TEXT,module_base INTEGER,module_size INTEGER,module_name TEXT,module_path TEXT,module_hash BLOB);
 CREATE TABLE IF NOT EXISTS analysis_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL,analysis_revision INTEGER NOT NULL,overlay_revision INTEGER NOT NULL,baseline_complete INTEGER NOT NULL,settings_json TEXT NOT NULL,metrics_json TEXT NOT NULL,updated_utc_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS segments(segment_id INTEGER PRIMARY KEY,name TEXT NOT NULL,virtual_address INTEGER NOT NULL,virtual_size INTEGER NOT NULL,raw_offset INTEGER NOT NULL,raw_size INTEGER NOT NULL,characteristics INTEGER NOT NULL,readable INTEGER NOT NULL,writable INTEGER NOT NULL,executable INTEGER NOT NULL,discardable INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS instruction_chunks(chunk_id INTEGER PRIMARY KEY,start_value INTEGER NOT NULL,end_value INTEGER NOT NULL,record_count INTEGER NOT NULL,blob_version INTEGER NOT NULL,payload BLOB NOT NULL);
@@ -212,6 +215,55 @@ std::uint64_t measure_us(Fn&& fn) {
         end - start).count());
 }
 
+workspace_result_t<packed_generation_publication_t> publication_from_batch(
+    const packed_page_batch_t& batch) {
+    auto warm_index = packed_page_codec_t::build_warm_open_index(batch);
+    if (!warm_index)
+        return workspace_result_t<packed_generation_publication_t>::failure(
+            warm_index.error());
+    packed_generation_publication_t publication;
+    publication.generation.generation = batch.generation;
+    publication.generation.analysis_revision = batch.analysis_revision;
+    publication.generation.overlay_revision = batch.overlay_revision;
+    publication.generation.total_payload_bytes = batch.checkpoint.total_payload_bytes;
+    publication.generation.total_records = batch.checkpoint.total_records;
+    publication.generation.batch_checksum = batch.checkpoint.batch_checksum;
+    publication.generation.created_utc_ms = batch.checkpoint.created_utc_ms;
+    publication.generation.committed = false;
+    const auto checkpoint = batch.checkpoint.encode();
+    publication.generation.payload_blob.assign(checkpoint.begin(), checkpoint.end());
+    std::unordered_set<std::uint16_t> domains;
+    publication.pages.reserve(batch.pages.size());
+    for (const auto& page : batch.pages) {
+        packed_page_row_t row;
+        row.generation = page.header.generation;
+        row.page_index = page.header.page_index;
+        row.page_count = page.header.page_count;
+        row.page_type = page.header.page_type;
+        row.payload_length = page.header.payload_length;
+        row.checksum = page.header.checksum;
+        row.payload = page.payload;
+        domains.insert(static_cast<std::uint16_t>(row.page_type));
+        publication.pages.push_back(std::move(row));
+    }
+    publication.generation.shard_count =
+        static_cast<std::uint16_t>(domains.size());
+    publication.index.reserve(warm_index.value().size());
+    for (const auto& entry : warm_index.value()) {
+        packed_page_index_row_t row;
+        row.generation = batch.generation;
+        row.domain = entry.domain;
+        row.ordinal_begin = entry.ordinal_begin;
+        row.count = entry.count;
+        row.page_index = entry.page_index;
+        row.address_value_min = entry.address_value_min;
+        row.address_value_max = entry.address_value_max;
+        publication.index.push_back(std::move(row));
+    }
+    return workspace_result_t<packed_generation_publication_t>::success(
+        std::move(publication));
+}
+
 }
 
 schema_v9_fixture_result_t run_golden_v8_migration() {
@@ -234,14 +286,48 @@ schema_v9_fixture_result_t run_golden_v8_migration() {
             result.message = "failed to create v8 schema";
             return;
         }
-        auto migrated = create_schema_v9(db);
+        if (!exec_sql(db, R"SQL(
+INSERT INTO workspace_identity(singleton,binary_id,bin_name,source_path,member_path,content_hash,load_profile_hash,target_kind,format,architecture,architecture_mode,abi,endian,image_base,process_pid,process_creation,process_path,module_base,module_size,module_name,module_path,module_hash)
+VALUES(1,zeroblob(32),'golden.bin','C:/golden.bin',NULL,zeroblob(32),zeroblob(32),1,1,2,3,1,0,4194304,NULL,NULL,NULL,NULL,8192,NULL,NULL,NULL);
+INSERT INTO analysis_state(singleton,generation,analysis_revision,overlay_revision,baseline_complete,settings_json,metrics_json,updated_utc_ms)
+VALUES(1,11,9,7,1,'{}','{}',1000);
+INSERT INTO overlay_state(singleton,revision,history_cursor,next_transaction_id,history_epoch,updated_utc_ms)
+VALUES(1,7,3,12,2,1001);
+INSERT INTO decompiler_cache(cache_key,binary_id,format,architecture,architecture_mode,abi,endian,engine_version,schema_version,specification_version,settings_hash,function_id,function_rva,function_content_hash,overlay_revision,generation,function_name,result_json,created_utc_ms,last_access_utc_ms,result_bytes,analysis_revision)
+VALUES('legacy-key',zeroblob(32),1,2,3,1,0,'engine',8,'spec','settings',5,4096,zeroblob(32),7,11,'f','{}',1002,1003,2,9);
+INSERT INTO data_candidates(entity_id,address_space,address_value,address_arch,address_mode,size,kind,target_space,target_value,target_arch,target_mode,provenance,confidence)
+VALUES(576460752303423489,1,4096,2,3,8,5,1,8192,2,3,4,91);
+INSERT INTO type_candidates(entity_id,address_space,address_value,address_arch,address_mode,kind,display_name,canonical_type,provenance,confidence,explicitly_unknown)
+VALUES(720575940379279361,1,4096,2,3,0,'legacy_type','void()',10,88,0),
+      (720575940379279362,1,8192,2,3,0,'legacy_export','int()',6,87,0);
+)SQL")) {
+            result.message = "failed to seed v8 backfill records";
+            return;
+        }
+        bool invalidate_derived_facts = false;
+        auto migrated = migrate_workspace_database_schema(
+            db, invalidate_derived_facts);
         if (!migrated) {
             result.message = std::string("v9 migration failed: ") + migrated.error().message;
             return;
         }
-        const std::array<const char*, 6> v9_tables = {
+        if (invalidate_derived_facts || user_version(db) != workspace_schema_v9_version) {
+            result.message = "v8->v9 migration did not atomically advance user_version";
+            return;
+        }
+        const std::array<const char*, 30> v9_tables = {
             "packed_generations", "packed_pages", "packed_page_index",
-            "workbench_state", "decompiler_cache_v9", "overlay_v9_state"
+            "workbench_state", "decompiler_cache_v9", "overlay_v9_state",
+            "call_graph_state", "call_graph_nodes", "call_sites",
+            "call_candidates", "call_graph_edges", "call_graph_conflicts",
+            "rich_data_candidates", "data_pointer_facts", "data_conflicts",
+            "symbol_type_candidates", "type_references", "metadata_conflicts",
+            "alternate_call_graph_state", "alternate_call_graph_nodes",
+            "alternate_call_sites", "alternate_call_candidates",
+            "alternate_call_graph_edges", "alternate_call_graph_conflicts",
+            "alternate_rich_data_candidates", "alternate_data_pointer_facts",
+            "alternate_data_conflicts", "alternate_symbol_type_candidates",
+            "alternate_type_references", "alternate_metadata_conflicts"
         };
         for (const char* table : v9_tables) {
             if (!table_exists(db, table)) {
@@ -261,8 +347,92 @@ schema_v9_fixture_result_t run_golden_v8_migration() {
                 return;
             }
         }
+        auto cache = read_decompiler_cache_v9(db, "legacy-key");
+        if (!cache || !cache.value() || cache.value()->analysis_revision != 9 ||
+            cache.value()->overlay_revision != 7 || cache.value()->generation != 11) {
+            result.message = "v8 decompiler cache row was not backfilled into schema v9";
+            return;
+        }
+        auto overlay = read_overlay_v9_state(db);
+        if (!overlay || !overlay.value() || overlay.value()->revision != 7 ||
+            overlay.value()->history_cursor != 3 ||
+            overlay.value()->next_transaction_id != 12 ||
+            overlay.value()->target_generation != 11 ||
+            overlay.value()->target_image_base != 4194304 ||
+            overlay.value()->target_image_size != 8192) {
+            result.message = "v8 overlay and target identity were not backfilled into schema v9";
+            return;
+        }
+        harness_statement_t rich_data;
+        if (!rich_data.prepare(db,
+                "SELECT target_value,provenance,confidence FROM rich_data_candidates WHERE entity_id=576460752303423489") ||
+            rich_data.step_row() != SQLITE_ROW ||
+            sqlite3_column_int64(rich_data.get(), 0) != 8192 ||
+            sqlite3_column_int(rich_data.get(), 1) != 4 ||
+            sqlite3_column_int(rich_data.get(), 2) != 91) {
+            result.message = "v8 data candidate was not backfilled into rich facts";
+            return;
+        }
+        harness_statement_t rich_type;
+        if (!rich_type.prepare(db,
+                "SELECT source_key,provenance,confidence FROM symbol_type_candidates WHERE entity_id=720575940379279361") ||
+            rich_type.step_row() != SQLITE_ROW) {
+            result.message = "v8 type candidate was not backfilled into rich facts";
+            return;
+        }
+        const auto* source_key = sqlite3_column_text(rich_type.get(), 0);
+        if (!source_key || std::strlen(reinterpret_cast<const char*>(source_key)) == 0 ||
+            sqlite3_column_int(rich_type.get(), 1) != 6 ||
+            sqlite3_column_int(rich_type.get(), 2) != 88) {
+            result.message = "v8 type-candidate provenance backfill is incomplete";
+            return;
+        }
+        harness_statement_t export_type;
+        if (!export_type.prepare(db,
+                "SELECT source_key,provenance,confidence FROM symbol_type_candidates WHERE entity_id=720575940379279362") ||
+            export_type.step_row() != SQLITE_ROW) {
+            result.message = "v8 export type candidate was not backfilled into rich facts";
+            return;
+        }
+        const auto* export_source_key = sqlite3_column_text(export_type.get(), 0);
+        if (!export_source_key ||
+            std::strlen(reinterpret_cast<const char*>(export_source_key)) == 0 ||
+            sqlite3_column_int(export_type.get(), 1) != 5 ||
+            sqlite3_column_int(export_type.get(), 2) != 87) {
+            result.message = "v8 export provenance backfill is incomplete";
+            return;
+        }
+        if (!exec_sql(db, R"SQL(
+DELETE FROM overlay_state;
+INSERT INTO overlay_state(singleton,revision,history_cursor,next_transaction_id,history_epoch,updated_utc_ms)
+VALUES(1,8,4,13,3,1004);
+UPDATE analysis_state SET generation=12 WHERE singleton=1;
+)SQL")) {
+            result.message = "failed to exercise legacy-to-v9 synchronization triggers";
+            return;
+        }
+        auto synchronized = read_overlay_v9_state(db);
+        if (!synchronized || !synchronized.value() ||
+            synchronized.value()->revision != 8 ||
+            synchronized.value()->history_cursor != 4 ||
+            synchronized.value()->next_transaction_id != 13 ||
+            synchronized.value()->history_epoch != 3 ||
+            synchronized.value()->target_generation != 12) {
+            result.message = "legacy overlay/analysis writes did not synchronize schema-v9 state";
+            return;
+        }
+        if (!exec_sql(db, "DELETE FROM analysis_state WHERE singleton=1")) {
+            result.message = "failed to exercise analysis-state deletion trigger";
+            return;
+        }
+        auto cleared_generation = read_overlay_v9_state(db);
+        if (!cleared_generation || !cleared_generation.value() ||
+            cleared_generation.value()->target_generation != 0) {
+            result.message = "analysis-state deletion left a stale v9 target generation";
+            return;
+        }
         result.passed = true;
-        result.message = "v8->v9 migration succeeded, all 6 tables and 7 indexes verified";
+        result.message = "v8->v9 migration, backfill, and legacy synchronization verified";
     };
     elapsed = measure_us(run);
     result.elapsed_us = elapsed;
@@ -288,22 +458,6 @@ schema_v9_fixture_result_t run_interrupted_commit() {
             result.message = "v9 migration failed";
             return;
         }
-        packed_generation_record_t gen;
-        gen.generation = 42;
-        gen.analysis_revision = 1;
-        gen.overlay_revision = 0;
-        gen.shard_count = 1;
-        gen.total_payload_bytes = 100;
-        gen.total_records = 1;
-        gen.batch_checksum = 0xDEADBEEF;
-        gen.created_utc_ms = 12345;
-        gen.committed = false;
-        gen.payload_blob = {0x01, 0x02, 0x03, 0x04};
-        auto gen_written = write_packed_generation(db, gen);
-        if (!gen_written) {
-            result.message = std::string("failed to write packed generation: ") + gen_written.error().message;
-            return;
-        }
         packed_page_encode_options_t options;
         options.generation = 42;
         options.analysis_revision = 1;
@@ -316,18 +470,27 @@ schema_v9_fixture_result_t run_interrupted_commit() {
             result.message = "failed to encode batch";
             return;
         }
-        for (const auto& page : batch.value().pages) {
-            packed_page_row_t row;
-            row.generation = page.header.generation;
-            row.page_index = page.header.page_index;
-            row.page_count = page.header.page_count;
-            row.page_type = page.header.page_type;
-            row.payload_length = page.header.payload_length;
-            row.checksum = page.header.checksum;
-            row.payload = page.payload;
-            auto written = write_packed_page(db, row);
+        auto publication = publication_from_batch(batch.value());
+        if (!publication) {
+            result.message = "failed to construct publication";
+            return;
+        }
+        auto written = write_packed_generation(db, publication.value().generation);
+        if (!written) {
+            result.message = "failed to stage generation";
+            return;
+        }
+        for (const auto& page : publication.value().pages) {
+            written = write_packed_page(db, page);
             if (!written) {
-                result.message = std::string("failed to write packed page: ") + written.error().message;
+                result.message = "failed to stage page";
+                return;
+            }
+        }
+        for (const auto& index : publication.value().index) {
+            written = write_packed_page_index(db, index);
+            if (!written) {
+                result.message = "failed to stage page index";
                 return;
             }
         }
@@ -337,45 +500,43 @@ schema_v9_fixture_result_t run_interrupted_commit() {
             result.message = "failed to reopen database";
             return;
         }
-        auto gen_read = read_packed_generation(db, 42);
-        if (!gen_read) {
-            result.message = std::string("failed to read packed generation: ") + gen_read.error().message;
+        auto committed_manifest = read_packed_generation(db, 42);
+        auto committed_pages = read_packed_pages(db, 42);
+        auto committed_index = read_packed_page_index(db, 42);
+        if (!committed_manifest || !committed_pages || !committed_index ||
+            committed_manifest.value() || !committed_pages.value().empty() ||
+            !committed_index.value().empty()) {
+            result.message = "read-committed path exposed an interrupted publication";
             return;
         }
-        if (!gen_read.value()) {
-            result.message = "packed generation not found after reopen";
-            return;
-        }
-        if (gen_read.value()->committed) {
-            result.message = "generation is marked committed but was never published";
-            return;
-        }
-        auto pages_read = read_packed_pages(db, 42);
-        if (!pages_read) {
-            result.message = std::string("failed to read packed pages: ") + pages_read.error().message;
-            return;
-        }
-        if (pages_read.value().size() != batch.value().pages.size()) {
-            result.message = "page count mismatch after reopen";
+        auto staged_manifest = read_packed_generation(db, 42, false);
+        auto staged_pages = read_packed_pages(db, 42, false);
+        auto staged_index = read_packed_page_index(db, 42, false);
+        if (!staged_manifest || !staged_manifest.value() ||
+            !staged_pages || staged_pages.value().size() != batch.value().pages.size() ||
+            !staged_index || staged_index.value().size() != batch.value().pages.size()) {
+            result.message = "diagnostic staging path did not preserve interrupted rows";
             return;
         }
         auto publish = publish_packed_generation(db, 42);
         if (!publish) {
-            result.message = std::string("failed to publish generation: ") + publish.error().message;
+            result.message = std::string("failed to validate and publish staged generation: ") +
+                             publish.error().message;
             return;
         }
-        auto gen_read2 = read_packed_generation(db, 42);
-        if (!gen_read2 || !gen_read2.value() || !gen_read2.value()->committed) {
-            result.message = "generation not committed after publish";
+        auto committed = read_packed_generation_publication(db, 42);
+        if (!committed || !committed.value() ||
+            !committed.value()->generation.committed ||
+            committed.value()->pages.size() != batch.value().pages.size()) {
+            result.message = "committed publication did not become atomically visible";
             return;
         }
-        auto publish2 = publish_packed_generation(db, 42);
-        if (publish2) {
+        if (publish_packed_generation(db, 42)) {
             result.message = "double publish should fail";
             return;
         }
         result.passed = true;
-        result.message = "interrupted commit recovered, uncommitted generation preserved and publish verified";
+        result.message = "interrupted staging stayed hidden and validated publish became visible";
     };
     result.elapsed_us = measure_us(run);
     if (db)
@@ -441,8 +602,71 @@ schema_v9_fixture_result_t run_corruption_detection() {
             result.message = "corrupted checkpoint passed batch verification";
             return;
         }
+        packed_page_checkpoint_t checkpoint;
+        checkpoint.batch_checksum = 0xAABBCCDDu;
+        checkpoint.total_records = 0x0102030405060708ull;
+        checkpoint.total_payload_bytes = 0x1112131415161718ull;
+        checkpoint.created_utc_ms = 0x2122232425262728ull;
+        auto checkpoint_page = packed_page_codec_t::encode_checkpoint_page(
+            7, 2, 1, checkpoint);
+        if (!checkpoint_page) {
+            result.message = "checkpoint page encoding failed";
+            return;
+        }
+        if (checkpoint_page.value().payload.size() != 28 ||
+            checkpoint_page.value().header.payload_length != 28) {
+            result.message = "checkpoint payload size is not the complete 28-byte encoding";
+            return;
+        }
+        auto decoded_checkpoint = packed_page_codec_t::decode_checkpoint_page(
+            checkpoint_page.value());
+        if (!decoded_checkpoint ||
+            decoded_checkpoint.value().batch_checksum != checkpoint.batch_checksum ||
+            decoded_checkpoint.value().total_records != checkpoint.total_records ||
+            decoded_checkpoint.value().total_payload_bytes != checkpoint.total_payload_bytes ||
+            decoded_checkpoint.value().created_utc_ms != checkpoint.created_utc_ms) {
+            result.message = "checkpoint page did not round-trip all fields";
+            return;
+        }
+        auto direct_truncated_checkpoint = packed_page_checkpoint_t::decode(
+            checkpoint_page.value().payload.data(), 27);
+        if (direct_truncated_checkpoint) {
+            result.message = "direct checkpoint decoder accepted a 27-byte payload";
+            return;
+        }
+        auto truncated_checkpoint = checkpoint_page.value();
+        truncated_checkpoint.payload.pop_back();
+        truncated_checkpoint.header.payload_length =
+            static_cast<std::uint32_t>(truncated_checkpoint.payload.size());
+        truncated_checkpoint.header.checksum = pages[0].header.checksum;
+        auto truncated_decoded = packed_page_codec_t::decode_checkpoint_page(
+            truncated_checkpoint);
+        if (truncated_decoded) {
+            result.message = "truncated checkpoint payload decoded successfully";
+            return;
+        }
+        packed_page_encode_options_t short_options;
+        short_options.generation = 8;
+        short_options.analysis_revision = 2;
+        short_options.overlay_revision = 1;
+        short_options.page_size = 128;
+        std::vector<std::uint8_t> short_payload{1, 2, 3, 4};
+        auto short_batch = packed_page_codec_t::encode_batch(
+            packed_page_type_t::strings, short_payload, short_options);
+        if (!short_batch) {
+            result.message = "failed to encode short payload batch";
+            return;
+        }
+        auto short_index = packed_page_codec_t::build_warm_open_index(
+            short_batch.value());
+        if (!short_index || short_index.value().empty() ||
+            short_index.value()[0].address_value_min != 0 ||
+            short_index.value()[0].address_value_max != 0) {
+            result.message = "short payload warm-open index read beyond fixed-width address data";
+            return;
+        }
         result.passed = true;
-        result.message = "payload, header, and checkpoint corruption all detected via CRC32C";
+        result.message = "payload, header, checkpoint, and short warm-index corruption cases were detected";
     };
     result.elapsed_us = measure_us(run);
     return result;
@@ -463,58 +687,40 @@ schema_v9_fixture_result_t run_rollback_after_failed_migration() {
             result.message = "failed to create v8 schema";
             return;
         }
-        if (!exec_sql(db, "BEGIN IMMEDIATE")) {
-            result.message = "failed to begin transaction";
+        if (sqlite3_set_authorizer(db, deny_user_version_write, nullptr) != SQLITE_OK) {
+            result.message = "failed to install migration failure hook";
             return;
         }
-        auto migrated = create_schema_v9(db);
+        bool invalidate_derived_facts = false;
+        auto denied = migrate_workspace_database_schema(
+            db, invalidate_derived_facts);
+        sqlite3_set_authorizer(db, nullptr, nullptr);
+        if (denied) {
+            result.message = "migration unexpectedly ignored denied user_version write";
+            return;
+        }
+        if (user_version(db) != 8 || table_exists(db, "packed_generations") ||
+            table_exists(db, "workbench_state") ||
+            !table_exists(db, "metadata") ||
+            !table_exists(db, "decompiler_cache")) {
+            result.message = "failed migration did not roll schema and user_version back to v8";
+            return;
+        }
+        auto migrated = migrate_workspace_database_schema(
+            db, invalidate_derived_facts);
         if (!migrated) {
-            exec_sql(db, "ROLLBACK");
-            result.message = std::string("v9 migration failed inside transaction: ") + migrated.error().message;
+            result.message = std::string("migration after rollback failed: ") +
+                             migrated.error().message;
             return;
         }
-        if (!exec_sql(db, "ROLLBACK")) {
-            result.message = "failed to rollback";
-            return;
-        }
-        if (table_exists(db, "packed_generations")) {
-            result.message = "packed_generations table exists after rollback";
-            return;
-        }
-        if (table_exists(db, "workbench_state")) {
-            result.message = "workbench_state table exists after rollback";
-            return;
-        }
-        if (!table_exists(db, "metadata")) {
-            result.message = "v8 table metadata missing after rollback";
-            return;
-        }
-        if (!table_exists(db, "decompiler_cache")) {
-            result.message = "v8 table decompiler_cache missing after rollback";
-            return;
-        }
-        exec_sql(db, "BEGIN IMMEDIATE");
-        auto migrated2 = create_schema_v9(db);
-        if (!migrated2) {
-            exec_sql(db, "ROLLBACK");
-            result.message = std::string("second v9 migration failed: ") + migrated2.error().message;
-            return;
-        }
-        if (!exec_sql(db, "COMMIT")) {
-            exec_sql(db, "ROLLBACK");
-            result.message = "failed to commit second migration";
-            return;
-        }
-        if (!table_exists(db, "packed_generations")) {
-            result.message = "packed_generations table missing after second migration";
-            return;
-        }
-        if (!table_exists(db, "workbench_state")) {
-            result.message = "workbench_state table missing after second migration";
+        if (user_version(db) != workspace_schema_v9_version ||
+            !table_exists(db, "packed_generations") ||
+            !table_exists(db, "workbench_state")) {
+            result.message = "clean retry did not commit schema v9";
             return;
         }
         result.passed = true;
-        result.message = "rollback preserves v8 schema, re-migration succeeds after rollback";
+        result.message = "denied version write rolled all v9 DDL back and clean retry committed";
     };
     result.elapsed_us = measure_us(run);
     if (db)
@@ -531,7 +737,7 @@ schema_v9_fixture_result_t run_fixed_width_address() {
         const std::array<address_t, 8> test_addresses = {{
             {address_space_id_t::file_offset, 0, architecture_id_t::x86, architecture_mode_t::x86_32},
             {address_space_id_t::relative_virtual, 0x1000, architecture_id_t::x86_64, architecture_mode_t::x86_64},
-            {address_space_id_t::virtual_address, 0x7FFE0000, architecture_id_t::arm, architecture_mode_t::arm_64},
+            {address_space_id_t::virtual_address, 0x7FFE0000, architecture_id_t::aarch64, architecture_mode_t::aarch64},
             {address_space_id_t::live_virtual, 0xFFFFFFFFFFFFFFFFULL, architecture_id_t::mips, architecture_mode_t::unknown},
             {address_space_id_t::relative_virtual, 0x180100000ULL, architecture_id_t::ppc, architecture_mode_t::unknown},
             {address_space_id_t::file_offset, 1, architecture_id_t::riscv, architecture_mode_t::unknown},
@@ -601,24 +807,26 @@ schema_v9_fixture_result_t run_concurrent_reader() {
             result.message = "v9 migration failed";
             return;
         }
-        packed_generation_record_t gen1;
-        gen1.generation = 10;
-        gen1.analysis_revision = 1;
-        gen1.overlay_revision = 0;
-        gen1.shard_count = 1;
-        gen1.total_payload_bytes = 50;
-        gen1.total_records = 1;
-        gen1.batch_checksum = 0x12345678;
-        gen1.created_utc_ms = 1000;
-        gen1.committed = true;
-        gen1.payload_blob = {0xAA, 0xBB, 0xCC};
-        auto w1 = write_packed_generation(writer, gen1);
-        if (!w1) {
-            result.message = std::string("failed to write gen1: ") + w1.error().message;
+        packed_page_encode_options_t options;
+        options.page_size = 256;
+        options.generation = 10;
+        options.analysis_revision = 1;
+        auto batch1 = packed_page_codec_t::encode_batch(
+            packed_page_type_t::instructions,
+            std::vector<std::uint8_t>(128, 0xAA), options);
+        if (!batch1) {
+            result.message = "failed to encode generation 10";
+            return;
+        }
+        auto publication1 = publication_from_batch(batch1.value());
+        if (!publication1 ||
+            !publish_packed_generation_atomic(writer, publication1.value())) {
+            result.message = "failed to publish generation 10";
             return;
         }
         if (sqlite3_open_v2(path.c_str(), &reader,
-            SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI, nullptr) != SQLITE_OK) {
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI,
+            nullptr) != SQLITE_OK) {
             result.message = "failed to open reader";
             return;
         }
@@ -626,43 +834,42 @@ schema_v9_fixture_result_t run_concurrent_reader() {
         exec_sql(reader, "BEGIN");
         auto read1 = read_packed_generation(reader, 10);
         if (!read1 || !read1.value()) {
-            result.message = std::string("reader cannot see gen1: ") +
-                             (read1 ? "nullopt" : read1.error().message);
+            result.message = "reader cannot see initial committed generation";
             return;
         }
-        packed_generation_record_t gen2;
-        gen2.generation = 11;
-        gen2.analysis_revision = 2;
-        gen2.overlay_revision = 1;
-        gen2.shard_count = 1;
-        gen2.total_payload_bytes = 60;
-        gen2.total_records = 1;
-        gen2.batch_checksum = 0x87654321;
-        gen2.created_utc_ms = 2000;
-        gen2.committed = true;
-        gen2.payload_blob = {0xDD, 0xEE, 0xFF};
-        auto w2 = write_packed_generation(writer, gen2);
-        if (!w2) {
-            result.message = std::string("failed to write gen2: ") + w2.error().message;
+        options.generation = 11;
+        options.analysis_revision = 2;
+        options.overlay_revision = 1;
+        auto batch2 = packed_page_codec_t::encode_batch(
+            packed_page_type_t::instructions,
+            std::vector<std::uint8_t>(128, 0xBB), options);
+        if (!batch2) {
+            result.message = "failed to encode generation 11";
+            return;
+        }
+        auto publication2 = publication_from_batch(batch2.value());
+        if (!publication2 ||
+            !publish_packed_generation_atomic(writer, publication2.value())) {
+            result.message = "failed to publish generation 11";
             return;
         }
         auto read2_inside = read_packed_generation(reader, 11);
-        if (read2_inside && read2_inside.value()) {
-            result.message = "reader sees gen2 inside snapshot transaction (WAL isolation broken)";
+        if (!read2_inside || read2_inside.value()) {
+            result.message = "reader snapshot observed a later committed generation";
             return;
         }
-        exec_sql(reader, "COMMIT");
+        if (!exec_sql(reader, "COMMIT")) {
+            result.message = "failed to close reader snapshot";
+            return;
+        }
         auto read2_after = read_packed_generation(reader, 11);
-        if (!read2_after || !read2_after.value()) {
-            result.message = "reader cannot see gen2 after commit";
-            return;
-        }
-        if (read2_after.value()->generation != 11) {
-            result.message = "gen2 generation mismatch";
+        if (!read2_after || !read2_after.value() ||
+            read2_after.value()->generation != 11) {
+            result.message = "reader cannot see generation 11 after snapshot commit";
             return;
         }
         result.passed = true;
-        result.message = "WAL snapshot isolation verified: reader sees gen1 only during writer's gen2 commit";
+        result.message = "WAL reader retained one committed snapshot and advanced after commit";
     };
     result.elapsed_us = measure_us(run);
     if (reader)
@@ -761,6 +968,21 @@ schema_v9_fixture_result_t run_cache_key_round_trip() {
             result.message = "binary_id mismatch";
             return;
         }
+        auto collision = record;
+        ++collision.function_id;
+        auto collision_write = write_decompiler_cache_v9(db, collision);
+        if (collision_write ||
+            collision_write.error().code != workspace_error_code_t::target_conflict) {
+            result.message = "canonical cache key accepted conflicting identity metadata";
+            return;
+        }
+        auto preserved = read_decompiler_cache_v9(db, record.cache_key);
+        if (!preserved || !preserved.value() ||
+            preserved.value()->function_id != record.function_id ||
+            preserved.value()->result_json != record.result_json) {
+            result.message = "cache identity collision modified the stored record";
+            return;
+        }
         auto empty_key = read_decompiler_cache_v9(db, "nonexistent_key");
         if (!empty_key || empty_key.value()) {
             result.message = "nonexistent cache key should return nullopt";
@@ -793,68 +1015,86 @@ schema_v9_fixture_result_t run_workbench_round_trip() {
             return;
         }
         workbench_state_record_t record;
-        record.has_selection = true;
-        record.selection = {address_space_id_t::relative_virtual, 0x401000,
-                            architecture_id_t::x86_64, architecture_mode_t::x86_64};
-        record.navigation_back_json = "[{\"space\":1,\"value\":4096},{\"space\":1,\"value\":8192}]";
-        record.navigation_forward_json = "[{\"space\":1,\"value\":2048}]";
-        record.bookmarks_json = "[{\"space\":1,\"value\":12288,\"label\":\"main\"},{\"space\":1,\"value\":16384,\"label\":\"entry\"}]";
-        record.layout_json = "{\"tabs\":[\"disasm\",\"graph\",\"strings\"],\"active\":\"disasm\"}";
-        record.active_tab = 2;
-        record.zoom_level = 150;
+        record.workspace_id = 17;
+        record.contract_schema_version = 2;
         record.revision = 42;
-        record.updated_utc_ms = 0;
+        record.fingerprint = 0x1020304050607080ULL;
+        record.payload_json =
+            R"JSON({"schema":9,"kind":"workbench_persistence_v9","payload":{"split_tree":{"nodes":[]},"documents":[{"id":"1"}],"panels":[{"id":"2"}],"history":{"back":[],"forward":[]}}})JSON";
         auto written = write_workbench_state(db, record);
         if (!written) {
-            result.message = std::string("failed to write workbench state: ") + written.error().message;
+            result.message = std::string("failed to write workbench DTO envelope: ") +
+                             written.error().message;
+            return;
+        }
+        if (!write_workbench_state(db, record)) {
+            result.message = "identical workbench revision was not idempotent";
             return;
         }
         auto read = read_workbench_state(db);
         if (!read || !read.value()) {
-            result.message = "failed to read workbench state";
+            result.message = "failed to read workbench DTO envelope";
             return;
         }
-        const auto& found = *read.value();
-        if (found.has_selection != record.has_selection ||
-            found.selection != record.selection ||
-            found.navigation_back_json != record.navigation_back_json ||
-            found.navigation_forward_json != record.navigation_forward_json ||
-            found.bookmarks_json != record.bookmarks_json ||
-            found.layout_json != record.layout_json ||
-            found.active_tab != record.active_tab ||
-            found.zoom_level != record.zoom_level ||
-            found.revision != record.revision) {
-            result.message = "workbench state field mismatch after round-trip";
+        if (read.value()->workspace_id != record.workspace_id ||
+            read.value()->contract_schema_version != record.contract_schema_version ||
+            read.value()->revision != record.revision ||
+            read.value()->fingerprint != record.fingerprint ||
+            read.value()->payload_json != record.payload_json) {
+            result.message = "workbench DTO metadata changed during storage";
             return;
         }
-        workbench_state_record_t update;
-        update.has_selection = false;
-        update.selection = {};
-        update.navigation_back_json = "[]";
-        update.navigation_forward_json = "[]";
-        update.bookmarks_json = "[]";
-        update.layout_json = "{}";
-        update.active_tab = 0;
-        update.zoom_level = 100;
+        auto conflicting = record;
+        conflicting.payload_json.push_back(' ');
+        conflicting.fingerprint ^= 1;
+        if (write_workbench_state(db, conflicting)) {
+            result.message = "same-revision workbench conflict was accepted";
+            return;
+        }
+        auto update = record;
         update.revision = 43;
-        update.updated_utc_ms = 0;
-        auto updated = write_workbench_state(db, update);
-        if (!updated) {
-            result.message = "failed to update workbench state";
+        update.fingerprint ^= 0x55;
+        update.payload_json = R"JSON({"schema":9,"kind":"workbench_persistence_v9","payload":{"split_tree":{"nodes":[{"id":"3"}]},"documents":[],"panels":[],"history":{"back":[],"forward":[]}}})JSON";
+        if (!write_workbench_state(db, update)) {
+            result.message = "higher-revision workbench update was rejected";
             return;
         }
         auto read2 = read_workbench_state(db);
-        if (!read2 || !read2.value()) {
-            result.message = "failed to read updated workbench state";
+        if (!read2 || !read2.value() || read2.value()->revision != 43 ||
+            read2.value()->fingerprint != update.fingerprint ||
+            read2.value()->payload_json != update.payload_json) {
+            result.message = "higher-revision workbench update was not durable";
             return;
         }
-        const auto& found2 = *read2.value();
-        if (found2.has_selection || found2.revision != 43) {
-            result.message = "workbench state update not applied";
+        auto high_revision = update;
+        high_revision.revision = 0x8000000000000000ULL;
+        high_revision.fingerprint ^= 0x100;
+        high_revision.payload_json.push_back(' ');
+        if (!write_workbench_state(db, high_revision)) {
+            result.message = "unsigned high-bit workbench revision was rejected";
+            return;
+        }
+        auto maximum_revision = high_revision;
+        maximum_revision.revision = (std::numeric_limits<std::uint64_t>::max)();
+        maximum_revision.fingerprint ^= 0x200;
+        maximum_revision.payload_json.push_back(' ');
+        if (!write_workbench_state(db, maximum_revision)) {
+            result.message = "maximum workbench revision was rejected";
+            return;
+        }
+        auto read_maximum = read_workbench_state(db);
+        if (!read_maximum || !read_maximum.value() ||
+            read_maximum.value()->revision != maximum_revision.revision ||
+            read_maximum.value()->payload_json != maximum_revision.payload_json) {
+            result.message = "maximum workbench revision did not round-trip";
+            return;
+        }
+        if (write_workbench_state(db, record)) {
+            result.message = "stale workbench revision was accepted";
             return;
         }
         result.passed = true;
-        result.message = "workbench state with selection, navigation, bookmarks, layout round-tripped and updated";
+        result.message = "canonical DTO envelope, idempotency, and revision conflicts verified";
     };
     result.elapsed_us = measure_us(run);
     if (db)
@@ -885,148 +1125,483 @@ schema_v9_fixture_result_t run_generation_atomicity() {
         options.overlay_revision = 3;
         options.page_size = 512;
         std::vector<std::pair<packed_page_type_t, std::vector<std::uint8_t>>> domains;
-        std::vector<std::uint8_t> instr_data(1024);
-        std::iota(instr_data.begin(), instr_data.end(), static_cast<std::uint8_t>(0));
-        domains.emplace_back(packed_page_type_t::instructions, instr_data);
-        std::vector<std::uint8_t> func_data(256, 0x77);
-        domains.emplace_back(packed_page_type_t::functions, func_data);
-        std::vector<std::uint8_t> edge_data(128, 0x33);
-        domains.emplace_back(packed_page_type_t::edges, edge_data);
+        std::vector<std::uint8_t> instruction_data(1024);
+        std::iota(instruction_data.begin(), instruction_data.end(),
+                  static_cast<std::uint8_t>(0));
+        domains.emplace_back(packed_page_type_t::instructions,
+                             std::move(instruction_data));
+        domains.emplace_back(packed_page_type_t::functions,
+                             std::vector<std::uint8_t>(256, 0x77));
+        domains.emplace_back(packed_page_type_t::edges,
+                             std::vector<std::uint8_t>(128, 0x33));
+        domains.emplace_back(packed_page_type_t::symbol_type_candidates,
+                             std::vector<std::uint8_t>(192, 0x55));
         auto batch = packed_page_codec_t::encode_multi_domain_batch(domains, options);
         if (!batch) {
-            result.message = std::string("failed to encode multi-domain batch: ") + batch.error().message;
+            result.message = std::string("failed to encode multi-domain batch: ") +
+                             batch.error().message;
             return;
         }
-        const auto total_pages = batch.value().pages.size();
-        if (total_pages < 4) {
-            result.message = "multi-domain batch has too few pages";
+        auto publication = publication_from_batch(batch.value());
+        if (!publication) {
+            result.message = "failed to construct multi-domain publication";
             return;
         }
-        if (!exec_sql(db, "BEGIN IMMEDIATE")) {
-            result.message = "failed to begin transaction";
+        std::size_t cancellation_checks = 0;
+        const auto cancellation_check = publication.value().pages.size() +
+            publication.value().index.size() + 4U;
+        auto cancelled = publish_packed_generation_atomic(
+            db, publication.value(), [&cancellation_checks, cancellation_check] {
+                ++cancellation_checks;
+                return cancellation_checks == cancellation_check;
+            });
+        if (cancelled ||
+            cancelled.error().code != workspace_error_code_t::cancelled) {
+            result.message = "bulk publication cancellation did not fail closed";
             return;
         }
-        packed_generation_record_t gen;
-        gen.generation = 99;
-        gen.analysis_revision = 5;
-        gen.overlay_revision = 3;
-        gen.shard_count = 3;
-        gen.total_payload_bytes = batch.value().checkpoint.total_payload_bytes;
-        gen.total_records = batch.value().checkpoint.total_records;
-        gen.batch_checksum = batch.value().checkpoint.batch_checksum;
-        gen.created_utc_ms = batch.value().checkpoint.created_utc_ms;
-        gen.committed = false;
-        std::vector<std::uint8_t> gen_blob;
-        for (const auto& page : batch.value().pages) {
-            const auto encoded = page.header.encode();
-            gen_blob.insert(gen_blob.end(), encoded.begin(), encoded.end());
-            gen_blob.insert(gen_blob.end(), page.payload.begin(), page.payload.end());
-        }
-        gen.payload_blob = std::move(gen_blob);
-        auto gen_written = write_packed_generation(db, gen);
-        if (!gen_written) {
-            exec_sql(db, "ROLLBACK");
-            result.message = std::string("failed to write generation: ") + gen_written.error().message;
+        auto cancelled_manifest = read_packed_generation(db, 99, false);
+        auto cancelled_pages = read_packed_pages(db, 99, false);
+        auto cancelled_index = read_packed_page_index(db, 99, false);
+        if (!cancelled_manifest || cancelled_manifest.value() ||
+            !cancelled_pages || !cancelled_pages.value().empty() ||
+            !cancelled_index || !cancelled_index.value().empty()) {
+            result.message = "cancelled bulk publication left partial rows";
             return;
         }
-        for (const auto& page : batch.value().pages) {
-            packed_page_row_t row;
-            row.generation = page.header.generation;
-            row.page_index = page.header.page_index;
-            row.page_count = page.header.page_count;
-            row.page_type = page.header.page_type;
-            row.payload_length = page.header.payload_length;
-            row.checksum = page.header.checksum;
-            row.payload = page.payload;
-            auto written = write_packed_page(db, row);
-            if (!written) {
-                exec_sql(db, "ROLLBACK");
-                result.message = std::string("failed to write page: ") + written.error().message;
-                return;
-            }
-        }
-        for (const auto& page : batch.value().pages) {
-            packed_page_index_row_t idx;
-            idx.generation = page.header.generation;
-            idx.domain = static_cast<std::uint16_t>(page.header.page_type);
-            idx.ordinal_begin = page.header.page_index * packed_page_default_size;
-            idx.count = page.header.payload_length;
-            idx.page_index = page.header.page_index;
-            if (page.payload.size() >= 16) {
-                idx.address_value_min = *reinterpret_cast<const std::uint64_t*>(page.payload.data());
-                idx.address_value_max = *reinterpret_cast<const std::uint64_t*>(page.payload.data() + page.payload.size() - 8);
-            }
-            auto idx_written = write_packed_page_index(db, idx);
-            if (!idx_written) {
-                exec_sql(db, "ROLLBACK");
-                result.message = std::string("failed to write page index: ") + idx_written.error().message;
-                return;
-            }
-        }
-        if (!exec_sql(db, "COMMIT")) {
-            exec_sql(db, "ROLLBACK");
-            result.message = "failed to commit atomic batch";
+        auto published = publish_packed_generation_atomic(db, publication.value());
+        if (!published) {
+            result.message = std::string("atomic bulk publication failed: ") +
+                             published.error().message;
             return;
         }
-        auto pages_read = read_packed_pages(db, 99);
-        if (!pages_read) {
-            result.message = std::string("failed to read pages: ") + pages_read.error().message;
+        auto visible = read_packed_generation_publication(db, 99);
+        if (!visible || !visible.value() ||
+            visible.value()->pages.size() != batch.value().pages.size() ||
+            visible.value()->index.size() != batch.value().pages.size() ||
+            visible.value()->generation.shard_count != domains.size()) {
+            result.message = "committed multi-domain publication is incomplete";
             return;
         }
-        if (pages_read.value().size() != total_pages) {
-            result.message = std::string("page count mismatch: expected ") +
-                             std::to_string(total_pages) + " got " +
-                             std::to_string(pages_read.value().size());
+        std::size_t checksum_cancellation_checks = 0;
+        auto checksum_cancelled = packed_page_codec_t::verify_page(
+            batch.value().pages.front(), [&checksum_cancellation_checks] {
+                ++checksum_cancellation_checks;
+                return checksum_cancellation_checks > 2;
+            });
+        if (checksum_cancelled ||
+            checksum_cancelled.error().code != workspace_error_code_t::cancelled) {
+            result.message = "packed checksum validation ignored cancellation";
             return;
         }
-        auto idx_read = read_packed_page_index(db, 99);
-        if (!idx_read) {
-            result.message = std::string("failed to read page index: ") + idx_read.error().message;
+        std::size_t read_cancellation_checks = 0;
+        auto read_cancelled = read_packed_pages(
+            db, 99, true, [&read_cancellation_checks] {
+                ++read_cancellation_checks;
+                return read_cancellation_checks > 2;
+            });
+        if (read_cancelled ||
+            read_cancelled.error().code != workspace_error_code_t::cancelled) {
+            result.message = "packed page read ignored cancellation";
             return;
         }
-        if (idx_read.value().size() != total_pages) {
-            result.message = std::string("index count mismatch: expected ") +
-                             std::to_string(total_pages) + " got " +
-                             std::to_string(idx_read.value().size());
+        if (write_packed_generation(db, publication.value().generation) ||
+            write_packed_page(db, publication.value().pages.front()) ||
+            write_packed_page_index(db, publication.value().index.front())) {
+            result.message = "committed generation accepted staged-row mutation";
             return;
         }
-        if (!exec_sql(db, "BEGIN IMMEDIATE")) {
-            result.message = "failed to begin rollback transaction";
+        auto rollback_committed = rollback_packed_generation(db, 99);
+        if (!rollback_committed) {
+            result.message = "committed generation rollback probe failed";
             return;
         }
-        auto rolled_back = rollback_packed_generation(db, 99);
-        if (!rolled_back) {
-            exec_sql(db, "ROLLBACK");
-            result.message = std::string("failed to rollback generation: ") + rolled_back.error().message;
-            return;
-        }
-        if (!exec_sql(db, "COMMIT")) {
-            exec_sql(db, "ROLLBACK");
-            result.message = "failed to commit rollback";
-            return;
-        }
-        auto pages_after_rollback = read_packed_pages(db, 99);
-        if (!pages_after_rollback) {
-            result.message = std::string("failed to read pages after rollback: ") + pages_after_rollback.error().message;
-            return;
-        }
-        if (!pages_after_rollback.value().empty()) {
-            result.message = "pages still exist after rollback";
-            return;
-        }
-        auto gen_after_rollback = read_packed_generation(db, 99);
-        if (gen_after_rollback && gen_after_rollback.value()) {
-            result.message = "generation still exists after rollback";
+        auto preserved = read_packed_generation_publication(db, 99);
+        if (!preserved || !preserved.value()) {
+            result.message = "rollback removed an already committed generation";
             return;
         }
         result.passed = true;
-        result.message = std::string("3-domain batch of ") + std::to_string(total_pages) +
-                         " pages written atomically, verified, and rolled back cleanly";
+        result.message = "bulk cancel rolled back fully and one committed generation became visible";
     };
     result.elapsed_us = measure_us(run);
     if (db)
         sqlite3_close_v2(db);
     cleanup_db(path);
+    return result;
+}
+
+schema_v9_fixture_result_t run_database_open_queue_path() {
+    schema_v9_fixture_result_t result;
+    result.name = "database_open_queue_path";
+    const auto source_path = temp_db_path("queue_source");
+    std::string database_path;
+    std::shared_ptr<workspace_database_t> database;
+
+    auto run = [&]() {
+        aida::infra::taskflow_runtime::initialize();
+        {
+            std::ofstream source(source_path, std::ios::binary | std::ios::trunc);
+            if (!source) {
+                result.message = "failed to create queue source fixture";
+                return;
+            }
+            const std::string bytes = "AiDA schema v9 queued publication";
+            source.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            if (!source) {
+                result.message = "failed to write queue source fixture";
+                return;
+            }
+        }
+
+        auto content_hash = sha256_text("content:" + source_path);
+        auto profile_hash = sha256_text("profile:" + source_path);
+        if (!content_hash || !profile_hash) {
+            result.message = "failed to hash queue workspace identity";
+            return;
+        }
+        workspace_identity_input_t identity_input;
+        identity_input.bin_name = "schema-v9-queue.bin";
+        identity_input.source_path = source_path;
+        identity_input.content_hash = content_hash.take_value();
+        identity_input.load_profile_hash = profile_hash.take_value();
+        identity_input.target_kind = target_kind_t::static_file;
+        identity_input.format = format_id_t::pe32_plus;
+        identity_input.architecture = architecture_id_t::x86_64;
+        identity_input.architecture_mode = architecture_mode_t::x86_64;
+        identity_input.abi = abi_id_t::windows_x64;
+        identity_input.endian = endian_t::little;
+        identity_input.image_base = 0x140000000ULL;
+        auto identity = make_workspace_identity(std::move(identity_input));
+        if (!identity) {
+            result.message = "failed to create queue workspace identity";
+            return;
+        }
+
+        const auto workspace_identity = identity.take_value();
+        workspace_database_options_t database_options;
+        database_options.identity = workspace_identity;
+        database_options.versions.engine_version = "schema-v9-harness";
+        database_options.versions.specification_version = "schema-v9";
+        database_options.versions.analysis_settings_hash = "queue-path-settings";
+        database_options.candidate_operation_timeout_ms = 10000;
+        auto opened = workspace_database_t::open(std::move(database_options));
+        if (!opened) {
+            result.message = std::string("workspace database open failed: ") +
+                opened.error().message;
+            return;
+        }
+        database = opened.take_value();
+        database_path = database->path();
+        const auto initial_snapshot = database->snapshot();
+        if (!initial_snapshot.open ||
+            initial_snapshot.schema_version != workspace_schema_v9_version) {
+            result.message = "opened workspace database did not expose schema v9";
+            return;
+        }
+
+        auto normalized = std::make_shared<workspace_image_t>();
+        normalized->format = format_id_t::pe32_plus;
+        normalized->architecture = architecture_id_t::x86_64;
+        normalized->architecture_mode = architecture_mode_t::x86_64;
+        normalized->abi = abi_id_t::windows_x64;
+        normalized->endian = endian_t::little;
+        normalized->address_width_bits = 64;
+        normalized->image_base = 0x140000000ULL;
+        normalized->image_size = 16384;
+        normalized->format_name = "PE32+";
+        normalized->workspace_binary_id = workspace_identity->binary_id();
+        normalized->provider_content_hash = workspace_identity->content_hash();
+        normalized->provider_source = source_path;
+        normalized->provider_size = std::filesystem::file_size(
+            std::filesystem::u8path(source_path));
+        normalized->provider_binding_verified = true;
+
+        auto snapshot = std::make_shared<analysis_snapshot_t>();
+        snapshot->binary_id = workspace_identity->binary_id();
+        snapshot->load_profile_hash = workspace_identity->load_profile_hash();
+        snapshot->generation = 5001;
+        snapshot->analysis_revision = 71;
+        snapshot->overlay_revision = 12;
+        snapshot->normalized_image = normalized;
+        const address_t instruction_address{address_space_id_t::relative_virtual,
+            4096, architecture_id_t::x86_64, architecture_mode_t::x86_64};
+
+        instruction_record_t instruction;
+        instruction.id = 0x5001;
+        instruction.address = instruction_address;
+        instruction.length = 1;
+        instruction.flow_flags = flow_call | flow_indirect;
+        instruction.coverage = coverage_reason_t::decoded;
+        instruction.provenance = fact_provenance_t::recursive_decode;
+        instruction.confidence = 95;
+        instruction.stable_source_id = 4096;
+        snapshot->instructions.push_back(instruction);
+
+        basic_block_record_t block;
+        block.id = 0x2001;
+        block.function_id = 0x3001;
+        block.start = instruction_address;
+        block.end = instruction_address;
+        block.end.value = 4097;
+        block.first_instruction = 0;
+        block.instruction_count = 1;
+        block.provenance = fact_provenance_t::recursive_decode;
+        block.confidence = 95;
+        snapshot->blocks.push_back(block);
+
+        function_record_t function;
+        function.id = block.function_id;
+        function.start = block.start;
+        function.end = block.end;
+        function.first_block = 0;
+        function.block_count = 1;
+        function.provenance = fact_provenance_t::recursive_decode;
+        function.confidence = 95;
+        snapshot->functions.push_back(function);
+
+        call_graph_node_record_t node;
+        node.function_id = function.id;
+        node.address = function.start;
+        node.outgoing_edges = 1;
+        node.indirect_edges = 1;
+        node.unresolved_sites = 1;
+        snapshot->call_graph.nodes.push_back(node);
+
+        recovered_call_site_t call_site;
+        call_site.id = 1080863910568919041ULL;
+        call_site.source_function_id = function.id;
+        call_site.source_block_id = block.id;
+        call_site.instruction_id = instruction.id;
+        call_site.address = instruction.address;
+        call_site.indirect = true;
+        call_site.unresolved = true;
+        snapshot->call_graph.call_sites.push_back(call_site);
+
+        call_graph_edge_record_t call_edge;
+        call_edge.id = 1224979098644774913ULL;
+        call_edge.call_site_id = call_site.id;
+        call_edge.source_function_id = function.id;
+        call_edge.source_block_id = block.id;
+        call_edge.call_site = call_site.address;
+        call_edge.target = instruction.address;
+        call_edge.target.value = 0;
+        call_edge.resolution = call_graph_resolution_t::unresolved;
+        call_edge.quality.provenance = fact_provenance_t::recursive_decode;
+        call_edge.quality.confidence = 80;
+        call_edge.quality.contributor_count = 1;
+        snapshot->call_graph.edges.push_back(call_edge);
+        snapshot->call_graph.indirect_site_count = 1;
+        snapshot->call_graph.unresolved_site_count = 1;
+        snapshot->call_graph.bounded = true;
+
+        data_candidate_record_t data_candidate;
+        data_candidate.id = 576460752303423489ULL;
+        data_candidate.address = instruction.address;
+        data_candidate.address.value = 4352;
+        data_candidate.size = 8;
+        data_candidate.kind = data_candidate_kind_t::in_image_pointer;
+        data_candidate.target = instruction.address;
+        data_candidate.target->value = 4608;
+        data_candidate.provenance = fact_provenance_t::relocation;
+        data_candidate.confidence = 92;
+        snapshot->rich_facts.data_candidates.push_back(data_candidate);
+
+        data_pointer_fact_t pointer;
+        pointer.id = 864691128455135233ULL;
+        pointer.slot = instruction.address;
+        pointer.slot.value = 4368;
+        pointer.target = instruction.address;
+        pointer.target.value = 4608;
+        pointer.candidate_kind = data_candidate_kind_t::in_image_pointer;
+        pointer.encoding = data_pointer_encoding_t::absolute_virtual;
+        pointer.width_bytes = 8;
+        pointer.provenance = fact_provenance_t::relocation;
+        pointer.confidence = 93;
+        snapshot->rich_facts.data_pointer_facts.push_back(pointer);
+
+        data_candidate_conflict_t data_conflict;
+        data_conflict.id = 936748722493063169ULL;
+        data_conflict.address = pointer.slot;
+        data_conflict.kind = data_candidate_kind_t::in_image_pointer;
+        data_conflict.selected_target = instruction.address;
+        data_conflict.selected_target->value = 4624;
+        data_conflict.rejected_target = instruction.address;
+        data_conflict.rejected_target->value = 4640;
+        data_conflict.selected_provenance = fact_provenance_t::relocation;
+        data_conflict.rejected_provenance = fact_provenance_t::linear_validation;
+        data_conflict.selected_confidence = 90;
+        data_conflict.rejected_confidence = 70;
+        snapshot->rich_facts.data_conflicts.push_back(data_conflict);
+
+        symbol_type_candidate_record_t type_candidate;
+        type_candidate.id = 720575940379279361ULL;
+        type_candidate.address = instruction.address;
+        type_candidate.kind = symbol_type_candidate_kind_t::function_prototype;
+        type_candidate.display_name = "queued_type";
+        type_candidate.canonical_type = "void()";
+        type_candidate.source_key = "schema-v9-harness:type";
+        type_candidate.provenance = metadata_provenance_t::debug_metadata;
+        type_candidate.confidence = 94;
+        type_candidate.explicitly_unknown = false;
+        snapshot->rich_facts.type_candidates.push_back(type_candidate);
+
+        type_reference_fact_t type_reference;
+        type_reference.id = 648518346341351425ULL;
+        type_reference.source = instruction.address;
+        type_reference.target = data_candidate.address;
+        type_reference.source_entity = type_candidate.id;
+        type_reference.kind = type_reference_kind_t::metadata_reference;
+        type_reference.provenance = metadata_provenance_t::debug_metadata;
+        type_reference.confidence = 89;
+        type_reference.source_key = "schema-v9-harness:reference";
+        snapshot->rich_facts.type_references.push_back(type_reference);
+
+        metadata_conflict_record_t metadata_conflict;
+        metadata_conflict.id = 1008806316530991105ULL;
+        metadata_conflict.address = instruction.address;
+        metadata_conflict.identity = "queued_type";
+        metadata_conflict.kind = metadata_conflict_kind_t::canonical_type;
+        metadata_conflict.selected_value = "void()";
+        metadata_conflict.rejected_value = "int()";
+        metadata_conflict.selected_provenance = metadata_provenance_t::debug_metadata;
+        metadata_conflict.rejected_provenance = metadata_provenance_t::decoded;
+        metadata_conflict.selected_confidence = 94;
+        metadata_conflict.rejected_confidence = 60;
+        snapshot->rich_facts.metadata_conflicts.push_back(metadata_conflict);
+
+        auto snapshot_ticket = database->persist_snapshot(snapshot, "{}", "{}");
+        if (!snapshot_ticket.accepted || !snapshot_ticket.completion.valid() ||
+            !snapshot_ticket.snapshot_candidate) {
+            result.message = "workspace queue rejected rich snapshot persistence";
+            return;
+        }
+        if (snapshot_ticket.completion.wait_for(std::chrono::seconds(10)) !=
+            std::future_status::ready) {
+            result.message = "queued rich snapshot persistence did not complete";
+            return;
+        }
+        try {
+            const auto& completion = snapshot_ticket.completion.get();
+            if (!completion) {
+                result.message = std::string("queued rich snapshot failed: ") +
+                    completion.error().message;
+                return;
+            }
+        } catch (const std::exception& exception) {
+            result.message = std::string("queued rich snapshot future failed: ") +
+                exception.what();
+            return;
+        }
+        auto finalized = snapshot_ticket.snapshot_candidate->finalize();
+        if (!finalized) {
+            result.message = std::string("rich snapshot promotion failed: ") +
+                finalized.error().message;
+            return;
+        }
+        auto reopened_snapshot = database->load_snapshot(normalized, {});
+        if (!reopened_snapshot || !reopened_snapshot.value() ||
+            reopened_snapshot.value()->call_graph.nodes.size() != 1 ||
+            reopened_snapshot.value()->call_graph.call_sites.size() != 1 ||
+            reopened_snapshot.value()->call_graph.edges.size() != 1 ||
+            reopened_snapshot.value()->call_graph.unresolved_site_count != 1 ||
+            reopened_snapshot.value()->rich_facts.data_candidates.size() != 1 ||
+            reopened_snapshot.value()->rich_facts.data_pointer_facts.size() != 1 ||
+            reopened_snapshot.value()->rich_facts.data_conflicts.size() != 1 ||
+            reopened_snapshot.value()->rich_facts.type_candidates.size() != 1 ||
+            reopened_snapshot.value()->rich_facts.type_references.size() != 1 ||
+            reopened_snapshot.value()->rich_facts.metadata_conflicts.size() != 1 ||
+            reopened_snapshot.value()->rich_facts.type_candidates.front().source_key !=
+                type_candidate.source_key) {
+            result.message = "production snapshot reopen lost call-graph or rich facts";
+            return;
+        }
+
+        constexpr std::size_t payload_capacity =
+            packed_page_default_size - packed_page_header_size;
+        std::vector<std::uint8_t> bytes(payload_capacity * 2U, 0xA5U);
+        for (std::size_t page = 0; page < 2; ++page) {
+            const auto offset = page * payload_capacity;
+            const std::uint64_t first_address = 0x1000U + page * 0x1000U;
+            const std::uint64_t last_address = first_address + 0xFF0U;
+            std::memcpy(bytes.data() + offset, &first_address,
+                        sizeof(first_address));
+            std::memcpy(bytes.data() + offset + payload_capacity -
+                            sizeof(last_address),
+                        &last_address, sizeof(last_address));
+        }
+        packed_page_encode_options_t encode_options;
+        encode_options.page_size = packed_page_default_size;
+        encode_options.generation = 7001;
+        encode_options.analysis_revision = 81;
+        encode_options.overlay_revision = 13;
+        auto batch = packed_page_codec_t::encode_batch(
+            packed_page_type_t::instructions, bytes, encode_options);
+        if (!batch) {
+            result.message = "failed to encode queued publication fixture";
+            return;
+        }
+        auto publication = publication_from_batch(batch.value());
+        if (!publication) {
+            result.message = "failed to construct queued publication fixture";
+            return;
+        }
+
+        auto ticket = database->publish_packed_generation(
+            publication.take_value());
+        if (!ticket.accepted || !ticket.completion.valid()) {
+            result.message = "workspace queue rejected packed publication";
+            return;
+        }
+        if (ticket.completion.wait_for(std::chrono::seconds(10)) !=
+            std::future_status::ready) {
+            result.message = "queued packed publication did not complete";
+            return;
+        }
+        try {
+            const auto& completion = ticket.completion.get();
+            if (!completion) {
+                result.message = std::string("queued packed publication failed: ") +
+                    completion.error().message;
+                return;
+            }
+        } catch (const std::exception& exception) {
+            result.message = std::string("queued publication future failed: ") +
+                exception.what();
+            return;
+        }
+
+        auto loaded = database->load_packed_generation(7001);
+        if (!loaded || !loaded.value() ||
+            loaded.value()->generation.generation != 7001 ||
+            !loaded.value()->generation.committed ||
+            loaded.value()->pages.size() != 2 ||
+            loaded.value()->index.size() != 2) {
+            result.message = "queued publication was not read as one committed generation";
+            return;
+        }
+
+        database->request_cancel();
+        auto closed_read = database->load_packed_generation(7001);
+        if (closed_read ||
+            closed_read.error().code != workspace_error_code_t::workspace_closing) {
+            result.message = "closed database accepted a new packed-generation read";
+            return;
+        }
+        result.passed = true;
+        result.message = "real open, queue publication, committed read, and close gate passed";
+    };
+
+    result.elapsed_us = measure_us(run);
+    if (database) {
+        database->request_cancel();
+        static_cast<void>(database->drain(
+            std::chrono::steady_clock::now() + std::chrono::seconds(10)));
+        database.reset();
+    }
+    if (!database_path.empty())
+        cleanup_db(database_path);
+    cleanup_db(source_path);
     return result;
 }
 
@@ -1042,6 +1617,7 @@ schema_v9_harness_summary_t run_all_schema_v9_fixtures() {
     results.push_back(run_cache_key_round_trip());
     results.push_back(run_workbench_round_trip());
     results.push_back(run_generation_atomicity());
+    results.push_back(run_database_open_queue_path());
     summary.total = results.size();
     for (const auto& r : results) {
         if (r.passed)

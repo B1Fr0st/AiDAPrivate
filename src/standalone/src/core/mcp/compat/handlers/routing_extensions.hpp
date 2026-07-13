@@ -9,9 +9,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace aida::standalone::mcp::compat::handlers {
@@ -44,14 +47,6 @@ struct routing_extension_limits_t final {
     std::size_t max_request_bytes = 1024U * 1024U;
     std::size_t max_response_bytes = 16U * 1024U * 1024U;
     std::size_t max_selector_bytes = 1024U;
-    std::size_t max_expression_bytes = 16384U;
-    std::size_t max_function_addresses = 256U;
-    std::size_t max_instruction_results = 5000U;
-    std::size_t max_address_bytes = 4096U;
-    std::size_t max_mnemonic_bytes = 64U;
-    std::size_t max_operand_pattern_bytes = 256U;
-    std::uint64_t max_offset = 10000000ULL;
-    std::uint64_t max_calculator_value = (std::numeric_limits<std::uint64_t>::max)();
     std::chrono::milliseconds max_execution_time{120000};
 };
 
@@ -75,19 +70,27 @@ struct routing_metadata_t final {
     extension_lane_t lane = extension_lane_t::registry_read;
 };
 
+struct routing_extension_workspace_handlers_t final {
+    adapter_handler_t analyze_funcs;
+    adapter_handler_t find_insns;
+};
+
 const std::array<std::string_view, k_routing_extension_tool_count>&
 routing_extension_tool_names() noexcept;
 
 const std::vector<routing_metadata_t>& routing_metadata_inventory();
 
-const routing_metadata_t* find_routing_metadata(std::string_view name) noexcept;
+const std::vector<std::string_view>& routing_metadata_names();
 
-std::size_t routing_metadata_count() noexcept;
+const routing_metadata_t* find_routing_metadata(std::string_view name);
+
+std::size_t routing_metadata_count();
 
 class routing_extensions_t final {
 public:
     routing_extensions_t(target_resolver_t& resolver,
-                         workspace_adapter_t& workspace,
+                         effect_lock_manager_t& lock_manager,
+                         routing_extension_workspace_handlers_t workspace_handlers,
                          protocol::schema_runtime_t& schemas,
                          routing_extension_limits_t limits = {});
 
@@ -137,11 +140,31 @@ private:
         const protocol::json& arguments,
         const protocol::cancellation_token_t& cancellation) const;
 
+    protocol::mcp_result_t route_workspace_extension(
+        std::string_view name,
+        const protocol::json& arguments,
+        const protocol::cancellation_token_t& cancellation,
+        const routing_extension_invocation_options_t& options) const;
+
+    struct known_instance_t final {
+        target_record_t target;
+        bool retired = false;
+    };
+
+    using known_instance_key_t =
+        std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t>;
+
+    static known_instance_key_t known_instance_key(const target_record_t& target) noexcept;
+    void refresh_known_instances(const std::vector<target_record_t>& active) const;
+
     target_resolver_t& resolver_;
-    workspace_adapter_t& workspace_;
+    effect_lock_manager_t& lock_manager_;
+    routing_extension_workspace_handlers_t workspace_handlers_;
     protocol::schema_runtime_t& schemas_;
     routing_extension_limits_t limits_;
     std::array<protocol::tool_contract_t, k_routing_extension_tool_count> contracts_;
+    mutable std::mutex known_instances_mutex_;
+    mutable std::map<known_instance_key_t, known_instance_t> known_instances_;
 };
 
 }

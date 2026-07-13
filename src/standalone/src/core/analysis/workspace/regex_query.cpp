@@ -153,84 +153,104 @@ regex_match_session_t::~regex_match_session_t() = default;
 
 workspace_result_t<regex_match_result_t> regex_match_session_t::match(
     std::string_view subject) {
-    if (!impl_ || !impl_->owner || !impl_->code || !impl_->context || !impl_->data) {
-        return workspace_result_t<regex_match_result_t>::failure(
-            make_workspace_error(workspace_error_code_t::integrity_failure,
-                "regular-expression match session is incomplete", "regex_query"));
-    }
-    if (subject.size() > impl_->limits.max_subject_bytes) {
-        auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
-            "regular-expression subject exceeds its byte limit", "regex_query");
-        error.size = subject.size();
-        error.details.emplace_back("maximum",
-            std::to_string(impl_->limits.max_subject_bytes));
-        return workspace_result_t<regex_match_result_t>::failure(std::move(error));
-    }
-    if (impl_->callout.cancel.stop_requested()) {
-        return workspace_result_t<regex_match_result_t>::failure(
-            cancellation_error(impl_->callout.cancel, false));
-    }
-    if (std::chrono::steady_clock::now() >= impl_->callout.deadline) {
-        return workspace_result_t<regex_match_result_t>::failure(
-            cancellation_error(impl_->callout.cancel, true));
-    }
-    if (impl_->subjects != std::numeric_limits<std::uint64_t>::max())
-        ++impl_->subjects;
-    impl_->callout.cancellation_observed = false;
-    impl_->callout.deadline_observed = false;
-    const auto initial_steps = impl_->callout.steps;
-    static constexpr PCRE2_UCHAR empty_subject = 0;
-    const auto* subject_data = subject.empty()
-        ? &empty_subject : reinterpret_cast<PCRE2_SPTR>(subject.data());
-    const int result = pcre2_match(impl_->code,
-        subject_data, subject.size(), 0, 0,
-        impl_->data, impl_->context);
-    const auto consumed_steps = impl_->callout.steps - initial_steps;
-    if (result == PCRE2_ERROR_NOMATCH) {
-        regex_match_result_t match;
-        match.engine_steps = consumed_steps;
-        return workspace_result_t<regex_match_result_t>::success(match);
-    }
-    if (result >= 0) {
-        const auto* offsets = pcre2_get_ovector_pointer(impl_->data);
-        if (!offsets || offsets[0] == PCRE2_UNSET || offsets[1] == PCRE2_UNSET ||
-            offsets[1] < offsets[0] || offsets[1] > subject.size()) {
+    try {
+        if (!impl_ || !impl_->owner || !impl_->code || !impl_->context || !impl_->data) {
             return workspace_result_t<regex_match_result_t>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "PCRE2 returned an invalid match range", "regex_query"));
+                    "regular-expression match session is incomplete", "regex_query"));
         }
-        regex_match_result_t match;
-        match.matched = true;
-        match.start = static_cast<std::size_t>(offsets[0]);
-        match.length = static_cast<std::size_t>(offsets[1] - offsets[0]);
-        match.engine_steps = consumed_steps;
-        return workspace_result_t<regex_match_result_t>::success(match);
-    }
-    if (result == PCRE2_ERROR_CALLOUT &&
-        (impl_->callout.cancellation_observed || impl_->callout.deadline_observed)) {
+        if (subject.size() > impl_->limits.max_subject_bytes) {
+            auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "regular-expression subject exceeds its byte limit", "regex_query");
+            error.size = subject.size();
+            error.details.emplace_back("maximum",
+                std::to_string(impl_->limits.max_subject_bytes));
+            return workspace_result_t<regex_match_result_t>::failure(std::move(error));
+        }
+        if (impl_->callout.cancel.stop_requested()) {
+            return workspace_result_t<regex_match_result_t>::failure(
+                cancellation_error(impl_->callout.cancel, false));
+        }
+        if (std::chrono::steady_clock::now() >= impl_->callout.deadline) {
+            return workspace_result_t<regex_match_result_t>::failure(
+                cancellation_error(impl_->callout.cancel, true));
+        }
+        if (impl_->subjects != std::numeric_limits<std::uint64_t>::max())
+            ++impl_->subjects;
+        impl_->callout.cancellation_observed = false;
+        impl_->callout.deadline_observed = false;
+        const auto initial_steps = impl_->callout.steps;
+        static constexpr PCRE2_UCHAR empty_subject = 0;
+        const auto* subject_data = subject.empty()
+            ? &empty_subject : reinterpret_cast<PCRE2_SPTR>(subject.data());
+        const int result = pcre2_match(impl_->code,
+            subject_data, subject.size(), 0, 0,
+            impl_->data, impl_->context);
+        const auto consumed_steps = impl_->callout.steps - initial_steps;
+        if (impl_->callout.cancel.stop_requested()) {
+            return workspace_result_t<regex_match_result_t>::failure(
+                cancellation_error(impl_->callout.cancel, false));
+        }
+        if (std::chrono::steady_clock::now() >= impl_->callout.deadline) {
+            return workspace_result_t<regex_match_result_t>::failure(
+                cancellation_error(impl_->callout.cancel, true));
+        }
+        if (result == PCRE2_ERROR_NOMATCH) {
+            regex_match_result_t match;
+            match.engine_steps = consumed_steps;
+            return workspace_result_t<regex_match_result_t>::success(match);
+        }
+        if (result >= 0) {
+            const auto* offsets = pcre2_get_ovector_pointer(impl_->data);
+            if (!offsets || offsets[0] == PCRE2_UNSET || offsets[1] == PCRE2_UNSET ||
+                offsets[1] < offsets[0] || offsets[1] > subject.size()) {
+                return workspace_result_t<regex_match_result_t>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                        "PCRE2 returned an invalid match range", "regex_query"));
+            }
+            regex_match_result_t match;
+            match.matched = true;
+            match.start = static_cast<std::size_t>(offsets[0]);
+            match.length = static_cast<std::size_t>(offsets[1] - offsets[0]);
+            match.engine_steps = consumed_steps;
+            return workspace_result_t<regex_match_result_t>::success(match);
+        }
+        if (result == PCRE2_ERROR_CALLOUT &&
+            (impl_->callout.cancellation_observed || impl_->callout.deadline_observed)) {
+            return workspace_result_t<regex_match_result_t>::failure(
+                cancellation_error(impl_->callout.cancel, impl_->callout.deadline_observed));
+        }
+        if (result == PCRE2_ERROR_MATCHLIMIT || result == PCRE2_ERROR_DEPTHLIMIT ||
+            result == PCRE2_ERROR_HEAPLIMIT || result == PCRE2_ERROR_NOMEMORY) {
+            auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "regular-expression engine resource limit was reached", "regex_query");
+            error.provider_status = result;
+            error.details.emplace_back("engine_error", pcre2_error_message(result));
+            return workspace_result_t<regex_match_result_t>::failure(std::move(error));
+        }
+        if (invalid_utf_error(result)) {
+            auto error = make_workspace_error(workspace_error_code_t::invalid_argument,
+                "regular-expression subject is not valid UTF-8", "regex_query");
+            error.provider_status = result;
+            error.details.emplace_back("engine_error", pcre2_error_message(result));
+            return workspace_result_t<regex_match_result_t>::failure(std::move(error));
+        }
+        auto error = make_workspace_error(workspace_error_code_t::integrity_failure,
+            "PCRE2 matching failed", "regex_query");
+        error.provider_status = result;
+        error.details.emplace_back("engine_error", pcre2_error_message(result));
+        return workspace_result_t<regex_match_result_t>::failure(std::move(error));
+    } catch (const std::bad_alloc&) {
         return workspace_result_t<regex_match_result_t>::failure(
-            cancellation_error(impl_->callout.cancel, impl_->callout.deadline_observed));
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "regular-expression match allocation exceeded available memory",
+                "regex_query"));
+    } catch (const std::length_error&) {
+        return workspace_result_t<regex_match_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "regular-expression match allocation exceeds container limits",
+                "regex_query"));
     }
-    if (result == PCRE2_ERROR_MATCHLIMIT || result == PCRE2_ERROR_DEPTHLIMIT ||
-        result == PCRE2_ERROR_HEAPLIMIT || result == PCRE2_ERROR_NOMEMORY) {
-        auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
-            "regular-expression engine resource limit was reached", "regex_query");
-        error.provider_status = result;
-        error.details.emplace_back("engine_error", pcre2_error_message(result));
-        return workspace_result_t<regex_match_result_t>::failure(std::move(error));
-    }
-    if (invalid_utf_error(result)) {
-        auto error = make_workspace_error(workspace_error_code_t::invalid_argument,
-            "regular-expression subject is not valid UTF-8", "regex_query");
-        error.provider_status = result;
-        error.details.emplace_back("engine_error", pcre2_error_message(result));
-        return workspace_result_t<regex_match_result_t>::failure(std::move(error));
-    }
-    auto error = make_workspace_error(workspace_error_code_t::integrity_failure,
-        "PCRE2 matching failed", "regex_query");
-    error.provider_status = result;
-    error.details.emplace_back("engine_error", pcre2_error_message(result));
-    return workspace_result_t<regex_match_result_t>::failure(std::move(error));
 }
 
 std::uint64_t regex_match_session_t::subjects_examined() const noexcept {

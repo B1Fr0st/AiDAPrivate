@@ -1,12 +1,9 @@
 #include "type_handlers_harness.hpp"
 
-#include <algorithm>
 #include <chrono>
-#include <cctype>
-#include <cmath>
-#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace aida::standalone::mcp::compat::handlers::test {
 
@@ -53,32 +50,36 @@ const json& json_array(const json& obj, const std::string& key) {
 
 }
 
-mock_adapter_context_t::mock_adapter_context_t(std::string_view tool_name)
-    : name_storage_(tool_name) {
-    descriptor_.name = std::string_view(name_storage_.data(), name_storage_.size());
-    descriptor_.effect = contract_effect_t::workspace_read;
-    descriptor_.lock = contract_lock_t::workspace_shared;
-    descriptor_.archive_backed = true;
-    descriptor_.target_dependent = true;
-    descriptor_.accepts_pid = true;
-    descriptor_.accepts_bin_name = true;
-    descriptor_.read_only = true;
-    descriptor_.unsafe = false;
-    context_.contract = &descriptor_;
-}
-
-const adapter_call_context_t& mock_adapter_context_t::context() const noexcept {
-    return context_;
-}
-
 types_test_fixture_t::types_test_fixture_t()
     : overlay_store_() {
+    default_target_.target_id = 0xA101ULL;
+    default_target_.pid = 4101;
+    default_target_.process_creation_identity = 0xB101ULL;
+    default_target_.bin_name = "fixture-types.exe";
+    default_target_.generation = 1;
+    default_target_.attach_generation = 1;
+    default_target_.revision = 1;
+    if (!resolver_.publish(default_target_)) {
+        throw std::runtime_error("failed to publish default types fixture target");
+    }
+    default_scope_ = overlay_store_.target_scope(default_target_);
+    workspace_adapter_handlers_t handlers;
+    handlers.query = [this](const adapter_call_context_t& context,
+                            const adapter_request_t& request) {
+        return overlay_store_.handle_query(context, request);
+    };
+    handlers.overlay = [this](const adapter_call_context_t& context,
+                              const adapter_request_t& request) {
+        return overlay_store_.handle_overlay(context, request);
+    };
+    workspace_ = std::make_unique<workspace_adapter_t>(
+        resolver_, lock_manager_, std::move(handlers));
 }
 
 types_test_fixture_t::~types_test_fixture_t() = default;
 
 types_overlay_store_t& types_test_fixture_t::overlay_store() noexcept {
-    return overlay_store_;
+    return *default_scope_;
 }
 
 target_resolver_t& types_test_fixture_t::resolver() noexcept {
@@ -95,29 +96,35 @@ protocol::schema_runtime_t& types_test_fixture_t::schemas() noexcept {
 
 adapter_request_t types_test_fixture_t::make_request(const protocol::json& args) {
     adapter_request_t request;
+    request.target.pid = default_target_.pid;
     request.payload = args.dump();
     return request;
 }
 
-adapter_call_context_t types_test_fixture_t::make_context(std::string_view contract_name) {
-    auto ctx = std::make_unique<mock_adapter_context_t>(contract_name);
-    adapter_call_context_t result = ctx->context();
-    contexts_.push_back(std::move(ctx));
-    return result;
-}
-
 adapter_result_t<adapter_response_t> types_test_fixture_t::call_query(
     std::string_view tool_name, const protocol::json& args) {
-    auto ctx = make_context(tool_name);
     auto req = make_request(args);
-    return overlay_store_.handle_query(ctx, req);
+    return workspace_->query(tool_name, req);
 }
 
 adapter_result_t<adapter_response_t> types_test_fixture_t::call_overlay(
     std::string_view tool_name, const protocol::json& args) {
-    auto ctx = make_context(tool_name);
     auto req = make_request(args);
-    return overlay_store_.handle_overlay(ctx, req);
+    return workspace_->overlay(tool_name, req);
+}
+
+adapter_result_t<adapter_response_t> types_test_fixture_t::call_query_for(
+    std::uint32_t pid, std::string_view tool_name, const protocol::json& args) {
+    auto req = make_request(args);
+    req.target.pid = pid;
+    return workspace_->query(tool_name, req);
+}
+
+adapter_result_t<adapter_response_t> types_test_fixture_t::call_overlay_for(
+    std::uint32_t pid, std::string_view tool_name, const protocol::json& args) {
+    auto req = make_request(args);
+    req.target.pid = pid;
+    return workspace_->overlay(tool_name, req);
 }
 
 protocol::json types_test_fixture_t::call_query_json(
@@ -138,6 +145,24 @@ protocol::json types_test_fixture_t::call_overlay_json(
     return json::parse(result.value().payload, nullptr, false);
 }
 
+protocol::json types_test_fixture_t::call_query_json_for(
+    std::uint32_t pid, std::string_view tool_name, const protocol::json& args) {
+    auto result = call_query_for(pid, tool_name, args);
+    if (!result) {
+        throw std::runtime_error("query adapter failed: " + std::string(result.error().stable_code));
+    }
+    return json::parse(result.value().payload, nullptr, false);
+}
+
+protocol::json types_test_fixture_t::call_overlay_json_for(
+    std::uint32_t pid, std::string_view tool_name, const protocol::json& args) {
+    auto result = call_overlay_for(pid, tool_name, args);
+    if (!result) {
+        throw std::runtime_error("overlay adapter failed: " + std::string(result.error().stable_code));
+    }
+    return json::parse(result.value().payload, nullptr, false);
+}
+
 void types_test_fixture_t::publish_test_target(std::uint32_t pid, const std::string& bin_name) {
     target_record_t record;
     record.target_id = static_cast<std::uint64_t>(pid) * 17 + 1;
@@ -148,12 +173,13 @@ void types_test_fixture_t::publish_test_target(std::uint32_t pid, const std::str
     record.attach_generation = 1;
     record.live = false;
     record.revision = 1;
-    resolver_.publish(record);
+    if (!resolver_.publish(record)) {
+        throw std::runtime_error("failed to publish types fixture target");
+    }
 }
 
 void types_test_fixture_t::reset() {
     overlay_store_.clear();
-    contexts_.clear();
 }
 
 void type_test_harness_t::register_test(
@@ -992,6 +1018,7 @@ type_test_result_t test_type_apply_batch_all_success() {
 type_test_result_t test_type_apply_batch_partial_failure() {
     type_test_result_t r{"type_apply_batch_partial_failure", false, ""};
     types_test_fixture_t fx;
+    const auto revision = fx.overlay_store().revision();
     auto output = fx.call_overlay_json("type_apply_batch", json{
         {"batch", json::object({
             {"edits", json::array({
@@ -1003,9 +1030,18 @@ type_test_result_t test_type_apply_batch_partial_failure() {
         })}
     });
     if (json_bool(output, "ok")) { r.message = "expected ok=false with failures"; return r; }
-    if (json_int(output, "applied") != 2) { r.message = "expected 2 applied"; return r; }
-    if (json_int(output, "failed") != 1) { r.message = "expected 1 failed"; return r; }
+    if (json_int(output, "applied") != 0) { r.message = "expected atomic rollback"; return r; }
+    if (json_int(output, "failed") != 3) { r.message = "expected all edits to fail atomically"; return r; }
     if (json_bool(output, "stopped")) { r.message = "expected stopped=false"; return r; }
+    if (fx.overlay_store().has_application("0xA000") ||
+        fx.overlay_store().has_application("0xA004")) {
+        r.message = "failed batch retained a partial application";
+        return r;
+    }
+    if (fx.overlay_store().revision() != revision) {
+        r.message = "failed batch changed the overlay revision";
+        return r;
+    }
     r.passed = true;
     return r;
 }
@@ -1080,20 +1116,30 @@ type_test_result_t test_infer_types_no_data() {
 type_test_result_t test_infer_types_multiple_addresses() {
     type_test_result_t r{"infer_types_multiple_addresses", false, ""};
     types_test_fixture_t fx;
+    fx.call_overlay_json("declare_type", json{
+        {"decls", "struct MEDIUM_INFER { int value; MEDIUM_INFER* next; };"}
+    });
     fx.call_overlay_json("set_type", json{
         {"edits", json::array({
             json::object({{"addr", "0xD000"}, {"ty", "int"}, {"kind", "data"}}),
             json::object({{"addr", "0xD004"}, {"ty", "long"}, {"kind", "data"}}),
+            json::object({{"addr", "0xD008"}, {"signature", "MEDIUM_INFER* candidate"}, {"kind", "data"}}),
         })}
     });
     auto output = fx.call_query_json("infer_types", json{
-        {"addrs", json::array({"0xD000", "0xD004", "0xDEAD"})}
+        {"addrs", json::array({"0xD000", "0xD004", "0xD008", "0xDEAD"})}
     });
     auto results = json_array(output, "result");
-    if (results.size() != 3) { r.message = "expected 3 results, got " + std::to_string(results.size()); return r; }
+    if (results.size() != 4) { r.message = "expected 4 results, got " + std::to_string(results.size()); return r; }
     if (json_string(results[0], "inferred_type") != "int") { r.message = "addr 0 result mismatch"; return r; }
     if (json_string(results[1], "inferred_type") != "long") { r.message = "addr 1 result mismatch"; return r; }
-    if (json_string(results[2], "confidence") != "low") { r.message = "addr 2 should be low confidence"; return r; }
+    if (json_string(results[2], "inferred_type") != "MEDIUM_INFER*" ||
+        json_string(results[2], "confidence") != "medium" ||
+        json_string(results[2], "method") != "xref_analysis") {
+        r.message = "addr 2 did not reach deterministic medium-confidence inference";
+        return r;
+    }
+    if (json_string(results[3], "confidence") != "low") { r.message = "addr 3 should be low confidence"; return r; }
     r.passed = true;
     return r;
 }
@@ -1496,6 +1542,37 @@ type_test_result_t test_type_apply_batch_multiple_kinds() {
     return r;
 }
 
+type_test_result_t test_target_scoped_overlay_isolation() {
+    type_test_result_t r{"target_scoped_overlay_isolation", false, ""};
+    types_test_fixture_t fx;
+    constexpr std::uint32_t second_pid = 4202;
+    fx.publish_test_target(second_pid, "fixture-types-second.exe");
+    fx.call_overlay_json("declare_type", json{
+        {"decls", "struct FIRST_TARGET_ONLY { int value; };"}
+    });
+    fx.call_overlay_json_for(second_pid, "declare_type", json{
+        {"decls", "struct SECOND_TARGET_ONLY { int value; };"}
+    });
+    const auto first_view = fx.call_query_json("type_inspect", json{
+        {"queries", json::object({{"name", "SECOND_TARGET_ONLY"}})}
+    });
+    const auto second_view = fx.call_query_json_for(second_pid, "type_inspect", json{
+        {"queries", json::object({{"name", "FIRST_TARGET_ONLY"}})}
+    });
+    const auto first_results = json_array(first_view, "result");
+    const auto second_results = json_array(second_view, "result");
+    if (first_results.size() != 1 || second_results.size() != 1) {
+        r.message = "target-scoped queries returned unexpected result counts";
+        return r;
+    }
+    if (json_bool(first_results[0], "exists") || json_bool(second_results[0], "exists")) {
+        r.message = "type overlay state crossed resolved target identities";
+        return r;
+    }
+    r.passed = true;
+    return r;
+}
+
 void register_all_type_handler_tests(type_test_harness_t& harness) {
     harness.register_test("declare_struct_basic", test_declare_struct_basic);
     harness.register_test("declare_union_basic", test_declare_union_basic);
@@ -1564,6 +1641,7 @@ void register_all_type_handler_tests(type_test_harness_t& harness) {
     harness.register_test("type_inspect_max_members_limit", test_type_inspect_max_members_limit);
     harness.register_test("type_query_max_members_limit", test_type_query_max_members_limit);
     harness.register_test("type_apply_batch_multiple_kinds", test_type_apply_batch_multiple_kinds);
+    harness.register_test("target_scoped_overlay_isolation", test_target_scoped_overlay_isolation);
 }
 
 type_test_summary_t run_all_type_handler_tests() {

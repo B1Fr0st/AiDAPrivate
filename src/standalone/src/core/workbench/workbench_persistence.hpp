@@ -4,9 +4,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+
+namespace aida::analysis {
+class workspace_database_t;
+}
 
 namespace aida {
 namespace workbench {
@@ -16,7 +21,15 @@ inline constexpr std::uint32_t k_persistence_codec_schema_v8 = 8;
 inline constexpr std::size_t k_persistence_codec_max_serialized_bytes = 16U << 20;
 inline constexpr std::size_t k_persistence_codec_max_json_depth = 64;
 inline constexpr std::size_t k_persistence_codec_max_field_count = 65536;
+inline constexpr std::size_t k_persistence_codec_max_collection_elements =
+    static_cast<std::size_t>(k_max_split_nodes_per_workspace) +
+    static_cast<std::size_t>(k_max_documents_per_workspace) +
+    static_cast<std::size_t>(k_max_views_per_workspace) +
+    static_cast<std::size_t>(k_max_panels_per_workspace) +
+    static_cast<std::size_t>(k_max_history_capacity);
 inline constexpr std::size_t k_persistence_codec_max_envelope_bytes = 4096;
+
+static_assert(k_persistence_codec_max_collection_elements == 17663);
 
 constexpr const char* k_persistence_codec_kind_v9 = "workbench_persistence_v9";
 constexpr const char* k_persistence_codec_kind_v8 = "workbench_persistence_v8";
@@ -83,7 +96,8 @@ public:
     static persistence_codec_result_t decode_v8_default(
         std::string_view input,
         workspace_id_t expected_workspace,
-        workbench_persistence_dto_t& output);
+        workbench_persistence_dto_t& output,
+        const persistence_codec_limits_t& limits = {});
 
     static persistence_codec_result_t round_trip(
         const workbench_persistence_dto_t& dto,
@@ -121,6 +135,24 @@ public:
     static persistence_codec_result_t check_revision_conflict(
         workspace_revision_t expected,
         workspace_revision_t observed) noexcept;
+};
+
+class workspace_database_workbench_persistence_adapter_t final
+    : public workbench_persistence_adapter_t {
+public:
+    explicit workspace_database_workbench_persistence_adapter_t(
+        std::shared_ptr<analysis::workspace_database_t> database,
+        workspace_id_t workspace,
+        persistence_codec_limits_t limits = {});
+
+    workbench_error_t load(workspace_id_t workspace,
+                           workbench_persistence_dto_t& output) const override;
+    workbench_error_t store(const workbench_persistence_dto_t& input) override;
+
+private:
+    std::shared_ptr<analysis::workspace_database_t> database_;
+    workspace_id_t workspace_;
+    persistence_codec_limits_t limits_;
 };
 
 }

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace aida::standalone::mcp::compat::handlers {
@@ -25,9 +26,13 @@ struct modify_handler_limits_t final {
     std::size_t max_asm_bytes = 4096U;
     std::size_t max_rename_batch_items = 4096U;
     std::size_t max_name_bytes = 4096U;
-    std::size_t max_type_batch_items = 4096U;
     std::size_t max_op_kind_bytes = 64U;
     std::chrono::milliseconds max_execution_time{60000};
+};
+
+struct modify_invocation_options_t final {
+    std::optional<std::uint64_t> expected_generation;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
 const std::array<std::string_view, k_modify_tool_count>& modify_tool_names() noexcept;
@@ -52,13 +57,15 @@ public:
         std::string_view name,
         const protocol::json& arguments,
         const protocol::cancellation_token_t& cancellation,
+        const modify_invocation_options_t& options = {},
         const protocol::json& aida_metadata = protocol::json::object()) const;
 
 private:
     protocol::mcp_result_t dispatch(
         std::size_t index,
         const protocol::json& arguments,
-        const protocol::cancellation_token_t& cancellation) const;
+        const protocol::cancellation_token_t& cancellation,
+        const modify_invocation_options_t& options) const;
 
     workspace_adapter_t& workspace_;
     protocol::schema_runtime_t& schemas_;
@@ -74,51 +81,64 @@ using modify_adapter_t = protocol::mcp_result_t (*)(
     const handlers::modify_handlers_t&,
     const protocol::json&,
     const protocol::cancellation_token_t&,
+    const handlers::modify_invocation_options_t&,
     const protocol::json&);
 
+protocol::mcp_result_t add_bookmark(
+    const handlers::modify_handlers_t& handlers,
+    const protocol::json& arguments,
+    const protocol::cancellation_token_t& cancellation,
+    const handlers::modify_invocation_options_t& options = {},
+    const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t set_comments(const handlers::modify_handlers_t& handlers,
                                     const protocol::json& arguments,
                                     const protocol::cancellation_token_t& cancellation,
+                                    const handlers::modify_invocation_options_t& options = {},
                                     const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t append_comments(const handlers::modify_handlers_t& handlers,
                                        const protocol::json& arguments,
                                        const protocol::cancellation_token_t& cancellation,
+                                       const handlers::modify_invocation_options_t& options = {},
                                        const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t rename(const handlers::modify_handlers_t& handlers,
                               const protocol::json& arguments,
                               const protocol::cancellation_token_t& cancellation,
+                              const handlers::modify_invocation_options_t& options = {},
                               const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t define_code(const handlers::modify_handlers_t& handlers,
                                    const protocol::json& arguments,
                                    const protocol::cancellation_token_t& cancellation,
+                                   const handlers::modify_invocation_options_t& options = {},
                                    const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t define_func(const handlers::modify_handlers_t& handlers,
                                    const protocol::json& arguments,
                                    const protocol::cancellation_token_t& cancellation,
+                                   const handlers::modify_invocation_options_t& options = {},
                                    const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t undefine(const handlers::modify_handlers_t& handlers,
                                 const protocol::json& arguments,
                                 const protocol::cancellation_token_t& cancellation,
+                                const handlers::modify_invocation_options_t& options = {},
                                 const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t make_data(const handlers::modify_handlers_t& handlers,
                                  const protocol::json& arguments,
                                  const protocol::cancellation_token_t& cancellation,
+                                 const handlers::modify_invocation_options_t& options = {},
                                  const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t patch_asm(const handlers::modify_handlers_t& handlers,
                                  const protocol::json& arguments,
                                  const protocol::cancellation_token_t& cancellation,
+                                 const handlers::modify_invocation_options_t& options = {},
                                  const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t force_recompile(const handlers::modify_handlers_t& handlers,
                                        const protocol::json& arguments,
                                        const protocol::cancellation_token_t& cancellation,
+                                       const handlers::modify_invocation_options_t& options = {},
                                        const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t set_op_type(const handlers::modify_handlers_t& handlers,
                                    const protocol::json& arguments,
                                    const protocol::cancellation_token_t& cancellation,
+                                   const handlers::modify_invocation_options_t& options = {},
                                    const protocol::json& aida_metadata = protocol::json::object());
-protocol::mcp_result_t set_type(const handlers::modify_handlers_t& handlers,
-                                const protocol::json& arguments,
-                                const protocol::cancellation_token_t& cancellation,
-                                const protocol::json& aida_metadata = protocol::json::object());
 
 }

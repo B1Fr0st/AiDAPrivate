@@ -4,6 +4,7 @@
 #include "analysis_workspace.hpp"
 #include "persistence_queue.hpp"
 #include "search_index.hpp"
+#include "workspace_schema_v9.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -18,7 +19,7 @@ struct sqlite3;
 
 namespace aida::analysis {
 
-inline constexpr std::uint32_t workspace_database_schema_version = 8;
+inline constexpr std::uint32_t workspace_database_schema_version = workspace_schema_v9_version;
 inline constexpr std::uint32_t workspace_instruction_blob_version = 2;
 inline constexpr std::uint64_t workspace_decompiler_cache_record_limit = 64ULL << 20;
 inline constexpr std::uint64_t workspace_search_blob_limit = 512ULL << 20;
@@ -104,6 +105,9 @@ struct persisted_search_products_t {
     std::vector<std::uint8_t> search_index_blob;
 };
 
+workspace_result_t<void> migrate_workspace_database_schema(
+    sqlite3* database, bool& invalidate_derived_facts);
+
 class workspace_database_t;
 
 class workspace_persistence_candidate_t final {
@@ -186,6 +190,17 @@ public:
         std::optional<std::uint64_t> function_rva,
         std::optional<std::uint64_t> minimum_overlay_revision,
         cancellation_token_t cancel = {});
+    persistence_ticket_t publish_packed_generation(
+        packed_generation_publication_t publication,
+        cancellation_token_t cancel = {});
+    workspace_result_t<std::optional<packed_generation_publication_t>>
+        load_packed_generation(std::uint64_t generation,
+                               const cancellation_token_t& cancel = {}) const;
+    persistence_ticket_t store_workbench_state(
+        workbench_state_record_t record,
+        cancellation_token_t cancel = {});
+    workspace_result_t<std::optional<workbench_state_record_t>>
+        load_workbench_state(const cancellation_token_t& cancel = {}) const;
     persistence_ticket_t checkpoint(bool truncate, cancellation_token_t cancel = {});
 
     workspace_database_snapshot_t snapshot() const;
@@ -205,7 +220,9 @@ private:
 
     persistence_ticket_t enqueue_write(std::string label, writer_operation_t operation,
                                        cancellation_token_t cancel);
-    workspace_result_t<void> with_reader(const reader_operation_t& operation) const;
+    workspace_result_t<void> with_reader(
+        const reader_operation_t& operation,
+        const cancellation_token_t& cancel = {}) const;
     workspace_result_t<void> finalize_candidate(
         const workspace_persistence_candidate_t& candidate,
         const cancellation_token_t& cancel);

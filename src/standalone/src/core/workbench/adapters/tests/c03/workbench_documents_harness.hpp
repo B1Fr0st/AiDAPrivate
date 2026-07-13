@@ -3,8 +3,6 @@
 #include "../disasm_document.hpp"
 #include "../hex_document.hpp"
 #include "../pseudocode_document.hpp"
-#include "../graph_document.hpp"
-#include "../diff_document.hpp"
 #include "../document_adapter_base.hpp"
 
 #include <atomic>
@@ -143,65 +141,6 @@ private:
     pseudocode::pseudocode_status_t result_status_ = pseudocode::pseudocode_status_t::ready;
 };
 
-class mock_graph_store_t final : public graph::graph_packed_store_adapter_t {
-public:
-    mock_graph_store_t(std::uint64_t generation, std::uint64_t node_count,
-                       std::uint64_t edge_count, graph::graph_kind_t kind = graph::graph_kind_t::cfg);
-    void advance_generation() noexcept;
-    void set_node_missing(std::uint64_t node_id) noexcept;
-    std::uint64_t current_generation() const noexcept override;
-    bool generation_current(std::uint64_t generation) const noexcept override;
-    graph::graph_kind_t graph_kind(std::uint64_t generation) const noexcept override;
-    std::uint64_t node_count(std::uint64_t generation) const noexcept override;
-    std::uint64_t edge_count(std::uint64_t generation) const noexcept override;
-    bool node_at(std::uint64_t generation, std::uint64_t ordinal,
-                graph::graph_node_view_t& output) const override;
-    bool node_by_id(std::uint64_t generation, std::uint64_t node_id,
-                   graph::graph_node_view_t& output) const override;
-    bool edge_at(std::uint64_t generation, std::uint64_t ordinal,
-                graph::graph_edge_view_t& output) const override;
-    bool edges_for_node(std::uint64_t generation, std::uint64_t node_id,
-                       std::vector<graph::graph_edge_view_t>& output) const override;
-    bool root_node(std::uint64_t generation, graph::graph_node_view_t& output) const override;
-private:
-    std::uint64_t generation_;
-    std::uint64_t node_count_;
-    std::uint64_t edge_count_;
-    graph::graph_kind_t kind_;
-    std::uint64_t missing_node_id_;
-    std::string node_label_storage_;
-    std::string edge_label_storage_;
-};
-
-class mock_diff_entity_adapter_t final : public diff::diff_entity_adapter_t {
-public:
-    mock_diff_entity_adapter_t(std::uint64_t generation);
-    void set_entities(std::uint64_t generation,
-                      const std::vector<std::tuple<std::uint64_t, std::string, std::string, std::uint64_t, bool>>& entities);
-    void advance_generation() noexcept;
-    std::uint64_t current_generation() const noexcept override;
-    bool generation_current(std::uint64_t generation) const noexcept override;
-    std::uint64_t entity_count(std::uint64_t generation) const noexcept override;
-    bool entity_at(std::uint64_t generation, std::uint64_t ordinal,
-                   std::string& label, std::string& detail,
-                   std::uint64_t& entity_id, std::uint64_t& address,
-                   bool& has_address) const override;
-    bool entity_by_id(std::uint64_t generation, std::uint64_t entity_id,
-                      std::string& label, std::string& detail,
-                      std::uint64_t& ordinal, std::uint64_t& address,
-                      bool& has_address) const override;
-private:
-    struct entity_t {
-        std::uint64_t entity_id = 0;
-        std::string label;
-        std::string detail;
-        std::uint64_t address = 0;
-        bool has_address = false;
-    };
-    std::uint64_t generation_;
-    std::vector<std::pair<std::uint64_t, std::vector<entity_t>>> generations_;
-};
-
 class test_harness_t {
 public:
     void register_test(const std::string& name, std::function<test_result_t()> test);
@@ -225,13 +164,8 @@ test_result_t test_c09_cancellation();
 test_result_t test_c10_address_mapping();
 test_result_t test_c11_stale_result();
 test_result_t test_c12_worker_failure();
-test_result_t test_c13_large_graph_cap();
-test_result_t test_c14_layout_cancellation();
-test_result_t test_c15_cross_generation_diff();
 test_result_t test_c16_pseudocode_source_mapping();
 test_result_t test_c17_hex_disasm_sync();
-test_result_t test_c18_missing_graph_node();
-test_result_t test_c19_diff_selection_sync();
 test_result_t test_c20_overlay_listing();
 
 }

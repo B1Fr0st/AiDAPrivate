@@ -1,20 +1,26 @@
 #include "stack_handlers_harness.hpp"
 
-#include "../../src/core/mcp/compat/handlers/stack.hpp"
-#include "../../src/core/mcp/compat/workspace_adapter.hpp"
-#include "../../src/core/mcp/compat/target_resolver.hpp"
+#include "../../src/core/analysis/workspace/calling_convention.hpp"
 #include "../../src/core/mcp/compat/effect_policy.hpp"
+#include "../../src/core/mcp/compat/handlers/stack.hpp"
 #include "../../src/core/mcp/compat/ida_contracts_generated.hpp"
+#include "../../src/core/mcp/compat/target_resolver.hpp"
+#include "../../src/core/mcp/compat/workspace_adapter.hpp"
 #include "../../src/core/mcp/protocol/mcp_tool_contract.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -44,330 +50,355 @@ void require_fixture(bool condition, std::string_view tool, std::string_view cat
     }
 }
 
-json schema_instance(const json& schema) {
-    if (!schema.is_object()) {
-        return nullptr;
+std::string_view provenance_name(analysis::fact_provenance_t value) noexcept {
+    using analysis::fact_provenance_t;
+    switch (value) {
+    case fact_provenance_t::unknown: return "unknown";
+    case fact_provenance_t::gap_recovery: return "gap_recovery";
+    case fact_provenance_t::linear_validation: return "linear_validation";
+    case fact_provenance_t::recursive_decode: return "recursive_decode";
+    case fact_provenance_t::relocation: return "relocation";
+    case fact_provenance_t::call_target: return "call_target";
+    case fact_provenance_t::export_entry: return "export_entry";
+    case fact_provenance_t::tls_entry: return "tls_entry";
+    case fact_provenance_t::image_entry: return "image_entry";
+    case fact_provenance_t::unwind_metadata: return "unwind_metadata";
+    case fact_provenance_t::debug_symbol: return "debug_symbol";
+    case fact_provenance_t::user_definition: return "user_definition";
+    case fact_provenance_t::decompiler_feedback: return "decompiler_feedback";
     }
-    if (const auto constant = schema.find("const"); constant != schema.end()) {
-        return *constant;
-    }
-    if (const auto enumeration = schema.find("enum");
-        enumeration != schema.end() && enumeration->is_array() && !enumeration->empty()) {
-        return (*enumeration)[0];
-    }
-    for (const char* keyword : {"anyOf", "oneOf"}) {
-        const auto alternatives = schema.find(keyword);
-        if (alternatives != schema.end() && alternatives->is_array() && !alternatives->empty()) {
-            return schema_instance((*alternatives)[0]);
-        }
-    }
-    const auto all_of = schema.find("allOf");
-    if (all_of != schema.end() && all_of->is_array() && !all_of->empty()) {
-        json merged = json::object();
-        for (const auto& component : *all_of) {
-            json instance = schema_instance(component);
-            if (!instance.is_object()) {
-                return instance;
-            }
-            merged.update(instance);
-        }
-        return merged;
-    }
-    std::string type;
-    const auto type_field = schema.find("type");
-    if (type_field != schema.end() && type_field->is_string()) {
-        type = type_field->get<std::string>();
-    } else if (type_field != schema.end() && type_field->is_array()) {
-        for (const auto& candidate : *type_field) {
-            if (candidate.is_string() && candidate.get_ref<const std::string&>() != "null") {
-                type = candidate.get<std::string>();
-                break;
-            }
-        }
-    } else if (schema.contains("properties")) {
-        type = "object";
-    }
-    if (type == "object") {
-        json result = json::object();
-        const auto required = schema.find("required");
-        const auto properties = schema.find("properties");
-        if (required != schema.end() && required->is_array()) {
-            for (const auto& name : *required) {
-                if (!name.is_string() || properties == schema.end() || !properties->is_object()) {
-                    throw std::runtime_error("generated output schema has an unresolved required property");
-                }
-                const auto property = properties->find(name.get_ref<const std::string&>());
-                if (property == properties->end()) {
-                    throw std::runtime_error("generated output schema required property is absent");
-                }
-                result[name.get_ref<const std::string&>()] = schema_instance(*property);
-            }
-        }
-        return result;
-    }
-    if (type == "array") {
-        json result = json::array();
-        std::size_t count = 0;
-        if (const auto minimum = schema.find("minItems");
-            minimum != schema.end() && minimum->is_number_unsigned()) {
-            count = minimum->get<std::size_t>();
-        }
-        const auto items = schema.find("items");
-        for (std::size_t index = 0; index < count; ++index) {
-            result.push_back(items == schema.end() ? json(nullptr) : schema_instance(*items));
-        }
-        return result;
-    }
-    if (type == "string") {
-        std::size_t length = 1;
-        if (const auto minimum = schema.find("minLength");
-            minimum != schema.end() && minimum->is_number_unsigned()) {
-            length = (std::max)(length, minimum->get<std::size_t>());
-        }
-        return std::string(length, 'x');
-    }
-    if (type == "integer") {
-        if (const auto minimum = schema.find("minimum");
-            minimum != schema.end() && minimum->is_number_integer()) {
-            return *minimum;
-        }
-        return 0;
-    }
-    if (type == "number") {
-        return 0.0;
-    }
-    if (type == "boolean") {
-        return false;
-    }
-    return nullptr;
+    return "unknown";
 }
 
-struct stack_var_t final {
-    std::string name;
-    std::string offset;
-    std::string size;
-    std::string type;
-    std::string source;
-    double confidence = 1.0;
+std::string_view slot_kind_name(analysis::stack_slot_kind_t value) noexcept {
+    using analysis::stack_slot_kind_t;
+    switch (value) {
+    case stack_slot_kind_t::unknown: return "unknown";
+    case stack_slot_kind_t::argument: return "argument";
+    case stack_slot_kind_t::local: return "local";
+    case stack_slot_kind_t::spill: return "spill";
+    case stack_slot_kind_t::saved_register: return "saved_register";
+    case stack_slot_kind_t::outgoing_argument: return "outgoing_argument";
+    }
+    return "unknown";
+}
+
+std::uint64_t fixture_type_size(std::string_view type) noexcept {
+    if (type == "char" || type == "bool" || type == "uint8_t") return 1U;
+    if (type == "short" || type == "uint16_t") return 2U;
+    if (type == "int" || type == "unsigned int" || type == "uint32_t") return 4U;
+    if (type == "long long" || type == "uint64_t" || type == "void*" ||
+        type == "char*") return 8U;
+    if (type == "char[16]") return 16U;
+    if (type == "char[32]") return 32U;
+    if (type == "char[256]") return 256U;
+    return 1U;
+}
+
+std::string fixture_hex(std::uint64_t value) {
+    std::array<char, 32> buffer{};
+    const auto formatted = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value, 16);
+    if (formatted.ec != std::errc{}) {
+        throw std::runtime_error("stack fixture address formatting failed");
+    }
+    std::string result = "0x";
+    result.append(buffer.data(), formatted.ptr);
+    return result;
+}
+
+struct typed_slot_fixture_t final {
+    analysis::stack_slot_t slot;
+    std::optional<std::string> name;
+    std::optional<std::string> type;
+    std::string source = "inferred";
 };
 
-struct frame_entry_t final {
-    std::vector<stack_var_t> vars;
+typed_slot_fixture_t make_slot(
+    std::int64_t offset, std::uint64_t size,
+    std::optional<std::string> name = std::nullopt,
+    std::optional<std::string> type = std::nullopt,
+    std::string source = "inferred",
+    analysis::fact_provenance_t provenance =
+        analysis::fact_provenance_t::recursive_decode,
+    std::uint8_t confidence = 80U,
+    analysis::stack_slot_kind_t kind = analysis::stack_slot_kind_t::local) {
+    typed_slot_fixture_t result;
+    result.slot.offset = offset;
+    result.slot.size = size;
+    result.slot.base_reg = 5U;
+    const std::uint64_t maximum_width =
+        (std::numeric_limits<std::uint16_t>::max)();
+    result.slot.access_width_bits = static_cast<std::uint16_t>(
+        size > maximum_width / 8U ? maximum_width : size * 8U);
+    result.slot.kind = kind;
+    result.slot.provenance = provenance;
+    result.slot.confidence = confidence;
+    result.slot.is_argument = kind == analysis::stack_slot_kind_t::argument;
+    result.slot.is_spill = kind == analysis::stack_slot_kind_t::spill;
+    result.slot.is_local = kind == analysis::stack_slot_kind_t::local;
+    result.slot.is_saved_register = kind == analysis::stack_slot_kind_t::saved_register;
+    result.slot.read = true;
+    result.slot.written = kind != analysis::stack_slot_kind_t::argument;
+    result.name = std::move(name);
+    result.type = std::move(type);
+    result.source = std::move(source);
+    return result;
+}
+
+struct frame_fixture_t final {
+    analysis::stack_frame_info_t frame;
+    std::vector<typed_slot_fixture_t> slots;
+    std::uint8_t confidence = 88U;
 };
 
-struct overlay_record_t final {
-    std::string addr;
-    std::string name;
-    std::string offset;
-    std::string type;
-    enum class kind_t : std::uint8_t { declare, remove } kind;
+struct overlay_snapshot_t final {
+    std::unordered_map<std::string, frame_fixture_t> frames;
 };
 
-class stack_frame_store_t final {
+class typed_stack_store_t final {
 public:
-    json query_frame(const json& args) {
-        json results = json::array();
-        std::vector<std::string> addrs;
-        if (args.contains("addrs")) {
-            const auto& a = args["addrs"];
-            if (a.is_string()) {
-                addrs.push_back(a.get<std::string>());
-            } else if (a.is_array()) {
-                for (const auto& item : a) {
-                    if (item.is_string()) {
-                        addrs.push_back(item.get<std::string>());
-                    }
-                }
-            }
-        }
-        for (const auto& addr : addrs) {
-            const auto it = frames_.find(addr);
-            if (it == frames_.end() || it->second.vars.empty()) {
-                results.push_back({{"addr", addr}, {"vars", nullptr}});
-            } else {
-                json vars_array = json::array();
-                for (const auto& var : it->second.vars) {
-                    vars_array.push_back({
-                        {"name", var.name},
-                        {"offset", var.offset},
-                        {"size", var.size},
-                        {"type", var.type},
-                    });
-                }
-                results.push_back({{"addr", addr}, {"vars", std::move(vars_array)}});
-            }
-        }
-        return {{"result", std::move(results)}};
-    }
-
-    json declare_vars(const json& args) {
-        json results = json::array();
-        std::vector<json> items;
-        if (args.contains("items")) {
-            const auto& it = args["items"];
-            if (it.is_object()) {
-                items.push_back(it);
-            } else if (it.is_array()) {
-                for (const auto& item : it) {
-                    items.push_back(item);
-                }
-            }
-        }
-        for (const auto& item : items) {
-            const std::string addr = item.value("addr", "");
-            const std::string name = item.value("name", "");
-            const std::string offset = item.value("offset", "");
-            const std::string ty = item.value("ty", "");
-            auto& frame = frames_[addr];
-            bool conflict = false;
-            std::string error_reason;
-            for (const auto& existing : frame.vars) {
-                if (existing.offset == offset && existing.name != name) {
-                    conflict = true;
-                    error_reason = "offset_overlap_conflict";
-                    break;
-                }
-                if (existing.name == name && existing.type != ty) {
-                    conflict = true;
-                    error_reason = "type_conflict";
-                    break;
-                }
-            }
-            if (conflict) {
-                results.push_back({{"addr", addr}, {"name", name}, {"error", error_reason}});
-            } else {
-                bool updated = false;
-                for (auto& existing : frame.vars) {
-                    if (existing.name == name) {
-                        existing.offset = offset;
-                        existing.type = ty;
-                        existing.size = estimate_size(ty);
-                        existing.source = "declare_stack";
-                        existing.confidence = 1.0;
-                        updated = true;
-                        break;
-                    }
-                }
-                if (!updated) {
-                    frame.vars.push_back({
-                        name, offset, estimate_size(ty), ty, "declare_stack", 1.0,
-                    });
-                }
-                overlay_log_.push_back({addr, name, offset, ty, overlay_record_t::kind_t::declare});
-                ++generation_;
-                results.push_back({{"addr", addr}, {"name", name}});
-            }
-        }
-        return {{"result", std::move(results)}};
-    }
-
-    json delete_vars(const json& args) {
-        json results = json::array();
-        std::vector<json> items;
-        if (args.contains("items")) {
-            const auto& it = args["items"];
-            if (it.is_object()) {
-                items.push_back(it);
-            } else if (it.is_array()) {
-                for (const auto& item : it) {
-                    items.push_back(item);
-                }
-            }
-        }
-        for (const auto& item : items) {
-            const std::string addr = item.value("addr", "");
-            const std::string name = item.value("name", "");
-            auto frame_it = frames_.find(addr);
-            if (frame_it == frames_.end()) {
-                results.push_back({{"addr", addr}, {"name", name}, {"error", "frame_not_found"}});
-                continue;
-            }
-            auto& vars = frame_it->second.vars;
-            auto var_it = std::find_if(vars.begin(), vars.end(),
-                [&](const stack_var_t& v) { return v.name == name; });
-            if (var_it == vars.end()) {
-                results.push_back({{"addr", addr}, {"name", name}, {"error", "variable_not_found"}});
-            } else {
-                overlay_log_.push_back({addr, name, var_it->offset, var_it->type,
-                                        overlay_record_t::kind_t::remove});
-                vars.erase(var_it);
-                ++generation_;
-                results.push_back({{"addr", addr}, {"name", name}});
-            }
-        }
-        return {{"result", std::move(results)}};
-    }
-
-    void undo_last_overlay() {
-        if (overlay_log_.empty()) {
-            return;
-        }
-        auto record = std::move(overlay_log_.back());
-        overlay_log_.pop_back();
-        auto& frame = frames_[record.addr];
-        if (record.kind == overlay_record_t::kind_t::declare) {
-            auto it = std::find_if(frame.vars.begin(), frame.vars.end(),
-                [&](const stack_var_t& v) { return v.name == record.name; });
-            if (it != frame.vars.end()) {
-                frame.vars.erase(it);
-            }
-        } else {
-            frame.vars.push_back({
-                record.name, record.offset, estimate_size(record.type),
-                record.type, "undo", 1.0,
-            });
-        }
-        ++generation_;
-    }
-
-    bool has_frame(const std::string& addr) const {
-        const auto it = frames_.find(addr);
-        return it != frames_.end() && !it->second.vars.empty();
-    }
-
-    const frame_entry_t* get_frame(const std::string& addr) const {
-        const auto it = frames_.find(addr);
-        return it == frames_.end() ? nullptr : &it->second;
-    }
-
-    std::size_t overlay_count() const noexcept { return overlay_log_.size(); }
-    std::uint64_t generation() const noexcept { return generation_; }
-
-    void seed_frame(const std::string& addr, std::vector<stack_var_t> vars) {
-        frames_[addr].vars = std::move(vars);
-    }
-
     void clear() {
         frames_.clear();
-        overlay_log_.clear();
-        generation_ = 1;
+        missing_.clear();
+        history_.clear();
+        analysis_revision_ = 3U;
+        overlay_revision_ = 7U;
+        transaction_id_ = 40U;
+    }
+
+    void seed_frame(std::string address, std::vector<typed_slot_fixture_t> slots,
+                    std::uint8_t confidence = 88U) {
+        frame_fixture_t frame;
+        frame.confidence = confidence;
+        frame.frame.frame_size = 0x100U;
+        frame.frame.observed_stack_extent = 0x100U;
+        frame.frame.frame_size_known = true;
+        frame.frame.stack_pointer_reg = 4U;
+        frame.frame.frame_pointer_reg = 5U;
+        frame.frame.uses_frame_pointer = true;
+        frame.frame.prologue_end_rva = 0x10U;
+        frame.frame.epilogue_start_rva = 0x80U;
+        frame.slots = std::move(slots);
+        sync_slots(frame);
+        frames_[std::move(address)] = std::move(frame);
+    }
+
+    void mark_missing(std::string address) {
+        missing_.insert(std::move(address));
+    }
+
+    bool is_missing(std::string_view address) const {
+        return missing_.find(std::string(address)) != missing_.end();
+    }
+
+    std::uint64_t overlay_revision() const noexcept {
+        return overlay_revision_;
+    }
+
+    std::size_t history_size() const noexcept {
+        return history_.size();
+    }
+
+    std::size_t named_slot_count(std::string_view address) const {
+        const auto found = frames_.find(std::string(address));
+        if (found == frames_.end()) return 0U;
+        return static_cast<std::size_t>(std::count_if(
+            found->second.slots.begin(), found->second.slots.end(),
+            [](const typed_slot_fixture_t& slot) { return slot.name.has_value(); }));
+    }
+
+    bool has_named_slot(std::string_view address, std::string_view name) const {
+        const auto found = frames_.find(std::string(address));
+        if (found == frames_.end()) return false;
+        return std::any_of(
+            found->second.slots.begin(), found->second.slots.end(),
+            [name](const typed_slot_fixture_t& slot) {
+                return slot.name && *slot.name == name;
+            });
+    }
+
+    json query_frame(std::string_view address) const {
+        const auto found = frames_.find(std::string(address));
+        const frame_fixture_t* frame = found == frames_.end() ? &empty_frame_ : &found->second;
+        json slots = json::array();
+        for (const auto& record : frame->slots) {
+            json slot{
+                {"offset", record.slot.offset},
+                {"size", record.slot.size},
+                {"base_reg", record.slot.base_reg},
+                {"access_width_bits", record.slot.access_width_bits},
+                {"kind", record.source == "declared"
+                    ? std::string("declared")
+                    : std::string(slot_kind_name(record.slot.kind))},
+                {"provenance", std::string(provenance_name(record.slot.provenance))},
+                {"confidence", record.slot.confidence},
+                {"is_argument", record.slot.is_argument},
+                {"is_spill", record.slot.is_spill},
+                {"is_local", record.slot.is_local},
+                {"is_saved_register", record.slot.is_saved_register},
+                {"read", record.slot.read},
+                {"written", record.slot.written},
+                {"source", record.source},
+            };
+            if (record.name) slot["name"] = *record.name;
+            if (record.type) slot["type"] = *record.type;
+            slots.push_back(std::move(slot));
+        }
+        json saved_registers = json::array();
+        for (const auto& record : frame->frame.preserved_registers) {
+            saved_registers.push_back({
+                {"reg", record.reg},
+                {"saved", record.saved},
+                {"restored", record.restored},
+                {"save_address", fixture_hex(record.save_rva)},
+                {"restore_address", fixture_hex(record.restore_rva)},
+                {"provenance", std::string(provenance_name(record.provenance))},
+                {"confidence", record.confidence},
+            });
+        }
+        json output{
+            {"function", std::string(address)},
+            {"state", "inferred"},
+            {"abi", static_cast<std::uint64_t>(analysis::cc_abi_t::windows_x64)},
+            {"confidence", frame->confidence},
+            {"frame_size", frame->frame.frame_size},
+            {"frame_size_known", frame->frame.frame_size_known},
+            {"observed_stack_extent", frame->frame.observed_stack_extent},
+            {"stack_pointer_reg", frame->frame.stack_pointer_reg},
+            {"frame_pointer_reg", frame->frame.frame_pointer_reg},
+            {"uses_frame_pointer", frame->frame.uses_frame_pointer},
+            {"has_shadow_space", frame->frame.has_shadow_space},
+            {"shadow_space_size", frame->frame.shadow_space_size},
+            {"prologue_end", "0x10"},
+            {"epilogue_start", "0x80"},
+            {"slots", std::move(slots)},
+            {"slot_count", frame->slots.size()},
+            {"saved_registers", std::move(saved_registers)},
+            {"saved_register_count", frame->frame.preserved_registers.size()},
+            {"bounded", true},
+            {"instructions_analyzed", 64U},
+        };
+        output["_meta"]["aida"] = {
+            {"adapter", "ida_compat_read"},
+            {"analysis_revision", analysis_revision_},
+            {"overlay_revision", overlay_revision_},
+            {"target_kind", "static"},
+            {"pid", nullptr},
+        };
+        return output;
+    }
+
+    json transact(std::string_view tool, const json& arguments,
+                  bool live_write, bool target_file_write,
+                  bool non_overlapping) {
+        const std::uint64_t revision_before = overlay_revision_;
+        history_.push_back({frames_});
+        const auto& items = arguments.at("items");
+        for (const auto& item : items) {
+            const std::string address = item.at("address").get<std::string>();
+            const std::int64_t offset = item.at("offset").get<std::int64_t>();
+            auto& frame = frames_[address];
+            if (tool == "declare_stack") {
+                const std::string name = item.at("name").get<std::string>();
+                const std::string type = item.at("type").get<std::string>();
+                auto existing = std::find_if(
+                    frame.slots.begin(), frame.slots.end(),
+                    [offset](const typed_slot_fixture_t& slot) {
+                        return slot.slot.offset == offset;
+                    });
+                if (existing != frame.slots.end()) {
+                    existing->name = name;
+                    existing->type = type;
+                    existing->source = existing->source == "inferred"
+                        ? "inferred_and_declared"
+                        : "declared";
+                } else {
+                    frame.slots.push_back(make_slot(
+                        offset, fixture_type_size(type), name, type, "declared",
+                        analysis::fact_provenance_t::user_definition, 100U,
+                        analysis::stack_slot_kind_t::unknown));
+                }
+            } else {
+                auto existing = std::find_if(
+                    frame.slots.begin(), frame.slots.end(),
+                    [offset](const typed_slot_fixture_t& slot) {
+                        return slot.slot.offset == offset && slot.name.has_value();
+                    });
+                if (existing != frame.slots.end()) {
+                    if (existing->source == "inferred_and_declared") {
+                        existing->name.reset();
+                        existing->type.reset();
+                        existing->source = "inferred";
+                    } else {
+                        frame.slots.erase(existing);
+                    }
+                }
+            }
+            sync_slots(frame);
+        }
+        ++overlay_revision_;
+        ++transaction_id_;
+        json item_receipts = json::array();
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            item_receipts.push_back({
+                {"index", index},
+                {"success", true},
+                {"operation_index", index},
+                {"entity_key", "stack:" + std::to_string(index)},
+                {"removes_value", tool == "delete_stack"},
+            });
+        }
+        json provenance{
+            {"adapter", "ida_compat_mut"},
+            {"tool", std::string(tool)},
+            {"read_only", false},
+            {"mutation_mode", "reversible_overlay"},
+            {"target_binding", "workspace_request_context"},
+            {"target_selector_supplied", false},
+            {"ui_switched", false},
+            {"target_kind", "static_file"},
+            {"live_write", live_write},
+            {"analysis_revision", analysis_revision_},
+            {"overlay_revision", revision_before},
+        };
+        if (target_file_write) provenance["target_file_write"] = true;
+        if (!non_overlapping) provenance["non_overlapping"] = false;
+        return {
+            {"committed", true},
+            {"dry_run", false},
+            {"item_count", items.size()},
+            {"items", std::move(item_receipts)},
+            {"revision", overlay_revision_},
+            {"transaction_id", transaction_id_},
+            {"idempotent_replay", false},
+            {"operations", items.size()},
+            {"_meta", {{"aida", std::move(provenance)}}},
+        };
+    }
+
+    bool undo_last() {
+        if (history_.empty()) return false;
+        frames_ = std::move(history_.back().frames);
+        history_.pop_back();
+        ++overlay_revision_;
+        return true;
     }
 
 private:
-    static std::string estimate_size(std::string_view type_name) {
-        if (type_name == "int" || type_name == "unsigned int" || type_name == "uint32_t") {
-            return "4";
-        }
-        if (type_name == "long" || type_name == "unsigned long" || type_name == "uint64_t" ||
-            type_name == "long long" || type_name == "unsigned long long") {
-            return "8";
-        }
-        if (type_name == "short" || type_name == "unsigned short" || type_name == "uint16_t") {
-            return "2";
-        }
-        if (type_name == "char" || type_name == "unsigned char" || type_name == "uint8_t" ||
-            type_name == "bool") {
-            return "1";
-        }
-        if (type_name == "void*") {
-            return "8";
-        }
-        return "8";
+    static void sync_slots(frame_fixture_t& frame) {
+        frame.frame.slots.clear();
+        frame.frame.slots.reserve(frame.slots.size());
+        for (const auto& slot : frame.slots) frame.frame.slots.push_back(slot.slot);
     }
 
-    std::unordered_map<std::string, frame_entry_t> frames_;
-    std::vector<overlay_record_t> overlay_log_;
-    std::uint64_t generation_ = 1;
+    frame_fixture_t empty_frame_{};
+    std::unordered_map<std::string, frame_fixture_t> frames_;
+    std::unordered_set<std::string> missing_;
+    std::vector<overlay_snapshot_t> history_;
+    std::uint64_t analysis_revision_ = 3U;
+    std::uint64_t overlay_revision_ = 7U;
+    std::uint64_t transaction_id_ = 40U;
 };
 
 const adapters::stack_adapter_t k_stack_adapters[k_stack_tool_count] = {
@@ -379,73 +410,130 @@ const adapters::stack_adapter_t k_stack_adapters[k_stack_tool_count] = {
 struct backend_state_t final {
     std::size_t query_calls = 0;
     std::size_t overlay_calls = 0;
-    bool invalid_output = false;
-    bool simulate = false;
     std::string last_contract;
     std::string last_lane;
     json last_arguments = json::object();
+    std::vector<json> query_arguments;
+    std::vector<json> overlay_arguments;
     std::uint32_t last_pid = 0;
+    std::optional<std::uint64_t> last_expected_generation;
     bool saw_deadline = false;
+    bool invalid_output = false;
+    bool invalid_confidence = false;
+    bool receipt_live_write = false;
+    bool receipt_target_file_write = false;
+    bool receipt_non_overlapping = true;
+    std::size_t live_writes = 0;
+    std::size_t target_file_writes = 0;
     std::shared_ptr<std::atomic_bool> cancel_during_dispatch;
-    stack_frame_store_t store;
+    typed_stack_store_t store;
+
+    void clear_observations() {
+        query_arguments.clear();
+        overlay_arguments.clear();
+        last_arguments = json::object();
+    }
+
+    void prepare_standard(std::string_view tool) {
+        store.clear();
+        clear_observations();
+        invalid_output = false;
+        invalid_confidence = false;
+        receipt_live_write = false;
+        receipt_target_file_write = false;
+        receipt_non_overlapping = true;
+        if (tool == "delete_stack") {
+            store.seed_frame("0x140001200", {
+                make_slot(-0x20, 4U, std::string("var_20"), std::string("int"),
+                          "declared", analysis::fact_provenance_t::user_definition, 100U,
+                          analysis::stack_slot_kind_t::unknown),
+            });
+        }
+    }
 
     adapter_result_t<adapter_response_t> respond(
-        const char* lane_name, const adapter_call_context_t& context,
+        std::string_view lane, const adapter_call_context_t& context,
         const adapter_request_t& request) {
-        if (std::string(lane_name) == "query") {
-            ++query_calls;
-        } else {
-            ++overlay_calls;
-        }
-        last_lane = lane_name;
-        last_contract = context.contract == nullptr ? std::string() : std::string(context.contract->name);
-        last_pid = context.target ? context.target->target().pid : 0;
-        saw_deadline = request.deadline.has_value() &&
+        if (lane == "query") ++query_calls;
+        else ++overlay_calls;
+        last_lane = std::string(lane);
+        last_contract = context.contract == nullptr
+            ? std::string()
+            : std::string(context.contract->name);
+        last_pid = context.target ? context.target->target().pid : 0U;
+        last_expected_generation = request.expected_generation;
+        saw_deadline = request.deadline &&
             *request.deadline > std::chrono::steady_clock::now();
         last_arguments = json::parse(request.payload, nullptr, false);
+        if (lane == "query") query_arguments.push_back(last_arguments);
+        else overlay_arguments.push_back(last_arguments);
         if (cancel_during_dispatch) {
             cancel_during_dispatch->store(true, std::memory_order_release);
         }
-        json output;
         if (invalid_output) {
-            output = json{{"__schema_violation", true}};
-        } else if (simulate && context.contract != nullptr) {
-            const auto name = context.contract->name;
-            if (name == "stack_frame") {
-                output = store.query_frame(last_arguments);
-            } else if (name == "declare_stack") {
-                output = store.declare_vars(last_arguments);
-            } else if (name == "delete_stack") {
-                output = store.delete_vars(last_arguments);
-            } else {
-                return adapter_result_t<adapter_response_t>::failure(
-                    {adapter_error_code_t::backend_rejected, "fixture_contract_unknown", 0, 0});
-            }
-        } else {
-            if (context.contract == nullptr) {
-                return adapter_result_t<adapter_response_t>::failure(
-                    {adapter_error_code_t::backend_rejected, "fixture_contract_missing", 0, 0});
-            }
-            const json schema = json::parse(
-                context.contract->output_schema_json.begin(),
-                context.contract->output_schema_json.end());
-            output = schema_instance(schema);
+            return adapter_result_t<adapter_response_t>::success({json::array().dump(), false});
         }
+        if (context.contract == nullptr || last_arguments.is_discarded() ||
+            !last_arguments.is_object()) {
+            return adapter_result_t<adapter_response_t>::failure(
+                {adapter_error_code_t::backend_rejected,
+                 "fixture_request_invalid", 0U, 0U});
+        }
+        if (lane == "query") {
+            if (context.contract->name != "stack_frame" ||
+                !last_arguments.contains("address") ||
+                !last_arguments.at("address").is_string() ||
+                last_arguments.value("include_saved_regs", false) != true) {
+                return adapter_result_t<adapter_response_t>::failure(
+                    {adapter_error_code_t::backend_rejected,
+                     "fixture_typed_query_required", 0U, 0U});
+            }
+            const std::string address = last_arguments.at("address").get<std::string>();
+            if (store.is_missing(address)) {
+                return adapter_result_t<adapter_response_t>::failure(
+                    {adapter_error_code_t::backend_rejected,
+                     "stack_frame_not_found", 0U, 0U});
+            }
+            json output = store.query_frame(address);
+            if (invalid_confidence) output["confidence"] = 101U;
+            return adapter_result_t<adapter_response_t>::success({output.dump(), false});
+        }
+        if (context.contract->name != "declare_stack" &&
+            context.contract->name != "delete_stack") {
+            return adapter_result_t<adapter_response_t>::failure(
+                {adapter_error_code_t::backend_rejected,
+                 "fixture_overlay_contract_invalid", 0U, 0U});
+        }
+        if (!last_arguments.contains("items") ||
+            !last_arguments.at("items").is_array() ||
+            !last_arguments.contains("aida_tx") ||
+            !last_arguments.at("aida_tx").is_object() ||
+            last_arguments.at("aida_tx").value(
+                "expected_revision", (std::numeric_limits<std::uint64_t>::max)()) !=
+                store.overlay_revision()) {
+            return adapter_result_t<adapter_response_t>::failure(
+                {adapter_error_code_t::backend_rejected,
+                 "fixture_overlay_revision_stale", store.overlay_revision(), 0U});
+        }
+        json output = store.transact(
+            context.contract->name, last_arguments,
+            receipt_live_write, receipt_target_file_write,
+            receipt_non_overlapping);
         return adapter_result_t<adapter_response_t>::success({output.dump(), false});
     }
 };
 
 target_record_t make_target(std::uint64_t target_id, std::uint32_t pid,
                             std::uint64_t creation_identity, std::string name,
-                            std::uint64_t generation = 9) {
+                            std::uint64_t generation = 9U) {
     target_record_t target;
     target.target_id = target_id;
     target.pid = pid;
     target.process_creation_identity = creation_identity;
     target.bin_name = std::move(name);
     target.generation = generation;
-    target.attach_generation = 0x109ULL;
-    target.revision = 1;
+    target.attach_generation = 0x109U;
+    target.revision = 1U;
     return target;
 }
 
@@ -454,67 +542,74 @@ json routed(json arguments) {
     return arguments;
 }
 
+stack_invocation_options_t matching_options() {
+    stack_invocation_options_t options;
+    options.expected_generation = 9U;
+    return options;
+}
+
 json make_valid_args(std::string_view tool) {
     if (tool == "stack_frame") {
         return routed({{"addrs", "0x140001000"}});
     }
     if (tool == "declare_stack") {
-        return routed({{"items", json{{"addr", "0x140001000"}, {"offset", "-0x20"}, {"name", "var_20"}, {"ty", "int"}}}});
+        return routed({{"items", json{{"addr", "0x140001100"},
+                                        {"offset", "-0x20"},
+                                        {"name", "var_20"},
+                                        {"ty", "int"}}}});
     }
-    if (tool == "delete_stack") {
-        return routed({{"items", json{{"addr", "0x140001000"}, {"name", "var_20"}}}});
-    }
-    return routed(json::object());
+    return routed({{"items", json{{"addr", "0x140001200"},
+                                    {"name", "var_20"}}}});
 }
 
 json make_boundary_args(std::string_view tool, const stack_handler_limits_t& limits) {
     if (tool == "stack_frame") {
         json addrs = json::array();
-        for (std::size_t i = 0; i < limits.max_addrs; ++i) {
-            addrs.push_back("0x140001000");
+        for (std::size_t index = 0; index < limits.max_addrs; ++index) {
+            addrs.push_back("0x140010000");
         }
         return routed({{"addrs", std::move(addrs)}});
     }
+    json items = json::array();
     if (tool == "declare_stack") {
-        json items = json::array();
-        for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"offset", "-0x10"}, {"name", "v" + std::to_string(i)}, {"ty", "int"}});
+        for (std::size_t index = 0; index < limits.max_batch_items; ++index) {
+            items.push_back({
+                {"addr", "0x140020000"},
+                {"offset", std::to_string(-4096LL - static_cast<std::int64_t>(index * 8U))},
+                {"name", "v" + std::to_string(index)},
+                {"ty", "int"},
+            });
         }
-        return routed({{"items", std::move(items)}});
-    }
-    if (tool == "delete_stack") {
-        json items = json::array();
-        for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"name", "v" + std::to_string(i)}});
+    } else {
+        for (std::size_t index = 0; index < limits.max_batch_items; ++index) {
+            items.push_back({
+                {"addr", "0x140030000"},
+                {"name", "v" + std::to_string(index)},
+            });
         }
-        return routed({{"items", std::move(items)}});
     }
-    return routed(json::object());
+    return routed({{"items", std::move(items)}});
 }
 
 json make_invalid_args(std::string_view tool, const stack_handler_limits_t& limits) {
-    if (tool == "stack_frame") {
-        json addrs = json::array();
-        for (std::size_t i = 0; i < limits.max_addrs + 1; ++i) {
-            addrs.push_back("0x140001000");
+    json values = json::array();
+    const std::size_t maximum = tool == "stack_frame"
+        ? limits.max_addrs
+        : limits.max_batch_items;
+    for (std::size_t index = 0; index <= maximum; ++index) {
+        if (tool == "stack_frame") values.push_back("0x140001000");
+        else if (tool == "declare_stack") {
+            values.push_back({
+                {"addr", "0x140001000"}, {"offset", "-0x10"},
+                {"name", "v"}, {"ty", "int"},
+            });
+        } else {
+            values.push_back({{"addr", "0x140001000"}, {"name", "v"}});
         }
-        return routed({{"addrs", std::move(addrs)}});
     }
-    if (tool == "declare_stack") {
-        json items = json::array();
-        for (std::size_t i = 0; i < limits.max_batch_items + 1; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"offset", "-0x10"}, {"name", "v"}, {"ty", "int"}});
-        }
-        return routed({{"items", std::move(items)}});
-    }
-    if (tool == "delete_stack") {
-        json items = json::array();
-        for (std::size_t i = 0; i < limits.max_batch_items + 1; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"name", "v"}});
-        }
-        return routed({{"items", std::move(items)}});
-    }
-    return routed(json::object());
+    return tool == "stack_frame"
+        ? routed({{"addrs", std::move(values)}})
+        : routed({{"items", std::move(values)}});
 }
 
 void verify_contracts(const stack_handlers_t& handlers,
@@ -526,7 +621,7 @@ void verify_contracts(const stack_handlers_t& handlers,
     std::unordered_set<std::string> unique_names;
     for (std::size_t index = 0; index < k_stack_tool_count; ++index) {
         const auto name = stack_tool_names()[index];
-        const auto* descriptor = aida::standalone::mcp::compat::find_contract(name);
+        const auto* descriptor = find_contract(name);
         const auto& contract = handlers.contract_at(index);
         require(descriptor != nullptr, "stack generated descriptor is missing");
         require(contract.name == name && handlers.find(name) == &contract,
@@ -536,37 +631,44 @@ void verify_contracts(const stack_handlers_t& handlers,
         require(descriptor->adapter_symbol ==
                     "aida::standalone::mcp::compat::adapters::" + std::string(name),
                 "stack generated adapter symbol differs from the linked function name");
-        require(contract.description == descriptor->description,
-                "stack generated description was not preserved");
-        require(contract.input_schema == json::parse(
-                    descriptor->input_schema_json.begin(), descriptor->input_schema_json.end()) &&
+        require(contract.description == descriptor->description &&
+                    contract.input_schema == json::parse(
+                        descriptor->input_schema_json.begin(),
+                        descriptor->input_schema_json.end()) &&
                     contract.output_schema == json::parse(
-                    descriptor->output_schema_json.begin(), descriptor->output_schema_json.end()) &&
+                        descriptor->output_schema_json.begin(),
+                        descriptor->output_schema_json.end()) &&
                     contract.annotations == json::parse(
-                    descriptor->annotations_json.begin(), descriptor->annotations_json.end()),
-                "stack generated schema or annotations were not preserved");
-        require(contract.target_policy.requirement == protocol::target_requirement_t::optional &&
+                        descriptor->annotations_json.begin(),
+                        descriptor->annotations_json.end()),
+                "stack generated descriptor data was not preserved exactly");
+        require(contract.target_policy.requirement ==
+                    protocol::target_requirement_t::optional &&
                     contract.target_policy.accepts_pid &&
                     contract.target_policy.accepts_bin_name,
-                "stack target routing policy is not the generated optional selector policy");
+                "stack target policy differs from the generated contract");
         if (name == "stack_frame") {
-            require(contract.effect_policy.effect == protocol::tool_effect_t::workspace_read &&
-                        contract.effect_policy.lock == protocol::effect_lock_t::workspace_shared &&
+            require(contract.effect_policy.effect ==
+                        protocol::tool_effect_t::workspace_read &&
+                        contract.effect_policy.lock ==
+                        protocol::effect_lock_t::workspace_shared &&
                         contract.effect_policy.read_only && !contract.effect_policy.unsafe,
-                        "stack_frame effect policy is not generated workspace read shared");
+                    "stack_frame effect policy is not a shared workspace read");
         } else {
-            require(contract.effect_policy.effect == protocol::tool_effect_t::workspace_overlay_mutation &&
-                        contract.effect_policy.lock == protocol::effect_lock_t::workspace_overlay_transaction &&
+            require(contract.effect_policy.effect ==
+                        protocol::tool_effect_t::workspace_overlay_mutation &&
+                        contract.effect_policy.lock ==
+                        protocol::effect_lock_t::workspace_overlay_transaction &&
                         !contract.effect_policy.read_only && !contract.effect_policy.unsafe,
-                        "stack mutation effect policy is not generated overlay mutation transaction");
+                    "stack mutation effect policy is not a reversible overlay transaction");
         }
         require(protocol::validate_tool_contract(contract, schemas).valid,
-                "stack generated contract does not validate through the schema runtime");
+                "stack generated contract fails schema runtime validation");
         const json list_entry = contract.tool_list_entry();
         require(list_entry.at("inputSchema") == contract.input_schema &&
                     list_entry.at("outputSchema") == contract.output_schema &&
                     !list_entry.contains("_meta"),
-                "stack tool list entry altered schema or embedded provenance");
+                "stack tool-list schema or metadata separation changed");
     }
 }
 
@@ -574,517 +676,533 @@ std::size_t total_backend_calls(const backend_state_t& backend) {
     return backend.query_calls + backend.overlay_calls;
 }
 
-void verify_fixture(std::string_view tool_name,
-                    adapters::stack_adapter_t adapter,
-                    const stack_handlers_t& handlers,
-                    backend_state_t& backend,
-                    std::size_t& completed) {
-    const json metadata{{"fixture_tool", std::string(tool_name)}};
+void verify_standard_fixture(std::string_view tool,
+                             adapters::stack_adapter_t adapter,
+                             const stack_handlers_t& handlers,
+                             backend_state_t& backend,
+                             std::size_t& completed) {
+    backend.prepare_standard(tool);
+    const json metadata{{"fixture_tool", std::string(tool)}};
+    const auto options = matching_options();
+    const json valid = make_valid_args(tool);
 
-    json valid = make_valid_args(tool_name);
     std::size_t before = total_backend_calls(backend);
-    auto result = adapter(handlers, valid, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), tool_name, "valid", result.text());
-    require_fixture(total_backend_calls(backend) == before + 1, tool_name, "valid",
-                    "backend was not invoked exactly once");
-    require_fixture(backend.last_contract == tool_name, tool_name, "valid",
-                    "request reached the wrong tool in backend");
-    require_fixture(backend.last_pid == 4101 && backend.saw_deadline, tool_name, "valid",
-                    "target binding or deadline was not propagated");
-    json expected_args = valid;
-    expected_args.erase("pid");
-    expected_args.erase("bin_name");
-    require_fixture(backend.last_arguments == expected_args, tool_name, "valid",
-                    "routing selectors leaked into backend arguments");
+    auto result = adapter(
+        handlers, valid, cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error(), tool, "valid", result.text());
+    require_fixture(total_backend_calls(backend) > before,
+                    tool, "valid", "typed backend was not invoked");
+    require_fixture(backend.last_contract == tool, tool, "valid",
+                    "request reached the wrong production stack contract");
+    require_fixture(backend.last_pid == 4101 && backend.saw_deadline &&
+                        backend.last_expected_generation == options.expected_generation,
+                    tool, "valid",
+                    "target, deadline, or expected generation was not forwarded");
     require_fixture(result.structured_content().is_object() &&
-                        !result.structured_content().contains("_meta"),
-                    tool_name, "valid", "structured output or metadata separation changed");
-    require_fixture(result.aida_metadata().value("tool", std::string()) == tool_name,
-                    tool_name, "valid", "provenance metadata is incomplete");
+                        !result.structured_content().contains("_meta") &&
+                        result.aida_metadata().value("tool", std::string()) == tool,
+                    tool, "valid", "generated output and trusted metadata were not separated");
+    if (tool == "stack_frame") {
+        require_fixture(backend.last_lane == "query" &&
+                            backend.last_arguments == json{{"address", "0x140001000"},
+                                                           {"include_saved_regs", true}},
+                        tool, "valid", "generated query was not normalized to production shape");
+    } else {
+        require_fixture(backend.last_lane == "overlay" &&
+                            backend.last_arguments.at("items").is_array() &&
+                            backend.last_arguments.at("aida_tx").contains("expected_revision"),
+                        tool, "valid", "mutation was not normalized to a revision-bound overlay");
+    }
     ++completed;
 
-    json boundary = make_boundary_args(tool_name, handlers.limits());
-    if (boundary.size() > 1 || (boundary.is_object() && boundary.contains("pid"))) {
-        before = total_backend_calls(backend);
-        result = adapter(handlers, boundary, cancellation_token_t::create(), metadata);
-        require_fixture(!result.is_error(), tool_name, "boundary", result.text());
-        require_fixture(total_backend_calls(backend) == before + 1, tool_name, "boundary",
-                        "pinned maximum was not admitted by the backend lane");
-        ++completed;
-    }
-
-    json invalid = make_invalid_args(tool_name, handlers.limits());
+    const json boundary = make_boundary_args(tool, handlers.limits());
     before = total_backend_calls(backend);
-    result = adapter(handlers, invalid, cancellation_token_t::create(), metadata);
+    result = adapter(
+        handlers, boundary, cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error(), tool, "boundary", result.text());
+    require_fixture(total_backend_calls(backend) > before,
+                    tool, "boundary", "pinned maximum did not reach typed preflight");
+    ++completed;
+
+    const json invalid = make_invalid_args(tool, handlers.limits());
+    before = total_backend_calls(backend);
+    result = adapter(
+        handlers, invalid, cancellation_token_t::create(), options, metadata);
     require_fixture(result.is_error() &&
                         result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    tool_name, "invalid", "out-of-policy input was not rejected canonically");
-    require_fixture(total_backend_calls(backend) == before, tool_name, "invalid",
-                    "invalid input reached the backend");
+                    tool, "invalid", "over-limit input was not rejected canonically");
+    require_fixture(total_backend_calls(backend) == before,
+                    tool, "invalid", "invalid input reached the backend");
     require_fixture(
         result.structured_content().at("error").at("details").value(
             "policy", std::string()) == "bounded_stack_adapter",
-        tool_name, "invalid", "bounded policy diagnostics are absent");
+        tool, "invalid", "bounded stack diagnostics are absent");
     ++completed;
 
     json ambiguous = valid;
     ambiguous.erase("pid");
     ambiguous["bin_name"] = "fixture";
     before = total_backend_calls(backend);
-    result = adapter(handlers, ambiguous, cancellation_token_t::create(), metadata);
+    result = adapter(
+        handlers, ambiguous, cancellation_token_t::create(), options, metadata);
     require_fixture(result.is_error() &&
                         result.error_code() == "MCP_TOOL_TARGET_POLICY_REJECTED",
-                    tool_name, "ambiguous_target",
+                    tool, "ambiguous_target",
                     "ambiguous binary selector was not rejected canonically");
-    require_fixture(total_backend_calls(backend) == before, tool_name, "ambiguous_target",
-                    "ambiguous target reached the backend");
+    require_fixture(total_backend_calls(backend) == before,
+                    tool, "ambiguous_target", "ambiguous target reached the backend");
     ++completed;
 
     auto cancellation = cancellation_token_t::create();
     backend.cancel_during_dispatch = cancellation.state();
     before = total_backend_calls(backend);
-    result = adapter(handlers, valid, cancellation, metadata);
+    result = adapter(handlers, valid, cancellation, options, metadata);
     backend.cancel_during_dispatch.reset();
-    require_fixture(result.is_error() && result.error_code() == "MCP_TOOL_CANCELLED",
-                    tool_name, "cancellation",
-                    "in-flight cancellation was not observed canonically");
+    require_fixture(result.is_error() &&
+                        result.error_code() == "MCP_TOOL_CANCELLED",
+                    tool, "cancellation", "in-flight cancellation was not observed");
+    require_fixture(total_backend_calls(backend) > before,
+                    tool, "cancellation", "cancellation did not exercise the backend window");
     ++completed;
 
     backend.invalid_output = true;
     before = total_backend_calls(backend);
-    result = adapter(handlers, valid, cancellation_token_t::create(), metadata);
+    result = adapter(
+        handlers, valid, cancellation_token_t::create(), options, metadata);
     backend.invalid_output = false;
     require_fixture(result.is_error() &&
                         result.error_code() == "MCP_TOOL_OUTPUT_INVALID",
-                    tool_name, "output_validation",
-                    "schema-invalid structured output was not rejected canonically");
+                    tool, "output_validation",
+                    "untyped backend output was not rejected canonically");
+    require_fixture(total_backend_calls(backend) > before,
+                    tool, "output_validation", "invalid-output fixture missed the backend");
     ++completed;
 }
 
-void verify_absent_frames_fixture(stack_handlers_t& handlers,
-                                  backend_state_t& backend,
-                                  std::size_t& completed) {
-    backend.simulate = true;
+void verify_generated_compatibility(stack_handlers_t& handlers,
+                                    backend_state_t& backend,
+                                    std::size_t& completed) {
     backend.store.clear();
-
-    const json metadata{{"fixture_tool", "stack_frame"}};
-
-    json args = routed({{"addrs", json::array({"0x140002000", "0x140003000", "0x140004000"})}});
-    std::size_t before = backend.query_calls;
-    auto result = adapters::stack_frame(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "stack_frame", "absent_frames", result.text());
-    require_fixture(backend.query_calls == before + 1, "stack_frame", "absent_frames",
-                    "query backend was not invoked exactly once");
-    const json& structured = result.structured_content();
-    require_fixture(structured.contains("result") && structured["result"].is_array(),
-                    "stack_frame", "absent_frames", "result array is absent");
-    require_fixture(structured["result"].size() == 3, "stack_frame", "absent_frames",
-                    "result array does not contain exactly three entries");
-    for (std::size_t i = 0; i < 3; ++i) {
-        const auto& entry = structured["result"][i];
-        require_fixture(entry.contains("addr") && entry["addr"].is_string(),
-                        "stack_frame", "absent_frames", "addr field is missing or wrong type");
-        require_fixture(entry.contains("vars") && entry["vars"].is_null(),
-                        "stack_frame", "absent_frames",
-                        "vars should be null for absent frame");
-    }
-    ++completed;
-
-    backend.store.seed_frame("0x140002000", {
-        {"saved_rbp", "-0x8", "8", "void*", "seed", 1.0},
-        {"local_buf", "-0x40", "32", "char[32]", "seed", 1.0},
+    backend.clear_observations();
+    backend.store.seed_frame("0x140040000", {
+        make_slot(-8, 8U, std::string("saved_rbp"), std::string("void*"),
+                  "inferred_and_declared", analysis::fact_provenance_t::debug_symbol,
+                  84U, analysis::stack_slot_kind_t::saved_register),
     });
-    before = backend.query_calls;
-    result = adapters::stack_frame(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "stack_frame", "absent_frames_mixed", result.text());
-    require_fixture(backend.query_calls == before + 1, "stack_frame", "absent_frames_mixed",
-                    "query backend was not invoked for mixed fixture");
-    const auto& mixed = result.structured_content()["result"];
-    require_fixture(mixed[0]["vars"].is_array() && mixed[0]["vars"].size() == 2,
-                    "stack_frame", "absent_frames_mixed",
-                    "seeded frame should return two variables");
-    require_fixture(mixed[0]["vars"][0]["name"] == "saved_rbp",
-                    "stack_frame", "absent_frames_mixed",
-                    "first variable name does not match seeded value");
-    require_fixture(mixed[0]["vars"][0]["offset"] == "-0x8",
-                    "stack_frame", "absent_frames_mixed",
-                    "first variable offset does not match seeded value");
-    require_fixture(mixed[0]["vars"][0]["size"] == "8",
-                    "stack_frame", "absent_frames_mixed",
-                    "first variable size does not match seeded value");
-    require_fixture(mixed[0]["vars"][0]["type"] == "void*",
-                    "stack_frame", "absent_frames_mixed",
-                    "first variable type does not match seeded value");
-    require_fixture(mixed[1]["vars"].is_null(),
-                    "stack_frame", "absent_frames_mixed",
-                    "second address should still have null vars");
-    require_fixture(mixed[2]["vars"].is_null(),
-                    "stack_frame", "absent_frames_mixed",
-                    "third address should still have null vars");
-    ++completed;
-
-    backend.store.clear();
-    backend.simulate = false;
-}
-
-void verify_overlap_conflict_fixture(stack_handlers_t& handlers,
-                                     backend_state_t& backend,
-                                     std::size_t& completed) {
-    backend.simulate = true;
-    backend.store.clear();
-
-    const json metadata{{"fixture_tool", "declare_stack"}};
-
-    json first_batch = routed({{"items", json::array({
-        {{"addr", "0x140005000"}, {"offset", "-0x10"}, {"name", "var_a"}, {"ty", "int"}},
-        {{"addr", "0x140005000"}, {"offset", "-0x10"}, {"name", "var_b"}, {"ty", "int"}},
-    })}});
-    std::size_t before = backend.overlay_calls;
-    auto result = adapters::declare_stack(handlers, first_batch, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "declare_stack", "overlap_conflict", result.text());
-    require_fixture(backend.overlay_calls == before + 1, "declare_stack", "overlap_conflict",
-                    "overlay backend was not invoked exactly once");
-    const auto& results = result.structured_content()["result"];
-    require_fixture(results.size() == 2, "declare_stack", "overlap_conflict",
-                    "declare_stack should return two results for two items");
-    require_fixture(!results[0].contains("error"),
-                    "declare_stack", "overlap_conflict",
-                    "first declaration should succeed without error");
-    require_fixture(results[0]["name"] == "var_a",
-                    "declare_stack", "overlap_conflict",
-                    "first result name should be var_a");
-    require_fixture(results[1].contains("error") &&
-                        results[1]["error"] == "offset_overlap_conflict",
-                    "declare_stack", "overlap_conflict",
-                    "second declaration should report offset_overlap_conflict");
-    ++completed;
-
-    json type_conflict_batch = routed({{"items", json::array({
-        {{"addr", "0x140006000"}, {"offset", "-0x20"}, {"name", "var_c"}, {"ty", "int"}},
-        {{"addr", "0x140006000"}, {"offset", "-0x30"}, {"name", "var_c"}, {"ty", "char*"}},
-    })}});
-    before = backend.overlay_calls;
-    result = adapters::declare_stack(handlers, type_conflict_batch, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "declare_stack", "type_conflict", result.text());
-    require_fixture(backend.overlay_calls == before + 1, "declare_stack", "type_conflict",
-                    "overlay backend was not invoked for type conflict");
-    const auto& tc_results = result.structured_content()["result"];
-    require_fixture(!tc_results[0].contains("error"),
-                    "declare_stack", "type_conflict",
-                    "first type-conflict declaration should succeed");
-    require_fixture(tc_results[1].contains("error") &&
-                        tc_results[1]["error"] == "type_conflict",
-                    "declare_stack", "type_conflict",
-                    "second declaration should report type_conflict");
-    ++completed;
-
-    json same_name_same_type = routed({{"items", json::array({
-        {{"addr", "0x140007000"}, {"offset", "-0x40"}, {"name", "var_d"}, {"ty", "int"}},
-        {{"addr", "0x140007000"}, {"offset", "-0x48"}, {"name", "var_d"}, {"ty", "int"}},
-    })}});
-    before = backend.overlay_calls;
-    result = adapters::declare_stack(handlers, same_name_same_type, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "declare_stack", "update_same_name", result.text());
-    const auto& upd_results = result.structured_content()["result"];
-    require_fixture(!upd_results[0].contains("error"),
-                    "declare_stack", "update_same_name",
-                    "first update declaration should succeed");
-    require_fixture(!upd_results[1].contains("error"),
-                    "declare_stack", "update_same_name",
-                    "second update with same name and type should succeed as update");
-    const auto* frame = backend.store.get_frame("0x140007000");
-    require_fixture(frame != nullptr && frame->vars.size() == 1,
-                    "declare_stack", "update_same_name",
-                    "frame should contain exactly one variable after in-place update");
-    require_fixture(frame->vars[0].offset == "-0x48",
-                    "declare_stack", "update_same_name",
-                    "updated variable offset should reflect the second declaration");
-    ++completed;
-
-    backend.store.clear();
-    backend.simulate = false;
-}
-
-void verify_undo_fixture(stack_handlers_t& handlers,
-                         backend_state_t& backend,
-                         std::size_t& completed) {
-    backend.simulate = true;
-    backend.store.clear();
-
-    const json metadata{{"fixture_tool", "delete_stack"}};
-
-    json declare_args = routed({{"items", json::array({
-        {{"addr", "0x140008000"}, {"offset", "-0x10"}, {"name", "undo_var"}, {"ty", "int"}},
-        {{"addr", "0x140008000"}, {"offset", "-0x20"}, {"name", "keep_var"}, {"ty", "long"}},
-    })}});
-    auto result = adapters::declare_stack(handlers, declare_args, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "delete_stack", "undo_declare", result.text());
-    const auto* frame = backend.store.get_frame("0x140008000");
-    require_fixture(frame != nullptr && frame->vars.size() == 2,
-                    "delete_stack", "undo_declare",
-                    "frame should contain two variables after declaration");
-    require_fixture(backend.store.overlay_count() == 2,
-                    "delete_stack", "undo_declare",
-                    "overlay log should contain two records");
-    ++completed;
-
-    json delete_args = routed({{"items", json{{"addr", "0x140008000"}, {"name", "undo_var"}}}});
-    std::size_t before = backend.overlay_calls;
-    result = adapters::delete_stack(handlers, delete_args, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "delete_stack", "undo_delete", result.text());
-    require_fixture(backend.overlay_calls == before + 1, "delete_stack", "undo_delete",
-                    "overlay backend was not invoked for delete");
-    const auto& del_results = result.structured_content()["result"];
-    require_fixture(del_results.size() == 1, "delete_stack", "undo_delete",
-                    "delete_stack should return one result");
-    require_fixture(!del_results[0].contains("error"),
-                    "delete_stack", "undo_delete",
-                    "delete should succeed without error");
-    require_fixture(del_results[0]["name"] == "undo_var",
-                    "delete_stack", "undo_delete",
-                    "delete result name should match");
-    frame = backend.store.get_frame("0x140008000");
-    require_fixture(frame != nullptr && frame->vars.size() == 1,
-                    "delete_stack", "undo_delete",
-                    "frame should contain one variable after deletion");
-    require_fixture(frame->vars[0].name == "keep_var",
-                    "delete_stack", "undo_delete",
-                    "remaining variable should be keep_var");
-    require_fixture(backend.store.overlay_count() == 3,
-                    "delete_stack", "undo_delete",
-                    "overlay log should contain three records after delete");
-    ++completed;
-
-    backend.store.undo_last_overlay();
-    frame = backend.store.get_frame("0x140008000");
-    require_fixture(frame != nullptr && frame->vars.size() == 2,
-                    "delete_stack", "undo_reversal",
-                    "frame should contain two variables after undo reversal");
-    require_fixture(frame->vars[0].name == "keep_var" && frame->vars[1].name == "undo_var",
-                    "delete_stack", "undo_reversal",
-                    "undo should have restored undo_var");
-    require_fixture(backend.store.overlay_count() == 2,
-                    "delete_stack", "undo_reversal",
-                    "overlay log should contain two records after undo");
-    ++completed;
-
-    json delete_missing = routed({{"items", json{{"addr", "0x140009000"}, {"name", "nonexistent"}}}});
-    before = backend.overlay_calls;
-    result = adapters::delete_stack(handlers, delete_missing, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "delete_stack", "undo_missing_frame", result.text());
-    require_fixture(backend.overlay_calls == before + 1, "delete_stack", "undo_missing_frame",
-                    "overlay backend was not invoked for missing frame delete");
-    const auto& missing_results = result.structured_content()["result"];
-    require_fixture(missing_results[0].contains("error") &&
-                        missing_results[0]["error"] == "frame_not_found",
-                    "delete_stack", "undo_missing_frame",
-                    "deleting from absent frame should report frame_not_found");
-    ++completed;
-
-    json delete_missing_var = routed({{"items", json{{"addr", "0x140008000"}, {"name", "ghost"}}}});
-    result = adapters::delete_stack(handlers, delete_missing_var, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "delete_stack", "undo_missing_var", result.text());
-    const auto& ghost_results = result.structured_content()["result"];
-    require_fixture(ghost_results[0].contains("error") &&
-                        ghost_results[0]["error"] == "variable_not_found",
-                    "delete_stack", "undo_missing_var",
-                    "deleting nonexistent variable should report variable_not_found");
-    ++completed;
-
-    backend.store.clear();
-    backend.simulate = false;
-}
-
-void verify_stale_generation_fixture(target_resolver_t& resolver,
-                                     std::size_t& completed) {
-    require(static_cast<bool>(resolver.publish(
-                make_target(10, 4201, 0xB201ULL, "stale-alpha.exe", 1))),
-            "stale generation first target publication failed");
-    require(static_cast<bool>(resolver.publish(
-                make_target(11, 4202, 0xB202ULL, "stale-beta.exe", 2))),
-            "stale generation second target publication failed");
-
-    target_selector_t selector;
-    selector.pid = 4201;
-    auto resolution = resolver.resolve(selector, 1);
-    require_fixture(static_cast<bool>(resolution), "resolver", "stale_generation",
-                    "resolve with matching generation should succeed");
-    require_fixture(resolution.value().target().generation == 1,
-                    "resolver", "stale_generation",
-                    "resolved target generation should be 1");
-    ++completed;
-
-    resolution = resolver.resolve(selector, 2);
-    require_fixture(!static_cast<bool>(resolution), "resolver", "stale_generation",
-                    "resolve with stale generation should fail");
-    require_fixture(resolution.error().code == target_resolution_error_code_t::target_generation_stale,
-                    "resolver", "stale_generation",
-                    "stale generation error code should be target_generation_stale");
-    require_fixture(resolution.error().expected == 2 && resolution.error().actual == 1,
-                    "resolver", "stale_generation",
-                    "stale generation error should carry expected=2 actual=1");
-    ++completed;
-
-    resolution = resolver.resolve(selector);
-    require_fixture(static_cast<bool>(resolution), "resolver", "stale_generation",
-                    "resolve without expected generation should succeed");
-    ++completed;
-
-    require(static_cast<bool>(resolver.retire(10)), "resolver", "stale_generation",
-            "retiring stale target should succeed");
-    resolution = resolver.resolve(selector, 1);
-    require_fixture(!static_cast<bool>(resolution), "resolver", "stale_generation",
-                    "resolve against retired target should fail");
-    require_fixture(resolution.error().code == target_resolution_error_code_t::target_retired,
-                    "resolver", "stale_generation",
-                    "retired target error code should be target_retired");
-    ++completed;
-
-    require(static_cast<bool>(resolver.publish(
-                make_target(12, 4201, 0xB203ULL, "stale-alpha.exe", 3))),
-            "re-publishing target with new generation should succeed");
-    resolution = resolver.resolve(selector, 1);
-    require_fixture(!static_cast<bool>(resolution), "resolver", "stale_generation",
-                    "resolve with old generation against re-published target should fail");
-    require_fixture(resolution.error().code == target_resolution_error_code_t::target_generation_stale,
-                    "resolver", "stale_generation",
-                    "re-published stale generation should still report target_generation_stale");
-    require_fixture(resolution.error().actual == 3,
-                    "resolver", "stale_generation",
-                    "re-published target actual generation should be 3");
-    ++completed;
-
-    require(static_cast<bool>(resolver.retire(11)), "resolver", "stale_generation",
-            "cleanup retire of second stale target should succeed");
-    require(static_cast<bool>(resolver.retire(12)), "resolver", "stale_generation",
-            "cleanup retire of third stale target should succeed");
-}
-
-void verify_exact_output_fixture(stack_handlers_t& handlers,
-                                 backend_state_t& backend,
-                                 std::size_t& completed) {
-    backend.simulate = true;
-    backend.store.clear();
-
-    const json metadata{{"fixture_tool", "stack_frame"}};
-
-    backend.store.seed_frame("0x14000A000", {
-        {"rbp_save", "-0x8", "8", "void*", "seed", 1.0},
-        {"counter", "-0x4", "4", "int", "seed", 1.0},
-        {"buffer", "-0x100", "256", "char[256]", "seed", 1.0},
-    });
-
-    json query_args = routed({{"addrs", "0x14000A000"}});
-    auto result = adapters::stack_frame(handlers, query_args, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "stack_frame", "exact_output", result.text());
-    const json expected = {
+    const auto options = matching_options();
+    const json metadata{{"fixture_tool", "generated_compatibility"}};
+    auto result = adapters::stack_frame(
+        handlers,
+        routed({{"addrs", json::array({"0x140040000", "0x140040100"})}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error(), "stack_frame", "generated_compatibility",
+                    result.text());
+    const json expected{
         {"result", json::array({
-            {{"addr", "0x14000A000"}, {"vars", json::array({
-                {{"name", "rbp_save"}, {"offset", "-0x8"}, {"size", "8"}, {"type", "void*"}},
-                {{"name", "counter"}, {"offset", "-0x4"}, {"size", "4"}, {"type", "int"}},
-                {{"name", "buffer"}, {"offset", "-0x100"}, {"size", "256"}, {"type", "char[256]"}},
-            })}},
+            json{{"addr", "0x140040000"},
+                 {"vars", json::array({
+                     json{{"name", "saved_rbp"}, {"offset", "-0x8"},
+                          {"size", "8"}, {"type", "void*"}},
+                 })}},
+            json{{"addr", "0x140040100"}, {"vars", json::array()}},
         })},
     };
     require_fixture(result.structured_content() == expected,
-                    "stack_frame", "exact_output",
-                    "structured output does not match the exact expected JSON");
-    ++completed;
-
-    json declare_args = routed({{"items", json::array({
-        {{"addr", "0x14000B000"}, {"offset", "-0x10"}, {"name", "new_var"}, {"ty", "int"}},
-    })}});
-    result = adapters::declare_stack(handlers, declare_args, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "declare_stack", "exact_output", result.text());
-    const json expected_declare = {
-        {"result", json::array({
-            {{"addr", "0x14000B000"}, {"name", "new_var"}},
-        })},
-    };
-    require_fixture(result.structured_content() == expected_declare,
-                    "declare_stack", "exact_output",
-                    "declare structured output does not match exact expected JSON");
-    ++completed;
-
-    json delete_args = routed({{"items", json::array({
-        {{"addr", "0x14000B000"}, {"name", "new_var"}},
-    })}});
-    result = adapters::delete_stack(handlers, delete_args, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "delete_stack", "exact_output", result.text());
-    const json expected_delete = {
-        {"result", json::array({
-            {{"addr", "0x14000B000"}, {"name", "new_var"}},
-        })},
-    };
-    require_fixture(result.structured_content() == expected_delete,
-                    "delete_stack", "exact_output",
-                    "delete structured output does not match exact expected JSON");
-    ++completed;
-
-    json batch_query = routed({{"addrs", json::array({"0x14000A000", "0x14000C000"})}});
-    result = adapters::stack_frame(handlers, batch_query, cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "stack_frame", "exact_output_batch", result.text());
-    const auto& batch_result = result.structured_content()["result"];
-    require_fixture(batch_result.size() == 2,
-                    "stack_frame", "exact_output_batch",
-                    "batch query should return two results");
-    require_fixture(batch_result[0]["vars"].is_array() && batch_result[0]["vars"].size() == 3,
-                    "stack_frame", "exact_output_batch",
-                    "first address should return three variables");
-    require_fixture(batch_result[1]["vars"].is_null(),
-                    "stack_frame", "exact_output_batch",
-                    "second address should return null vars");
+                    "stack_frame", "generated_compatibility",
+                    "typed frames did not translate to the exact generated output schema");
+    require_fixture(backend.query_arguments.size() == 2U &&
+                        backend.query_arguments[0] ==
+                            json{{"address", "0x140040000"}, {"include_saved_regs", true}} &&
+                        backend.query_arguments[1] ==
+                            json{{"address", "0x140040100"}, {"include_saved_regs", true}},
+                    "stack_frame", "generated_compatibility",
+                    "generated address batch was not fanned out to production typed queries");
     ++completed;
 
     backend.store.clear();
-    backend.simulate = false;
+    backend.clear_observations();
+    result = adapters::declare_stack(
+        handlers,
+        routed({{"items", json{{"addr", "0x140041000"},
+                                 {"offset", "-0x10"},
+                                 {"name", "counter"},
+                                 {"ty", "int"}}}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error(), "declare_stack", "generated_singleton",
+                    result.text());
+    require_fixture(result.structured_content() == json{{"result", json::array({
+                        json{{"addr", "0x140041000"}, {"name", "counter"}},
+                    })}},
+                    "declare_stack", "generated_singleton",
+                    "singleton declaration output differs from the generated schema");
+    const auto& declare_payload = backend.overlay_arguments.back();
+    require_fixture(declare_payload.at("items").size() == 1U &&
+                        declare_payload.at("items")[0] == json{
+                            {"address", "0x140041000"}, {"offset", -16},
+                            {"name", "counter"}, {"type", "int"}} &&
+                        !declare_payload.at("items")[0].contains("addr") &&
+                        !declare_payload.at("items")[0].contains("ty"),
+                    "declare_stack", "generated_singleton",
+                    "generated declaration was not normalized to the production overlay schema");
+    ++completed;
+
+    backend.clear_observations();
+    result = adapters::delete_stack(
+        handlers,
+        routed({{"items", json{{"addr", "0x140041000"}, {"name", "counter"}}}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error(), "delete_stack", "generated_singleton",
+                    result.text());
+    require_fixture(result.structured_content() == json{{"result", json::array({
+                        json{{"addr", "0x140041000"}, {"name", "counter"}},
+                    })}},
+                    "delete_stack", "generated_singleton",
+                    "delete-by-name output differs from the generated schema");
+    const auto& delete_payload = backend.overlay_arguments.back().at("items")[0];
+    require_fixture(delete_payload ==
+                        json{{"address", "0x140041000"}, {"offset", -16}} &&
+                        !delete_payload.contains("name"),
+                    "delete_stack", "generated_singleton",
+                    "delete-by-name did not resolve to the typed production offset payload");
+    ++completed;
+}
+
+void verify_provenance_confidence(stack_handlers_t& handlers,
+                                  backend_state_t& backend,
+                                  std::size_t& completed) {
+    backend.store.clear();
+    backend.store.seed_frame("0x140050000", {
+        make_slot(-0x40, 32U, std::nullopt, std::nullopt, "inferred",
+                  analysis::fact_provenance_t::recursive_decode, 61U),
+        make_slot(-0x8, 8U, std::string("saved_rbp"), std::string("void*"),
+                  "inferred_and_declared", analysis::fact_provenance_t::debug_symbol,
+                  73U, analysis::stack_slot_kind_t::saved_register),
+        make_slot(-0x80, 16U, std::string("buffer"), std::string("char[16]"),
+                  "declared", analysis::fact_provenance_t::user_definition,
+                  100U, analysis::stack_slot_kind_t::unknown),
+    }, 79U);
+    const auto result = adapters::stack_frame(
+        handlers, routed({{"addrs", "0x140050000"}}),
+        cancellation_token_t::create(), matching_options(),
+        json{{"fixture_tool", "typed_provenance"}});
+    require_fixture(!result.is_error(), "stack_frame", "typed_provenance",
+                    result.text());
+    const auto& variables = result.structured_content().at("result")[0].at("vars");
+    require_fixture(variables.size() == 2U &&
+                        variables[0].at("name") == "saved_rbp" &&
+                        variables[1].at("name") == "buffer",
+                    "stack_frame", "typed_provenance",
+                    "generated output did not exclude unnamed inferred slots");
+    const auto& typed = result.aida_metadata().at("typed_frames")[0];
+    require_fixture(typed.at("confidence") == 79U &&
+                        typed.at("slots").size() == 3U &&
+                        typed.at("slots")[0].at("provenance") == "recursive_decode" &&
+                        typed.at("slots")[0].at("confidence") == 61U &&
+                        typed.at("slots")[1].at("provenance") == "debug_symbol" &&
+                        typed.at("slots")[1].at("confidence") == 73U &&
+                        typed.at("slots")[2].at("provenance") == "user_definition" &&
+                        typed.at("slots")[2].at("confidence") == 100U,
+                    "stack_frame", "typed_provenance",
+                    "typed provenance or confidence was lost during generated translation");
+    ++completed;
+}
+
+void verify_expected_generation(stack_handlers_t& handlers,
+                                backend_state_t& backend,
+                                std::size_t& completed) {
+    backend.store.clear();
+    stack_invocation_options_t matching;
+    matching.expected_generation = 9U;
+    std::size_t before = backend.query_calls;
+    auto result = adapters::stack_frame(
+        handlers, routed({{"addrs", "0x140060000"}}),
+        cancellation_token_t::create(), matching,
+        json{{"fixture_tool", "expected_generation"}});
+    require_fixture(!result.is_error() && backend.query_calls == before + 1U &&
+                        backend.last_expected_generation == matching.expected_generation,
+                    "stack_frame", "matching_generation",
+                    "matching expected_generation was not forwarded to the typed query");
+    ++completed;
+
+    stack_invocation_options_t stale;
+    stale.expected_generation = 8U;
+    before = backend.query_calls;
+    result = adapters::stack_frame(
+        handlers, routed({{"addrs", "0x140060000"}}),
+        cancellation_token_t::create(), stale,
+        json{{"fixture_tool", "expected_generation"}});
+    require_fixture(result.is_error() &&
+                        result.error_code() == "MCP_TOOL_TARGET_POLICY_REJECTED" &&
+                        backend.query_calls == before,
+                    "stack_frame", "stale_generation",
+                    "stale expected_generation reached the typed backend");
+    const auto& details = result.structured_content().at("error").at("details");
+    require_fixture(details.value("expected", 0ULL) == 8ULL &&
+                        details.value("actual", 0ULL) == 9ULL,
+                    "stack_frame", "stale_generation",
+                    "stale generation diagnostics lost expected and actual values");
+    ++completed;
+}
+
+void verify_conflicts(stack_handlers_t& handlers,
+                      backend_state_t& backend,
+                      std::size_t& completed) {
+    const auto options = matching_options();
+    const json metadata{{"fixture_tool", "stack_conflicts"}};
+
+    backend.store.clear();
+    backend.store.seed_frame("0x140070000", {
+        make_slot(-0x20, 16U, std::nullopt, std::nullopt, "inferred",
+                  analysis::fact_provenance_t::recursive_decode, 72U),
+    });
+    std::size_t before = backend.overlay_calls;
+    auto result = adapters::declare_stack(
+        handlers,
+        routed({{"items", json{{"addr", "0x140070000"},
+                                 {"offset", "-0x18"},
+                                 {"name", "partial"},
+                                 {"ty", "int"}}}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error() && backend.overlay_calls == before &&
+                        result.structured_content().at("result")[0].at("error") ==
+                            "offset_overlap_conflict",
+                    "declare_stack", "typed_overlap",
+                    "partial overlap with an inferred typed slot was not rejected preflight");
+    ++completed;
+
+    backend.store.clear();
+    before = backend.overlay_calls;
+    result = adapters::declare_stack(
+        handlers,
+        routed({{"items", json::array({
+            json{{"addr", "0x140071000"}, {"offset", "-0x40"},
+                 {"name", "buffer"}, {"ty", "char[16]"}},
+            json{{"addr", "0x140071000"}, {"offset", "-0x38"},
+                 {"name", "counter"}, {"ty", "int"}},
+        })}}),
+        cancellation_token_t::create(), options, metadata);
+    const auto& overlap_results = result.structured_content().at("result");
+    require_fixture(!result.is_error() && backend.overlay_calls == before + 1U &&
+                        !overlap_results[0].contains("error") &&
+                        overlap_results[1].at("error") == "offset_overlap_conflict" &&
+                        result.aida_metadata().at("overlay_receipt").at("operations") == 1U,
+                    "declare_stack", "request_overlap",
+                    "intra-request overlap was not filtered before the atomic overlay commit");
+    ++completed;
+
+    backend.store.clear();
+    backend.store.seed_frame("0x140072000", {
+        make_slot(-0x10, 4U, std::string("counter"), std::string("int"),
+                  "declared", analysis::fact_provenance_t::user_definition,
+                  100U, analysis::stack_slot_kind_t::unknown),
+    });
+    before = backend.overlay_calls;
+    result = adapters::declare_stack(
+        handlers,
+        routed({{"items", json{{"addr", "0x140072000"},
+                                 {"offset", "-0x30"},
+                                 {"name", "counter"},
+                                 {"ty", "char*"}}}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error() && backend.overlay_calls == before &&
+                        result.structured_content().at("result")[0].at("error") ==
+                            "type_conflict",
+                    "declare_stack", "type_conflict",
+                    "conflicting type for an existing named slot was not rejected");
+    ++completed;
+
+    backend.store.clear();
+    backend.store.seed_frame("0x140073000", {
+        make_slot(-0x30, 8U, std::nullopt, std::nullopt, "inferred",
+                  analysis::fact_provenance_t::unwind_metadata, 91U),
+    });
+    before = backend.overlay_calls;
+    result = adapters::declare_stack(
+        handlers,
+        routed({{"items", json{{"addr", "0x140073000"},
+                                 {"offset", "-0x30"},
+                                 {"name", "typed_local"},
+                                 {"ty", "int"}}}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error() && backend.overlay_calls == before + 1U &&
+                        backend.store.has_named_slot("0x140073000", "typed_local"),
+                    "declare_stack", "typed_attachment",
+                    "exact declaration did not attach to the inferred typed slot");
+    ++completed;
+}
+
+void verify_reversible_overlay(stack_handlers_t& handlers,
+                               backend_state_t& backend,
+                               std::size_t& completed) {
+    backend.store.clear();
+    const auto options = matching_options();
+    const json metadata{{"fixture_tool", "stack_reversible_overlay"}};
+    auto result = adapters::declare_stack(
+        handlers,
+        routed({{"items", json::array({
+            json{{"addr", "0x140080000"}, {"offset", "-0x10"},
+                 {"name", "undo_var"}, {"ty", "int"}},
+            json{{"addr", "0x140080000"}, {"offset", "-0x20"},
+                 {"name", "keep_var"}, {"ty", "long long"}},
+        })}}),
+        cancellation_token_t::create(), options, metadata);
+    const auto& receipt = result.aida_metadata().at("overlay_receipt");
+    require_fixture(!result.is_error() &&
+                        backend.store.named_slot_count("0x140080000") == 2U &&
+                        backend.store.history_size() == 1U &&
+                        receipt.at("mode") == "reversible_overlay" &&
+                        receipt.at("operations") == 2U &&
+                        receipt.at("non_overlapping") == true &&
+                        receipt.at("live_write") == false &&
+                        receipt.at("target_file_write") == false &&
+                        backend.live_writes == 0U && backend.target_file_writes == 0U,
+                    "declare_stack", "reversible_commit",
+                    "stack declaration lacks a verified isolated transaction receipt");
+    ++completed;
+
+    result = adapters::delete_stack(
+        handlers,
+        routed({{"items", json{{"addr", "0x140080000"}, {"name", "undo_var"}}}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error() &&
+                        !backend.store.has_named_slot("0x140080000", "undo_var") &&
+                        backend.store.has_named_slot("0x140080000", "keep_var") &&
+                        backend.store.history_size() == 2U,
+                    "delete_stack", "reversible_delete",
+                    "delete-by-name was not committed as a reversible offset operation");
+    ++completed;
+
+    require_fixture(backend.store.undo_last() &&
+                        backend.store.has_named_slot("0x140080000", "undo_var") &&
+                        backend.store.has_named_slot("0x140080000", "keep_var"),
+                    "delete_stack", "undo_delete",
+                    "undo did not restore the deleted typed variable");
+    ++completed;
+
+    require_fixture(backend.store.undo_last() &&
+                        backend.store.named_slot_count("0x140080000") == 0U &&
+                        backend.store.history_size() == 0U,
+                    "declare_stack", "undo_declare",
+                    "undo did not restore the pre-declaration frame");
+    ++completed;
+
+    const auto verify_tamper = [&](bool& flag, std::string_view category) {
+        backend.store.clear();
+        flag = true;
+        auto tampered = adapters::declare_stack(
+            handlers,
+            routed({{"items", json{{"addr", "0x140081000"},
+                                     {"offset", "-0x10"},
+                                     {"name", "tampered"},
+                                     {"ty", "int"}}}}),
+            cancellation_token_t::create(), options, metadata);
+        flag = false;
+        require_fixture(tampered.is_error() &&
+                            tampered.error_code() == "MCP_TOOL_OUTPUT_INVALID",
+                        "declare_stack", category,
+                        "unsafe overlay receipt was not rejected fail-closed");
+        require_fixture(backend.store.undo_last(), "declare_stack", category,
+                        "tampered fixture transaction could not be reversed");
+        ++completed;
+    };
+    verify_tamper(backend.receipt_live_write, "live_write_receipt");
+    verify_tamper(backend.receipt_target_file_write, "target_file_receipt");
+    backend.receipt_non_overlapping = false;
+    auto tampered = adapters::declare_stack(
+        handlers,
+        routed({{"items", json{{"addr", "0x140082000"},
+                                 {"offset", "-0x10"},
+                                 {"name", "tampered"},
+                                 {"ty", "int"}}}}),
+        cancellation_token_t::create(), options, metadata);
+    backend.receipt_non_overlapping = true;
+    require_fixture(tampered.is_error() &&
+                        tampered.error_code() == "MCP_TOOL_OUTPUT_INVALID" &&
+                        backend.store.undo_last(),
+                    "declare_stack", "non_overlap_receipt",
+                    "explicitly overlapping receipt was not rejected and reversed");
+    ++completed;
+}
+
+void verify_absent_and_invalid_typed_frames(stack_handlers_t& handlers,
+                                            backend_state_t& backend,
+                                            std::size_t& completed) {
+    backend.store.clear();
+    backend.store.mark_missing("0x140090000");
+    auto result = adapters::stack_frame(
+        handlers, routed({{"addrs", "0x140090000"}}),
+        cancellation_token_t::create(), matching_options(),
+        json{{"fixture_tool", "absent_frame"}});
+    require_fixture(!result.is_error() &&
+                        result.structured_content().at("result")[0].at("vars").is_null() &&
+                        result.structured_content().at("result")[0].at("error") ==
+                            "stack_frame_not_found" &&
+                        result.aida_metadata().at("typed_frames")[0].at("status") ==
+                            "backend_rejected",
+                    "stack_frame", "absent_frame",
+                    "absent production frame was not represented in generated-compatible form");
+    ++completed;
+
+    backend.store.clear();
+    backend.invalid_confidence = true;
+    result = adapters::stack_frame(
+        handlers, routed({{"addrs", "0x140090100"}}),
+        cancellation_token_t::create(), matching_options(),
+        json{{"fixture_tool", "invalid_typed_frame"}});
+    backend.invalid_confidence = false;
+    require_fixture(result.is_error() &&
+                        result.error_code() == "MCP_TOOL_OUTPUT_INVALID",
+                    "stack_frame", "invalid_typed_frame",
+                    "out-of-range typed confidence was not rejected");
+    ++completed;
 }
 
 void verify_stack_handlers() {
     target_resolver_t resolver;
     effect_lock_manager_t locks;
     require(static_cast<bool>(resolver.publish(
-                make_target(1, 4101, 0xA101ULL, "fixture-alpha.exe"))),
+                make_target(1U, 4101U, 0xA101U, "fixture-alpha.exe"))),
             "first stack handler target publication failed");
     require(static_cast<bool>(resolver.publish(
-                make_target(2, 4102, 0xA102ULL, "fixture-beta.exe"))),
+                make_target(2U, 4102U, 0xA102U, "fixture-beta.exe"))),
             "second stack handler target publication failed");
 
     backend_state_t backend;
     workspace_adapter_handlers_t workspace_handlers;
-    workspace_handlers.query = [&backend](const adapter_call_context_t& context,
-                                          const adapter_request_t& request) {
+    workspace_handlers.query = [&backend](
+        const adapter_call_context_t& context, const adapter_request_t& request) {
         return backend.respond("query", context, request);
     };
-    workspace_handlers.overlay = [&backend](const adapter_call_context_t& context,
-                                            const adapter_request_t& request) {
+    workspace_handlers.overlay = [&backend](
+        const adapter_call_context_t& context, const adapter_request_t& request) {
         return backend.respond("overlay", context, request);
     };
     workspace_adapter_t workspace(resolver, locks, std::move(workspace_handlers));
-    protocol::schema_runtime_t schemas(64);
+    protocol::schema_runtime_t schemas(64U);
     stack_handlers_t handlers(workspace, schemas);
 
     verify_contracts(handlers, schemas);
 
-    std::size_t completed = 0;
+    std::size_t completed = 0U;
     for (std::size_t index = 0; index < k_stack_tool_count; ++index) {
-        const auto name = stack_tool_names()[index];
         require(k_stack_adapters[index] != nullptr,
                 "stack adapter function is not linked");
-        verify_fixture(name, k_stack_adapters[index], handlers, backend, completed);
+        verify_standard_fixture(
+            stack_tool_names()[index], k_stack_adapters[index],
+            handlers, backend, completed);
     }
+    require(completed == k_stack_tool_count * 6U,
+            "stack standard fixture count differs from the exact inventory");
 
-    require(completed >= k_stack_tool_count * 5U,
-            "stack handler harness did not execute all standard fixture families");
+    verify_generated_compatibility(handlers, backend, completed);
+    verify_provenance_confidence(handlers, backend, completed);
+    verify_expected_generation(handlers, backend, completed);
+    verify_conflicts(handlers, backend, completed);
+    verify_reversible_overlay(handlers, backend, completed);
+    verify_absent_and_invalid_typed_frames(handlers, backend, completed);
 
-    verify_absent_frames_fixture(handlers, backend, completed);
-    verify_overlap_conflict_fixture(handlers, backend, completed);
-    verify_undo_fixture(handlers, backend, completed);
-    verify_stale_generation_fixture(resolver, completed);
-    verify_exact_output_fixture(handlers, backend, completed);
-
-    require(completed >= k_stack_tool_count * 5U + 14U,
-            "stack handler harness did not execute all stack-specific fixture families");
+    require(completed == 37U,
+            "stack C16 fixture count differs from the exact verified inventory");
 }
 
 }

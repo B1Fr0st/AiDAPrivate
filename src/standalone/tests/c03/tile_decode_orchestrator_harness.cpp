@@ -14,11 +14,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -57,14 +59,6 @@ binary_id_t content_id(std::uint8_t seed)
     binary_id_t result;
     for (std::size_t index = 0; index < result.bytes.size(); ++index)
         result.bytes[index] = static_cast<std::uint8_t>(seed + index * 13U);
-    return result;
-}
-
-std::vector<std::uint8_t> pad_bytes(const std::vector<std::uint8_t>& src,
-                                     std::size_t target_size)
-{
-    std::vector<std::uint8_t> result(target_size, 0x90);
-    std::copy(src.begin(), src.end(), result.begin());
     return result;
 }
 
@@ -120,7 +114,8 @@ image_layout_index_t build_layout(std::uint64_t text_rva, std::uint64_t text_siz
                                    std::uint64_t provider_size,
                                    std::uint64_t data_rva = 0,
                                    std::uint64_t data_size = 0,
-                                   std::uint64_t data_file_offset = 0)
+                                   std::uint64_t data_file_offset = 0,
+                                   std::uint64_t text_virtual_size = 0)
 {
     image_layout_definition_t definition;
     definition.identity.content_id = content_id(7U);
@@ -131,18 +126,21 @@ image_layout_index_t build_layout(std::uint64_t text_rva, std::uint64_t text_siz
     definition.identity.provider_size = provider_size;
 
     const auto base = definition.identity.image_base;
+    const auto effective_text_virtual_size =
+        text_virtual_size == 0 ? text_size : text_virtual_size;
 
     definition.segments.push_back({10U, ".image", text_rva,
                                     text_rva + (data_size > 0 ? data_size : text_size),
                                     0U, provider_size,
                                     image_permission_read | image_permission_execute});
 
-    definition.sections.push_back({1U, ".text", text_rva, text_size,
-                                    text_file_offset, text_size,
-                                    image_permission_read | image_permission_execute});
+    definition.sections.push_back({1U, ".text", text_rva, effective_text_virtual_size,
+                                     text_file_offset, text_size,
+                                     image_permission_read | image_permission_execute});
 
-    definition.mappings.push_back({100U, text_rva, base + text_rva, text_size,
-                                    text_file_offset, text_size,
+    definition.mappings.push_back({100U, text_rva, base + text_rva,
+                                     effective_text_virtual_size,
+                                     text_file_offset, text_size,
                                     image_permission_read | image_permission_execute,
                                     1U, 10U, std::nullopt});
 
@@ -161,12 +159,28 @@ image_layout_index_t build_layout(std::uint64_t text_rva, std::uint64_t text_siz
     return result.value();
 }
 
+enum class mock_completion_fault_t : std::uint8_t {
+    none = 0,
+    duplicate,
+    missing,
+    unknown
+};
+
+struct mock_tile_decode_executor_options_t final {
+    std::uint64_t maximum_request_bytes = 64ULL * 1024ULL;
+    bool reverse_completions = false;
+    bool duplicate_targets = false;
+    mock_completion_fault_t completion_fault = mock_completion_fault_t::none;
+};
+
 class mock_tile_decode_executor_t final : public tile_decode_executor_t {
 public:
-    mock_tile_decode_executor_t()
+    explicit mock_tile_decode_executor_t(
+        mock_tile_decode_executor_options_t options = {})
+        : options_(options)
     {
         caps_.decoder_key = x64_key();
-        caps_.maximum_request_bytes = 64ULL * 1024ULL;
+        caps_.maximum_request_bytes = options_.maximum_request_bytes;
         caps_.minimum_instruction_bytes = 1;
         caps_.maximum_instruction_bytes = 15;
         caps_.instruction_alignment = 1;
@@ -178,6 +192,16 @@ public:
         return caps_;
     }
 
+    std::uint64_t maximum_observed_gap_request_bytes() const noexcept
+    {
+        return maximum_observed_gap_request_bytes_;
+    }
+
+    const std::vector<tile_decode_request_t>& observed_requests() const noexcept
+    {
+        return observed_requests_;
+    }
+
     workspace_result_t<std::vector<tile_decode_completion_t>> execute_batch(
         const provider_snapshot_t& snapshot,
         const std::vector<tile_decode_request_t>& requests,
@@ -186,6 +210,11 @@ public:
         std::vector<tile_decode_completion_t> completions;
         completions.reserve(requests.size());
         for (const auto& request : requests) {
+            observed_requests_.push_back(request);
+            if (request.pass == tile_decode_pass_t::gap) {
+                maximum_observed_gap_request_bytes_ = (std::max)(
+                    maximum_observed_gap_request_bytes_, request.byte_count);
+            }
             if (cancellation.stop_requested()) {
                 tile_decode_completion_t cancelled;
                 cancelled.request_id = request.request_id;
@@ -199,12 +228,28 @@ public:
             }
             completions.push_back(decode_one(snapshot, request, cancellation));
         }
+
+        if (options_.reverse_completions)
+            std::reverse(completions.begin(), completions.end());
+        if (!completions.empty()) {
+            if (options_.completion_fault == mock_completion_fault_t::duplicate) {
+                completions.push_back(completions.front());
+            } else if (options_.completion_fault == mock_completion_fault_t::missing) {
+                completions.pop_back();
+            } else if (options_.completion_fault == mock_completion_fault_t::unknown) {
+                completions.front().request_id =
+                    (std::numeric_limits<std::uint64_t>::max)();
+            }
+        }
         return workspace_result_t<std::vector<tile_decode_completion_t>>::success(
             std::move(completions));
     }
 
 private:
+    mock_tile_decode_executor_options_t options_;
     tile_decode_executor_capabilities_t caps_;
+    std::uint64_t maximum_observed_gap_request_bytes_ = 0;
+    std::vector<tile_decode_request_t> observed_requests_;
 
     tile_decode_completion_t decode_one(
         const provider_snapshot_t& snapshot,
@@ -287,6 +332,10 @@ private:
                 target.direct = true;
                 completion.records.target_facts.push_back(target);
                 ++target_idx;
+                if (options_.duplicate_targets) {
+                    completion.records.target_facts.push_back(target);
+                    ++target_idx;
+                }
 
                 coverage_span_t span;
                 span.start = rva_address(rva);
@@ -315,6 +364,10 @@ private:
                 target.direct = true;
                 completion.records.target_facts.push_back(target);
                 ++target_idx;
+                if (options_.duplicate_targets) {
+                    completion.records.target_facts.push_back(target);
+                    ++target_idx;
+                }
 
                 coverage_span_t span;
                 span.start = rva_address(rva);
@@ -376,6 +429,8 @@ private:
             }
 
             offset += instr.length;
+            if ((instr.flow_flags & flow_terminal) != 0)
+                break;
         }
 
         completion.records.bytes_consumed = offset;
@@ -384,52 +439,359 @@ private:
     }
 };
 
-std::uint64_t mix(std::uint64_t value) noexcept
+class adversarial_tile_decode_executor_t final : public tile_decode_executor_t {
+public:
+    adversarial_tile_decode_executor_t()
+    {
+        capabilities_.decoder_key = x64_key();
+        capabilities_.maximum_request_bytes = 32;
+        capabilities_.minimum_instruction_bytes = 1;
+        capabilities_.maximum_instruction_bytes = 15;
+        capabilities_.instruction_alignment = 1;
+        capabilities_.worker_count = 1;
+    }
+
+    const tile_decode_executor_capabilities_t& capabilities() const noexcept override
+    {
+        return capabilities_;
+    }
+
+    workspace_result_t<std::vector<tile_decode_completion_t>> execute_batch(
+        const provider_snapshot_t&,
+        const std::vector<tile_decode_request_t>& requests,
+        const cancellation_token_t&) override
+    {
+        std::vector<tile_decode_completion_t> completions;
+        completions.reserve(requests.size());
+        for (const auto& request : requests) {
+            tile_decode_completion_t completion;
+            completion.request_id = request.request_id;
+            if (request.pass == tile_decode_pass_t::recursive) {
+                instruction_record_t first;
+                first.address = rva_address(request.start.value);
+                first.length = 3;
+                first.mnemonic_id = 10;
+                first.opcode_id = 0x100;
+                first.flow_flags = flow_terminal;
+                first.provenance = request.provenance;
+                first.confidence = 60;
+                first.stable_source_id = 10;
+                first.operand_fact_begin = 0;
+                first.operand_fact_count = 2;
+
+                operand_fact_t destination;
+                destination.operand_index = 0;
+                destination.kind = operand_kind_t::reg;
+                destination.bit_width = 64;
+                destination.reg = 1;
+                completion.records.operand_facts.push_back(destination);
+                auto source = destination;
+                source.operand_index = 1;
+                source.reg = 2;
+                completion.records.operand_facts.push_back(source);
+                completion.records.instructions.push_back(first);
+
+                auto overlap = first;
+                overlap.address = rva_address(request.start.value + 1);
+                overlap.length = 2;
+                overlap.mnemonic_id = 11;
+                overlap.opcode_id = 0x101;
+                overlap.confidence = 50;
+                overlap.stable_source_id = 11;
+                overlap.operand_fact_begin = 0;
+                overlap.operand_fact_count = 0;
+                completion.records.instructions.push_back(overlap);
+
+                auto replacement = first;
+                replacement.length = 2;
+                replacement.mnemonic_id = 12;
+                replacement.opcode_id = 0x102;
+                replacement.confidence = 90;
+                replacement.stable_source_id = 9;
+                completion.records.instructions.push_back(replacement);
+
+                auto outside = first;
+                outside.address = rva_address(request.owned_end_rva);
+                outside.length = 1;
+                outside.mnemonic_id = 13;
+                outside.opcode_id = 0x103;
+                outside.confidence = 100;
+                outside.stable_source_id = 8;
+                completion.records.instructions.push_back(outside);
+
+                completion.records.delay_slot_counts.resize(
+                    completion.records.instructions.size(), 0);
+
+                coverage_span_t clipped;
+                clipped.start = rva_address(request.owned_end_rva - 1);
+                clipped.size = 4;
+                clipped.reason = coverage_reason_t::decoded;
+                clipped.provenance = request.provenance;
+                clipped.confidence = request.confidence;
+                completion.records.coverage.push_back(clipped);
+
+                auto outside_coverage = clipped;
+                outside_coverage.start = rva_address(request.owned_end_rva);
+                outside_coverage.size = 1;
+                completion.records.coverage.push_back(outside_coverage);
+                completion.records.bytes_consumed = request.byte_count;
+            }
+            completions.push_back(std::move(completion));
+        }
+        return workspace_result_t<std::vector<tile_decode_completion_t>>::success(
+            std::move(completions));
+    }
+
+private:
+    tile_decode_executor_capabilities_t capabilities_;
+};
+
+class in_flight_cancelling_executor_t final : public tile_decode_executor_t {
+public:
+    explicit in_flight_cancelling_executor_t(cancellation_source_t& source)
+        : source_(source)
+    {
+        capabilities_.decoder_key = x64_key();
+        capabilities_.maximum_request_bytes = 64;
+        capabilities_.minimum_instruction_bytes = 1;
+        capabilities_.maximum_instruction_bytes = 15;
+        capabilities_.instruction_alignment = 1;
+        capabilities_.worker_count = 1;
+    }
+
+    const tile_decode_executor_capabilities_t& capabilities() const noexcept override
+    {
+        return capabilities_;
+    }
+
+    workspace_result_t<std::vector<tile_decode_completion_t>> execute_batch(
+        const provider_snapshot_t&,
+        const std::vector<tile_decode_request_t>& requests,
+        const cancellation_token_t&) override
+    {
+        std::vector<tile_decode_completion_t> completions;
+        completions.reserve(requests.size());
+        for (const auto& request : requests) {
+            tile_decode_completion_t completion;
+            completion.request_id = request.request_id;
+            completions.push_back(std::move(completion));
+        }
+        source_.request_cancel();
+        return workspace_result_t<std::vector<tile_decode_completion_t>>::success(
+            std::move(completions));
+    }
+
+private:
+    cancellation_source_t& source_;
+    tile_decode_executor_capabilities_t capabilities_;
+};
+
+template <typename T,
+          std::enable_if_t<std::is_integral_v<T> &&
+                           !std::is_same_v<T, bool>, int> = 0>
+void append_integral(std::vector<std::uint8_t>& output, T value)
 {
-    value ^= value >> 30U;
-    value *= 0xbf58476d1ce4e5b9ULL;
-    value ^= value >> 27U;
-    value *= 0x94d049bb133111ebULL;
-    value ^= value >> 31U;
-    return value;
+    using unsigned_t = std::make_unsigned_t<T>;
+    auto encoded = static_cast<std::uint64_t>(
+        static_cast<unsigned_t>(value));
+    for (std::size_t index = 0; index < sizeof(unsigned_t); ++index) {
+        output.push_back(static_cast<std::uint8_t>(encoded & 0xFFU));
+        encoded >>= 8U;
+    }
 }
 
-std::uint64_t combine(std::uint64_t seed, std::uint64_t value) noexcept
+void append_integral(std::vector<std::uint8_t>& output, bool value)
 {
-    return mix(seed ^ (mix(value) + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U)));
+    output.push_back(value ? 1U : 0U);
 }
 
-std::uint64_t orchestration_hash(const tile_decode_orchestration_result_t& result) noexcept
+template <typename T, std::enable_if_t<std::is_enum_v<T>, int> = 0>
+void append_enum(std::vector<std::uint8_t>& output, T value)
 {
-    std::uint64_t value = 0;
-    for (const auto& s : result.shards) {
-        value = combine(value, s.tile_id);
-        value = combine(value, s.shard_id);
-        value = combine(value, s.instruction_count);
-        value = combine(value, s.operand_count);
-        value = combine(value, s.edge_count);
+    append_integral(output, static_cast<std::underlying_type_t<T>>(value));
+}
+
+void append_address(std::vector<std::uint8_t>& output, const address_t& address)
+{
+    append_enum(output, address.space);
+    append_integral(output, address.value);
+    append_enum(output, address.architecture);
+    append_enum(output, address.mode);
+}
+
+void append_string(std::vector<std::uint8_t>& output, std::string_view value)
+{
+    append_integral(output, static_cast<std::uint64_t>(value.size()));
+    for (const auto character : value) {
+        output.push_back(static_cast<std::uint8_t>(
+            static_cast<unsigned char>(character)));
     }
-    for (const auto& e : result.cross_tile_edges) {
-        value = combine(value, e.source_tile_id);
-        value = combine(value, e.target_tile_id);
-        value = combine(value, e.source.value);
-        value = combine(value, e.target.value);
-        value = combine(value, static_cast<std::uint64_t>(e.kind));
+}
+
+std::vector<std::uint8_t> orchestration_bytes(
+    const tile_decode_orchestration_result_t& result)
+{
+    std::vector<std::uint8_t> output;
+    append_integral(output, static_cast<std::uint64_t>(result.shards.size()));
+    for (const auto& shard : result.shards) {
+        append_integral(output, shard.tile_id);
+        append_integral(output, shard.shard_id);
+        append_integral(output, shard.instruction_count);
+        append_integral(output, shard.operand_count);
+        append_integral(output, shard.target_count);
+        append_integral(output, shard.edge_count);
     }
-    value = combine(value, result.statistics.accepted_instructions);
-    value = combine(value, result.statistics.accepted_operands);
-    value = combine(value, result.statistics.accepted_edges);
-    value = combine(value, result.statistics.cross_tile_edges);
-    value = combine(value, result.statistics.invalid_bytes);
-    value = combine(value, result.statistics.recursive_requests);
-    value = combine(value, result.statistics.gap_requests);
-    if (result.packed_store) {
-        value = combine(value, result.packed_store->instruction_count());
-        value = combine(value, result.packed_store->operand_count());
-        value = combine(value, result.packed_store->edge_count());
-        value = combine(value, result.packed_store->coverage_count());
+
+    append_integral(output,
+                    static_cast<std::uint64_t>(result.delay_slot_counts.size()));
+    for (const auto count : result.delay_slot_counts)
+        append_integral(output, count);
+
+    append_integral(output,
+                    static_cast<std::uint64_t>(result.cross_tile_edges.size()));
+    for (const auto& edge : result.cross_tile_edges) {
+        append_integral(output, edge.source_tile_id);
+        append_integral(output, edge.target_tile_id);
+        append_address(output, edge.source);
+        append_address(output, edge.target);
+        append_enum(output, edge.kind);
     }
-    return value;
+
+    append_integral(output, static_cast<std::uint64_t>(result.coverage.size()));
+    for (const auto& span : result.coverage) {
+        append_address(output, span.start);
+        append_integral(output, span.size);
+        append_enum(output, span.reason);
+        append_enum(output, span.provenance);
+        append_integral(output, span.confidence);
+        append_integral(output, span.detail_code);
+    }
+
+    const auto& statistics = result.statistics;
+    append_integral(output, statistics.initialized_executable_bytes);
+    append_integral(output, statistics.zero_fill_executable_bytes);
+    append_integral(output, statistics.recursive_requests);
+    append_integral(output, statistics.gap_requests);
+    append_integral(output, statistics.decoded_instruction_candidates);
+    append_integral(output, statistics.accepted_instructions);
+    append_integral(output, statistics.duplicate_instruction_candidates);
+    append_integral(output, statistics.overlap_instruction_candidates);
+    append_integral(output, statistics.accepted_operands);
+    append_integral(output, statistics.accepted_target_facts);
+    append_integral(output, statistics.accepted_edges);
+    append_integral(output, statistics.duplicate_edges);
+    append_integral(output, statistics.cross_tile_edges);
+    append_integral(output, statistics.invalid_bytes);
+    append_integral(output, statistics.invalid_runs);
+    append_integral(output, statistics.frontier.unique_seed_count);
+    append_integral(output, statistics.frontier.pending_seed_count);
+    append_integral(output, statistics.frontier.claimed_seed_count);
+    append_integral(output, statistics.frontier.duplicate_seed_count);
+    append_integral(output, statistics.frontier.strengthened_seed_count);
+    append_integral(output, statistics.frontier.outside_seed_count);
+    append_integral(output, statistics.frontier.cross_tile_route_count);
+
+    append_integral(output, result.packed_store != nullptr);
+    if (result.packed_store == nullptr)
+        return output;
+
+    const auto& store = *result.packed_store;
+    append_integral(output, store.instruction_count());
+    append_integral(output, store.operand_count());
+    append_integral(output, store.edge_count());
+    append_integral(output, store.string_record_count());
+    append_integral(output, store.symbol_count());
+    append_integral(output, store.address_expression_count());
+    append_integral(output, store.basic_block_count());
+    append_integral(output, store.function_count());
+    append_integral(output, store.function_chunk_count());
+    append_integral(output, store.target_fact_count());
+    append_integral(output, store.xref_count());
+    append_integral(output, store.coverage_count());
+
+    for (std::size_t index = 0; index < store.instruction_count(); ++index) {
+        const auto instruction = store.instruction(index);
+        require(instruction.has_value(), "packed instruction view is unavailable");
+        append_integral(output, instruction->id.value());
+        append_address(output, instruction->address);
+        append_integral(output, instruction->length);
+        append_integral(output, instruction->mnemonic_id);
+        append_string(output, instruction->mnemonic);
+        append_integral(output, instruction->opcode_id);
+        append_integral(output, instruction->flow_flags);
+        append_integral(output, instruction->first_operand);
+        append_integral(output, instruction->operand_count);
+        append_enum(output, instruction->provenance);
+        append_integral(output, instruction->confidence);
+        append_enum(output, instruction->coverage);
+        append_integral(output, instruction->stable_source_id);
+    }
+
+    for (std::size_t index = 0; index < store.operand_count(); ++index) {
+        const auto operand = store.operand(index);
+        require(operand.has_value(), "packed operand view is unavailable");
+        append_integral(output, operand->id.value());
+        append_integral(output, operand->instruction_id.value());
+        append_integral(output, operand->address_expression_id.value());
+        append_integral(output, operand->operand_index);
+        append_integral(output, operand->decoder_operand_id);
+        append_enum(output, operand->kind);
+        append_integral(output, operand->access);
+        append_integral(output, operand->visibility);
+        append_integral(output, operand->encoding);
+        append_integral(output, operand->memory_type);
+        append_integral(output, operand->access_width);
+        append_integral(output, operand->bit_width);
+        append_integral(output, operand->access_width_bits);
+        append_integral(output, operand->access_count);
+        append_integral(output, operand->element_width_bits);
+        append_integral(output, operand->element_count);
+        append_integral(output, operand->address_width_bits);
+        append_integral(output, operand->reg);
+        append_integral(output, operand->segment_reg);
+        append_integral(output, operand->base_reg);
+        append_integral(output, operand->index_reg);
+        append_integral(output, operand->scale);
+        append_integral(output, operand->relative);
+        append_integral(output, operand->signed_value);
+        append_integral(output, operand->has_displacement);
+        append_integral(output, operand->has_resolved_expression_value);
+        append_integral(output, operand->displacement);
+        append_integral(output, operand->immediate);
+        append_integral(output, operand->resolved_expression_value);
+        append_integral(output, operand->address_components);
+        append_enum(output, operand->address_expression_kind);
+        append_enum(output, operand->address_resolution);
+    }
+
+    for (std::size_t index = 0; index < store.edge_count(); ++index) {
+        const auto edge = store.edge(index);
+        require(edge.has_value(), "packed edge view is unavailable");
+        append_integral(output, edge->id.value());
+        append_integral(output, edge->source_entity.value());
+        append_integral(output, edge->target_entity.has_value());
+        if (edge->target_entity)
+            append_integral(output, edge->target_entity->value());
+        append_address(output, edge->source);
+        append_address(output, edge->target);
+        append_enum(output, edge->kind);
+        append_enum(output, edge->provenance);
+        append_integral(output, edge->confidence);
+    }
+
+    for (std::size_t index = 0; index < store.coverage_count(); ++index) {
+        const auto coverage = store.coverage(index);
+        require(coverage.has_value(), "packed coverage view is unavailable");
+        append_integral(output, coverage->id.value());
+        append_address(output, coverage->span_begin);
+        append_address(output, coverage->span_end);
+        append_enum(output, coverage->reason);
+        append_integral(output, coverage->undecodable_count);
+        append_enum(output, coverage->provenance);
+        append_integral(output, coverage->confidence);
+    }
+
+    return output;
 }
 
 tile_decode_orchestrator_limits_t small_limits()
@@ -448,6 +810,241 @@ tile_decode_orchestrator_limits_t small_limits()
     limits.invalid_run_policy.maximum_invalid_runs_per_tile = 32;
     limits.invalid_run_policy.maximum_gap_resynchronization_bytes = 256;
     return limits;
+}
+
+tile_decode_seed_t export_seed(std::uint64_t rva, std::uint64_t source_id = 1)
+{
+    tile_decode_seed_t seed;
+    seed.address = rva_address(rva);
+    seed.provenance = fact_provenance_t::export_entry;
+    seed.confidence = 100;
+    seed.stable_source_id = source_id;
+    return seed;
+}
+
+void require_limit_exceeded(
+    const workspace_result_t<tile_decode_orchestration_result_t>& result,
+    std::string_view message)
+{
+    require(!result, message);
+    require(result.error().code == workspace_error_code_t::limit_exceeded,
+            "orchestrator exhaustion did not return limit_exceeded");
+    const auto resource = std::find_if(
+        result.error().details.begin(), result.error().details.end(),
+        [](const auto& detail) { return detail.first == "resource"; });
+    require(resource != result.error().details.end() && !resource->second.empty(),
+            "orchestrator exhaustion omitted typed resource metadata");
+}
+
+void test_request_correlation_and_completion_contract()
+{
+    std::vector<std::uint8_t> text(8, 0x90);
+    text.back() = 0xC3;
+    std::vector<std::uint8_t> file_bytes(0x800, 0x00);
+    std::copy(text.begin(), text.end(), file_bytes.begin() + 0x400);
+
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, text.size(), 0x400, file_bytes.size());
+    auto limits = small_limits();
+    limits.target_tile_bytes = 8;
+    limits.seed_executable_range_starts = false;
+
+    auto orchestrator_result = tile_decode_orchestrator_t::create(limits);
+    require(orchestrator_result.has_value(),
+            "request-correlation orchestrator create failed");
+    const std::vector<tile_decode_seed_t> seeds{export_seed(0x1000)};
+
+    mock_tile_decode_executor_options_t ordered_options;
+    ordered_options.maximum_request_bytes = 1;
+    ordered_options.reverse_completions = true;
+    mock_tile_decode_executor_t ordered_executor(ordered_options);
+    auto ordered_result = orchestrator_result.value().run(
+        fixture.snapshot(), layout, seeds, ordered_executor);
+    require(ordered_result.has_value(),
+            "globally numbered out-of-order completions were not correlated");
+    require(ordered_result.value().packed_store != nullptr,
+            "request-correlation run produced no packed store");
+    require(ordered_result.value().packed_store->instruction_count() == text.size(),
+            "request correlation lost recursively scheduled instructions");
+
+    const mock_completion_fault_t faults[] = {
+        mock_completion_fault_t::duplicate,
+        mock_completion_fault_t::missing,
+        mock_completion_fault_t::unknown};
+    for (const auto fault : faults) {
+        mock_tile_decode_executor_options_t fault_options;
+        fault_options.maximum_request_bytes = text.size();
+        fault_options.completion_fault = fault;
+        mock_tile_decode_executor_t fault_executor(fault_options);
+        auto fault_result = orchestrator_result.value().run(
+            fixture.snapshot(), layout, seeds, fault_executor);
+        require(!fault_result,
+                "malformed completion cardinality was accepted");
+        require(fault_result.error().code ==
+                    workspace_error_code_t::integrity_failure,
+                "malformed completion cardinality returned the wrong error type");
+    }
+}
+
+void test_duplicate_overlap_and_ownership()
+{
+    std::vector<std::uint8_t> text(0x10, 0x90);
+    std::vector<std::uint8_t> file_bytes(0x800, 0x00);
+    std::copy(text.begin(), text.end(), file_bytes.begin() + 0x400);
+
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, text.size(), 0x400, file_bytes.size());
+    auto limits = small_limits();
+    limits.target_tile_bytes = 8;
+    limits.seed_executable_range_starts = false;
+
+    auto orchestrator_result = tile_decode_orchestrator_t::create(limits);
+    require(orchestrator_result.has_value(),
+            "ownership orchestrator create failed");
+    adversarial_tile_decode_executor_t executor;
+    const std::vector<tile_decode_seed_t> seeds{export_seed(0x1000)};
+    auto run_result = orchestrator_result.value().run(
+        fixture.snapshot(), layout, seeds, executor);
+    require(run_result.has_value(), "ownership decode run failed");
+
+    const auto& result = run_result.value();
+    require(result.packed_store != nullptr,
+            "ownership decode produced no packed store");
+    require(result.packed_store->instruction_count() == 1,
+            "duplicate or overlapping instructions escaped arbitration");
+    const auto instruction = result.packed_store->instruction(0);
+    require(instruction.has_value(),
+            "retained ownership instruction is unavailable");
+    require(instruction->address.value == 0x1000 && instruction->length == 2 &&
+                instruction->mnemonic_id == 12,
+            "strongest duplicate instruction was not retained");
+    require(result.statistics.duplicate_instruction_candidates == 1,
+            "duplicate instruction candidate was not counted");
+    require(result.statistics.overlap_instruction_candidates == 1,
+            "overlap instruction candidate was not counted");
+    require(result.statistics.accepted_instructions == 1 &&
+                result.statistics.accepted_operands == 2,
+            "accepted instruction or operand totals do not reflect retained ownership");
+    require(result.coverage.size() == 1,
+            "out-of-ownership coverage was not discarded");
+    require(result.coverage.front().start.value == 0x1007 &&
+                result.coverage.front().size == 1,
+            "cross-boundary coverage was not clipped to tile ownership");
+}
+
+void test_typed_exhaustion_failures()
+{
+    std::vector<std::uint8_t> text(0x40, 0x90);
+    std::vector<std::uint8_t> file_bytes(0x800, 0x00);
+    std::copy(text.begin(), text.end(), file_bytes.begin() + 0x400);
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, text.size(), 0x400, file_bytes.size());
+    const std::vector<tile_decode_seed_t> seeds{export_seed(0x1000)};
+
+    {
+        auto limits = small_limits();
+        limits.target_tile_bytes = 8;
+        limits.maximum_tiles = 1;
+        limits.seed_executable_range_starts = false;
+        auto orchestrator = tile_decode_orchestrator_t::create(limits);
+        require(orchestrator.has_value(), "tile-limit orchestrator create failed");
+        mock_tile_decode_executor_t executor;
+        auto result = orchestrator.value().run(
+            fixture.snapshot(), layout, seeds, executor);
+        require_limit_exceeded(result, "tile exhaustion was silently truncated");
+    }
+
+    {
+        auto limits = small_limits();
+        limits.target_tile_bytes = text.size();
+        limits.maximum_decode_requests = 1;
+        limits.seed_executable_range_starts = false;
+        auto orchestrator = tile_decode_orchestrator_t::create(limits);
+        require(orchestrator.has_value(), "request-limit orchestrator create failed");
+        mock_tile_decode_executor_options_t options;
+        options.maximum_request_bytes = 1;
+        mock_tile_decode_executor_t executor(options);
+        auto result = orchestrator.value().run(
+            fixture.snapshot(), layout, seeds, executor);
+        require_limit_exceeded(result,
+                               "decode request exhaustion was silently truncated");
+    }
+
+    {
+        auto limits = small_limits();
+        limits.target_tile_bytes = text.size();
+        limits.maximum_instructions = 2;
+        limits.seed_executable_range_starts = false;
+        auto orchestrator = tile_decode_orchestrator_t::create(limits);
+        require(orchestrator.has_value(),
+                "instruction-limit orchestrator create failed");
+        mock_tile_decode_executor_t executor;
+        auto result = orchestrator.value().run(
+            fixture.snapshot(), layout, seeds, executor);
+        require_limit_exceeded(result,
+                               "instruction exhaustion was detected too late");
+    }
+
+    {
+        auto limits = small_limits();
+        limits.target_tile_bytes = text.size();
+        limits.maximum_operand_facts = 1;
+        limits.seed_executable_range_starts = false;
+        auto orchestrator = tile_decode_orchestrator_t::create(limits);
+        require(orchestrator.has_value(), "operand-limit orchestrator create failed");
+        adversarial_tile_decode_executor_t executor;
+        auto result = orchestrator.value().run(
+            fixture.snapshot(), layout, seeds, executor);
+        require_limit_exceeded(result,
+                               "operand exhaustion was detected too late");
+    }
+
+    {
+        auto limits = small_limits();
+        limits.target_tile_bytes = text.size();
+        limits.maximum_coverage_spans = 1;
+        limits.seed_executable_range_starts = false;
+        auto orchestrator = tile_decode_orchestrator_t::create(limits);
+        require(orchestrator.has_value(),
+                "coverage-limit orchestrator create failed");
+        mock_tile_decode_executor_t executor;
+        auto result = orchestrator.value().run(
+            fixture.snapshot(), layout, seeds, executor);
+        require_limit_exceeded(result,
+                               "coverage span exhaustion was not enforced");
+    }
+
+    {
+        auto edge_bytes = text;
+        edge_bytes[0x00] = 0xE8;
+        edge_bytes[0x01] = 0x0B;
+        edge_bytes[0x02] = 0x00;
+        edge_bytes[0x03] = 0x00;
+        edge_bytes[0x04] = 0x00;
+        edge_bytes[0x05] = 0xE8;
+        edge_bytes[0x06] = 0x16;
+        edge_bytes[0x07] = 0x00;
+        edge_bytes[0x08] = 0x00;
+        edge_bytes[0x09] = 0x00;
+        edge_bytes[0x0A] = 0xC3;
+        std::vector<std::uint8_t> edge_file(0x800, 0x00);
+        std::copy(edge_bytes.begin(), edge_bytes.end(),
+                  edge_file.begin() + 0x400);
+        mapped_fixture_t edge_fixture(edge_file);
+        auto edge_layout = build_layout(
+            0x1000, edge_bytes.size(), 0x400, edge_file.size());
+
+        auto limits = small_limits();
+        limits.target_tile_bytes = edge_bytes.size();
+        limits.maximum_edges = 1;
+        limits.seed_executable_range_starts = false;
+        auto orchestrator = tile_decode_orchestrator_t::create(limits);
+        require(orchestrator.has_value(), "edge-limit orchestrator create failed");
+        mock_tile_decode_executor_t executor;
+        auto result = orchestrator.value().run(
+            edge_fixture.snapshot(), edge_layout, seeds, executor);
+        require_limit_exceeded(result, "edge exhaustion was detected too late");
+    }
 }
 
 void test_deterministic_decode_fixtures()
@@ -501,9 +1098,10 @@ void test_deterministic_decode_fixtures()
     auto run_result2 = orch.run(fixture.snapshot(), layout, seeds, executor);
     require(run_result2.has_value(), "second deterministic decode run failed");
 
-    const auto hash1 = orchestration_hash(run_result.value());
-    const auto hash2 = orchestration_hash(run_result2.value());
-    require(hash1 == hash2, "deterministic decode is not byte-identical across runs");
+    const auto bytes1 = orchestration_bytes(run_result.value());
+    const auto bytes2 = orchestration_bytes(run_result2.value());
+    require(bytes1 == bytes2,
+            "deterministic decode is not byte-identical across runs");
 }
 
 void test_cross_tile_edge_routing()
@@ -514,7 +1112,6 @@ void test_cross_tile_edge_routing()
     text[0x002] = 0x01;
     text[0x003] = 0x00;
     text[0x004] = 0x00;
-    text[0x005] = 0xC3;
     text[0x200] = 0x90;
     text[0x201] = 0xC3;
 
@@ -539,7 +1136,9 @@ void test_cross_tile_edge_routing()
     seed.stable_source_id = 1;
     seeds.push_back(seed);
 
-    mock_tile_decode_executor_t executor;
+    mock_tile_decode_executor_options_t executor_options;
+    executor_options.duplicate_targets = true;
+    mock_tile_decode_executor_t executor(executor_options);
     auto run_result = orch.run(fixture.snapshot(), layout, seeds, executor);
     require(run_result.has_value(), "cross-tile decode run failed");
 
@@ -548,12 +1147,34 @@ void test_cross_tile_edge_routing()
             "cross-tile edges were not routed");
     require(result.statistics.cross_tile_edges > 0,
             "cross-tile edge count statistic is zero");
+    require(result.packed_store != nullptr &&
+                result.packed_store->target_fact_count() ==
+                    result.statistics.accepted_target_facts &&
+                result.statistics.accepted_target_facts > 0,
+            "accepted target facts did not reach the packed publication");
+    const auto target = result.packed_store->compatibility_view().target_fact(0);
+    require(target.has_value() && target->instruction_id != 0,
+            "packed target fact lost its instruction relationship");
 
-    const auto& edge = result.cross_tile_edges.front();
-    require(edge.source_tile_id != edge.target_tile_id,
-            "cross-tile edge does not cross tiles");
-    require(edge.target.value == 0x1200,
-            "cross-tile edge target is incorrect");
+    const auto call_edges = static_cast<std::size_t>(std::count_if(
+        result.cross_tile_edges.begin(), result.cross_tile_edges.end(),
+        [](const auto& edge) {
+            return edge.source.value == 0x1000 && edge.target.value == 0x1200 &&
+                   edge.kind == edge_kind_t::call;
+        }));
+    const auto fallthrough_edges = static_cast<std::size_t>(std::count_if(
+        result.cross_tile_edges.begin(), result.cross_tile_edges.end(),
+        [](const auto& edge) {
+            return edge.source.value == 0x11FF && edge.target.value == 0x1200 &&
+                   edge.kind == edge_kind_t::fallthrough;
+        }));
+    require(call_edges == 1, "cross-tile call edge was not deduplicated");
+    require(fallthrough_edges == 1,
+            "cross-tile boundary fallthrough was not routed exactly once");
+    require(result.statistics.duplicate_edges > 0,
+            "duplicate cross-tile edge candidates were not tracked");
+    require(result.statistics.cross_tile_edges == result.cross_tile_edges.size(),
+            "cross-tile edge statistic does not match unique output");
 }
 
 void test_gap_decode()
@@ -572,6 +1193,7 @@ void test_gap_decode()
 
     tile_decode_orchestrator_limits_t limits = small_limits();
     limits.seed_executable_range_starts = false;
+    limits.invalid_run_policy.maximum_gap_resynchronization_bytes = 32;
 
     auto orch_result = tile_decode_orchestrator_t::create(limits);
     require(orch_result.has_value(), "gap decode orchestrator create failed");
@@ -594,6 +1216,9 @@ void test_gap_decode()
             "gap pass did not produce any gap requests");
     require(result.statistics.accepted_instructions > 2,
             "gap decode did not recover instructions beyond recursive pass");
+    require(executor.maximum_observed_gap_request_bytes() ==
+                limits.invalid_run_policy.maximum_gap_resynchronization_bytes,
+            "gap decode request exceeded the resynchronization byte limit");
 }
 
 void test_invalid_run_handling()
@@ -624,13 +1249,47 @@ void test_invalid_run_handling()
 
     mock_tile_decode_executor_t executor;
     auto run_result = orch.run(fixture.snapshot(), layout, seeds, executor);
-    require(run_result.has_value(), "invalid-run decode run failed");
+    require(!run_result.has_value(),
+            "invalid-run exhaustion returned a partial successful decode");
+    require(run_result.error().code == workspace_error_code_t::limit_exceeded,
+            "invalid-run exhaustion did not report a limit error");
+}
 
+void test_zero_fill_is_not_submitted_for_decode()
+{
+    std::vector<std::uint8_t> file_bytes(0x800, 0x00);
+    std::fill(file_bytes.begin() + 0x400, file_bytes.begin() + 0x500, 0x90);
+
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, 0x100, 0x400, file_bytes.size(),
+        0, 0, 0, 0x200);
+    auto orch_result = tile_decode_orchestrator_t::create(small_limits());
+    require(orch_result.has_value(), "zero-fill orchestrator create failed");
+
+    mock_tile_decode_executor_t executor;
+    auto run_result = orch_result.value().run(
+        fixture.snapshot(), layout, {export_seed(0x1000)}, executor);
+    require(run_result.has_value(), "zero-fill decode run failed");
     const auto& result = run_result.value();
-    require(result.statistics.invalid_policy_cutoffs > 0,
-            "invalid-run policy did not trigger any cutoffs");
-    require(result.statistics.invalid_bytes > 0,
-            "invalid-run policy did not track invalid bytes");
+    require(result.statistics.initialized_executable_bytes == 0x100,
+            "initialized executable byte accounting is incorrect");
+    require(result.statistics.zero_fill_executable_bytes == 0x100,
+            "zero-fill executable byte accounting is incorrect");
+    for (const auto& request : executor.observed_requests()) {
+        std::uint64_t provider_end = 0;
+        require(checked_add_u64(request.provider_offset, request.byte_count,
+                    provider_end) && provider_end <= 0x500,
+                "zero-fill bytes were submitted as provider-backed decode input");
+    }
+    const auto zero_fill = std::find_if(result.coverage.begin(), result.coverage.end(),
+        [](const coverage_span_t& span) {
+            return span.start.value == 0x1100 && span.size == 0x100 &&
+                span.reason == coverage_reason_t::undecodable &&
+                span.detail_code == static_cast<std::uint32_t>(
+                    tile_coverage_detail_t::zero_fill);
+        });
+    require(zero_fill != result.coverage.end(),
+            "zero-fill range did not publish a typed undecodable span");
 }
 
 void test_cancellation()
@@ -664,7 +1323,35 @@ void test_cancellation()
     require(!run_result, "cancelled orchestrator run did not fail");
     require(run_result.error().code == workspace_error_code_t::cancelled ||
             run_result.error().code == workspace_error_code_t::deadline_exceeded,
-            "cancelled orchestrator run did not report cancellation");
+             "cancelled orchestrator run did not report cancellation");
+}
+
+void test_in_flight_cancellation()
+{
+    std::vector<std::uint8_t> text(0x40, 0x90);
+    std::vector<std::uint8_t> file_bytes(0x800, 0x00);
+    std::copy(text.begin(), text.end(), file_bytes.begin() + 0x400);
+
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, text.size(), 0x400, file_bytes.size());
+    auto limits = small_limits();
+    limits.target_tile_bytes = text.size();
+    limits.seed_executable_range_starts = false;
+
+    auto orchestrator_result = tile_decode_orchestrator_t::create(limits);
+    require(orchestrator_result.has_value(),
+            "in-flight cancellation orchestrator create failed");
+    cancellation_source_t cancellation;
+    in_flight_cancelling_executor_t executor(cancellation);
+    const std::vector<tile_decode_seed_t> seeds{export_seed(0x1000)};
+
+    auto run_result = orchestrator_result.value().run(
+        fixture.snapshot(), layout, seeds, executor, cancellation.token());
+    require(!run_result, "in-flight cancellation was ignored");
+    require(run_result.error().code == workspace_error_code_t::cancelled,
+            "in-flight cancellation returned the wrong error type");
+    require(run_result.error().cancellation,
+            "in-flight cancellation did not preserve cancellation metadata");
 }
 
 void test_shard_output()
@@ -745,8 +1432,6 @@ void test_randomized_scheduling_byte_identical()
     require(orch_result.has_value(), "randomized scheduling orchestrator create failed");
     auto& orch = orch_result.value();
 
-    mock_tile_decode_executor_t executor;
-
     std::vector<tile_decode_seed_t> base_seeds;
     for (int i = 0; i < 4; ++i) {
         tile_decode_seed_t seed;
@@ -758,22 +1443,26 @@ void test_randomized_scheduling_byte_identical()
     }
 
     std::mt19937_64 rng(42);
-    std::uint64_t first_hash = 0;
+    std::vector<std::uint8_t> first_bytes;
     bool first = true;
 
     for (int trial = 0; trial < 8; ++trial) {
         auto shuffled = base_seeds;
         std::shuffle(shuffled.begin(), shuffled.end(), rng);
 
+        mock_tile_decode_executor_options_t options;
+        options.reverse_completions = (trial % 2) != 0;
+        mock_tile_decode_executor_t executor(options);
+
         auto run_result = orch.run(fixture.snapshot(), layout, shuffled, executor);
         require(run_result.has_value(), "randomized scheduling run failed");
 
-        const auto hash = orchestration_hash(run_result.value());
+        const auto bytes = orchestration_bytes(run_result.value());
         if (first) {
-            first_hash = hash;
+            first_bytes = bytes;
             first = false;
         } else {
-            require(hash == first_hash,
+            require(bytes == first_bytes,
                     "randomized scheduling is not byte-identical across orderings");
         }
     }
@@ -784,11 +1473,16 @@ void test_randomized_scheduling_byte_identical()
 bool run_tile_decode_orchestrator_harness(std::string& failure)
 {
     try {
+        test_request_correlation_and_completion_contract();
+        test_duplicate_overlap_and_ownership();
+        test_typed_exhaustion_failures();
         test_deterministic_decode_fixtures();
         test_cross_tile_edge_routing();
         test_gap_decode();
         test_invalid_run_handling();
+        test_zero_fill_is_not_submitted_for_decode();
         test_cancellation();
+        test_in_flight_cancellation();
         test_shard_output();
         test_randomized_scheduling_byte_identical();
         return true;

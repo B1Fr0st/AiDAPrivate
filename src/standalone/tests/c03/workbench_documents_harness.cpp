@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -48,10 +50,9 @@ public:
     explicit disasm_source_t(std::uint64_t row_count)
         : row_count_(row_count)
     {
-        rebuild();
     }
 
-    void advance_generation() { ++generation_; rebuild(); }
+    void advance_generation() { ++generation_; }
 
     std::uint64_t current_generation() const noexcept override { return generation_; }
     bool generation_current(std::uint64_t gen) const noexcept override
@@ -64,7 +65,7 @@ public:
     }
 
     bool row_at(std::uint64_t gen, std::uint64_t ordinal,
-                disasm_document::disasm_instruction_view_t& output) const noexcept override
+                disasm_document::disasm_instruction_view_t& output) const override
     {
         if (gen != generation_ || ordinal >= row_count_)
             return false;
@@ -83,53 +84,38 @@ public:
 
     bool row_by_address(std::uint64_t gen, std::uint64_t address,
                         disasm_document::disasm_instruction_view_t& output,
-                        std::uint64_t& ordinal) const noexcept override
+                        std::uint64_t& ordinal) const override
     {
         if (gen != generation_)
             return false;
         if (address < 0x401000U)
             return false;
         const auto offset = address - 0x401000U;
-        if (offset % 4 != 0)
-            return false;
         ordinal = offset / 4;
         if (ordinal >= row_count_)
             return false;
         return row_at(gen, ordinal, output);
     }
 
-    std::uint64_t overlay_revision(std::uint64_t gen) const noexcept override
+    std::uint64_t overlay_revision(std::uint64_t) const noexcept override
     {
-        return gen;
+        return generation_;
     }
 
 private:
-    void rebuild()
-    {
-        mnemonics_.clear();
-        operands_.clear();
-        hexes_.clear();
-        mnemonics_.resize(row_count_, "nop");
-        operands_.resize(row_count_, "");
-        hexes_.resize(row_count_, "90 90 90 90");
-    }
-
     std::uint64_t generation_ = 1;
     std::uint64_t row_count_;
-    std::vector<std::string> mnemonics_;
-    std::vector<std::string> operands_;
-    std::vector<std::string> hexes_;
 };
 
 class disasm_overlay_t final : public disasm_document::disasm_overlay_adapter_t {
 public:
-    std::uint32_t overlay_count(std::uint64_t gen) const noexcept override
+    std::uint32_t overlay_count(std::uint64_t) const noexcept override
     {
         return static_cast<std::uint32_t>(entries_.size());
     }
 
-    bool overlay_at(std::uint64_t gen, std::uint32_t ordinal,
-                    disasm_document::disasm_overlay_entry_t& output) const noexcept override
+    bool overlay_at(std::uint64_t, std::uint32_t ordinal,
+                    disasm_document::disasm_overlay_entry_t& output) const override
     {
         if (ordinal >= entries_.size())
             return false;
@@ -137,8 +123,8 @@ public:
         return true;
     }
 
-    bool overlay_by_address(std::uint64_t gen, std::uint64_t address,
-                            disasm_document::disasm_overlay_entry_t& output) const noexcept override
+    bool overlay_by_address(std::uint64_t, std::uint64_t address,
+                            disasm_document::disasm_overlay_entry_t& output) const override
     {
         for (const auto& e : entries_) {
             if (e.address == address && e.active) {
@@ -149,7 +135,7 @@ public:
         return false;
     }
 
-    workbench_error_t apply_overlay(std::uint64_t gen,
+    workbench_error_t apply_overlay(std::uint64_t,
                                     const disasm_document::disasm_overlay_entry_t& entry) override
     {
         for (auto& e : entries_) {
@@ -162,7 +148,7 @@ public:
         return {};
     }
 
-    workbench_error_t remove_overlay(std::uint64_t gen,
+    workbench_error_t remove_overlay(std::uint64_t,
                                      std::uint64_t address) override
     {
         auto it = std::remove_if(entries_.begin(), entries_.end(),
@@ -197,13 +183,13 @@ public:
 
 class hex_source_t final : public hex_document::hex_source_adapter_t {
 public:
-    explicit hex_source_t(std::uint64_t row_count)
+    explicit hex_source_t(std::uint64_t row_count, std::uint64_t base_address = 0)
         : row_count_(row_count)
+        , base_address_(base_address)
     {
-        rebuild();
     }
 
-    void advance_generation() { ++generation_; rebuild(); }
+    void advance_generation() { ++generation_; }
 
     std::uint64_t current_generation() const noexcept override { return generation_; }
     bool generation_current(std::uint64_t gen) const noexcept override
@@ -216,59 +202,53 @@ public:
     }
 
     bool row_at(std::uint64_t gen, std::uint64_t ordinal,
-                hex_document::hex_row_view_t& output) const noexcept override
+                hex_document::hex_row_view_t& output) const override
     {
         if (gen != generation_ || ordinal >= row_count_)
             return false;
         output.id = hex_document::hex_row_id_t{ordinal + 1};
-        output.address = ordinal * hex_document::k_hex_document_bytes_per_row;
+        output.address = base_address_ + ordinal * hex_document::k_hex_document_bytes_per_row;
         output.hex_text = "90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90";
         output.ascii_text = "................";
+        output.bytes.assign(hex_document::k_hex_document_bytes_per_row, 0x90);
         output.byte_count = hex_document::k_hex_document_bytes_per_row;
         return true;
     }
 
     bool row_by_address(std::uint64_t gen, std::uint64_t address,
                         hex_document::hex_row_view_t& output,
-                        std::uint64_t& ordinal) const noexcept override
+                        std::uint64_t& ordinal) const override
     {
         if (gen != generation_)
             return false;
-        ordinal = address / hex_document::k_hex_document_bytes_per_row;
+        if (address < base_address_)
+            return false;
+        ordinal = (address - base_address_) / hex_document::k_hex_document_bytes_per_row;
         if (ordinal >= row_count_)
             return false;
         return row_at(gen, ordinal, output);
     }
 
-    std::uint64_t overlay_revision(std::uint64_t gen) const noexcept override
+    std::uint64_t overlay_revision(std::uint64_t) const noexcept override
     {
-        return gen;
+        return generation_;
     }
 
 private:
-    void rebuild()
-    {
-        hex_lines_.clear();
-        ascii_lines_.clear();
-        hex_lines_.resize(row_count_, "90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90");
-        ascii_lines_.resize(row_count_, "................");
-    }
-
     std::uint64_t generation_ = 1;
     std::uint64_t row_count_;
-    std::vector<std::string> hex_lines_;
-    std::vector<std::string> ascii_lines_;
+    std::uint64_t base_address_ = 0;
 };
 
 class hex_overlay_t final : public hex_document::hex_overlay_adapter_t {
 public:
-    std::uint32_t overlay_count(std::uint64_t gen) const noexcept override
+    std::uint32_t overlay_count(std::uint64_t) const noexcept override
     {
         return static_cast<std::uint32_t>(entries_.size());
     }
 
-    bool overlay_at(std::uint64_t gen, std::uint32_t ordinal,
-                    hex_document::hex_overlay_entry_t& output) const noexcept override
+    bool overlay_at(std::uint64_t, std::uint32_t ordinal,
+                    hex_document::hex_overlay_entry_t& output) const override
     {
         if (ordinal >= entries_.size())
             return false;
@@ -276,8 +256,8 @@ public:
         return true;
     }
 
-    bool overlay_by_address(std::uint64_t gen, std::uint64_t address,
-                            hex_document::hex_overlay_entry_t& output) const noexcept override
+    bool overlay_by_address(std::uint64_t, std::uint64_t address,
+                            hex_document::hex_overlay_entry_t& output) const override
     {
         for (const auto& e : entries_) {
             if (e.address == address && e.active) {
@@ -288,7 +268,7 @@ public:
         return false;
     }
 
-    workbench_error_t apply_overlay(std::uint64_t gen,
+    workbench_error_t apply_overlay(std::uint64_t,
                                     const hex_document::hex_overlay_entry_t& entry) override
     {
         for (auto& e : entries_) {
@@ -301,7 +281,7 @@ public:
         return {};
     }
 
-    workbench_error_t remove_overlay(std::uint64_t gen,
+    workbench_error_t remove_overlay(std::uint64_t,
                                      std::uint64_t address) override
     {
         auto it = std::remove_if(entries_.begin(), entries_.end(),
@@ -376,13 +356,39 @@ void verify_disasm_large_virtual_model()
 void verify_disasm_stale_generation()
 {
     disasm_source_t source(1000);
-    disasm_document::disasm_document_model_t model(source);
+    disasm_overlay_t overlays;
+    disasm_document::disasm_document_model_t model(source, &overlays);
     const auto original_gen = model.bound_generation();
 
     source.advance_generation();
 
     require(model.is_stale(), "disasm model must detect stale generation");
     require(!model.generation_current(original_gen), "disasm model must report old generation as not current");
+    require(!model.generation_current(source.current_generation()),
+            "disasm stale model must not accept the source's newer generation");
+
+    disasm_document::disasm_navigation_request_t navigation;
+    navigation.address = 0x401000U;
+    disasm_document::disasm_navigation_result_t navigation_result;
+    auto err = model.navigate(navigation, source.current_generation(), navigation_result);
+    require(err.code == disasm_document::disasm_error_code_t::stale_generation,
+            "disasm navigate must enforce the bound generation lease");
+
+    disasm_document::disasm_selection_t stale_selection;
+    stale_selection.kind = selection_kind_t::address;
+    stale_selection.has_address = true;
+    stale_selection.address = 0x401000U;
+    err = model.select(stale_selection, source.current_generation());
+    require(err.code == disasm_document::disasm_error_code_t::stale_generation,
+            "disasm select must enforce the bound generation lease");
+
+    disasm_document::disasm_overlay_entry_t stale_overlay;
+    stale_overlay.kind = disasm_document::disasm_overlay_kind_t::comment;
+    stale_overlay.address = 0x401000U;
+    stale_overlay.text = "stale";
+    err = model.apply_overlay(source.current_generation(), stale_overlay);
+    require(err.code == disasm_document::disasm_error_code_t::stale_generation,
+            "disasm overlay mutation must enforce the bound generation lease");
 
     disasm_document::disasm_command_t cmd;
     cmd.kind = disasm_document::disasm_command_kind_t::refresh;
@@ -394,7 +400,7 @@ void verify_disasm_stale_generation()
     req.offset = 0;
     req.limit = 10;
     disasm_document::disasm_page_t page;
-    auto err = model.page(req, nullptr, page);
+    err = model.page(req, nullptr, page);
     require(err.ok() && page.rows.size() == 10, "disasm page must work after refresh");
 }
 
@@ -424,12 +430,19 @@ void verify_disasm_overlay_visualization()
 
     bool found_overlay = false;
     for (const auto& row : page.rows) {
-        if (row.overlay != nullptr) {
+        if (row.overlay) {
             found_overlay = true;
             require(row.overlay->text == "loop_start", "disasm overlay text must match");
         }
     }
     require(found_overlay, "disasm overlay must be visible on matching row");
+
+    auto copied_page = page;
+    page = {};
+    require(copied_page.rows[2].overlay.has_value(),
+            "disasm copied page must retain owned overlay storage");
+    require(copied_page.rows[2].overlay->text == "loop_start",
+            "disasm copied page overlay must remain valid after source page reset");
 
     err = model.remove_overlay(model.bound_generation(), entry.address);
     require(err.ok(), "disasm remove overlay must succeed");
@@ -480,6 +493,7 @@ void verify_disasm_command_routing()
 
     disasm_document::disasm_command_t clear_cmd;
     clear_cmd.kind = disasm_document::disasm_command_kind_t::clear_selection;
+    clear_cmd.expected_generation = model.bound_generation();
     result = model.execute(clear_cmd);
     require(result.changed, "disasm clear selection must report changed");
     require(model.selection().kind == selection_kind_t::none,
@@ -487,11 +501,167 @@ void verify_disasm_command_routing()
 
     disasm_document::disasm_command_t page_cmd;
     page_cmd.kind = disasm_document::disasm_command_kind_t::page;
+    page_cmd.expected_generation = model.bound_generation();
     page_cmd.page_request.offset = 0;
     page_cmd.page_request.limit = 50;
     result = model.execute(page_cmd);
     require(result.error.ok() && result.page.rows.size() == 50,
             "disasm page command must return rows");
+}
+
+void verify_disasm_limits_and_selection()
+{
+    disasm_source_t oversized(disasm_document::k_disasm_document_max_total_rows + 1);
+    disasm_document::disasm_document_model_t oversized_model(oversized);
+    require(oversized_model.total_rows() == disasm_document::k_disasm_document_max_total_rows,
+            "disasm total_rows must remain capped at the document ceiling");
+
+    disasm_document::disasm_page_request_t request;
+    disasm_document::disasm_page_t page;
+    request.limit = disasm_document::k_disasm_document_max_page_size + 1;
+    auto err = oversized_model.page(request, nullptr, page);
+    require(err.code == disasm_document::disasm_error_code_t::invalid_page,
+            "disasm page must reject a request above the packed-page ceiling");
+    request.limit = 1;
+    err = oversized_model.page(request, nullptr, page);
+    require(err.code == disasm_document::disasm_error_code_t::resource_exhausted,
+            "disasm page must reject a source above the row ceiling");
+
+    disasm_source_t exact(disasm_document::k_disasm_document_max_total_rows);
+    disasm_document::disasm_document_model_t model(exact);
+    request.offset = disasm_document::k_disasm_document_max_total_rows - 1;
+    err = model.page(request, nullptr, page);
+    require(err.ok() && page.rows.size() == 1,
+            "disasm row ceiling must remain addressable without overflow");
+    require(page.rows.front().id.value == disasm_document::k_disasm_document_max_total_rows,
+            "disasm ceiling row must retain a valid one-based row id");
+
+    disasm_document::disasm_selection_t invalid_address;
+    invalid_address.kind = selection_kind_t::address;
+    invalid_address.address = 0x401000U;
+    err = model.select(invalid_address, model.bound_generation());
+    require(err.code == disasm_document::disasm_error_code_t::selection_rejected,
+            "disasm address selection must require has_address");
+
+    disasm_document::disasm_selection_t mismatched_row;
+    mismatched_row.kind = selection_kind_t::address;
+    mismatched_row.has_address = true;
+    mismatched_row.address = 0x401001U;
+    mismatched_row.start_row = {2};
+    mismatched_row.end_row = {2};
+    err = model.select(mismatched_row, model.bound_generation());
+    require(err.code == disasm_document::disasm_error_code_t::selection_rejected,
+            "disasm selection must reject a row id that does not contain the address");
+
+    disasm_document::disasm_selection_t range;
+    range.kind = selection_kind_t::range;
+    range.has_address = true;
+    range.address = 0x401002U;
+    range.extent = 6;
+    err = model.select(range, model.bound_generation());
+    require(err.ok(), "disasm range selection across instruction interiors must succeed");
+    require(model.selection().start_row.value == 1 && model.selection().end_row.value == 2,
+            "disasm range selection must canonicalize both boundary rows");
+
+    range.address = (std::numeric_limits<std::uint64_t>::max)();
+    range.extent = 2;
+    err = model.select(range, model.bound_generation());
+    require(err.code == disasm_document::disasm_error_code_t::selection_rejected,
+            "disasm range selection must reject address overflow");
+}
+
+void verify_navigation_event_bridge()
+{
+    disasm_source_t disasm_source(1000);
+    hex_source_t hex_source(1000, 0x400000U);
+    disasm_nav_t disasm_navigation;
+    hex_nav_t hex_navigation;
+    disasm_document::disasm_document_model_t disasm_model(
+        disasm_source, nullptr, &disasm_navigation);
+    hex_document::hex_document_model_t hex_model(
+        hex_source, nullptr, &hex_navigation);
+
+    disasm_document::disasm_navigation_event_bridge_request_t outbound;
+    outbound.id = {1};
+    outbound.sequence = 1;
+    outbound.source.workspace = {1};
+    outbound.source.document = {10};
+    outbound.source.view = {20};
+    outbound.navigation.target = disasm_document::disasm_cross_document_target_t::hex;
+    outbound.navigation.address = 0x401200U;
+    outbound.navigation.source_document.workspace = {1};
+    outbound.navigation.source_document.kind = document_kind_t::disassembly;
+    outbound.navigation.source_document.object_id = 1;
+
+    disasm_document::disasm_command_t emit_command;
+    emit_command.kind = disasm_document::disasm_command_kind_t::emit_navigation_event;
+    emit_command.expected_generation = disasm_model.bound_generation();
+    emit_command.navigation_event_bridge = outbound;
+    auto emitted = disasm_model.execute(emit_command);
+    require(emitted.error.ok() && emitted.has_navigation_event,
+            "disasm command bridge must emit a workbench navigation event");
+    require(validate_navigation_event(emitted.navigation_event).ok(),
+            "disasm emitted navigation event must satisfy the workbench contract");
+
+    hex_document::hex_command_t apply_command;
+    apply_command.kind = hex_document::hex_command_kind_t::apply_navigation_event;
+    apply_command.expected_generation = hex_model.bound_generation();
+    apply_command.navigation_event = emitted.navigation_event;
+    auto applied = hex_model.execute(apply_command);
+    require(applied.error.ok() && applied.navigation.found,
+            "hex command bridge must apply a workbench navigation event");
+    require(hex_model.selection().address == outbound.navigation.address,
+            "hex navigation bridge must synchronize the target address");
+
+    hex_document::hex_navigation_event_bridge_request_t reverse;
+    reverse.id = {2};
+    reverse.sequence = 2;
+    reverse.source.workspace = {1};
+    reverse.source.document = {11};
+    reverse.source.view = {21};
+    reverse.navigation.target = hex_document::hex_cross_document_target_t::disassembly;
+    reverse.navigation.address = 0x401204U;
+    reverse.navigation.source_document.workspace = {1};
+    reverse.navigation.source_document.kind = document_kind_t::hex;
+    reverse.navigation.source_document.object_id = 2;
+
+    navigation_event_t reverse_event;
+    const auto hex_emit_error = hex_model.emit_navigation_event(reverse, reverse_event);
+    require(hex_emit_error.ok() && validate_navigation_event(reverse_event).ok(),
+            "hex bridge must emit a valid reverse navigation event");
+    disasm_document::disasm_navigation_result_t disasm_result;
+    auto disasm_apply_error = disasm_model.apply_navigation_event(
+        reverse_event, disasm_model.bound_generation(), disasm_result);
+    require(disasm_apply_error.ok() && disasm_result.found,
+            "disasm bridge must apply a reverse navigation event");
+    require(disasm_model.selection().address == reverse.navigation.address,
+            "disasm navigation bridge must synchronize the target address");
+
+    auto clear_event = emitted.navigation_event;
+    clear_event.id = {3};
+    clear_event.sequence = 3;
+    clear_event.target.selection = {};
+    clear_event.target.document.has_address = true;
+    clear_event.target.document.address = outbound.navigation.address;
+    hex_document::hex_navigation_result_t clear_result;
+    const auto clear_error = hex_model.apply_navigation_event(
+        clear_event, hex_model.bound_generation(), clear_result);
+    require(clear_error.ok() && clear_result.found &&
+                hex_model.selection().kind == selection_kind_t::none,
+            "hex navigation bridge must apply an explicit empty target selection");
+
+    hex_source.advance_generation();
+    hex_document::hex_navigation_result_t stale_hex_result;
+    const auto stale_hex_error = hex_model.apply_navigation_event(
+        emitted.navigation_event, hex_source.current_generation(), stale_hex_result);
+    require(stale_hex_error.code == hex_document::hex_error_code_t::stale_generation,
+            "hex navigation bridge must reject the source's newer generation before refresh");
+
+    disasm_source.advance_generation();
+    disasm_apply_error = disasm_model.apply_navigation_event(
+        reverse_event, disasm_source.current_generation(), disasm_result);
+    require(disasm_apply_error.code == disasm_document::disasm_error_code_t::stale_generation,
+            "disasm navigation bridge must reject the source's newer generation before refresh");
 }
 
 void verify_hex_large_virtual_model()
@@ -535,12 +705,132 @@ void verify_hex_stale_and_overlay()
 
     source.advance_generation();
     require(model.is_stale(), "hex model must detect stale generation");
+    require(!model.generation_current(source.current_generation()),
+            "hex stale model must not accept the source's newer generation");
+
+    hex_document::hex_navigation_request_t navigation;
+    navigation.address = 0x100;
+    hex_document::hex_navigation_result_t navigation_result;
+    err = model.navigate(navigation, source.current_generation(), navigation_result);
+    require(err.code == hex_document::hex_error_code_t::stale_generation,
+            "hex navigate must enforce the bound generation lease");
+    err = model.apply_overlay(source.current_generation(), patch);
+    require(err.code == hex_document::hex_error_code_t::stale_generation,
+            "hex overlay mutation must enforce the bound generation lease");
 
     hex_document::hex_command_t cmd;
     cmd.kind = hex_document::hex_command_kind_t::refresh;
     auto result = model.execute(cmd);
     require(result.changed, "hex refresh must update generation");
     require(!model.is_stale(), "hex model must not be stale after refresh");
+}
+
+void verify_hex_patch_projection_limits_and_selection()
+{
+    hex_source_t source(4);
+    hex_overlay_t overlays;
+    hex_document::hex_document_model_t model(source, &overlays);
+
+    hex_document::hex_overlay_entry_t patch;
+    patch.kind = hex_document::hex_overlay_kind_t::patch;
+    patch.revision = 7;
+    patch.address = 14;
+    patch.extent = 6;
+    patch.patch_bytes = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x41};
+    patch.text = "cross-row patch";
+    auto err = model.apply_overlay(model.bound_generation(), patch);
+    require(err.ok(), "hex cross-row patch must be accepted");
+
+    hex_document::hex_page_request_t request;
+    request.limit = 2;
+    hex_document::hex_page_t page;
+    err = model.page(request, nullptr, page);
+    require(err.ok() && page.rows.size() == 2,
+            "hex patch projection page must contain both affected rows");
+    require(page.rows[0].overlays.size() == 1 &&
+                page.rows[0].overlays[0].address == 14 &&
+                page.rows[0].overlays[0].extent == 2 &&
+                page.rows[0].overlays[0].patch_bytes == std::vector<std::uint8_t>({0xAA, 0xBB}),
+            "hex first-row projection must clip patch address, extent, and bytes");
+    require(page.rows[1].overlays.size() == 1 &&
+                page.rows[1].overlays[0].address == 16 &&
+                page.rows[1].overlays[0].extent == 4 &&
+                page.rows[1].overlays[0].patch_bytes ==
+                    std::vector<std::uint8_t>({0xCC, 0xDD, 0xEE, 0x41}),
+            "hex second-row projection must carry the remaining patch bytes");
+    require(page.rows[0].bytes[14] == 0xAA && page.rows[0].bytes[15] == 0xBB,
+            "hex first row must apply projected patch content");
+    require(page.rows[1].bytes[0] == 0xCC && page.rows[1].bytes[3] == 0x41,
+            "hex second row must apply projected patch content");
+    require(page.rows[0].hex_text.substr(page.rows[0].hex_text.size() - 5) == "AA BB",
+            "hex rendered text must expose patched bytes");
+    require(page.rows[1].ascii_text == "...A............",
+            "hex ASCII projection must reflect patched printable content");
+
+    auto copied_page = page;
+    page = {};
+    require(copied_page.rows[1].overlays[0].patch_bytes[3] == 0x41,
+            "hex copied page must retain owned overlay projections");
+
+    auto invalid_patch = patch;
+    invalid_patch.extent = 7;
+    err = model.apply_overlay(model.bound_generation(), invalid_patch);
+    require(err.code == hex_document::hex_error_code_t::invalid_argument,
+            "hex patch extent must exactly match patch content");
+
+    hex_document::hex_selection_t invalid_address;
+    invalid_address.kind = selection_kind_t::address;
+    invalid_address.address = 1;
+    err = model.select(invalid_address, model.bound_generation());
+    require(err.code == hex_document::hex_error_code_t::selection_rejected,
+            "hex address selection must require has_address");
+
+    hex_document::hex_selection_t mismatched_row;
+    mismatched_row.kind = selection_kind_t::address;
+    mismatched_row.has_address = true;
+    mismatched_row.address = 1;
+    mismatched_row.start_row = {2};
+    mismatched_row.end_row = {2};
+    err = model.select(mismatched_row, model.bound_generation());
+    require(err.code == hex_document::hex_error_code_t::selection_rejected,
+            "hex selection must reject a row id that does not contain the address");
+
+    hex_document::hex_selection_t range;
+    range.kind = selection_kind_t::range;
+    range.has_address = true;
+    range.address = 14;
+    range.extent = 6;
+    err = model.select(range, model.bound_generation());
+    require(err.ok() && model.selection().start_row.value == 1 &&
+                model.selection().end_row.value == 2,
+            "hex range selection must canonicalize rows across an interior boundary");
+
+    range.address = (std::numeric_limits<std::uint64_t>::max)();
+    range.extent = 2;
+    err = model.select(range, model.bound_generation());
+    require(err.code == hex_document::hex_error_code_t::selection_rejected,
+            "hex range selection must reject address overflow");
+
+    hex_source_t oversized(hex_document::k_hex_document_max_total_rows + 1);
+    hex_document::hex_document_model_t oversized_model(oversized);
+    require(oversized_model.total_rows() == hex_document::k_hex_document_max_total_rows,
+            "hex total_rows must remain capped at the document ceiling");
+    request.limit = hex_document::k_hex_document_max_page_size + 1;
+    err = oversized_model.page(request, nullptr, page);
+    require(err.code == hex_document::hex_error_code_t::invalid_page,
+            "hex page must reject a request above the packed-page ceiling");
+    request.limit = 1;
+    err = oversized_model.page(request, nullptr, page);
+    require(err.code == hex_document::hex_error_code_t::resource_exhausted,
+            "hex page must reject a source above the row ceiling");
+
+    hex_source_t exact(hex_document::k_hex_document_max_total_rows);
+    hex_document::hex_document_model_t exact_model(exact);
+    request.offset = hex_document::k_hex_document_max_total_rows - 1;
+    err = exact_model.page(request, nullptr, page);
+    require(err.ok() && page.rows.size() == 1 &&
+                page.rows.front().id.value == hex_document::k_hex_document_max_total_rows,
+            "hex row ceiling must remain addressable without overflow");
 }
 
 void verify_hex_cross_document_navigation()
@@ -603,6 +893,35 @@ void verify_independent_workspace_fixtures()
     require(!hex_model_b.is_stale(), "workspace B hex must not be stale");
 }
 
+aida::analysis::address_t pseudocode_address(std::uint64_t value)
+{
+    aida::analysis::address_t address;
+    address.space = aida::analysis::address_space_id_t::relative_virtual;
+    address.value = value;
+    address.architecture = aida::analysis::architecture_id_t::x86_64;
+    address.mode = aida::analysis::architecture_mode_t::x86_64;
+    return address;
+}
+
+aida::analysis::decompiler_entity_key_t pseudocode_entity()
+{
+    aida::analysis::native_decompiler_entity_identity_t identity;
+    identity.function_id = 1;
+    identity.entry = pseudocode_address(0x401000);
+    identity.end = pseudocode_address(0x401100);
+    identity.function_bytes_hash =
+        aida::analysis::stable_serialization_hash(std::string("workbench-function"));
+    identity.canonical_symbol = "fixture::main";
+
+    aida::analysis::decompiler_entity_key_t entity;
+    entity.kind = aida::analysis::decompiler_entity_kind_t::native_function;
+    entity.format = aida::analysis::format_id_t::pe32_plus;
+    entity.architecture = aida::analysis::architecture_id_t::x86_64;
+    entity.mode = aida::analysis::architecture_mode_t::x86_64;
+    entity.identity = std::move(identity);
+    return entity;
+}
+
 class pseudo_source_t final : public pseudocode_document::pseudocode_source_adapter_t {
 public:
     pseudo_source_t() = default;
@@ -624,48 +943,45 @@ public:
             fail_next_ = false;
             return {workbench_error_code_t::adapter_rejected, job_id};
         }
-        pending_jobs_.push_back(job_id);
+        jobs_.push_back({job_id, job_state_t::pending, request, {}, {}});
         return {};
     }
 
     workbench_error_t cancel_decompilation(std::uint64_t job_id) override
     {
-        auto it = std::find(pending_jobs_.begin(), pending_jobs_.end(), job_id);
-        if (it != pending_jobs_.end())
-            pending_jobs_.erase(it);
-        cancelled_jobs_.push_back(job_id);
+        const auto job = find_job(job_id);
+        if (job == jobs_.end() || job->state != job_state_t::pending)
+            return {workbench_error_code_t::invalid_document_state, job_id};
+        jobs_.erase(job);
         return {};
     }
 
     bool poll_result(std::uint64_t job_id,
                      aida::analysis::decompiler_document_t& output) override
     {
-        auto it = std::find(pending_jobs_.begin(), pending_jobs_.end(), job_id);
-        if (it == pending_jobs_.end())
+        const auto job = find_job(job_id);
+        if (job == jobs_.end() || job->state != job_state_t::result_ready)
             return false;
-        pending_jobs_.erase(it);
-        output.schema_version = aida::analysis::k_decompiler_document_schema_version;
-        output.rendered_text = "int main() {\n  return 0;\n}\n";
-        output.tokens.clear();
-        aida::analysis::decompiler_document_token_t tok;
-        tok.kind = aida::analysis::decompiler_document_token_kind_t::keyword;
-        tok.range.begin = 0;
-        tok.range.end = 3;
-        output.tokens.push_back(tok);
-        completed_jobs_.push_back(job_id);
+        output = std::move(job->document);
+        jobs_.erase(job);
         return true;
     }
 
     bool poll_failure(std::uint64_t job_id,
                       std::vector<aida::analysis::decompiler_diagnostic_t>& output) override
     {
-        return false;
+        const auto job = find_job(job_id);
+        if (job == jobs_.end() || job->state != job_state_t::failure_ready)
+            return false;
+        output = std::move(job->diagnostics);
+        jobs_.erase(job);
+        return true;
     }
 
     bool job_active(std::uint64_t job_id) const noexcept override
     {
-        return std::find(pending_jobs_.begin(), pending_jobs_.end(), job_id) !=
-               pending_jobs_.end();
+        const auto job = find_job(job_id);
+        return job != jobs_.end() && job->state == job_state_t::pending;
     }
 
     aida::analysis::decompiler_profile_budget_t profile_budget(
@@ -676,23 +992,192 @@ public:
         budget.max_wall_clock_ms = 30000;
         budget.max_cpu_ms = 30000;
         budget.max_memory_bytes = 1ULL << 30;
+        budget.max_provider_ir_nodes = 1ULL << 20;
+        budget.max_hir_nodes = 1ULL << 20;
+        budget.max_ast_nodes = 1ULL << 20;
+        if (profile == aida::analysis::decompiler_profile_id_t::thorough) {
+            budget.max_semantic_queries = 100;
+            budget.semantic_proofs_enabled = true;
+        }
         return budget;
     }
 
-    void force_complete(std::uint64_t job_id)
+    bool complete_success(std::uint64_t job_id)
     {
-        auto it = std::find(pending_jobs_.begin(), pending_jobs_.end(), job_id);
-        if (it != pending_jobs_.end())
-            pending_jobs_.erase(it);
-        completed_jobs_.push_back(job_id);
+        const auto job = find_job(job_id);
+        if (job == jobs_.end() || job->state != job_state_t::pending)
+            return false;
+        job->document = make_document(job->request);
+        job->state = job_state_t::result_ready;
+        return true;
+    }
+
+    bool complete_failure(std::uint64_t job_id)
+    {
+        const auto job = find_job(job_id);
+        if (job == jobs_.end() || job->state != job_state_t::pending)
+            return false;
+        aida::analysis::decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = aida::analysis::decompiler_diagnostic_severity_t::error;
+        diagnostic.code = aida::analysis::decompiler_diagnostic_code_t::provider_failure;
+        diagnostic.localization_key = "decompiler.worker.provider_failure";
+        diagnostic.localization_arguments = {"synthetic_failure"};
+        diagnostic.retryable = true;
+        diagnostic.ordinal = 1;
+        job->diagnostics.push_back(std::move(diagnostic));
+        job->state = job_state_t::failure_ready;
+        return true;
     }
 
 private:
+    enum class job_state_t : std::uint8_t {
+        pending,
+        result_ready,
+        failure_ready
+    };
+
+    struct job_t {
+        std::uint64_t id = 0;
+        job_state_t state = job_state_t::pending;
+        pseudocode_document::pseudocode_request_t request;
+        aida::analysis::decompiler_document_t document;
+        std::vector<aida::analysis::decompiler_diagnostic_t> diagnostics;
+    };
+
+    static aida::analysis::decompiler_document_t make_document(
+        const pseudocode_document::pseudocode_request_t& request)
+    {
+        const auto make_coordinate = [&request](
+            aida::analysis::decompiler_coordinate_layer_t layer,
+            std::uint64_t begin,
+            std::uint64_t end) {
+            aida::analysis::source_coordinate_t coordinate;
+            coordinate.layer = layer;
+            coordinate.workspace_generation = request.workspace_generation;
+            coordinate.entity = request.entity;
+            coordinate.address_range = aida::analysis::decompiler_address_range_t{
+                pseudocode_address(begin), pseudocode_address(end)};
+            return coordinate;
+        };
+
+        aida::analysis::typed_pseudocode_ast_node_t root;
+        root.id = 1;
+        root.kind = aida::analysis::typed_pseudocode_ast_node_kind_t::function_definition;
+        root.child_ids = {2};
+        root.stable_text = "main";
+        root.coordinate = make_coordinate(
+            aida::analysis::decompiler_coordinate_layer_t::typed_ast,
+            0x401000, 0x401008);
+        root.confidence = 100;
+
+        aida::analysis::typed_pseudocode_ast_node_t body;
+        body.id = 2;
+        body.kind = aida::analysis::typed_pseudocode_ast_node_kind_t::compound_statement;
+        body.child_ids = {3};
+        body.coordinate = root.coordinate;
+        body.confidence = 100;
+
+        aida::analysis::typed_pseudocode_ast_node_t statement;
+        statement.id = 3;
+        statement.kind = aida::analysis::typed_pseudocode_ast_node_kind_t::return_statement;
+        statement.stable_text = "return 0";
+        statement.coordinate = root.coordinate;
+        statement.confidence = 100;
+
+        aida::analysis::typed_pseudocode_ast_v2_t ast;
+        ast.entity = request.entity;
+        ast.hir_hash = aida::analysis::stable_serialization_hash(
+            std::string("workbench-hir"));
+        ast.type_graph_hash = aida::analysis::stable_serialization_hash(
+            std::string("workbench-types"));
+        ast.root_node_id = 1;
+        ast.body_node_id = 2;
+        ast.nodes = {std::move(root), std::move(body), std::move(statement)};
+
+        aida::analysis::decompiler_document_t document;
+        document.schema_version = aida::analysis::k_decompiler_document_schema_version;
+        document.entity = request.entity;
+        document.ast = std::move(ast);
+        document.ast_hash = aida::analysis::stable_serialization_hash(document.ast);
+        document.type_graph_hash = document.ast.type_graph_hash;
+        document.profile = request.profile;
+        document.renderer.style_id = "aida.c03.workbench";
+        document.rendered_text = "int main() {\n  return 0;\n}\n";
+
+        const auto append_token = [&document](
+            aida::analysis::decompiler_document_token_kind_t kind,
+            std::uint32_t begin, std::uint32_t end,
+            std::uint64_t ast_node_id) {
+            aida::analysis::decompiler_document_token_t token;
+            token.kind = kind;
+            token.range.begin = begin;
+            token.range.end = end;
+            token.ast_node_id = ast_node_id;
+            document.tokens.push_back(token);
+        };
+        using token_kind_t = aida::analysis::decompiler_document_token_kind_t;
+        append_token(token_kind_t::keyword, 0, 3, 1);
+        append_token(token_kind_t::whitespace, 3, 4, 1);
+        append_token(token_kind_t::identifier, 4, 8, 1);
+        append_token(token_kind_t::punctuation, 8, 10, 1);
+        append_token(token_kind_t::whitespace, 10, 11, 1);
+        append_token(token_kind_t::punctuation, 11, 12, 1);
+        append_token(token_kind_t::whitespace, 12, 13, 2);
+        append_token(token_kind_t::whitespace, 13, 15, 2);
+        append_token(token_kind_t::keyword, 15, 21, 3);
+        append_token(token_kind_t::whitespace, 21, 22, 3);
+        append_token(token_kind_t::literal, 22, 23, 3);
+        append_token(token_kind_t::punctuation, 23, 24, 3);
+        append_token(token_kind_t::whitespace, 24, 25, 2);
+        append_token(token_kind_t::punctuation, 25, 26, 2);
+        append_token(token_kind_t::whitespace, 26, 27, 1);
+
+        auto coordinate = make_coordinate(
+            aida::analysis::decompiler_coordinate_layer_t::document,
+            0x401004, 0x401008);
+        coordinate.document_range = aida::analysis::decompiler_token_range_t{15, 21};
+        aida::analysis::decompiler_source_origin_t source_origin;
+        source_origin.source_artifact_hash = aida::analysis::stable_serialization_hash(
+            std::string("fixture-source"));
+        source_origin.source_path = "fixture.c";
+        source_origin.first_line = 42;
+        source_origin.first_column = 3;
+        source_origin.last_line = 42;
+        source_origin.last_column = 9;
+        coordinate.source_origin = source_origin;
+
+        aida::analysis::decompiler_document_source_map_t source_map;
+        source_map.document_range = *coordinate.document_range;
+        source_map.coordinates.push_back(coordinate);
+        document.source_maps.push_back(std::move(source_map));
+
+        aida::analysis::decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = aida::analysis::decompiler_diagnostic_severity_t::warning;
+        diagnostic.code = aida::analysis::decompiler_diagnostic_code_t::unresolved_type;
+        diagnostic.localization_key = "decompiler.warning.unresolved_type";
+        diagnostic.localization_arguments = {"result"};
+        diagnostic.coordinate = std::move(coordinate);
+        diagnostic.confidence = 80;
+        diagnostic.ordinal = 1;
+        document.diagnostics.push_back(std::move(diagnostic));
+        return document;
+    }
+
+    std::vector<job_t>::iterator find_job(std::uint64_t job_id)
+    {
+        return std::find_if(jobs_.begin(), jobs_.end(),
+            [job_id](const job_t& job) { return job.id == job_id; });
+    }
+
+    std::vector<job_t>::const_iterator find_job(std::uint64_t job_id) const noexcept
+    {
+        return std::find_if(jobs_.begin(), jobs_.end(),
+            [job_id](const job_t& job) { return job.id == job_id; });
+    }
+
     std::uint64_t generation_ = 1;
     bool fail_next_ = false;
-    std::vector<std::uint64_t> pending_jobs_;
-    std::vector<std::uint64_t> completed_jobs_;
-    std::vector<std::uint64_t> cancelled_jobs_;
+    std::vector<job_t> jobs_;
 };
 
 void verify_pseudocode_explicit_request_only()
@@ -722,7 +1207,7 @@ void verify_pseudocode_request_and_cache()
     pseudocode_document::pseudocode_document_model_t model(source);
 
     pseudocode_document::pseudocode_request_t req;
-    req.entity.kind = aida::analysis::decompiler_entity_kind_t::native_function;
+    req.entity = pseudocode_entity();
     req.profile = aida::analysis::decompiler_profile_id_t::fast;
     req.workspace_generation = model.current_generation();
     req.timeout_ms = 5000;
@@ -738,7 +1223,7 @@ void verify_pseudocode_request_and_cache()
 
     require(source.job_active(job_id), "pseudocode source must show job as active");
 
-    source.force_complete(job_id);
+    require(source.complete_success(job_id), "pseudocode fake worker must complete active job");
 
     err = model.poll(job_id);
     require(err.ok(), "pseudocode poll must succeed when result is ready");
@@ -753,6 +1238,102 @@ void verify_pseudocode_request_and_cache()
     require(err.ok(), "pseudocode page must succeed after cache");
     require(page.total_lines == 3, "pseudocode must split rendered text into 3 lines");
     require(page.lines.size() == 3, "pseudocode page must return 3 lines");
+    require(model.profile_info().profile == aida::analysis::decompiler_profile_id_t::fast,
+            "pseudocode profile presentation must retain the requested profile");
+    require(model.profile_info().max_wall_clock_ms == 30000 &&
+                model.profile_info().max_cpu_ms == 30000 &&
+                model.profile_info().max_memory_bytes == (1ULL << 30),
+            "pseudocode profile presentation must retain worker budgets");
+}
+
+void verify_pseudocode_tokens_diagnostics_and_mapping()
+{
+    pseudo_source_t source;
+    pseudocode_document::pseudocode_document_model_t model(source);
+
+    pseudocode_document::pseudocode_request_t request;
+    request.entity = pseudocode_entity();
+    request.workspace_generation = model.current_generation();
+    auto err = model.request(request);
+    require(err.ok(), "pseudocode typed presentation request must succeed");
+    const auto job_id = model.cached_document()->job_id;
+    require(source.complete_success(job_id),
+            "pseudocode typed presentation worker must complete");
+    err = model.poll(job_id);
+    require(err.ok(), "pseudocode typed presentation result must be accepted");
+
+    pseudocode_document::pseudocode_page_request_t page_request;
+    pseudocode_document::pseudocode_page_t page;
+    page_request.line_count = pseudocode_document::k_pseudocode_document_max_page_lines + 1;
+    err = model.page(page_request, page);
+    require(err.code == pseudocode_document::pseudocode_error_code_t::invalid_argument,
+            "pseudocode page must reject a request above the line-page ceiling");
+    page_request.line_count = 10;
+    err = model.page(page_request, page);
+    require(err.ok(), "pseudocode typed presentation page must succeed");
+    require(page.tokens.size() == 15,
+            "pseudocode page must expose every typed document token");
+    require(page.tokens[0].text == "int" && page.tokens[2].text == "main" &&
+                page.tokens[8].text == "return" && page.tokens[10].text == "0",
+            "pseudocode token presentation must preserve rendered token text");
+    require(page.tokens[0].kind ==
+                aida::analysis::decompiler_document_token_kind_t::keyword &&
+                page.tokens[2].kind ==
+                    aida::analysis::decompiler_document_token_kind_t::identifier &&
+                page.tokens[10].kind ==
+                    aida::analysis::decompiler_document_token_kind_t::literal,
+            "pseudocode token presentation must preserve typed token kinds");
+    require(page.lines[0].first_token == 0 && page.lines[0].token_count == 7 &&
+                page.lines[1].first_token == 7 && page.lines[1].token_count == 6 &&
+                page.lines[2].first_token == 13 && page.lines[2].token_count == 2,
+            "pseudocode line presentation must index tokens by token ordinal");
+    require(page.source_maps.size() == 1 && page.source_maps[0].has_address &&
+                page.source_maps[0].address == 0x401004 &&
+                page.source_maps[0].address_extent == 4 &&
+                page.source_maps[0].has_source &&
+                page.source_maps[0].source_path == "fixture.c" &&
+                page.source_maps[0].source_line == 42,
+            "pseudocode page must expose typed address and source mappings");
+    require(page.diagnostics.size() == 1 &&
+                page.diagnostics[0].severity ==
+                    aida::analysis::decompiler_diagnostic_severity_t::warning &&
+                page.diagnostics[0].message ==
+                    "decompiler.warning.unresolved_type result" &&
+                page.diagnostics[0].has_line && page.diagnostics[0].line == 42,
+            "pseudocode diagnostics must include presentation messages and source lines");
+
+    pseudocode_document::pseudocode_address_map_entry_t mapping;
+    err = model.resolve_address(0x401006, mapping);
+    require(err.ok() && mapping.address == 0x401004 && mapping.extent == 4 &&
+                mapping.token_begin == 15 && mapping.token_end == 21 &&
+                mapping.line_number == 2,
+            "pseudocode interior address must resolve to its containing token range");
+    err = model.resolve_token(17, mapping);
+    require(err.ok() && mapping.address == 0x401004,
+            "pseudocode interior token offset must resolve to its address range");
+    err = model.resolve_address(0x401008, mapping);
+    require(err.code == pseudocode_document::pseudocode_error_code_t::address_not_mapped,
+            "pseudocode address range end must remain exclusive");
+
+    pseudocode_document::pseudocode_selection_t selection;
+    selection.kind = selection_kind_t::address;
+    selection.has_address = true;
+    selection.address = 0x401007;
+    err = model.select(selection);
+    require(err.ok() && model.selection().token_begin == 15 &&
+                model.selection().token_end == 21 &&
+                model.selection().line_number == 2,
+            "pseudocode address selection must canonicalize token and line coordinates");
+
+    auto copied_page = page;
+    source.advance_generation();
+    model.refresh();
+    page = {};
+    require(copied_page.tokens[8].text == "return" &&
+                copied_page.source_maps[0].source_path == "fixture.c" &&
+                copied_page.diagnostics[0].message ==
+                    "decompiler.warning.unresolved_type result",
+            "pseudocode page presentation strings must own their storage");
 }
 
 void verify_pseudocode_cancellation()
@@ -761,6 +1342,7 @@ void verify_pseudocode_cancellation()
     pseudocode_document::pseudocode_document_model_t model(source);
 
     pseudocode_document::pseudocode_request_t req;
+    req.entity = pseudocode_entity();
     req.workspace_generation = model.current_generation();
     auto err = model.request(req);
     require(err.ok(), "pseudocode request for cancellation test must succeed");
@@ -781,35 +1363,69 @@ void verify_pseudocode_stale_result()
     pseudocode_document::pseudocode_document_model_t model(source);
 
     pseudocode_document::pseudocode_request_t req;
+    req.entity = pseudocode_entity();
     req.workspace_generation = model.current_generation();
     auto err = model.request(req);
     require(err.ok(), "pseudocode request for stale test must succeed");
     const auto job_id = model.cached_document()->job_id;
 
-    source.force_complete(job_id);
-
-    err = model.poll(job_id);
-    require(err.ok(), "pseudocode poll must succeed");
-    require(model.cache_state() == pseudocode_document::pseudocode_cache_state_t::cached,
-            "pseudocode must be cached before stale check");
-
     source.advance_generation();
+    require(source.complete_success(job_id), "pseudocode fake worker must publish stale result");
+    err = model.poll(job_id);
+    require(err.code == pseudocode_document::pseudocode_error_code_t::stale_result,
+            "pseudocode poll must reject a generation-stale worker result");
+    require(model.cache_state() == pseudocode_document::pseudocode_cache_state_t::stale,
+            "pseudocode stale result must leave the cache stale");
+    require(model.cached_document()->document == nullptr,
+            "pseudocode stale result must not be cached");
+
     model.refresh();
-    require(model.is_stale(), "pseudocode must be stale after generation advance and refresh");
+    req.workspace_generation = model.current_generation();
+    err = model.request(req);
+    require(err.ok(), "pseudocode request for stale failure test must succeed");
+    const auto failure_job_id = model.cached_document()->job_id;
+    source.advance_generation();
+    require(source.complete_failure(failure_job_id),
+            "pseudocode fake worker must publish stale failure result");
+    err = model.poll(failure_job_id);
+    require(err.code == pseudocode_document::pseudocode_error_code_t::stale_result,
+            "pseudocode poll must reject generation-stale failure diagnostics");
+    require(model.cache_state() == pseudocode_document::pseudocode_cache_state_t::stale,
+            "pseudocode stale failure must leave the cache stale");
+    require(model.diagnostics().empty(),
+            "pseudocode stale failure diagnostics must not leak into presentation state");
 }
 
 void verify_pseudocode_worker_failure()
 {
     pseudo_source_t source;
-    source.set_fail_next(true);
     pseudocode_document::pseudocode_document_model_t model(source);
 
     pseudocode_document::pseudocode_request_t req;
+    req.entity = pseudocode_entity();
     req.workspace_generation = model.current_generation();
     auto err = model.request(req);
-    require(!err.ok(), "pseudocode request with failing source must fail");
+    require(err.ok(), "pseudocode failure fixture request must succeed");
+    const auto job_id = model.cached_document()->job_id;
+    require(source.complete_failure(job_id), "pseudocode fake worker must publish failure");
+    err = model.poll(job_id);
+    require(err.code == pseudocode_document::pseudocode_error_code_t::worker_failure,
+            "pseudocode worker failure must return worker_failure");
+    require(model.cache_state() == pseudocode_document::pseudocode_cache_state_t::failed,
+            "pseudocode worker failure must set failed cache state");
+    const auto diagnostics = model.diagnostics();
+    require(diagnostics.size() == 1, "pseudocode worker failure must expose its diagnostic");
+    require(diagnostics.front().message ==
+                "decompiler.worker.provider_failure synthetic_failure",
+            "pseudocode worker failure diagnostic must include a presentation message");
+
+    pseudo_source_t rejecting_source;
+    rejecting_source.set_fail_next(true);
+    pseudocode_document::pseudocode_document_model_t rejecting_model(rejecting_source);
+    req.workspace_generation = rejecting_model.current_generation();
+    err = rejecting_model.request(req);
     require(err.code == pseudocode_document::pseudocode_error_code_t::adapter_rejected,
-            "pseudocode request failure must return adapter_rejected");
+            "pseudocode request submission failure must return adapter_rejected");
 }
 
 void verify_pseudocode_multi_workspace()
@@ -820,6 +1436,7 @@ void verify_pseudocode_multi_workspace()
     pseudocode_document::pseudocode_document_model_t model_b(source_b);
 
     pseudocode_document::pseudocode_request_t req;
+    req.entity = pseudocode_entity();
     req.workspace_generation = model_a.current_generation();
     auto err = model_a.request(req);
     require(err.ok(), "workspace A pseudocode request must succeed");
@@ -831,6 +1448,11 @@ void verify_pseudocode_multi_workspace()
     source_a.advance_generation();
     require(model_a.is_stale(), "workspace A pseudocode must be stale");
     require(!model_b.is_stale(), "workspace B pseudocode must not be stale");
+
+    req.workspace_generation = source_a.current_generation();
+    err = model_a.request(req);
+    require(err.code == pseudocode_document::pseudocode_error_code_t::stale_generation,
+            "pseudocode stale model must reject the source's newer generation before refresh");
 }
 
 class graph_source_t final : public graph_document::graph_source_adapter_t {
@@ -854,34 +1476,40 @@ public:
         rebuild();
     }
 
+    void enable_parallel_edges() noexcept { parallel_edges_ = true; }
+
     std::uint64_t current_generation() const noexcept override { return generation_; }
     bool generation_current(std::uint64_t gen) const noexcept override
     {
         return gen == generation_;
     }
-    graph_document::graph_kind_t supported_kind() const noexcept override
+    bool generation_available(std::uint64_t gen) const noexcept override
     {
-        return graph_document::graph_kind_t::cfg;
+        return gen != 0 && gen <= generation_;
+    }
+    bool supports_kind(graph_document::graph_kind_t kind) const noexcept override
+    {
+        return kind == graph_document::graph_kind_t::cfg;
     }
 
-    std::uint64_t node_count(std::uint64_t gen, graph_document::graph_kind_t kind,
-                             std::uint64_t func_addr) const noexcept override
+    std::uint64_t node_count(std::uint64_t gen, graph_document::graph_kind_t,
+                             std::uint64_t) const noexcept override
     {
         if (gen == 0 || gen > generation_)
             return 0;
         return generations_[gen - 1].node_count;
     }
 
-    std::uint64_t edge_count(std::uint64_t gen, graph_document::graph_kind_t kind,
-                             std::uint64_t func_addr) const noexcept override
+    std::uint64_t edge_count(std::uint64_t gen, graph_document::graph_kind_t,
+                             std::uint64_t) const noexcept override
     {
         if (gen == 0 || gen > generation_)
             return 0;
         return generations_[gen - 1].edge_count;
     }
 
-    bool node_at(std::uint64_t gen, graph_document::graph_kind_t kind,
-                 std::uint64_t func_addr, std::uint64_t ordinal,
+    bool node_at(std::uint64_t gen, graph_document::graph_kind_t,
+                 std::uint64_t, std::uint64_t ordinal,
                  graph_document::graph_node_view_t& output) const noexcept override
     {
         if (gen == 0 || gen > generation_)
@@ -899,8 +1527,8 @@ public:
         return true;
     }
 
-    bool edge_at(std::uint64_t gen, graph_document::graph_kind_t kind,
-                 std::uint64_t func_addr, std::uint64_t ordinal,
+    bool edge_at(std::uint64_t gen, graph_document::graph_kind_t,
+                 std::uint64_t, std::uint64_t ordinal,
                  graph_document::graph_edge_view_t& output) const noexcept override
     {
         if (gen == 0 || gen > generation_)
@@ -908,13 +1536,20 @@ public:
         const auto ec = generations_[gen - 1].edge_count;
         if (ordinal >= ec)
             return false;
-        const auto src = graph_document::compute_deterministic_node_id(0x500000U + ordinal * 0x10);
-        const auto tgt = graph_document::compute_deterministic_node_id(0x500000U + (ordinal + 1) * 0x10);
-        output.id = graph_document::compute_deterministic_edge_id(src, tgt);
+        const auto edge_ordinal = parallel_edges_ && ordinal < 2 ? 0 : ordinal;
+        const auto src = graph_document::compute_deterministic_node_id(
+            0x500000U + edge_ordinal * 0x10);
+        const auto tgt = graph_document::compute_deterministic_node_id(
+            0x500000U + (edge_ordinal + 1) * 0x10);
         output.source = src;
         output.target = tgt;
         output.kind = graph_document::graph_edge_kind_t::unconditional;
-        output.site_address = 0x500000U + ordinal * 0x10 + 4;
+        output.site_address = 0x500000U + edge_ordinal * 0x10 + 4;
+        output.parallel_ordinal = parallel_edges_ && ordinal < 2 ? ordinal : 0;
+        output.id = graph_document::compute_deterministic_edge_id(
+            {output.source, output.target, output.kind, output.site_address,
+             output.parallel_ordinal});
+        output.label = "edge_" + std::to_string(ordinal);
         return true;
     }
 
@@ -934,17 +1569,44 @@ public:
         return node_at(gen, kind, func_addr, ordinal, output);
     }
 
-    graph_document::graph_node_id_t deterministic_node_id(
-        std::uint64_t address) const noexcept override
+    bool node_by_id(std::uint64_t gen, graph_document::graph_kind_t kind,
+                    std::uint64_t func_addr,
+                    graph_document::graph_node_id_t id,
+                    graph_document::graph_node_view_t& output,
+                    std::uint64_t& ordinal) const noexcept override
     {
-        return graph_document::compute_deterministic_node_id(address);
+        const auto count = node_count(gen, kind, func_addr);
+        for (std::uint64_t index = 0; index < count; ++index) {
+            graph_document::graph_node_view_t candidate;
+            if (!node_at(gen, kind, func_addr, index, candidate))
+                return false;
+            if (candidate.id == id) {
+                output = std::move(candidate);
+                ordinal = index;
+                return true;
+            }
+        }
+        return false;
     }
 
-    graph_document::graph_edge_id_t deterministic_edge_id(
-        graph_document::graph_node_id_t source,
-        graph_document::graph_node_id_t target) const noexcept override
+    bool edge_by_id(std::uint64_t gen, graph_document::graph_kind_t kind,
+                    std::uint64_t func_addr,
+                    graph_document::graph_edge_id_t id,
+                    graph_document::graph_edge_view_t& output,
+                    std::uint64_t& ordinal) const noexcept override
     {
-        return graph_document::compute_deterministic_edge_id(source, target);
+        const auto count = edge_count(gen, kind, func_addr);
+        for (std::uint64_t index = 0; index < count; ++index) {
+            graph_document::graph_edge_view_t candidate;
+            if (!edge_at(gen, kind, func_addr, index, candidate))
+                return false;
+            if (candidate.id == id) {
+                output = std::move(candidate);
+                ordinal = index;
+                return true;
+            }
+        }
+        return false;
     }
 
 private:
@@ -961,8 +1623,65 @@ private:
     }
 
     std::uint64_t generation_ = 1;
+    bool parallel_edges_ = false;
     std::vector<generation_data_t> generations_;
     std::vector<std::string> labels_;
+};
+
+class graph_overlay_t final : public graph_document::graph_overlay_adapter_t {
+public:
+    void set(graph_document::graph_node_id_t node, std::string text)
+    {
+        entries_.emplace_back(node, std::move(text));
+    }
+
+    void set_reported_count(std::uint32_t count) noexcept
+    {
+        reported_count_ = count;
+    }
+
+    std::uint32_t overlay_count(std::uint64_t) const noexcept override
+    {
+        return reported_count_ != 0 ? reported_count_
+                                    : static_cast<std::uint32_t>(entries_.size());
+    }
+
+    bool overlay_node(std::uint64_t, graph_document::graph_node_id_t node,
+                      std::string& text) const noexcept override
+    {
+        for (const auto& entry : entries_) {
+            if (entry.first == node) {
+                text = entry.second;
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    std::uint32_t reported_count_ = 0;
+    std::vector<std::pair<graph_document::graph_node_id_t, std::string>> entries_;
+};
+
+class graph_phase_cancellation_t final
+    : public graph_document::graph_layout_cancellation_t {
+public:
+    explicit graph_phase_cancellation_t(std::uint64_t trigger) noexcept
+        : trigger_(trigger)
+    {
+    }
+
+    bool cancelled() const noexcept override
+    {
+        ++checks_;
+        return checks_ >= trigger_;
+    }
+
+    std::uint64_t checks() const noexcept { return checks_; }
+
+private:
+    std::uint64_t trigger_ = 0;
+    mutable std::uint64_t checks_ = 0;
 };
 
 void verify_graph_large_cap()
@@ -991,6 +1710,41 @@ void verify_graph_large_cap()
     require(err.ok(), "graph layout within max_nodes must succeed");
     require(layout.complete, "graph layout must be complete");
     require(layout.nodes.size() == 100, "graph layout must position all nodes");
+
+    graph_source_t layout_edge_source(
+        2, graph_document::k_graph_document_max_layout_edges + 1ULL);
+    graph_document::graph_document_model_t layout_edge_model(layout_edge_source);
+    layout_req.expected_generation = layout_edge_model.bound_generation();
+    layout_req.max_nodes = 2;
+    layout_req.max_edges = graph_document::k_graph_document_max_layout_edges;
+    err = layout_edge_model.compute_layout(layout_req, nullptr, layout);
+    require(err.code == graph_document::graph_error_code_t::layout_capacity,
+            "graph layout exceeding max_edges must return layout_capacity");
+
+    graph_source_t global_edge_source(
+        2, graph_document::k_graph_document_max_edges + 1ULL);
+    graph_document::graph_document_model_t global_edge_model(global_edge_source);
+    layout_req.expected_generation = global_edge_model.bound_generation();
+    err = global_edge_model.compute_layout(layout_req, nullptr, layout);
+    require(err.code == graph_document::graph_error_code_t::graph_too_large,
+            "graph layout exceeding the global edge cap must return graph_too_large");
+
+    graph_document::graph_page_request_t page_request;
+    page_request.limit = 1;
+    page_request.edges = true;
+    graph_document::graph_page_t page;
+    err = global_edge_model.page(page_request, nullptr, page);
+    require(err.code == graph_document::graph_error_code_t::graph_too_large,
+            "graph edge paging must enforce the global edge cap");
+
+    const auto old_generation = global_edge_source.current_generation();
+    global_edge_source.advance_generation();
+    graph_document::graph_diff_result_t diff;
+    err = global_edge_model.diff_generations(
+        old_generation, global_edge_source.current_generation(),
+        graph_document::graph_kind_t::cfg, 0, nullptr, diff);
+    require(err.code == graph_document::graph_error_code_t::graph_too_large,
+            "graph generation diffs must enforce the global edge cap");
 }
 
 void verify_graph_layout_cancellation()
@@ -1012,6 +1766,18 @@ void verify_graph_layout_cancellation()
     require(err.code == graph_document::graph_error_code_t::layout_cancelled,
             "graph layout with cancellation must return layout_cancelled");
     require(layout.cancelled, "graph layout must report cancelled flag");
+
+    const std::uint64_t phase_triggers[] = {420, 750, 850, 950};
+    for (const auto trigger : phase_triggers) {
+        graph_phase_cancellation_t phase_cancel(trigger);
+        err = model.compute_layout(layout_req, &phase_cancel, layout);
+        require(err.code == graph_document::graph_error_code_t::layout_cancelled,
+                "graph post-load phase cancellation must return layout_cancelled");
+        require(layout.cancelled && !layout.complete,
+                "graph post-load phase cancellation must preserve incomplete state");
+        require(phase_cancel.checks() >= trigger,
+                "graph post-load phase cancellation must reach its requested phase");
+    }
 }
 
 void verify_graph_deterministic_ids()
@@ -1023,15 +1789,42 @@ void verify_graph_deterministic_ids()
     auto id3 = graph_document::compute_deterministic_node_id(0x401004U);
     require(id1 != id3, "deterministic node IDs must differ for different addresses");
 
-    auto e1 = graph_document::compute_deterministic_edge_id(id1, id3);
-    auto e2 = graph_document::compute_deterministic_edge_id(id1, id3);
-    require(e1 == e2, "deterministic edge IDs must be identical for same source/target");
+    graph_document::graph_edge_identity_t identity;
+    identity.source = id1;
+    identity.target = id3;
+    identity.kind = graph_document::graph_edge_kind_t::conditional_true;
+    identity.site_address = 0x401002U;
+    identity.parallel_ordinal = 0;
+    auto e1 = graph_document::compute_deterministic_edge_id(identity);
+    auto e2 = graph_document::compute_deterministic_edge_id(identity);
+    require(e1 == e2, "deterministic edge IDs must be identical for the same identity");
 
-    auto e3 = graph_document::compute_deterministic_edge_id(id3, id1);
+    identity.parallel_ordinal = 1;
+    auto parallel = graph_document::compute_deterministic_edge_id(identity);
+    require(e1 != parallel,
+            "parallel edges must have distinct deterministic identities");
+
+    identity.source = id3;
+    identity.target = id1;
+    identity.parallel_ordinal = 0;
+    auto e3 = graph_document::compute_deterministic_edge_id(identity);
     require(e1 != e3, "deterministic edge IDs must differ for reversed direction");
 
     require(!graph_document::compute_deterministic_node_id(0).valid(),
             "deterministic node ID for zero address must be invalid");
+
+    graph_source_t source(2, 2);
+    source.enable_parallel_edges();
+    graph_document::graph_document_model_t model(source);
+    graph_document::graph_page_request_t request;
+    request.limit = 2;
+    request.edges = true;
+    graph_document::graph_page_t page;
+    const auto error = model.page(request, nullptr, page);
+    require(error.ok() && page.edges.size() == 2,
+            "parallel edge paging must preserve both edges");
+    require(page.edges[0].id != page.edges[1].id,
+            "parallel edge paging must expose distinct stable identities");
 }
 
 void verify_graph_cross_generation_diff()
@@ -1044,7 +1837,9 @@ void verify_graph_cross_generation_diff()
     const auto new_gen = source.current_generation();
 
     graph_document::graph_diff_result_t diff;
-    auto err = model.diff_generations(old_gen, new_gen, graph_document::graph_kind_t::cfg, 0, diff);
+    auto err = model.diff_generations(old_gen, new_gen,
+                                      graph_document::graph_kind_t::cfg, 0,
+                                      nullptr, diff);
     require(err.ok(), "graph cross-generation diff must succeed");
     require(diff.old_generation == old_gen, "graph diff old generation must match");
     require(diff.new_generation == new_gen, "graph diff new generation must match");
@@ -1084,21 +1879,31 @@ void verify_graph_navigation_and_selection()
 
     graph_document::graph_navigation_request_t nav;
     nav.address = 0x500000U + 5 * 0x10;
+    nav.page_size = 4;
     nav.select_node = true;
 
     graph_document::graph_navigation_result_t result;
     auto err = model.navigate(nav, model.bound_generation(),
                               graph_document::graph_kind_t::cfg, 0, result);
     require(err.ok() && result.found, "graph navigate to existing node must succeed");
+    require(model.selection().node == result.node,
+            "graph navigation must synchronize the selected node");
+    require(model.selection().address == nav.address,
+            "graph navigation must synchronize the selected address");
+    require(result.page_offset == 4,
+            "graph navigation must use the requested page size");
+    require(result.focus_requested,
+            "graph navigation must preserve the focus request");
 
     graph_document::graph_selection_t sel;
     sel.kind = selection_kind_t::entity;
     sel.node = result.node;
-    err = model.select(sel);
+    err = model.select(sel, model.bound_generation());
     require(err.ok(), "graph select must succeed");
     require(model.selection().node == result.node, "graph selection must preserve node");
 
-    model.clear_selection();
+    err = model.clear_selection(model.bound_generation());
+    require(err.ok(), "graph clear selection must succeed for the bound generation");
     require(model.selection().kind == selection_kind_t::none,
             "graph selection must be none after clear");
 }
@@ -1125,108 +1930,219 @@ void verify_graph_page()
     err = model.page(req, nullptr, page);
     require(err.ok(), "graph edge page must succeed");
     require(page.edges.size() == 50, "graph first edge page must return 50 edges");
+    require(page.nodes.empty(), "graph edge page must not retain stale node rows");
+
+    graph_overlay_t overlays;
+    const auto first_node = graph_document::compute_deterministic_node_id(0x500000U);
+    overlays.set(first_node, "overlay_bb_0");
+    graph_document::graph_document_model_t overlay_model(source, &overlays);
+    req.edges = false;
+    req.limit = 1;
+    err = overlay_model.page(req, nullptr, page);
+    require(err.ok(), "graph page with overlays must succeed");
+    require(page.nodes.size() == 1 && page.nodes[0].label == "overlay_bb_0",
+            "graph node labels must project active overlays");
+
+    overlays.set_reported_count(graph_document::k_graph_document_max_overlays + 1U);
+    err = overlay_model.page(req, nullptr, page);
+    require(err.code == graph_document::graph_error_code_t::resource_exhausted,
+            "graph overlay projection must enforce the overlay cap");
 }
 
 class diff_source_t final : public diff_document::diff_source_adapter_t {
 public:
     diff_source_t(std::uint64_t entry_count)
-        : entry_count_(entry_count)
-    {
-        rebuild();
-    }
+        : entry_count_(entry_count) {}
 
-    void advance_generation() { ++generation_; rebuild(); }
+    void advance_generation() { ++generation_; }
+    void force_domain(diff_document::diff_domain_t domain) noexcept
+    {
+        forced_domain_ = domain;
+        has_forced_domain_ = true;
+    }
+    void set_entity_only_index(std::uint64_t index) noexcept
+    {
+        entity_only_index_ = index;
+    }
+    void reset_entry_reads() const noexcept { entry_reads_ = 0; }
+    std::uint64_t entry_reads() const noexcept { return entry_reads_; }
 
     std::uint64_t current_generation() const noexcept override { return generation_; }
     bool generation_current(std::uint64_t gen) const noexcept override
     {
         return gen == generation_;
     }
-    diff_document::diff_kind_t supported_kind() const noexcept override
+    bool supports_kind(diff_document::diff_kind_t kind) const noexcept override
     {
-        return diff_document::diff_kind_t::generation;
+        return kind <= diff_document::diff_kind_t::workspace;
+    }
+    bool scope_available(
+        std::uint64_t gen,
+        const diff_document::diff_scope_t& scope) const noexcept override
+    {
+        return gen == generation_ && diff_document::diff_scope_valid(scope);
     }
 
-    std::uint64_t entry_count(std::uint64_t gen, diff_document::diff_kind_t kind,
-                              std::uint64_t old_gen, std::uint64_t new_gen) const noexcept override
+    std::uint64_t entry_count(
+        std::uint64_t gen,
+        const diff_document::diff_scope_t& scope) const noexcept override
     {
-        return gen == generation_ ? entry_count_ : 0;
+        return gen == generation_ && diff_document::diff_scope_valid(scope)
+            ? entry_count_
+            : 0;
     }
 
-    bool entry_at(std::uint64_t gen, diff_document::diff_kind_t kind,
-                  std::uint64_t old_gen, std::uint64_t new_gen,
-                  std::uint64_t ordinal,
-                  diff_document::diff_entry_t& output) const noexcept override
+    bool entry_at(std::uint64_t gen,
+                  const diff_document::diff_scope_t& scope,
+                   std::uint64_t ordinal,
+                   diff_document::diff_entry_t& output) const noexcept override
     {
-        if (gen != generation_ || ordinal >= entry_count_)
+        if (gen != generation_ || !diff_document::diff_scope_valid(scope) ||
+            ordinal >= entry_count_) {
             return false;
+        }
+        ++entry_reads_;
         output.kind = (ordinal % 4 == 0) ? diff_document::diff_entry_kind_t::added :
                      (ordinal % 4 == 1) ? diff_document::diff_entry_kind_t::removed :
                      (ordinal % 4 == 2) ? diff_document::diff_entry_kind_t::modified :
                                           diff_document::diff_entry_kind_t::moved;
-        output.domain = static_cast<diff_document::diff_domain_t>(ordinal % 9);
-        output.address = 0x401000U + ordinal * 4;
+        output.domain = has_forced_domain_
+            ? forced_domain_
+            : static_cast<diff_document::diff_domain_t>(ordinal % 9);
+        const auto address = 0x401000U + ordinal * 4;
+        output.address = address;
         output.entity_key = "entity_" + std::to_string(ordinal);
-        output.old_value = "old_" + std::to_string(ordinal);
-        output.new_value = "new_" + std::to_string(ordinal);
+        const auto kind_name = scope.kind == diff_document::diff_kind_t::generation
+            ? "generation"
+            : scope.kind == diff_document::diff_kind_t::overlay
+                ? "overlay"
+                : "workspace";
+        output.old_value = std::string(kind_name) + "_old_" + std::to_string(ordinal);
+        output.new_value = std::string(kind_name) + "_new_" + std::to_string(ordinal);
+        if (output.kind == diff_document::diff_entry_kind_t::added)
+            output.new_address = address;
+        else if (output.kind == diff_document::diff_entry_kind_t::removed)
+            output.old_address = address;
+        else if (output.kind == diff_document::diff_entry_kind_t::modified) {
+            output.old_address = address;
+            output.new_address = address;
+        } else {
+            output.old_address = address;
+            output.new_address = address + 0x100000U;
+            output.address = output.new_address;
+        }
+        if (ordinal == entity_only_index_) {
+            output.kind = diff_document::diff_entry_kind_t::modified;
+            output.address = 0;
+            output.old_address = 0;
+            output.new_address = 0;
+        }
         return true;
     }
 
-    diff_document::diff_summary_t summary(std::uint64_t gen, diff_document::diff_kind_t kind,
-                                          std::uint64_t old_gen,
-                                          std::uint64_t new_gen) const noexcept override
+    bool summary(std::uint64_t gen,
+                 const diff_document::diff_scope_t& scope,
+                 diff_document::diff_summary_t& output) const noexcept override
     {
-        diff_document::diff_summary_t s;
-        s.kind = kind;
-        s.old_generation = old_gen;
-        s.new_generation = new_gen;
-        s.total_entries = entry_count_;
+        if (gen != generation_ || !diff_document::diff_scope_valid(scope))
+            return false;
+        output = {};
+        output.snapshot_generation = gen;
+        output.scope = scope;
+        output.total_entries = entry_count_;
         for (std::uint64_t i = 0; i < entry_count_; ++i) {
-            auto m = i % 4;
-            if (m == 0) ++s.added_count;
-            else if (m == 1) ++s.removed_count;
-            else if (m == 2) ++s.modified_count;
-            else ++s.moved_count;
+            const auto remainder = i % 4;
+            if (remainder == 0) ++output.added_count;
+            else if (remainder == 1) ++output.removed_count;
+            else if (remainder == 2) ++output.modified_count;
+            else ++output.moved_count;
         }
-        return s;
+        return true;
     }
 
 private:
-    void rebuild() {}
-
     std::uint64_t generation_ = 1;
     std::uint64_t entry_count_;
+    bool has_forced_domain_ = false;
+    diff_document::diff_domain_t forced_domain_ =
+        diff_document::diff_domain_t::instruction;
+    std::uint64_t entity_only_index_ = ~0ULL;
+    mutable std::uint64_t entry_reads_ = 0;
 };
+
+diff_document::diff_scope_t generation_diff_scope()
+{
+    diff_document::diff_scope_t scope;
+    scope.kind = diff_document::diff_kind_t::generation;
+    scope.before = {1, 10, 0};
+    scope.after = {1, 11, 0};
+    return scope;
+}
+
+diff_document::diff_scope_t overlay_diff_scope()
+{
+    diff_document::diff_scope_t scope;
+    scope.kind = diff_document::diff_kind_t::overlay;
+    scope.before = {1, 11, 2};
+    scope.after = {1, 11, 3};
+    return scope;
+}
+
+diff_document::diff_scope_t workspace_diff_scope()
+{
+    diff_document::diff_scope_t scope;
+    scope.kind = diff_document::diff_kind_t::workspace;
+    scope.before = {1, 11, 0};
+    scope.after = {2, 7, 0};
+    return scope;
+}
 
 void verify_diff_page_and_navigation()
 {
     diff_source_t source(1000);
     diff_document::diff_document_model_t model(source);
+    const auto scope = generation_diff_scope();
 
     diff_document::diff_page_request_t req;
     req.offset = 0;
     req.limit = 100;
 
     diff_document::diff_page_t page;
-    auto err = model.page(req, diff_document::diff_kind_t::generation, 1, 2, nullptr, page);
+    auto err = model.page(req, model.bound_generation(), scope, nullptr, page);
     require(err.ok(), "diff page must succeed");
     require(page.entries.size() == 100, "diff first page must return 100 entries");
     require(page.total_entries == 1000, "diff page total must be 1000");
 
     req.offset = 990;
     req.limit = 100;
-    err = model.page(req, diff_document::diff_kind_t::generation, 1, 2, nullptr, page);
+    err = model.page(req, model.bound_generation(), scope, nullptr, page);
     require(err.ok() && page.entries.size() == 10, "diff last page must return 10 entries");
 
     diff_document::diff_navigation_request_t nav;
     nav.entry_index = 500;
+    nav.page_size = 100;
     diff_document::diff_navigation_result_t nav_result;
-    err = model.navigate(nav, diff_document::diff_kind_t::generation, 1, 2, nav_result);
+    err = model.navigate(nav, model.bound_generation(), scope, nav_result);
     require(err.ok() && nav_result.found, "diff navigate to valid index must succeed");
     require(nav_result.entry_index == 500, "diff navigate entry index must match");
+    require(nav_result.page_offset == 500,
+            "diff navigation must use the requested page size");
+    require(nav_result.selection.kind == selection_kind_t::address &&
+                nav_result.selection.address == 0x401000U + 500 * 4,
+            "diff address navigation must resolve the entry address");
+    require(model.selection().address == nav_result.selection.address,
+            "diff navigation must synchronize address selection");
+
+    source.set_entity_only_index(501);
+    nav.entry_index = 501;
+    err = model.navigate(nav, model.bound_generation(), scope, nav_result);
+    require(err.ok() && nav_result.selection.kind == selection_kind_t::entity,
+            "addressless diff navigation must resolve an entity selection");
+    require(nav_result.selection.entity_key == "entity_501",
+            "diff entity navigation must preserve the entity key");
 
     nav.entry_index = 2000;
-    err = model.navigate(nav, diff_document::diff_kind_t::generation, 1, 2, nav_result);
+    err = model.navigate(nav, model.bound_generation(), scope, nav_result);
     require(!err.ok(), "diff navigate to out-of-range index must fail");
 }
 
@@ -1234,24 +2150,30 @@ void verify_diff_summary_and_selection()
 {
     diff_source_t source(100);
     diff_document::diff_document_model_t model(source);
+    const auto scope = generation_diff_scope();
 
-    auto s = model.compute_summary(diff_document::diff_kind_t::generation, 1, 2);
+    diff_document::diff_summary_t s;
+    auto err = model.compute_summary(model.bound_generation(), scope, s);
+    require(err.ok(), "diff summary must succeed");
     require(s.total_entries == 100, "diff summary total must be 100");
     require(s.added_count == 25, "diff summary added count must be 25");
     require(s.removed_count == 25, "diff summary removed count must be 25");
     require(s.modified_count == 25, "diff summary modified count must be 25");
     require(s.moved_count == 25, "diff summary moved count must be 25");
 
-    diff_document::diff_selection_t sel;
-    sel.kind = selection_kind_t::address;
-    sel.has_address = true;
-    sel.address = 0x401000U;
-    sel.entry_index = 5;
-    auto err = model.select(sel);
+    diff_document::diff_navigation_request_t navigation;
+    navigation.entry_index = 5;
+    navigation.select_entry = false;
+    diff_document::diff_navigation_result_t navigation_result;
+    err = model.navigate(navigation, model.bound_generation(), scope,
+                         navigation_result);
+    require(err.ok(), "diff selection fixture navigation must succeed");
+    err = model.select(navigation_result.selection, model.bound_generation(), scope);
     require(err.ok(), "diff select must succeed");
     require(model.selection().entry_index == 5, "diff selection must preserve entry index");
 
-    model.clear_selection();
+    err = model.clear_selection(model.bound_generation());
+    require(err.ok(), "diff clear selection must succeed");
     require(model.selection().kind == selection_kind_t::none,
             "diff selection must be none after clear");
 }
@@ -1262,11 +2184,13 @@ void verify_diff_stale_generation()
     diff_document::diff_document_model_t model(source);
 
     require(!model.is_stale(), "diff model must not be stale initially");
+    const auto bound_generation = model.bound_generation();
     source.advance_generation();
     require(model.is_stale(), "diff model must be stale after source advance");
 
     diff_document::diff_command_t cmd;
     cmd.kind = diff_document::diff_command_kind_t::refresh;
+    cmd.expected_generation = bound_generation;
     auto result = model.execute(cmd);
     require(result.changed, "diff refresh must update generation");
     require(!model.is_stale(), "diff model must not be stale after refresh");
@@ -1276,6 +2200,7 @@ void verify_diff_domain_filter()
 {
     diff_source_t source(100);
     diff_document::diff_document_model_t model(source);
+    const auto scope = generation_diff_scope();
 
     diff_document::diff_page_request_t req;
     req.offset = 0;
@@ -1283,17 +2208,37 @@ void verify_diff_domain_filter()
     req.domain_filter = diff_document::diff_domain_t::instruction;
 
     diff_document::diff_page_t page;
-    auto err = model.page(req, diff_document::diff_kind_t::generation, 1, 2, nullptr, page);
+    auto err = model.page(req, model.bound_generation(), scope, nullptr, page);
     require(err.ok(), "diff page with domain filter must succeed");
     for (const auto& e : page.entries)
         require(e.domain == diff_document::diff_domain_t::instruction,
                 "diff page domain filter must only return matching entries");
+
+    diff_source_t bounded_source(diff_document::k_diff_document_max_entries);
+    bounded_source.force_domain(diff_document::diff_domain_t::instruction);
+    diff_document::diff_document_model_t bounded_model(bounded_source);
+    req.offset = 0;
+    req.limit = diff_document::k_diff_document_max_page_size;
+    req.domain_filter = diff_document::diff_domain_t::type;
+    bounded_source.reset_entry_reads();
+    err = bounded_model.page(req, bounded_model.bound_generation(), scope,
+                             nullptr, page);
+    require(err.ok() && page.entries.empty(),
+            "diff filtered page without matches must succeed with an empty page");
+    require(page.scanned_entries == diff_document::k_diff_document_max_filtered_scan,
+            "diff filtered page must stop at the bounded scan ceiling");
+    require(bounded_source.entry_reads() ==
+                diff_document::k_diff_document_max_filtered_scan,
+            "diff filtered page must not read beyond the scan ceiling");
+    require(page.next_offset == diff_document::k_diff_document_max_filtered_scan,
+            "diff filtered page must return a resumable raw offset");
 }
 
 void verify_diff_cancellation()
 {
     diff_source_t source(100);
     diff_document::diff_document_model_t model(source);
+    const auto scope = generation_diff_scope();
 
     cancellation_flag_t cancel_flag;
     cancel_flag.cancel();
@@ -1303,9 +2248,94 @@ void verify_diff_cancellation()
     req.limit = 100;
 
     diff_document::diff_page_t page;
-    auto err = model.page(req, diff_document::diff_kind_t::generation, 1, 2, &cancel_flag, page);
+    auto err = model.page(req, model.bound_generation(), scope, &cancel_flag, page);
     require(err.code == diff_document::diff_error_code_t::cancelled,
             "diff page with cancellation must return cancelled");
+}
+
+void verify_diff_expected_generation_and_caps()
+{
+    const auto scope = generation_diff_scope();
+    diff_source_t source(100);
+    diff_document::diff_document_model_t model(source);
+
+    diff_document::diff_command_t command;
+    command.kind = diff_document::diff_command_kind_t::page;
+    command.expected_generation = model.bound_generation() + 1;
+    command.scope = scope;
+    command.page_request.limit = 1;
+    source.reset_entry_reads();
+    auto result = model.execute(command);
+    require(result.error.code == diff_document::diff_error_code_t::stale_generation,
+            "diff commands must reject a mismatched expected_generation");
+    require(source.entry_reads() == 0,
+            "diff stale-generation rejection must occur before entry traversal");
+
+    diff_source_t oversized_source(diff_document::k_diff_document_max_entries + 1ULL);
+    diff_document::diff_document_model_t oversized_model(oversized_source);
+    diff_document::diff_page_t page;
+    auto err = oversized_model.page(command.page_request,
+                                    oversized_model.bound_generation(), scope,
+                                    nullptr, page);
+    require(err.code == diff_document::diff_error_code_t::resource_exhausted,
+            "diff paging must enforce the entry cap");
+
+    diff_document::diff_navigation_request_t navigation;
+    diff_document::diff_navigation_result_t navigation_result;
+    err = oversized_model.navigate(navigation, oversized_model.bound_generation(),
+                                   scope, navigation_result);
+    require(err.code == diff_document::diff_error_code_t::resource_exhausted,
+            "diff navigation must enforce the entry cap");
+
+    diff_document::diff_summary_t summary;
+    err = oversized_model.compute_summary(oversized_model.bound_generation(),
+                                          scope, summary);
+    require(err.code == diff_document::diff_error_code_t::resource_exhausted,
+            "diff summaries must enforce the entry cap");
+}
+
+void verify_diff_scope_semantics()
+{
+    const auto generation_scope = generation_diff_scope();
+    const auto overlay_scope = overlay_diff_scope();
+    const auto workspace_scope = workspace_diff_scope();
+    require(diff_document::diff_scope_valid(generation_scope),
+            "generation diff scope must be valid");
+    require(diff_document::diff_scope_valid(overlay_scope),
+            "overlay diff scope must be valid");
+    require(diff_document::diff_scope_valid(workspace_scope),
+            "workspace diff scope must be valid");
+
+    auto invalid_scope = generation_scope;
+    invalid_scope.after.workspace_id = 2;
+    require(!diff_document::diff_scope_valid(invalid_scope),
+            "generation diff must reject cross-workspace endpoints");
+    invalid_scope = overlay_scope;
+    invalid_scope.after.generation = 12;
+    require(!diff_document::diff_scope_valid(invalid_scope),
+            "overlay diff must reject cross-generation endpoints");
+    invalid_scope = workspace_scope;
+    invalid_scope.after.workspace_id = invalid_scope.before.workspace_id;
+    require(!diff_document::diff_scope_valid(invalid_scope),
+            "workspace diff must require distinct workspaces");
+
+    diff_source_t source(4);
+    diff_document::diff_document_model_t model(source);
+    diff_document::diff_page_request_t request;
+    request.limit = 1;
+    const auto verify_scope = [&](const diff_document::diff_scope_t& scope,
+                                  const std::string& prefix) {
+        diff_document::diff_page_t page;
+        const auto error = model.page(request, model.bound_generation(), scope,
+                                      nullptr, page);
+        require(error.ok() && page.scope == scope && page.entries.size() == 1,
+                "concrete diff scope page must preserve endpoint identity");
+        require(page.entries[0].old_value.rfind(prefix, 0) == 0,
+                "concrete diff scope must route to kind-specific source semantics");
+    };
+    verify_scope(generation_scope, "generation_old_");
+    verify_scope(overlay_scope, "overlay_old_");
+    verify_scope(workspace_scope, "workspace_old_");
 }
 
 }
@@ -1318,15 +2348,19 @@ bool run_workbench_documents_harness(std::string& failure)
         verify_disasm_overlay_visualization();
         verify_disasm_cross_document_navigation();
         verify_disasm_command_routing();
+        verify_disasm_limits_and_selection();
+        verify_navigation_event_bridge();
 
         verify_hex_large_virtual_model();
         verify_hex_stale_and_overlay();
+        verify_hex_patch_projection_limits_and_selection();
         verify_hex_cross_document_navigation();
 
         verify_independent_workspace_fixtures();
 
         verify_pseudocode_explicit_request_only();
         verify_pseudocode_request_and_cache();
+        verify_pseudocode_tokens_diagnostics_and_mapping();
         verify_pseudocode_cancellation();
         verify_pseudocode_stale_result();
         verify_pseudocode_worker_failure();
@@ -1345,6 +2379,8 @@ bool run_workbench_documents_harness(std::string& failure)
         verify_diff_stale_generation();
         verify_diff_domain_filter();
         verify_diff_cancellation();
+        verify_diff_expected_generation_and_caps();
+        verify_diff_scope_semantics();
 
         failure.clear();
         return true;

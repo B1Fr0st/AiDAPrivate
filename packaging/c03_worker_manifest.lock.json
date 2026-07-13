@@ -13,6 +13,30 @@
       { "id": "System.Reflection.Metadata", "version": "9.0.0", "path": ".deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg", "sha256": "6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634", "license": "MIT" }
     ]
   },
+  "analysis_python_worker": {
+    "id": "analysis_python",
+    "network_fetch_forbidden": true,
+    "pinned_freezer_required": true,
+    "source": {
+      "path": "src/standalone/workers/analysis_python/analysis_python_worker.py",
+      "sha256": "493d52e9401adaa060a4f5d1435ea38dfd3ee9f0519325ea04ce651a73c83024"
+    },
+    "build_script": {
+      "path": "src/standalone/workers/analysis_python/build_frozen_worker.ps1",
+      "sha256": "ede6518908d017a99903edb21050cb721a783e69a45d0ab69df53672b628b45b"
+    },
+    "manifest_materializer": {
+      "path": "src/standalone/workers/analysis_python/materialize_python_worker_manifest.py",
+      "sha256": "59a2c9317f26d8c6b14955bfe8b792f3d0852fae1c20c783e21952f39ec5eaae"
+    },
+    "prebuilt_artifact": {
+      "source_path": ".deps/AiDA_AnalysisPythonWorker/AiDA_AnalysisPythonWorker.exe",
+      "package_relative_path": "deps/AiDA_AnalysisPythonWorker.exe",
+      "manifest_relative_path": "deps/AiDA_AnalysisPythonWorker.manifest.bin",
+      "manifest_digest_relative_path": "deps/AiDA_AnalysisPythonWorker.manifest.sha256",
+      "required_for_staging": true
+    }
+  },
   "notice_artifacts": {
     "ledger_source_path": "licenses/c03/THIRD_PARTY_NOTICES.md",
     "customer_ledger_relative_path": "notices/THIRD_PARTY_NOTICES.md",

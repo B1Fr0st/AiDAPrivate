@@ -6,6 +6,8 @@
 #include <array>
 #include <limits>
 #include <map>
+#include <new>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -85,6 +87,113 @@ bool executable_rva(const workspace_image_t& image, std::uint64_t rva) noexcept
             return true;
     }
     return false;
+}
+
+std::optional<std::uint64_t> to_rva_endpoint(const workspace_image_t& image,
+                                             const address_t& address) noexcept
+{
+    if (address.architecture != image.architecture ||
+        address.mode != image.architecture_mode)
+        return std::nullopt;
+    if (address.space == address_space_id_t::relative_virtual)
+        return address.value <= image.image_size
+            ? std::optional<std::uint64_t>(address.value) : std::nullopt;
+    if ((address.space == address_space_id_t::virtual_address ||
+         address.space == address_space_id_t::live_virtual) &&
+        address.value >= image.image_base) {
+        const auto rva = address.value - image.image_base;
+        return rva <= image.image_size ? std::optional<std::uint64_t>(rva)
+                                       : std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::uint64_t stable_mix(std::uint64_t lhs, std::uint64_t rhs) noexcept
+{
+    auto value = lhs ^ (rhs + 0x9e3779b97f4a7c15ULL + (lhs << 6) + (lhs >> 2));
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ULL;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebULL;
+    value ^= value >> 31;
+    return value == 0 ? 1 : value;
+}
+
+std::uint64_t stable_seed_source(function_seed_kind_t kind, std::uint64_t rva,
+                                 std::uint64_t discriminator) noexcept
+{
+    return stable_mix(static_cast<std::uint64_t>(kind) + 1,
+                      stable_mix(rva, discriminator));
+}
+
+std::uint64_t stable_text(std::string_view value) noexcept
+{
+    std::uint64_t result = 0xcbf29ce484222325ULL;
+    for (const auto character : value) {
+        result ^= static_cast<unsigned char>(character);
+        result *= 0x100000001b3ULL;
+    }
+    return result == 0 ? 1 : result;
+}
+
+bool contains_ascii(std::string_view value, std::string_view needle) noexcept
+{
+    if (needle.empty() || needle.size() > value.size())
+        return false;
+    for (std::size_t offset = 0; offset <= value.size() - needle.size(); ++offset) {
+        bool equal = true;
+        for (std::size_t index = 0; index < needle.size(); ++index) {
+            auto character = static_cast<unsigned char>(value[offset + index]);
+            if (character >= 'A' && character <= 'Z')
+                character = static_cast<unsigned char>(character - 'A' + 'a');
+            if (character != static_cast<unsigned char>(needle[index])) {
+                equal = false;
+                break;
+            }
+        }
+        if (equal)
+            return true;
+    }
+    return false;
+}
+
+function_seed_kind_t entry_seed_kind(std::string_view provenance) noexcept
+{
+    if (contains_ascii(provenance, "tls"))
+        return function_seed_kind_t::tls_callback;
+    if (contains_ascii(provenance, "unwind"))
+        return function_seed_kind_t::unwind_range;
+    if (contains_ascii(provenance, "export"))
+        return function_seed_kind_t::export_entry;
+    if (contains_ascii(provenance, "cfg") ||
+        contains_ascii(provenance, "safe_seh") ||
+        contains_ascii(provenance, "load_config"))
+        return function_seed_kind_t::load_config_entry;
+    return function_seed_kind_t::image_entry;
+}
+
+std::uint8_t seed_confidence(function_seed_kind_t kind) noexcept
+{
+    switch (kind) {
+        case function_seed_kind_t::image_entry:
+        case function_seed_kind_t::tls_callback:
+        case function_seed_kind_t::export_entry:
+            return 100;
+        case function_seed_kind_t::unwind_range:
+            return 98;
+        case function_seed_kind_t::debug_symbol:
+            return 95;
+        case function_seed_kind_t::load_config_entry:
+            return 94;
+        case function_seed_kind_t::direct_call_target:
+            return 90;
+        case function_seed_kind_t::relocation_target:
+        case function_seed_kind_t::pointer_target:
+            return 75;
+        case function_seed_kind_t::validated_gap_target:
+            return 65;
+    }
+    return 0;
 }
 
 std::uint64_t instruction_end(const instruction_record_t& instruction) noexcept
@@ -569,13 +678,27 @@ workspace_result_t<std::vector<function_seed_t>> function_recovery_t::combine_se
             workspace_error_code_t::invalid_argument,
             "function recovery limits are invalid", "seed_combine"));
     }
+    if (cancel.stop_requested()) {
+        return workspace_result_t<std::vector<function_seed_t>>::failure(
+            stop_error(cancel, "seed_combine"));
+    }
+    const std::array<std::pair<const std::vector<function_seed_t>*,
+                               function_seed_kind_t>, 10> groups{{
+        {&sources.image_entries, function_seed_kind_t::image_entry},
+        {&sources.tls_callbacks, function_seed_kind_t::tls_callback},
+        {&sources.symbols, function_seed_kind_t::debug_symbol},
+        {&sources.exports, function_seed_kind_t::export_entry},
+        {&sources.unwind_ranges, function_seed_kind_t::unwind_range},
+        {&sources.load_config_entries, function_seed_kind_t::load_config_entry},
+        {&sources.relocation_targets, function_seed_kind_t::relocation_target},
+        {&sources.call_targets, function_seed_kind_t::direct_call_target},
+        {&sources.pointer_targets, function_seed_kind_t::pointer_target},
+        {&sources.validated_gap_targets, function_seed_kind_t::validated_gap_target}
+    }};
     std::uint64_t count = 0;
-    const std::array<std::uint64_t, 5> counts = {
-        sources.symbols.size(), sources.exports.size(), sources.unwind_ranges.size(),
-        sources.call_targets.size(), sources.pointer_targets.size()
-    };
-    for (const auto value : counts) {
-        if (!checked_add_u64(count, value, count) || count > limits.max_seed_candidates) {
+    for (const auto& group : groups) {
+        if (!checked_add_u64(count, group.first->size(), count) ||
+            count > limits.max_seed_candidates) {
             return workspace_result_t<std::vector<function_seed_t>>::failure(
                 make_workspace_error(workspace_error_code_t::limit_exceeded,
                     "combined function seeds exceed analysis budget", "seed_combine"));
@@ -596,25 +719,363 @@ workspace_result_t<std::vector<function_seed_t>> function_recovery_t::combine_se
         }
         return workspace_result_t<void>::success();
     };
-    auto appended = append(sources.symbols, function_seed_kind_t::debug_symbol);
-    if (!appended)
-        return workspace_result_t<std::vector<function_seed_t>>::failure(appended.error());
-    appended = append(sources.exports, function_seed_kind_t::export_entry);
-    if (!appended)
-        return workspace_result_t<std::vector<function_seed_t>>::failure(appended.error());
-    appended = append(sources.unwind_ranges, function_seed_kind_t::unwind_range);
-    if (!appended)
-        return workspace_result_t<std::vector<function_seed_t>>::failure(appended.error());
-    appended = append(sources.call_targets, function_seed_kind_t::direct_call_target);
-    if (!appended)
-        return workspace_result_t<std::vector<function_seed_t>>::failure(appended.error());
-    appended = append(sources.pointer_targets, function_seed_kind_t::pointer_target);
-    if (!appended)
-        return workspace_result_t<std::vector<function_seed_t>>::failure(appended.error());
+    for (const auto& group : groups) {
+        auto appended = append(*group.first, group.second);
+        if (!appended) {
+            return workspace_result_t<std::vector<function_seed_t>>::failure(
+                appended.error());
+        }
+    }
     std::sort(combined.begin(), combined.end(), seed_canonical_less);
     combined.erase(std::unique(combined.begin(), combined.end(), seed_exact_equal),
                    combined.end());
     return workspace_result_t<std::vector<function_seed_t>>::success(std::move(combined));
+}
+
+workspace_result_t<std::vector<function_seed_t>> function_recovery_t::converge_seed_sources(
+    const workspace_image_t& image,
+    const std::vector<target_fact_t>& targets,
+    const function_seed_evidence_t& evidence,
+    const function_recovery_limits_t& limits,
+    const cancellation_token_t& cancel)
+{
+    if (!valid_limits(limits)) {
+        return workspace_result_t<std::vector<function_seed_t>>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "function recovery limits are invalid", "seed_converge"));
+    }
+    if (cancel.stop_requested())
+        return workspace_result_t<std::vector<function_seed_t>>::failure(
+            stop_error(cancel, "seed_converge"));
+    try {
+        function_seed_sources_t sources;
+        std::uint64_t source_count = 0;
+        std::uint64_t seed_storage_bytes = 0;
+        std::uint64_t visits = 0;
+        const auto inspect_source = [&]() -> workspace_result_t<void> {
+            if (++visits >= limits.cancellation_check_interval) {
+                visits = 0;
+                if (cancel.stop_requested())
+                    return workspace_result_t<void>::failure(
+                        stop_error(cancel, "seed_converge"));
+            }
+            if (source_count >= limits.max_seed_candidates) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "function seed evidence exceeds analysis budget", "seed_converge"));
+            }
+            ++source_count;
+            return workspace_result_t<void>::success();
+        };
+        const auto select_group = [&](function_seed_kind_t kind)
+            -> std::vector<function_seed_t>& {
+            switch (kind) {
+                case function_seed_kind_t::image_entry: return sources.image_entries;
+                case function_seed_kind_t::tls_callback: return sources.tls_callbacks;
+                case function_seed_kind_t::export_entry: return sources.exports;
+                case function_seed_kind_t::unwind_range: return sources.unwind_ranges;
+                case function_seed_kind_t::debug_symbol: return sources.symbols;
+                case function_seed_kind_t::load_config_entry:
+                    return sources.load_config_entries;
+                case function_seed_kind_t::relocation_target:
+                    return sources.relocation_targets;
+                case function_seed_kind_t::direct_call_target:
+                    return sources.call_targets;
+                case function_seed_kind_t::validated_gap_target:
+                    return sources.validated_gap_targets;
+                case function_seed_kind_t::pointer_target:
+                    return sources.pointer_targets;
+            }
+            return sources.validated_gap_targets;
+        };
+        const auto append_seed = [&](function_seed_t seed, function_seed_kind_t kind,
+                                     std::uint64_t source_discriminator)
+            -> workspace_result_t<void> {
+            const auto rva = to_rva(image, seed.address);
+            if (!rva || !executable_rva(image, *rva))
+                return workspace_result_t<void>::success();
+            seed.address = rva_address(image, *rva);
+            if (seed.known_end) {
+                const auto end = to_rva_endpoint(image, *seed.known_end);
+                if (end && *end > *rva)
+                    seed.known_end = rva_address(image, *end);
+                else
+                    seed.known_end.reset();
+            }
+            seed.kind = kind;
+            if (seed.provenance == fact_provenance_t::unknown)
+                seed.provenance = default_seed_provenance(kind);
+            if (seed.confidence == 0)
+                seed.confidence = seed_confidence(kind);
+            if (seed.provenance > fact_provenance_t::decompiler_feedback ||
+                seed.confidence > 100) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "function seed provenance or confidence is invalid", "seed_converge"));
+            }
+            if (seed.stable_source_id == 0) {
+                auto discriminator = seed.known_end ? seed.known_end->value : 0;
+                discriminator = stable_mix(discriminator,
+                    static_cast<std::uint64_t>(seed.provenance));
+                discriminator = stable_mix(discriminator, seed.confidence);
+                discriminator = stable_mix(discriminator, stable_text(seed.name));
+                discriminator = stable_mix(discriminator, seed.noreturn ? 1 : 0);
+                discriminator = stable_mix(discriminator, source_discriminator);
+                seed.stable_source_id = stable_seed_source(kind, *rva, discriminator);
+            }
+            std::uint64_t seed_bytes = 0;
+            if (!checked_add_u64(sizeof(function_seed_t), seed.name.size(), seed_bytes) ||
+                !checked_add_u64(seed_storage_bytes, seed_bytes, seed_storage_bytes) ||
+                seed_storage_bytes > limits.max_result_bytes) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "converged function seed storage exceeds analysis budget",
+                    "seed_converge"));
+            }
+            select_group(kind).push_back(std::move(seed));
+            return workspace_result_t<void>::success();
+        };
+        if (evidence.additional_sources) {
+            const std::array<std::pair<const std::vector<function_seed_t>*,
+                                       function_seed_kind_t>, 10> groups{{
+                {&evidence.additional_sources->image_entries,
+                    function_seed_kind_t::image_entry},
+                {&evidence.additional_sources->tls_callbacks,
+                    function_seed_kind_t::tls_callback},
+                {&evidence.additional_sources->symbols,
+                    function_seed_kind_t::debug_symbol},
+                {&evidence.additional_sources->exports,
+                    function_seed_kind_t::export_entry},
+                {&evidence.additional_sources->unwind_ranges,
+                    function_seed_kind_t::unwind_range},
+                {&evidence.additional_sources->load_config_entries,
+                    function_seed_kind_t::load_config_entry},
+                {&evidence.additional_sources->relocation_targets,
+                    function_seed_kind_t::relocation_target},
+                {&evidence.additional_sources->call_targets,
+                    function_seed_kind_t::direct_call_target},
+                {&evidence.additional_sources->pointer_targets,
+                    function_seed_kind_t::pointer_target},
+                {&evidence.additional_sources->validated_gap_targets,
+                    function_seed_kind_t::validated_gap_target}
+            }};
+            for (const auto& group : groups) {
+                for (const auto& seed : *group.first) {
+                    auto inspected = inspect_source();
+                    if (!inspected) {
+                        return workspace_result_t<std::vector<function_seed_t>>::failure(
+                            inspected.error());
+                    }
+                    auto appended = append_seed(seed, group.second, 0);
+                    if (!appended)
+                        return workspace_result_t<std::vector<function_seed_t>>::failure(
+                            appended.error());
+                }
+            }
+        }
+        for (const auto& entry : image.entry_points) {
+            auto inspected = inspect_source();
+            if (!inspected)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    inspected.error());
+            const auto kind = entry_seed_kind(entry.provenance);
+            function_seed_t seed;
+            seed.address = entry.address;
+            seed.name = entry.provenance;
+            const auto source_discriminator = stable_mix(
+                stable_text(entry.provenance), static_cast<std::uint64_t>(kind));
+            auto appended = append_seed(std::move(seed), kind, source_discriminator);
+            if (!appended)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    appended.error());
+        }
+        for (const auto& exported : image.exports) {
+            auto inspected = inspect_source();
+            if (!inspected)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    inspected.error());
+            if (exported.forwarder)
+                continue;
+            function_seed_t seed;
+            seed.address = exported.address;
+            seed.name = exported.name.value_or(std::string{});
+            const auto source_discriminator = stable_mix(
+                exported.ordinal, stable_text(seed.name));
+            auto appended = append_seed(std::move(seed),
+                function_seed_kind_t::export_entry, source_discriminator);
+            if (!appended)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    appended.error());
+        }
+        for (const auto& symbol : image.symbols) {
+            auto inspected = inspect_source();
+            if (!inspected)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    inspected.error());
+            if (!symbol.defined ||
+                (symbol.kind != image_symbol_kind_t::function &&
+                 symbol.kind != image_symbol_kind_t::debug_symbol &&
+                 symbol.kind != image_symbol_kind_t::export_symbol))
+                continue;
+            function_seed_t seed;
+            seed.address = symbol.address;
+            seed.name = symbol.name;
+            const auto kind = symbol.kind == image_symbol_kind_t::export_symbol
+                ? function_seed_kind_t::export_entry
+                : function_seed_kind_t::debug_symbol;
+            seed.confidence = symbol.kind == image_symbol_kind_t::function ? 96 : 95;
+            const auto source_discriminator = stable_mix(
+                symbol.ordinal, stable_text(symbol.name));
+            auto appended = append_seed(std::move(seed), kind, source_discriminator);
+            if (!appended)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    appended.error());
+        }
+        if (evidence.symbols) {
+            for (const auto& symbol : *evidence.symbols) {
+                auto inspected = inspect_source();
+                if (!inspected)
+                    return workspace_result_t<std::vector<function_seed_t>>::failure(
+                        inspected.error());
+                if (symbol.kind != symbol_kind_t::function &&
+                    symbol.kind != symbol_kind_t::debug_symbol &&
+                    symbol.kind != symbol_kind_t::export_symbol)
+                    continue;
+                function_seed_t seed;
+                seed.address = symbol.address;
+                seed.name = symbol.name;
+                seed.provenance = symbol.provenance;
+                seed.confidence = symbol.confidence;
+                seed.stable_source_id = symbol.id;
+                const auto kind = symbol.kind == symbol_kind_t::export_symbol
+                    ? function_seed_kind_t::export_entry
+                    : function_seed_kind_t::debug_symbol;
+                auto appended = append_seed(std::move(seed), kind,
+                    stable_text(symbol.name));
+                if (!appended)
+                    return workspace_result_t<std::vector<function_seed_t>>::failure(
+                        appended.error());
+            }
+        }
+        if (evidence.unwind_ranges) {
+            for (const auto& unwind : *evidence.unwind_ranges) {
+                auto inspected = inspect_source();
+                if (!inspected)
+                    return workspace_result_t<std::vector<function_seed_t>>::failure(
+                        inspected.error());
+                function_seed_t seed;
+                seed.address = rva_address(image, unwind.function_rva);
+                if (unwind.end_rva > unwind.function_rva)
+                    seed.known_end = rva_address(image, unwind.end_rva);
+                const auto source_discriminator = stable_mix(
+                    unwind.end_rva, unwind.unwind_info_rva);
+                auto appended = append_seed(std::move(seed),
+                    function_seed_kind_t::unwind_range, source_discriminator);
+                if (!appended)
+                    return workspace_result_t<std::vector<function_seed_t>>::failure(
+                        appended.error());
+            }
+        }
+        for (const auto& target : targets) {
+            auto inspected = inspect_source();
+            if (!inspected)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    inspected.error());
+            if (target.kind != target_kind_record_t::call || !target.direct ||
+                target.is_external)
+                continue;
+            function_seed_t seed;
+            seed.address = target.target;
+            const auto source_discriminator = stable_mix(target.instruction_id,
+                stable_mix(target.operand_fact_id, target.address_expression_id));
+            auto appended = append_seed(std::move(seed),
+                function_seed_kind_t::direct_call_target, source_discriminator);
+            if (!appended)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    appended.error());
+        }
+        for (const auto& relocation : image.relocations) {
+            auto inspected = inspect_source();
+            if (!inspected)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    inspected.error());
+            if (!relocation.target)
+                continue;
+            function_seed_t seed;
+            seed.address = *relocation.target;
+            const auto slot_rva = to_rva(image, relocation.address);
+            const auto source_discriminator = stable_mix(
+                slot_rva.value_or(relocation.address.value), relocation.type);
+            auto appended = append_seed(std::move(seed),
+                function_seed_kind_t::relocation_target, source_discriminator);
+            if (!appended)
+                return workspace_result_t<std::vector<function_seed_t>>::failure(
+                    appended.error());
+        }
+        if (evidence.pointer_facts) {
+            for (const auto& pointer : *evidence.pointer_facts) {
+                auto inspected = inspect_source();
+                if (!inspected)
+                    return workspace_result_t<std::vector<function_seed_t>>::failure(
+                        inspected.error());
+                function_seed_t seed;
+                seed.address = pointer.target;
+                seed.provenance = pointer.provenance;
+                seed.confidence = pointer.confidence;
+                seed.stable_source_id = pointer.id;
+                const auto slot_rva = to_rva(image, pointer.slot);
+                auto appended = append_seed(std::move(seed),
+                    function_seed_kind_t::pointer_target,
+                    slot_rva.value_or(pointer.slot.value));
+                if (!appended)
+                    return workspace_result_t<std::vector<function_seed_t>>::failure(
+                        appended.error());
+            }
+        }
+        return combine_seed_sources(sources, limits, cancel);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::vector<function_seed_t>>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "function seed convergence exhausted memory", "seed_converge"));
+    } catch (const std::length_error&) {
+        return workspace_result_t<std::vector<function_seed_t>>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "function seed convergence exceeded container capacity", "seed_converge"));
+    }
+}
+
+workspace_result_t<function_recovery_result_t> function_recovery_t::recover(
+    const workspace_image_t& image,
+    const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<operand_fact_t>& operands,
+    const std::vector<target_fact_t>& targets,
+    const function_seed_evidence_t& evidence,
+    const std::vector<std::uint8_t>& delay_slot_counts,
+    const function_recovery_limits_t& limits,
+    const cancellation_token_t& cancel)
+{
+    auto seeds = converge_seed_sources(image, targets, evidence, limits, cancel);
+    if (!seeds)
+        return workspace_result_t<function_recovery_result_t>::failure(seeds.error());
+    const auto converged_seed_count = static_cast<std::uint64_t>(seeds.value().size());
+    auto blocks = build_blocks(image, instructions, targets, seeds.value(),
+        delay_slot_counts, limits, cancel);
+    if (!blocks)
+        return workspace_result_t<function_recovery_result_t>::failure(blocks.error());
+    auto functions = recover_functions(image, instructions, seeds.value(),
+        blocks.take_value(), limits, cancel);
+    if (!functions)
+        return workspace_result_t<function_recovery_result_t>::failure(functions.error());
+    auto finalized = finalize_cfg_calls(image, provider, instructions, operands, targets,
+        functions.take_value(), limits, cancel);
+    if (!finalized)
+        return finalized;
+    finalized.value().converged_seed_count = converged_seed_count;
+    finalized.value().delay_slot_transfer_count = static_cast<std::uint64_t>(
+        std::count_if(delay_slot_counts.begin(), delay_slot_counts.end(),
+            [](std::uint8_t count) { return count != 0; }));
+    return finalized;
 }
 
 workspace_result_t<block_recovery_result_t> function_recovery_t::build_blocks(
@@ -672,7 +1133,7 @@ workspace_result_t<block_recovery_result_t> function_recovery_t::build_blocks(
         if (found != instruction_index.end())
             leaders[found->second] = true;
         if (seed.known_end) {
-            const auto end_rva = to_rva(image, *seed.known_end);
+            const auto end_rva = to_rva_endpoint(image, *seed.known_end);
             const auto end_found = end_rva ? instruction_index.find(*end_rva)
                                            : instruction_index.end();
             if (end_found != instruction_index.end())
@@ -912,7 +1373,7 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
         }
         std::optional<std::uint64_t> end;
         if (seed.known_end) {
-            end = to_rva(image, *seed.known_end);
+            end = to_rva_endpoint(image, *seed.known_end);
             if (!end || *end <= *start ||
                 block_boundaries.find(*end) == block_boundaries.end()) {
                 function_recovery_conflict_t conflict;
@@ -1296,7 +1757,9 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
             range.rva_start = result.blocks[first_block].start.value;
             range.rva_end = result.blocks[last_block].end.value;
             range.chunk_kind = static_cast<std::uint8_t>(
-                (run.shared ? 1U : 0U) | ((run_index != 0 && !run.shared) ? 2U : 0U));
+                (run.shared ? function_chunk_shared : function_chunk_none) |
+                ((run_index != 0 && !run.shared) ? function_chunk_cold
+                                                  : function_chunk_none));
             function.chunks.push_back(range);
             if (run_index == 0) {
                 function.first_block = static_cast<std::uint32_t>(first_block);

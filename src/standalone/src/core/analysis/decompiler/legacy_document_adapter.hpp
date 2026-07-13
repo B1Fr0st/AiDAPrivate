@@ -73,6 +73,9 @@ struct legacy_document_adapter_result_t {
 sha256_digest_t hash_decompiler_source_maps(
     const std::vector<decompiler_document_source_map_t>& source_maps);
 
+bool typed_ast_has_proven_function_body(
+    const typed_pseudocode_ast_v2_t& ast) noexcept;
+
 legacy_document_adapter_result_t adapt_decompiler_document_for_legacy(
     const decompiler_document_t* document,
     const legacy_document_adapter_limits_t& limits = {});

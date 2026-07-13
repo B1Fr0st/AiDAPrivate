@@ -5,19 +5,13 @@
 #include "target_resolver.hpp"
 #include "effect_policy.hpp"
 #include "../protocol/mcp_tool_contract.hpp"
-#include "../../analysis/live_request_budget.hpp"
 
 #include <atomic>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
-#include <string>
 #include <string_view>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace aida::standalone::mcp::compat {
@@ -36,7 +30,11 @@ enum class live_routing_error_code_t : std::uint8_t {
     static_mutation_blocked_live_write,
     unsupported_live_effect,
     routing_contract_not_found,
-    internal_error
+    internal_error,
+    debugger_request_invalid,
+    debugger_cancelled,
+    debugger_deadline_exceeded,
+    debugger_adapter_rejected
 };
 
 struct live_routing_error_t final {
@@ -75,7 +73,30 @@ private:
     live_routing_error_t error_{};
 };
 
+template <>
+class live_routing_result_t<void> final {
+public:
+    static live_routing_result_t success() noexcept {
+        return live_routing_result_t();
+    }
+
+    static live_routing_result_t failure(live_routing_error_t error) noexcept {
+        return live_routing_result_t(error);
+    }
+
+    bool has_value() const noexcept { return !error_; }
+    explicit operator bool() const noexcept { return has_value(); }
+    const live_routing_error_t& error() const noexcept { return error_; }
+
+private:
+    live_routing_result_t() = default;
+    explicit live_routing_result_t(live_routing_error_t error) noexcept : error_(error) {}
+
+    live_routing_error_t error_{};
+};
+
 struct live_routing_identity_binding_t final {
+    std::uint64_t target_id = 0;
     std::uint32_t pid = 0;
     std::uint64_t process_creation_identity = 0;
     std::uint64_t module_base = 0;
@@ -89,6 +110,7 @@ struct live_routing_snapshot_request_t final {
     std::optional<std::uint64_t> expected_generation;
     std::uint64_t address = 0;
     std::uint64_t size = 0;
+    protocol::cancellation_token_t cancellation;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
@@ -125,7 +147,8 @@ public:
         target_resolver_t& resolver,
         effect_lock_manager_t& lock_manager,
         debugger_lane_t& debugger_lane,
-        live_routing_limits_t limits = {});
+        live_routing_limits_t limits = {},
+        live_snapshot_handler_t snapshot_reader = {});
 
     live_routing_integration_t(const live_routing_integration_t&) = delete;
     live_routing_integration_t& operator=(const live_routing_integration_t&) = delete;
@@ -163,10 +186,6 @@ private:
     static bool effect_permits_debugger_lane(contract_effect_t effect) noexcept;
     static live_routing_identity_binding_t
         binding_from_target(const target_record_t& target) noexcept;
-    static live_routing_identity_binding_t
-        binding_from_debugger(const debugger_target_identity_t& identity) noexcept;
-    static bool binding_matches(const live_routing_identity_binding_t& a,
-                                const live_routing_identity_binding_t& b) noexcept;
 
     live_routing_result_t<live_routing_identity_binding_t>
         resolve_and_bind(const target_selector_t& selector,
@@ -177,6 +196,7 @@ private:
     effect_lock_manager_t& lock_manager_;
     debugger_lane_t& debugger_lane_;
     live_routing_limits_t limits_;
+    live_snapshot_handler_t snapshot_reader_;
 
     mutable std::atomic_uint64_t completed_snapshots_{0};
     mutable std::atomic_uint64_t completed_debugger_{0};

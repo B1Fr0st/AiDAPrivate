@@ -8,13 +8,16 @@
 #include "../../src/core/mcp/protocol/mcp_tool_contract.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -142,6 +145,7 @@ json schema_instance(const json& schema) {
 }
 
 const adapters::modify_adapter_t k_modify_adapters[k_modify_tool_count] = {
+    &adapters::add_bookmark,
     &adapters::set_comments,
     &adapters::append_comments,
     &adapters::rename,
@@ -152,7 +156,6 @@ const adapters::modify_adapter_t k_modify_adapters[k_modify_tool_count] = {
     &adapters::patch_asm,
     &adapters::force_recompile,
     &adapters::set_op_type,
-    &adapters::set_type,
 };
 
 struct backend_state_t final {
@@ -162,8 +165,93 @@ struct backend_state_t final {
     std::string last_lane;
     json last_arguments = json::object();
     std::uint32_t last_pid = 0;
+    std::optional<std::uint64_t> last_expected_generation;
     bool saw_deadline = false;
     std::shared_ptr<std::atomic_bool> cancel_during_dispatch;
+    bool receipt_live_write = false;
+    bool receipt_target_file_write = false;
+    bool receipt_non_overlapping = true;
+    std::uint64_t revision = 1;
+    std::uint64_t transaction_id = 0;
+    std::size_t live_writes = 0;
+    std::size_t target_file_writes = 0;
+    bool track_overlay = false;
+    std::unordered_map<std::string, json> overlay;
+    std::vector<std::unordered_map<std::string, json>> history;
+
+    static std::vector<json> collection(const json& value) {
+        if (!value.is_array()) {
+            return {value};
+        }
+        return std::vector<json>(value.begin(), value.end());
+    }
+
+    static std::vector<std::string> operation_keys(std::string_view tool,
+                                                   const json& arguments) {
+        std::vector<std::string> keys;
+        if (tool == "add_bookmark") {
+            keys.push_back("bookmark:" + arguments.value("addr", std::string()));
+            return keys;
+        }
+        if (tool == "rename") {
+            const auto batch = arguments.find("batch");
+            if (batch == arguments.end() || !batch->is_object()) {
+                return keys;
+            }
+            for (const char* field : {"func", "data", "local", "stack"}) {
+                const auto found = batch->find(field);
+                if (found == batch->end()) {
+                    continue;
+                }
+                for (const auto& item : collection(*found)) {
+                    const std::string identity = std::string_view(field) == "func"
+                        ? item.value("addr", std::string())
+                        : item.value("func_addr", std::string()) + ":" +
+                              item.value("old", std::string());
+                    keys.push_back("rename:" + std::string(field) + ":" + identity);
+                }
+            }
+            return keys;
+        }
+        const auto items = arguments.find("items");
+        if (items == arguments.end() ||
+            (tool == "force_recompile" && items->is_array() && items->empty())) {
+            keys.push_back(std::string(tool) + ":all");
+            return keys;
+        }
+        for (const auto& item : collection(*items)) {
+            std::string key = std::string(tool) + ":" +
+                item.value("addr", std::string());
+            if (tool == "set_op_type") {
+                key += ":" + std::to_string(item.value("op_n", 0));
+            }
+            keys.push_back(std::move(key));
+        }
+        return keys;
+    }
+
+    bool undo_last_overlay() {
+        if (history.empty()) {
+            return false;
+        }
+        overlay = std::move(history.back());
+        history.pop_back();
+        ++revision;
+        return true;
+    }
+
+    void reset_overlay() {
+        overlay.clear();
+        history.clear();
+        revision = 1;
+        transaction_id = 0;
+        receipt_live_write = false;
+        receipt_target_file_write = false;
+        receipt_non_overlapping = true;
+        live_writes = 0;
+        target_file_writes = 0;
+        track_overlay = true;
+    }
 
     adapter_result_t<adapter_response_t> respond(
         const char* lane_name, const adapter_call_context_t& context,
@@ -172,25 +260,61 @@ struct backend_state_t final {
         last_lane = lane_name;
         last_contract = context.contract == nullptr ? std::string() : std::string(context.contract->name);
         last_pid = context.target ? context.target->target().pid : 0;
+        last_expected_generation = request.expected_generation;
         saw_deadline = request.deadline.has_value() &&
             *request.deadline > std::chrono::steady_clock::now();
         last_arguments = json::parse(request.payload, nullptr, false);
         if (cancel_during_dispatch) {
             cancel_during_dispatch->store(true, std::memory_order_release);
         }
-        json output;
-        if (!invalid_output) {
-            if (context.contract == nullptr) {
-                return adapter_result_t<adapter_response_t>::failure(
-                    {adapter_error_code_t::backend_rejected, "fixture_contract_missing", 0, 0});
-            }
-            const json schema = json::parse(
-                context.contract->output_schema_json.begin(),
-                context.contract->output_schema_json.end());
-            output = schema_instance(schema);
-        } else {
-            output = json{{"__schema_violation", true}};
+        if (invalid_output) {
+            return adapter_result_t<adapter_response_t>::success(
+                {json::array({"invalid"}).dump(), false});
         }
+        if (context.contract == nullptr) {
+            return adapter_result_t<adapter_response_t>::failure(
+                {adapter_error_code_t::backend_rejected, "fixture_contract_missing", 0, 0});
+        }
+        const json schema = json::parse(
+            context.contract->output_schema_json.begin(),
+            context.contract->output_schema_json.end());
+        json output = schema_instance(schema);
+        const auto keys = operation_keys(context.contract->name, last_arguments);
+        std::unordered_set<std::string> unique_keys;
+        for (const auto& key : keys) {
+            if (!unique_keys.emplace(key).second) {
+                return adapter_result_t<adapter_response_t>::failure(
+                    {adapter_error_code_t::backend_rejected,
+                     "fixture_overlay_overlap", keys.size(), unique_keys.size()});
+            }
+        }
+        const bool dry_run = context.contract->name == "rename" &&
+            last_arguments.contains("batch") && last_arguments["batch"].is_object() &&
+            last_arguments["batch"].value("dry_run", false);
+        const std::uint64_t revision_before = revision;
+        if (!dry_run) {
+            if (track_overlay) {
+                history.push_back(overlay);
+                for (const auto& key : keys) {
+                    overlay[key] = json{{"tool", last_contract}};
+                }
+            }
+            ++revision;
+        }
+        ++transaction_id;
+        output["_aida_overlay"] = {
+            {"tool", std::string(context.contract->name)},
+            {"mode", "reversible_overlay"},
+            {"committed", !dry_run},
+            {"transaction_id", transaction_id},
+            {"revision_before", revision_before},
+            {"revision_after", revision},
+            {"operations", keys.size()},
+            {"live_write", receipt_live_write},
+            {"target_file_write", receipt_target_file_write},
+            {"ui_switched", false},
+            {"non_overlapping", receipt_non_overlapping},
+        };
         return adapter_result_t<adapter_response_t>::success({output.dump(), false});
     }
 };
@@ -213,7 +337,14 @@ json routed(json arguments) {
     return arguments;
 }
 
+std::string fixture_addr(std::size_t index) {
+    return std::to_string(0x140001000ULL + static_cast<std::uint64_t>(index) * 0x10ULL);
+}
+
 json make_valid_args(std::string_view tool) {
+    if (tool == "add_bookmark") {
+        return routed({{"addr", "0x140001000"}, {"name", "entry"}});
+    }
     if (tool == "set_comments") {
         return routed({{"items", json{{"addr", "0x140001000"}, {"comment", "test comment"}}}});
     }
@@ -244,73 +375,70 @@ json make_valid_args(std::string_view tool) {
     if (tool == "set_op_type") {
         return routed({{"items", json{{"addr", "0x140001000"}, {"kind", "offset"}, {"op_n", 0}}}});
     }
-    if (tool == "set_type") {
-        return routed({{"edits", json{{"addr", "0x140001000"}, {"ty", "int"}}}});
-    }
     return routed(json::object());
 }
 
 json make_boundary_args(std::string_view tool, const modify_handler_limits_t& limits) {
+    if (tool == "add_bookmark") {
+        return routed({
+            {"addr", std::string(limits.max_address_bytes, 'a')},
+            {"name", std::string(limits.max_name_bytes, 'n')},
+            {"prefix", std::string(limits.max_comment_bytes, 'p')},
+        });
+    }
     if (tool == "set_comments" || tool == "append_comments") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"comment", std::string(limits.max_comment_bytes, 'c')}});
+            items.push_back({{"addr", fixture_addr(i)}, {"comment", "c"}});
         }
         return routed({{"items", std::move(items)}});
     }
     if (tool == "define_code" || tool == "define_func") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}});
+            items.push_back({{"addr", fixture_addr(i)}});
         }
         return routed({{"items", std::move(items)}});
     }
     if (tool == "undefine") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"size", limits.max_data_bytes}});
+            items.push_back({{"addr", fixture_addr(i)}, {"size", limits.max_data_bytes}});
         }
         return routed({{"items", std::move(items)}});
     }
     if (tool == "make_data") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"type", std::string(limits.max_type_bytes, 't')}});
+            items.push_back({{"addr", fixture_addr(i)}, {"type", "int"}});
         }
         return routed({{"items", std::move(items)}});
     }
     if (tool == "patch_asm") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"asm", std::string(limits.max_asm_bytes, 'n')}});
+            items.push_back({{"addr", fixture_addr(i)}, {"asm", "nop"}});
         }
         return routed({{"items", std::move(items)}});
     }
     if (tool == "force_recompile") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}});
+            items.push_back({{"addr", fixture_addr(i)}});
         }
         return routed({{"items", std::move(items)}});
     }
     if (tool == "set_op_type") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items; ++i) {
-            items.push_back({{"addr", "0x140001000"}, {"kind", "offset"}, {"op_n", 0}});
+            items.push_back({{"addr", fixture_addr(i)}, {"kind", "offset"}, {"op_n", 0}});
         }
         return routed({{"items", std::move(items)}});
-    }
-    if (tool == "set_type") {
-        json edits = json::array();
-        for (std::size_t i = 0; i < limits.max_type_batch_items; ++i) {
-            edits.push_back({{"addr", "0x140001000"}, {"ty", std::string(limits.max_type_bytes, 't')}});
-        }
-        return routed({{"edits", std::move(edits)}});
     }
     if (tool == "rename") {
         json funcs = json::array();
         for (std::size_t i = 0; i < limits.max_rename_batch_items; ++i) {
-            funcs.push_back({{"addr", "0x140001000"}, {"name", std::string(limits.max_name_bytes, 'n')}});
+            funcs.push_back({{"addr", fixture_addr(i)}, {"name", "n" + std::to_string(i)}});
         }
         return routed({{"batch", json{{"func", std::move(funcs)}}}});
     }
@@ -318,6 +446,12 @@ json make_boundary_args(std::string_view tool, const modify_handler_limits_t& li
 }
 
 json make_invalid_args(std::string_view tool, const modify_handler_limits_t& limits) {
+    if (tool == "add_bookmark") {
+        return routed({
+            {"addr", "0x140001000"},
+            {"name", std::string(limits.max_name_bytes + 1U, 'n')},
+        });
+    }
     if (tool == "set_comments" || tool == "append_comments") {
         json items = json::array();
         for (std::size_t i = 0; i < limits.max_batch_items + 1; ++i) {
@@ -348,18 +482,19 @@ json make_invalid_args(std::string_view tool, const modify_handler_limits_t& lim
         }
         return routed({{"items", std::move(items)}});
     }
-    if (tool == "set_type") {
-        json edits = json::array();
-        for (std::size_t i = 0; i < limits.max_type_batch_items + 1; ++i) {
-            edits.push_back({{"addr", "0x140001000"}, {"ty", "int"}});
-        }
-        return routed({{"edits", std::move(edits)}});
-    }
     if (tool == "rename") {
-        return routed({{"batch", json::object()}});
+        json funcs = json::array();
+        for (std::size_t i = 0; i < limits.max_rename_batch_items + 1U; ++i) {
+            funcs.push_back({{"addr", fixture_addr(i)}, {"name", "renamed"}});
+        }
+        return routed({{"batch", json{{"func", std::move(funcs)}}}});
     }
     if (tool == "force_recompile") {
-        return routed({{"items", 123}});
+        json items = json::array();
+        for (std::size_t i = 0; i < limits.max_batch_items + 1U; ++i) {
+            items.push_back({{"addr", "0x140001000"}});
+        }
+        return routed({{"items", std::move(items)}});
     }
     return routed(json::object());
 }
@@ -416,17 +551,26 @@ void verify_fixture(std::string_view tool_name,
                     backend_state_t& backend,
                     std::size_t& completed) {
     const json metadata{{"fixture_tool", std::string(tool_name)}};
+    modify_invocation_options_t options;
+    options.expected_generation = 9;
+    const auto invoke = [&](const json& args, const cancellation_token_t& token) {
+        return adapter(handlers, args, token, options, metadata);
+    };
 
     json valid = make_valid_args(tool_name);
     std::size_t before = backend.calls;
-    auto result = adapter(handlers, valid, cancellation_token_t::create(), metadata);
+    auto result = invoke(valid, cancellation_token_t::create());
     require_fixture(!result.is_error(), tool_name, "valid", result.text());
     require_fixture(backend.calls == before + 1, tool_name, "valid",
                     "backend was not invoked exactly once");
     require_fixture(backend.last_contract == tool_name, tool_name, "valid",
                     "request reached the wrong tool in backend");
-    require_fixture(backend.last_pid == 4101 && backend.saw_deadline, tool_name, "valid",
-                    "target binding or deadline was not propagated");
+    require_fixture(backend.last_lane == "overlay", tool_name, "valid",
+                    "modify request escaped the reversible overlay lane");
+    require_fixture(backend.last_pid == 4101 && backend.saw_deadline &&
+                        backend.last_expected_generation == options.expected_generation,
+                    tool_name, "valid",
+                    "target binding, generation, or deadline was not propagated");
     json expected_args = valid;
     expected_args.erase("pid");
     expected_args.erase("bin_name");
@@ -437,12 +581,20 @@ void verify_fixture(std::string_view tool_name,
                     tool_name, "valid", "structured output or metadata separation changed");
     require_fixture(result.aida_metadata().value("tool", std::string()) == tool_name,
                     tool_name, "valid", "provenance metadata is incomplete");
+    const auto receipt = result.aida_metadata().find("overlay_receipt");
+    require_fixture(receipt != result.aida_metadata().end() && receipt->is_object() &&
+                        receipt->value("mode", std::string()) == "reversible_overlay" &&
+                        receipt->value("non_overlapping", false) &&
+                        !receipt->value("live_write", true) &&
+                        !receipt->value("target_file_write", true),
+                    tool_name, "valid",
+                    "verified reversible-overlay receipt is absent");
     ++completed;
 
     json boundary = make_boundary_args(tool_name, handlers.limits());
     if (boundary.size() > 1 || (boundary.is_object() && boundary.contains("pid"))) {
         before = backend.calls;
-        result = adapter(handlers, boundary, cancellation_token_t::create(), metadata);
+        result = invoke(boundary, cancellation_token_t::create());
         require_fixture(!result.is_error(), tool_name, "boundary", result.text());
         require_fixture(backend.calls == before + 1, tool_name, "boundary",
                         "pinned maximum was not admitted by the backend lane");
@@ -451,7 +603,7 @@ void verify_fixture(std::string_view tool_name,
 
     json invalid = make_invalid_args(tool_name, handlers.limits());
     before = backend.calls;
-    result = adapter(handlers, invalid, cancellation_token_t::create(), metadata);
+    result = invoke(invalid, cancellation_token_t::create());
     require_fixture(result.is_error() &&
                         result.error_code() == "MCP_TOOL_INPUT_INVALID",
                     tool_name, "invalid", "out-of-policy input was not rejected canonically");
@@ -467,7 +619,7 @@ void verify_fixture(std::string_view tool_name,
     ambiguous.erase("pid");
     ambiguous["bin_name"] = "fixture";
     before = backend.calls;
-    result = adapter(handlers, ambiguous, cancellation_token_t::create(), metadata);
+    result = invoke(ambiguous, cancellation_token_t::create());
     require_fixture(result.is_error() &&
                         result.error_code() == "MCP_TOOL_TARGET_POLICY_REJECTED",
                     tool_name, "ambiguous_target",
@@ -479,21 +631,199 @@ void verify_fixture(std::string_view tool_name,
     auto cancellation = cancellation_token_t::create();
     backend.cancel_during_dispatch = cancellation.state();
     before = backend.calls;
-    result = adapter(handlers, valid, cancellation, metadata);
+    result = invoke(valid, cancellation);
     backend.cancel_during_dispatch.reset();
     require_fixture(result.is_error() && result.error_code() == "MCP_TOOL_CANCELLED",
                     tool_name, "cancellation",
                     "in-flight cancellation was not observed canonically");
+    require_fixture(backend.calls == before + 1U, tool_name, "cancellation",
+                    "cancellation did not exercise the backend window");
     ++completed;
 
     backend.invalid_output = true;
     before = backend.calls;
-    result = adapter(handlers, valid, cancellation_token_t::create(), metadata);
+    result = invoke(valid, cancellation_token_t::create());
     backend.invalid_output = false;
     require_fixture(result.is_error() &&
                         result.error_code() == "MCP_TOOL_OUTPUT_INVALID",
                     tool_name, "output_validation",
                     "schema-invalid structured output was not rejected canonically");
+    require_fixture(backend.calls == before + 1U, tool_name, "output_validation",
+                    "invalid-output fixture did not reach the backend");
+    ++completed;
+}
+
+void verify_generated_union_inputs(modify_handlers_t& handlers,
+                                   backend_state_t& backend,
+                                   std::size_t& completed) {
+    const json metadata{{"fixture_tool", "generated_union_inputs"}};
+    modify_invocation_options_t options;
+    options.expected_generation = 9;
+
+    for (const json& arguments : {
+             routed(json::object()),
+             routed({{"items", json::array()}}),
+             routed({{"items", json{{"addr", "0x140001000"}}}})}) {
+        const std::size_t before = backend.calls;
+        auto result = adapters::force_recompile(
+            handlers, arguments, cancellation_token_t::create(), options, metadata);
+        require_fixture(!result.is_error(), "force_recompile", "optional_inputs",
+                        result.text());
+        require_fixture(backend.calls == before + 1,
+                        "force_recompile", "optional_inputs",
+                        "optional or singleton input did not reach the backend");
+        ++completed;
+    }
+
+    const std::array<json, 3> rename_batches{{
+        json{{"data", json{{"old", "g_old"}, {"new", "g_new"}}}},
+        json{{"local", json{{"func_addr", "0x140001000"},
+                              {"old", "v1"}, {"new", "counter"}}}},
+        json{{"stack", json{{"func_addr", "0x140001000"},
+                              {"old", "var_20"}, {"new", "buffer"}}}},
+    }};
+    for (const auto& batch : rename_batches) {
+        const std::size_t before = backend.calls;
+        auto result = adapters::rename(
+            handlers, routed({{"batch", batch}}), cancellation_token_t::create(),
+            options, metadata);
+        require_fixture(!result.is_error(), "rename", "singleton_union", result.text());
+        require_fixture(backend.calls == before + 1, "rename", "singleton_union",
+                        "schema-valid singleton rename did not reach the backend");
+        ++completed;
+    }
+}
+
+void verify_expected_generation(modify_handlers_t& handlers,
+                                backend_state_t& backend,
+                                std::size_t& completed) {
+    const json arguments = routed({{"addr", "0x140002000"}, {"name", "generation"}});
+    const json metadata{{"fixture_tool", "add_bookmark"}};
+    modify_invocation_options_t matching;
+    matching.expected_generation = 9;
+    std::size_t before = backend.calls;
+    auto result = adapters::add_bookmark(
+        handlers, arguments, cancellation_token_t::create(), matching, metadata);
+    require_fixture(!result.is_error(), "add_bookmark", "matching_generation",
+                    result.text());
+    require_fixture(backend.calls == before + 1 &&
+                        backend.last_expected_generation == matching.expected_generation,
+                    "add_bookmark", "matching_generation",
+                    "matching expected_generation was not forwarded");
+    ++completed;
+
+    modify_invocation_options_t stale;
+    stale.expected_generation = 8;
+    before = backend.calls;
+    result = adapters::add_bookmark(
+        handlers, arguments, cancellation_token_t::create(), stale, metadata);
+    require_fixture(result.is_error() &&
+                        result.error_code() == "MCP_TOOL_TARGET_POLICY_REJECTED",
+                    "add_bookmark", "stale_generation",
+                    "stale expected_generation was not rejected by handler routing");
+    require_fixture(backend.calls == before,
+                    "add_bookmark", "stale_generation",
+                    "stale generation reached the overlay backend");
+    const auto& details = result.structured_content().at("error").at("details");
+    require_fixture(details.value("expected", 0ULL) == 8ULL &&
+                        details.value("actual", 0ULL) == 9ULL,
+                    "add_bookmark", "stale_generation",
+                    "stale generation diagnostics lost expected/actual values");
+    ++completed;
+}
+
+void verify_reversible_overlay(modify_handlers_t& handlers,
+                               backend_state_t& backend,
+                               std::size_t& completed) {
+    backend.reset_overlay();
+    modify_invocation_options_t options;
+    options.expected_generation = 9;
+    const json metadata{{"fixture_tool", "reversible_overlay"}};
+
+    auto result = adapters::add_bookmark(
+        handlers,
+        routed({{"addr", "0x140003000"}, {"name", "undo_me"}}),
+        cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error(), "add_bookmark", "overlay_apply", result.text());
+    require_fixture(backend.overlay.size() == 1 && backend.history.size() == 1,
+                    "add_bookmark", "overlay_apply",
+                    "overlay mutation was not journaled reversibly");
+    require_fixture(!result.structured_content().contains("_aida_overlay") &&
+                        !result.structured_content().contains("_meta"),
+                    "add_bookmark", "overlay_apply",
+                    "backend receipt leaked into generated structured output");
+    ++completed;
+
+    require_fixture(backend.undo_last_overlay(), "add_bookmark", "overlay_undo",
+                    "overlay undo was unavailable");
+    require_fixture(backend.overlay.empty() && backend.history.empty(),
+                    "add_bookmark", "overlay_undo",
+                    "overlay undo did not restore the prior state");
+    ++completed;
+
+    const json non_overlapping = routed({{"items", json::array({
+        json{{"addr", "0x140004000"}, {"asm", "nop"}},
+        json{{"addr", "0x140004010"}, {"asm", "ret"}},
+    })}});
+    result = adapters::patch_asm(
+        handlers, non_overlapping, cancellation_token_t::create(), options, metadata);
+    require_fixture(!result.is_error(), "patch_asm", "non_overlap", result.text());
+    require_fixture(backend.overlay.size() == 2,
+                    "patch_asm", "non_overlap",
+                    "non-overlapping overlay operations were not committed together");
+    require_fixture(backend.live_writes == 0 && backend.target_file_writes == 0,
+                    "patch_asm", "write_isolation",
+                    "overlay fixture performed a live or target-file write");
+    ++completed;
+
+    require_fixture(backend.undo_last_overlay(), "patch_asm", "batch_undo",
+                    "batch overlay undo was unavailable");
+    require_fixture(backend.overlay.empty(), "patch_asm", "batch_undo",
+                    "batch undo did not restore the empty overlay");
+    ++completed;
+
+    const json overlapping = routed({{"items", json::array({
+        json{{"addr", "0x140005000"}, {"asm", "nop"}},
+        json{{"addr", "0x140005000"}, {"asm", "ret"}},
+    })}});
+    const std::size_t before = backend.calls;
+    result = adapters::patch_asm(
+        handlers, overlapping, cancellation_token_t::create(), options, metadata);
+    require_fixture(result.is_error() &&
+                        result.error_code() == "MCP_TOOL_HANDLER_FAILED",
+                    "patch_asm", "overlap_rejection",
+                    "overlapping overlay operations were not rejected");
+    require_fixture(backend.calls == before + 1 && backend.overlay.empty(),
+                    "patch_asm", "overlap_rejection",
+                    "overlap rejection changed overlay state");
+    ++completed;
+
+    const json dry_run = routed({{"batch", json{
+        {"dry_run", true},
+        {"func", json{{"addr", "0x140006000"}, {"name", "dry_name"}}},
+    }}});
+    backend.receipt_live_write = true;
+    result = adapters::rename(
+        handlers, dry_run, cancellation_token_t::create(), options, metadata);
+    backend.receipt_live_write = false;
+    require_fixture(result.is_error() &&
+                        result.error_code() == "MCP_TOOL_OUTPUT_INVALID",
+                    "rename", "receipt_live_write",
+                    "live-write receipt was not rejected fail-closed");
+    require_fixture(backend.overlay.empty(), "rename", "receipt_live_write",
+                    "dry-run receipt rejection changed overlay state");
+    ++completed;
+
+    backend.receipt_target_file_write = true;
+    result = adapters::rename(
+        handlers, dry_run, cancellation_token_t::create(), options, metadata);
+    backend.receipt_target_file_write = false;
+    require_fixture(result.is_error() &&
+                        result.error_code() == "MCP_TOOL_OUTPUT_INVALID",
+                    "rename", "receipt_file_write",
+                    "target-file-write receipt was not rejected fail-closed");
+    require_fixture(backend.overlay.empty(), "rename", "receipt_file_write",
+                    "file-write receipt rejection changed overlay state");
     ++completed;
 }
 
@@ -527,8 +857,15 @@ void verify_modify_handlers() {
         verify_fixture(name, k_modify_adapters[index], handlers, backend, completed);
     }
 
-    require(completed >= k_modify_tool_count * 5U,
-            "modify handler harness did not execute all fixture families");
+    require(completed == k_modify_tool_count * 6U,
+            "modify standard fixture count differs from the exact inventory");
+
+    verify_generated_union_inputs(handlers, backend, completed);
+    verify_expected_generation(handlers, backend, completed);
+    verify_reversible_overlay(handlers, backend, completed);
+
+    require(completed == 81U,
+            "modify C13 fixture count differs from the exact verified inventory");
 }
 
 }

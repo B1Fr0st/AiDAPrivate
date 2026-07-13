@@ -317,6 +317,21 @@ bool equal_provider(
            left.worker_build_hash == right.worker_build_hash;
 }
 
+bool equivalent_attested_document(
+    const decompiler_document_t& attested,
+    const decompiler_document_t& rendered)
+{
+    if (!validate_decompiler_document(attested).valid() ||
+        !validate_decompiler_document(rendered).valid())
+        return false;
+    auto canonical_attested = attested;
+    auto canonical_rendered = rendered;
+    canonical_attested.diagnostics.clear();
+    canonical_rendered.diagnostics.clear();
+    return serialize_decompiler_document(canonical_attested) ==
+           serialize_decompiler_document(canonical_rendered);
+}
+
 bool equal_language(
     const decompiler_language_identity_t& left,
     const decompiler_language_identity_t& right) noexcept
@@ -687,6 +702,48 @@ decompiler_diagnostic_t cache_failure_diagnostic(const workspace_error_t& error)
         error.code == workspace_error_code_t::persistence_failure);
 }
 
+decompiler_pipeline_status_t provider_context_error_status(
+    const workspace_error_t& error,
+    const cancellation_token_t& cancel) noexcept
+{
+    if (error.code == workspace_error_code_t::deadline_exceeded || cancel.deadline_exceeded())
+        return decompiler_pipeline_status_t::deadline_exceeded;
+    if (error.code == workspace_error_code_t::cancelled || cancel.cancellation_requested())
+        return decompiler_pipeline_status_t::cancelled;
+    if (error.code == workspace_error_code_t::stale_generation ||
+        error.code == workspace_error_code_t::target_stale)
+        return decompiler_pipeline_status_t::stale_generation;
+    if (error.code == workspace_error_code_t::limit_exceeded)
+        return decompiler_pipeline_status_t::resource_limit;
+    return decompiler_pipeline_status_t::provider_unavailable;
+}
+
+decompiler_diagnostic_t provider_context_error_diagnostic(const workspace_error_t& error)
+{
+    decompiler_diagnostic_code_t code = decompiler_diagnostic_code_t::provider_failure;
+    if (error.code == workspace_error_code_t::deadline_exceeded)
+        code = decompiler_diagnostic_code_t::deadline_exceeded;
+    else if (error.code == workspace_error_code_t::cancelled)
+        code = decompiler_diagnostic_code_t::cancelled;
+    else if (error.code == workspace_error_code_t::stale_generation ||
+             error.code == workspace_error_code_t::target_stale)
+        code = decompiler_diagnostic_code_t::cache_key_rejected;
+    else if (error.code == workspace_error_code_t::limit_exceeded)
+        code = decompiler_diagnostic_code_t::resource_limit;
+    else if (error.code == workspace_error_code_t::provider_unavailable ||
+             error.code == workspace_error_code_t::unsupported_format ||
+             error.code == workspace_error_code_t::unsupported_pe_arch)
+        code = decompiler_diagnostic_code_t::unsupported_provider;
+    auto diagnostic = pipeline_diagnostic(
+        decompiler_diagnostic_severity_t::error,
+        code,
+        "decompiler.pipeline.provider.context." + error.stable_code(),
+        error.code == workspace_error_code_t::provider_unavailable ||
+            error.code == workspace_error_code_t::analysis_in_progress);
+    diagnostic.localization_arguments.push_back(error.phase);
+    return diagnostic;
+}
+
 }
 
 struct decompiler_pipeline_service_t::state_t : service_state_data_t {
@@ -774,6 +831,8 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
 {
     const auto started = std::chrono::steady_clock::now();
     decompiler_pipeline_result_t result;
+    std::optional<decompiler_document_t> attested_document;
+    bool deferred_intermediate_cache_writes = false;
     {
         std::lock_guard lock(state_->metrics_mutex);
         ++state_->metrics.requests;
@@ -799,7 +858,8 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
     }
     if (!valid_cache_mode(request.cache_mode) || request.workspace_id.empty() ||
         request.workspace_generation == 0 || request.cache_identity.type_graph_revision == 0 ||
-        !validate_decompiler_entity_key(request.entity).valid()) {
+        !validate_decompiler_entity_key(request.entity).valid() ||
+        (request.provider_context && request.provider_context_factory)) {
         result.diagnostics.push_back(pipeline_diagnostic(
             decompiler_diagnostic_severity_t::error,
             decompiler_diagnostic_code_t::invalid_contract,
@@ -946,10 +1006,64 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
         provider_request.cache_key = provider_key;
         provider_request.deadline = operation_deadline;
         provider_request.context = request.provider_context;
+        std::shared_ptr<decompiler_isolated_provider_host_t> isolated_host;
+        if (route.value().descriptor.isolated) {
+            isolated_host = state_->config.isolated_provider_host;
+            if (!isolated_host || !isolated_host->supports(route.value().descriptor)) {
+                {
+                    std::lock_guard lock(state_->metrics_mutex);
+                    ++state_->metrics.isolated_host_rejections;
+                }
+                result.diagnostics.push_back(pipeline_diagnostic(
+                    decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::worker_protocol_failure,
+                    "decompiler.pipeline.provider.isolated_host_required"));
+                return finish(decompiler_pipeline_status_t::provider_unavailable);
+            }
+        }
+        if (!provider_request.context && request.provider_context_factory) {
+            try {
+                auto context = request.provider_context_factory(provider_request, operation_cancel);
+                if (!context) {
+                    result.diagnostics.push_back(provider_context_error_diagnostic(context.error()));
+                    return finish(provider_context_error_status(context.error(), operation_cancel));
+                }
+                provider_request.context = std::move(context.value());
+                if (!provider_request.context) {
+                    result.diagnostics.push_back(pipeline_diagnostic(
+                        decompiler_diagnostic_severity_t::error,
+                        decompiler_diagnostic_code_t::provider_failure,
+                        "decompiler.pipeline.provider.context.empty"));
+                    return finish(decompiler_pipeline_status_t::provider_unavailable);
+                }
+            } catch (const std::bad_alloc&) {
+                result.diagnostics.push_back(pipeline_diagnostic(
+                    decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::resource_limit,
+                    "decompiler.pipeline.provider.context.allocation"));
+                return finish(decompiler_pipeline_status_t::resource_limit);
+            } catch (...) {
+                result.diagnostics.push_back(pipeline_diagnostic(
+                    decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::provider_failure,
+                    "decompiler.pipeline.provider.context.exception",
+                    true));
+                return finish(decompiler_pipeline_status_t::provider_unavailable);
+            }
+        }
         decompiler_provider_result_t provider_result;
         const auto provider_started = std::chrono::steady_clock::now();
         try {
-            provider_result = route.value().provider->decompile(provider_request, operation_cancel);
+            if (route.value().descriptor.isolated) {
+                {
+                    std::lock_guard lock(state_->metrics_mutex);
+                    ++state_->metrics.isolated_provider_invocations;
+                }
+                provider_result = isolated_host->execute(
+                    route.value(), provider_request, operation_cancel);
+            } else {
+                provider_result = route.value().provider->decompile(provider_request, operation_cancel);
+            }
         } catch (...) {
             provider_result.status = decompiler_provider_execution_status_t::crashed;
             provider_result.diagnostics.push_back(pipeline_diagnostic(
@@ -979,6 +1093,15 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             }
             return finish(provider_failure_status(provider_result.status, operation_cancel));
         }
+        if (route.value().descriptor.isolated && !provider_result.attested_document) {
+            result.diagnostics.push_back(pipeline_diagnostic(
+                decompiler_diagnostic_severity_t::error,
+                decompiler_diagnostic_code_t::worker_protocol_failure,
+                "decompiler.pipeline.provider.attested_document_required"));
+            return finish(decompiler_pipeline_status_t::provider_failed);
+        }
+        deferred_intermediate_cache_writes = provider_result.attested_document.has_value();
+        attested_document = std::move(provider_result.attested_document);
         if (operation_cancel.stop_requested() || measured_provider_ms < 0 ||
             static_cast<std::uint64_t>(measured_provider_ms) > budget->max_wall_clock_ms ||
             provider_result.elapsed_wall_clock_ms > budget->max_wall_clock_ms ||
@@ -1046,7 +1169,7 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             return finish(decompiler_pipeline_status_t::resource_limit);
         }
         result.provider_stage = std::make_shared<const decompiler_provider_ir_cache_value_t>(provider_stage);
-        if (cache_writes_enabled(request.cache_mode)) {
+        if (cache_writes_enabled(request.cache_mode) && !deferred_intermediate_cache_writes) {
             auto stored = state_->cache->store_provider_ir(provider_key, std::move(provider_stage));
             if (!stored) {
                 result.diagnostics = result.provider_stage->diagnostics;
@@ -1158,7 +1281,7 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             return finish(decompiler_pipeline_status_t::resource_limit);
         }
         result.normalized_stage = std::make_shared<const decompiler_normalized_cache_value_t>(normalized);
-        if (cache_writes_enabled(request.cache_mode)) {
+        if (cache_writes_enabled(request.cache_mode) && !deferred_intermediate_cache_writes) {
             auto stored = state_->cache->store_normalized(normalized_key, std::move(normalized));
             if (!stored) {
                 result.diagnostics = result.normalized_stage->diagnostics;
@@ -1209,6 +1332,37 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             "decompiler.pipeline.render.rejected"));
         result.diagnostics = std::move(diagnostics);
         return finish(decompiler_pipeline_status_t::rendering_failed);
+    }
+    if (attested_document &&
+        !equivalent_attested_document(*attested_document, *rendering.document)) {
+        diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.pipeline.provider.attested_document_mismatch"));
+        result.diagnostics = std::move(diagnostics);
+        return finish(decompiler_pipeline_status_t::provider_failed);
+    }
+    if (deferred_intermediate_cache_writes && cache_writes_enabled(request.cache_mode)) {
+        auto provider_stored = state_->cache->store_provider_ir(
+            provider_key, *result.provider_stage);
+        if (!provider_stored) {
+            diagnostics.push_back(cache_failure_diagnostic(provider_stored.error()));
+            if (provider_stored.error().code == workspace_error_code_t::stale_generation ||
+                provider_stored.error().code == workspace_error_code_t::integrity_failure) {
+                result.diagnostics = std::move(diagnostics);
+                return finish(cache_error_status(provider_stored.error()));
+            }
+        }
+        auto normalized_stored = state_->cache->store_normalized(
+            normalized_key, *result.normalized_stage);
+        if (!normalized_stored) {
+            diagnostics.push_back(cache_failure_diagnostic(normalized_stored.error()));
+            if (normalized_stored.error().code == workspace_error_code_t::stale_generation ||
+                normalized_stored.error().code == workspace_error_code_t::integrity_failure) {
+                result.diagnostics = std::move(diagnostics);
+                return finish(cache_error_status(normalized_stored.error()));
+            }
+        }
     }
 
     decompiler_rendered_cache_value_t rendered;

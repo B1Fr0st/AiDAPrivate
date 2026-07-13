@@ -21,7 +21,8 @@ enum class search_query_kind_t : std::uint8_t {
     bytes,
     instruction,
     entity,
-    address
+    address,
+    invalid = 0xffU
 };
 
 struct literal_search_query_t {
@@ -63,6 +64,7 @@ struct query_cursor_t {
     std::uint64_t query_fingerprint = 0;
     std::uint64_t position = 0;
     std::uint64_t matches_consumed = 0;
+    std::uint64_t integrity_tag = 0;
 };
 
 struct query_page_request_t {
@@ -120,6 +122,11 @@ struct query_index_limits_t {
 class query_index_t final {
 public:
     static workspace_result_t<std::shared_ptr<const query_index_t>> build(
+        std::shared_ptr<const search_index_t> index,
+        std::shared_ptr<const provider_snapshot_t> provider = {},
+        const query_index_limits_t& limits = {},
+        query_telemetry_hook_t telemetry = {});
+    static workspace_result_t<std::shared_ptr<const query_index_t>> build(
         search_generation_handle_t generation,
         std::shared_ptr<const provider_snapshot_t> provider = {},
         const query_index_limits_t& limits = {},
@@ -134,6 +141,33 @@ public:
     const query_index_limits_t& limits() const noexcept;
     bool has_byte_provider() const noexcept;
     workspace_result_t<query_page_t> query(const search_query_t& query,
+        const query_page_request_t& page = {},
+        const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<void> validate_cursor(
+        const search_query_t& query,
+        const query_cursor_t& cursor) const;
+    workspace_result_t<query_page_t> query_literal(
+        const literal_search_query_t& query,
+        const query_page_request_t& page = {},
+        const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<query_page_t> query_regex(
+        const regex_search_query_t& query,
+        const query_page_request_t& page = {},
+        const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<query_page_t> query_bytes(
+        const byte_search_query_t& query,
+        const query_page_request_t& page = {},
+        const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<query_page_t> query_instruction(
+        const instruction_search_query_t& query,
+        const query_page_request_t& page = {},
+        const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<query_page_t> query_entity(
+        const entity_search_query_t& query,
+        const query_page_request_t& page = {},
+        const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<query_page_t> query_address(
+        const address_search_query_t& query,
         const query_page_request_t& page = {},
         const cancellation_token_t& cancel = {}) const;
 

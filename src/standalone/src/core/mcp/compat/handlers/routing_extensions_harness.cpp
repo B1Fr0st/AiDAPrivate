@@ -1,20 +1,15 @@
 #include "routing_extensions_harness.hpp"
 
-#include <algorithm>
 #include <chrono>
-#include <cctype>
-#include <cmath>
-#include <cstring>
-#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace aida::standalone::mcp::compat::handlers::test {
 
 namespace {
 
 using protocol::json;
-using protocol::mcp_result_t;
 using protocol::result_error_code_t;
 using protocol::cancellation_token_t;
 using protocol::canonical_error_code;
@@ -34,7 +29,8 @@ bool json_is_string(const json& obj, const std::string& key) {
 }
 
 bool json_is_int(const json& obj, const std::string& key) {
-    return json_has(obj, key) && obj[key].is_number_integer();
+    return json_has(obj, key) &&
+        (obj[key].is_number_integer() || obj[key].is_number_unsigned());
 }
 
 std::string json_string(const json& obj, const std::string& key) {
@@ -58,14 +54,6 @@ const json& json_array(const json& obj, const std::string& key) {
     return obj[key];
 }
 
-std::uint64_t parse_number(const std::string& text) {
-    if (text.empty()) return 0;
-    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
-        return std::stoull(text.substr(2), nullptr, 16);
-    }
-    return std::stoull(text);
-}
-
 }
 
 adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_analysis_handler(
@@ -76,10 +64,14 @@ adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_analysis_handl
         if (context.contract) {
             state.last_contract_name = std::string(context.contract->name);
         }
-        state.last_payload = request.payload;
-        if (state.canned_success && !state.canned_response.empty()) {
-            return adapter_result_t<adapter_response_t>::success({state.canned_response, false});
+        if (context.target) {
+            const auto& target = context.target->target();
+            state.last_target_id = target.target_id;
+            state.last_generation = target.generation;
+            state.last_pid = target.pid;
+            state.last_bin_name = target.bin_name;
         }
+        state.last_payload = request.payload;
     }
     json response = json{{"results", json::array({json{{"addr", "0x1000"}, {"name", "func_mock"}}})}};
     return adapter_result_t<adapter_response_t>::success({response.dump(), false});
@@ -93,96 +85,43 @@ adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_query_handler(
         if (context.contract) {
             state.last_contract_name = std::string(context.contract->name);
         }
-        state.last_payload = request.payload;
-        if (state.canned_success && !state.canned_response.empty()) {
-            return adapter_result_t<adapter_response_t>::success({state.canned_response, false});
+        if (context.target) {
+            const auto& target = context.target->target();
+            state.last_target_id = target.target_id;
+            state.last_generation = target.generation;
+            state.last_pid = target.pid;
+            state.last_bin_name = target.bin_name;
         }
+        state.last_payload = request.payload;
     }
-    json response = json{{"matches", json::array({json{{"addr", "0x1000"}, {"mnem", "mov"}}})}};
+    json response = json{{"results", json::array({json{{"address", "0x1000"}, {"text", "mov eax, ebx"}}})}};
     return adapter_result_t<adapter_response_t>::success({response.dump(), false});
-}
-
-adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_overlay_handler(
-    const adapter_call_context_t&, const adapter_request_t&) {
-    return adapter_result_t<adapter_response_t>::failure(
-        {adapter_error_code_t::backend_unavailable, "stub_overlay", 0, 0});
-}
-
-adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_checkpoint_handler(
-    const adapter_call_context_t&, const adapter_request_t&) {
-    return adapter_result_t<adapter_response_t>::failure(
-        {adapter_error_code_t::backend_unavailable, "stub_checkpoint", 0, 0});
-}
-
-adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_debugger_handler(
-    const adapter_call_context_t&, const adapter_request_t&) {
-    return adapter_result_t<adapter_response_t>::failure(
-        {adapter_error_code_t::backend_unavailable, "stub_debugger", 0, 0});
-}
-
-adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_python_handler(
-    const adapter_call_context_t&, const adapter_request_t&) {
-    return adapter_result_t<adapter_response_t>::failure(
-        {adapter_error_code_t::backend_unavailable, "stub_python", 0, 0});
-}
-
-adapter_result_t<adapter_response_t> routing_test_fixture_t::stub_decompilation_handler(
-    const adapter_call_context_t&, const adapter_request_t&) {
-    return adapter_result_t<adapter_response_t>::failure(
-        {adapter_error_code_t::backend_unavailable, "stub_decompilation", 0, 0});
-}
-
-adapter_result_t<bounded_live_snapshot_t> routing_test_fixture_t::stub_snapshot_handler(
-    const adapter_call_context_t&, const bounded_live_snapshot_request_t&) {
-    return adapter_result_t<bounded_live_snapshot_t>::failure(
-        {adapter_error_code_t::live_snapshot_denied, "stub_snapshot", 0, 0});
 }
 
 routing_test_fixture_t::routing_test_fixture_t() {
     g_current_fixture = this;
-    handlers_.analysis = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
+    handlers_.analyze_funcs = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
         return stub_analysis_handler(ctx, req);
     };
-    handlers_.query = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
+    handlers_.find_insns = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
         return stub_query_handler(ctx, req);
     };
-    handlers_.overlay = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
-        return stub_overlay_handler(ctx, req);
-    };
-    handlers_.checkpoint = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
-        return stub_checkpoint_handler(ctx, req);
-    };
-    handlers_.debugger = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
-        return stub_debugger_handler(ctx, req);
-    };
-    handlers_.isolated_python = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
-        return stub_python_handler(ctx, req);
-    };
-    handlers_.decompilation = [](const adapter_call_context_t& ctx, const adapter_request_t& req) {
-        return stub_decompilation_handler(ctx, req);
-    };
-    handlers_.live_snapshot = [](const adapter_call_context_t& ctx, const bounded_live_snapshot_request_t& req) {
-        return stub_snapshot_handler(ctx, req);
-    };
-    workspace_ = std::make_unique<workspace_adapter_t>(resolver_, lock_manager_, handlers_);
-    routing_ = std::make_unique<routing_extensions_t>(resolver_, *workspace_, schemas_);
+    routing_ = std::make_unique<routing_extensions_t>(
+        resolver_, lock_manager_, handlers_, schemas_);
 }
 
 routing_test_fixture_t::~routing_test_fixture_t() {
     routing_.reset();
-    workspace_.reset();
     g_current_fixture = nullptr;
 }
 
 target_resolver_t& routing_test_fixture_t::resolver() noexcept { return resolver_; }
-effect_lock_manager_t& routing_test_fixture_t::lock_manager() noexcept { return lock_manager_; }
-workspace_adapter_t& routing_test_fixture_t::workspace() noexcept { return *workspace_; }
-protocol::schema_runtime_t& routing_test_fixture_t::schemas() noexcept { return schemas_; }
 routing_extensions_t& routing_test_fixture_t::routing() noexcept { return *routing_; }
 stub_handler_state_t& routing_test_fixture_t::analysis_state() noexcept { return analysis_state_; }
 stub_handler_state_t& routing_test_fixture_t::query_state() noexcept { return query_state_; }
 
-void routing_test_fixture_t::publish_target(std::uint32_t pid, const std::string& bin_name, bool live) {
+std::uint64_t routing_test_fixture_t::publish_target(
+    std::uint32_t pid, const std::string& bin_name, bool live) {
     target_record_t record;
     record.target_id = static_cast<std::uint64_t>(pid) * 17 + 1;
     record.pid = pid;
@@ -192,17 +131,10 @@ void routing_test_fixture_t::publish_target(std::uint32_t pid, const std::string
     record.attach_generation = 1;
     record.live = live;
     record.revision = 1;
-    resolver_.publish(record);
-}
-
-void routing_test_fixture_t::set_analysis_response(const std::string& json_payload) {
-    analysis_state_.canned_response = json_payload;
-    analysis_state_.canned_success = true;
-}
-
-void routing_test_fixture_t::set_query_response(const std::string& json_payload) {
-    query_state_.canned_response = json_payload;
-    query_state_.canned_success = true;
+    if (!resolver_.publish(record)) {
+        throw std::runtime_error("routing test target publication failed");
+    }
+    return record.target_id;
 }
 
 cancellation_token_t routing_test_fixture_t::make_cancellation(bool cancelled) {
@@ -315,9 +247,9 @@ routing_test_result_t test_metadata_effect_fields_for_extensions() {
     routing_test_result_t r{"metadata_effect_fields_for_extensions", false, ""};
     const auto* analyze_meta = find_routing_metadata("analyze_funcs");
     if (!analyze_meta) { r.message = "missing analyze_funcs metadata"; return r; }
-    if (analyze_meta->effect != protocol::tool_effect_t::workspace_read) { r.message = "analyze_funcs effect should be workspace_read"; return r; }
-    if (analyze_meta->lock != protocol::effect_lock_t::workspace_shared) { r.message = "analyze_funcs lock should be workspace_shared"; return r; }
-    if (!analyze_meta->read_only) { r.message = "analyze_funcs should be read_only"; return r; }
+    if (analyze_meta->effect != protocol::tool_effect_t::workspace_overlay_mutation) { r.message = "analyze_funcs effect should be workspace_overlay_mutation"; return r; }
+    if (analyze_meta->lock != protocol::effect_lock_t::workspace_overlay_transaction) { r.message = "analyze_funcs lock should be workspace_overlay_transaction"; return r; }
+    if (analyze_meta->read_only) { r.message = "analyze_funcs should be a mutation"; return r; }
 
     const auto* find_meta = find_routing_metadata("find_insns");
     if (!find_meta) { r.message = "missing find_insns metadata"; return r; }
@@ -408,6 +340,35 @@ routing_test_result_t test_metadata_count_function() {
     if (count != k_union_tool_count) {
         r.message = "expected " + std::to_string(k_union_tool_count) + ", got " + std::to_string(count);
         return r;
+    }
+    r.passed = true;
+    return r;
+}
+
+routing_test_result_t test_metadata_names_helper_consistency() {
+    routing_test_result_t r{"metadata_names_helper_consistency", false, ""};
+    const auto& inventory = routing_metadata_inventory();
+    const auto& names = routing_metadata_names();
+    if (names.size() != 92 || names.size() != inventory.size() ||
+        names.size() != routing_metadata_count()) {
+        r.message = "metadata helper sizes differ from the exact 92-name inventory";
+        return r;
+    }
+    std::unordered_set<std::string_view> unique_names;
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        if (names[index] != inventory[index].name) {
+            r.message = "metadata helper order differs at index " + std::to_string(index);
+            return r;
+        }
+        if (!unique_names.emplace(names[index]).second) {
+            r.message = "metadata helper contains duplicate name " + std::string(names[index]);
+            return r;
+        }
+        if (find_routing_metadata(names[index]) != &inventory[index]) {
+            r.message = "metadata lookup does not reference inventory entry " +
+                std::string(names[index]);
+            return r;
+        }
     }
     r.passed = true;
     return r;
@@ -544,13 +505,41 @@ routing_test_result_t test_list_instances_multiple_targets() {
 routing_test_result_t test_list_instances_include_retired_flag() {
     routing_test_result_t r{"list_instances_include_retired_flag", false, ""};
     routing_test_fixture_t fx;
-    fx.publish_target(42, "retire_test.exe");
-    auto result = fx.routing().invoke(
+    const auto target_id = fx.publish_target(42, "retire_test.exe");
+    auto active = fx.routing().invoke(
+        "list_instances", json::object(), fx.make_cancellation());
+    if (active.is_error() || json_array(active.structured_content(), "instances").size() != 1) {
+        r.message = "active target was not captured before retirement";
+        return r;
+    }
+    if (!fx.resolver().retire(target_id)) {
+        r.message = "target retirement failed";
+        return r;
+    }
+    auto current_only = fx.routing().invoke(
+        "list_instances", json::object(), fx.make_cancellation());
+    if (current_only.is_error() ||
+        !json_array(current_only.structured_content(), "instances").empty()) {
+        r.message = "retired target leaked into the default listing";
+        return r;
+    }
+    auto with_retired = fx.routing().invoke(
         "list_instances", json{{"include_retired", true}}, fx.make_cancellation());
-    if (result.is_error()) { r.message = "list_instances with include_retired failed"; return r; }
-    const auto& structured = result.structured_content();
-    auto instances = json_array(structured, "instances");
-    if (instances.empty()) { r.message = "expected at least 1 instance"; return r; }
+    if (with_retired.is_error()) {
+        r.message = "list_instances with include_retired failed";
+        return r;
+    }
+    const auto& instances = json_array(with_retired.structured_content(), "instances");
+    if (instances.size() != 1 || json_int(instances[0], "pid") != 42 ||
+        !json_bool(instances[0], "retired")) {
+        r.message = "include_retired did not return the retired target identity";
+        return r;
+    }
+    if (!json_bool(with_retired.aida_metadata(), "include_retired") ||
+        json_int(with_retired.aida_metadata(), "known_target_count") != 1) {
+        r.message = "include_retired provenance is inconsistent";
+        return r;
+    }
     r.passed = true;
     return r;
 }
@@ -559,10 +548,10 @@ routing_test_result_t test_calculator_addition() {
     routing_test_result_t r{"calculator_addition", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "1 + 2"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "1 + 2"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed: " + std::string(result.text()); return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "3") { r.message = "expected result=3, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "3") { r.message = "expected result=3, got " + json_string(structured, "value"); return r; }
     if (json_string(structured, "decimal") != "3") { r.message = "decimal mismatch"; return r; }
     r.passed = true;
     return r;
@@ -572,10 +561,10 @@ routing_test_result_t test_calculator_subtraction() {
     routing_test_result_t r{"calculator_subtraction", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "100 - 37"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "100 - 37"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "63") { r.message = "expected 63, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "63") { r.message = "expected 63, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -584,10 +573,10 @@ routing_test_result_t test_calculator_multiplication() {
     routing_test_result_t r{"calculator_multiplication", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "7 * 8"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "7 * 8"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "56") { r.message = "expected 56, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "56") { r.message = "expected 56, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -596,10 +585,10 @@ routing_test_result_t test_calculator_division() {
     routing_test_result_t r{"calculator_division", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "144 / 12"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "144 / 12"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "12") { r.message = "expected 12, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "12") { r.message = "expected 12, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -608,10 +597,10 @@ routing_test_result_t test_calculator_modulo() {
     routing_test_result_t r{"calculator_modulo", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "17 % 5"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "17 % 5"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "2") { r.message = "expected 2, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "2") { r.message = "expected 2, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -620,11 +609,12 @@ routing_test_result_t test_calculator_hex_literal() {
     routing_test_result_t r{"calculator_hex_literal", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "0xFF + 1"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "0xFF + 1"}, {"format", "all"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "256") { r.message = "expected 256, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "decimal") != "256") { r.message = "expected decimal=256"; return r; }
     if (json_string(structured, "hex") != "0x100") { r.message = "expected hex=0x100, got " + json_string(structured, "hex"); return r; }
+    if (json_string(structured, "value") != "0x100") { r.message = "all-format value should use canonical hexadecimal form"; return r; }
     r.passed = true;
     return r;
 }
@@ -633,10 +623,10 @@ routing_test_result_t test_calculator_binary_literal() {
     routing_test_result_t r{"calculator_binary_literal", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "0b1010 + 0b0101"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "0b1010 + 0b0101"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "15") { r.message = "expected 15, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "15") { r.message = "expected 15, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -645,10 +635,10 @@ routing_test_result_t test_calculator_bitwise_and() {
     routing_test_result_t r{"calculator_bitwise_and", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "0xFF & 0x0F"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "0xFF & 0x0F"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "15") { r.message = "expected 15, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "15") { r.message = "expected 15, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -657,10 +647,10 @@ routing_test_result_t test_calculator_bitwise_or() {
     routing_test_result_t r{"calculator_bitwise_or", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "0xF0 | 0x0F"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "0xF0 | 0x0F"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "255") { r.message = "expected 255, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "255") { r.message = "expected 255, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -669,10 +659,10 @@ routing_test_result_t test_calculator_bitwise_xor() {
     routing_test_result_t r{"calculator_bitwise_xor", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "0xAA ^ 0xFF"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "0xAA ^ 0xFF"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "85") { r.message = "expected 85, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "85") { r.message = "expected 85, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -681,11 +671,10 @@ routing_test_result_t test_calculator_bitwise_not() {
     routing_test_result_t r{"calculator_bitwise_not", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "~0"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "~0"}, {"bits", 64}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    const auto val = parse_number(json_string(structured, "result"));
-    if (val != 0xFFFFFFFFFFFFFFFFULL) { r.message = "expected all 1s, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "18446744073709551615") { r.message = "expected unsigned 64-bit all-ones value, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -694,10 +683,10 @@ routing_test_result_t test_calculator_shift_left() {
     routing_test_result_t r{"calculator_shift_left", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "1 << 8"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "1 << 8"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "256") { r.message = "expected 256, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "256") { r.message = "expected 256, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -706,10 +695,10 @@ routing_test_result_t test_calculator_shift_right() {
     routing_test_result_t r{"calculator_shift_right", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "256 >> 4"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "256 >> 4"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "16") { r.message = "expected 16, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "16") { r.message = "expected 16, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -718,10 +707,10 @@ routing_test_result_t test_calculator_parentheses() {
     routing_test_result_t r{"calculator_parentheses", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "(2 + 3) * 4"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "(2 + 3) * 4"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    if (json_string(structured, "result") != "20") { r.message = "expected 20, got " + json_string(structured, "result"); return r; }
+    if (json_string(structured, "value") != "20") { r.message = "expected 20, got " + json_string(structured, "value"); return r; }
     r.passed = true;
     return r;
 }
@@ -730,7 +719,7 @@ routing_test_result_t test_calculator_division_by_zero() {
     routing_test_result_t r{"calculator_division_by_zero", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "1 / 0"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "1 / 0"}, {"format", "decimal"}}, fx.make_cancellation());
     if (!result.is_error()) { r.message = "expected error for division by zero"; return r; }
     if (result.error_code() != std::string_view(canonical_error_code(result_error_code_t::invalid_input))) {
         r.message = "expected invalid_input error code";
@@ -744,7 +733,7 @@ routing_test_result_t test_calculator_empty_expression() {
     routing_test_result_t r{"calculator_empty_expression", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", ""}}, fx.make_cancellation());
+        "calculator", json{{"expression", ""}, {"format", "decimal"}}, fx.make_cancellation());
     if (!result.is_error()) { r.message = "expected error for empty expression"; return r; }
     r.passed = true;
     return r;
@@ -754,7 +743,7 @@ routing_test_result_t test_calculator_trailing_tokens() {
     routing_test_result_t r{"calculator_trailing_tokens", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "1 + 2 3"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "1 + 2 3"}, {"format", "decimal"}}, fx.make_cancellation());
     if (!result.is_error()) { r.message = "expected error for trailing tokens"; return r; }
     r.passed = true;
     return r;
@@ -764,12 +753,70 @@ routing_test_result_t test_calculator_complex_expression() {
     routing_test_result_t r{"calculator_complex_expression", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculator", json{{"expression", "((0x100 + 0x200) * 2) - 0x50"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "((0x100 + 0x200) * 2) - 0x50"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculator failed"; return r; }
     const auto& structured = result.structured_content();
-    const auto expected = ((0x100 + 0x200) * 2) - 0x50;
-    if (parse_number(json_string(structured, "result")) != expected) {
-        r.message = "expected " + std::to_string(expected) + ", got " + json_string(structured, "result");
+    if (json_string(structured, "value") != "1456") {
+        r.message = "expected 1456, got " + json_string(structured, "value");
+        return r;
+    }
+    r.passed = true;
+    return r;
+}
+
+routing_test_result_t test_calculator_canonical_boundaries() {
+    routing_test_result_t r{"calculator_canonical_boundaries", false, ""};
+    routing_test_fixture_t fx;
+
+    auto arbitrary_precision = fx.routing().invoke(
+        "calculator",
+        json{{"expression", "(1 << 65) + 3"}, {"format", "decimal"}},
+        fx.make_cancellation());
+    if (arbitrary_precision.is_error() ||
+        json_string(arbitrary_precision.structured_content(), "value") !=
+            "36893488147419103235") {
+        r.message = "arbitrary-precision calculation was narrowed or rejected";
+        return r;
+    }
+
+    auto scalar_item = fx.routing().invoke(
+        "calculate",
+        json{{"items", json{{"id", "scalar"}, {"expression", "2 + 3"},
+                             {"format", "decimal"}}}},
+        fx.make_cancellation());
+    if (scalar_item.is_error()) {
+        r.message = "scalar calculator item was rejected";
+        return r;
+    }
+    const auto& scalar_results = json_array(scalar_item.structured_content(), "results");
+    if (scalar_results.size() != 1 || !json_bool(scalar_results[0], "success") ||
+        json_string(scalar_results[0], "id") != "scalar" ||
+        !scalar_results[0].contains("result") ||
+        json_string(scalar_results[0]["result"], "value") != "5") {
+        r.message = "scalar calculator item did not retain the canonical batch envelope";
+        return r;
+    }
+
+    json items = json::array();
+    for (std::size_t index = 0; index < 128; ++index) {
+        items.push_back(json{{"id", std::to_string(index)},
+                             {"expression", "1 + 1"},
+                             {"format", "decimal"}});
+    }
+    auto at_limit = fx.routing().invoke(
+        "calculator", json{{"items", items}}, fx.make_cancellation());
+    if (at_limit.is_error() || json_int(at_limit.structured_content(), "count") != 128 ||
+        json_array(at_limit.structured_content(), "results").size() != 128) {
+        r.message = "calculator rejected the canonical 128-item boundary";
+        return r;
+    }
+    items.push_back(json{{"expression", "1 + 1"}, {"format", "decimal"}});
+    auto over_limit = fx.routing().invoke(
+        "calculator", json{{"items", std::move(items)}}, fx.make_cancellation());
+    if (!over_limit.is_error() ||
+        over_limit.error_code() !=
+            std::string_view(canonical_error_code(result_error_code_t::invalid_input))) {
+        r.message = "calculator did not reject the 129-item boundary canonically";
         return r;
     }
     r.passed = true;
@@ -780,18 +827,17 @@ routing_test_result_t test_calculate_alias_matches_calculator() {
     routing_test_result_t r{"calculate_alias_matches_calculator", false, ""};
     routing_test_fixture_t fx;
     auto result_calc = fx.routing().invoke(
-        "calculator", json{{"expression", "42 * 2"}}, fx.make_cancellation());
+        "calculator", json{{"expression", "42 * 2"}, {"format", "decimal"}}, fx.make_cancellation());
     auto result_calculate = fx.routing().invoke(
-        "calculate", json{{"expression", "42 * 2"}}, fx.make_cancellation());
+        "calculate", json{{"expression", "42 * 2"}, {"format", "decimal"}}, fx.make_cancellation());
     if (result_calc.is_error()) { r.message = "calculator failed"; return r; }
     if (result_calculate.is_error()) { r.message = "calculate failed"; return r; }
-    if (json_string(result_calc.structured_content(), "result") !=
-        json_string(result_calculate.structured_content(), "result")) {
+    if (result_calc.structured_content() != result_calculate.structured_content()) {
         r.message = "calculator and calculate should return same result";
         return r;
     }
-    if (json_string(result_calculate.structured_content(), "result") != "84") {
-        r.message = "expected 84, got " + json_string(result_calculate.structured_content(), "result");
+    if (json_string(result_calculate.structured_content(), "value") != "84") {
+        r.message = "expected 84, got " + json_string(result_calculate.structured_content(), "value");
         return r;
     }
     r.passed = true;
@@ -802,7 +848,7 @@ routing_test_result_t test_calculate_hex_output() {
     routing_test_result_t r{"calculate_hex_output", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "calculate", json{{"expression", "255"}}, fx.make_cancellation());
+        "calculate", json{{"expression", "255"}, {"format", "all"}}, fx.make_cancellation());
     if (result.is_error()) { r.message = "calculate failed"; return r; }
     const auto& structured = result.structured_content();
     if (json_string(structured, "decimal") != "255") { r.message = "decimal mismatch"; return r; }
@@ -811,12 +857,58 @@ routing_test_result_t test_calculate_hex_output() {
     return r;
 }
 
-routing_test_result_t test_analyze_funcs_missing_addrs() {
-    routing_test_result_t r{"analyze_funcs_missing_addrs", false, ""};
+routing_test_result_t test_workspace_extension_target_routing_without_ui_switch() {
+    routing_test_result_t r{"workspace_extension_target_routing_without_ui_switch", false, ""};
+    routing_test_fixture_t fx;
+    const auto ui_selected_target_id = fx.publish_target(4101, "ui-selected.exe");
+    fx.publish_target(4102, "routed-target.exe");
+
+    const json analyze_arguments{
+        {"items", "0x140001000"},
+        {"dry_run", true},
+        {"pid", 4102},
+    };
+    auto analyze = fx.routing().invoke(
+        "analyze_funcs", analyze_arguments, fx.make_cancellation());
+    if (analyze.is_error() || fx.analysis_state().call_count != 1 ||
+        fx.analysis_state().last_contract_name != "analyze_funcs" ||
+        fx.analysis_state().last_pid != 4102 ||
+        fx.analysis_state().last_bin_name != "routed-target.exe" ||
+        json::parse(fx.analysis_state().last_payload) != analyze_arguments) {
+        r.message = "analyze_funcs did not route the exact payload to the selected target";
+        return r;
+    }
+
+    const json find_arguments{
+        {"mnemonic", "mov"},
+        {"operand_pattern", "r*, [r*]"},
+        {"limit", 100},
+        {"bin_name", "routed-target.exe"},
+    };
+    auto find = fx.routing().invoke(
+        "find_insns", find_arguments, fx.make_cancellation());
+    if (find.is_error() || fx.query_state().call_count != 1 ||
+        fx.query_state().last_contract_name != "find_insns" ||
+        fx.query_state().last_target_id == ui_selected_target_id ||
+        fx.query_state().last_pid != 4102 ||
+        json::parse(fx.query_state().last_payload) != find_arguments) {
+        r.message = "find_insns did not route independently of the UI-selected target";
+        return r;
+    }
+    r.passed = true;
+    return r;
+}
+
+routing_test_result_t test_analyze_funcs_legacy_addrs_rejected() {
+    routing_test_result_t r{"analyze_funcs_legacy_addrs_rejected", false, ""};
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
-        "analyze_funcs", json::object(), fx.make_cancellation());
-    if (!result.is_error()) { r.message = "expected error when addrs is missing"; return r; }
+        "analyze_funcs", json{{"addrs", json::array({"0x140001000"})}},
+        fx.make_cancellation());
+    if (!result.is_error() || fx.analysis_state().call_count != 0) {
+        r.message = "legacy addrs input bypassed the canonical analyze_funcs schema";
+        return r;
+    }
     r.passed = true;
     return r;
 }
@@ -826,7 +918,7 @@ routing_test_result_t test_find_insns_missing_mnemonic() {
     routing_test_fixture_t fx;
     auto result = fx.routing().invoke(
         "find_insns", json::object(), fx.make_cancellation());
-    if (!result.is_error()) { r.message = "expected error when mnem is missing"; return r; }
+    if (!result.is_error()) { r.message = "expected error when mnemonic is missing"; return r; }
     r.passed = true;
     return r;
 }
@@ -869,9 +961,7 @@ routing_test_result_t test_routing_extension_limits_defaults() {
     const auto& limits = fx.routing().limits();
     if (limits.max_request_bytes != 1024U * 1024U) { r.message = "max_request_bytes mismatch"; return r; }
     if (limits.max_response_bytes != 16U * 1024U * 1024U) { r.message = "max_response_bytes mismatch"; return r; }
-    if (limits.max_expression_bytes != 16384U) { r.message = "max_expression_bytes mismatch"; return r; }
-    if (limits.max_function_addresses != 256U) { r.message = "max_function_addresses mismatch"; return r; }
-    if (limits.max_instruction_results != 5000U) { r.message = "max_instruction_results mismatch"; return r; }
+    if (limits.max_selector_bytes != 1024U) { r.message = "max_selector_bytes mismatch"; return r; }
     if (limits.max_execution_time.count() != 120000) { r.message = "max_execution_time mismatch"; return r; }
     r.passed = true;
     return r;
@@ -916,6 +1006,7 @@ void register_all_routing_extension_tests(routing_test_harness_t& harness) {
     harness.register_test("metadata_is_extension_flag", test_metadata_is_extension_flag);
     harness.register_test("metadata_target_requirement_for_extensions", test_metadata_target_requirement_for_extensions);
     harness.register_test("metadata_count_function", test_metadata_count_function);
+    harness.register_test("metadata_names_helper_consistency", test_metadata_names_helper_consistency);
     harness.register_test("extension_tool_count", test_extension_tool_count);
     harness.register_test("extension_tool_names_match_constants", test_extension_tool_names_match_constants);
     harness.register_test("union_tool_count_is_92", test_union_tool_count_is_92);
@@ -944,9 +1035,11 @@ void register_all_routing_extension_tests(routing_test_harness_t& harness) {
     harness.register_test("calculator_empty_expression", test_calculator_empty_expression);
     harness.register_test("calculator_trailing_tokens", test_calculator_trailing_tokens);
     harness.register_test("calculator_complex_expression", test_calculator_complex_expression);
+    harness.register_test("calculator_canonical_boundaries", test_calculator_canonical_boundaries);
     harness.register_test("calculate_alias_matches_calculator", test_calculate_alias_matches_calculator);
     harness.register_test("calculate_hex_output", test_calculate_hex_output);
-    harness.register_test("analyze_funcs_missing_addrs", test_analyze_funcs_missing_addrs);
+    harness.register_test("workspace_extension_target_routing_without_ui_switch", test_workspace_extension_target_routing_without_ui_switch);
+    harness.register_test("analyze_funcs_legacy_addrs_rejected", test_analyze_funcs_legacy_addrs_rejected);
     harness.register_test("find_insns_missing_mnemonic", test_find_insns_missing_mnemonic);
     harness.register_test("routing_extension_size", test_routing_extension_size);
     harness.register_test("routing_extension_find_existing", test_routing_extension_find_existing);

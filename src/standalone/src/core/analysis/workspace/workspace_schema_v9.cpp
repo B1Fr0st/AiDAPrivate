@@ -1,11 +1,7 @@
 #include "workspace_schema_v9.hpp"
 
 #include "checked_range.hpp"
-
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <bcrypt.h>
+#include "packed_page_codec.hpp"
 
 #include <sqlite3.h>
 
@@ -13,9 +9,8 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
-#include <sstream>
-
-#include <nlohmann/json.hpp>
+#include <unordered_set>
+#include <utility>
 
 namespace aida::analysis {
 
@@ -121,19 +116,18 @@ public:
                 schema_v9_error(database_, SQLITE_TOOBIG,
                                 "v9 blob value exceeds SQLite limit", phase_));
         }
-        const int status = sqlite3_bind_blob(statement_, index, data,
-                                              static_cast<int>(size), SQLITE_TRANSIENT);
+        if (size != 0 && !data) {
+            return workspace_result_t<void>::failure(
+                schema_v9_error(database_, SQLITE_MISUSE,
+                                "v9 blob value is null with a non-zero size", phase_));
+        }
+        const int status = size == 0
+            ? sqlite3_bind_zeroblob(statement_, index, 0)
+            : sqlite3_bind_blob(statement_, index, data,
+                                static_cast<int>(size), SQLITE_TRANSIENT);
         if (status != SQLITE_OK)
             return workspace_result_t<void>::failure(
                 schema_v9_error(database_, status, "v9 bind_blob failed", phase_));
-        return workspace_result_t<void>::success();
-    }
-
-    workspace_result_t<void> bind_null(int index) {
-        const int status = sqlite3_bind_null(statement_, index);
-        if (status != SQLITE_OK)
-            return workspace_result_t<void>::failure(
-                schema_v9_error(database_, status, "v9 bind_null failed", phase_));
         return workspace_result_t<void>::success();
     }
 
@@ -176,102 +170,582 @@ std::uint64_t utc_ms_v9() noexcept {
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+std::uint64_t read_u64_le_v9(const std::uint8_t* data) noexcept {
+    std::uint64_t value = 0;
+    for (std::size_t index = 0; index < sizeof(value); ++index)
+        value |= static_cast<std::uint64_t>(data[index]) << (index * 8U);
+    return value;
 }
 
-workspace_result_t<void> create_schema_v9(sqlite3* database) {
-    return exec_sql_v9(database, R"SQL(
-CREATE TABLE IF NOT EXISTS packed_generations(
+void append_u32_le_v9(std::vector<std::uint8_t>& output,
+                      std::uint32_t value) {
+    output.push_back(static_cast<std::uint8_t>(value));
+    output.push_back(static_cast<std::uint8_t>(value >> 8U));
+    output.push_back(static_cast<std::uint8_t>(value >> 16U));
+    output.push_back(static_cast<std::uint8_t>(value >> 24U));
+}
+
+workspace_result_t<bool> table_exists_v9(sqlite3* database,
+                                         const std::string& table) {
+    v9_statement_t statement;
+    auto result = statement.prepare(database,
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1",
+        "workspace_schema_v9.table_exists");
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_text(1, table);
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    const int status = sqlite3_step(statement.get());
+    if (status == SQLITE_ROW)
+        return workspace_result_t<bool>::success(true);
+    if (status == SQLITE_DONE)
+        return workspace_result_t<bool>::success(false);
+    return workspace_result_t<bool>::failure(schema_v9_error(
+        database, status, "unable to inspect v9 migration source table",
+        "workspace_schema_v9.table_exists"));
+}
+
+workspace_result_t<bool> packed_domain_upgrade_required_v9(sqlite3* database) {
+    v9_statement_t statement;
+    auto result = statement.prepare(database,
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='packed_pages'",
+        "workspace_schema_v9.inspect_packed_domain");
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    const int status = sqlite3_step(statement.get());
+    if (status == SQLITE_DONE)
+        return workspace_result_t<bool>::success(false);
+    if (status != SQLITE_ROW) {
+        return workspace_result_t<bool>::failure(schema_v9_error(
+            database, status, "unable to inspect packed-page schema",
+            "workspace_schema_v9.inspect_packed_domain"));
+    }
+    const auto sql = column_text_v9(statement.get(), 0);
+    return workspace_result_t<bool>::success(
+        sql.find("BETWEEN 1 AND 13") != std::string::npos);
+}
+
+workspace_result_t<void> upgrade_packed_domain_schema_v9(sqlite3* database) {
+    auto required = packed_domain_upgrade_required_v9(database);
+    if (!required)
+        return workspace_result_t<void>::failure(required.error());
+    if (!required.value())
+        return workspace_result_t<void>::success();
+    auto result = exec_sql_v9(database,
+        "SAVEPOINT aida_packed_domain_upgrade_v9",
+        "workspace_schema_v9.upgrade_packed_domain.begin");
+    if (!result)
+        return result;
+    result = exec_sql_v9(database, R"SQL(
+DROP TABLE IF EXISTS packed_page_index_v9_upgrade;
+DROP TABLE IF EXISTS packed_pages_v9_upgrade;
+DROP TABLE IF EXISTS packed_generations_v9_upgrade;
+CREATE TABLE packed_generations_v9_upgrade(
     generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    generation INTEGER NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation<>0),
     analysis_revision INTEGER NOT NULL,
     overlay_revision INTEGER NOT NULL,
-    shard_count INTEGER NOT NULL,
-    total_payload_bytes INTEGER NOT NULL,
-    total_records INTEGER NOT NULL,
+    shard_count INTEGER NOT NULL CHECK(shard_count BETWEEN 1 AND 18),
+    total_payload_bytes INTEGER NOT NULL CHECK(total_payload_bytes BETWEEN 0 AND 536870912),
+    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 1 AND 131072),
     batch_checksum INTEGER NOT NULL,
     created_utc_ms INTEGER NOT NULL,
     committed INTEGER NOT NULL CHECK(committed IN (0,1)),
-    payload_blob BLOB NOT NULL
+    payload_blob BLOB NOT NULL CHECK(length(payload_blob)<=16777216),
+    UNIQUE(generation)
+);
+CREATE TABLE packed_pages_v9_upgrade(
+    page_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation INTEGER NOT NULL,
+    page_index INTEGER NOT NULL CHECK(page_index BETWEEN 0 AND 131071),
+    page_count INTEGER NOT NULL CHECK(page_count BETWEEN 1 AND 131072),
+    page_type INTEGER NOT NULL CHECK(page_type BETWEEN 1 AND 18),
+    payload_length INTEGER NOT NULL CHECK(payload_length BETWEEN 0 AND 1048576),
+    checksum INTEGER NOT NULL,
+    payload BLOB NOT NULL CHECK(length(payload)=payload_length),
+    UNIQUE(generation,page_index),
+    FOREIGN KEY(generation) REFERENCES packed_generations_v9_upgrade(generation) ON DELETE CASCADE
+);
+CREATE TABLE packed_page_index_v9_upgrade(
+    index_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation INTEGER NOT NULL,
+    domain INTEGER NOT NULL CHECK(domain BETWEEN 1 AND 18),
+    ordinal_begin INTEGER NOT NULL CHECK(ordinal_begin BETWEEN 0 AND 4294967295),
+    count INTEGER NOT NULL CHECK(count BETWEEN 0 AND 1048576),
+    page_index INTEGER NOT NULL CHECK(page_index BETWEEN 0 AND 131071),
+    address_value_min INTEGER NOT NULL,
+    address_value_max INTEGER NOT NULL,
+    UNIQUE(generation,domain,page_index),
+    FOREIGN KEY(generation) REFERENCES packed_generations_v9_upgrade(generation) ON DELETE CASCADE
+);
+INSERT INTO packed_generations_v9_upgrade SELECT * FROM packed_generations;
+INSERT INTO packed_pages_v9_upgrade SELECT * FROM packed_pages;
+INSERT INTO packed_page_index_v9_upgrade SELECT * FROM packed_page_index;
+DROP TABLE packed_page_index;
+DROP TABLE packed_pages;
+DROP TABLE packed_generations;
+ALTER TABLE packed_generations_v9_upgrade RENAME TO packed_generations;
+ALTER TABLE packed_pages_v9_upgrade RENAME TO packed_pages;
+ALTER TABLE packed_page_index_v9_upgrade RENAME TO packed_page_index;
+)SQL", "workspace_schema_v9.upgrade_packed_domain");
+    if (!result) {
+        exec_sql_v9(database, "ROLLBACK TO aida_packed_domain_upgrade_v9",
+                    "workspace_schema_v9.upgrade_packed_domain.rollback");
+        exec_sql_v9(database, "RELEASE aida_packed_domain_upgrade_v9",
+                    "workspace_schema_v9.upgrade_packed_domain.release");
+        return result;
+    }
+    result = exec_sql_v9(database,
+        "RELEASE aida_packed_domain_upgrade_v9",
+        "workspace_schema_v9.upgrade_packed_domain.commit");
+    return result;
+}
+
+workspace_result_t<void> cancelled_publish_error() {
+    auto error = make_workspace_error(workspace_error_code_t::cancelled,
+                                      "packed generation publication was cancelled",
+                                      "workspace_schema_v9.publish_atomic");
+    error.cancellation = true;
+    return workspace_result_t<void>::failure(std::move(error));
+}
+
+bool publish_stop_requested_v9(
+    const packed_publish_stop_predicate_t& stop_requested) noexcept {
+    if (!stop_requested)
+        return false;
+    try {
+        return stop_requested();
+    } catch (...) {
+        return true;
+    }
+}
+
+workspace_error_t cancelled_read_error_v9(const char* phase) {
+    auto error = make_workspace_error(workspace_error_code_t::cancelled,
+                                      "packed generation read was cancelled",
+                                      phase);
+    error.cancellation = true;
+    return error;
+}
+
+workspace_result_t<void> copy_blob_v9(
+    std::vector<std::uint8_t>& output, const std::uint8_t* input,
+    std::size_t size, const packed_stop_predicate_t& stop_requested,
+    const char* phase) {
+    output.clear();
+    output.reserve(size);
+    constexpr std::size_t chunk_size = 4096;
+    for (std::size_t offset = 0; offset < size;) {
+        if (publish_stop_requested_v9(stop_requested))
+            return workspace_result_t<void>::failure(
+                cancelled_read_error_v9(phase));
+        const auto end = (std::min)(size, offset + chunk_size);
+        output.insert(output.end(), input + offset, input + end);
+        offset = end;
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<void>::failure(cancelled_read_error_v9(phase));
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> create_snapshot_extension_slot_v9(
+    sqlite3* database, const std::string& prefix) {
+    const auto table = [&](const char* suffix) { return prefix + suffix; };
+    std::string sql;
+    sql.reserve(16384);
+    sql += "CREATE TABLE IF NOT EXISTS " + table("call_graph_state") +
+        "(singleton INTEGER PRIMARY KEY CHECK(singleton=1),indirect_site_count INTEGER NOT NULL,unresolved_site_count INTEGER NOT NULL,bounded INTEGER NOT NULL CHECK(bounded IN (0,1)));";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("call_graph_nodes") +
+        "(function_id INTEGER PRIMARY KEY,address_space INTEGER NOT NULL,address_value INTEGER NOT NULL,address_arch INTEGER NOT NULL,address_mode INTEGER NOT NULL,incoming_edges INTEGER NOT NULL,outgoing_edges INTEGER NOT NULL,indirect_edges INTEGER NOT NULL,unresolved_sites INTEGER NOT NULL);";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("call_graph_nodes_address") +
+        " ON " + table("call_graph_nodes") +
+        "(address_space,address_value,address_arch,address_mode);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("call_sites") +
+        "(entity_id INTEGER PRIMARY KEY,source_function_id INTEGER NOT NULL,source_block_id INTEGER NOT NULL,instruction_id INTEGER NOT NULL,address_space INTEGER NOT NULL,address_value INTEGER NOT NULL,address_arch INTEGER NOT NULL,address_mode INTEGER NOT NULL,first_candidate INTEGER NOT NULL,candidate_count INTEGER NOT NULL,indirect INTEGER NOT NULL CHECK(indirect IN (0,1)),tail_call INTEGER NOT NULL CHECK(tail_call IN (0,1)),unresolved INTEGER NOT NULL CHECK(unresolved IN (0,1)));";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("call_sites_source") +
+        " ON " + table("call_sites") +
+        "(source_function_id,address_value);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("call_candidates") +
+        "(entity_id INTEGER PRIMARY KEY,call_site_id INTEGER NOT NULL,target_space INTEGER NOT NULL,target_value INTEGER NOT NULL,target_arch INTEGER NOT NULL,target_mode INTEGER NOT NULL,target_function_id INTEGER,kind INTEGER NOT NULL,provenance INTEGER NOT NULL,confidence INTEGER NOT NULL,contributor_count INTEGER NOT NULL,conflicted INTEGER NOT NULL CHECK(conflicted IN (0,1)),stable_source_id INTEGER NOT NULL,rank INTEGER NOT NULL,external_target INTEGER NOT NULL CHECK(external_target IN (0,1)));";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("call_candidates_site") +
+        " ON " + table("call_candidates") + "(call_site_id,rank);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("call_graph_edges") +
+        "(entity_id INTEGER PRIMARY KEY,call_site_id INTEGER NOT NULL,source_function_id INTEGER NOT NULL,source_block_id INTEGER NOT NULL,target_function_id INTEGER,call_site_space INTEGER NOT NULL,call_site_value INTEGER NOT NULL,call_site_arch INTEGER NOT NULL,call_site_mode INTEGER NOT NULL,target_space INTEGER NOT NULL,target_value INTEGER NOT NULL,target_arch INTEGER NOT NULL,target_mode INTEGER NOT NULL,resolution INTEGER NOT NULL,provenance INTEGER NOT NULL,confidence INTEGER NOT NULL,contributor_count INTEGER NOT NULL,conflicted INTEGER NOT NULL CHECK(conflicted IN (0,1)),candidate_rank INTEGER NOT NULL,external_target INTEGER NOT NULL CHECK(external_target IN (0,1)),target_noreturn INTEGER NOT NULL CHECK(target_noreturn IN (0,1)));";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("call_graph_edges_source") +
+        " ON " + table("call_graph_edges") +
+        "(source_function_id,call_site_value);";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("call_graph_edges_target") +
+        " ON " + table("call_graph_edges") +
+        "(target_function_id,target_value);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("call_graph_conflicts") +
+        "(entity_id INTEGER PRIMARY KEY,kind INTEGER NOT NULL,instruction_id INTEGER NOT NULL,source_function_id INTEGER NOT NULL,call_site_rva INTEGER NOT NULL,selected_target_rva INTEGER NOT NULL,competing_target_rva INTEGER NOT NULL,selected_target_function_id INTEGER NOT NULL,competing_target_function_id INTEGER NOT NULL);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("rich_data_candidates") +
+        "(entity_id INTEGER PRIMARY KEY,address_space INTEGER NOT NULL,address_value INTEGER NOT NULL,address_arch INTEGER NOT NULL,address_mode INTEGER NOT NULL,size INTEGER NOT NULL,kind INTEGER NOT NULL,target_space INTEGER,target_value INTEGER,target_arch INTEGER,target_mode INTEGER,provenance INTEGER NOT NULL,confidence INTEGER NOT NULL,CHECK((target_space IS NULL AND target_value IS NULL AND target_arch IS NULL AND target_mode IS NULL) OR (target_space IS NOT NULL AND target_value IS NOT NULL AND target_arch IS NOT NULL AND target_mode IS NOT NULL)));";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("rich_data_candidates_address") +
+        " ON " + table("rich_data_candidates") +
+        "(address_space,address_value,address_arch,address_mode);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("data_pointer_facts") +
+        "(entity_id INTEGER PRIMARY KEY,slot_space INTEGER NOT NULL,slot_value INTEGER NOT NULL,slot_arch INTEGER NOT NULL,slot_mode INTEGER NOT NULL,target_space INTEGER NOT NULL,target_value INTEGER NOT NULL,target_arch INTEGER NOT NULL,target_mode INTEGER NOT NULL,candidate_kind INTEGER NOT NULL,encoding INTEGER NOT NULL,width_bytes INTEGER NOT NULL,provenance INTEGER NOT NULL,confidence INTEGER NOT NULL);";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("data_pointer_facts_slot") +
+        " ON " + table("data_pointer_facts") +
+        "(slot_space,slot_value,slot_arch,slot_mode);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("data_conflicts") +
+        "(entity_id INTEGER PRIMARY KEY,address_space INTEGER NOT NULL,address_value INTEGER NOT NULL,address_arch INTEGER NOT NULL,address_mode INTEGER NOT NULL,kind INTEGER NOT NULL,selected_target_space INTEGER,selected_target_value INTEGER,selected_target_arch INTEGER,selected_target_mode INTEGER,rejected_target_space INTEGER,rejected_target_value INTEGER,rejected_target_arch INTEGER,rejected_target_mode INTEGER,selected_provenance INTEGER NOT NULL,rejected_provenance INTEGER NOT NULL,selected_confidence INTEGER NOT NULL,rejected_confidence INTEGER NOT NULL,CHECK((selected_target_space IS NULL AND selected_target_value IS NULL AND selected_target_arch IS NULL AND selected_target_mode IS NULL) OR (selected_target_space IS NOT NULL AND selected_target_value IS NOT NULL AND selected_target_arch IS NOT NULL AND selected_target_mode IS NOT NULL)),CHECK((rejected_target_space IS NULL AND rejected_target_value IS NULL AND rejected_target_arch IS NULL AND rejected_target_mode IS NULL) OR (rejected_target_space IS NOT NULL AND rejected_target_value IS NOT NULL AND rejected_target_arch IS NOT NULL AND rejected_target_mode IS NOT NULL)));";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("symbol_type_candidates") +
+        "(entity_id INTEGER PRIMARY KEY,address_space INTEGER,address_value INTEGER,address_arch INTEGER,address_mode INTEGER,related_space INTEGER,related_value INTEGER,related_arch INTEGER,related_mode INTEGER,kind INTEGER NOT NULL,display_name TEXT NOT NULL,canonical_type TEXT NOT NULL,source_key TEXT NOT NULL,provenance INTEGER NOT NULL,confidence INTEGER NOT NULL,explicitly_unknown INTEGER NOT NULL CHECK(explicitly_unknown IN (0,1)),CHECK((address_space IS NULL AND address_value IS NULL AND address_arch IS NULL AND address_mode IS NULL) OR (address_space IS NOT NULL AND address_value IS NOT NULL AND address_arch IS NOT NULL AND address_mode IS NOT NULL)),CHECK((related_space IS NULL AND related_value IS NULL AND related_arch IS NULL AND related_mode IS NULL) OR (related_space IS NOT NULL AND related_value IS NOT NULL AND related_arch IS NOT NULL AND related_mode IS NOT NULL)));";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("symbol_type_candidates_address") +
+        " ON " + table("symbol_type_candidates") +
+        "(address_space,address_value,address_arch,address_mode);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("type_references") +
+        "(entity_id INTEGER PRIMARY KEY,source_space INTEGER,source_value INTEGER,source_arch INTEGER,source_mode INTEGER,target_space INTEGER,target_value INTEGER,target_arch INTEGER,target_mode INTEGER,source_entity INTEGER NOT NULL,target_entity INTEGER NOT NULL,kind INTEGER NOT NULL,provenance INTEGER NOT NULL,confidence INTEGER NOT NULL,source_key TEXT NOT NULL,CHECK((source_space IS NULL AND source_value IS NULL AND source_arch IS NULL AND source_mode IS NULL) OR (source_space IS NOT NULL AND source_value IS NOT NULL AND source_arch IS NOT NULL AND source_mode IS NOT NULL)),CHECK((target_space IS NULL AND target_value IS NULL AND target_arch IS NULL AND target_mode IS NULL) OR (target_space IS NOT NULL AND target_value IS NOT NULL AND target_arch IS NOT NULL AND target_mode IS NOT NULL)));";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("type_references_entities") +
+        " ON " + table("type_references") +
+        "(source_entity,target_entity,kind);";
+    sql += "CREATE TABLE IF NOT EXISTS " + table("metadata_conflicts") +
+        "(entity_id INTEGER PRIMARY KEY,address_space INTEGER,address_value INTEGER,address_arch INTEGER,address_mode INTEGER,identity TEXT NOT NULL,kind INTEGER NOT NULL,selected_value TEXT NOT NULL,rejected_value TEXT NOT NULL,selected_provenance INTEGER NOT NULL,rejected_provenance INTEGER NOT NULL,selected_confidence INTEGER NOT NULL,rejected_confidence INTEGER NOT NULL,CHECK((address_space IS NULL AND address_value IS NULL AND address_arch IS NULL AND address_mode IS NULL) OR (address_space IS NOT NULL AND address_value IS NOT NULL AND address_arch IS NOT NULL AND address_mode IS NOT NULL)));";
+    sql += "CREATE INDEX IF NOT EXISTS " + table("metadata_conflicts_identity") +
+        " ON " + table("metadata_conflicts") + "(identity,kind);";
+    return exec_sql_v9(database, sql.c_str(),
+                       "workspace_schema_v9.snapshot_extensions");
+}
+
+workspace_result_t<void> backfill_snapshot_extension_slot_v9(
+    sqlite3* database, const std::string& prefix) {
+    const auto table = [&](const char* suffix) { return prefix + suffix; };
+    auto data_source = table_exists_v9(database, table("data_candidates"));
+    if (!data_source)
+        return workspace_result_t<void>::failure(data_source.error());
+    if (data_source.value()) {
+        const std::string sql =
+            "INSERT OR IGNORE INTO " + table("rich_data_candidates") +
+            "(entity_id,address_space,address_value,address_arch,address_mode,size,kind,target_space,target_value,target_arch,target_mode,provenance,confidence) "
+            "SELECT entity_id,address_space,address_value,address_arch,address_mode,size,kind,target_space,target_value,target_arch,target_mode,provenance,confidence FROM " +
+            table("data_candidates") + ";";
+        auto result = exec_sql_v9(database, sql.c_str(),
+                                  "workspace_schema_v9.backfill_rich_data");
+        if (!result)
+            return result;
+    }
+    auto type_source = table_exists_v9(database, table("type_candidates"));
+    if (!type_source)
+        return workspace_result_t<void>::failure(type_source.error());
+    if (type_source.value()) {
+        const std::string sql =
+            "INSERT OR IGNORE INTO " + table("symbol_type_candidates") +
+            "(entity_id,address_space,address_value,address_arch,address_mode,related_space,related_value,related_arch,related_mode,kind,display_name,canonical_type,source_key,provenance,confidence,explicitly_unknown) "
+            "SELECT entity_id,address_space,address_value,address_arch,address_mode,NULL,NULL,NULL,NULL,kind,display_name,canonical_type,'schema-v8:'||CAST(entity_id AS TEXT),CASE provenance WHEN 4 THEN 2 WHEN 6 THEN 5 WHEN 10 THEN 6 WHEN 1 THEN 1 WHEN 3 THEN 1 WHEN 5 THEN 1 ELSE 3 END,confidence,explicitly_unknown FROM " +
+            table("type_candidates") + ";";
+        auto result = exec_sql_v9(database, sql.c_str(),
+                                  "workspace_schema_v9.backfill_symbol_types");
+        if (!result)
+            return result;
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<bool> rich_backfill_complete_v9(sqlite3* database) {
+    auto metadata = table_exists_v9(database, "metadata");
+    if (!metadata)
+        return workspace_result_t<bool>::failure(metadata.error());
+    if (!metadata.value())
+        return workspace_result_t<bool>::success(false);
+    v9_statement_t statement;
+    auto result = statement.prepare(database,
+        "SELECT 1 FROM metadata WHERE key='schema_v9_rich_backfill_complete' AND value='1'",
+        "workspace_schema_v9.rich_backfill_state");
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    const int status = sqlite3_step(statement.get());
+    if (status == SQLITE_ROW)
+        return workspace_result_t<bool>::success(true);
+    if (status == SQLITE_DONE)
+        return workspace_result_t<bool>::success(false);
+    return workspace_result_t<bool>::failure(schema_v9_error(
+        database, status, "unable to inspect rich-fact backfill state",
+        "workspace_schema_v9.rich_backfill_state"));
+}
+
+workspace_result_t<void> mark_rich_backfill_complete_v9(sqlite3* database) {
+    auto metadata = table_exists_v9(database, "metadata");
+    if (!metadata)
+        return workspace_result_t<void>::failure(metadata.error());
+    if (!metadata.value())
+        return workspace_result_t<void>::success();
+    return exec_sql_v9(database,
+        "INSERT INTO metadata(key,value) VALUES('schema_v9_rich_backfill_complete','1') ON CONFLICT(key) DO UPDATE SET value='1'",
+        "workspace_schema_v9.rich_backfill_state");
+}
+
+workspace_result_t<void> validate_publication_v9(
+    const packed_generation_publication_t& publication,
+    const packed_publish_stop_predicate_t& stop_requested = {}) {
+    const auto& generation = publication.generation;
+    if (generation.generation == 0 || generation.committed ||
+        generation.shard_count == 0 ||
+        generation.shard_count >
+            static_cast<std::uint16_t>(packed_page_last_data_type) ||
+        publication.pages.empty() ||
+        publication.pages.size() > packed_generation_max_pages ||
+        publication.index.size() != publication.pages.size() ||
+        publication.index.size() > packed_generation_max_index_rows ||
+        generation.payload_blob.size() > packed_generation_max_metadata_bytes) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "packed publication shape exceeds its bounded invariants",
+                                 "workspace_schema_v9.publish_atomic"));
+    }
+    std::uint64_t total_payload_bytes = 0;
+    std::vector<std::uint8_t> checksum_bytes;
+    checksum_bytes.reserve(publication.pages.size() * sizeof(std::uint32_t));
+    for (std::size_t page_index = 0;
+         page_index < publication.pages.size(); ++page_index) {
+        if (publish_stop_requested_v9(stop_requested))
+            return cancelled_publish_error();
+        const auto& row = publication.pages[page_index];
+        const auto expected_page_index = static_cast<std::uint32_t>(page_index);
+        const auto expected_page_count =
+            static_cast<std::uint32_t>(publication.pages.size());
+        if (row.generation != generation.generation ||
+            row.page_index != expected_page_index ||
+            row.page_count != expected_page_count ||
+            row.page_type < static_cast<std::uint32_t>(packed_page_type_t::instructions) ||
+            row.page_type > static_cast<std::uint32_t>(packed_page_last_data_type) ||
+            row.payload.size() > packed_page_max_payload ||
+            row.payload_length != row.payload.size()) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "packed page does not belong to the publication",
+                                     "workspace_schema_v9.publish_atomic"));
+        }
+        packed_page_t page;
+        page.header.page_type = row.page_type;
+        page.header.page_index = row.page_index;
+        page.header.page_count = row.page_count;
+        page.header.generation = row.generation;
+        page.header.analysis_revision = generation.analysis_revision;
+        page.header.overlay_revision = generation.overlay_revision;
+        page.header.payload_length = row.payload_length;
+        page.header.checksum = row.checksum;
+        auto copied = copy_blob_v9(page.payload, row.payload.data(),
+                                   row.payload.size(), stop_requested,
+                                   "workspace_schema_v9.publish_atomic");
+        if (!copied)
+            return copied;
+        auto verified = packed_page_codec_t::verify_page(page, stop_requested);
+        if (!verified)
+            return verified;
+        if (!checked_add_u64(total_payload_bytes, row.payload.size(),
+                             total_payload_bytes) ||
+            total_payload_bytes > packed_generation_max_payload_bytes) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "packed publication payload exceeds its bounded byte limit",
+                                     "workspace_schema_v9.publish_atomic"));
+        }
+        append_u32_le_v9(checksum_bytes, row.checksum);
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return cancelled_publish_error();
+    auto observed_batch_checksum = crc32c_cancellable(
+        checksum_bytes.data(), checksum_bytes.size(), stop_requested);
+    if (!observed_batch_checksum)
+        return workspace_result_t<void>::failure(observed_batch_checksum.error());
+    if (generation.total_records !=
+            static_cast<std::uint64_t>(publication.pages.size()) ||
+        generation.total_payload_bytes != total_payload_bytes ||
+        generation.batch_checksum != observed_batch_checksum.value()) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "packed publication checkpoint does not match its pages",
+                                 "workspace_schema_v9.publish_atomic"));
+    }
+
+    std::unordered_set<std::uint16_t> domains;
+    std::vector<bool> indexed(publication.pages.size(), false);
+    std::vector<std::uint32_t> expected_ordinals(publication.pages.size(), 0);
+    std::uint64_t ordinal = 0;
+    for (std::size_t page_index = 0;
+         page_index < publication.pages.size(); ++page_index) {
+        if (publish_stop_requested_v9(stop_requested))
+            return cancelled_publish_error();
+        if (ordinal > (std::numeric_limits<std::uint32_t>::max)()) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                                     "packed page index ordinal exceeds its representation",
+                                     "workspace_schema_v9.publish_atomic"));
+        }
+        expected_ordinals[page_index] = static_cast<std::uint32_t>(ordinal);
+        if (!checked_add_u64(ordinal,
+                             publication.pages[page_index].payload.size(),
+                             ordinal)) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                                     "packed page index ordinal accumulation overflowed",
+                                     "workspace_schema_v9.publish_atomic"));
+        }
+    }
+    for (const auto& row : publication.index) {
+        if (publish_stop_requested_v9(stop_requested))
+            return cancelled_publish_error();
+        if (row.generation != generation.generation ||
+            static_cast<std::size_t>(row.page_index) >= publication.pages.size() ||
+            indexed[row.page_index]) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "packed page index ownership or uniqueness is invalid",
+                                     "workspace_schema_v9.publish_atomic"));
+        }
+        const auto& page = publication.pages[row.page_index];
+        std::uint64_t expected_min = 0;
+        std::uint64_t expected_max = 0;
+        if (page.payload.size() >= sizeof(std::uint64_t)) {
+            const auto first = read_u64_le_v9(page.payload.data());
+            const auto last = read_u64_le_v9(
+                page.payload.data() + page.payload.size() - sizeof(std::uint64_t));
+            expected_min = (std::min)(first, last);
+            expected_max = (std::max)(first, last);
+        }
+        if (row.domain != static_cast<std::uint16_t>(page.page_type) ||
+            row.count != page.payload_length ||
+            row.ordinal_begin != expected_ordinals[row.page_index] ||
+            row.address_value_min != expected_min ||
+            row.address_value_max != expected_max) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "packed page index does not describe its page",
+                                     "workspace_schema_v9.publish_atomic"));
+        }
+        indexed[row.page_index] = true;
+        domains.insert(row.domain);
+    }
+    if (domains.size() != static_cast<std::size_t>(generation.shard_count)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "packed publication shard count is inconsistent",
+                                 "workspace_schema_v9.publish_atomic"));
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> delete_uncommitted_rows_v9(sqlite3* database,
+                                                     std::uint64_t generation) {
+    v9_statement_t pages;
+    auto result = pages.prepare(database,
+        "DELETE FROM packed_pages WHERE generation=?1 AND EXISTS(SELECT 1 FROM packed_generations g WHERE g.generation=?1 AND g.committed=0)",
+        "workspace_schema_v9.rollback.pages");
+    if (!result) return result;
+    result = pages.bind_uint(1, generation); if (!result) return result;
+    result = pages.step_done(); if (!result) return result;
+    v9_statement_t index;
+    result = index.prepare(database,
+        "DELETE FROM packed_page_index WHERE generation=?1 AND EXISTS(SELECT 1 FROM packed_generations g WHERE g.generation=?1 AND g.committed=0)",
+        "workspace_schema_v9.rollback.index");
+    if (!result) return result;
+    result = index.bind_uint(1, generation); if (!result) return result;
+    result = index.step_done(); if (!result) return result;
+    v9_statement_t manifest;
+    result = manifest.prepare(database,
+        "DELETE FROM packed_generations WHERE generation=?1 AND committed=0",
+        "workspace_schema_v9.rollback.generation");
+    if (!result) return result;
+    result = manifest.bind_uint(1, generation); if (!result) return result;
+    return manifest.step_done();
+}
+
+}
+
+workspace_result_t<void> create_schema_v9(sqlite3* database) {
+    auto result = upgrade_packed_domain_schema_v9(database);
+    if (!result)
+        return result;
+    result = exec_sql_v9(database, R"SQL(
+CREATE TABLE IF NOT EXISTS packed_generations(
+    generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation INTEGER NOT NULL CHECK(generation<>0),
+    analysis_revision INTEGER NOT NULL,
+    overlay_revision INTEGER NOT NULL,
+    shard_count INTEGER NOT NULL CHECK(shard_count BETWEEN 1 AND 18),
+    total_payload_bytes INTEGER NOT NULL CHECK(total_payload_bytes BETWEEN 0 AND 536870912),
+    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 1 AND 131072),
+    batch_checksum INTEGER NOT NULL,
+    created_utc_ms INTEGER NOT NULL,
+    committed INTEGER NOT NULL CHECK(committed IN (0,1)),
+    payload_blob BLOB NOT NULL CHECK(length(payload_blob)<=16777216)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS packed_generations_generation ON packed_generations(generation);
 CREATE INDEX IF NOT EXISTS packed_generations_revisions ON packed_generations(analysis_revision,overlay_revision);
 CREATE TABLE IF NOT EXISTS packed_pages(
     page_id INTEGER PRIMARY KEY AUTOINCREMENT,
     generation INTEGER NOT NULL,
-    page_index INTEGER NOT NULL,
-    page_count INTEGER NOT NULL,
-    page_type INTEGER NOT NULL,
-    payload_length INTEGER NOT NULL,
+    page_index INTEGER NOT NULL CHECK(page_index BETWEEN 0 AND 131071),
+    page_count INTEGER NOT NULL CHECK(page_count BETWEEN 1 AND 131072),
+    page_type INTEGER NOT NULL CHECK(page_type BETWEEN 1 AND 18),
+    payload_length INTEGER NOT NULL CHECK(payload_length BETWEEN 0 AND 1048576),
     checksum INTEGER NOT NULL,
-    payload BLOB NOT NULL,
-    UNIQUE(generation,page_index)
+    payload BLOB NOT NULL CHECK(length(payload)=payload_length),
+    UNIQUE(generation,page_index),
+    FOREIGN KEY(generation) REFERENCES packed_generations(generation) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS packed_pages_generation ON packed_pages(generation,page_index);
 CREATE INDEX IF NOT EXISTS packed_pages_type ON packed_pages(generation,page_type);
 CREATE TABLE IF NOT EXISTS packed_page_index(
     index_id INTEGER PRIMARY KEY AUTOINCREMENT,
     generation INTEGER NOT NULL,
-    domain INTEGER NOT NULL,
-    ordinal_begin INTEGER NOT NULL,
-    count INTEGER NOT NULL,
-    page_index INTEGER NOT NULL,
+    domain INTEGER NOT NULL CHECK(domain BETWEEN 1 AND 18),
+    ordinal_begin INTEGER NOT NULL CHECK(ordinal_begin BETWEEN 0 AND 4294967295),
+    count INTEGER NOT NULL CHECK(count BETWEEN 0 AND 1048576),
+    page_index INTEGER NOT NULL CHECK(page_index BETWEEN 0 AND 131071),
     address_value_min INTEGER NOT NULL,
     address_value_max INTEGER NOT NULL,
-    UNIQUE(generation,domain,page_index)
+    UNIQUE(generation,domain,page_index),
+    FOREIGN KEY(generation) REFERENCES packed_generations(generation) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS packed_page_index_generation_domain ON packed_page_index(generation,domain,ordinal_begin);
 CREATE INDEX IF NOT EXISTS packed_page_index_address ON packed_page_index(generation,address_value_min,address_value_max);
 CREATE TABLE IF NOT EXISTS workbench_state(
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-    has_selection INTEGER NOT NULL CHECK(has_selection IN (0,1)),
-    selection_space INTEGER NOT NULL DEFAULT 0,
-    selection_value INTEGER NOT NULL DEFAULT 0,
-    selection_arch INTEGER NOT NULL DEFAULT 0,
-    selection_mode INTEGER NOT NULL DEFAULT 0,
-    navigation_back_json TEXT NOT NULL DEFAULT '[]',
-    navigation_forward_json TEXT NOT NULL DEFAULT '[]',
-    bookmarks_json TEXT NOT NULL DEFAULT '[]',
-    layout_json TEXT NOT NULL DEFAULT '{}',
-    active_tab INTEGER NOT NULL DEFAULT 0,
-    zoom_level INTEGER NOT NULL DEFAULT 100,
-    revision INTEGER NOT NULL DEFAULT 0,
-    updated_utc_ms INTEGER NOT NULL DEFAULT 0
+    workspace_id INTEGER NOT NULL CHECK(workspace_id<>0),
+    contract_schema_version INTEGER NOT NULL CHECK(contract_schema_version>0),
+    revision INTEGER NOT NULL CHECK(revision<>0),
+    fingerprint INTEGER NOT NULL CHECK(fingerprint<>0),
+    payload_json TEXT NOT NULL CHECK(length(CAST(payload_json AS BLOB)) BETWEEN 1 AND 16777216),
+    updated_utc_ms INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO workbench_state(singleton,has_selection,selection_space,selection_value,selection_arch,selection_mode,navigation_back_json,navigation_forward_json,bookmarks_json,layout_json,active_tab,zoom_level,revision,updated_utc_ms) VALUES(1,0,0,0,0,0,'[]','[]','[]','{}',0,100,0,0);
 CREATE TABLE IF NOT EXISTS decompiler_cache_v9(
-    cache_key TEXT PRIMARY KEY NOT NULL,
-    binary_id BLOB NOT NULL,
+    cache_key TEXT PRIMARY KEY NOT NULL CHECK(length(CAST(cache_key AS BLOB)) BETWEEN 1 AND 16384),
+    binary_id BLOB NOT NULL CHECK(length(binary_id)=32),
     format INTEGER NOT NULL,
     architecture INTEGER NOT NULL,
     architecture_mode INTEGER NOT NULL,
     abi INTEGER NOT NULL,
     endian INTEGER NOT NULL,
-    engine_version TEXT NOT NULL,
-    schema_version INTEGER NOT NULL,
-    specification_version TEXT NOT NULL,
-    settings_hash TEXT NOT NULL,
+    engine_version TEXT NOT NULL CHECK(length(CAST(engine_version AS BLOB))<=65536),
+    schema_version INTEGER NOT NULL CHECK(schema_version>0),
+    specification_version TEXT NOT NULL CHECK(length(CAST(specification_version AS BLOB))<=65536),
+    settings_hash TEXT NOT NULL CHECK(length(CAST(settings_hash AS BLOB))<=65536),
     function_id INTEGER NOT NULL,
     function_rva INTEGER NOT NULL,
-    function_rva_space INTEGER NOT NULL DEFAULT 0,
+    function_rva_space INTEGER NOT NULL DEFAULT 1,
     function_rva_arch INTEGER NOT NULL DEFAULT 0,
     function_rva_mode INTEGER NOT NULL DEFAULT 0,
-    function_content_hash BLOB NOT NULL,
+    function_content_hash BLOB NOT NULL CHECK(length(function_content_hash)=32),
     analysis_revision INTEGER NOT NULL,
     overlay_revision INTEGER NOT NULL,
     generation INTEGER NOT NULL,
-    function_name TEXT NOT NULL,
-    result_json TEXT NOT NULL,
+    function_name TEXT NOT NULL CHECK(length(CAST(function_name AS BLOB))<=4096),
+    result_json TEXT NOT NULL CHECK(length(CAST(result_json AS BLOB)) BETWEEN 1 AND 67108864),
     created_utc_ms INTEGER NOT NULL,
     last_access_utc_ms INTEGER NOT NULL,
-    result_bytes INTEGER NOT NULL,
-    cache_key_version INTEGER NOT NULL DEFAULT 1
+    result_bytes INTEGER NOT NULL CHECK(result_bytes=length(CAST(result_json AS BLOB))),
+    cache_key_version INTEGER NOT NULL DEFAULT 1 CHECK(cache_key_version=1)
 );
 CREATE INDEX IF NOT EXISTS decompiler_cache_v9_function ON decompiler_cache_v9(function_rva,overlay_revision,generation);
 CREATE INDEX IF NOT EXISTS decompiler_cache_v9_binary ON decompiler_cache_v9(binary_id,analysis_revision);
 CREATE TABLE IF NOT EXISTS overlay_v9_state(
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-    target_image_hash BLOB NOT NULL,
-    target_provenance_hash BLOB NOT NULL,
+    target_image_hash BLOB NOT NULL CHECK(length(target_image_hash)=32),
+    target_provenance_hash BLOB NOT NULL CHECK(length(target_provenance_hash)=32),
     target_image_base INTEGER NOT NULL,
     target_image_size INTEGER NOT NULL,
     target_generation INTEGER NOT NULL,
@@ -284,16 +758,186 @@ CREATE TABLE IF NOT EXISTS overlay_v9_state(
     history_epoch INTEGER NOT NULL,
     updated_utc_ms INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO overlay_v9_state(singleton,target_image_hash,target_provenance_hash,target_image_base,target_image_size,target_generation,target_kind,target_architecture,target_address_width,revision,next_transaction_id,history_cursor,history_epoch,updated_utc_ms) VALUES(1,X'0000000000000000000000000000000000000000000000000000000000000000',X'0000000000000000000000000000000000000000000000000000000000000000',0,0,0,0,0,0,0,1,0,1,0);
+INSERT OR IGNORE INTO overlay_v9_state(singleton,target_image_hash,target_provenance_hash,target_image_base,target_image_size,target_generation,target_kind,target_architecture,target_address_width,revision,next_transaction_id,history_cursor,history_epoch,updated_utc_ms) VALUES(1,zeroblob(32),zeroblob(32),0,0,0,0,0,0,0,1,0,1,0);
 )SQL", "workspace_schema_v9.migrate");
+    if (!result)
+        return result;
+
+    result = create_snapshot_extension_slot_v9(database, {});
+    if (!result)
+        return result;
+    result = create_snapshot_extension_slot_v9(database, "alternate_");
+    if (!result)
+        return result;
+    auto backfill_complete = rich_backfill_complete_v9(database);
+    if (!backfill_complete)
+        return workspace_result_t<void>::failure(backfill_complete.error());
+    if (!backfill_complete.value()) {
+        result = backfill_snapshot_extension_slot_v9(database, {});
+        if (!result)
+            return result;
+        result = backfill_snapshot_extension_slot_v9(database, "alternate_");
+        if (!result)
+            return result;
+        result = mark_rich_backfill_complete_v9(database);
+        if (!result)
+            return result;
+    }
+
+    auto legacy_cache = table_exists_v9(database, "decompiler_cache");
+    if (!legacy_cache)
+        return workspace_result_t<void>::failure(legacy_cache.error());
+    if (legacy_cache.value()) {
+        result = exec_sql_v9(database, R"SQL(
+INSERT OR IGNORE INTO decompiler_cache_v9(
+    cache_key,binary_id,format,architecture,architecture_mode,abi,endian,
+    engine_version,schema_version,specification_version,settings_hash,
+    function_id,function_rva,function_rva_space,function_rva_arch,function_rva_mode,
+    function_content_hash,analysis_revision,overlay_revision,generation,function_name,
+    result_json,created_utc_ms,last_access_utc_ms,result_bytes,cache_key_version)
+SELECT cache_key,binary_id,format,architecture,architecture_mode,abi,endian,
+       engine_version,schema_version,specification_version,settings_hash,
+       function_id,function_rva,1,architecture,architecture_mode,
+       function_content_hash,analysis_revision,overlay_revision,generation,function_name,
+       result_json,created_utc_ms,last_access_utc_ms,result_bytes,1
+FROM decompiler_cache
+WHERE length(cache_key) BETWEEN 1 AND 16384
+  AND length(binary_id)=32
+  AND length(function_content_hash)=32
+  AND length(CAST(result_json AS BLOB))=result_bytes
+  AND result_bytes BETWEEN 1 AND 67108864;
+)SQL", "workspace_schema_v9.backfill_cache");
+        if (!result)
+            return result;
+    }
+
+    auto identity = table_exists_v9(database, "workspace_identity");
+    if (!identity)
+        return workspace_result_t<void>::failure(identity.error());
+    auto analysis_state = table_exists_v9(database, "analysis_state");
+    if (!analysis_state)
+        return workspace_result_t<void>::failure(analysis_state.error());
+    auto overlay_state = table_exists_v9(database, "overlay_state");
+    if (!overlay_state)
+        return workspace_result_t<void>::failure(overlay_state.error());
+    if (identity.value() && analysis_state.value() && overlay_state.value()) {
+        result = exec_sql_v9(database, R"SQL(
+INSERT INTO overlay_v9_state(
+    singleton,target_image_hash,target_provenance_hash,target_image_base,target_image_size,
+    target_generation,target_kind,target_architecture,target_address_width,revision,
+    next_transaction_id,history_cursor,history_epoch,updated_utc_ms)
+SELECT 1,wi.content_hash,wi.load_profile_hash,COALESCE(wi.module_base,wi.image_base),
+       COALESCE(wi.module_size,0),COALESCE(ast.generation,0),wi.target_kind,wi.architecture,
+       CASE wi.architecture_mode WHEN 1 THEN 16 WHEN 2 THEN 32 WHEN 3 THEN 64
+            WHEN 4 THEN 32 WHEN 5 THEN 32 WHEN 6 THEN 64 WHEN 7 THEN 32
+            WHEN 8 THEN 64 WHEN 9 THEN 32 WHEN 10 THEN 64 WHEN 11 THEN 32
+            WHEN 12 THEN 64 WHEN 13 THEN 32 WHEN 14 THEN 32 ELSE 0 END,
+       os.revision,os.next_transaction_id,os.history_cursor,os.history_epoch,os.updated_utc_ms
+FROM workspace_identity wi
+CROSS JOIN overlay_state os
+LEFT JOIN analysis_state ast ON ast.singleton=1
+WHERE wi.singleton=1 AND os.singleton=1
+ON CONFLICT(singleton) DO UPDATE SET
+    target_image_hash=excluded.target_image_hash,
+    target_provenance_hash=excluded.target_provenance_hash,
+    target_image_base=excluded.target_image_base,
+    target_image_size=excluded.target_image_size,
+    target_generation=excluded.target_generation,
+    target_kind=excluded.target_kind,
+    target_architecture=excluded.target_architecture,
+    target_address_width=excluded.target_address_width,
+    revision=excluded.revision,
+    next_transaction_id=excluded.next_transaction_id,
+    history_cursor=excluded.history_cursor,
+    history_epoch=excluded.history_epoch,
+    updated_utc_ms=excluded.updated_utc_ms;
+CREATE TRIGGER IF NOT EXISTS overlay_state_v9_sync_update
+AFTER UPDATE ON overlay_state
+BEGIN
+    UPDATE overlay_v9_state SET revision=NEW.revision,
+        next_transaction_id=NEW.next_transaction_id,
+        history_cursor=NEW.history_cursor,
+        history_epoch=NEW.history_epoch,
+        updated_utc_ms=NEW.updated_utc_ms
+    WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS overlay_state_v9_sync_insert
+AFTER INSERT ON overlay_state
+BEGIN
+    UPDATE overlay_v9_state SET revision=NEW.revision,
+        next_transaction_id=NEW.next_transaction_id,
+        history_cursor=NEW.history_cursor,
+        history_epoch=NEW.history_epoch,
+        updated_utc_ms=NEW.updated_utc_ms
+    WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS analysis_state_v9_sync_insert
+AFTER INSERT ON analysis_state
+BEGIN
+    UPDATE overlay_v9_state SET target_generation=NEW.generation WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS analysis_state_v9_sync_update
+AFTER UPDATE OF generation ON analysis_state
+BEGIN
+    UPDATE overlay_v9_state SET target_generation=NEW.generation WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS analysis_state_v9_sync_delete
+AFTER DELETE ON analysis_state
+BEGIN
+    UPDATE overlay_v9_state SET target_generation=0 WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS workspace_identity_v9_sync_insert
+AFTER INSERT ON workspace_identity
+BEGIN
+    UPDATE overlay_v9_state SET
+        target_image_hash=NEW.content_hash,
+        target_provenance_hash=NEW.load_profile_hash,
+        target_image_base=COALESCE(NEW.module_base,NEW.image_base),
+        target_image_size=COALESCE(NEW.module_size,0),
+        target_kind=NEW.target_kind,
+        target_architecture=NEW.architecture,
+        target_address_width=CASE NEW.architecture_mode
+            WHEN 1 THEN 16 WHEN 2 THEN 32 WHEN 3 THEN 64 WHEN 4 THEN 32
+            WHEN 5 THEN 32 WHEN 6 THEN 64 WHEN 7 THEN 32 WHEN 8 THEN 64
+            WHEN 9 THEN 32 WHEN 10 THEN 64 WHEN 11 THEN 32 WHEN 12 THEN 64
+            WHEN 13 THEN 32 WHEN 14 THEN 32 ELSE 0 END
+    WHERE singleton=1;
+END;
+CREATE TRIGGER IF NOT EXISTS workspace_identity_v9_sync_update
+AFTER UPDATE ON workspace_identity
+BEGIN
+    UPDATE overlay_v9_state SET
+        target_image_hash=NEW.content_hash,
+        target_provenance_hash=NEW.load_profile_hash,
+        target_image_base=COALESCE(NEW.module_base,NEW.image_base),
+        target_image_size=COALESCE(NEW.module_size,0),
+        target_kind=NEW.target_kind,
+        target_architecture=NEW.architecture,
+        target_address_width=CASE NEW.architecture_mode
+            WHEN 1 THEN 16 WHEN 2 THEN 32 WHEN 3 THEN 64 WHEN 4 THEN 32
+            WHEN 5 THEN 32 WHEN 6 THEN 64 WHEN 7 THEN 32 WHEN 8 THEN 64
+            WHEN 9 THEN 32 WHEN 10 THEN 64 WHEN 11 THEN 32 WHEN 12 THEN 64
+            WHEN 13 THEN 32 WHEN 14 THEN 32 ELSE 0 END
+    WHERE singleton=1;
+END;
+)SQL", "workspace_schema_v9.backfill_overlay");
+        if (!result)
+            return result;
+    }
+    return workspace_result_t<void>::success();
 }
 
 workspace_result_t<void> write_packed_generation(
     sqlite3* database, const packed_generation_record_t& record) {
-    if (record.generation == 0) {
+    if (record.generation == 0 || record.committed || record.shard_count == 0 ||
+        record.shard_count > static_cast<std::uint16_t>(packed_page_last_data_type) ||
+        record.total_records == 0 ||
+        record.total_records > packed_generation_max_pages ||
+        record.total_payload_bytes > packed_generation_max_payload_bytes ||
+        record.payload_blob.size() > packed_generation_max_metadata_bytes) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "packed generation must be non-zero",
+                                 "packed generation metadata exceeds its bounded invariants",
                                  "workspace_schema_v9.write_packed_generation"));
     }
     v9_statement_t statement;
@@ -301,6 +945,7 @@ workspace_result_t<void> write_packed_generation(
 INSERT INTO packed_generations(generation,analysis_revision,overlay_revision,shard_count,total_payload_bytes,total_records,batch_checksum,created_utc_ms,committed,payload_blob)
 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
 ON CONFLICT(generation) DO UPDATE SET analysis_revision=excluded.analysis_revision,overlay_revision=excluded.overlay_revision,shard_count=excluded.shard_count,total_payload_bytes=excluded.total_payload_bytes,total_records=excluded.total_records,batch_checksum=excluded.batch_checksum,created_utc_ms=excluded.created_utc_ms,committed=excluded.committed,payload_blob=excluded.payload_blob
+WHERE packed_generations.committed=0
 )SQL", "workspace_schema_v9.write_packed_generation");
     if (!result) return result;
     result = statement.bind_uint(1, record.generation); if (!result) return result;
@@ -313,21 +958,43 @@ ON CONFLICT(generation) DO UPDATE SET analysis_revision=excluded.analysis_revisi
     result = statement.bind_uint(8, record.created_utc_ms); if (!result) return result;
     result = statement.bind_int(9, record.committed ? 1 : 0); if (!result) return result;
     result = statement.bind_blob(10, record.payload_blob.data(), record.payload_blob.size()); if (!result) return result;
-    return statement.step_done();
+    result = statement.step_done();
+    if (!result)
+        return result;
+    if (sqlite3_changes(database) != 1) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_conflict,
+                                 "committed packed generation cannot be restaged",
+                                 "workspace_schema_v9.write_packed_generation"));
+    }
+    return workspace_result_t<void>::success();
 }
 
 workspace_result_t<std::optional<packed_generation_record_t>>
-    read_packed_generation(sqlite3* database, std::uint64_t generation) {
+    read_packed_generation(sqlite3* database, std::uint64_t generation,
+                           bool committed_only,
+                           const packed_stop_predicate_t& stop_requested) {
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::optional<packed_generation_record_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_generation"));
     v9_statement_t statement;
     auto result = statement.prepare(database,
-        "SELECT generation,analysis_revision,overlay_revision,shard_count,total_payload_bytes,total_records,batch_checksum,created_utc_ms,committed,length(payload_blob),payload_blob FROM packed_generations WHERE generation=?1",
+        committed_only
+            ? "SELECT generation,analysis_revision,overlay_revision,shard_count,total_payload_bytes,total_records,batch_checksum,created_utc_ms,committed,length(payload_blob),payload_blob FROM packed_generations WHERE generation=?1 AND committed=1"
+            : "SELECT generation,analysis_revision,overlay_revision,shard_count,total_payload_bytes,total_records,batch_checksum,created_utc_ms,committed,length(payload_blob),payload_blob FROM packed_generations WHERE generation=?1",
         "workspace_schema_v9.read_packed_generation");
     if (!result)
         return workspace_result_t<std::optional<packed_generation_record_t>>::failure(result.error());
     result = statement.bind_uint(1, generation);
     if (!result)
         return workspace_result_t<std::optional<packed_generation_record_t>>::failure(result.error());
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::optional<packed_generation_record_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_generation"));
     const int status = sqlite3_step(statement.get());
+    if (status == SQLITE_INTERRUPT && publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::optional<packed_generation_record_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_generation"));
     if (status == SQLITE_DONE)
         return workspace_result_t<std::optional<packed_generation_record_t>>::success(std::nullopt);
     if (status != SQLITE_ROW) {
@@ -348,7 +1015,15 @@ workspace_result_t<std::optional<packed_generation_record_t>>
     const auto declared_blob_length = sqlite3_column_int64(statement.get(), 9);
     const void* payload = sqlite3_column_blob(statement.get(), 10);
     const int payload_bytes = sqlite3_column_bytes(statement.get(), 10);
-    if (declared_blob_length < 0 || payload_bytes < 0 ||
+    if (declared_blob_length < 0 ||
+        static_cast<std::uint64_t>(declared_blob_length) >
+            packed_generation_max_metadata_bytes ||
+        record.shard_count == 0 ||
+        record.shard_count > static_cast<std::uint16_t>(packed_page_last_data_type) ||
+        record.total_records == 0 ||
+        record.total_records > packed_generation_max_pages ||
+        record.total_payload_bytes > packed_generation_max_payload_bytes ||
+        payload_bytes < 0 ||
         static_cast<std::uint64_t>(payload_bytes) != static_cast<std::uint64_t>(declared_blob_length) ||
         (payload_bytes > 0 && !payload)) {
         return workspace_result_t<std::optional<packed_generation_record_t>>::failure(
@@ -358,25 +1033,41 @@ workspace_result_t<std::optional<packed_generation_record_t>>
     }
     if (payload_bytes > 0) {
         const auto* begin = static_cast<const std::uint8_t*>(payload);
-        record.payload_blob.assign(begin, begin + payload_bytes);
+        auto copied = copy_blob_v9(record.payload_blob, begin,
+            static_cast<std::size_t>(payload_bytes), stop_requested,
+            "workspace_schema_v9.read_packed_generation");
+        if (!copied)
+            return workspace_result_t<std::optional<packed_generation_record_t>>::failure(
+                copied.error());
     }
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::optional<packed_generation_record_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_generation"));
     return workspace_result_t<std::optional<packed_generation_record_t>>::success(
         std::optional<packed_generation_record_t>(std::move(record)));
 }
 
 workspace_result_t<void> write_packed_page(
     sqlite3* database, const packed_page_row_t& row) {
-    if (row.generation == 0) {
+    if (row.generation == 0 || row.page_count == 0 ||
+        row.page_count > packed_generation_max_pages ||
+        row.page_index >= row.page_count ||
+        row.page_type < static_cast<std::uint32_t>(packed_page_type_t::instructions) ||
+        row.page_type > static_cast<std::uint32_t>(packed_page_last_data_type) ||
+        row.payload.size() > packed_page_max_payload ||
+        row.payload_length != row.payload.size()) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "packed page generation must be non-zero",
+                                 "packed page metadata exceeds its bounded invariants",
                                  "workspace_schema_v9.write_packed_page"));
     }
     v9_statement_t statement;
     auto result = statement.prepare(database, R"SQL(
 INSERT INTO packed_pages(generation,page_index,page_count,page_type,payload_length,checksum,payload)
-VALUES(?1,?2,?3,?4,?5,?6,?7)
+SELECT ?1,?2,?3,?4,?5,?6,?7
+WHERE EXISTS(SELECT 1 FROM packed_generations WHERE generation=?1 AND committed=0)
 ON CONFLICT(generation,page_index) DO UPDATE SET page_count=excluded.page_count,page_type=excluded.page_type,payload_length=excluded.payload_length,checksum=excluded.checksum,payload=excluded.payload
+WHERE EXISTS(SELECT 1 FROM packed_generations WHERE generation=?1 AND committed=0)
 )SQL", "workspace_schema_v9.write_packed_page");
     if (!result) return result;
     result = statement.bind_uint(1, row.generation); if (!result) return result;
@@ -386,25 +1077,87 @@ ON CONFLICT(generation,page_index) DO UPDATE SET page_count=excluded.page_count,
     result = statement.bind_int(5, static_cast<std::int64_t>(row.payload_length)); if (!result) return result;
     result = statement.bind_int(6, static_cast<std::int64_t>(row.checksum)); if (!result) return result;
     result = statement.bind_blob(7, row.payload.data(), row.payload.size()); if (!result) return result;
-    return statement.step_done();
+    result = statement.step_done();
+    if (!result)
+        return result;
+    if (sqlite3_changes(database) != 1) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_conflict,
+                                 "packed page requires an uncommitted generation",
+                                 "workspace_schema_v9.write_packed_page"));
+    }
+    return workspace_result_t<void>::success();
 }
 
 workspace_result_t<std::vector<packed_page_row_t>>
-    read_packed_pages(sqlite3* database, std::uint64_t generation) {
+    read_packed_pages(sqlite3* database, std::uint64_t generation,
+                      bool committed_only,
+                      const packed_stop_predicate_t& stop_requested) {
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_pages"));
+    const char* count_sql = committed_only
+        ? "SELECT COUNT(*),COALESCE(SUM(length(p.payload)),0) FROM packed_pages p JOIN packed_generations g ON g.generation=p.generation AND g.committed=1 WHERE p.generation=?1"
+        : "SELECT COUNT(*),COALESCE(SUM(length(payload)),0) FROM packed_pages WHERE generation=?1";
+    v9_statement_t count_statement;
+    auto result = count_statement.prepare(database, count_sql,
+        "workspace_schema_v9.read_packed_pages.count");
+    if (!result)
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(result.error());
+    result = count_statement.bind_uint(1, generation);
+    if (!result)
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(result.error());
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_pages.count"));
+    const int count_status = sqlite3_step(count_statement.get());
+    if (count_status == SQLITE_INTERRUPT && publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_pages.count"));
+    if (count_status != SQLITE_ROW) {
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            schema_v9_error(database, count_status, "unable to bound packed page rows",
+                            "workspace_schema_v9.read_packed_pages.count"));
+    }
+    const auto row_count = sqlite3_column_int64(count_statement.get(), 0);
+    const auto total_payload_bytes = sqlite3_column_int64(count_statement.get(), 1);
+    if (row_count < 0 || total_payload_bytes < 0 ||
+        static_cast<std::uint64_t>(row_count) > packed_generation_max_pages ||
+        static_cast<std::uint64_t>(total_payload_bytes) >
+            packed_generation_max_payload_bytes) {
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "persisted packed pages exceed bounded decode limits",
+                                 "workspace_schema_v9.read_packed_pages"));
+    }
     v9_statement_t statement;
-    auto result = statement.prepare(database,
-        "SELECT generation,page_index,page_count,page_type,payload_length,checksum,length(payload),payload FROM packed_pages WHERE generation=?1 ORDER BY page_index",
+    result = statement.prepare(database, committed_only
+        ? "SELECT p.generation,p.page_index,p.page_count,p.page_type,p.payload_length,p.checksum,length(p.payload),p.payload FROM packed_pages p JOIN packed_generations g ON g.generation=p.generation AND g.committed=1 WHERE p.generation=?1 ORDER BY p.page_index"
+        : "SELECT generation,page_index,page_count,page_type,payload_length,checksum,length(payload),payload FROM packed_pages WHERE generation=?1 ORDER BY page_index",
         "workspace_schema_v9.read_packed_pages");
     if (!result)
         return workspace_result_t<std::vector<packed_page_row_t>>::failure(result.error());
     result = statement.bind_uint(1, generation);
     if (!result)
         return workspace_result_t<std::vector<packed_page_row_t>>::failure(result.error());
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_pages"));
     std::vector<packed_page_row_t> rows;
+    rows.reserve(static_cast<std::size_t>(row_count));
+    std::uint64_t observed_payload_bytes = 0;
     for (;;) {
+        if (publish_stop_requested_v9(stop_requested))
+            return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+                cancelled_read_error_v9("workspace_schema_v9.read_packed_pages"));
         const int status = sqlite3_step(statement.get());
         if (status == SQLITE_DONE)
             break;
+        if (status == SQLITE_INTERRUPT &&
+            publish_stop_requested_v9(stop_requested)) {
+            return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+                cancelled_read_error_v9("workspace_schema_v9.read_packed_pages"));
+        }
         if (status != SQLITE_ROW) {
             return workspace_result_t<std::vector<packed_page_row_t>>::failure(
                 schema_v9_error(database, status, "unable to read packed page row",
@@ -420,37 +1173,73 @@ workspace_result_t<std::vector<packed_page_row_t>>
         const auto declared_length = sqlite3_column_int64(statement.get(), 6);
         const void* payload = sqlite3_column_blob(statement.get(), 7);
         const int payload_bytes = sqlite3_column_bytes(statement.get(), 7);
-        if (declared_length < 0 || payload_bytes < 0 ||
+        if (rows.size() >= packed_generation_max_pages ||
+            declared_length < 0 || payload_bytes < 0 ||
+            static_cast<std::uint64_t>(declared_length) > packed_page_max_payload ||
             static_cast<std::uint64_t>(payload_bytes) != static_cast<std::uint64_t>(declared_length) ||
             static_cast<std::uint32_t>(payload_bytes) != row.payload_length ||
+            row.page_count == 0 || row.page_count > packed_generation_max_pages ||
+            row.page_index >= row.page_count ||
+            row.page_type < static_cast<std::uint32_t>(packed_page_type_t::instructions) ||
+            row.page_type > static_cast<std::uint32_t>(packed_page_last_data_type) ||
             (payload_bytes > 0 && !payload)) {
             return workspace_result_t<std::vector<packed_page_row_t>>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "packed page payload is malformed",
                                      "workspace_schema_v9.read_packed_pages"));
         }
+        if (!checked_add_u64(observed_payload_bytes,
+                             static_cast<std::uint64_t>(payload_bytes),
+                             observed_payload_bytes) ||
+            observed_payload_bytes > packed_generation_max_payload_bytes) {
+            return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "packed page payload exceeds its aggregate byte limit",
+                                     "workspace_schema_v9.read_packed_pages"));
+        }
         if (payload_bytes > 0) {
             const auto* begin = static_cast<const std::uint8_t*>(payload);
-            row.payload.assign(begin, begin + payload_bytes);
+            auto copied = copy_blob_v9(row.payload, begin,
+                static_cast<std::size_t>(payload_bytes), stop_requested,
+                "workspace_schema_v9.read_packed_pages");
+            if (!copied)
+                return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+                    copied.error());
         }
         rows.push_back(std::move(row));
     }
+    if (rows.size() != static_cast<std::size_t>(row_count) ||
+        observed_payload_bytes != static_cast<std::uint64_t>(total_payload_bytes)) {
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "packed page rows changed across the bounded read snapshot",
+                                 "workspace_schema_v9.read_packed_pages"));
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_pages"));
     return workspace_result_t<std::vector<packed_page_row_t>>::success(std::move(rows));
 }
 
 workspace_result_t<void> write_packed_page_index(
     sqlite3* database, const packed_page_index_row_t& row) {
-    if (row.generation == 0) {
+    if (row.generation == 0 || row.domain == 0 ||
+        row.domain > static_cast<std::uint16_t>(packed_page_last_data_type) ||
+        row.page_index >= packed_generation_max_pages ||
+        row.count > packed_page_max_payload ||
+        row.address_value_min > row.address_value_max) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "packed page index generation must be non-zero",
+                                 "packed page index metadata exceeds its bounded invariants",
                                  "workspace_schema_v9.write_packed_page_index"));
     }
     v9_statement_t statement;
     auto result = statement.prepare(database, R"SQL(
 INSERT INTO packed_page_index(generation,domain,ordinal_begin,count,page_index,address_value_min,address_value_max)
-VALUES(?1,?2,?3,?4,?5,?6,?7)
+SELECT ?1,?2,?3,?4,?5,?6,?7
+WHERE EXISTS(SELECT 1 FROM packed_generations WHERE generation=?1 AND committed=0)
 ON CONFLICT(generation,domain,page_index) DO UPDATE SET ordinal_begin=excluded.ordinal_begin,count=excluded.count,address_value_min=excluded.address_value_min,address_value_max=excluded.address_value_max
+WHERE EXISTS(SELECT 1 FROM packed_generations WHERE generation=?1 AND committed=0)
 )SQL", "workspace_schema_v9.write_packed_page_index");
     if (!result) return result;
     result = statement.bind_uint(1, row.generation); if (!result) return result;
@@ -460,29 +1249,93 @@ ON CONFLICT(generation,domain,page_index) DO UPDATE SET ordinal_begin=excluded.o
     result = statement.bind_int(5, static_cast<std::int64_t>(row.page_index)); if (!result) return result;
     result = statement.bind_uint(6, row.address_value_min); if (!result) return result;
     result = statement.bind_uint(7, row.address_value_max); if (!result) return result;
-    return statement.step_done();
+    result = statement.step_done();
+    if (!result)
+        return result;
+    if (sqlite3_changes(database) != 1) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_conflict,
+                                 "packed page index requires an uncommitted generation",
+                                 "workspace_schema_v9.write_packed_page_index"));
+    }
+    return workspace_result_t<void>::success();
 }
 
 workspace_result_t<std::vector<packed_page_index_row_t>>
-    read_packed_page_index(sqlite3* database, std::uint64_t generation) {
+    read_packed_page_index(sqlite3* database, std::uint64_t generation,
+                           bool committed_only,
+                           const packed_stop_predicate_t& stop_requested) {
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_page_index"));
+    v9_statement_t count_statement;
+    auto result = count_statement.prepare(database, committed_only
+        ? "SELECT COUNT(*) FROM packed_page_index i JOIN packed_generations g ON g.generation=i.generation AND g.committed=1 WHERE i.generation=?1"
+        : "SELECT COUNT(*) FROM packed_page_index WHERE generation=?1",
+        "workspace_schema_v9.read_packed_page_index.count");
+    if (!result)
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(result.error());
+    result = count_statement.bind_uint(1, generation);
+    if (!result)
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(result.error());
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_page_index.count"));
+    const int count_status = sqlite3_step(count_statement.get());
+    if (count_status == SQLITE_INTERRUPT && publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_page_index.count"));
+    if (count_status != SQLITE_ROW) {
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            schema_v9_error(database, count_status, "unable to bound packed index rows",
+                            "workspace_schema_v9.read_packed_page_index.count"));
+    }
+    const auto row_count = sqlite3_column_int64(count_statement.get(), 0);
+    if (row_count < 0 ||
+        static_cast<std::uint64_t>(row_count) > packed_generation_max_index_rows) {
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "persisted packed index exceeds its bounded row limit",
+                                 "workspace_schema_v9.read_packed_page_index"));
+    }
     v9_statement_t statement;
-    auto result = statement.prepare(database,
-        "SELECT generation,domain,ordinal_begin,count,page_index,address_value_min,address_value_max FROM packed_page_index WHERE generation=?1 ORDER BY domain,ordinal_begin",
+    result = statement.prepare(database, committed_only
+        ? "SELECT i.generation,i.domain,i.ordinal_begin,i.count,i.page_index,i.address_value_min,i.address_value_max FROM packed_page_index i JOIN packed_generations g ON g.generation=i.generation AND g.committed=1 WHERE i.generation=?1 ORDER BY i.domain,i.ordinal_begin"
+        : "SELECT generation,domain,ordinal_begin,count,page_index,address_value_min,address_value_max FROM packed_page_index WHERE generation=?1 ORDER BY domain,ordinal_begin",
         "workspace_schema_v9.read_packed_page_index");
     if (!result)
         return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(result.error());
     result = statement.bind_uint(1, generation);
     if (!result)
         return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(result.error());
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_page_index"));
     std::vector<packed_page_index_row_t> rows;
+    rows.reserve(static_cast<std::size_t>(row_count));
     for (;;) {
+        if (publish_stop_requested_v9(stop_requested))
+            return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+                cancelled_read_error_v9("workspace_schema_v9.read_packed_page_index"));
         const int status = sqlite3_step(statement.get());
         if (status == SQLITE_DONE)
             break;
+        if (status == SQLITE_INTERRUPT &&
+            publish_stop_requested_v9(stop_requested)) {
+            return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+                cancelled_read_error_v9(
+                    "workspace_schema_v9.read_packed_page_index"));
+        }
         if (status != SQLITE_ROW) {
             return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
                 schema_v9_error(database, status, "unable to read packed page index row",
                                 "workspace_schema_v9.read_packed_page_index"));
+        }
+        if (rows.size() >= packed_generation_max_index_rows) {
+            return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "packed page index exceeds its aggregate row limit",
+                                     "workspace_schema_v9.read_packed_page_index"));
         }
         packed_page_index_row_t row;
         row.generation = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
@@ -492,41 +1345,96 @@ workspace_result_t<std::vector<packed_page_index_row_t>>
         row.page_index = static_cast<std::uint32_t>(sqlite3_column_int64(statement.get(), 4));
         row.address_value_min = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 5));
         row.address_value_max = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 6));
+        if (row.domain == 0 ||
+            row.domain > static_cast<std::uint16_t>(packed_page_last_data_type) ||
+            row.page_index >= packed_generation_max_pages ||
+            row.count > packed_page_max_payload ||
+            row.address_value_min > row.address_value_max) {
+            return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "packed page index row is malformed",
+                                     "workspace_schema_v9.read_packed_page_index"));
+        }
         rows.push_back(std::move(row));
     }
+    if (rows.size() != static_cast<std::size_t>(row_count)) {
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "packed page index changed across the bounded read snapshot",
+                                 "workspace_schema_v9.read_packed_page_index"));
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<packed_page_index_row_t>>::failure(
+            cancelled_read_error_v9("workspace_schema_v9.read_packed_page_index"));
     return workspace_result_t<std::vector<packed_page_index_row_t>>::success(std::move(rows));
 }
 
 workspace_result_t<void> write_workbench_state(
     sqlite3* database, const workbench_state_record_t& record) {
+    if (record.workspace_id == 0 || record.contract_schema_version == 0 ||
+        record.revision == 0 || record.fingerprint == 0 ||
+        record.payload_json.empty() ||
+        record.payload_json.size() > workbench_state_max_payload_bytes) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "workbench state metadata exceeds its bounded invariants",
+                                 "workspace_schema_v9.write_workbench_state"));
+    }
+    const auto updated_utc_ms = record.updated_utc_ms > 0
+        ? record.updated_utc_ms : utc_ms_v9();
     v9_statement_t statement;
     auto result = statement.prepare(database, R"SQL(
-INSERT INTO workbench_state(singleton,has_selection,selection_space,selection_value,selection_arch,selection_mode,navigation_back_json,navigation_forward_json,bookmarks_json,layout_json,active_tab,zoom_level,revision,updated_utc_ms)
-VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-ON CONFLICT(singleton) DO UPDATE SET has_selection=excluded.has_selection,selection_space=excluded.selection_space,selection_value=excluded.selection_value,selection_arch=excluded.selection_arch,selection_mode=excluded.selection_mode,navigation_back_json=excluded.navigation_back_json,navigation_forward_json=excluded.navigation_forward_json,bookmarks_json=excluded.bookmarks_json,layout_json=excluded.layout_json,active_tab=excluded.active_tab,zoom_level=excluded.zoom_level,revision=excluded.revision,updated_utc_ms=excluded.updated_utc_ms
+INSERT INTO workbench_state(singleton,workspace_id,contract_schema_version,revision,fingerprint,payload_json,updated_utc_ms)
+VALUES(1,?1,?2,?3,?4,?5,?6)
+ON CONFLICT(singleton) DO UPDATE SET
+    workspace_id=excluded.workspace_id,
+    contract_schema_version=excluded.contract_schema_version,
+    revision=excluded.revision,
+    fingerprint=excluded.fingerprint,
+    payload_json=excluded.payload_json,
+    updated_utc_ms=excluded.updated_utc_ms
+WHERE workbench_state.workspace_id=excluded.workspace_id
+  AND (
+      (excluded.revision<0 AND workbench_state.revision>=0)
+      OR (((excluded.revision<0)=(workbench_state.revision<0))
+          AND excluded.revision>workbench_state.revision)
+  )
 )SQL", "workspace_schema_v9.write_workbench_state");
     if (!result) return result;
-    result = statement.bind_int(1, record.has_selection ? 1 : 0); if (!result) return result;
-    result = statement.bind_int(2, static_cast<std::int64_t>(record.selection.space)); if (!result) return result;
-    result = statement.bind_uint(3, record.selection.value); if (!result) return result;
-    result = statement.bind_int(4, static_cast<std::int64_t>(record.selection.architecture)); if (!result) return result;
-    result = statement.bind_int(5, static_cast<std::int64_t>(record.selection.mode)); if (!result) return result;
-    result = statement.bind_text(6, record.navigation_back_json); if (!result) return result;
-    result = statement.bind_text(7, record.navigation_forward_json); if (!result) return result;
-    result = statement.bind_text(8, record.bookmarks_json); if (!result) return result;
-    result = statement.bind_text(9, record.layout_json); if (!result) return result;
-    result = statement.bind_int(10, static_cast<std::int64_t>(record.active_tab)); if (!result) return result;
-    result = statement.bind_int(11, static_cast<std::int64_t>(record.zoom_level)); if (!result) return result;
-    result = statement.bind_uint(12, record.revision); if (!result) return result;
-    result = statement.bind_uint(13, record.updated_utc_ms > 0 ? record.updated_utc_ms : utc_ms_v9()); if (!result) return result;
-    return statement.step_done();
+    result = statement.bind_uint(1, record.workspace_id); if (!result) return result;
+    result = statement.bind_int(2, static_cast<std::int64_t>(record.contract_schema_version)); if (!result) return result;
+    result = statement.bind_uint(3, record.revision); if (!result) return result;
+    result = statement.bind_uint(4, record.fingerprint); if (!result) return result;
+    result = statement.bind_text(5, record.payload_json); if (!result) return result;
+    result = statement.bind_uint(6, updated_utc_ms); if (!result) return result;
+    result = statement.step_done();
+    if (!result)
+        return result;
+    if (sqlite3_changes(database) == 1)
+        return workspace_result_t<void>::success();
+    auto existing = read_workbench_state(database);
+    if (!existing)
+        return workspace_result_t<void>::failure(existing.error());
+    if (existing.value()) {
+        const auto& current = *existing.value();
+        if (current.workspace_id == record.workspace_id &&
+            current.contract_schema_version == record.contract_schema_version &&
+            current.revision == record.revision &&
+            current.fingerprint == record.fingerprint &&
+            current.payload_json == record.payload_json)
+            return workspace_result_t<void>::success();
+    }
+    return workspace_result_t<void>::failure(
+        make_workspace_error(workspace_error_code_t::target_conflict,
+                             "workbench persistence revision conflicts with stored state",
+                             "workspace_schema_v9.write_workbench_state"));
 }
 
 workspace_result_t<std::optional<workbench_state_record_t>>
     read_workbench_state(sqlite3* database) {
     v9_statement_t statement;
     auto result = statement.prepare(database,
-        "SELECT has_selection,selection_space,selection_value,selection_arch,selection_mode,navigation_back_json,navigation_forward_json,bookmarks_json,layout_json,active_tab,zoom_level,revision,updated_utc_ms FROM workbench_state WHERE singleton=1",
+        "SELECT workspace_id,contract_schema_version,revision,fingerprint,length(CAST(payload_json AS BLOB)),payload_json,updated_utc_ms FROM workbench_state WHERE singleton=1",
         "workspace_schema_v9.read_workbench_state");
     if (!result)
         return workspace_result_t<std::optional<workbench_state_record_t>>::failure(result.error());
@@ -539,32 +1447,53 @@ workspace_result_t<std::optional<workbench_state_record_t>>
                             "workspace_schema_v9.read_workbench_state"));
     }
     workbench_state_record_t record;
-    record.has_selection = sqlite3_column_int(statement.get(), 0) != 0;
-    record.selection.space = static_cast<address_space_id_t>(sqlite3_column_int(statement.get(), 1));
-    record.selection.value = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 2));
-    record.selection.architecture = static_cast<architecture_id_t>(sqlite3_column_int(statement.get(), 3));
-    record.selection.mode = static_cast<architecture_mode_t>(sqlite3_column_int(statement.get(), 4));
-    record.navigation_back_json = column_text_v9(statement.get(), 5);
-    record.navigation_forward_json = column_text_v9(statement.get(), 6);
-    record.bookmarks_json = column_text_v9(statement.get(), 7);
-    record.layout_json = column_text_v9(statement.get(), 8);
-    record.active_tab = static_cast<std::int32_t>(sqlite3_column_int(statement.get(), 9));
-    record.zoom_level = static_cast<std::int32_t>(sqlite3_column_int(statement.get(), 10));
-    record.revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 11));
-    record.updated_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 12));
+    record.workspace_id = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
+    record.contract_schema_version = static_cast<std::uint32_t>(sqlite3_column_int64(statement.get(), 1));
+    record.revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 2));
+    record.fingerprint = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 3));
+    const auto declared_length = sqlite3_column_int64(statement.get(), 4);
+    if (declared_length <= 0 ||
+        static_cast<std::uint64_t>(declared_length) > workbench_state_max_payload_bytes) {
+        return workspace_result_t<std::optional<workbench_state_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "persisted workbench state exceeds its bounded byte limit",
+                                 "workspace_schema_v9.read_workbench_state"));
+    }
+    record.payload_json = column_text_v9(statement.get(), 5);
+    record.updated_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 6));
+    if (record.workspace_id == 0 || record.contract_schema_version == 0 ||
+        record.revision == 0 || record.fingerprint == 0 ||
+        record.payload_json.size() != static_cast<std::size_t>(declared_length)) {
+        return workspace_result_t<std::optional<workbench_state_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "persisted workbench state metadata is inconsistent",
+                                 "workspace_schema_v9.read_workbench_state"));
+    }
     return workspace_result_t<std::optional<workbench_state_record_t>>::success(
         std::optional<workbench_state_record_t>(std::move(record)));
 }
 
 workspace_result_t<void> write_decompiler_cache_v9(
     sqlite3* database, const decompiler_cache_v9_record_t& record) {
-    if (record.cache_key.empty() || record.cache_key.size() > 16384) {
+    if (record.cache_key.empty() || record.cache_key.size() > 16384 ||
+        record.binary_id.empty() || record.function_content_hash.empty() ||
+        record.engine_version.size() > 65536 ||
+        record.specification_version.size() > 65536 ||
+        record.settings_hash.size() > 65536 || record.schema_version == 0 ||
+        record.cache_key_version != decompiler_cache_v9_key_version ||
+        record.function_rva_address.space != address_space_id_t::relative_virtual ||
+        record.function_rva_address.value != record.function_rva ||
+        record.function_rva_address.architecture != record.architecture ||
+        record.function_rva_address.mode != record.architecture_mode) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "decompiler cache v9 key is empty or too long",
                                  "workspace_schema_v9.write_decompiler_cache_v9"));
     }
-    if (record.result_json.empty() || record.result_bytes != record.result_json.size()) {
+    if (record.result_json.empty() ||
+        record.result_json.size() > (64ULL << 20) ||
+        record.result_bytes != record.result_json.size() ||
+        record.function_name.size() > 4096) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "decompiler cache v9 result json is empty or size mismatch",
@@ -574,7 +1503,27 @@ workspace_result_t<void> write_decompiler_cache_v9(
     auto result = statement.prepare(database, R"SQL(
 INSERT INTO decompiler_cache_v9(cache_key,binary_id,format,architecture,architecture_mode,abi,endian,engine_version,schema_version,specification_version,settings_hash,function_id,function_rva,function_rva_space,function_rva_arch,function_rva_mode,function_content_hash,analysis_revision,overlay_revision,generation,function_name,result_json,created_utc_ms,last_access_utc_ms,result_bytes,cache_key_version)
 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)
-ON CONFLICT(cache_key) DO UPDATE SET function_name=excluded.function_name,result_json=excluded.result_json,last_access_utc_ms=excluded.last_access_utc_ms,result_bytes=excluded.result_bytes,analysis_revision=excluded.analysis_revision,overlay_revision=excluded.overlay_revision,generation=excluded.generation
+ON CONFLICT(cache_key) DO UPDATE SET function_name=excluded.function_name,result_json=excluded.result_json,last_access_utc_ms=excluded.last_access_utc_ms,result_bytes=excluded.result_bytes
+WHERE decompiler_cache_v9.binary_id=excluded.binary_id
+  AND decompiler_cache_v9.format=excluded.format
+  AND decompiler_cache_v9.architecture=excluded.architecture
+  AND decompiler_cache_v9.architecture_mode=excluded.architecture_mode
+  AND decompiler_cache_v9.abi=excluded.abi
+  AND decompiler_cache_v9.endian=excluded.endian
+  AND decompiler_cache_v9.engine_version=excluded.engine_version
+  AND decompiler_cache_v9.schema_version=excluded.schema_version
+  AND decompiler_cache_v9.specification_version=excluded.specification_version
+  AND decompiler_cache_v9.settings_hash=excluded.settings_hash
+  AND decompiler_cache_v9.function_id=excluded.function_id
+  AND decompiler_cache_v9.function_rva=excluded.function_rva
+  AND decompiler_cache_v9.function_rva_space=excluded.function_rva_space
+  AND decompiler_cache_v9.function_rva_arch=excluded.function_rva_arch
+  AND decompiler_cache_v9.function_rva_mode=excluded.function_rva_mode
+  AND decompiler_cache_v9.function_content_hash=excluded.function_content_hash
+  AND decompiler_cache_v9.analysis_revision=excluded.analysis_revision
+  AND decompiler_cache_v9.overlay_revision=excluded.overlay_revision
+  AND decompiler_cache_v9.generation=excluded.generation
+  AND decompiler_cache_v9.cache_key_version=excluded.cache_key_version
 )SQL", "workspace_schema_v9.write_decompiler_cache_v9");
     if (!result) return result;
     result = statement.bind_text(1, record.cache_key); if (!result) return result;
@@ -603,14 +1552,29 @@ ON CONFLICT(cache_key) DO UPDATE SET function_name=excluded.function_name,result
     result = statement.bind_uint(24, record.last_access_utc_ms); if (!result) return result;
     result = statement.bind_uint(25, record.result_bytes); if (!result) return result;
     result = statement.bind_int(26, static_cast<std::int64_t>(record.cache_key_version)); if (!result) return result;
-    return statement.step_done();
+    result = statement.step_done();
+    if (!result)
+        return result;
+    if (sqlite3_changes(database) != 1) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_conflict,
+                                 "decompiler cache key conflicts with stored identity metadata",
+                                 "workspace_schema_v9.write_decompiler_cache_v9"));
+    }
+    return workspace_result_t<void>::success();
 }
 
 workspace_result_t<std::optional<decompiler_cache_v9_record_t>>
     read_decompiler_cache_v9(sqlite3* database, const std::string& cache_key) {
+    if (cache_key.empty() || cache_key.size() > 16384) {
+        return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "decompiler cache v9 lookup key is empty or too long",
+                                 "workspace_schema_v9.read_decompiler_cache_v9"));
+    }
     v9_statement_t statement;
     auto result = statement.prepare(database,
-        "SELECT cache_key,binary_id,format,architecture,architecture_mode,abi,endian,engine_version,schema_version,specification_version,settings_hash,function_id,function_rva,function_rva_space,function_rva_arch,function_rva_mode,function_content_hash,analysis_revision,overlay_revision,generation,function_name,length(result_json),result_json,created_utc_ms,last_access_utc_ms,result_bytes,cache_key_version FROM decompiler_cache_v9 WHERE cache_key=?1",
+        "SELECT cache_key,binary_id,format,architecture,architecture_mode,abi,endian,engine_version,schema_version,specification_version,settings_hash,function_id,function_rva,function_rva_space,function_rva_arch,function_rva_mode,function_content_hash,analysis_revision,overlay_revision,generation,length(CAST(function_name AS BLOB)),function_name,length(CAST(result_json AS BLOB)),result_json,created_utc_ms,last_access_utc_ms,result_bytes,cache_key_version FROM decompiler_cache_v9 WHERE cache_key=?1",
         "workspace_schema_v9.read_decompiler_cache_v9");
     if (!result)
         return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::failure(result.error());
@@ -625,13 +1589,29 @@ workspace_result_t<std::optional<decompiler_cache_v9_record_t>>
             schema_v9_error(database, status, "unable to read decompiler cache v9",
                             "workspace_schema_v9.read_decompiler_cache_v9"));
     }
+    const int cache_key_bytes = sqlite3_column_bytes(statement.get(), 0);
+    const int engine_version_bytes = sqlite3_column_bytes(statement.get(), 7);
+    const int specification_version_bytes = sqlite3_column_bytes(statement.get(), 9);
+    const int settings_hash_bytes = sqlite3_column_bytes(statement.get(), 10);
+    if (cache_key_bytes <= 0 || cache_key_bytes > 16384 ||
+        engine_version_bytes < 0 || engine_version_bytes > 65536 ||
+        specification_version_bytes < 0 || specification_version_bytes > 65536 ||
+        settings_hash_bytes < 0 || settings_hash_bytes > 65536) {
+        return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "decompiler cache v9 metadata exceeds its bounded byte limit",
+                                 "workspace_schema_v9.read_decompiler_cache_v9"));
+    }
     decompiler_cache_v9_record_t record;
     record.cache_key = column_text_v9(statement.get(), 0);
     const void* binary_blob = sqlite3_column_blob(statement.get(), 1);
     const int binary_bytes = sqlite3_column_bytes(statement.get(), 1);
-    if (binary_blob && binary_bytes == static_cast<int>(record.binary_id.bytes.size())) {
-        std::memcpy(record.binary_id.bytes.data(), binary_blob, record.binary_id.bytes.size());
-    }
+    if (!binary_blob || binary_bytes != static_cast<int>(record.binary_id.bytes.size()))
+        return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "decompiler cache v9 binary identity is malformed",
+                                 "workspace_schema_v9.read_decompiler_cache_v9"));
+    std::memcpy(record.binary_id.bytes.data(), binary_blob, record.binary_id.bytes.size());
     record.format = static_cast<format_id_t>(sqlite3_column_int(statement.get(), 2));
     record.architecture = static_cast<architecture_id_t>(sqlite3_column_int(statement.get(), 3));
     record.architecture_mode = static_cast<architecture_mode_t>(sqlite3_column_int(statement.get(), 4));
@@ -646,25 +1626,44 @@ workspace_result_t<std::optional<decompiler_cache_v9_record_t>>
     record.function_rva_address.space = static_cast<address_space_id_t>(sqlite3_column_int(statement.get(), 13));
     record.function_rva_address.architecture = static_cast<architecture_id_t>(sqlite3_column_int(statement.get(), 14));
     record.function_rva_address.mode = static_cast<architecture_mode_t>(sqlite3_column_int(statement.get(), 15));
+    record.function_rva_address.value = record.function_rva;
     const void* content_hash_blob = sqlite3_column_blob(statement.get(), 16);
     const int content_hash_bytes = sqlite3_column_bytes(statement.get(), 16);
-    if (content_hash_blob && content_hash_bytes == static_cast<int>(record.function_content_hash.bytes.size())) {
-        std::memcpy(record.function_content_hash.bytes.data(), content_hash_blob,
-                    record.function_content_hash.bytes.size());
-    }
+    if (!content_hash_blob ||
+        content_hash_bytes != static_cast<int>(record.function_content_hash.bytes.size()))
+        return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "decompiler cache v9 content identity is malformed",
+                                 "workspace_schema_v9.read_decompiler_cache_v9"));
+    std::memcpy(record.function_content_hash.bytes.data(), content_hash_blob,
+                record.function_content_hash.bytes.size());
     record.analysis_revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 17));
     record.overlay_revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 18));
     record.generation = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 19));
-    record.function_name = column_text_v9(statement.get(), 20);
-    const auto declared_length = sqlite3_column_int64(statement.get(), 21);
-    record.result_json = column_text_v9(statement.get(), 22);
-    record.created_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 23));
-    record.last_access_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 24));
-    record.result_bytes = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 25));
-    record.cache_key_version = static_cast<std::uint32_t>(sqlite3_column_int64(statement.get(), 26));
-    if (declared_length <= 0 ||
+    const auto function_name_length = sqlite3_column_int64(statement.get(), 20);
+    const auto declared_length = sqlite3_column_int64(statement.get(), 22);
+    if (function_name_length < 0 || function_name_length > 4096 ||
+        declared_length <= 0 || declared_length > (64LL << 20)) {
+        return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "decompiler cache v9 text exceeds its bounded byte limit",
+                                 "workspace_schema_v9.read_decompiler_cache_v9"));
+    }
+    record.function_name = column_text_v9(statement.get(), 21);
+    record.result_json = column_text_v9(statement.get(), 23);
+    record.created_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 24));
+    record.last_access_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 25));
+    record.result_bytes = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 26));
+    record.cache_key_version = static_cast<std::uint32_t>(sqlite3_column_int64(statement.get(), 27));
+    if (record.cache_key != cache_key ||
+        record.cache_key_version != decompiler_cache_v9_key_version ||
+        record.function_rva_address.space != address_space_id_t::relative_virtual ||
+        record.function_rva_address.architecture != record.architecture ||
+        record.function_rva_address.mode != record.architecture_mode ||
+        static_cast<std::uint64_t>(function_name_length) != record.function_name.size() ||
         static_cast<std::uint64_t>(declared_length) != record.result_json.size() ||
-        record.result_bytes != record.result_json.size()) {
+        record.result_bytes != record.result_json.size() ||
+        record.function_name.size() > 4096) {
         return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "decompiler cache v9 result length is inconsistent",
@@ -718,15 +1717,23 @@ workspace_result_t<std::optional<overlay_v9_state_record_t>>
     overlay_v9_state_record_t record;
     const void* image_hash_blob = sqlite3_column_blob(statement.get(), 0);
     const int image_hash_bytes = sqlite3_column_bytes(statement.get(), 0);
-    if (image_hash_blob && image_hash_bytes == static_cast<int>(record.target_image_hash.size())) {
-        std::memcpy(record.target_image_hash.data(), image_hash_blob, record.target_image_hash.size());
-    }
+    if (!image_hash_blob ||
+        image_hash_bytes != static_cast<int>(record.target_image_hash.size()))
+        return workspace_result_t<std::optional<overlay_v9_state_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "overlay v9 target image hash is malformed",
+                                 "workspace_schema_v9.read_overlay_v9_state"));
+    std::memcpy(record.target_image_hash.data(), image_hash_blob, record.target_image_hash.size());
     const void* provenance_hash_blob = sqlite3_column_blob(statement.get(), 1);
     const int provenance_hash_bytes = sqlite3_column_bytes(statement.get(), 1);
-    if (provenance_hash_blob && provenance_hash_bytes == static_cast<int>(record.target_provenance_hash.size())) {
-        std::memcpy(record.target_provenance_hash.data(), provenance_hash_blob,
-                    record.target_provenance_hash.size());
-    }
+    if (!provenance_hash_blob ||
+        provenance_hash_bytes != static_cast<int>(record.target_provenance_hash.size()))
+        return workspace_result_t<std::optional<overlay_v9_state_record_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "overlay v9 target provenance hash is malformed",
+                                 "workspace_schema_v9.read_overlay_v9_state"));
+    std::memcpy(record.target_provenance_hash.data(), provenance_hash_blob,
+                record.target_provenance_hash.size());
     record.target_image_base = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 2));
     record.target_image_size = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 3));
     record.target_generation = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 4));
@@ -742,47 +1749,252 @@ workspace_result_t<std::optional<overlay_v9_state_record_t>>
         std::optional<overlay_v9_state_record_t>(std::move(record)));
 }
 
-workspace_result_t<void> publish_packed_generation(
-    sqlite3* database, std::uint64_t generation) {
-    v9_statement_t statement;
-    auto result = statement.prepare(database,
+workspace_result_t<void> publish_packed_generation_atomic(
+    sqlite3* database, const packed_generation_publication_t& publication,
+    const packed_publish_stop_predicate_t& stop_requested) {
+    if (publish_stop_requested_v9(stop_requested))
+        return cancelled_publish_error();
+    auto result = validate_publication_v9(publication, stop_requested);
+    if (!result)
+        return result;
+    result = exec_sql_v9(database, "BEGIN IMMEDIATE",
+                         "workspace_schema_v9.publish_atomic.begin");
+    if (!result)
+        return result;
+    const auto fail = [&](workspace_result_t<void> failure) {
+        exec_sql_v9(database, "ROLLBACK", "workspace_schema_v9.publish_atomic.rollback");
+        return failure;
+    };
+    auto existing = read_packed_generation(
+        database, publication.generation.generation, false, stop_requested);
+    if (!existing)
+        return fail(workspace_result_t<void>::failure(existing.error()));
+    if (existing.value() && existing.value()->committed) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_conflict,
+                                 "packed generation is already committed",
+                                 "workspace_schema_v9.publish_atomic")));
+    }
+    result = delete_uncommitted_rows_v9(database,
+                                        publication.generation.generation);
+    if (!result)
+        return fail(std::move(result));
+    if (publish_stop_requested_v9(stop_requested))
+        return fail(cancelled_publish_error());
+
+    auto manifest = publication.generation;
+    manifest.committed = false;
+    result = write_packed_generation(database, manifest);
+    if (!result)
+        return fail(std::move(result));
+    v9_statement_t page_statement;
+    result = page_statement.prepare(database, R"SQL(
+INSERT INTO packed_pages(generation,page_index,page_count,page_type,payload_length,checksum,payload)
+VALUES(?1,?2,?3,?4,?5,?6,?7)
+)SQL", "workspace_schema_v9.publish_atomic.page");
+    if (!result)
+        return fail(std::move(result));
+    for (const auto& page : publication.pages) {
+        if (publish_stop_requested_v9(stop_requested))
+            return fail(cancelled_publish_error());
+        result = page_statement.bind_uint(1, page.generation); if (!result) return fail(std::move(result));
+        result = page_statement.bind_int(2, static_cast<std::int64_t>(page.page_index)); if (!result) return fail(std::move(result));
+        result = page_statement.bind_int(3, static_cast<std::int64_t>(page.page_count)); if (!result) return fail(std::move(result));
+        result = page_statement.bind_int(4, static_cast<std::int64_t>(page.page_type)); if (!result) return fail(std::move(result));
+        result = page_statement.bind_int(5, static_cast<std::int64_t>(page.payload_length)); if (!result) return fail(std::move(result));
+        result = page_statement.bind_int(6, static_cast<std::int64_t>(page.checksum)); if (!result) return fail(std::move(result));
+        result = page_statement.bind_blob(7, page.payload.data(), page.payload.size()); if (!result) return fail(std::move(result));
+        result = page_statement.step_done();
+        if (!result)
+            return fail(std::move(result));
+        result = page_statement.reset();
+        if (!result)
+            return fail(std::move(result));
+    }
+    v9_statement_t index_statement;
+    result = index_statement.prepare(database, R"SQL(
+INSERT INTO packed_page_index(generation,domain,ordinal_begin,count,page_index,address_value_min,address_value_max)
+VALUES(?1,?2,?3,?4,?5,?6,?7)
+)SQL", "workspace_schema_v9.publish_atomic.index");
+    if (!result)
+        return fail(std::move(result));
+    for (const auto& index : publication.index) {
+        if (publish_stop_requested_v9(stop_requested))
+            return fail(cancelled_publish_error());
+        result = index_statement.bind_uint(1, index.generation); if (!result) return fail(std::move(result));
+        result = index_statement.bind_int(2, static_cast<std::int64_t>(index.domain)); if (!result) return fail(std::move(result));
+        result = index_statement.bind_int(3, static_cast<std::int64_t>(index.ordinal_begin)); if (!result) return fail(std::move(result));
+        result = index_statement.bind_int(4, static_cast<std::int64_t>(index.count)); if (!result) return fail(std::move(result));
+        result = index_statement.bind_int(5, static_cast<std::int64_t>(index.page_index)); if (!result) return fail(std::move(result));
+        result = index_statement.bind_uint(6, index.address_value_min); if (!result) return fail(std::move(result));
+        result = index_statement.bind_uint(7, index.address_value_max); if (!result) return fail(std::move(result));
+        result = index_statement.step_done();
+        if (!result)
+            return fail(std::move(result));
+        result = index_statement.reset();
+        if (!result)
+            return fail(std::move(result));
+    }
+    v9_statement_t commit_statement;
+    result = commit_statement.prepare(database,
         "UPDATE packed_generations SET committed=1 WHERE generation=?1 AND committed=0",
-        "workspace_schema_v9.publish_packed_generation");
-    if (!result) return result;
-    result = statement.bind_uint(1, generation); if (!result) return result;
-    result = statement.step_done(); if (!result) return result;
-    if (sqlite3_changes(database) == 0) {
-        return workspace_result_t<void>::failure(
-            make_workspace_error(workspace_error_code_t::target_not_found,
-                                 "packed generation not found or already committed",
-                                 "workspace_schema_v9.publish_packed_generation"));
+        "workspace_schema_v9.publish_atomic.marker");
+    if (!result)
+        return fail(std::move(result));
+    result = commit_statement.bind_uint(1, manifest.generation);
+    if (!result)
+        return fail(std::move(result));
+    result = commit_statement.step_done();
+    if (!result)
+        return fail(std::move(result));
+    if (sqlite3_changes(database) != 1) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_conflict,
+                                 "packed generation commit marker was not staged",
+                                 "workspace_schema_v9.publish_atomic")));
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return fail(cancelled_publish_error());
+    result = exec_sql_v9(database, "COMMIT",
+                         "workspace_schema_v9.publish_atomic.commit");
+    if (!result) {
+        exec_sql_v9(database, "ROLLBACK", "workspace_schema_v9.publish_atomic.rollback");
+        return result;
     }
     return workspace_result_t<void>::success();
 }
 
+workspace_result_t<std::optional<packed_generation_publication_t>>
+    read_packed_generation_publication(sqlite3* database,
+                                       std::uint64_t generation,
+                                       const packed_stop_predicate_t& stop_requested) {
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
+            cancelled_read_error_v9(
+                "workspace_schema_v9.read_packed_generation_publication"));
+    auto manifest = read_packed_generation(database, generation, true,
+                                           stop_requested);
+    if (!manifest)
+        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
+            manifest.error());
+    if (!manifest.value())
+        return workspace_result_t<std::optional<packed_generation_publication_t>>::success(
+            std::nullopt);
+    auto pages = read_packed_pages(database, generation, true, stop_requested);
+    if (!pages)
+        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
+            pages.error());
+    auto index = read_packed_page_index(database, generation, true,
+                                        stop_requested);
+    if (!index)
+        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
+            index.error());
+    packed_generation_publication_t publication;
+    publication.generation = std::move(*manifest.value());
+    publication.pages = pages.take_value();
+    publication.index = index.take_value();
+    publication.generation.committed = false;
+    auto validated = validate_publication_v9(publication, stop_requested);
+    if (!validated)
+        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
+            validated.error());
+    publication.generation.committed = true;
+    return workspace_result_t<std::optional<packed_generation_publication_t>>::success(
+        std::optional<packed_generation_publication_t>(std::move(publication)));
+}
+
+workspace_result_t<void> publish_packed_generation(
+    sqlite3* database, std::uint64_t generation) {
+    if (generation == 0) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "publish generation must be non-zero",
+                                 "workspace_schema_v9.publish_packed_generation"));
+    }
+    auto transaction = exec_sql_v9(
+        database, "SAVEPOINT aida_publish_packed_generation_v9",
+        "workspace_schema_v9.publish_packed_generation.begin");
+    if (!transaction)
+        return transaction;
+    const auto fail = [&](workspace_result_t<void> failure) {
+        exec_sql_v9(database,
+            "ROLLBACK TO aida_publish_packed_generation_v9",
+            "workspace_schema_v9.publish_packed_generation.rollback");
+        exec_sql_v9(database,
+            "RELEASE aida_publish_packed_generation_v9",
+            "workspace_schema_v9.publish_packed_generation.release");
+        return failure;
+    };
+    auto manifest = read_packed_generation(database, generation, false);
+    if (!manifest)
+        return fail(workspace_result_t<void>::failure(manifest.error()));
+    if (!manifest.value() || manifest.value()->committed) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_not_found,
+                                 "packed generation not found or already committed",
+                                 "workspace_schema_v9.publish_packed_generation")));
+    }
+    auto pages = read_packed_pages(database, generation, false);
+    if (!pages)
+        return fail(workspace_result_t<void>::failure(pages.error()));
+    auto index = read_packed_page_index(database, generation, false);
+    if (!index)
+        return fail(workspace_result_t<void>::failure(index.error()));
+    packed_generation_publication_t publication;
+    publication.generation = *manifest.value();
+    publication.pages = pages.take_value();
+    publication.index = index.take_value();
+    auto validated = validate_publication_v9(publication);
+    if (!validated)
+        return fail(std::move(validated));
+    v9_statement_t statement;
+    auto result = statement.prepare(database,
+        "UPDATE packed_generations SET committed=1 WHERE generation=?1 AND committed=0",
+        "workspace_schema_v9.publish_packed_generation");
+    if (!result) return fail(std::move(result));
+    result = statement.bind_uint(1, generation);
+    if (!result) return fail(std::move(result));
+    result = statement.step_done();
+    if (!result) return fail(std::move(result));
+    if (sqlite3_changes(database) == 0) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_not_found,
+                                 "packed generation not found or already committed",
+                                 "workspace_schema_v9.publish_packed_generation")));
+    }
+    result = exec_sql_v9(database,
+        "RELEASE aida_publish_packed_generation_v9",
+        "workspace_schema_v9.publish_packed_generation.commit");
+    return result;
+}
+
 workspace_result_t<void> rollback_packed_generation(
     sqlite3* database, std::uint64_t generation) {
-    v9_statement_t pages;
-    auto result = pages.prepare(database,
-        "DELETE FROM packed_pages WHERE generation=?1",
-        "workspace_schema_v9.rollback_packed_generation.pages");
-    if (!result) return result;
-    result = pages.bind_uint(1, generation); if (!result) return result;
-    result = pages.step_done(); if (!result) return result;
-    v9_statement_t index;
-    result = index.prepare(database,
-        "DELETE FROM packed_page_index WHERE generation=?1",
-        "workspace_schema_v9.rollback_packed_generation.index");
-    if (!result) return result;
-    result = index.bind_uint(1, generation); if (!result) return result;
-    result = index.step_done(); if (!result) return result;
-    v9_statement_t gen;
-    result = gen.prepare(database,
-        "DELETE FROM packed_generations WHERE generation=?1 AND committed=0",
-        "workspace_schema_v9.rollback_packed_generation.gen");
-    if (!result) return result;
-    result = gen.bind_uint(1, generation); if (!result) return result;
-    return gen.step_done();
+    if (generation == 0) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "rollback generation must be non-zero",
+                                 "workspace_schema_v9.rollback_packed_generation"));
+    }
+    auto result = exec_sql_v9(database,
+                              "SAVEPOINT aida_rollback_packed_generation_v9",
+                              "workspace_schema_v9.rollback.begin");
+    if (!result)
+        return result;
+    result = delete_uncommitted_rows_v9(database, generation);
+    if (!result) {
+        exec_sql_v9(database,
+                    "ROLLBACK TO aida_rollback_packed_generation_v9",
+                    "workspace_schema_v9.rollback.failure");
+        exec_sql_v9(database,
+                    "RELEASE aida_rollback_packed_generation_v9",
+                    "workspace_schema_v9.rollback.release");
+        return result;
+    }
+    result = exec_sql_v9(database,
+                         "RELEASE aida_rollback_packed_generation_v9",
+                         "workspace_schema_v9.rollback.commit");
+    return result;
 }
 
 }

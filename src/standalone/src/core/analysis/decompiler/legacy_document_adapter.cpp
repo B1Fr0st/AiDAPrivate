@@ -304,6 +304,27 @@ sha256_digest_t hash_decompiler_source_maps(
     return stable_serialization_hash(canonical);
 }
 
+bool typed_ast_has_proven_function_body(
+    const typed_pseudocode_ast_v2_t& ast) noexcept
+{
+    if (ast.root_node_id == 0 || ast.body_node_id == 0 || ast.nodes.empty())
+        return false;
+    const auto root = std::find_if(ast.nodes.begin(), ast.nodes.end(),
+        [&ast](const typed_pseudocode_ast_node_t& node) {
+            return node.id == ast.root_node_id;
+        });
+    const auto body = std::find_if(ast.nodes.begin(), ast.nodes.end(),
+        [&ast](const typed_pseudocode_ast_node_t& node) {
+            return node.id == ast.body_node_id;
+        });
+    return root != ast.nodes.end() && body != ast.nodes.end() &&
+           root->kind == typed_pseudocode_ast_node_kind_t::function_definition &&
+           body->kind == typed_pseudocode_ast_node_kind_t::compound_statement &&
+           !body->child_ids.empty() &&
+           std::find(root->child_ids.begin(), root->child_ids.end(), ast.body_node_id) !=
+               root->child_ids.end();
+}
+
 legacy_document_adapter_result_t adapt_decompiler_document_for_legacy(
     const decompiler_document_t* document,
     const legacy_document_adapter_limits_t& limits)
@@ -324,6 +345,12 @@ legacy_document_adapter_result_t adapt_decompiler_document_for_legacy(
         result.diagnostics.push_back(adapter_diagnostic(decompiler_diagnostic_severity_t::error,
             decompiler_diagnostic_code_t::invalid_contract,
             "decompiler.legacy_adapter.limits", ordinal));
+        return result;
+    }
+    if (!typed_ast_has_proven_function_body(document->ast)) {
+        result.diagnostics.push_back(adapter_diagnostic(decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::malformed_ast,
+            "decompiler.legacy_adapter.fabricated_body", ordinal));
         return result;
     }
     const auto validation = validate_decompiler_document(*document);

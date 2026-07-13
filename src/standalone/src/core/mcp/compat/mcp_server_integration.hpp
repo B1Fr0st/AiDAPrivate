@@ -8,21 +8,41 @@
 #include "../compat/effect_policy.hpp"
 #include "../compat/workspace_adapter.hpp"
 
-#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace aida::standalone::mcp::integration {
 
 using json = nlohmann::json;
+
+struct adapter_invocation_t final {
+    std::string_view tool_name;
+    std::string_view adapter_symbol;
+    const compat::contract_descriptor_t* descriptor = nullptr;
+    const protocol::tool_contract_t* contract = nullptr;
+    const json* arguments = nullptr;
+    const mcp_standalone::workspace_request_context_t* workspace = nullptr;
+    const protocol::cancellation_token_t* cancellation = nullptr;
+    json aida_metadata = json::object();
+};
+
+using adapter_dispatcher_t = std::function<protocol::mcp_result_t(
+    const adapter_invocation_t& invocation)>;
+
+struct extension_tool_binding_t final {
+    protocol::tool_contract_t contract;
+    std::string adapter_symbol;
+};
+
+using extension_binding_provider_t = std::function<std::optional<extension_tool_binding_t>(
+    std::string_view tool_name)>;
 
 struct server_integration_config_t {
     bool enforce_input_validation = true;
@@ -31,6 +51,9 @@ struct server_integration_config_t {
     bool replace_hand_drifted_registration = true;
     bool use_generated_descriptors = true;
     std::size_t schema_cache_capacity = 256;
+    std::chrono::milliseconds effect_lock_timeout{5000};
+    adapter_dispatcher_t adapter_dispatcher;
+    extension_binding_provider_t extension_binding_provider;
 };
 
 struct server_integration_metrics_t {
@@ -62,7 +85,8 @@ struct tool_provenance_metadata_t {
     json to_json() const;
 };
 
-class mcp_server_integration_t final {
+class mcp_server_integration_t final
+    : public std::enable_shared_from_this<mcp_server_integration_t> {
 public:
     static std::shared_ptr<mcp_server_integration_t>
         create(mcp_standalone::server_t& server,
@@ -87,7 +111,8 @@ public:
     protocol::mcp_result_t invoke_tool(
         const std::string& tool_name,
         const json& arguments,
-        const protocol::cancellation_token_t& cancellation = {});
+        const protocol::cancellation_token_t& cancellation = {},
+        const mcp_standalone::workspace_request_context_t* workspace = nullptr);
 
     static protocol::tool_contract_t
         descriptor_to_contract(const compat::contract_descriptor_t& descriptor);

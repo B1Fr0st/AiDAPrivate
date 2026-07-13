@@ -2,7 +2,7 @@
 
 #include "comment_dialog.hpp"
 #include "rename_dialog.hpp"
-#include "../analysis/workspace/decompiler_service.hpp"
+#include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../ui/theme.hpp"
@@ -36,7 +36,7 @@ enum class tab_status_t : std::uint8_t {
 };
 
 struct rendered_result_t {
-    aida::analysis::decompiler_result_t result;
+    aida::analysis::decompiler_ui_result_t result;
     std::vector<std::size_t> line_offsets;
 };
 
@@ -45,6 +45,7 @@ struct tab_t {
     std::string label;
     tab_status_t status = tab_status_t::queued;
     std::string error;
+    std::vector<aida::analysis::decompiler_ui_diagnostic_t> diagnostics;
     bool error_acknowledged = false;
     std::shared_ptr<const rendered_result_t> rendered;
     std::shared_ptr<aida::analysis::cancellation_source_t> cancellation;
@@ -58,6 +59,9 @@ struct state_t {
     int active = -1;
     int selected_line = -1;
     std::atomic<std::uint64_t> next_serial{1};
+    std::mutex integration_mutex;
+    std::weak_ptr<aida::analysis::analysis_workspace_t> integration_workspace;
+    std::shared_ptr<aida::analysis::decompiler_ui_integration_t> integration;
 };
 
 std::mutex& state_registry_mutex() {
@@ -86,15 +90,21 @@ std::shared_ptr<state_t> state_for(const disasm_view::workspace_context_t& conte
     return created;
 }
 
-std::vector<std::size_t> line_offsets(const std::string& text) {
-    std::vector<std::size_t> output;
+bool build_line_offsets(const std::string& text, std::vector<std::size_t>& output) {
+    constexpr std::size_t max_line_metadata = 1U << 20;
+    output.clear();
     output.reserve((std::min)(text.size() / 24 + 1, static_cast<std::size_t>(1U << 20)));
     output.push_back(0);
     for (std::size_t index = 0; index < text.size(); ++index) {
-        if (text[index] == '\n' && index + 1 < text.size())
+        if (text[index] == '\n' && index + 1 < text.size()) {
+            if (output.size() >= max_line_metadata) {
+                output.clear();
+                return false;
+            }
             output.push_back(index + 1);
+        }
     }
-    return output;
+    return true;
 }
 
 std::string label_for(const disasm_view::workspace_context_t& context,
@@ -118,11 +128,47 @@ std::optional<std::size_t> find_tab(const state_t& state,
     return {};
 }
 
+aida::analysis::workspace_result_t<
+    std::shared_ptr<aida::analysis::decompiler_ui_integration_t>>
+integration_for(
+    const std::shared_ptr<state_t>& state,
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+{
+    std::lock_guard<std::mutex> lock(state->integration_mutex);
+    const auto bound = state->integration_workspace.lock();
+    if (state->integration && bound == workspace)
+        return aida::analysis::workspace_result_t<
+            std::shared_ptr<aida::analysis::decompiler_ui_integration_t>>::success(
+                state->integration);
+    auto created = aida::analysis::decompiler_ui_integration_t::create_production(workspace);
+    if (!created)
+        return created;
+    state->integration_workspace = workspace;
+    state->integration = created.value();
+    return created;
+}
+
+std::string result_error(const aida::analysis::decompiler_ui_result_t& result)
+{
+    if (!result.diagnostics.empty()) {
+        const auto& diagnostic = result.diagnostics.front();
+        if (!diagnostic.message.empty())
+            return diagnostic.message;
+        if (!diagnostic.localization_key.empty())
+            return diagnostic.localization_key;
+    }
+    return "decompiler.pipeline.status." +
+        std::to_string(static_cast<unsigned int>(result.status));
+}
+
 void finish_request(const disasm_view::workspace_context_t& context,
-                    const std::shared_ptr<state_t>& state,
-                    const aida::analysis::address_t& address,
-                    std::uint64_t serial,
-                    aida::analysis::workspace_result_t<aida::analysis::decompiler_result_t> result) {
+                     const std::shared_ptr<state_t>& state,
+                     const aida::analysis::address_t& address,
+                     std::uint64_t serial,
+                     aida::analysis::workspace_result_t<
+                         aida::analysis::decompiler_ui_result_t> result) {
+    const auto current_publication = context.workspace
+        ? context.workspace->analysis_publication() : nullptr;
     std::lock_guard<std::mutex> lock(state->mutex);
     const auto index = find_tab(*state, address);
     if (!index)
@@ -130,36 +176,80 @@ void finish_request(const disasm_view::workspace_context_t& context,
     auto& tab = state->tabs[*index];
     if (tab.serial != serial || tab.generation != context.publication->generation)
         return;
+    if (!current_publication ||
+        !current_publication->coherent_with(context.workspace->identity()) ||
+        current_publication->generation != tab.generation ||
+        current_publication->analysis_revision != context.publication->analysis_revision ||
+        current_publication->overlay_revision != context.publication->overlay_revision) {
+        tab.error = "decompiler.ui.stale_result";
+        tab.error_acknowledged = false;
+        tab.status = tab_status_t::failed;
+        tab.rendered.reset();
+        tab.diagnostics.clear();
+        aida::analysis::decompiler_ui_diagnostic_t diagnostic;
+        diagnostic.severity = aida::analysis::decompiler_diagnostic_severity_t::error;
+        diagnostic.code = aida::analysis::decompiler_diagnostic_code_t::cache_key_rejected;
+        diagnostic.localization_key = tab.error;
+        diagnostic.message = tab.error;
+        diagnostic.retryable = true;
+        tab.diagnostics.push_back(std::move(diagnostic));
+        return;
+    }
     if (!result) {
         tab.error = result.error().stable_code() + ": " + result.error().message;
         tab.error_acknowledged = false;
         tab.status = result.error().cancellation ? tab_status_t::cancelled : tab_status_t::failed;
         tab.rendered.reset();
+        tab.diagnostics.clear();
+        return;
+    }
+    auto typed_result = result.take_value();
+    tab.diagnostics = typed_result.diagnostics;
+    if (!typed_result.succeeded() || !typed_result.document ||
+        typed_result.rendered_text.empty()) {
+        tab.error = result_error(typed_result);
+        tab.error_acknowledged = false;
+        tab.status = typed_result.status == aida::analysis::decompiler_pipeline_status_t::cancelled
+            ? tab_status_t::cancelled : tab_status_t::failed;
+        tab.rendered.reset();
         return;
     }
     auto rendered = std::make_shared<rendered_result_t>();
-    rendered->result = result.take_value();
-    rendered->line_offsets = line_offsets(rendered->result.pseudocode);
-    tab.label = rendered->result.function_name.empty() ? tab.label :
-        rendered->result.function_name;
+    rendered->result = std::move(typed_result);
+    if (!build_line_offsets(rendered->result.rendered_text, rendered->line_offsets)) {
+        tab.error = "decompiler.ui.line_metadata_limit";
+        tab.error_acknowledged = false;
+        tab.status = tab_status_t::failed;
+        tab.rendered.reset();
+        aida::analysis::decompiler_ui_diagnostic_t diagnostic;
+        diagnostic.severity = aida::analysis::decompiler_diagnostic_severity_t::error;
+        diagnostic.code = aida::analysis::decompiler_diagnostic_code_t::resource_limit;
+        diagnostic.localization_key = tab.error;
+        diagnostic.message = tab.error;
+        tab.diagnostics.push_back(std::move(diagnostic));
+        return;
+    }
+    tab.label = rendered->result.function_symbol.empty() ? tab.label :
+        rendered->result.function_symbol;
     tab.rendered = std::move(rendered);
     tab.error.clear();
     tab.status = tab_status_t::ready;
 }
 
 void submit_request(const disasm_view::workspace_context_t& context,
-                    const std::shared_ptr<state_t>& state,
-                    const aida::analysis::address_t& address,
-                    std::uint64_t serial,
-                    const std::shared_ptr<aida::analysis::cancellation_source_t>& cancellation) {
+                     const std::shared_ptr<state_t>& state,
+                     const aida::analysis::address_t& address,
+                     std::uint64_t serial,
+                     const std::shared_ptr<aida::analysis::cancellation_source_t>& cancellation,
+                     const bool force_refresh) {
     const std::string target_id = context.workspace->identity().binary_id().to_hex();
     aida::infra::taskflow_runtime::task_descriptor_t descriptor;
     descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
     descriptor.owner_subsystem = "pseudocode_view";
-    descriptor.label = "workspace_decompile";
+    descriptor.label = "typed_decompiler_pipeline";
     descriptor.target_id = target_id.c_str();
     descriptor.generation = context.publication->generation;
-    descriptor.cancellable_body = [context, state, address, serial, cancellation](
+    descriptor.cancellable_body = [context, state, address, serial, cancellation, force_refresh](
         const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) {
         if (runtime_cancel.requested.load(std::memory_order_acquire))
             cancellation->request_cancel();
@@ -170,22 +260,30 @@ void submit_request(const disasm_view::workspace_context_t& context,
                 return;
             state->tabs[*index].status = tab_status_t::decompiling;
         }
-        auto service = context.workspace->decompiler();
-        if (!service) {
+        auto integration = integration_for(state, context.workspace);
+        if (!integration) {
             finish_request(context, state, address, serial,
-                aida::analysis::workspace_result_t<aida::analysis::decompiler_result_t>::failure(
-                    aida::analysis::make_workspace_error(
-                        aida::analysis::workspace_error_code_t::service_conflict,
-                        "workspace decompiler service is unavailable", "ui_decompile")));
+                aida::analysis::workspace_result_t<
+                    aida::analysis::decompiler_ui_result_t>::failure(integration.error()));
             return;
         }
-        auto result = service->decompile(address, {}, cancellation->token());
+        auto result = integration.value()->decompile_native(
+            address.value,
+            force_refresh
+                ? aida::analysis::decompiler_ui_invocation_source_t::keyboard_shift_f5
+                : aida::analysis::decompiler_ui_invocation_source_t::keyboard_f5,
+            aida::analysis::decompiler_profile_id_t::balanced,
+            force_refresh
+                ? aida::analysis::decompiler_pipeline_cache_mode_t::refresh
+                : aida::analysis::decompiler_pipeline_cache_mode_t::read_write,
+            cancellation->token());
         finish_request(context, state, address, serial, std::move(result));
     };
     const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
     if (!submitted.submitted) {
         finish_request(context, state, address, serial,
-            aida::analysis::workspace_result_t<aida::analysis::decompiler_result_t>::failure(
+            aida::analysis::workspace_result_t<
+                aida::analysis::decompiler_ui_result_t>::failure(
                 aida::analysis::make_workspace_error(
                     aida::analysis::workspace_error_code_t::service_conflict,
                     submitted.reject_reason.empty() ? "decompiler queue rejected the request" :
@@ -205,13 +303,24 @@ std::optional<aida::analysis::address_t> function_address(
 std::optional<aida::analysis::address_t> line_address(
     const rendered_result_t& rendered, int line,
     const disasm_view::workspace_context_t& context) {
-    std::uint64_t best = 0;
-    for (const auto& mapping : rendered.result.line_to_address) {
-        if (mapping.first > line)
+    if (line < 0 || static_cast<std::size_t>(line) >= rendered.line_offsets.size())
+        return std::nullopt;
+    const auto line_index = static_cast<std::size_t>(line);
+    const auto begin = rendered.line_offsets[line_index];
+    const auto end = line_index + 1U < rendered.line_offsets.size()
+        ? rendered.line_offsets[line_index + 1U]
+        : rendered.result.rendered_text.size();
+    for (const auto& mapping : rendered.result.source_mappings) {
+        if (mapping.token_end <= begin)
+            continue;
+        if (mapping.token_begin >= end)
             break;
-        best = mapping.second;
+        if (mapping.address_range)
+            return mapping.address_range->begin;
+        if (mapping.address != 0)
+            return disasm_view::typed_address(context, mapping.address);
     }
-    return best == 0 ? std::nullopt : disasm_view::typed_address(context, best);
+    return std::nullopt;
 }
 
 std::string line_text(const rendered_result_t& rendered, std::size_t index) {
@@ -219,11 +328,11 @@ std::string line_text(const rendered_result_t& rendered, std::size_t index) {
         return {};
     const auto begin = rendered.line_offsets[index];
     auto end = index + 1 < rendered.line_offsets.size()
-        ? rendered.line_offsets[index + 1] : rendered.result.pseudocode.size();
-    while (end > begin && (rendered.result.pseudocode[end - 1] == '\n' ||
-           rendered.result.pseudocode[end - 1] == '\r'))
+        ? rendered.line_offsets[index + 1] : rendered.result.rendered_text.size();
+    while (end > begin && (rendered.result.rendered_text[end - 1] == '\n' ||
+           rendered.result.rendered_text[end - 1] == '\r'))
         --end;
-    return rendered.result.pseudocode.substr(begin, end - begin);
+    return rendered.result.rendered_text.substr(begin, end - begin);
 }
 
 disasm_view::workspace_context_t selected_context() {
@@ -263,6 +372,7 @@ void request_decompile(const disasm_view::workspace_context_t& context,
             tab.generation = context.publication->generation;
             tab.status = tab_status_t::queued;
             tab.error.clear();
+            tab.diagnostics.clear();
             tab.error_acknowledged = false;
             tab.rendered.reset();
         } else {
@@ -279,7 +389,7 @@ void request_decompile(const disasm_view::workspace_context_t& context,
         }
         state->selected_line = -1;
     }
-    submit_request(context, state, *typed, serial, cancellation);
+    submit_request(context, state, *typed, serial, cancellation, force_refresh);
 }
 
 void request_decompile(std::uint64_t address, const DisasmFile*, bool force_refresh) {
@@ -419,8 +529,8 @@ std::vector<tab_info_t> snapshot_tabs(const disasm_view::workspace_context_t& co
         tab_info_t info;
         info.addr = disasm_view::runtime_address(context, tab.address).value_or(tab.address.value);
         info.label = tab.label;
-        info.function_name = tab.rendered && !tab.rendered->result.function_name.empty()
-            ? tab.rendered->result.function_name : tab.label;
+        info.function_name = tab.rendered && !tab.rendered->result.function_symbol.empty()
+            ? tab.rendered->result.function_symbol : tab.label;
         info.loaded = tab.status == tab_status_t::ready;
         info.decompiling = tab.status == tab_status_t::queued ||
                            tab.status == tab_status_t::decompiling;
@@ -491,6 +601,7 @@ void render(float, float, float width, float height,
     std::shared_ptr<const rendered_result_t> rendered;
     tab_status_t status = tab_status_t::failed;
     std::string error;
+    std::vector<aida::analysis::decompiler_ui_diagnostic_t> diagnostics;
     int selected_line = -1;
     bool error_acknowledged = false;
     {
@@ -500,12 +611,13 @@ void render(float, float, float width, float height,
             rendered = tab.rendered;
             status = tab.status;
             error = tab.error;
+            diagnostics = tab.diagnostics;
             error_acknowledged = tab.error_acknowledged;
             selected_line = state->selected_line;
         }
     }
     if (rendered && ImGui::Button("Copy"))
-        ImGui::SetClipboardText(rendered->result.pseudocode.c_str());
+        ImGui::SetClipboardText(rendered->result.rendered_text.c_str());
     if ((status == tab_status_t::failed || status == tab_status_t::cancelled) &&
         ImGui::Button("Retry"))
         refresh_active_tab(context);
@@ -518,6 +630,13 @@ void render(float, float, float width, float height,
                 static_cast<std::size_t>(state->active) < state->tabs.size())
                 state->tabs[static_cast<std::size_t>(state->active)].error_acknowledged = true;
             error_acknowledged = true;
+        }
+    }
+    if (!diagnostics.empty() && ImGui::CollapsingHeader("Diagnostics")) {
+        for (const auto& diagnostic : diagnostics) {
+            const auto& message = diagnostic.message.empty()
+                ? diagnostic.localization_key : diagnostic.message;
+            ImGui::TextWrapped("%s", message.empty() ? "decompiler_diagnostic" : message.c_str());
         }
     }
     if (active < 0 || tabs.empty()) {

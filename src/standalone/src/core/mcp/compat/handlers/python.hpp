@@ -1,12 +1,18 @@
 #pragma once
 
 #include "../python_worker_host.hpp"
+#include "../workspace_adapter.hpp"
 #include "../../protocol/mcp_tool_contract.hpp"
 
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <filesystem>
 #include <functional>
+#include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
 
 namespace aida::standalone::mcp::compat::handlers {
@@ -14,21 +20,44 @@ namespace aida::standalone::mcp::compat::handlers {
 inline constexpr std::size_t k_python_tool_count = 1;
 
 struct python_handler_limits_t final {
-    std::size_t max_request_bytes = 1024U * 1024U;
+    std::size_t max_request_bytes = 16U * 1024U;
     std::size_t max_script_path_bytes = 4096U;
+    std::size_t max_target_source_path_bytes = 32U * 1024U;
+    std::size_t max_selector_bytes = 1024U;
+    std::size_t max_workspace_id_bytes = 1024U;
     std::size_t max_workspace_metadata_bytes = 64U * 1024U;
     std::size_t max_result_bytes = 256U * 1024U;
     std::chrono::milliseconds max_execution_time{30000};
 };
 
+struct python_target_lease_t final {
+    std::shared_ptr<const void> owner;
+    std::string workspace_id;
+    std::optional<std::uint32_t> pid;
+    std::string bin_name;
+    std::string normalized_source_path;
+    std::uint64_t generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
+    bool live = false;
+    protocol::json workspace_metadata = protocol::json::object();
+    python_workspace_api_t workspace_api;
+};
+
+using python_target_acquire_t = std::function<adapter_result_t<python_target_lease_t>(
+    const target_selector_t&,
+    std::optional<std::chrono::steady_clock::time_point>)>;
+
 using python_worker_execute_t = std::function<python_worker_execution_result_t(
+    const std::filesystem::path&,
     const python_worker_execution_request_t&)>;
 
 const std::array<std::string_view, k_python_tool_count>& python_tool_names() noexcept;
 
 class python_handlers_t final {
 public:
-    python_handlers_t(python_worker_execute_t executor,
+    python_handlers_t(python_target_acquire_t acquire_target,
+                      python_worker_execute_t executor,
                       protocol::schema_runtime_t& schemas,
                       python_handler_limits_t limits = {});
 
@@ -54,6 +83,7 @@ private:
         const protocol::json& arguments,
         const protocol::cancellation_token_t& cancellation) const;
 
+    python_target_acquire_t acquire_target_;
     python_worker_execute_t executor_;
     protocol::schema_runtime_t& schemas_;
     python_handler_limits_t limits_;

@@ -36,11 +36,23 @@ struct function_seed_t {
 };
 
 struct function_seed_sources_t {
+    std::vector<function_seed_t> image_entries;
+    std::vector<function_seed_t> tls_callbacks;
     std::vector<function_seed_t> symbols;
     std::vector<function_seed_t> exports;
     std::vector<function_seed_t> unwind_ranges;
+    std::vector<function_seed_t> load_config_entries;
+    std::vector<function_seed_t> relocation_targets;
     std::vector<function_seed_t> call_targets;
     std::vector<function_seed_t> pointer_targets;
+    std::vector<function_seed_t> validated_gap_targets;
+};
+
+struct function_seed_evidence_t {
+    const std::vector<symbol_record_t>* symbols = nullptr;
+    const std::vector<unwind_record_t>* unwind_ranges = nullptr;
+    const std::vector<data_pointer_fact_t>* pointer_facts = nullptr;
+    const function_seed_sources_t* additional_sources = nullptr;
 };
 
 enum class function_recovery_conflict_kind_t : std::uint8_t {
@@ -116,12 +128,32 @@ struct function_recovery_result_t {
     std::uint64_t reachability_mark_slots = 0;
     std::uint64_t reachability_passes = 0;
     std::uint64_t synthetic_gap_functions = 0;
+    std::uint64_t converged_seed_count = 0;
+    std::uint64_t delay_slot_transfer_count = 0;
 };
 
 class function_recovery_t final {
 public:
     static workspace_result_t<std::vector<function_seed_t>> combine_seed_sources(
         const function_seed_sources_t& sources,
+        const function_recovery_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<std::vector<function_seed_t>> converge_seed_sources(
+        const workspace_image_t& image,
+        const std::vector<target_fact_t>& targets,
+        const function_seed_evidence_t& evidence,
+        const function_recovery_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<function_recovery_result_t> recover(
+        const workspace_image_t& image,
+        const byte_provider_t& provider,
+        const std::vector<instruction_record_t>& instructions,
+        const std::vector<operand_fact_t>& operands,
+        const std::vector<target_fact_t>& targets,
+        const function_seed_evidence_t& evidence,
+        const std::vector<std::uint8_t>& delay_slot_counts,
         const function_recovery_limits_t& limits,
         const cancellation_token_t& cancel);
 

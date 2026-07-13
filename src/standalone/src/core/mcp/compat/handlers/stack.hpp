@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace aida::standalone::mcp::compat::handlers {
@@ -24,6 +25,11 @@ struct stack_handler_limits_t final {
     std::size_t max_batch_items = 256U;
     std::size_t max_addrs = 256U;
     std::chrono::milliseconds max_execution_time{120000};
+};
+
+struct stack_invocation_options_t final {
+    std::optional<std::uint64_t> expected_generation;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
 const std::array<std::string_view, k_stack_tool_count>& stack_tool_names() noexcept;
@@ -48,13 +54,15 @@ public:
         std::string_view name,
         const protocol::json& arguments,
         const protocol::cancellation_token_t& cancellation,
+        const stack_invocation_options_t& options = {},
         const protocol::json& aida_metadata = protocol::json::object()) const;
 
 private:
     protocol::mcp_result_t dispatch(
         std::size_t index,
         const protocol::json& arguments,
-        const protocol::cancellation_token_t& cancellation) const;
+        const protocol::cancellation_token_t& cancellation,
+        const stack_invocation_options_t& options) const;
 
     workspace_adapter_t& workspace_;
     protocol::schema_runtime_t& schemas_;
@@ -70,19 +78,23 @@ using stack_adapter_t = protocol::mcp_result_t (*)(
     const handlers::stack_handlers_t&,
     const protocol::json&,
     const protocol::cancellation_token_t&,
+    const handlers::stack_invocation_options_t&,
     const protocol::json&);
 
 protocol::mcp_result_t stack_frame(const handlers::stack_handlers_t& handlers,
                                    const protocol::json& arguments,
                                    const protocol::cancellation_token_t& cancellation,
+                                   const handlers::stack_invocation_options_t& options = {},
                                    const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t declare_stack(const handlers::stack_handlers_t& handlers,
                                     const protocol::json& arguments,
                                     const protocol::cancellation_token_t& cancellation,
+                                    const handlers::stack_invocation_options_t& options = {},
                                     const protocol::json& aida_metadata = protocol::json::object());
 protocol::mcp_result_t delete_stack(const handlers::stack_handlers_t& handlers,
                                     const protocol::json& arguments,
                                     const protocol::cancellation_token_t& cancellation,
+                                    const handlers::stack_invocation_options_t& options = {},
                                     const protocol::json& aida_metadata = protocol::json::object());
 
 }

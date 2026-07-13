@@ -383,6 +383,7 @@ generation_result_t generate_signature_at(
     const signature_source_t& source,
     std::uint64_t address,
     std::size_t max_length,
+    std::size_t maximum_instruction_bytes,
     bool wildcard_operands,
     const protocol::cancellation_token_t& cancellation) {
 
@@ -402,6 +403,10 @@ generation_result_t generate_signature_at(
             }
             break;
         }
+        if (insn->bytes.empty() || insn->bytes.size() > maximum_instruction_bytes) {
+            result.error = "instruction_size_out_of_bounds";
+            break;
+        }
 
         std::size_t remaining = max_length - result.bytes.size();
         std::size_t to_copy = (std::min)(insn->bytes.size(), remaining);
@@ -412,7 +417,8 @@ generation_result_t generate_signature_at(
         }
 
         auto match = source.find_matches(result.bytes, result.mask, 2, cancellation);
-        if (match.addresses.size() == 1 && match.addresses[0] == address) {
+        if (!match.exhausted && match.error.empty() &&
+            match.addresses.size() == 1 && match.addresses[0] == address) {
             result.unique = true;
             break;
         }
@@ -607,7 +613,8 @@ mcp_result_t make_signature(
                 }
 
                 auto gen = generate_signature_at(
-                    *source, *resolved, max_length, wildcard_operands, token);
+                    *source, *resolved, max_length, limits.maximum_instruction_bytes,
+                    wildcard_operands, token);
                 ++source_queries;
 
                 if (gen.error == "cancelled") {
@@ -759,7 +766,8 @@ mcp_result_t make_signature_for_function(
                 }
 
                 auto gen = generate_signature_at(
-                    *source, func->start, max_length, wildcard_operands, token);
+                    *source, func->start, max_length, limits.maximum_instruction_bytes,
+                    wildcard_operands, token);
                 ++source_queries;
 
                 if (gen.error == "cancelled") {
@@ -780,7 +788,6 @@ mcp_result_t make_signature_for_function(
                 } else {
                     item["signature"] = format_signature(gen.bytes, gen.mask, format);
                     item["format"] = format;
-                    item["unique"] = gen.unique;
                     if (!gen.error.empty()) {
                         item["error"] = gen.error;
                     }
@@ -929,6 +936,17 @@ mcp_result_t make_signature_for_range(
                         ++current;
                         continue;
                     }
+                    if (insn->bytes.empty() ||
+                        insn->bytes.size() > limits.maximum_instruction_bytes) {
+                        result["addr"] = format_address(*start_resolved);
+                        result["signature"] = nullptr;
+                        result["format"] = format;
+                        result["error"] = "instruction_size_out_of_bounds";
+                        return mcp_result_t::success(
+                            result.dump(), result,
+                            json{{"source_queries", 3},
+                                 {"range_bytes", range_size}});
+                    }
                     for (std::size_t i = 0;
                          i < insn->bytes.size() && current < *end_resolved; ++i) {
                         std::size_t offset = static_cast<std::size_t>(current - *start_resolved);
@@ -946,7 +964,9 @@ mcp_result_t make_signature_for_range(
 
             auto match_result = source->find_matches(
                 range_bytes, range_mask, 2, token);
-            result["unique"] = match_result.addresses.size() == 1 &&
+            result["unique"] = !match_result.exhausted &&
+                               match_result.error.empty() &&
+                               match_result.addresses.size() == 1 &&
                                match_result.addresses[0] == *start_resolved;
 
             return mcp_result_t::success(
@@ -1056,6 +1076,13 @@ mcp_result_t find_xref_signatures(
                 auto xrefs = source->xrefs_to(*resolved);
                 ++source_queries;
 
+                xrefs.erase(std::remove_if(xrefs.begin(), xrefs.end(),
+                    [](const signature_xref_t& xref) { return !xref.code; }),
+                    xrefs.end());
+                std::sort(xrefs.begin(), xrefs.end(),
+                          [](const signature_xref_t& a, const signature_xref_t& b) {
+                              return a.from < b.from;
+                          });
                 std::size_t total_xrefs = xrefs.size();
                 if (xrefs.size() > limits.maximum_xrefs_per_query) {
                     xrefs.resize(limits.maximum_xrefs_per_query);
@@ -1079,7 +1106,8 @@ mcp_result_t find_xref_signatures(
                     }
 
                     auto gen = generate_signature_at(
-                        *source, xref.from, max_length, wildcard_operands, token);
+                        *source, xref.from, max_length, limits.maximum_instruction_bytes,
+                        wildcard_operands, token);
                     ++source_queries;
 
                     if (gen.error == "cancelled") {
@@ -1089,7 +1117,7 @@ mcp_result_t find_xref_signatures(
                             json{{"phase", "find_xref_generate"}});
                     }
 
-                    if (gen.bytes.empty()) continue;
+                    if (gen.bytes.empty() || !gen.unique) continue;
 
                     sigs.push_back({xref.from, gen.bytes, gen.mask, gen.unique,
                                     gen.bytes.size()});

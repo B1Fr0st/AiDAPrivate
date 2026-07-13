@@ -19,10 +19,6 @@
 
 namespace aida::analysis {
 
-std::uint8_t metadata_provenance_rank(metadata_provenance_t provenance) noexcept {
-    return static_cast<std::uint8_t>(provenance);
-}
-
 namespace {
 
 constexpr std::uint64_t kSymbolEntityTag = 7ULL << 56;

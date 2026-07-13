@@ -9,12 +9,9 @@
 #include "../../protocol/mcp_result.hpp"
 #include "../../protocol/schema_runtime.hpp"
 
-#include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -46,16 +43,6 @@ private:
     std::vector<std::pair<std::string, std::function<type_test_result_t()>>> tests_;
 };
 
-class mock_adapter_context_t final {
-public:
-    explicit mock_adapter_context_t(std::string_view tool_name);
-    const adapter_call_context_t& context() const noexcept;
-private:
-    std::string name_storage_;
-    contract_descriptor_t descriptor_{};
-    adapter_call_context_t context_{};
-};
-
 class types_test_fixture_t final {
 public:
     types_test_fixture_t();
@@ -72,17 +59,24 @@ public:
     protocol::schema_runtime_t& schemas() noexcept;
 
     adapter_request_t make_request(const protocol::json& args);
-    adapter_call_context_t make_context(std::string_view contract_name);
 
     adapter_result_t<adapter_response_t> call_query(
         std::string_view tool_name, const protocol::json& args);
     adapter_result_t<adapter_response_t> call_overlay(
         std::string_view tool_name, const protocol::json& args);
+    adapter_result_t<adapter_response_t> call_query_for(
+        std::uint32_t pid, std::string_view tool_name, const protocol::json& args);
+    adapter_result_t<adapter_response_t> call_overlay_for(
+        std::uint32_t pid, std::string_view tool_name, const protocol::json& args);
 
     protocol::json call_query_json(
         std::string_view tool_name, const protocol::json& args);
     protocol::json call_overlay_json(
         std::string_view tool_name, const protocol::json& args);
+    protocol::json call_query_json_for(
+        std::uint32_t pid, std::string_view tool_name, const protocol::json& args);
+    protocol::json call_overlay_json_for(
+        std::uint32_t pid, std::string_view tool_name, const protocol::json& args);
 
     void publish_test_target(std::uint32_t pid, const std::string& bin_name);
     void reset();
@@ -92,7 +86,9 @@ private:
     effect_lock_manager_t lock_manager_;
     types_overlay_store_t overlay_store_;
     protocol::schema_runtime_t schemas_;
-    std::vector<std::unique_ptr<mock_adapter_context_t>> contexts_;
+    target_record_t default_target_;
+    std::shared_ptr<types_overlay_store_t> default_scope_;
+    std::unique_ptr<workspace_adapter_t> workspace_;
 };
 
 void register_all_type_handler_tests(type_test_harness_t& harness);
@@ -165,5 +161,6 @@ type_test_result_t test_type_query_filter_substring();
 type_test_result_t test_type_inspect_max_members_limit();
 type_test_result_t test_type_query_max_members_limit();
 type_test_result_t test_type_apply_batch_multiple_kinds();
+type_test_result_t test_target_scoped_overlay_isolation();
 
 }

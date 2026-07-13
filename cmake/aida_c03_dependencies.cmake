@@ -38,6 +38,50 @@ function(aida_c03_require_file_sha256 relative_path expected_sha256)
     aida_c03_require_path_sha256("${AIDA_C03_DEPENDENCY_ROOT}/${relative_path}" "${expected_sha256}" "${relative_path}")
 endfunction()
 
+function(aida_c03_register_pcre2_8bit_no_jit)
+    if(TARGET pcre2-8)
+        if(NOT TARGET pcre2-8-static)
+            message(FATAL_ERROR "AiDA C03 PCRE2 dependency is not the approved static 8-bit target")
+        endif()
+        return()
+    endif()
+
+    set(_aida_c03_pcre2_source "${AIDA_C03_DEPENDENCY_ROOT}/.deps/pcre2-10.47")
+    set(_aida_c03_pcre2_binary "${CMAKE_BINARY_DIR}/.deps/pcre2-c03")
+    aida_c03_require_path_sha256(
+        "${_aida_c03_pcre2_source}/CMakeLists.txt"
+        "74f65935e2b1120e7d7aeb4be81755e0f7a875732467ae64a9cc6ee7174fa5ba"
+        "PCRE2 10.47 CMake contract")
+    aida_c03_require_path_sha256(
+        "${_aida_c03_pcre2_source}/src/pcre2.h.generic"
+        "058462dc030e845ee627e19ac36347f561f5cc44d89eaf1c0010f2b363ab68d5"
+        "PCRE2 10.47 public header")
+    aida_c03_require_path_sha256(
+        "${_aida_c03_pcre2_source}/LICENCE.md"
+        "197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811"
+        "PCRE2 10.47 license")
+
+    set(_aida_c03_saved_build_shared_libs "${BUILD_SHARED_LIBS}")
+    set(_aida_c03_saved_build_static_libs "${BUILD_STATIC_LIBS}")
+    set(BUILD_SHARED_LIBS OFF)
+    set(BUILD_STATIC_LIBS ON)
+    set(PCRE2_BUILD_PCRE2_8 ON CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_16 OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_32 OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PCRE2_SUPPORT_JIT OFF CACHE BOOL "" FORCE)
+    set(PCRE2_SUPPORT_JIT_SEALLOC OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${_aida_c03_pcre2_source}" "${_aida_c03_pcre2_binary}" EXCLUDE_FROM_ALL)
+    set(BUILD_SHARED_LIBS "${_aida_c03_saved_build_shared_libs}")
+    set(BUILD_STATIC_LIBS "${_aida_c03_saved_build_static_libs}")
+
+    if(NOT TARGET pcre2-8 OR NOT TARGET pcre2-8-static)
+        message(FATAL_ERROR "AiDA C03 PCRE2 static 8-bit target registration failed")
+    endif()
+    set_target_properties(pcre2-8-static PROPERTIES FOLDER "Dependencies/C03")
+endfunction()
+
 function(aida_c03_verify_dependency_inventory)
     foreach(_aida_c03_metadata_file IN ITEMS
             "licenses/c03/THIRD_PARTY_NOTICES.md"
@@ -53,7 +97,7 @@ function(aida_c03_verify_dependency_inventory)
     aida_c03_require_file_sha256("licenses/c03/THIRD_PARTY_NOTICES.md" "ed491c0cf9a9f34bc745d6bfb033656672862e1b6e38320c10698c6228f48d5e")
     aida_c03_require_file_sha256("licenses/c03/SQLite-Public-Domain.txt" "003344876cc9d3b93313b297bc432ab109f41cf970c64c3c357cc8aa8dfc0c09")
     aida_c03_require_file_sha256("packaging/c03_worker_manifest.schema.json" "401d7d9b31f30687cb0430388bc0f4a2cac69fe65a5f0a5caa51039b9ca1f48c")
-    aida_c03_require_file_sha256("packaging/c03_worker_manifest.lock.json" "18a207dca364967ae90dd1a68f4734a312a7b362ae2754fb77d3d06246681c31")
+    aida_c03_require_file_sha256("packaging/c03_worker_manifest.lock.json" "b50acb65713a5b025acda20b348c192f3d9007924240e686d70358b9ef9d6824")
     aida_c03_require_file_sha256(".deps/zydis-4.1.1/CMakeLists.txt" "f577d285af7cf71f78830e45add8e0f4567f29b464414611be49ae2aef6e210f")
     aida_c03_require_file_sha256(".deps/zydis-4.1.1/LICENSE" "e5e99718209e94baaf3e9cbf6f64aa3329c9e73c63b1ab47e10f29d81974e6f3")
     aida_c03_require_file_sha256(".deps/zydis-4.1.1/dependencies/zycore/LICENSE" "7991ec4481a82c51d196f7440fda34c578aab51f8b9c7023935c6e03b57638bd")
@@ -81,6 +125,9 @@ function(aida_c03_verify_dependency_inventory)
     aida_c03_require_file_sha256(".deps/minizip-ng-4.2.2/LICENSE" "675181c03fc1302a1c8554c00f7be9bb420c5dbc9dcc2013433cec144413de03")
     aida_c03_require_file_sha256(".deps/pcre2-10.47/src/pcre2.h.generic" "058462dc030e845ee627e19ac36347f561f5cc44d89eaf1c0010f2b363ab68d5")
     aida_c03_require_file_sha256(".deps/pcre2-10.47/LICENCE.md" "197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811")
+    aida_c03_require_file_sha256("src/standalone/workers/analysis_python/analysis_python_worker.py" "493d52e9401adaa060a4f5d1435ea38dfd3ee9f0519325ea04ce651a73c83024")
+    aida_c03_require_file_sha256("src/standalone/workers/analysis_python/build_frozen_worker.ps1" "ede6518908d017a99903edb21050cb721a783e69a45d0ab69df53672b628b45b")
+    aida_c03_require_file_sha256("src/standalone/workers/analysis_python/materialize_python_worker_manifest.py" "59a2c9317f26d8c6b14955bfe8b792f3d0852fae1c20c783e21952f39ec5eaae")
     aida_c03_require_file_sha256("libs/nlohmann/json.hpp" "aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63")
     aida_c03_require_file_sha256(".deps/licenses/nlohmann-json-3.12.0-LICENSE.MIT" "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603")
     aida_c03_require_file_sha256(".deps/json-schema-validator-2.4.0/src/nlohmann/json-schema.hpp" "2d9772aee4cb7ddb6d338eac207c965fe2cd283a045dc35dfa9c0aaec481247b")
@@ -202,3 +249,5 @@ function(aida_c03_stage_evidence_notices destination)
         aida_c03_copy_notice("${destination}" "${_aida_c03_notice}")
     endforeach()
 endfunction()
+
+aida_c03_register_pcre2_8bit_no_jit()

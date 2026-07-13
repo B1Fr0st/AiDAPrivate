@@ -3,8 +3,8 @@
 #include "../ida_contracts_generated.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
-#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -311,6 +311,85 @@ validation_failure_t bounded_member_text(const json& object, std::string_view fi
     return bounded_text(*found, path, maximum, allow_empty);
 }
 
+int hex_nibble(char value) noexcept {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+bool is_hex_separator(char value) noexcept {
+    return std::isspace(static_cast<unsigned char>(value)) != 0 ||
+        value == ',' || value == ':' || value == '_' || value == '-';
+}
+
+validation_failure_t count_hex_bytes(const json& value, std::string path,
+                                     std::uint64_t maximum,
+                                     std::uint64_t& byte_count) {
+    if (!value.is_string()) {
+        return invalid_value(std::move(path), "string_required", value);
+    }
+    const auto& text = value.get_ref<const std::string&>();
+    byte_count = 0;
+    int high_nibble = -1;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char character = text[index];
+        if (is_hex_separator(character)) {
+            if (high_nibble != -1) {
+                return invalid_value(std::move(path), "incomplete_hex_byte", value);
+            }
+            continue;
+        }
+        if (character == '0' && index + 1 < text.size() &&
+            (text[index + 1] == 'x' || text[index + 1] == 'X') &&
+            high_nibble == -1) {
+            ++index;
+            continue;
+        }
+        const int nibble = hex_nibble(character);
+        if (nibble < 0) {
+            return invalid_value(std::move(path), "hexadecimal_bytes_required", value);
+        }
+        if (high_nibble == -1) {
+            high_nibble = nibble;
+            continue;
+        }
+        if (byte_count >= maximum) {
+            return exceeded_value(std::move(path), maximum, byte_count + 1U);
+        }
+        ++byte_count;
+        high_nibble = -1;
+    }
+    if (high_nibble != -1) {
+        return invalid_value(std::move(path), "incomplete_hex_byte", value);
+    }
+    if (byte_count == 0) {
+        return invalid_value(std::move(path), "nonempty_hex_bytes_required", value);
+    }
+    return std::nullopt;
+}
+
+validation_failure_t add_to_aggregate(std::uint64_t& aggregate,
+                                      std::uint64_t amount,
+                                      std::uint64_t maximum,
+                                      std::string path) {
+    const auto maximum_value = (std::numeric_limits<std::uint64_t>::max)();
+    if (aggregate > maximum || amount > maximum - aggregate) {
+        const std::uint64_t actual = amount > maximum_value - aggregate
+            ? maximum_value
+            : aggregate + amount;
+        return exceeded_value(std::move(path), maximum, actual);
+    }
+    aggregate += amount;
+    return std::nullopt;
+}
+
 validation_failure_t validate_routing_bounds(const json& arguments,
                                               const debugger_handler_limits_t& limits) {
     if (const auto pid = arguments.find("pid"); pid != arguments.end()) {
@@ -372,8 +451,10 @@ validation_failure_t validate_thread_ids(const json& value, std::string_view pat
 
 validation_failure_t validate_read_regions(const json& value,
                                             const debugger_handler_limits_t& limits) {
+    std::uint64_t aggregate = 0;
     return scalar_or_array(value, "regions", limits.max_read_regions,
-        [&limits](const json& region, std::string path) -> validation_failure_t {
+        [&limits, &aggregate](const json& region,
+                              std::string path) -> validation_failure_t {
             if (!region.is_object()) {
                 return invalid_value(std::move(path), "object_required", region);
             }
@@ -381,8 +462,23 @@ validation_failure_t validate_read_regions(const json& value,
                     region, "addr", path, limits.max_address_bytes, false)) {
                 return failure;
             }
-            if (auto failure = bounded_integer(
-                    region, "size", limits.max_read_bytes_per_region, path)) {
+            const auto size = region.find("size");
+            const auto parsed_size = size == region.end()
+                ? std::optional<std::uint64_t>{}
+                : unsigned_integer(*size);
+            if (!parsed_size || *parsed_size == 0) {
+                return invalid_value(
+                    path + ".size", "positive_integer_required",
+                    size == region.end() ? json(nullptr) : *size);
+            }
+            if (*parsed_size > limits.max_read_bytes_per_region) {
+                return exceeded_value(path + ".size",
+                                      limits.max_read_bytes_per_region,
+                                      *parsed_size);
+            }
+            if (auto failure = add_to_aggregate(
+                    aggregate, *parsed_size, limits.max_read_bytes_total,
+                    "aggregate_read_bytes")) {
                 return failure;
             }
             return std::nullopt;
@@ -391,8 +487,10 @@ validation_failure_t validate_read_regions(const json& value,
 
 validation_failure_t validate_write_regions(const json& value,
                                              const debugger_handler_limits_t& limits) {
+    std::uint64_t aggregate = 0;
     return scalar_or_array(value, "regions", limits.max_write_regions,
-        [&limits](const json& region, std::string path) -> validation_failure_t {
+        [&limits, &aggregate](const json& region,
+                              std::string path) -> validation_failure_t {
             if (!region.is_object()) {
                 return invalid_value(std::move(path), "object_required", region);
             }
@@ -400,9 +498,24 @@ validation_failure_t validate_write_regions(const json& value,
                     region, "addr", path, limits.max_address_bytes, false)) {
                 return failure;
             }
-            if (auto failure = bounded_member_text(
-                    region, "data", path,
-                    limits.max_write_bytes_per_region * 2, false)) {
+            const auto data = region.find("data");
+            if (data == region.end()) {
+                return invalid_value(path + ".data", "field_required", json(nullptr));
+            }
+            if (auto failure = bounded_text(
+                    *data, path + ".data",
+                    limits.max_write_bytes_per_region * 3U, false)) {
+                return failure;
+            }
+            std::uint64_t byte_count = 0;
+            if (auto failure = count_hex_bytes(
+                    *data, path + ".data",
+                    limits.max_write_bytes_per_region, byte_count)) {
+                return failure;
+            }
+            if (auto failure = add_to_aggregate(
+                    aggregate, byte_count, limits.max_write_bytes_total,
+                    "aggregate_write_bytes")) {
                 return failure;
             }
             return std::nullopt;
@@ -657,13 +770,29 @@ protocol::mcp_result_t debugger_handlers_t::invoke(
             },
             aida_metadata);
     }
+    if (requires_approval(name) &&
+        (approval.approval_id == 0 || approval.source.empty() ||
+         approval.source.size() > limits_.max_approval_source_bytes)) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::effect_policy_rejected,
+            "Debugger effect approval identity is invalid.",
+            protocol::json{
+                {"phase", "debugger_approval_gate"},
+                {"tool", std::string(name)},
+                {"approval_required", true},
+                {"approval_id_valid", approval.approval_id != 0},
+                {"approval_source_bytes", approval.source.size()},
+                {"approval_source_maximum", limits_.max_approval_source_bytes},
+            },
+            aida_metadata);
+    }
     const std::size_t index = static_cast<std::size_t>(std::distance(contracts_.begin(), found));
     return protocol::invoke_tool_contract(
         *found,
         arguments,
-        [this, index, &approval](const protocol::json& validated_arguments,
-                                   const protocol::cancellation_token_t& token) {
-            return dispatch(index, validated_arguments, token, approval);
+        [this, index](const protocol::json& validated_arguments,
+                      const protocol::cancellation_token_t& token) {
+            return dispatch(index, validated_arguments, token);
         },
         schemas_,
         cancellation,
@@ -672,8 +801,7 @@ protocol::mcp_result_t debugger_handlers_t::invoke(
 
 protocol::mcp_result_t debugger_handlers_t::dispatch(
     std::size_t index, const protocol::json& arguments,
-    const protocol::cancellation_token_t& cancellation,
-    const debugger_effect_approval_t& approval) const {
+    const protocol::cancellation_token_t& cancellation) const {
     const auto name = k_debugger_names.at(index);
     const auto& contract = contracts_.at(index);
     if (cancellation.cancelled()) {
@@ -732,6 +860,8 @@ protocol::mcp_result_t debugger_handlers_t::dispatch(
     request.deadline = std::chrono::steady_clock::now() +
         execution_timeout(contract, limits_.max_execution_time);
 
+    const auto lane_scope = lane_.bind(cancellation);
+    (void)lane_scope;
     auto adapter_result = workspace_.debug(name, request);
     if (!adapter_result) {
         return adapter_failure(adapter_result.error());

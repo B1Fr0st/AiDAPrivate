@@ -72,7 +72,9 @@ struct basic_block_fact_t {
     entity_id_t primary_function_id = 0;
     address_t start;
     address_t end;
+    entity_id_t transfer_instruction_id = 0;
     std::uint32_t instruction_count = 0;
+    std::uint8_t delay_slot_count = 0;
     advanced_cfg_quality_t quality;
     bool reachable = false;
     bool terminal = false;

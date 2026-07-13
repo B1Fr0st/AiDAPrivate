@@ -2057,12 +2057,17 @@ if(WIN32)
             $<TARGET_OBJECTS:AiDAStandalone_asm>
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
-        target_sources(AiDAStandalone PRIVATE ${AIDA_C03_WAVE_B_STANDALONE_SOURCES})
+        target_sources(AiDAStandalone PRIVATE
+            ${AIDA_C03_WAVE_B_STANDALONE_SOURCES}
+            ${AIDA_C03_WAVE_C_STANDALONE_SOURCES}
+            ${AIDA_C03_WAVE_D_SHARED_STANDALONE_SOURCES}
+        )
         if(NOT Z3_FOUND OR NOT Z3_INCLUDE_DIRS OR NOT Z3_LIBRARIES OR
            NOT IS_DIRECTORY "${Z3_INCLUDE_DIRS}" OR NOT EXISTS "${Z3_LIBRARIES}")
             message(FATAL_ERROR "AiDAStandalone requires the pinned local Z3 include and library dependencies")
         endif()
         aida_c03_register_native_decompiler_worker_package(AiDAStandalone)
+        aida_c03_register_analysis_python_worker_package(AiDAStandalone)
 
         target_include_directories(AiDAStandalone PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -2150,7 +2155,7 @@ if(WIN32)
             /bigobj
         )
 
-        option(AIDA_BUILD_C03_SAFE_HEADLESS_HARNESSES "Build and register C03 safe-headless Wave B harness targets" ON)
+        option(AIDA_BUILD_C03_SAFE_HEADLESS_HARNESSES "Build and register C03 safe-headless Wave B and Wave C harness targets" ON)
         if(AIDA_BUILD_C03_SAFE_HEADLESS_HARNESSES)
             enable_testing()
             aida_c03_register_safe_headless_targets()
@@ -2311,6 +2316,7 @@ if(WIN32)
             zlibstatic
             libzstd_static
             liblzma
+            pcre2-8
             brotlidec
             brotlienc
             brotlicommon

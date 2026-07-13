@@ -23,6 +23,7 @@
 #include "workspace/pe_image.hpp"
 #include "workspace/compact_ir.hpp"
 #include "workspace/workspace_types.hpp"
+#include "decompiler/legacy_document_adapter.hpp"
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -56,8 +57,10 @@ struct workspace_reconstruction_result_t {
 	std::string module_name;
 	int total_functions = 0;
 	int decompiled_functions = 0;
+	int failed_functions = 0;
 	int modules_created = 0;
 	std::vector<std::string> files_created;
+	std::vector<aida::analysis::decompiler_diagnostic_t> diagnostics;
 	std::string output_dir;
 };
 
@@ -77,6 +80,8 @@ struct function_info_t {
 	std::string name;
 	std::string pseudocode;
 	std::vector<uint64_t> callees;
+	std::vector<aida::analysis::decompiler_document_source_map_t> source_maps;
+	std::vector<aida::analysis::decompiler_diagnostic_t> diagnostics;
 	bool is_export = false;
 	bool decompiled = false;
 	int cluster_id = -1;
@@ -452,14 +457,16 @@ inline void generate_exports_header(
 	for (auto& fi : funcs) {
 		if (!fi.is_export) continue;
 		if (fi.decompiled && !fi.pseudocode.empty()) {
-			auto first_line = fi.pseudocode.substr(0, fi.pseudocode.find('\n'));
-			if (!first_line.empty() && first_line.back() == '{')
-				first_line.pop_back();
-			while (!first_line.empty() && (first_line.back() == ' ' || first_line.back() == '\t'))
-				first_line.pop_back();
-			ofs << first_line << ";\n";
-		} else {
-			ofs << "void " << fi.name << "(void);\n";
+			const auto body = fi.pseudocode.find('{');
+			if (body == std::string::npos)
+				continue;
+			auto declaration = fi.pseudocode.substr(0, body);
+			while (!declaration.empty() &&
+			       (declaration.back() == ' ' || declaration.back() == '\t' ||
+			        declaration.back() == '\r' || declaration.back() == '\n'))
+				declaration.pop_back();
+			if (!declaration.empty())
+				ofs << declaration << ";\n";
 		}
 	}
 
@@ -467,7 +474,7 @@ inline void generate_exports_header(
 	files_created.push_back(hdr_path.string());
 }
 
-inline void generate_module_source(
+inline bool generate_module_source(
 	const std::string& dir,
 	const std::string& project_name,
 	const std::string& module_name,
@@ -475,11 +482,17 @@ inline void generate_module_source(
 	const std::vector<int>& indices,
 	std::vector<std::string>& files_created)
 {
+	const bool has_document = std::any_of(indices.begin(), indices.end(),
+		[&funcs](const int index) {
+			return funcs[index].decompiled && !funcs[index].pseudocode.empty();
+		});
+	if (!has_document)
+		return false;
 	std::filesystem::path src_path = std::filesystem::path(dir) / "src" / (module_name + ".cpp");
 	std::filesystem::create_directories(src_path.parent_path());
 
 	std::ofstream ofs(src_path, std::ios::binary);
-	if (!ofs) return;
+	if (!ofs) return false;
 
 	ofs << "#include \"../include/" << project_name << "_types.h\"\n";
 	ofs << "#include \"../include/" << project_name << "_exports.h\"\n\n";
@@ -487,16 +500,13 @@ inline void generate_module_source(
 	for (int idx : indices) {
 		auto& fi = funcs[idx];
 
-		if (fi.decompiled && !fi.pseudocode.empty()) {
+		if (fi.decompiled && !fi.pseudocode.empty())
 			ofs << fi.pseudocode << "\n\n";
-		} else {
-			ofs << "void " << fi.name << "(void) {\n";
-			ofs << "}\n\n";
-		}
 	}
 
 	ofs.close();
 	files_created.push_back(src_path.string());
+	return true;
 }
 
 inline void generate_cmake(
@@ -584,7 +594,9 @@ inline void generate_module_map_json(
 		ofs << "    \"name\": \"" << fi.name << "\",\n";
 		ofs << "    \"module\": \"" << mod_name << "\",\n";
 		ofs << "    \"export\": " << (fi.is_export ? "true" : "false") << ",\n";
-		ofs << "    \"decompiled\": " << (fi.decompiled ? "true" : "false") << "\n";
+		ofs << "    \"decompiled\": " << (fi.decompiled ? "true" : "false") << ",\n";
+		ofs << "    \"source_map_count\": " << fi.source_maps.size() << ",\n";
+		ofs << "    \"diagnostic_count\": " << fi.diagnostics.size() << "\n";
 		ofs << "  }";
 	}
 	ofs << "\n}\n";
@@ -593,6 +605,42 @@ inline void generate_module_map_json(
 	files_created.push_back(json_path.string());
 }
 
+}
+
+inline bool accept_decompiler_document(
+	function_info_t& function,
+	const aida::analysis::decompiler_document_t& document,
+	const std::string& function_name,
+	std::vector<aida::analysis::decompiler_diagnostic_t>& aggregate_diagnostics)
+{
+	function.pseudocode.clear();
+	function.callees.clear();
+	function.source_maps.clear();
+	function.diagnostics.clear();
+	function.decompiled = false;
+
+	auto adapted = aida::analysis::adapt_decompiler_document_for_legacy(document);
+	function.diagnostics = adapted.diagnostics;
+	aggregate_diagnostics.insert(aggregate_diagnostics.end(),
+		adapted.diagnostics.begin(), adapted.diagnostics.end());
+	if (!adapted.succeeded() || !adapted.view || !adapted.view->complete() ||
+	    adapted.view->pseudocode.empty()) {
+		return false;
+	}
+
+	function.pseudocode = std::move(adapted.view->pseudocode);
+	function.source_maps = std::move(adapted.view->source_maps);
+	for (const auto& callee : adapted.view->callees)
+		function.callees.push_back(callee.second);
+	function.decompiled = true;
+
+	if (!function_name.empty() && function_name.find("FUN_") != 0 &&
+	    function_name.find("sub_") != 0) {
+		auto sanitized = detail::sanitize_name(function_name);
+		if (!sanitized.empty())
+			function.name = std::move(sanitized);
+	}
+	return true;
 }
 
 inline void reconstruct_workspace(
@@ -799,14 +847,25 @@ inline void reconstruct_workspace(
 
 			if (decomp_result) {
 				auto& dr = decomp_result.value();
-				if (!dr.pseudocode.empty()) {
-					funcs[i].pseudocode = std::move(dr.pseudocode);
-					funcs[i].decompiled = true;
+				if (accept_decompiler_document(
+						funcs[i], dr.document, dr.function_name, result.diagnostics)) {
 					++successful_decompiles;
-					if (!dr.function_name.empty() && dr.function_name.find("FUN_") != 0 &&
-					    dr.function_name.find("sub_") != 0)
-						funcs[i].name = detail::sanitize_name(dr.function_name);
 				}
+			} else {
+				aida::analysis::decompiler_diagnostic_t diagnostic;
+				diagnostic.severity = aida::analysis::decompiler_diagnostic_severity_t::error;
+				diagnostic.code = decomp_result.error().code == aida::analysis::workspace_error_code_t::deadline_exceeded
+					? aida::analysis::decompiler_diagnostic_code_t::deadline_exceeded
+					: decomp_result.error().code == aida::analysis::workspace_error_code_t::cancelled
+						? aida::analysis::decompiler_diagnostic_code_t::cancelled
+						: aida::analysis::decompiler_diagnostic_code_t::provider_failure;
+				diagnostic.localization_key = "source_reconstruction.decompiler_failure";
+				diagnostic.localization_arguments = {
+					decomp_result.error().stable_code(), detail::to_hex(funcs[i].address)};
+				diagnostic.retryable = decomp_result.error().code !=
+					aida::analysis::workspace_error_code_t::integrity_failure;
+				funcs[i].diagnostics.push_back(diagnostic);
+				result.diagnostics.push_back(std::move(diagnostic));
 			}
 
 			{
@@ -825,6 +884,12 @@ inline void reconstruct_workspace(
 		if (detail::cancelled(state)) { finish(false, "Cancelled."); return; }
 
 		result.decompiled_functions = successful_decompiles;
+		result.failed_functions = total - successful_decompiles;
+		for (std::size_t diagnostic_index = 0;
+		     diagnostic_index < result.diagnostics.size(); ++diagnostic_index) {
+			result.diagnostics[diagnostic_index].ordinal =
+				static_cast<std::uint32_t>(diagnostic_index + 1U);
+		}
 		{
 			std::lock_guard<std::mutex> lk(state.mutex);
 			state.last_result.decompiled_functions = successful_decompiles;
@@ -834,12 +899,14 @@ inline void reconstruct_workspace(
 			"decompile_accounted total=%d success=%d failed=%d",
 			total, successful_decompiles, total - successful_decompiles);
 
+		if (successful_decompiles == 0) {
+			finish(false, "No function produced a complete typed decompiler document.");
+			return;
+		}
+
 		detail::set_stage(state, stage_t::cluster);
 		detail::set_status(state, "Extracting call graph from workspace snapshot...");
 		state.progress.store(0.72f);
-
-		std::set<uint64_t> addr_set;
-		for (auto& fi : funcs) addr_set.insert(fi.address);
 
 		detail::extract_all_callees(funcs, *snapshot, *image);
 
@@ -883,22 +950,26 @@ inline void reconstruct_workspace(
 
 		std::vector<std::string> source_files;
 		int module_idx = 0;
+		int cluster_idx = 0;
 		int total_clusters = static_cast<int>(clusters.size());
 
 		for (auto& [cid, indices] : clusters) {
 			if (detail::cancelled(state)) { finish(false, "Cancelled."); return; }
 
-			float mod_pct = 0.82f + 0.10f * (static_cast<float>(module_idx) / static_cast<float>((std::max)(total_clusters, 1)));
+			float mod_pct = 0.82f + 0.10f * (static_cast<float>(cluster_idx) / static_cast<float>((std::max)(total_clusters, 1)));
 			state.progress.store(mod_pct);
 
 			std::string mod_name = cluster_names[cid];
-			detail::generate_module_source(
+			const bool generated = detail::generate_module_source(
 				output_dir, project_name, mod_name,
 				funcs, indices, result.files_created);
 
-			source_files.push_back(
-				(std::filesystem::path(output_dir) / "src" / (mod_name + ".cpp")).string());
-			module_idx++;
+			if (generated) {
+				source_files.push_back(
+					(std::filesystem::path(output_dir) / "src" / (mod_name + ".cpp")).string());
+				++module_idx;
+			}
+			++cluster_idx;
 		}
 
 		result.modules_created = module_idx;
@@ -907,7 +978,7 @@ inline void reconstruct_workspace(
 		detail::set_status(state, "Generating metadata...");
 		state.progress.store(0.93f);
 
-		if (config.generate_cmake) {
+		if (config.generate_cmake && !source_files.empty()) {
 			detail::generate_cmake(
 				output_dir, project_name,
 				source_files, result.files_created);
@@ -921,6 +992,10 @@ inline void reconstruct_workspace(
 
 		result.total_functions = static_cast<int>(funcs.size());
 
+		if (result.failed_functions != 0) {
+			finish(false, "Reconstruction is incomplete because one or more functions lacked a complete typed document.");
+			return;
+		}
 		finish(true);
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("source_recon",

@@ -6,6 +6,8 @@
 #include "workspace_types.hpp"
 #include "xref_builder.hpp"
 
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -15,6 +17,8 @@
 #include <vector>
 
 namespace aida::analysis {
+
+using search_deadline_t = std::optional<std::chrono::steady_clock::time_point>;
 
 enum class search_entity_kind_t : std::uint8_t {
     function = 0,
@@ -106,6 +110,8 @@ struct search_page_t {
     std::vector<search_hit_t> hits;
     std::uint64_t total = 0;
     std::uint64_t next_offset = 0;
+    std::uint64_t candidates_examined = 0;
+    std::uint64_t cancellation_checks = 0;
     bool truncated = false;
 };
 
@@ -124,6 +130,7 @@ struct search_entity_filter_t {
 };
 
 class search_index_t;
+class query_index_t;
 
 class search_generation_handle_t final {
 public:
@@ -189,27 +196,32 @@ public:
     std::optional<search_record_view_t> text_record(std::size_t index) const noexcept;
     workspace_result_t<search_page_t> find_text(const std::string& text,
         std::uint64_t offset, std::uint32_t limit,
-        const cancellation_token_t& cancel) const;
+        const cancellation_token_t& cancel, search_deadline_t deadline = {}) const;
     workspace_result_t<search_page_t> find_opcode(std::uint32_t opcode_id,
         std::uint64_t offset, std::uint32_t limit,
-        const cancellation_token_t& cancel) const;
+        const cancellation_token_t& cancel, search_deadline_t deadline = {}) const;
     workspace_result_t<search_page_t> find_immediate(std::uint64_t value,
         std::uint64_t offset, std::uint32_t limit,
-        const cancellation_token_t& cancel) const;
+        const cancellation_token_t& cancel, search_deadline_t deadline = {}) const;
     workspace_result_t<search_page_t> find_instruction(
         const search_instruction_filter_t& filter, std::uint64_t offset,
-        std::uint32_t limit, const cancellation_token_t& cancel) const;
+        std::uint32_t limit, const cancellation_token_t& cancel,
+        search_deadline_t deadline = {}) const;
     workspace_result_t<search_page_t> find_entity(
         const search_entity_filter_t& filter, std::uint64_t offset,
-        std::uint32_t limit, const cancellation_token_t& cancel) const;
+        std::uint32_t limit, const cancellation_token_t& cancel,
+        search_deadline_t deadline = {}) const;
     workspace_result_t<search_page_t> find_address_range(const address_t& begin,
         const address_t& end, std::uint64_t offset, std::uint32_t limit,
-        const cancellation_token_t& cancel) const;
+        const cancellation_token_t& cancel, search_deadline_t deadline = {}) const;
 
 private:
     struct impl_t;
     explicit search_index_t(std::unique_ptr<impl_t> impl);
+    const std::array<std::uint64_t, 2>& cursor_integrity_key() const noexcept;
     std::unique_ptr<impl_t> impl_;
+
+    friend class query_index_t;
 };
 
 }

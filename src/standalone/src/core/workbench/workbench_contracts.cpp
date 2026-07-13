@@ -995,5 +995,287 @@ persistence_fingerprint_t persistence_fingerprint(const workbench_persistence_dt
     return {hash};
 }
 
+workbench_error_t workbench_persistence_dto_t::validate() const
+{
+    return validate_persistence_dto(*this);
+}
+
+workbench_error_t workbench_persistence_dto_t::normalize()
+{
+    return normalize_persistence_dto(*this);
+}
+
+persistence_fingerprint_t workbench_persistence_dto_t::fingerprint() const
+{
+    return persistence_fingerprint(*this);
+}
+
+bool workbench_persistence_dto_t::equivalent(
+    const workbench_persistence_dto_t& other) const
+{
+    return persistence_dto_equal(*this, other);
+}
+
+workbench_document_bridge_t::workbench_document_bridge_t(
+    workspace_id_t workspace) noexcept
+    : workspace_(workspace)
+{
+}
+
+workbench_error_t workbench_document_bridge_t::publish(
+    document_descriptor_t descriptor)
+{
+    const auto identity_error = validate_document_identity(descriptor.identity);
+    if (!identity_error)
+        return identity_error;
+    if (!workspace_.valid() || descriptor.identity.workspace != workspace_)
+        return error(workbench_error_code_t::workspace_mismatch, workspace_.value);
+    if (descriptor.title.empty() ||
+        descriptor.title.size() > k_max_document_title_bytes)
+        return error(workbench_error_code_t::invalid_document);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto existing = std::find_if(
+        documents_.begin(), documents_.end(),
+        [&descriptor](const document_descriptor_t& candidate) {
+            return document_identity_equal(candidate.identity,
+                                           descriptor.identity);
+        });
+    if (existing != documents_.end()) {
+        *existing = std::move(descriptor);
+        return {};
+    }
+    if (documents_.size() >= k_max_documents_per_workspace)
+        return error(workbench_error_code_t::invalid_document,
+                     static_cast<std::uint64_t>(documents_.size()));
+    documents_.push_back(std::move(descriptor));
+    std::sort(documents_.begin(), documents_.end(),
+        [](const document_descriptor_t& lhs,
+           const document_descriptor_t& rhs) {
+            return document_identity_less(lhs.identity, rhs.identity);
+        });
+    return {};
+}
+
+workbench_error_t workbench_document_bridge_t::replace(
+    std::vector<document_descriptor_t> descriptors)
+{
+    if (!workspace_.valid() ||
+        descriptors.size() > k_max_documents_per_workspace)
+        return error(workbench_error_code_t::invalid_workspace, workspace_.value);
+    for (const auto& descriptor : descriptors) {
+        const auto identity_error = validate_document_identity(descriptor.identity);
+        if (!identity_error)
+            return identity_error;
+        if (descriptor.identity.workspace != workspace_)
+            return error(workbench_error_code_t::workspace_mismatch,
+                         descriptor.identity.workspace.value);
+        if (descriptor.title.empty() ||
+            descriptor.title.size() > k_max_document_title_bytes)
+            return error(workbench_error_code_t::invalid_document);
+    }
+    std::sort(descriptors.begin(), descriptors.end(),
+        [](const document_descriptor_t& lhs,
+           const document_descriptor_t& rhs) {
+            return document_identity_less(lhs.identity, rhs.identity);
+        });
+    for (std::size_t index = 1; index < descriptors.size(); ++index) {
+        if (document_identity_equal(descriptors[index - 1].identity,
+                                    descriptors[index].identity))
+            return error(workbench_error_code_t::duplicate_identifier,
+                         static_cast<std::uint64_t>(index));
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    documents_ = std::move(descriptors);
+    return {};
+}
+
+workbench_error_t workbench_document_bridge_t::remove(
+    const document_identity_t& identity)
+{
+    const auto identity_error = validate_document_identity(identity);
+    if (!identity_error)
+        return identity_error;
+    if (identity.workspace != workspace_)
+        return error(workbench_error_code_t::workspace_mismatch,
+                     identity.workspace.value);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto existing = std::find_if(
+        documents_.begin(), documents_.end(),
+        [&identity](const document_descriptor_t& candidate) {
+            return document_identity_equal(candidate.identity, identity);
+        });
+    if (existing == documents_.end())
+        return error(workbench_error_code_t::invalid_document);
+    documents_.erase(existing);
+    return {};
+}
+
+void workbench_document_bridge_t::clear() noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    documents_.clear();
+}
+
+workbench_error_t workbench_document_bridge_t::describe(
+    const document_identity_t& identity,
+    document_descriptor_t& output) const
+{
+    output = {};
+    const auto identity_error = validate_document_identity(identity);
+    if (!identity_error)
+        return identity_error;
+    if (identity.workspace != workspace_)
+        return error(workbench_error_code_t::workspace_mismatch,
+                     identity.workspace.value);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto existing = std::find_if(
+        documents_.begin(), documents_.end(),
+        [&identity](const document_descriptor_t& candidate) {
+            return document_identity_equal(candidate.identity, identity);
+        });
+    if (existing != documents_.end()) {
+        output = *existing;
+        return {};
+    }
+    const auto base = std::find_if(
+        documents_.begin(), documents_.end(),
+        [&identity](const document_descriptor_t& candidate) {
+            return candidate.identity.workspace == identity.workspace &&
+                   candidate.identity.kind == identity.kind &&
+                   candidate.identity.object_id == identity.object_id &&
+                   candidate.identity.variant_id == identity.variant_id &&
+                   candidate.identity.provider_key == identity.provider_key &&
+                   !candidate.identity.has_address;
+        });
+    if (base == documents_.end())
+        return error(workbench_error_code_t::invalid_document);
+    output = *base;
+    output.identity = identity;
+    return {};
+}
+
+workbench_error_t workbench_document_bridge_t::resolve(
+    const navigation_event_t& event,
+    navigation_resolution_t& output) const
+{
+    output = {};
+    const auto event_error = validate_navigation_event(event);
+    if (!event_error)
+        return event_error;
+    if (event.workspace != workspace_)
+        return error(workbench_error_code_t::workspace_mismatch,
+                     event.workspace.value);
+    document_descriptor_t descriptor;
+    const auto describe_error = describe(event.target.document, descriptor);
+    if (!describe_error)
+        return describe_error;
+    if (!descriptor.can_open)
+        return error(workbench_error_code_t::adapter_rejected,
+                     event.target.document.object_id);
+    output.document = event.target.document;
+    output.selection = event.target.selection;
+    output.cursor = event.target.cursor;
+    output.requires_document_open = true;
+    return {};
+}
+
+workbench_error_t workbench_document_bridge_t::resolve_target(
+    const document_identity_t& source,
+    document_kind_t target_kind,
+    std::uint64_t address,
+    navigation_resolution_t& output) const
+{
+    output = {};
+    const auto source_error = validate_document_identity(source);
+    if (!source_error)
+        return source_error;
+    if (source.workspace != workspace_)
+        return error(workbench_error_code_t::workspace_mismatch,
+                     source.workspace.value);
+    if (target_kind == document_kind_t::unknown)
+        return error(workbench_error_code_t::invalid_document);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const document_descriptor_t* selected = nullptr;
+    for (const auto& candidate : documents_) {
+        if (candidate.identity.kind != target_kind || !candidate.can_open)
+            continue;
+        const bool same_source =
+            candidate.identity.object_id == source.object_id &&
+            candidate.identity.variant_id == source.variant_id &&
+            candidate.identity.provider_key == source.provider_key;
+        if (same_source) {
+            selected = &candidate;
+            break;
+        }
+    }
+    if (!selected) {
+        for (const auto& candidate : documents_) {
+            if (candidate.identity.kind != target_kind || !candidate.can_open)
+                continue;
+            if (selected != nullptr)
+                return error(workbench_error_code_t::adapter_rejected,
+                             static_cast<std::uint64_t>(target_kind));
+            selected = &candidate;
+        }
+    }
+    if (!selected)
+        return error(workbench_error_code_t::invalid_document,
+                     static_cast<std::uint64_t>(target_kind));
+
+    output.document = selected->identity;
+    output.document.has_address = true;
+    output.document.address = address;
+    output.selection.kind = selection_kind_t::address;
+    output.selection.has_address = true;
+    output.selection.address = address;
+    output.cursor.has_position = true;
+    output.cursor.position = address;
+    output.requires_document_open = true;
+    return {};
+}
+
+workbench_error_t workbench_document_bridge_t::emit(
+    const document_navigation_bridge_request_t& request,
+    navigation_event_t& output) const
+{
+    output = {};
+    const auto source_error = validate_view_context(request.source);
+    if (!source_error)
+        return source_error;
+    if (request.source.workspace != workspace_)
+        return error(workbench_error_code_t::workspace_mismatch,
+                     request.source.workspace.value);
+
+    document_descriptor_t descriptor;
+    const auto describe_error = describe(request.target.document, descriptor);
+    if (!describe_error)
+        return describe_error;
+    if (!descriptor.can_open)
+        return error(workbench_error_code_t::adapter_rejected,
+                     request.target.document.object_id);
+
+    output.id = request.id;
+    output.workspace = workspace_;
+    output.has_source = true;
+    output.source = request.source;
+    output.target = request.target;
+    output.origin = request.origin;
+    output.sequence = request.sequence;
+    output.request_focus = request.request_focus;
+    const auto event_error = validate_navigation_event(output);
+    if (!event_error)
+        output = {};
+    return event_error;
+}
+
+std::vector<document_descriptor_t>
+workbench_document_bridge_t::documents() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return documents_;
+}
+
 }
 }

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -143,9 +144,7 @@ public:
         const cancellation_token_t& cancel = {});
 
     overlay_snapshot_t snapshot() const;
-    const overlay_target_identity_v9_t& fixed_target() const noexcept {
-        return fixed_target_;
-    }
+    overlay_target_identity_v9_t fixed_target() const;
     std::optional<overlay_operation_t> find(const std::string& entity_key) const;
     std::vector<overlay_operation_t> patch_operations() const;
 
@@ -170,7 +169,8 @@ private:
     std::weak_ptr<analysis_workspace_t> workspace_;
     std::shared_ptr<workspace_database_t> database_;
     overlay_limits_t limits_;
-    const overlay_target_identity_v9_t fixed_target_;
+    overlay_target_identity_v9_t fixed_target_;
+    mutable std::mutex publication_mutex_;
     mutable std::shared_mutex state_mutex_;
     std::unordered_map<std::string, overlay_operation_t> items_;
     std::uint64_t revision_ = 0;

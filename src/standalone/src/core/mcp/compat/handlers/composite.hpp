@@ -16,6 +16,8 @@
 
 namespace aida::standalone::mcp::compat::handlers {
 
+inline constexpr std::size_t k_composite_tool_count = 4;
+
 enum class composite_step_kind_t : std::uint8_t {
     function_snapshot = 0,
     decompile_function,

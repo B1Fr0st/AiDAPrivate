@@ -84,6 +84,14 @@ public:
         xrefs_[to].push_back({from, code});
     }
 
+    void set_match_error(std::string error) {
+        match_error_ = std::move(error);
+    }
+
+    void set_match_exhausted(bool exhausted) noexcept {
+        match_exhausted_ = exhausted;
+    }
+
     std::optional<std::uint64_t> resolve_address(std::string_view query) const override {
         if (query.size() >= 2 && query[0] == '0' && (query[1] == 'x' || query[1] == 'X')) {
             try {
@@ -168,6 +176,13 @@ public:
             }
         }
 
+        if (!match_error_.empty()) {
+            result.error = match_error_;
+        }
+        if (match_exhausted_) {
+            result.exhausted = true;
+        }
+
         return result;
     }
 
@@ -178,6 +193,8 @@ private:
     std::unordered_map<std::string, signature_function_t> functions_;
     std::unordered_map<std::string, std::uint64_t> symbols_;
     std::unordered_map<std::uint64_t, std::vector<signature_xref_t>> xrefs_;
+    std::string match_error_;
+    bool match_exhausted_ = false;
 };
 
 fixture_source_t make_x86_source() {
@@ -443,6 +460,34 @@ fixture_source_t make_non_unique_source() {
     return src;
 }
 
+fixture_source_t make_instruction_bound_source() {
+    fixture_source_t src;
+    src.set_memory({0x10, 0x20, 0x30, 0x40, 0x50, 0x90}, 0x6000);
+    src.add_instruction(
+        0x6000,
+        {0x10, 0x20, 0x30, 0x40, 0x50},
+        {0xFF, 0xFF, 0xFF, 0xFF, 0xFF});
+    src.add_instruction(0x6005, {}, {});
+    src.add_symbol("oversized_instruction", 0x6000);
+    src.add_symbol("empty_instruction", 0x6005);
+    return src;
+}
+
+fixture_source_t make_xref_policy_source() {
+    fixture_source_t src;
+    src.set_memory({0xA1, 0xB2, 0xC3, 0xD4}, 0x7000);
+    src.add_instruction(0x7000, {0xA1}, {0xFF});
+    src.add_instruction(0x7001, {0xB2}, {0xFF});
+    src.add_instruction(0x7002, {0xC3}, {0xFF});
+    src.add_instruction(0x7003, {0xD4}, {0xFF});
+    src.add_symbol("xref_policy_target", 0x8000);
+    src.add_xref(0x8000, 0x7002, true);
+    src.add_xref(0x8000, 0x7003, false);
+    src.add_xref(0x8000, 0x7000, true);
+    src.add_xref(0x8000, 0x7001, true);
+    return src;
+}
+
 void verify_contracts(protocol::schema_runtime_t& schemas) {
     constexpr std::array<std::string_view, 4> names{{
         "make_signature",
@@ -633,10 +678,8 @@ void verify_architecture_fixtures(protocol::schema_runtime_t& schemas, std::size
         require_fixture(r["addr"] == "0x401000", "make_sig_func", "x86_func", "addr should be function start");
         require_fixture(r["name"] == "_main", "make_sig_func", "x86_func", "name should be function name");
         require_fixture(!r["signature"].is_null(), "make_sig_func", "x86_func", "signature should not be null");
-        require_fixture(r.contains("unique"), "make_sig_func", "x86_func",
-                        "unique field must be present in make_signature_for_function output");
-        require_fixture(r.value("unique", false) == true, "make_sig_func", "x86_func",
-                        "x86 function signature should be unique");
+        require_fixture(!r.contains("unique"), "make_sig_func", "x86_func",
+                        "function result must omit the schema-incompatible unique field");
         ++completed;
     }
 
@@ -650,10 +693,8 @@ void verify_architecture_fixtures(protocol::schema_runtime_t& schemas, std::size
         require_fixture(r["addr"] == "0x140001000", "make_sig_func", "x64_func", "addr should be function start");
         require_fixture(r["name"] == "main", "make_sig_func", "x64_func", "name should be function name");
         require_fixture(!r["signature"].is_null(), "make_sig_func", "x64_func", "signature should not be null");
-        require_fixture(r.contains("unique"), "make_sig_func", "x64_func",
-                        "unique field must be present in make_signature_for_function output");
-        require_fixture(r.value("unique", false) == true, "make_sig_func", "x64_func",
-                        "x64 function signature should be unique");
+        require_fixture(!r.contains("unique"), "make_sig_func", "x64_func",
+                        "function result must omit the schema-incompatible unique field");
         ++completed;
     }
 }
@@ -697,13 +738,17 @@ void verify_relocation_fixtures(protocol::schema_runtime_t& schemas, std::size_t
         json args{{"start", "0x10019"}, {"end", "0x10020"}, {"wildcard_operands", true}, {"format", "mask"}};
         auto result = adapters::make_signature_for_range(ctx, args, cancellation_token_t::create());
         require_fixture(!result.is_error(), "make_sig_range", "reloc_range_mask", result.text());
-        const auto& sig = result.structured_content()["signature"];
+        const auto& range = result.structured_content();
+        const auto& sig = range["signature"];
         require_fixture(sig.is_string(), "make_sig_range", "reloc_range_mask", "signature should be string");
         const auto sig_str = sig.get<std::string>();
         require_fixture(sig_str.find('?') != std::string::npos, "make_sig_range", "reloc_range_mask",
                         "rip-relative MOV range with wildcard should contain ? in mask format");
         require_fixture(sig_str.find('x') != std::string::npos, "make_sig_range", "reloc_range_mask",
                         "range should contain stable x bytes in mask format");
+        require_fixture(range.contains("unique") && range["unique"] == true,
+                        "make_sig_range", "reloc_range_mask",
+                        "range result must retain its schema-compatible unique field");
         ++completed;
     }
 
@@ -722,11 +767,13 @@ void verify_relocation_fixtures(protocol::schema_runtime_t& schemas, std::size_t
                         "reloc_target should have at least 3 xrefs");
         bool found_wildcarded = false;
         for (const auto& sig_entry : r["signatures"]) {
+            require_fixture(sig_entry.value("unique", false) == true,
+                            "find_xref", "reloc_xref",
+                            "xref results must contain only unique signatures");
             if (sig_entry["signature"].is_string()) {
                 const auto s = sig_entry["signature"].get<std::string>();
                 if (s.find("??") != std::string::npos) {
                     found_wildcarded = true;
-                    break;
                 }
             }
         }
@@ -789,10 +836,8 @@ void verify_non_unique_fixtures(protocol::schema_runtime_t& schemas, std::size_t
                         "shared_target should have exactly 3 xrefs");
         require_fixture(r["signatures"].is_array(), "find_xref", "non_unique_xref",
                         "signatures should be array");
-        for (const auto& sig_entry : r["signatures"]) {
-            require_fixture(sig_entry.value("unique", true) == false, "find_xref", "non_unique_xref",
-                            "all xref signatures from duplicate prologues should be non-unique");
-        }
+        require_fixture(r["signatures"].empty(), "find_xref", "non_unique_xref",
+                        "non-unique xref signatures must be omitted");
         ++completed;
     }
 }
@@ -901,6 +946,184 @@ void verify_bounds_fixtures(protocol::schema_runtime_t& schemas, std::size_t& co
     }
 }
 
+void verify_failure_and_xref_policy_fixtures(
+    protocol::schema_runtime_t& schemas,
+    std::size_t& completed) {
+    {
+        auto src = make_xref_policy_source();
+        src.set_match_error("injected_match_failure");
+        auto ctx = make_context(src, schemas);
+        json args{{"addrs", "0x7000"}, {"max_length", 1}};
+        auto result = adapters::make_signature(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "make_signature", "match_error",
+                        result.text());
+        const auto& r = result.structured_content()["result"][0];
+        require_fixture(r["signature"].is_string(), "make_signature", "match_error",
+                        "matcher errors must not discard generated bytes");
+        require_fixture(r.value("unique", true) == false,
+                        "make_signature", "match_error",
+                        "matcher errors must prevent uniqueness claims");
+        ++completed;
+    }
+
+    {
+        auto src = make_xref_policy_source();
+        src.set_match_exhausted(true);
+        auto ctx = make_context(src, schemas);
+        json args{{"addrs", "0x7000"}, {"max_length", 1}};
+        auto result = adapters::make_signature(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "make_signature", "match_exhausted",
+                        result.text());
+        const auto& r = result.structured_content()["result"][0];
+        require_fixture(r.value("unique", true) == false,
+                        "make_signature", "match_exhausted",
+                        "an exhausted matcher must prevent uniqueness claims");
+        ++completed;
+    }
+
+    {
+        auto src = make_xref_policy_source();
+        src.set_match_error("injected_range_match_failure");
+        auto ctx = make_context(src, schemas);
+        json args{{"start", "0x7000"}, {"end", "0x7001"}};
+        auto result = adapters::make_signature_for_range(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "make_sig_range", "match_error",
+                        result.text());
+        const auto& r = result.structured_content();
+        require_fixture(r["signature"].is_string(), "make_sig_range", "match_error",
+                        "range matcher errors must not discard generated bytes");
+        require_fixture(r.value("unique", true) == false,
+                        "make_sig_range", "match_error",
+                        "range matcher errors must prevent uniqueness claims");
+        ++completed;
+    }
+
+    {
+        auto src = make_xref_policy_source();
+        src.set_match_exhausted(true);
+        auto ctx = make_context(src, schemas);
+        json args{{"start", "0x7000"}, {"end", "0x7001"}};
+        auto result = adapters::make_signature_for_range(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "make_sig_range", "match_exhausted",
+                        result.text());
+        const auto& r = result.structured_content();
+        require_fixture(r.value("unique", true) == false,
+                        "make_sig_range", "match_exhausted",
+                        "an exhausted range matcher must prevent uniqueness claims");
+        ++completed;
+    }
+
+    {
+        auto src = make_instruction_bound_source();
+        auto ctx = make_context(src, schemas);
+        ctx.limits.maximum_instruction_bytes = 4;
+        json args{{"addrs", "oversized_instruction"}};
+        auto result = adapters::make_signature(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "make_signature", "instruction_size",
+                        result.text());
+        const auto& r = result.structured_content()["result"][0];
+        require_fixture(r["signature"].is_null(),
+                        "make_signature", "instruction_size",
+                        "oversized instructions must not produce signatures");
+        require_fixture(r.value("error", std::string()) ==
+                            "instruction_size_out_of_bounds",
+                        "make_signature", "instruction_size",
+                        "oversized instructions must return the bounded error");
+        ++completed;
+    }
+
+    {
+        auto src = make_instruction_bound_source();
+        auto ctx = make_context(src, schemas);
+        ctx.limits.maximum_instruction_bytes = 4;
+        json args{{"start", "0x6000"}, {"end", "0x6005"}};
+        auto result = adapters::make_signature_for_range(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "make_sig_range", "instruction_size",
+                        result.text());
+        const auto& r = result.structured_content();
+        require_fixture(r["signature"].is_null(),
+                        "make_sig_range", "instruction_size",
+                        "wildcarded ranges must reject oversized instructions");
+        require_fixture(r.value("error", std::string()) ==
+                            "instruction_size_out_of_bounds",
+                        "make_sig_range", "instruction_size",
+                        "wildcarded range must return the bounded instruction error");
+        ++completed;
+    }
+
+    {
+        auto src = make_instruction_bound_source();
+        auto ctx = make_context(src, schemas);
+        json args{{"start", "empty_instruction"}, {"end", "0x6006"}};
+        auto result = adapters::make_signature_for_range(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "make_sig_range", "empty_instruction",
+                        result.text());
+        const auto& r = result.structured_content();
+        require_fixture(r["signature"].is_null(),
+                        "make_sig_range", "empty_instruction",
+                        "empty decoded instructions must not stall range processing");
+        require_fixture(r.value("error", std::string()) ==
+                            "instruction_size_out_of_bounds",
+                        "make_sig_range", "empty_instruction",
+                        "empty decoded instructions must return the bounded error");
+        ++completed;
+    }
+
+    {
+        auto src = make_xref_policy_source();
+        auto ctx = make_context(src, schemas);
+        json args{{"addrs", "xref_policy_target"}};
+        auto result = adapters::find_xref_signatures(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "find_xref", "code_only",
+                        result.text());
+        const auto& r = result.structured_content()["result"][0];
+        require_fixture(r.value("total_xrefs", 0) == 3,
+                        "find_xref", "code_only",
+                        "total_xrefs must count only code references");
+        require_fixture(r["signatures"].size() == 3,
+                        "find_xref", "code_only",
+                        "only the three code xrefs should produce signatures");
+        for (const auto& signature : r["signatures"]) {
+            require_fixture(signature["addr"] != "0x7003",
+                            "find_xref", "code_only",
+                            "non-code xrefs must never produce signatures");
+        }
+        ++completed;
+    }
+
+    {
+        auto src = make_xref_policy_source();
+        auto ctx = make_context(src, schemas);
+        ctx.limits.maximum_xrefs_per_query = 2;
+        json args{{"addrs", "xref_policy_target"}};
+        auto result = adapters::find_xref_signatures(
+            ctx, args, cancellation_token_t::create());
+        require_fixture(!result.is_error(), "find_xref", "sorted_cap",
+                        result.text());
+        const auto& r = result.structured_content()["result"][0];
+        const auto& signatures = r["signatures"];
+        require_fixture(r.value("total_xrefs", 0) == 3,
+                        "find_xref", "sorted_cap",
+                        "the deterministic cap must preserve the full code-xref count");
+        require_fixture(signatures.size() == 2,
+                        "find_xref", "sorted_cap",
+                        "the xref cap must retain exactly two signatures");
+        require_fixture(signatures[0]["addr"] == "0x7000" &&
+                            signatures[1]["addr"] == "0x7001",
+                        "find_xref", "sorted_cap",
+                        "xrefs must be address-sorted before applying the cap");
+        ++completed;
+    }
+}
+
 void verify_deterministic_formatting_fixtures(protocol::schema_runtime_t& schemas,
                                               std::size_t& completed) {
     {
@@ -998,10 +1221,11 @@ bool run_signature_handlers_harness(std::string& failure) {
         verify_relocation_fixtures(schemas, completed);
         verify_non_unique_fixtures(schemas, completed);
         verify_bounds_fixtures(schemas, completed);
+        verify_failure_and_xref_policy_fixtures(schemas, completed);
         verify_deterministic_formatting_fixtures(schemas, completed);
 
-        require(completed == 29,
-                "signature handler harness did not execute all twenty-nine fixture families");
+        require(completed == 38,
+                "signature handler harness did not execute all thirty-eight fixture families");
     } catch (const std::exception& error) {
         failure.assign(error.what());
         return false;

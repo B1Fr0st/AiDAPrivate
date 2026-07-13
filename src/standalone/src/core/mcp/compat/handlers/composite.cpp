@@ -29,7 +29,7 @@ using protocol::tool_contract_t;
 using protocol::tool_effect_t;
 
 constexpr std::uint64_t k_internal_schema_version = 1;
-constexpr std::array<std::string_view, 4> k_composite_names = {
+constexpr std::array<std::string_view, k_composite_tool_count> k_composite_names = {
     "analyze_component",
     "analyze_function",
     "diff_before_after",
@@ -38,24 +38,6 @@ constexpr std::array<std::string_view, 4> k_composite_names = {
 
 bool is_composite_name(std::string_view name) noexcept {
     return std::binary_search(k_composite_names.begin(), k_composite_names.end(), name);
-}
-
-std::string_view step_name(composite_step_kind_t kind) noexcept {
-    switch (kind) {
-    case composite_step_kind_t::function_snapshot:
-        return "function_snapshot";
-    case composite_step_kind_t::decompile_function:
-        return "decompile_function";
-    case composite_step_kind_t::disassemble_function:
-        return "disassemble_function";
-    case composite_step_kind_t::xref_neighbors:
-        return "xref_neighbors";
-    case composite_step_kind_t::address_snapshot:
-        return "address_snapshot";
-    case composite_step_kind_t::apply_overlay_action:
-        return "apply_overlay_action";
-    }
-    return "unknown";
 }
 
 tool_effect_t protocol_effect(contract_effect_t effect) noexcept {
@@ -1812,18 +1794,23 @@ protocol::mcp_result_t composite_handlers_t::invoke(
             json{{"tool", std::string(tool_name)}});
     }
     const bool mutation = tool_name == "diff_before_after";
-    const bool descriptor_valid = mutation
+    const std::string expected_adapter =
+        "aida::standalone::mcp::compat::adapters::" + std::string(tool_name);
+    const bool descriptor_identity_valid = descriptor->name == tool_name &&
+        descriptor->adapter_symbol == expected_adapter && descriptor->archive_backed;
+    const bool descriptor_effect_valid = mutation
         ? descriptor->effect == contract_effect_t::workspace_overlay_mutation &&
             descriptor->lock == contract_lock_t::workspace_overlay_transaction &&
             !descriptor->read_only && descriptor->unsafe
         : descriptor->effect == contract_effect_t::workspace_read &&
             descriptor->lock == contract_lock_t::workspace_shared && descriptor->read_only &&
             !descriptor->unsafe;
-    if (!descriptor_valid || !descriptor->target_dependent || !descriptor->accepts_pid ||
+    if (!descriptor_identity_valid || !descriptor_effect_valid ||
+        !descriptor->target_dependent || !descriptor->accepts_pid ||
         !descriptor->accepts_bin_name) {
         return mcp_result_t::failure(
             result_error_code_t::invalid_contract,
-            "Generated composite effect or routing policy is invalid.",
+            "Generated composite identity, effect, or routing policy is invalid.",
             json{{"tool", std::string(tool_name)}});
     }
     const auto contract = protocol_contract_for(*descriptor);
@@ -1832,6 +1819,13 @@ protocol::mcp_result_t composite_handlers_t::invoke(
             result_error_code_t::invalid_contract,
             "Generated composite schemas could not be decoded.",
             json{{"tool", std::string(tool_name)}});
+    }
+    const auto contract_validation = protocol::validate_tool_contract(*contract, schemas);
+    if (!contract_validation.valid) {
+        return mcp_result_t::failure(
+            contract_validation.error_code,
+            "Generated composite contract validation failed.",
+            contract_validation.diagnostics());
     }
     if (!valid_limits(impl_->limits) || !impl_->backend) {
         return mcp_result_t::failure(

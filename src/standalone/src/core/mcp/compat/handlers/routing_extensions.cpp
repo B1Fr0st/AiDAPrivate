@@ -1,16 +1,17 @@
 #include "routing_extensions.hpp"
 
 #include "../ida_contracts_generated.hpp"
+#include "../../calculator_tool.hpp"
+#include "../../ida_compat_schemas.hpp"
+
+#include <Windows.h>
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
-#include <cmath>
-#include <cstring>
-#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -112,9 +113,9 @@ routing_metadata_t metadata_for_extension(std::string_view name) {
         meta.target_requirement = protocol::target_requirement_t::optional;
         meta.accepts_pid = true;
         meta.accepts_bin_name = true;
-        meta.effect = protocol::tool_effect_t::workspace_read;
-        meta.lock = protocol::effect_lock_t::workspace_shared;
-        meta.read_only = true;
+        meta.effect = protocol::tool_effect_t::workspace_overlay_mutation;
+        meta.lock = protocol::effect_lock_t::workspace_overlay_transaction;
+        meta.read_only = false;
         meta.lane = extension_lane_t::workspace_analysis;
     } else if (name == "find_insns") {
         meta.target_requirement = protocol::target_requirement_t::optional;
@@ -133,11 +134,7 @@ routing_metadata_t metadata_for_extension(std::string_view name) {
         meta.read_only = true;
         meta.lane = extension_lane_t::local_calculator;
     } else {
-        meta.target_requirement = protocol::target_requirement_t::independent;
-        meta.effect = protocol::tool_effect_t::registry_read;
-        meta.lock = protocol::effect_lock_t::registry_read;
-        meta.read_only = true;
-        meta.lane = extension_lane_t::registry_read;
+        throw std::runtime_error("routing metadata extension name is not retained");
     }
     return meta;
 }
@@ -146,13 +143,6 @@ bool valid_limits(const routing_extension_limits_t& limits) noexcept {
     return limits.max_request_bytes != 0 && limits.max_request_bytes <= 1024U * 1024U &&
         limits.max_response_bytes != 0 && limits.max_response_bytes <= 16U * 1024U * 1024U &&
         limits.max_selector_bytes != 0 && limits.max_selector_bytes <= 1024U &&
-        limits.max_expression_bytes != 0 && limits.max_expression_bytes <= 16384U &&
-        limits.max_function_addresses != 0 && limits.max_function_addresses <= 256U &&
-        limits.max_instruction_results != 0 && limits.max_instruction_results <= 5000U &&
-        limits.max_address_bytes != 0 && limits.max_address_bytes <= 4096U &&
-        limits.max_mnemonic_bytes != 0 && limits.max_mnemonic_bytes <= 64U &&
-        limits.max_operand_pattern_bytes != 0 && limits.max_operand_pattern_bytes <= 256U &&
-        limits.max_offset != 0 && limits.max_offset <= 10000000ULL &&
         limits.max_execution_time.count() > 0 && limits.max_execution_time.count() <= 120000;
 }
 
@@ -221,25 +211,6 @@ validation_failure_t bounded_member_text(const json& object, std::string_view fi
     return bounded_text(*found, path, maximum, allow_empty);
 }
 
-validation_failure_t bounded_integer(const json& object, std::string_view field,
-                                     std::uint64_t maximum, std::string path_prefix = {}) {
-    const auto found = object.find(std::string(field));
-    if (found == object.end()) {
-        return std::nullopt;
-    }
-    const std::string path = path_prefix.empty()
-        ? std::string(field)
-        : path_prefix + "." + std::string(field);
-    const auto value = unsigned_integer(*found);
-    if (!value) {
-        return invalid_value(path, "nonnegative_integer_required", *found);
-    }
-    if (*value > maximum) {
-        return exceeded_value(path, maximum, *value);
-    }
-    return std::nullopt;
-}
-
 validation_failure_t validate_routing_bounds(const json& arguments,
                                             const routing_extension_limits_t& limits) {
     if (const auto pid = arguments.find("pid"); pid != arguments.end()) {
@@ -266,120 +237,21 @@ validation_failure_t validate_list_instances(const json& arguments,
     return std::nullopt;
 }
 
-validation_failure_t validate_analyze_funcs(const json& arguments,
-                                           const routing_extension_limits_t& limits) {
-    if (auto failure = validate_routing_bounds(arguments, limits)) {
-        return failure;
-    }
-    const auto addrs = arguments.find("addrs");
-    if (addrs == arguments.end()) {
-        return invalid_value("addrs", "field_required", json(nullptr));
-    }
-    if (!addrs->is_array()) {
-        return invalid_value("addrs", "array_required", *addrs);
-    }
-    if (addrs->size() > limits.max_function_addresses) {
-        return exceeded_value(
-            "addrs", static_cast<std::uint64_t>(limits.max_function_addresses),
-            static_cast<std::uint64_t>(addrs->size()));
-    }
-    for (std::size_t index = 0; index < addrs->size(); ++index) {
-        if (auto failure = bounded_text(
-                (*addrs)[index], "addrs[" + std::to_string(index) + "]",
-                limits.max_address_bytes, false)) {
-            return failure;
-        }
-    }
-    if (auto failure = bounded_integer(arguments, "max_depth", 64ULL)) {
-        return failure;
-    }
-    return std::nullopt;
-}
-
-validation_failure_t validate_find_insns(const json& arguments,
-                                        const routing_extension_limits_t& limits) {
-    if (auto failure = validate_routing_bounds(arguments, limits)) {
-        return failure;
-    }
-    if (auto failure = bounded_member_text(
-            arguments, "mnem", {}, limits.max_mnemonic_bytes, false)) {
-        return failure;
-    }
-    if (auto failure = bounded_member_text(
-            arguments, "operand", {}, limits.max_operand_pattern_bytes, true)) {
-        return failure;
-    }
-    if (auto failure = bounded_integer(
-            arguments, "limit", limits.max_instruction_results)) {
-        return failure;
-    }
-    if (auto failure = bounded_integer(arguments, "offset", limits.max_offset)) {
-        return failure;
-    }
-    return std::nullopt;
-}
-
-validation_failure_t validate_calculator(const json& arguments,
-                                        const routing_extension_limits_t& limits) {
-    if (auto failure = bounded_member_text(
-            arguments, "expression", {}, limits.max_expression_bytes, false)) {
-        return failure;
-    }
-    return std::nullopt;
-}
-
 validation_failure_t validate_tool_bounds(std::string_view name, const json& arguments,
                                          const routing_extension_limits_t& limits) {
     if (name == "list_instances") {
         return validate_list_instances(arguments, limits);
     }
-    if (name == "analyze_funcs") {
-        return validate_analyze_funcs(arguments, limits);
-    }
-    if (name == "find_insns") {
-        return validate_find_insns(arguments, limits);
+    if (name == "analyze_funcs" || name == "find_insns") {
+        return validate_routing_bounds(arguments, limits);
     }
     if (name == "calculator" || name == "calculate") {
-        return validate_calculator(arguments, limits);
+        return std::nullopt;
     }
     return invalid_value("tool", "routing_extension_not_registered", std::string(name));
 }
 
-std::chrono::milliseconds execution_timeout(const protocol::tool_contract_t& contract,
-                                            std::chrono::milliseconds maximum) noexcept {
-    const auto decorators = contract.annotations.find("decorators");
-    if (decorators == contract.annotations.end() || !decorators->is_array()) {
-        return maximum;
-    }
-    for (const auto& decorator : *decorators) {
-        if (!decorator.is_object()) {
-            continue;
-        }
-        const auto name = decorator.find("name");
-        if (name == decorator.end() || !name->is_string() ||
-            name->get_ref<const std::string&>() != "tool_timeout") {
-            continue;
-        }
-        const auto arguments = decorator.find("args");
-        if (arguments == decorator.end() || !arguments->is_array() || arguments->empty() ||
-            !(*arguments)[0].is_number()) {
-            continue;
-        }
-        try {
-            const double seconds = (*arguments)[0].get<double>();
-            if (!std::isfinite(seconds) || seconds <= 0.0) {
-                continue;
-            }
-            const auto generated = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::duration<double>(seconds));
-            if (generated.count() > 0) {
-                return (std::min)(generated, maximum);
-            }
-        } catch (const std::exception&) {
-        }
-    }
-    return maximum;
-}
+
 
 result_error_code_t adapter_error_code(adapter_error_code_t code) noexcept {
     switch (code) {
@@ -415,6 +287,115 @@ mcp_result_t adapter_failure(const adapter_error_t& error) {
         });
 }
 
+const contract_descriptor_t& extension_adapter_descriptor(std::string_view name) {
+    static constexpr std::array<contract_descriptor_t, 2> descriptors{{
+        {
+            "analyze_funcs", "", "", "", "",
+            "aida::standalone::mcp::compat::adapters::analyze_funcs",
+            "retained-aida-extension", 0,
+            contract_effect_t::workspace_overlay_mutation,
+            contract_lock_t::workspace_overlay_transaction,
+            false, true, true, true, false, false,
+        },
+        {
+            "find_insns", "", "", "", "",
+            "aida::standalone::mcp::compat::adapters::find_insns",
+            "retained-aida-extension", 0,
+            contract_effect_t::workspace_read,
+            contract_lock_t::workspace_shared,
+            false, true, true, true, true, false,
+        },
+    }};
+    const auto found = std::find_if(
+        descriptors.begin(), descriptors.end(),
+        [name](const contract_descriptor_t& descriptor) { return descriptor.name == name; });
+    if (found == descriptors.end()) {
+        throw std::runtime_error("retained workspace extension descriptor is unavailable");
+    }
+    return *found;
+}
+
+mcp_result_t target_failure(const target_resolution_error_t& error) {
+    return mcp_result_t::failure(
+        result_error_code_t::target_policy_rejected,
+        "Routing extension target resolution failed.",
+        json{
+            {"phase", "extension_target_resolution"},
+            {"target_code", std::string(error.stable_code)},
+            {"expected", error.expected},
+            {"actual", error.actual},
+        });
+}
+
+mcp_result_t effect_failure(const effect_policy_error_t& error) {
+    return mcp_result_t::failure(
+        result_error_code_t::effect_policy_rejected,
+        "Routing extension effect policy rejected the request.",
+        json{
+            {"phase", "extension_effect_lock"},
+            {"effect_code", std::string(error.stable_code)},
+        });
+}
+
+result_error_code_t retained_calculator_error_code(std::string_view code) noexcept {
+    if (code == "CANCELLED" || code == "DEADLINE_EXCEEDED") {
+        return result_error_code_t::cancelled;
+    }
+    if (code == "ARITY_ERROR" || code == "DOMAIN_ERROR" ||
+        code == "INVALID_ARGUMENT" || code == "LIMIT_EXCEEDED" ||
+        code == "MAPPING_NOT_FOUND" || code == "MAPPING_REQUIRED" ||
+        code == "PARSE_ERROR" || code == "RANGE_ERROR" ||
+        code == "TYPE_ERROR" || code == "UNKNOWN_FUNCTION" ||
+        code == "UNKNOWN_IDENTIFIER") {
+        return result_error_code_t::invalid_input;
+    }
+    return result_error_code_t::handler_failed;
+}
+
+std::uint64_t retained_calculator_deadline(std::chrono::milliseconds maximum) noexcept {
+    const std::uint64_t now = static_cast<std::uint64_t>(::GetTickCount64());
+    const auto timeout_count = maximum.count();
+    const auto bounded = static_cast<std::uint64_t>(timeout_count > 0 ? timeout_count : 1);
+    const std::uint64_t local = now > (std::numeric_limits<std::uint64_t>::max)() - bounded
+        ? (std::numeric_limits<std::uint64_t>::max)()
+        : now + bounded;
+    const std::uint64_t active = mcp_standalone::current_call_deadline_ms();
+    return active == 0 ? local : (std::min)(active, local);
+}
+
+mcp_result_t invoke_retained_calculator(
+    std::string_view name,
+    const json& arguments,
+    const protocol::cancellation_token_t& cancellation,
+    std::chrono::milliseconds maximum_execution_time) {
+    auto cancellation_state = cancellation.state();
+    mcp_standalone::workspace_request_context_t context;
+    context.cancellation = cancellation_state.get();
+    context.deadline_ms = retained_calculator_deadline(maximum_execution_time);
+    context.tool_name.assign(name.data(), name.size());
+    auto result = mcp_standalone::ida_compat::tool_calculate(arguments, context);
+    if (!result.success) {
+        return mcp_result_t::failure(
+            retained_calculator_error_code(result.error_code),
+            result.text.empty() ? "Retained calculator rejected the request." : result.text,
+            json{
+                {"phase", "retained_calculator"},
+                {"retained_error_code", result.error_code},
+                {"retained_error_details", result.error_details},
+            });
+    }
+    if (!result.data.is_object()) {
+        return mcp_result_t::failure(
+            result_error_code_t::invalid_output,
+            "Retained calculator returned non-object structured output.",
+            json{{"phase", "retained_calculator_output"}});
+    }
+    std::string payload = result.text.empty() ? result.data.dump() : std::move(result.text);
+    return mcp_result_t::success(
+        std::move(payload), std::move(result.data),
+        json{{"retained_handler", "mcp_standalone::ida_compat::tool_calculate"}});
+}
+
 json list_instances_input_schema() {
     return json{
         {"type", "object"},
@@ -438,73 +419,39 @@ json list_instances_output_schema() {
 }
 
 json analyze_funcs_input_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", json{
-            {"addrs", json{{"type", "array"}, {"items", json{{"type", "string"}}}}},
-            {"pid", json{{"type", "integer"}}},
-            {"bin_name", json{{"type", "string"}}},
-            {"max_depth", json{{"type", "integer"}}},
-        }},
-        {"required", json::array({"addrs"})},
-    };
+    const auto* schema = mcp_standalone::ida_compat::find_schema("analyze_funcs");
+    if (schema == nullptr) {
+        throw std::runtime_error("retained analyze_funcs schema is unavailable");
+    }
+    return *schema;
 }
 
 json analyze_funcs_output_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", json{
-            {"results", json{{"type", "array"}}},
-        }},
-        {"required", json::array({"results"})},
-    };
+    return json{{"type", "object"}};
 }
 
 json find_insns_input_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", json{
-            {"mnem", json{{"type", "string"}}},
-            {"operand", json{{"type", "string"}}},
-            {"pid", json{{"type", "integer"}}},
-            {"bin_name", json{{"type", "string"}}},
-            {"limit", json{{"type", "integer"}}},
-            {"offset", json{{"type", "integer"}}},
-        }},
-        {"required", json::array({"mnem"})},
-    };
+    const auto* schema = mcp_standalone::ida_compat::find_schema("find_insns");
+    if (schema == nullptr) {
+        throw std::runtime_error("retained find_insns schema is unavailable");
+    }
+    return *schema;
 }
 
 json find_insns_output_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", json{
-            {"matches", json{{"type", "array"}}},
-        }},
-        {"required", json::array({"matches"})},
-    };
+    return json{{"type", "object"}};
 }
 
 json calculator_input_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", json{
-            {"expression", json{{"type", "string"}}},
-        }},
-        {"required", json::array({"expression"})},
-    };
+    const auto* schema = mcp_standalone::ida_compat::find_schema("calculate");
+    if (schema == nullptr) {
+        throw std::runtime_error("retained calculator schema is unavailable");
+    }
+    return *schema;
 }
 
 json calculator_output_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", json{
-            {"result", json{{"type", "string"}}},
-            {"decimal", json{{"type", "string"}}},
-            {"hex", json{{"type", "string"}}},
-        }},
-        {"required", json::array({"result"})},
-    };
+    return json{{"type", "object"}};
 }
 
 struct extension_contract_spec_t {
@@ -528,22 +475,23 @@ const extension_contract_spec_t& extension_spec(std::string_view name) {
          protocol::target_requirement_t::independent, false, false,
          protocol::tool_effect_t::registry_read, protocol::effect_lock_t::registry_read, true},
         {k_extension_tool_analyze_funcs,
-         "Analyze one or more functions by address with optional depth control.",
+         "Analyze one or more functions through the retained reversible workspace mutation.",
          analyze_funcs_input_schema, analyze_funcs_output_schema,
          protocol::target_requirement_t::optional, true, true,
-         protocol::tool_effect_t::workspace_read, protocol::effect_lock_t::workspace_shared, true},
+         protocol::tool_effect_t::workspace_overlay_mutation,
+         protocol::effect_lock_t::workspace_overlay_transaction, false},
         {k_extension_tool_find_insns,
-         "Find instructions matching a mnemonic and optional operand pattern.",
+         "Find instructions through the retained bounded workspace formatter.",
          find_insns_input_schema, find_insns_output_schema,
          protocol::target_requirement_t::optional, true, true,
          protocol::tool_effect_t::workspace_read, protocol::effect_lock_t::workspace_shared, true},
         {k_extension_tool_calculator,
-         "Evaluate an arithmetic expression and return the result in multiple bases.",
+         "ida-pro-mcp compatible calculator.",
          calculator_input_schema, calculator_output_schema,
          protocol::target_requirement_t::independent, false, false,
          protocol::tool_effect_t::unspecified, protocol::effect_lock_t::unspecified, true},
         {k_extension_tool_calculate,
-         "Evaluate an arithmetic expression and return the result in multiple bases.",
+         "Safe target-independent integer, bytes, hash, floating-point, and address mapping calculator",
          calculator_input_schema, calculator_output_schema,
          protocol::target_requirement_t::independent, false, false,
          protocol::tool_effect_t::unspecified, protocol::effect_lock_t::unspecified, true},
@@ -574,275 +522,7 @@ protocol::tool_contract_t make_extension_contract(std::string_view name) {
     return contract;
 }
 
-namespace calc {
 
-enum class token_kind_t : std::uint8_t {
-    number,
-    plus,
-    minus,
-    star,
-    slash,
-    percent,
-    amp,
-    pipe,
-    caret,
-    tilde,
-    shl,
-    shr,
-    lparen,
-    rparen,
-    end_of_input,
-};
-
-struct token_t {
-    token_kind_t kind = token_kind_t::end_of_input;
-    std::uint64_t value = 0;
-};
-
-class tokenizer_t final {
-public:
-    explicit tokenizer_t(std::string_view text) : text_(text) {}
-
-    token_t next() {
-        skip_whitespace();
-        if (pos_ >= text_.size()) {
-            return {token_kind_t::end_of_input, 0};
-        }
-        const char ch = text_[pos_];
-        if (ch == '+') { ++pos_; return {token_kind_t::plus, 0}; }
-        if (ch == '-') { ++pos_; return {token_kind_t::minus, 0}; }
-        if (ch == '*') { ++pos_; return {token_kind_t::star, 0}; }
-        if (ch == '/') { ++pos_; return {token_kind_t::slash, 0}; }
-        if (ch == '%') { ++pos_; return {token_kind_t::percent, 0}; }
-        if (ch == '&') { ++pos_; return {token_kind_t::amp, 0}; }
-        if (ch == '|') { ++pos_; return {token_kind_t::pipe, 0}; }
-        if (ch == '^') { ++pos_; return {token_kind_t::caret, 0}; }
-        if (ch == '~') { ++pos_; return {token_kind_t::tilde, 0}; }
-        if (ch == '(') { ++pos_; return {token_kind_t::lparen, 0}; }
-        if (ch == ')') { ++pos_; return {token_kind_t::rparen, 0}; }
-        if (ch == '<') {
-            ++pos_;
-            if (pos_ < text_.size() && text_[pos_] == '<') { ++pos_; return {token_kind_t::shl, 0}; }
-            throw std::runtime_error("calculator: expected '<<'");
-        }
-        if (ch == '>') {
-            ++pos_;
-            if (pos_ < text_.size() && text_[pos_] == '>') { ++pos_; return {token_kind_t::shr, 0}; }
-            throw std::runtime_error("calculator: expected '>>'");
-        }
-        if (ch == '0' && pos_ + 1 < text_.size() &&
-            (text_[pos_ + 1] == 'x' || text_[pos_ + 1] == 'X')) {
-            pos_ += 2;
-            return parse_hex();
-        }
-        if (ch == '0' && pos_ + 1 < text_.size() &&
-            (text_[pos_ + 1] == 'b' || text_[pos_ + 1] == 'B')) {
-            pos_ += 2;
-            return parse_binary();
-        }
-        if (std::isdigit(static_cast<unsigned char>(ch))) {
-            return parse_decimal();
-        }
-        throw std::runtime_error("calculator: unexpected character");
-    }
-
-private:
-    void skip_whitespace() {
-        while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_]))) {
-            ++pos_;
-        }
-    }
-
-    token_t parse_hex() {
-        std::uint64_t value = 0;
-        bool any = false;
-        while (pos_ < text_.size()) {
-            const char ch = text_[pos_];
-            int digit = -1;
-            if (ch >= '0' && ch <= '9') digit = ch - '0';
-            else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
-            else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
-            if (digit < 0) break;
-            value = (value << 4) | static_cast<std::uint64_t>(digit);
-            ++pos_;
-            any = true;
-        }
-        if (!any) throw std::runtime_error("calculator: empty hex literal");
-        return {token_kind_t::number, value};
-    }
-
-    token_t parse_binary() {
-        std::uint64_t value = 0;
-        bool any = false;
-        while (pos_ < text_.size() && (text_[pos_] == '0' || text_[pos_] == '1')) {
-            value = (value << 1) | static_cast<std::uint64_t>(text_[pos_] - '0');
-            ++pos_;
-            any = true;
-        }
-        if (!any) throw std::runtime_error("calculator: empty binary literal");
-        return {token_kind_t::number, value};
-    }
-
-    token_t parse_decimal() {
-        std::uint64_t value = 0;
-        while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
-            value = value * 10 + static_cast<std::uint64_t>(text_[pos_] - '0');
-            ++pos_;
-        }
-        return {token_kind_t::number, value};
-    }
-
-    std::string_view text_;
-    std::size_t pos_ = 0;
-};
-
-class parser_t final {
-public:
-    explicit parser_t(std::string_view expression) : tokenizer_(expression) {
-        current_ = tokenizer_.next();
-    }
-
-    std::uint64_t parse() {
-        const std::uint64_t result = parse_expression();
-        if (current_.kind != token_kind_t::end_of_input) {
-            throw std::runtime_error("calculator: trailing tokens after expression");
-        }
-        return result;
-    }
-
-private:
-    std::uint64_t parse_expression() {
-        std::uint64_t left = parse_term();
-        for (;;) {
-            switch (current_.kind) {
-            case token_kind_t::plus:
-                current_ = tokenizer_.next();
-                left = left + parse_term();
-                break;
-            case token_kind_t::minus:
-                current_ = tokenizer_.next();
-                left = left - parse_term();
-                break;
-            case token_kind_t::pipe:
-                current_ = tokenizer_.next();
-                left = left | parse_term();
-                break;
-            case token_kind_t::amp:
-                current_ = tokenizer_.next();
-                left = left & parse_term();
-                break;
-            case token_kind_t::caret:
-                current_ = tokenizer_.next();
-                left = left ^ parse_term();
-                break;
-            default:
-                return left;
-            }
-        }
-    }
-
-    std::uint64_t parse_term() {
-        std::uint64_t left = parse_factor();
-        for (;;) {
-            switch (current_.kind) {
-            case token_kind_t::star:
-                current_ = tokenizer_.next();
-                left = left * parse_factor();
-                break;
-            case token_kind_t::slash:
-                current_ = tokenizer_.next();
-                {
-                    const std::uint64_t divisor = parse_factor();
-                    if (divisor == 0) throw std::runtime_error("calculator: division by zero");
-                    left = left / divisor;
-                }
-                break;
-            case token_kind_t::percent:
-                current_ = tokenizer_.next();
-                {
-                    const std::uint64_t divisor = parse_factor();
-                    if (divisor == 0) throw std::runtime_error("calculator: modulo by zero");
-                    left = left % divisor;
-                }
-                break;
-            case token_kind_t::shl:
-                current_ = tokenizer_.next();
-                left = left << parse_factor();
-                break;
-            case token_kind_t::shr:
-                current_ = tokenizer_.next();
-                left = left >> parse_factor();
-                break;
-            default:
-                return left;
-            }
-        }
-    }
-
-    std::uint64_t parse_factor() {
-        if (current_.kind == token_kind_t::tilde) {
-            current_ = tokenizer_.next();
-            return ~parse_factor();
-        }
-        if (current_.kind == token_kind_t::minus) {
-            current_ = tokenizer_.next();
-            return static_cast<std::uint64_t>(0) - parse_factor();
-        }
-        if (current_.kind == token_kind_t::plus) {
-            current_ = tokenizer_.next();
-            return parse_factor();
-        }
-        return parse_primary();
-    }
-
-    std::uint64_t parse_primary() {
-        if (current_.kind == token_kind_t::number) {
-            const std::uint64_t value = current_.value;
-            current_ = tokenizer_.next();
-            return value;
-        }
-        if (current_.kind == token_kind_t::lparen) {
-            current_ = tokenizer_.next();
-            const std::uint64_t value = parse_expression();
-            if (current_.kind != token_kind_t::rparen) {
-                throw std::runtime_error("calculator: expected closing parenthesis");
-            }
-            current_ = tokenizer_.next();
-            return value;
-        }
-        throw std::runtime_error("calculator: unexpected token in primary");
-    }
-
-    tokenizer_t tokenizer_;
-    token_t current_;
-};
-
-std::string decimal_string(std::uint64_t value) {
-    if (value == 0) return "0";
-    std::string digits;
-    while (value > 0) {
-        digits.push_back(static_cast<char>('0' + value % 10));
-        value /= 10;
-    }
-    std::reverse(digits.begin(), digits.end());
-    return digits;
-}
-
-std::string hex_string(std::uint64_t value) {
-    constexpr char hex_digits[] = "0123456789abcdef";
-    std::string result = "0x";
-    bool emitted = false;
-    for (int shift = 60; shift >= 0; shift -= 4) {
-        const std::uint8_t nibble = static_cast<std::uint8_t>((value >> shift) & 0xf);
-        if (nibble != 0 || emitted || shift == 0) {
-            result.push_back(hex_digits[nibble]);
-            emitted = true;
-        }
-    }
-    return result;
-}
-
-}
 
 }
 
@@ -855,20 +535,46 @@ const std::vector<routing_metadata_t>& routing_metadata_inventory() {
     static const std::vector<routing_metadata_t> inventory = []() {
         std::vector<routing_metadata_t> result;
         result.reserve(k_union_tool_count);
+        std::set<std::string> names;
         const auto* archive = aida::standalone::mcp::compat::contracts();
         const std::size_t archive_count = aida::standalone::mcp::compat::contract_count();
+        if (archive == nullptr || archive_count != k_compatibility_tool_count) {
+            throw std::runtime_error("routing metadata archive inventory count mismatch");
+        }
         for (std::size_t index = 0; index < archive_count; ++index) {
+            if (!names.emplace(archive[index].name).second) {
+                throw std::runtime_error("routing metadata archive inventory contains duplicate names");
+            }
             result.push_back(metadata_from_descriptor(archive[index]));
         }
         for (const auto ext_name : k_aida_extension_names) {
+            if (!names.emplace(ext_name).second) {
+                throw std::runtime_error("routing metadata extension inventory overlaps compatibility names");
+            }
             result.push_back(metadata_for_extension(ext_name));
+        }
+        if (result.size() != k_union_tool_count || names.size() != k_union_tool_count) {
+            throw std::runtime_error("routing metadata union inventory count mismatch");
         }
         return result;
     }();
     return inventory;
 }
 
-const routing_metadata_t* find_routing_metadata(std::string_view name) noexcept {
+const std::vector<std::string_view>& routing_metadata_names() {
+    static const std::vector<std::string_view> names = []() {
+        const auto& inventory = routing_metadata_inventory();
+        std::vector<std::string_view> result;
+        result.reserve(inventory.size());
+        for (const auto& metadata : inventory) {
+            result.emplace_back(metadata.name);
+        }
+        return result;
+    }();
+    return names;
+}
+
+const routing_metadata_t* find_routing_metadata(std::string_view name) {
     const auto& inventory = routing_metadata_inventory();
     const auto found = std::find_if(
         inventory.begin(), inventory.end(),
@@ -876,18 +582,24 @@ const routing_metadata_t* find_routing_metadata(std::string_view name) noexcept 
     return found == inventory.end() ? nullptr : &*found;
 }
 
-std::size_t routing_metadata_count() noexcept {
-    return routing_metadata_inventory().size();
+std::size_t routing_metadata_count() {
+    return routing_metadata_names().size();
 }
 
 routing_extensions_t::routing_extensions_t(target_resolver_t& resolver,
-                                           workspace_adapter_t& workspace,
+                                           effect_lock_manager_t& lock_manager,
+                                           routing_extension_workspace_handlers_t workspace_handlers,
                                            protocol::schema_runtime_t& schemas,
                                            routing_extension_limits_t limits)
-    : resolver_(resolver), workspace_(workspace), schemas_(schemas), limits_(std::move(limits)) {
+    : resolver_(resolver), lock_manager_(lock_manager),
+      workspace_handlers_(std::move(workspace_handlers)), schemas_(schemas),
+      limits_(std::move(limits)) {
     if (!valid_limits(limits_)) {
         throw std::invalid_argument(
             "routing extension limits are invalid or weaken pinned maxima");
+    }
+    if (!workspace_handlers_.analyze_funcs || !workspace_handlers_.find_insns) {
+        throw std::invalid_argument("retained workspace extension handlers are incomplete");
     }
     for (std::size_t index = 0; index < k_routing_extension_names.size(); ++index) {
         const auto name = k_routing_extension_names[index];
@@ -898,7 +610,18 @@ routing_extensions_t::routing_extensions_t(target_resolver_t& resolver,
                 "routing extension contract validation failed for " + std::string(name) +
                 ": " + validation.reason);
         }
+        const auto* metadata = find_routing_metadata(name);
+        if (metadata == nullptr || metadata->target_requirement != contracts_[index].target_policy.requirement ||
+            metadata->accepts_pid != contracts_[index].target_policy.accepts_pid ||
+            metadata->accepts_bin_name != contracts_[index].target_policy.accepts_bin_name ||
+            metadata->effect != contracts_[index].effect_policy.effect ||
+            metadata->lock != contracts_[index].effect_policy.lock ||
+            metadata->read_only != contracts_[index].effect_policy.read_only) {
+            throw std::runtime_error(
+                "routing extension metadata differs from contract for " + std::string(name));
+        }
     }
+    refresh_known_instances(resolver_.snapshot());
 }
 
 std::size_t routing_extensions_t::size() const noexcept {
@@ -1012,6 +735,27 @@ protocol::mcp_result_t routing_extensions_t::dispatch(
         protocol::json{{"tool", std::string(name)}});
 }
 
+routing_extensions_t::known_instance_key_t routing_extensions_t::known_instance_key(
+    const target_record_t& target) noexcept {
+    return {
+        target.target_id,
+        target.process_creation_identity,
+        target.generation,
+        target.attach_generation,
+    };
+}
+
+void routing_extensions_t::refresh_known_instances(
+    const std::vector<target_record_t>& active) const {
+    std::lock_guard<std::mutex> lock(known_instances_mutex_);
+    for (auto& entry : known_instances_) {
+        entry.second.retired = true;
+    }
+    for (const auto& target : active) {
+        known_instances_[known_instance_key(target)] = known_instance_t{target, false};
+    }
+}
+
 protocol::mcp_result_t routing_extensions_t::handle_list_instances(
     const protocol::json& arguments,
     const protocol::cancellation_token_t& cancellation) const {
@@ -1023,6 +767,7 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
     }
 
     const auto targets = resolver_.snapshot();
+    refresh_known_instances(targets);
 
     json instances = json::array();
     std::string filter;
@@ -1035,22 +780,32 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
         include_retired = retired_val->get<bool>();
     }
 
-    for (const auto& target : targets) {
-        if (!filter.empty()) {
-            if (target.bin_name.find(filter) == std::string::npos) {
+    std::size_t known_target_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(known_instances_mutex_);
+        known_target_count = known_instances_.size();
+        for (const auto& entry : known_instances_) {
+            const auto& known = entry.second;
+            const auto& target = known.target;
+            if (known.retired && !include_retired) {
                 continue;
             }
+            if (!filter.empty() && target.bin_name.find(filter) == std::string::npos) {
+                continue;
+            }
+            instances.push_back(json{
+                {"target_id", target.target_id},
+                {"pid", target.live ? target.pid : 0U},
+                {"bin_name", target.bin_name},
+                {"generation", target.generation},
+                {"attach_generation", target.attach_generation},
+                {"live", target.live},
+                {"retired", known.retired},
+                {"snapshot_stale", target.live && !target.live_snapshot_permitted},
+                {"process_creation_identity", target.process_creation_identity},
+                {"revision", target.revision},
+            });
         }
-        instances.push_back(json{
-            {"target_id", target.target_id},
-            {"pid", target.pid},
-            {"bin_name", target.bin_name},
-            {"generation", target.generation},
-            {"attach_generation", target.attach_generation},
-            {"live", target.live},
-            {"process_creation_identity", target.process_creation_identity},
-            {"revision", target.revision},
-        });
     }
 
     if (cancellation.cancelled()) {
@@ -1072,6 +827,133 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
         std::move(output),
         protocol::json{
             {"resolver_target_count", targets.size()},
+            {"known_target_count", known_target_count},
+            {"include_retired", include_retired},
+        });
+}
+
+protocol::mcp_result_t routing_extensions_t::route_workspace_extension(
+    std::string_view name,
+    const protocol::json& arguments,
+    const protocol::cancellation_token_t& cancellation,
+    const routing_extension_invocation_options_t& options) const {
+    if (cancellation.cancelled()) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::cancelled,
+            "Routing extension was cancelled before target resolution.",
+            protocol::json{{"phase", "extension_pre_route"}, {"tool", std::string(name)}});
+    }
+
+    const auto& descriptor = extension_adapter_descriptor(name);
+    const auto policy = effect_policy_for(descriptor);
+    if (!policy) {
+        return effect_failure(policy.error);
+    }
+
+    adapter_request_t request;
+    if (const auto pid = arguments.find("pid"); pid != arguments.end()) {
+        const auto value = unsigned_integer(*pid);
+        if (value) {
+            request.target.pid = static_cast<std::uint32_t>(*value);
+        }
+    }
+    if (const auto bin_name = arguments.find("bin_name"); bin_name != arguments.end()) {
+        request.target.bin_name = bin_name->get<std::string>();
+    }
+    try {
+        request.payload = arguments.dump();
+    } catch (const std::exception&) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_input,
+            "Routing extension backend arguments cannot be serialized.",
+            protocol::json{{"phase", "extension_serialization"}, {"tool", std::string(name)}});
+    }
+    request.expected_generation = options.expected_generation;
+    const auto maximum_deadline = std::chrono::steady_clock::now() + limits_.max_execution_time;
+    request.deadline = options.deadline.has_value()
+        ? (std::min)(*options.deadline, maximum_deadline)
+        : maximum_deadline;
+
+    auto resolution = resolver_.resolve(request.target, request.expected_generation);
+    if (!resolution) {
+        return target_failure(resolution.error());
+    }
+    auto resolved = std::move(resolution).take_value();
+    auto lease = lock_manager_.acquire(
+        policy.value(), resolved.target().target_id, request.deadline);
+    if (!lease) {
+        return effect_failure(lease.error);
+    }
+    auto pin = resolver_.pin_current(resolved, request.expected_generation);
+    if (!pin) {
+        return target_failure(pin.error);
+    }
+
+    const adapter_handler_t* handler = nullptr;
+    if (name == k_extension_tool_analyze_funcs) {
+        handler = &workspace_handlers_.analyze_funcs;
+    } else if (name == k_extension_tool_find_insns) {
+        handler = &workspace_handlers_.find_insns;
+    }
+    if (handler == nullptr || !*handler) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::handler_failed,
+            "Retained workspace extension handler is unavailable.",
+            protocol::json{{"phase", "extension_backend"}, {"tool", std::string(name)}});
+    }
+
+    const adapter_call_context_t context{
+        &descriptor,
+        std::optional<target_resolution_t>{pin.pin.resolution()},
+        policy.value(),
+    };
+    auto adapter_result = (*handler)(context, request);
+    if (!adapter_result) {
+        return adapter_failure(adapter_result.error());
+    }
+    if (cancellation.cancelled()) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::cancelled,
+            "Routing extension was cancelled during retained handler execution.",
+            protocol::json{{"phase", "extension_post_adapter"}, {"tool", std::string(name)}});
+    }
+
+    auto response = std::move(adapter_result).take_value();
+    if (response.payload.empty()) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Retained workspace extension response is empty.",
+            invalid_value("response_bytes", "nonempty_response_required", 0));
+    }
+    if (response.payload.size() > limits_.max_response_bytes) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Retained workspace extension response violates the output byte quota.",
+            exceeded_value(
+                "response_bytes",
+                static_cast<std::uint64_t>(limits_.max_response_bytes),
+                static_cast<std::uint64_t>(response.payload.size())));
+    }
+    protocol::json structured = protocol::json::parse(response.payload, nullptr, false);
+    if (structured.is_discarded() || !structured.is_object()) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Retained workspace extension returned malformed structured output.",
+            protocol::json{{"phase", "extension_output_parse"},
+                           {"tool", std::string(name)},
+                           {"response_bytes", response.payload.size()}});
+    }
+
+    const std::size_t response_bytes = response.payload.size();
+    return protocol::mcp_result_t::success(
+        std::move(response.payload),
+        std::move(structured),
+        protocol::json{
+            {"adapter_truncated", response.truncated},
+            {"adapter_response_bytes", response_bytes},
+            {"retained_extension", std::string(name)},
+            {"target_id", resolved.target().target_id},
+            {"target_generation", resolved.target().generation},
         });
 }
 
@@ -1079,284 +961,30 @@ protocol::mcp_result_t routing_extensions_t::handle_analyze_funcs(
     const protocol::json& arguments,
     const protocol::cancellation_token_t& cancellation,
     const routing_extension_invocation_options_t& options) const {
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "analyze_funcs was cancelled before adapter routing.",
-            protocol::json{{"phase", "analyze_funcs_pre_route"}});
-    }
-
-    adapter_request_t request;
-    if (const auto pid = arguments.find("pid"); pid != arguments.end()) {
-        const auto value = unsigned_integer(*pid);
-        if (value) {
-            request.target.pid = static_cast<std::uint32_t>(*value);
-        }
-    }
-    if (const auto bin_name = arguments.find("bin_name"); bin_name != arguments.end()) {
-        request.target.bin_name = bin_name->get<std::string>();
-    }
-    protocol::json backend_arguments = arguments;
-    backend_arguments.erase("pid");
-    backend_arguments.erase("bin_name");
-    try {
-        request.payload = backend_arguments.dump();
-    } catch (const std::exception&) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_input,
-            "analyze_funcs backend arguments cannot be serialized.",
-            protocol::json{{"phase", "analyze_funcs_serialization"}});
-    }
-    request.expected_generation = options.expected_generation;
-    request.deadline = options.deadline;
-    if (!request.deadline.has_value()) {
-        request.deadline = std::chrono::steady_clock::now() + limits_.max_execution_time;
-    }
-
-    auto adapter_result = workspace_.analyze("analyze_funcs", request);
-    if (!adapter_result) {
-        return adapter_failure(adapter_result.error());
-    }
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "analyze_funcs was cancelled during adapter execution.",
-            protocol::json{{"phase", "analyze_funcs_post_adapter"}});
-    }
-
-    auto response = std::move(adapter_result).take_value();
-    if (response.payload.empty()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_output,
-            "analyze_funcs adapter response is empty.",
-            invalid_value("response_bytes", "nonempty_response_required", 0));
-    }
-    if (response.payload.size() > limits_.max_response_bytes) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_output,
-            "analyze_funcs adapter response violates the output byte quota.",
-            exceeded_value(
-                "response_bytes",
-                static_cast<std::uint64_t>(limits_.max_response_bytes),
-                static_cast<std::uint64_t>(response.payload.size())));
-    }
-    protocol::json structured = protocol::json::parse(response.payload, nullptr, false);
-    if (structured.is_discarded() || !structured.is_object()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_output,
-            "analyze_funcs adapter returned malformed structured output.",
-            protocol::json{{"phase", "analyze_funcs_output_parse"},
-                           {"response_bytes", response.payload.size()}});
-    }
-
-    const std::size_t response_bytes = response.payload.size();
-    return protocol::mcp_result_t::success(
-        std::move(response.payload),
-        std::move(structured),
-        protocol::json{
-            {"adapter_truncated", response.truncated},
-            {"adapter_response_bytes", response_bytes},
-        });
+    return route_workspace_extension(
+        k_extension_tool_analyze_funcs, arguments, cancellation, options);
 }
 
 protocol::mcp_result_t routing_extensions_t::handle_find_insns(
     const protocol::json& arguments,
     const protocol::cancellation_token_t& cancellation,
     const routing_extension_invocation_options_t& options) const {
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "find_insns was cancelled before adapter routing.",
-            protocol::json{{"phase", "find_insns_pre_route"}});
-    }
-
-    adapter_request_t request;
-    if (const auto pid = arguments.find("pid"); pid != arguments.end()) {
-        const auto value = unsigned_integer(*pid);
-        if (value) {
-            request.target.pid = static_cast<std::uint32_t>(*value);
-        }
-    }
-    if (const auto bin_name = arguments.find("bin_name"); bin_name != arguments.end()) {
-        request.target.bin_name = bin_name->get<std::string>();
-    }
-    protocol::json backend_arguments = arguments;
-    backend_arguments.erase("pid");
-    backend_arguments.erase("bin_name");
-    try {
-        request.payload = backend_arguments.dump();
-    } catch (const std::exception&) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_input,
-            "find_insns backend arguments cannot be serialized.",
-            protocol::json{{"phase", "find_insns_serialization"}});
-    }
-    request.expected_generation = options.expected_generation;
-    request.deadline = options.deadline;
-    if (!request.deadline.has_value()) {
-        request.deadline = std::chrono::steady_clock::now() + limits_.max_execution_time;
-    }
-
-    auto adapter_result = workspace_.query("find_insns", request);
-    if (!adapter_result) {
-        return adapter_failure(adapter_result.error());
-    }
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "find_insns was cancelled during adapter execution.",
-            protocol::json{{"phase", "find_insns_post_adapter"}});
-    }
-
-    auto response = std::move(adapter_result).take_value();
-    if (response.payload.empty()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_output,
-            "find_insns adapter response is empty.",
-            invalid_value("response_bytes", "nonempty_response_required", 0));
-    }
-    if (response.payload.size() > limits_.max_response_bytes) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_output,
-            "find_insns adapter response violates the output byte quota.",
-            exceeded_value(
-                "response_bytes",
-                static_cast<std::uint64_t>(limits_.max_response_bytes),
-                static_cast<std::uint64_t>(response.payload.size())));
-    }
-    protocol::json structured = protocol::json::parse(response.payload, nullptr, false);
-    if (structured.is_discarded() || !structured.is_object()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_output,
-            "find_insns adapter returned malformed structured output.",
-            protocol::json{{"phase", "find_insns_output_parse"},
-                           {"response_bytes", response.payload.size()}});
-    }
-
-    const std::size_t response_bytes = response.payload.size();
-    return protocol::mcp_result_t::success(
-        std::move(response.payload),
-        std::move(structured),
-        protocol::json{
-            {"adapter_truncated", response.truncated},
-            {"adapter_response_bytes", response_bytes},
-        });
+    return route_workspace_extension(
+        k_extension_tool_find_insns, arguments, cancellation, options);
 }
 
 protocol::mcp_result_t routing_extensions_t::handle_calculator(
     const protocol::json& arguments,
     const protocol::cancellation_token_t& cancellation) const {
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "calculator was cancelled before evaluation.",
-            protocol::json{{"phase", "calculator_pre_eval"}});
-    }
-
-    const auto expression = arguments.at("expression").get_ref<const std::string&>();
-    if (expression.empty()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_input,
-            "calculator expression must not be empty.",
-            invalid_value("expression", "nonempty_string_required", expression));
-    }
-
-    std::uint64_t result_value = 0;
-    try {
-        calc::parser_t parser(expression);
-        result_value = parser.parse();
-    } catch (const std::exception& error) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_input,
-            "calculator expression evaluation failed.",
-            json{
-                {"phase", "calculator_eval"},
-                {"reason", error.what()},
-                {"expression", expression},
-            });
-    }
-
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "calculator was cancelled after evaluation.",
-            protocol::json{{"phase", "calculator_post_eval"}});
-    }
-
-    const std::string dec = calc::decimal_string(result_value);
-    const std::string hex = calc::hex_string(result_value);
-    json output{
-        {"result", dec},
-        {"decimal", dec},
-        {"hex", hex},
-    };
-
-    std::string payload = output.dump();
-    return protocol::mcp_result_t::success(
-        std::move(payload),
-        std::move(output),
-        protocol::json{
-            {"expression_bytes", expression.size()},
-            {"local_computation", true},
-        });
+    return invoke_retained_calculator(
+        k_extension_tool_calculator, arguments, cancellation, limits_.max_execution_time);
 }
 
 protocol::mcp_result_t routing_extensions_t::handle_calculate(
     const protocol::json& arguments,
     const protocol::cancellation_token_t& cancellation) const {
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "calculate was cancelled before evaluation.",
-            protocol::json{{"phase", "calculate_pre_eval"}});
-    }
-
-    const auto expression = arguments.at("expression").get_ref<const std::string&>();
-    if (expression.empty()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_input,
-            "calculate expression must not be empty.",
-            invalid_value("expression", "nonempty_string_required", expression));
-    }
-
-    std::uint64_t result_value = 0;
-    try {
-        calc::parser_t parser(expression);
-        result_value = parser.parse();
-    } catch (const std::exception& error) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::invalid_input,
-            "calculate expression evaluation failed.",
-            json{
-                {"phase", "calculate_eval"},
-                {"reason", error.what()},
-                {"expression", expression},
-            });
-    }
-
-    if (cancellation.cancelled()) {
-        return protocol::mcp_result_t::failure(
-            protocol::result_error_code_t::cancelled,
-            "calculate was cancelled after evaluation.",
-            protocol::json{{"phase", "calculate_post_eval"}});
-    }
-
-    const std::string dec = calc::decimal_string(result_value);
-    const std::string hex = calc::hex_string(result_value);
-    json output{
-        {"result", dec},
-        {"decimal", dec},
-        {"hex", hex},
-    };
-
-    std::string payload = output.dump();
-    return protocol::mcp_result_t::success(
-        std::move(payload),
-        std::move(output),
-        protocol::json{
-            {"expression_bytes", expression.size()},
-            {"local_computation", true},
-        });
+    return invoke_retained_calculator(
+        k_extension_tool_calculate, arguments, cancellation, limits_.max_execution_time);
 }
 
 }

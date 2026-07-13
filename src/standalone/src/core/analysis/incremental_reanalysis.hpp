@@ -1,7 +1,6 @@
 #pragma once
 
 #include "overlay_projection.hpp"
-#include "overlay_apply_engine.hpp"
 
 #include <cstdint>
 #include <string>
@@ -30,17 +29,22 @@ struct reanalysis_scope_t final {
     std::uint64_t generation = 0;
     std::uint64_t total_patched_bytes = 0;
     bool requires_full_reanalysis = false;
+    bool generation_conflict = false;
 
     bool empty() const noexcept
     {
         return ranges.empty() && entities.empty() &&
-               stage_flags == projection_stage_flag_t::none && !requires_full_reanalysis;
+               stage_flags == projection_stage_flag_t::none && !requires_full_reanalysis &&
+               !generation_conflict;
     }
+
+    bool valid() const noexcept { return !generation_conflict; }
 };
 
 struct reanalysis_result_t final {
     bool ok = false;
     reanalysis_scope_t scope;
+    projection_invalidation_set_t invalidation;
     std::uint64_t new_generation = 0;
     std::string detail;
 
@@ -53,18 +57,13 @@ struct undo_redo_identity_t final {
     bool inverse_valid = false;
     bool keys_match = false;
     bool payloads_are_inverse = false;
+    bool provenance_is_inverse = false;
 
     bool identity_preserved() const noexcept
     {
-        return forward_valid && inverse_valid && keys_match && payloads_are_inverse;
+        return forward_valid && inverse_valid && keys_match &&
+               payloads_are_inverse && provenance_is_inverse;
     }
-};
-
-struct cache_invalidation_check_t final {
-    bool cache_invalidated = false;
-    std::size_t invalidated_entry_count = 0;
-    std::vector<projected_range_t> invalidated_ranges;
-    projection_stage_flag_t invalidated_stages = projection_stage_flag_t::none;
 };
 
 class incremental_reanalysis_t final {
@@ -87,15 +86,6 @@ public:
     static undo_redo_identity_t validate_undo_redo_identity(
         const overlay_change_v9_t& forward_change,
         const overlay_change_v9_t& inverse_change);
-
-    static cache_invalidation_check_t check_cache_invalidation(
-        const reanalysis_scope_t& scope,
-        const overlay_static_state_v9_t& state);
-
-    static reanalysis_result_t publish_reanalysis(
-        overlay_static_state_v9_t& state,
-        std::uint64_t expected_generation,
-        const reanalysis_scope_t& scope);
 
     static std::vector<reanalysis_stage_t> stages_for_flags(
         projection_stage_flag_t flags);

@@ -11,9 +11,6 @@
 namespace aida::analysis {
 namespace {
 
-constexpr std::uint64_t kCallSiteEntityTag = 12ULL << 56;
-constexpr std::uint64_t kCallCandidateEntityTag = 13ULL << 56;
-constexpr std::uint64_t kCallEdgeEntityTag = 14ULL << 56;
 constexpr std::uint32_t kControlFlowMask =
     flow_branch | flow_call | flow_return | flow_interrupt | flow_terminal;
 
@@ -604,13 +601,20 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
         for (auto& candidate : raw_site.candidates) {
             const auto exact = function_by_address.find(candidate.target);
             const auto supplied = candidate.target_function_id;
-            if (supplied && function_by_id.find(*supplied) == function_by_id.end()) {
+            const auto supplied_function = supplied
+                ? function_by_id.find(*supplied) : function_by_id.end();
+            if (supplied &&
+                (supplied_function == function_by_id.end() ||
+                 recovery.functions[supplied_function->second].start != candidate.target)) {
                 call_graph_conflict_t conflict;
                 conflict.kind =
                     call_graph_conflict_kind_t::candidate_identity_mismatch;
                 conflict.instruction_id = raw_site.instruction_id;
                 conflict.source_function_id = raw_site.source_function_id;
                 conflict.call_site_rva = raw_site.address.value;
+                conflict.selected_target_rva = candidate.target.value;
+                if (exact != function_by_address.end())
+                    conflict.selected_target_function_id = exact->second;
                 conflict.competing_target_rva = candidate.target.value;
                 conflict.competing_target_function_id = *supplied;
                 auto appended = append_conflict(std::move(conflict));
@@ -620,29 +624,9 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
                 candidate.target_function_id.reset();
             }
             if (exact != function_by_address.end()) {
-                if (candidate.target_function_id &&
-                    *candidate.target_function_id != exact->second) {
-                    call_graph_conflict_t conflict;
-                    conflict.kind =
-                        call_graph_conflict_kind_t::candidate_identity_mismatch;
-                    conflict.instruction_id = raw_site.instruction_id;
-                    conflict.source_function_id =
-                        raw_site.source_function_id;
-                    conflict.call_site_rva = raw_site.address.value;
-                    conflict.selected_target_rva = candidate.target.value;
-                    conflict.selected_target_function_id = exact->second;
-                    conflict.competing_target_function_id =
-                        *candidate.target_function_id;
-                    auto appended = append_conflict(std::move(conflict));
-                    if (!appended)
-                        return workspace_result_t<call_graph_result_t>::failure(
-                            appended.error());
-                }
                 candidate.target_function_id = exact->second;
             }
-            candidate.external_target =
-                candidate.external_target ||
-                !candidate.target_function_id.has_value();
+            candidate.external_target = !candidate.target_function_id.has_value();
             candidate_key_t key;
             key.target = candidate.target;
             key.target_function_id =
@@ -703,7 +687,7 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
             result.bounded = true;
         }
         recovered_call_site_t site;
-        site.id = kCallSiteEntityTag |
+        site.id = call_site_entity_tag |
             static_cast<std::uint64_t>(result.call_sites.size() + 1);
         site.source_function_id = raw_site.source_function_id;
         site.source_block_id = raw_site.source_block_id;
@@ -737,7 +721,7 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
                 return workspace_result_t<call_graph_result_t>::failure(
                     appended.error());
             call_graph_edge_record_t edge;
-            edge.id = kCallEdgeEntityTag |
+            edge.id = call_edge_entity_tag |
                 static_cast<std::uint64_t>(result.edges.size() + 1);
             edge.call_site_id = site_id;
             edge.source_function_id = raw_site.source_function_id;
@@ -757,7 +741,7 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
             for (std::size_t rank = 0; rank < ranked.size(); ++rank) {
                 const auto& candidate = ranked[rank];
                 recovered_call_candidate_t output;
-                output.id = kCallCandidateEntityTag |
+                output.id = call_candidate_entity_tag |
                     static_cast<std::uint64_t>(result.candidates.size() + 1);
                 output.call_site_id = site_id;
                 output.target = candidate.target;
@@ -776,7 +760,7 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
                     return workspace_result_t<call_graph_result_t>::failure(
                         appended_candidate.error());
                 call_graph_edge_record_t edge;
-                edge.id = kCallEdgeEntityTag |
+                edge.id = call_edge_entity_tag |
                     static_cast<std::uint64_t>(result.edges.size() + 1);
                 edge.call_site_id = site_id;
                 edge.source_function_id = raw_site.source_function_id;
@@ -839,7 +823,31 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
     std::sort(result.conflicts.begin(), result.conflicts.end(), conflict_less);
     result.conflicts.erase(std::unique(result.conflicts.begin(),
         result.conflicts.end(), conflict_equal), result.conflicts.end());
+    for (std::size_t index = 0; index < result.conflicts.size(); ++index)
+        result.conflicts[index].id = call_conflict_entity_tag |
+            static_cast<std::uint64_t>(index + 1);
     return workspace_result_t<call_graph_result_t>::success(std::move(result));
+}
+
+workspace_result_t<void> call_graph_builder_t::publish(
+    analysis_snapshot_t& snapshot,
+    call_graph_result_t result,
+    const cancellation_token_t& cancel)
+{
+    call_graph_publication_t publication;
+    publication.nodes = std::move(result.nodes);
+    publication.call_sites = std::move(result.call_sites);
+    publication.candidates = std::move(result.candidates);
+    publication.edges = std::move(result.edges);
+    publication.conflicts = std::move(result.conflicts);
+    publication.indirect_site_count = result.indirect_site_count;
+    publication.unresolved_site_count = result.unresolved_site_count;
+    publication.bounded = result.bounded;
+    auto validated = validate_call_graph_publication(snapshot, publication, cancel);
+    if (!validated)
+        return validated;
+    snapshot.call_graph = std::move(publication);
+    return workspace_result_t<void>::success();
 }
 
 }

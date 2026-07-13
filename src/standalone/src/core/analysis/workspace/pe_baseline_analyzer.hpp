@@ -3,10 +3,15 @@
 #include "analysis_metrics.hpp"
 #include "analysis_workspace.hpp"
 #include "arch_decoder.hpp"
+#include "data_discovery.hpp"
 #include "function_recovery.hpp"
 #include "search_index.hpp"
+#include "string_discovery.hpp"
+#include "symbol_type_candidates.hpp"
 #include "workspace_types.hpp"
 #include "xref_builder.hpp"
+#include "../call_graph_builder.hpp"
+#include "../tile_decode_orchestrator.hpp"
 
 #include <chrono>
 #include <atomic>
@@ -19,8 +24,13 @@ namespace aida::analysis {
 
 struct baseline_analysis_settings_t {
     pe_parse_limits_t pe_limits;
+    tile_decode_orchestrator_limits_t tile_decode_limits;
     function_recovery_limits_t function_limits;
+    call_graph_builder_limits_t call_graph_limits;
+    data_discovery_limits_t data_limits;
     xref_build_limits_t xref_limits;
+    string_discovery_limits_t string_limits;
+    symbol_type_candidate_limits_t symbol_type_limits;
     search_index_limits_t search_limits;
     std::uint64_t max_seed_count = 1ULL << 24;
     std::uint64_t max_decode_queue = 1ULL << 24;

@@ -74,8 +74,7 @@ private:
     protocol::mcp_result_t dispatch(
         std::size_t index,
         const protocol::json& arguments,
-        const protocol::cancellation_token_t& cancellation,
-        const debugger_effect_approval_t& approval) const;
+        const protocol::cancellation_token_t& cancellation) const;
 
     workspace_adapter_t& workspace_;
     debugger_lane_t& lane_;

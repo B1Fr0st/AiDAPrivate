@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <set>
 #include <utility>
 
 namespace aida {
@@ -10,38 +9,101 @@ namespace analysis {
 
 namespace {
 
-bool is_byte_patch_kind(overlay_operation_kind_v9_t kind) noexcept
+std::optional<overlay_operation_kind_v9_t> before_kind_of(
+    const overlay_change_v9_t& change) noexcept
 {
-    return kind == overlay_operation_kind_v9_t::byte_patch ||
-           kind == overlay_operation_kind_v9_t::assembly_patch ||
-           kind == overlay_operation_kind_v9_t::integer_patch;
+    if (!change.before)
+        return std::nullopt;
+    if (change.before_kind)
+        return change.before_kind;
+    const auto inferred = overlay_operation_kind_for_item_v9(change.entity, *change.before);
+    return inferred ? inferred : std::optional<overlay_operation_kind_v9_t>(change.operation_kind);
 }
 
-bool is_metadata_only_kind(overlay_operation_kind_v9_t kind) noexcept
+std::optional<overlay_operation_kind_v9_t> after_kind_of(
+    const overlay_change_v9_t& change) noexcept
 {
-    return kind == overlay_operation_kind_v9_t::comment ||
-           kind == overlay_operation_kind_v9_t::comment_update ||
-           kind == overlay_operation_kind_v9_t::bookmark;
+    if (!change.after)
+        return std::nullopt;
+    if (change.after_kind)
+        return change.after_kind;
+    const auto inferred = overlay_operation_kind_for_item_v9(change.entity, *change.after);
+    return inferred ? inferred : std::optional<overlay_operation_kind_v9_t>(change.operation_kind);
 }
 
-bool is_define_kind(overlay_operation_kind_v9_t kind) noexcept
+bool change_requires_full_reanalysis(const overlay_change_v9_t& change) noexcept
 {
-    return kind == overlay_operation_kind_v9_t::define_function ||
-           kind == overlay_operation_kind_v9_t::define_code ||
-           kind == overlay_operation_kind_v9_t::define_data;
+    const auto before_kind = before_kind_of(change);
+    const auto after_kind = after_kind_of(change);
+    return (before_kind && *before_kind == overlay_operation_kind_v9_t::reanalysis) ||
+           (after_kind && *after_kind == overlay_operation_kind_v9_t::reanalysis);
 }
 
-bool ranges_overlap(std::uint64_t a_offset, std::uint64_t a_size,
-                    std::uint64_t b_offset, std::uint64_t b_size) noexcept
+bool entity_address_in_bounds(const overlay_entity_key_v9_t& entity,
+                              std::uint64_t image_size) noexcept
 {
-    if (a_size == 0 || b_size == 0)
+    if (entity.domain == overlay_operation_kind_v9_t::type_declaration ||
+        entity.domain == overlay_operation_kind_v9_t::enum_definition)
+        return entity.range.offset == 0 && entity.range.size == 0;
+    return entity.range.offset < image_size;
+}
+
+void bind_invalidation_generation(projection_invalidation_set_t& invalidation,
+                                  std::uint64_t generation) noexcept
+{
+    invalidation.packed_index.source_generation = generation;
+    invalidation.packed_index.target_generation = generation;
+    invalidation.decompiler_cache.source_generation = generation;
+    invalidation.decompiler_cache.target_generation = generation;
+}
+
+std::uint64_t saturated_add(std::uint64_t lhs, std::uint64_t rhs) noexcept
+{
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    return rhs > maximum - lhs ? maximum : lhs + rhs;
+}
+
+bool checked_range_end(const projected_range_t& range,
+                       std::uint64_t& end) noexcept
+{
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    if (range.size > maximum - range.offset)
         return false;
-    return a_offset < b_offset + b_size && b_offset < a_offset + a_size;
+    end = range.offset + range.size;
+    return true;
 }
 
-std::uint64_t range_end(const projected_range_t& range) noexcept
+void merge_ranges(std::vector<projected_range_t>& ranges)
 {
-    return range.offset + range.size;
+    if (ranges.size() <= 1)
+        return;
+    std::sort(ranges.begin(), ranges.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  if (lhs.offset != rhs.offset)
+                      return lhs.offset < rhs.offset;
+                  if (lhs.is_byte_patch != rhs.is_byte_patch)
+                      return lhs.is_byte_patch < rhs.is_byte_patch;
+                  return lhs.size < rhs.size;
+              });
+    std::vector<projected_range_t> merged;
+    merged.reserve(ranges.size());
+    merged.push_back(ranges.front());
+    for (std::size_t index = 1; index < ranges.size(); ++index) {
+        auto& last = merged.back();
+        const auto& current = ranges[index];
+        std::uint64_t last_end = 0;
+        std::uint64_t current_end = 0;
+        if (last.size == 0 || current.size == 0 ||
+            last.is_byte_patch != current.is_byte_patch ||
+            !checked_range_end(last, last_end) ||
+            !checked_range_end(current, current_end) ||
+            current.offset > last_end) {
+            merged.push_back(current);
+            continue;
+        }
+        last.size = (std::max)(last_end, current_end) - last.offset;
+    }
+    ranges = std::move(merged);
 }
 
 }
@@ -52,8 +114,11 @@ reanalysis_result_t incremental_reanalysis_t::compute_scope(
     std::uint64_t current_generation)
 {
     reanalysis_result_t result;
-    if (!state.target.valid()) {
-        result.detail = "state target is not valid";
+    if (!state.target.valid() ||
+        state.target.kind != overlay_target_kind_v9_t::static_image ||
+        state.next_transaction_id == 0 || state.history_epoch == 0 ||
+        state.history_cursor > state.history.size()) {
+        result.detail = "static overlay state is not initialized or coherent";
         return result;
     }
     if (current_generation != state.target.generation) {
@@ -64,34 +129,30 @@ reanalysis_result_t incremental_reanalysis_t::compute_scope(
         result.detail = "no changes to compute scope from";
         return result;
     }
-    result.scope = reanalysis_scope_t{};
+
+    result.invalidation = overlay_projection_t::compute_invalidation(
+        changes, state.target.image_size);
+    if (!overlay_projection_t::validate_ranges_in_bounds(
+            result.invalidation.affected_ranges, state.target.image_size) ||
+        !std::all_of(
+            result.invalidation.affected_entities.begin(),
+            result.invalidation.affected_entities.end(),
+            [&](const auto& entity) {
+                return entity_address_in_bounds(
+                    entity.key, state.target.image_size);
+            })) {
+        result.detail = "one or more reanalysis ranges or entities exceed image bounds";
+        return result;
+    }
+    bind_invalidation_generation(result.invalidation, current_generation);
     result.scope.generation = current_generation;
-    result.scope.ranges = overlay_projection_t::derive_affected_ranges(changes);
-    result.scope.stage_flags = overlay_projection_t::derive_invalidated_stages(changes);
-    result.scope.requires_full_reanalysis = false;
-    result.scope.total_patched_bytes = 0;
-    for (const auto& change : changes) {
-        result.scope.entities.push_back(change.entity);
-        if (change.operation_kind == overlay_operation_kind_v9_t::reanalysis) {
-            result.scope.requires_full_reanalysis = true;
-            result.scope.stage_flags = projection_stage_flag_t::all_stages;
-        }
-        if (is_byte_patch_kind(change.operation_kind)) {
-            if (change.after)
-                result.scope.total_patched_bytes += change.after->bytes.size();
-            else if (change.before)
-                result.scope.total_patched_bytes += change.before->bytes.size();
-        }
-    }
-    if (result.scope.requires_full_reanalysis) {
-        result.scope.ranges.clear();
-        projected_range_t full_range;
-        full_range.offset = 0;
-        full_range.size = state.target.image_size;
-        full_range.is_byte_patch = true;
-        full_range.source_kind = overlay_operation_kind_v9_t::reanalysis;
-        result.scope.ranges.push_back(full_range);
-    }
+    result.scope.ranges = result.invalidation.affected_ranges;
+    result.scope.stage_flags = result.invalidation.invalidated_stages;
+    result.scope.total_patched_bytes = result.invalidation.total_patched_bytes;
+    for (const auto& entity : result.invalidation.affected_entities)
+        result.scope.entities.push_back(entity.key);
+    result.scope.requires_full_reanalysis = std::any_of(
+        changes.begin(), changes.end(), change_requires_full_reanalysis);
     result.ok = true;
     result.new_generation = current_generation;
     return result;
@@ -100,20 +161,14 @@ reanalysis_result_t incremental_reanalysis_t::compute_scope(
 reanalysis_scope_t incremental_reanalysis_t::minimal_invalidation(
     const overlay_change_v9_t& change)
 {
+    const auto invalidation = overlay_projection_t::compute_invalidation({change});
     reanalysis_scope_t scope;
-    scope.generation = 0;
-    scope.stage_flags = stage_flags_for_operation(change.operation_kind);
-    scope.requires_full_reanalysis =
-        change.operation_kind == overlay_operation_kind_v9_t::reanalysis;
-    scope.entities.push_back(change.entity);
-    auto ranges = overlay_projection_t::derive_affected_ranges({change});
-    scope.ranges = std::move(ranges);
-    if (is_byte_patch_kind(change.operation_kind)) {
-        if (change.after)
-            scope.total_patched_bytes = change.after->bytes.size();
-        else if (change.before)
-            scope.total_patched_bytes = change.before->bytes.size();
-    }
+    scope.ranges = invalidation.affected_ranges;
+    scope.stage_flags = invalidation.invalidated_stages;
+    scope.total_patched_bytes = invalidation.total_patched_bytes;
+    for (const auto& entity : invalidation.affected_entities)
+        scope.entities.push_back(entity.key);
+    scope.requires_full_reanalysis = change_requires_full_reanalysis(change);
     return scope;
 }
 
@@ -159,15 +214,14 @@ undo_redo_identity_t incremental_reanalysis_t::validate_undo_redo_identity(
 {
     undo_redo_identity_t identity;
     identity.entity = forward_change.entity;
-    identity.forward_valid = (forward_change.entity == inverse_change.entity);
-    identity.keys_match = identity.forward_valid;
-    if (!identity.keys_match) {
-        identity.inverse_valid = false;
-        identity.payloads_are_inverse = false;
+    identity.keys_match = forward_change.entity == inverse_change.entity;
+    identity.forward_valid = identity.keys_match &&
+        (forward_change.before.has_value() || forward_change.after.has_value());
+    identity.inverse_valid = identity.keys_match &&
+        (inverse_change.before.has_value() || inverse_change.after.has_value());
+    if (!identity.forward_valid || !identity.inverse_valid)
         return identity;
-    }
-    identity.forward_valid = true;
-    identity.inverse_valid = true;
+
     const bool forward_before_after = forward_change.before.has_value() &&
                                       forward_change.after.has_value();
     const bool inverse_before_after = inverse_change.before.has_value() &&
@@ -176,84 +230,20 @@ undo_redo_identity_t incremental_reanalysis_t::validate_undo_redo_identity(
         identity.payloads_are_inverse =
             (*forward_change.before == *inverse_change.after) &&
             (*forward_change.after == *inverse_change.before);
-    } else if (!forward_change.before.has_value() && forward_change.after.has_value() &&
-               inverse_change.before.has_value() && !inverse_change.after.has_value()) {
+    } else if (!forward_change.before && forward_change.after &&
+               inverse_change.before && !inverse_change.after) {
         identity.payloads_are_inverse =
-            (*forward_change.after == *inverse_change.before);
-    } else if (forward_change.before.has_value() && !forward_change.after.has_value() &&
-               !inverse_change.before.has_value() && inverse_change.after.has_value()) {
+            *forward_change.after == *inverse_change.before;
+    } else if (forward_change.before && !forward_change.after &&
+               !inverse_change.before && inverse_change.after) {
         identity.payloads_are_inverse =
-            (*forward_change.before == *inverse_change.after);
-    } else {
-        identity.payloads_are_inverse = false;
+            *forward_change.before == *inverse_change.after;
     }
+
+    identity.provenance_is_inverse =
+        before_kind_of(forward_change) == after_kind_of(inverse_change) &&
+        after_kind_of(forward_change) == before_kind_of(inverse_change);
     return identity;
-}
-
-cache_invalidation_check_t incremental_reanalysis_t::check_cache_invalidation(
-    const reanalysis_scope_t& scope,
-    const overlay_static_state_v9_t& state)
-{
-    cache_invalidation_check_t check;
-    check.cache_invalidated = false;
-    check.invalidated_entry_count = 0;
-    check.invalidated_stages = scope.stage_flags;
-    if (scope.empty())
-        return check;
-    if (scope.requires_full_reanalysis) {
-        check.cache_invalidated = true;
-        check.invalidated_entry_count = state.items.size();
-        check.invalidated_ranges = scope.ranges;
-        check.invalidated_stages = projection_stage_flag_t::all_stages;
-        return check;
-    }
-    std::size_t invalidated = 0;
-    for (const auto& [key, payload] : state.items) {
-        for (const auto& range : scope.ranges) {
-            if (range.size == 0) {
-                if (key.range.offset == range.offset) {
-                    ++invalidated;
-                    break;
-                }
-                continue;
-            }
-            if (ranges_overlap(key.range.offset, key.range.size > 0 ? key.range.size : 1,
-                               range.offset, range.size)) {
-                ++invalidated;
-                break;
-            }
-        }
-    }
-    check.invalidated_entry_count = invalidated;
-    check.cache_invalidated = invalidated > 0 || scope.stage_flags != projection_stage_flag_t::none;
-    check.invalidated_ranges = scope.ranges;
-    return check;
-}
-
-reanalysis_result_t incremental_reanalysis_t::publish_reanalysis(
-    overlay_static_state_v9_t& state,
-    std::uint64_t expected_generation,
-    const reanalysis_scope_t& scope)
-{
-    reanalysis_result_t result;
-    if (!state.target.valid()) {
-        result.detail = "state target is not valid";
-        return result;
-    }
-    if (expected_generation != state.target.generation) {
-        result.detail = "expected_generation does not match state.target.generation";
-        return result;
-    }
-    if (state.target.generation == (std::numeric_limits<std::uint64_t>::max)()) {
-        result.detail = "generation at maximum, cannot publish";
-        return result;
-    }
-    state.target.generation += 1;
-    result.ok = true;
-    result.scope = scope;
-    result.scope.generation = state.target.generation;
-    result.new_generation = state.target.generation;
-    return result;
 }
 
 std::vector<reanalysis_stage_t> incremental_reanalysis_t::stages_for_flags(
@@ -286,12 +276,17 @@ bool incremental_reanalysis_t::scope_contains_range(
     const projected_range_t& range) noexcept
 {
     for (const auto& scope_range : scope.ranges) {
-        if (scope_range.size == 0 && range.size == 0)
-            return scope_range.offset == range.offset;
-        if (scope_range.size == 0 || range.size == 0)
+        if (scope_range.size == 0 || range.size == 0) {
+            if (scope_range.size == 0 && range.size == 0 &&
+                scope_range.offset == range.offset)
+                return true;
             continue;
-        if (scope_range.offset <= range.offset &&
-            scope_range.offset + scope_range.size >= range.offset + range.size)
+        }
+        if (scope_range.offset > range.offset)
+            continue;
+        const auto offset_delta = range.offset - scope_range.offset;
+        if (offset_delta <= scope_range.size &&
+            range.size <= scope_range.size - offset_delta)
             return true;
     }
     return false;
@@ -302,28 +297,31 @@ reanalysis_scope_t incremental_reanalysis_t::merge_scopes(
     const reanalysis_scope_t& rhs)
 {
     reanalysis_scope_t merged;
-    merged.generation = std::max(lhs.generation, rhs.generation);
+    merged.generation_conflict = lhs.generation_conflict || rhs.generation_conflict ||
+        (lhs.generation != 0 && rhs.generation != 0 &&
+         lhs.generation != rhs.generation);
+    merged.generation = merged.generation_conflict
+        ? 0
+        : (std::max)(lhs.generation, rhs.generation);
     merged.requires_full_reanalysis = lhs.requires_full_reanalysis ||
                                       rhs.requires_full_reanalysis;
-    merged.stage_flags = static_cast<projection_stage_flag_t>(
-        static_cast<std::uint32_t>(lhs.stage_flags) |
-        static_cast<std::uint32_t>(rhs.stage_flags));
-    merged.total_patched_bytes = lhs.total_patched_bytes + rhs.total_patched_bytes;
+    merged.stage_flags = lhs.stage_flags | rhs.stage_flags;
     merged.ranges = lhs.ranges;
-    for (const auto& range : rhs.ranges)
-        merged.ranges.push_back(range);
-    if (merged.ranges.size() > 1) {
-        std::sort(merged.ranges.begin(), merged.ranges.end(),
-                  [](const auto& a, const auto& b) {
-                      return a.offset < b.offset;
-                  });
+    merged.ranges.insert(merged.ranges.end(), rhs.ranges.begin(), rhs.ranges.end());
+    merge_ranges(merged.ranges);
+    for (const auto& range : merged.ranges) {
+        if (range.is_byte_patch)
+            merged.total_patched_bytes = saturated_add(
+                merged.total_patched_bytes, range.size);
     }
     merged.entities = lhs.entities;
-    for (const auto& entity : rhs.entities)
-        merged.entities.push_back(entity);
+    merged.entities.insert(merged.entities.end(), rhs.entities.begin(), rhs.entities.end());
+    std::sort(merged.entities.begin(), merged.entities.end());
+    merged.entities.erase(
+        std::unique(merged.entities.begin(), merged.entities.end()),
+        merged.entities.end());
     if (merged.requires_full_reanalysis) {
         merged.stage_flags = projection_stage_flag_t::all_stages;
-        merged.ranges.clear();
         merged.total_patched_bytes = 0;
     }
     return merged;

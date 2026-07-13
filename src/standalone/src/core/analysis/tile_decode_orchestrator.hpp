@@ -20,6 +20,12 @@ enum class tile_decode_pass_t : std::uint8_t {
     gap = 1
 };
 
+enum class tile_coverage_detail_t : std::uint32_t {
+    none = 0,
+    undecodable_gap = 1,
+    zero_fill = 2
+};
+
 struct tile_decode_executor_capabilities_t final {
     arch_decoder_key_t decoder_key;
     std::uint64_t maximum_request_bytes = 0;
@@ -109,6 +115,7 @@ struct tile_decode_orchestrator_limits_t final {
     std::uint64_t maximum_decode_requests = 8'000'000;
     std::uint64_t maximum_instructions = 32'000'000;
     std::uint64_t maximum_operand_facts = 256'000'000;
+    std::uint64_t maximum_target_facts = 256'000'000;
     std::uint64_t maximum_edges = 128'000'000;
     std::uint64_t maximum_coverage_spans = 8'000'000;
     bool seed_executable_range_starts = true;
@@ -138,6 +145,7 @@ struct executable_decode_tile_t final {
 
 struct executable_decode_partition_t final {
     std::vector<executable_decode_range_t> ranges;
+    std::vector<executable_decode_range_t> zero_fill_ranges;
     std::vector<executable_decode_tile_t> tiles;
     std::uint64_t initialized_executable_bytes = 0;
     std::uint64_t zero_fill_executable_bytes = 0;
@@ -162,6 +170,7 @@ struct tile_decode_shard_summary_t final {
     std::uint16_t shard_id = 0;
     std::uint32_t instruction_count = 0;
     std::uint32_t operand_count = 0;
+    std::uint32_t target_count = 0;
     std::uint32_t edge_count = 0;
 };
 
@@ -175,17 +184,18 @@ struct tile_decode_orchestrator_statistics_t final {
     std::uint64_t duplicate_instruction_candidates = 0;
     std::uint64_t overlap_instruction_candidates = 0;
     std::uint64_t accepted_operands = 0;
+    std::uint64_t accepted_target_facts = 0;
     std::uint64_t accepted_edges = 0;
     std::uint64_t duplicate_edges = 0;
     std::uint64_t cross_tile_edges = 0;
     std::uint64_t invalid_bytes = 0;
     std::uint64_t invalid_runs = 0;
-    std::uint64_t invalid_policy_cutoffs = 0;
     decode_frontier_snapshot_t frontier;
 };
 
 struct tile_decode_orchestration_result_t final {
     std::unique_ptr<packed_analysis_store_t> packed_store;
+    std::vector<std::uint8_t> delay_slot_counts;
     std::vector<coverage_span_t> coverage;
     std::vector<tile_decode_cross_tile_edge_t> cross_tile_edges;
     std::vector<tile_decode_shard_summary_t> shards;

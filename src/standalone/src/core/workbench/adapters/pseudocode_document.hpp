@@ -4,10 +4,10 @@
 #include "../../analysis/decompiler/decompiler_contracts.hpp"
 
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace aida {
@@ -16,8 +16,14 @@ namespace pseudocode_document {
 
 inline constexpr std::uint32_t k_pseudocode_document_schema_version = 1;
 inline constexpr std::uint32_t k_pseudocode_document_max_line_length = 4096;
+inline constexpr std::uint32_t k_pseudocode_document_max_page_lines = 1024;
 inline constexpr std::uint32_t k_pseudocode_document_max_diagnostics = 256;
 inline constexpr std::uint32_t k_pseudocode_document_max_cached_documents = 128;
+inline constexpr std::uint32_t k_pseudocode_document_max_tokens = 1U << 20;
+inline constexpr std::uint32_t k_pseudocode_document_max_source_maps = 1U << 20;
+inline constexpr std::uint32_t k_pseudocode_document_max_ast_nodes = 1U << 20;
+inline constexpr std::uint32_t k_pseudocode_document_max_lines = 1U << 20;
+inline constexpr std::uint64_t k_pseudocode_document_max_rendered_bytes = 64ULL << 20;
 inline constexpr std::uint64_t k_pseudocode_document_default_timeout_ms = 30'000;
 
 enum class pseudocode_error_code_t : std::uint16_t {
@@ -66,14 +72,17 @@ struct pseudocode_request_t {
 struct pseudocode_token_view_t {
     aida::analysis::decompiler_document_token_kind_t kind =
         aida::analysis::decompiler_document_token_kind_t::unknown;
+    std::uint32_t token_index = 0;
     aida::analysis::decompiler_token_range_t range;
     std::uint64_t ast_node_id = 0;
-    std::string_view text;
+    std::string text;
 };
 
 struct pseudocode_line_view_t {
     std::uint32_t line_number = 0;
-    std::string_view text;
+    std::uint32_t text_begin = 0;
+    std::uint32_t text_end = 0;
+    std::string text;
     std::uint32_t first_token = 0;
     std::uint32_t token_count = 0;
 };
@@ -83,22 +92,35 @@ struct pseudocode_diagnostic_view_t {
         aida::analysis::decompiler_diagnostic_severity_t::error;
     aida::analysis::decompiler_diagnostic_code_t code =
         aida::analysis::decompiler_diagnostic_code_t::invalid_contract;
-    std::string_view localization_key;
-    std::string_view message;
+    std::string localization_key;
+    std::string message;
+    std::optional<aida::analysis::source_coordinate_t> coordinate;
     bool has_line = false;
     std::uint32_t line = 0;
+    std::uint8_t confidence = 0;
     bool retryable = false;
+    std::uint32_t ordinal = 0;
 };
 
 struct pseudocode_source_map_view_t {
     std::uint32_t token_begin = 0;
     std::uint32_t token_end = 0;
+    bool has_address = false;
+    std::uint64_t address = 0;
+    std::uint64_t address_extent = 0;
+    std::optional<aida::analysis::decompiler_address_range_t> address_range;
+    aida::analysis::source_coordinate_t coordinate;
+    bool has_source = false;
     std::uint32_t source_line = 0;
-    std::string_view source_path;
+    std::uint32_t source_column = 0;
+    std::uint32_t source_last_line = 0;
+    std::uint32_t source_last_column = 0;
+    std::string source_path;
 };
 
 struct pseudocode_address_map_entry_t {
     std::uint64_t address = 0;
+    std::uint64_t extent = 0;
     std::uint32_t token_begin = 0;
     std::uint32_t token_end = 0;
     std::uint32_t line_number = 0;
@@ -116,6 +138,8 @@ struct pseudocode_page_t {
     std::uint32_t first_line = 0;
     std::vector<pseudocode_line_view_t> lines;
     std::vector<pseudocode_token_view_t> tokens;
+    std::vector<pseudocode_source_map_view_t> source_maps;
+    std::vector<pseudocode_diagnostic_view_t> diagnostics;
 };
 
 struct pseudocode_selection_t {
@@ -134,12 +158,6 @@ struct pseudocode_profile_info_t {
     std::uint64_t max_cpu_ms = 0;
     std::uint64_t max_memory_bytes = 0;
     std::uint64_t elapsed_ms = 0;
-};
-
-class pseudocode_cancellation_t {
-public:
-    virtual ~pseudocode_cancellation_t() = default;
-    virtual bool cancelled() const noexcept = 0;
 };
 
 class pseudocode_source_adapter_t {
@@ -221,7 +239,7 @@ struct pseudocode_command_result_t {
 class pseudocode_document_model_t final {
 public:
     explicit pseudocode_document_model_t(
-        const pseudocode_source_adapter_t& source,
+        pseudocode_source_adapter_t& source,
         const pseudocode_navigation_adapter_t* navigation = nullptr) noexcept;
 
     pseudocode_error_t request(const pseudocode_request_t& request);
@@ -250,35 +268,35 @@ public:
     const pseudocode_selection_t& selection() const noexcept;
     const pseudocode_profile_info_t& profile_info() const noexcept;
     std::vector<pseudocode_diagnostic_view_t> diagnostics() const;
+    std::vector<pseudocode_source_map_view_t> source_maps() const;
 
 private:
     pseudocode_error_t fail(pseudocode_error_code_t code,
-                            std::uint64_t subject = 0) noexcept;
-    pseudocode_error_t stale() noexcept;
+                            std::uint64_t subject = 0) const noexcept;
+    pseudocode_error_t stale() const noexcept;
+    bool lease_current(std::uint64_t generation) const noexcept;
+    pseudocode_error_t validate_document(
+        const aida::analysis::decompiler_document_t& document,
+        const pseudocode_cached_document_t& cache_entry) const;
     void rebuild_address_map();
     void split_lines();
     pseudocode_cached_document_t* find_cached(
         const aida::analysis::decompiler_entity_key_t& entity);
-    const pseudocode_cached_document_t* find_cached(
-        const aida::analysis::decompiler_entity_key_t& entity) const;
-    void evict_oldest();
+    bool evict_oldest();
 
-    const pseudocode_source_adapter_t* source_;
+    pseudocode_source_adapter_t* source_;
     const pseudocode_navigation_adapter_t* navigation_;
     std::uint64_t bound_generation_;
-    std::vector<pseudocode_cached_document_t> cache_;
+    std::list<pseudocode_cached_document_t> cache_;
     std::uint64_t next_job_id_;
     pseudocode_cached_document_t* active_;
     pseudocode_selection_t selection_;
-    pseudocode_profile_info_t profile_info_;
-    std::vector<std::string> line_storage_;
     std::vector<pseudocode_line_view_t> line_views_;
 };
 
 bool pseudocode_page_request_valid(const pseudocode_page_request_t& request) noexcept;
 bool pseudocode_selection_valid(const pseudocode_selection_t& selection) noexcept;
-bool pseudocode_request_valid(const pseudocode_request_t& request) noexcept;
-std::uint32_t count_lines(const std::string& text) noexcept;
+bool pseudocode_request_valid(const pseudocode_request_t& request);
 
 }
 }

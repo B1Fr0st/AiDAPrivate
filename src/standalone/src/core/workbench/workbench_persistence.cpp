@@ -1,5 +1,6 @@
 #include "workbench_persistence.hpp"
 
+#include "../analysis/workspace/workspace_database.hpp"
 #include "split_tree.h"
 
 #include <nlohmann/json.hpp>
@@ -7,9 +8,10 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
+#include <exception>
+#include <future>
 #include <limits>
-#include <stdexcept>
-#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -29,42 +31,140 @@ persistence_codec_result_t codec_error(persistence_codec_code_t code,
     return result;
 }
 
-bool valid_document_kind_ordinal(unsigned value) noexcept
+std::optional<persistence_codec_result_t> preflight_json(
+    std::string_view input, const persistence_codec_limits_t& limits) noexcept
+{
+    if (limits.max_serialized_bytes == 0 ||
+        limits.max_serialized_bytes > k_persistence_codec_max_serialized_bytes ||
+        limits.max_json_depth == 0 ||
+        limits.max_json_depth > k_persistence_codec_max_json_depth ||
+        limits.max_field_count == 0 ||
+        limits.max_field_count > k_persistence_codec_max_field_count)
+        return codec_error(persistence_codec_code_t::oversized_payload,
+                           "codec limits exceed hard production bounds");
+    if (input.size() > limits.max_serialized_bytes)
+        return codec_error(persistence_codec_code_t::oversized_payload,
+                           "input exceeds max_serialized_bytes");
+    struct container_frame_t final {
+        unsigned char type = 0;
+        std::size_t array_items = 0;
+        bool array_expects_value = true;
+    };
+    std::array<container_frame_t, k_persistence_codec_max_json_depth> containers{};
+    std::size_t depth = 0;
+    std::size_t fields = 0;
+    std::size_t structural_values = 0;
+    bool in_string = false;
+    bool escaped = false;
+    const auto mark_array_value = [&]() noexcept {
+        if (depth == 0 || containers[depth - 1].type != '[' ||
+            !containers[depth - 1].array_expects_value)
+            return true;
+        auto& frame = containers[depth - 1];
+        if (frame.array_items >= k_max_split_nodes_per_workspace ||
+            structural_values >= k_persistence_codec_max_collection_elements)
+            return false;
+        ++frame.array_items;
+        ++structural_values;
+        frame.array_expects_value = false;
+        return true;
+    };
+    for (const unsigned char byte : input) {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (byte == '"') {
+            if (!mark_array_value())
+                return codec_error(persistence_codec_code_t::oversized_payload,
+                                   "JSON structural value count exceeds hard bounds");
+            in_string = true;
+        } else if (byte == '{' || byte == '[') {
+            if (!mark_array_value())
+                return codec_error(persistence_codec_code_t::oversized_payload,
+                                   "JSON structural value count exceeds hard bounds");
+            if (depth >= limits.max_json_depth)
+                return codec_error(persistence_codec_code_t::oversized_payload,
+                                   "JSON depth exceeds max_json_depth");
+            containers[depth].type = byte;
+            containers[depth].array_items = 0;
+            containers[depth].array_expects_value = true;
+            ++depth;
+        } else if (byte == '}' || byte == ']') {
+            if (depth == 0 ||
+                containers[depth - 1].type !=
+                    static_cast<unsigned char>(byte == '}' ? '{' : '[') ||
+                (byte == ']' && containers[depth - 1].array_items != 0 &&
+                 containers[depth - 1].array_expects_value))
+                return codec_error(persistence_codec_code_t::invalid_json,
+                                   "JSON delimiters are unbalanced");
+            --depth;
+        } else if (byte == ':') {
+            if (fields >= limits.max_field_count)
+                return codec_error(persistence_codec_code_t::field_count_exceeded,
+                                   "total field count exceeds max_field_count");
+            ++fields;
+        } else if (byte == ',' && depth != 0 &&
+                   containers[depth - 1].type == '[') {
+            if (containers[depth - 1].array_expects_value)
+                return codec_error(persistence_codec_code_t::invalid_json,
+                                   "JSON array separators are malformed");
+            containers[depth - 1].array_expects_value = true;
+        } else if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n' &&
+                   byte != ',') {
+            if (!mark_array_value())
+                return codec_error(persistence_codec_code_t::oversized_payload,
+                                   "JSON structural value count exceeds hard bounds");
+        }
+    }
+    if (in_string || escaped || depth != 0)
+        return codec_error(persistence_codec_code_t::invalid_json,
+                           "JSON structure is incomplete");
+    return std::nullopt;
+}
+
+bool valid_document_kind_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(document_kind_t::diff);
 }
 
-bool valid_view_role_ordinal(unsigned value) noexcept
+bool valid_view_role_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(view_role_t::transient);
 }
 
-bool valid_selection_kind_ordinal(unsigned value) noexcept
+bool valid_selection_kind_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(selection_kind_t::source);
 }
 
-bool valid_sync_policy_ordinal(unsigned value) noexcept
+bool valid_sync_policy_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(view_synchronization_policy_t::cursor_and_selection);
 }
 
-bool valid_nav_origin_ordinal(unsigned value) noexcept
+bool valid_nav_origin_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(navigation_origin_t::mcp);
 }
 
-bool valid_split_node_kind_ordinal(unsigned value) noexcept
+bool valid_split_node_kind_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(split_node_kind_t::branch);
 }
 
-bool valid_split_orientation_ordinal(unsigned value) noexcept
+bool valid_split_orientation_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(split_orientation_t::vertical);
 }
 
-bool valid_panel_kind_ordinal(unsigned value) noexcept
+bool valid_panel_kind_ordinal(std::uint64_t value) noexcept
 {
     return value <= static_cast<unsigned>(panel_kind_t::custom);
 }
@@ -177,8 +277,8 @@ std::optional<split_node_dto_t> parse_split_node_json(const json& value) noexcep
         if (!exact_fields(value, fields) || !value["kind"].is_number_unsigned() ||
             !value["orientation"].is_number_unsigned())
             return std::nullopt;
-        const auto kind_ordinal = value["kind"].get<unsigned>();
-        const auto orientation_ordinal = value["orientation"].get<unsigned>();
+        const auto kind_ordinal = value["kind"].get<std::uint64_t>();
+        const auto orientation_ordinal = value["orientation"].get<std::uint64_t>();
         if (!valid_split_node_kind_ordinal(kind_ordinal) ||
             !valid_split_orientation_ordinal(orientation_ordinal))
             return std::nullopt;
@@ -214,6 +314,8 @@ std::optional<split_tree_dto_t> parse_split_tree_json(const json& value) noexcep
         split_tree_dto_t tree;
         if (!parse_decimal(value["root"], tree.root.value))
             return std::nullopt;
+        if (value["nodes"].size() > k_max_split_nodes_per_workspace)
+            return std::nullopt;
         tree.nodes.reserve(value["nodes"].size());
         for (const auto& node_json : value["nodes"]) {
             auto node = parse_split_node_json(node_json);
@@ -247,17 +349,18 @@ std::optional<selection_context_t> parse_selection_json(const json& value) noexc
         if (!exact_fields(value, fields) || !value["kind"].is_number_unsigned() ||
             !value["has_address"].is_boolean() || !value["entity_key"].is_string())
             return std::nullopt;
-        const auto kind_ordinal = value["kind"].get<unsigned>();
+        const auto kind_ordinal = value["kind"].get<std::uint64_t>();
         if (!valid_selection_kind_ordinal(kind_ordinal))
+            return std::nullopt;
+        const auto& entity_key = value["entity_key"].get_ref<const std::string&>();
+        if (entity_key.size() > k_max_document_key_bytes)
             return std::nullopt;
         selection_context_t selection;
         selection.kind = static_cast<selection_kind_t>(kind_ordinal);
         selection.has_address = value["has_address"].get<bool>();
-        selection.entity_key = value["entity_key"].get<std::string>();
+        selection.entity_key = entity_key;
         if (!parse_decimal(value["address"], selection.address) ||
             !parse_decimal(value["extent"], selection.extent))
-            return std::nullopt;
-        if (selection.entity_key.size() > k_max_document_key_bytes)
             return std::nullopt;
         return selection;
     } catch (...) {
@@ -335,19 +438,21 @@ std::optional<document_identity_t> parse_document_identity_json(const json& valu
         if (!exact_fields(value, fields) || !value["kind"].is_number_unsigned() ||
             !value["has_address"].is_boolean() || !value["provider_key"].is_string())
             return std::nullopt;
-        const auto kind_ordinal = value["kind"].get<unsigned>();
+        const auto kind_ordinal = value["kind"].get<std::uint64_t>();
         if (!valid_document_kind_ordinal(kind_ordinal))
+            return std::nullopt;
+        const auto& provider_key =
+            value["provider_key"].get_ref<const std::string&>();
+        if (provider_key.size() > k_max_document_key_bytes)
             return std::nullopt;
         document_identity_t identity;
         identity.kind = static_cast<document_kind_t>(kind_ordinal);
         identity.has_address = value["has_address"].get<bool>();
-        identity.provider_key = value["provider_key"].get<std::string>();
+        identity.provider_key = provider_key;
         if (!parse_decimal(value["workspace"], identity.workspace.value) ||
             !parse_decimal(value["object_id"], identity.object_id) ||
             !parse_decimal(value["variant_id"], identity.variant_id) ||
             !parse_decimal(value["address"], identity.address))
-            return std::nullopt;
-        if (identity.provider_key.size() > k_max_document_key_bytes)
             return std::nullopt;
         return identity;
     } catch (...) {
@@ -378,11 +483,17 @@ std::optional<document_persistence_dto_t> parse_document_dto_json(const json& va
             !value["closeable"].is_boolean() || !value["title"].is_string() ||
             !value["state_token"].is_string())
             return std::nullopt;
+        const auto& title = value["title"].get_ref<const std::string&>();
+        const auto& state_token =
+            value["state_token"].get_ref<const std::string&>();
+        if (title.size() > k_max_document_title_bytes ||
+            state_token.size() > k_max_panel_state_bytes)
+            return std::nullopt;
         document_persistence_dto_t document;
         document.pinned = value["pinned"].get<bool>();
         document.closeable = value["closeable"].get<bool>();
-        document.title = value["title"].get<std::string>();
-        document.state_token = value["state_token"].get<std::string>();
+        document.title = title;
+        document.state_token = state_token;
         if (!parse_decimal(value["id"], document.id.value))
             return std::nullopt;
         auto identity = parse_document_identity_json(value["identity"]);
@@ -391,9 +502,6 @@ std::optional<document_persistence_dto_t> parse_document_dto_json(const json& va
             return std::nullopt;
         document.identity = std::move(*identity);
         document.local_state = std::move(*local_state);
-        if (document.title.size() > k_max_document_title_bytes ||
-            document.state_token.size() > k_max_panel_state_bytes)
-            return std::nullopt;
         return document;
     } catch (...) {
         return std::nullopt;
@@ -424,8 +532,8 @@ std::optional<view_persistence_dto_t> parse_view_dto_json(const json& value) noe
             !value["synchronization_policy"].is_number_unsigned() ||
             !value["focused"].is_boolean())
             return std::nullopt;
-        const auto role_ordinal = value["role"].get<unsigned>();
-        const auto policy_ordinal = value["synchronization_policy"].get<unsigned>();
+        const auto role_ordinal = value["role"].get<std::uint64_t>();
+        const auto policy_ordinal = value["synchronization_policy"].get<std::uint64_t>();
         if (!valid_view_role_ordinal(role_ordinal) ||
             !valid_sync_policy_ordinal(policy_ordinal))
             return std::nullopt;
@@ -470,21 +578,23 @@ std::optional<panel_state_dto_t> parse_panel_dto_json(const json& value) noexcep
             !value["visible"].is_boolean() || !value["pinned"].is_boolean() ||
             !value["state_token"].is_string())
             return std::nullopt;
-        const auto kind_ordinal = value["kind"].get<unsigned>();
+        const auto kind_ordinal = value["kind"].get<std::uint64_t>();
         if (!valid_panel_kind_ordinal(kind_ordinal))
+            return std::nullopt;
+        const auto& state_token =
+            value["state_token"].get_ref<const std::string&>();
+        if (state_token.size() > k_max_panel_state_bytes)
             return std::nullopt;
         panel_state_dto_t panel;
         panel.kind = static_cast<panel_kind_t>(kind_ordinal);
         panel.visible = value["visible"].get<bool>();
         panel.pinned = value["pinned"].get<bool>();
-        panel.state_token = value["state_token"].get<std::string>();
+        panel.state_token = state_token;
         if (!parse_decimal(value["id"], panel.id.value) ||
             !parse_decimal(value["workspace"], panel.workspace.value) ||
             !parse_decimal(value["extent_pixels"], panel.extent_pixels) ||
             !parse_decimal(value["selected_document"], panel.selected_document.value) ||
             !parse_decimal(value["revision"], panel.revision.value))
-            return std::nullopt;
-        if (panel.state_token.size() > k_max_panel_state_bytes)
             return std::nullopt;
         return panel;
     } catch (...) {
@@ -515,7 +625,7 @@ std::optional<workspace_view_context_t> parse_view_context_json(const json& valu
         if (!exact_fields(value, fields) ||
             !value["synchronization_policy"].is_number_unsigned())
             return std::nullopt;
-        const auto policy_ordinal = value["synchronization_policy"].get<unsigned>();
+        const auto policy_ordinal = value["synchronization_policy"].get<std::uint64_t>();
         if (!valid_sync_policy_ordinal(policy_ordinal))
             return std::nullopt;
         workspace_view_context_t context;
@@ -596,7 +706,7 @@ std::optional<navigation_event_t> parse_navigation_event_json(const json& value)
         if (!exact_fields(value, fields) || !value["has_source"].is_boolean() ||
             !value["origin"].is_number_unsigned() || !value["request_focus"].is_boolean())
             return std::nullopt;
-        const auto origin_ordinal = value["origin"].get<unsigned>();
+        const auto origin_ordinal = value["origin"].get<std::uint64_t>();
         if (!valid_nav_origin_ordinal(origin_ordinal))
             return std::nullopt;
         navigation_event_t event;
@@ -618,7 +728,8 @@ std::optional<navigation_event_t> parse_navigation_event_json(const json& value)
             if (!source)
                 return std::nullopt;
             event.source = std::move(*source);
-        }
+        } else if (!value["source"].is_null())
+            return std::nullopt;
         return event;
     } catch (...) {
         return std::nullopt;
@@ -653,6 +764,12 @@ std::optional<navigation_history_dto_t> parse_history_json(const json& value) no
         navigation_history_dto_t history;
         if (!parse_decimal(value["workspace"], history.workspace.value) ||
             !parse_decimal(value["capacity"], history.capacity))
+            return std::nullopt;
+        if (history.capacity == 0 || history.capacity > k_max_history_capacity ||
+            value["back"].size() > history.capacity ||
+            value["forward"].size() > history.capacity ||
+            value["back"].size() >
+                history.capacity - value["forward"].size())
             return std::nullopt;
         history.back.reserve(value["back"].size());
         for (const auto& event_json : value["back"]) {
@@ -709,6 +826,10 @@ std::optional<workbench_persistence_dto_t> parse_payload_json_v9(const json& pay
         if (!exact_fields(payload, fields) || !payload["documents"].is_array() ||
             !payload["views"].is_array() || !payload["panels"].is_array())
             return std::nullopt;
+        if (payload["documents"].size() > k_max_documents_per_workspace ||
+            payload["views"].size() > k_max_views_per_workspace ||
+            payload["panels"].size() > k_max_panels_per_workspace)
+            return std::nullopt;
         workbench_persistence_dto_t dto;
         if (!parse_decimal(payload["schema_version"], dto.schema_version) ||
             !parse_decimal(payload["workspace"], dto.workspace.value) ||
@@ -759,6 +880,9 @@ std::optional<workbench_persistence_dto_t> parse_payload_json_v8(const json& pay
         }};
         if (!exact_fields(payload, v8_fields) || !payload["documents"].is_array() ||
             !payload["views"].is_array())
+            return std::nullopt;
+        if (payload["documents"].size() > k_max_documents_per_workspace ||
+            payload["views"].size() > k_max_views_per_workspace)
             return std::nullopt;
         workbench_persistence_dto_t dto;
         if (!parse_decimal(payload["schema_version"], dto.schema_version) ||
@@ -911,6 +1035,21 @@ bool recover_unknown_documents(workbench_persistence_dto_t& dto,
     return true;
 }
 
+workbench_error_t persistence_adapter_error(
+    const analysis::workspace_error_t& error, std::uint64_t subject) noexcept
+{
+    switch (error.code) {
+    case analysis::workspace_error_code_t::target_conflict:
+        return {workbench_error_code_t::revision_mismatch, subject};
+    case analysis::workspace_error_code_t::invalid_argument:
+    case analysis::workspace_error_code_t::integrity_failure:
+    case analysis::workspace_error_code_t::limit_exceeded:
+        return {workbench_error_code_t::invalid_persistence, subject};
+    default:
+        return {workbench_error_code_t::adapter_rejected, subject};
+    }
+}
+
 }
 
 persistence_codec_result_t workbench_persistence_codec_t::encode(
@@ -918,6 +1057,9 @@ persistence_codec_result_t workbench_persistence_codec_t::encode(
     std::string& output,
     const persistence_codec_limits_t& limits)
 {
+    output.clear();
+    if (auto limit_error = preflight_json({}, limits))
+        return *limit_error;
     workbench_persistence_dto_t normalized = dto;
     const auto norm_result = normalize_persistence_dto(normalized);
     if (!norm_result)
@@ -944,9 +1086,10 @@ persistence_codec_result_t workbench_persistence_codec_t::encode(
         return codec_error(persistence_codec_code_t::corrupt_payload,
                            "unknown serialization exception");
     }
-    if (output.size() > limits.max_serialized_bytes)
-        return codec_error(persistence_codec_code_t::oversized_payload,
-                           "serialized output exceeds max_serialized_bytes");
+    if (auto preflight_error = preflight_json(output, limits)) {
+        output.clear();
+        return *preflight_error;
+    }
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
     result.fingerprint = fingerprint;
@@ -962,9 +1105,8 @@ persistence_codec_result_t workbench_persistence_codec_t::decode(
 {
     if (input.empty())
         return codec_error(persistence_codec_code_t::empty_input);
-    if (input.size() > limits.max_serialized_bytes)
-        return codec_error(persistence_codec_code_t::oversized_payload,
-                           "input exceeds max_serialized_bytes");
+    if (auto preflight_error = preflight_json(input, limits))
+        return *preflight_error;
     json envelope;
     try {
         envelope = json::parse(input.begin(), input.end(), nullptr, false);
@@ -981,7 +1123,7 @@ persistence_codec_result_t workbench_persistence_codec_t::decode(
         !envelope["payload"].is_object())
         return codec_error(persistence_codec_code_t::corrupt_payload,
                            "envelope missing required fields");
-    const auto schema = envelope["schema"].get<std::uint32_t>();
+    const auto schema = envelope["schema"].get<std::uint64_t>();
     if (schema != k_persistence_codec_schema_v9)
         return codec_error(persistence_codec_code_t::schema_mismatch,
                            "expected schema v9, got " + std::to_string(schema));
@@ -1012,6 +1154,9 @@ persistence_codec_result_t workbench_persistence_codec_t::decode(
         return codec_error(persistence_codec_code_t::validation_failed,
                            "validate_persistence_dto rejected the decoded normalized input");
     const auto fingerprint = persistence_fingerprint(*dto);
+    if (!fingerprint.value)
+        return codec_error(persistence_codec_code_t::fingerprint_mismatch,
+                           "decoded fingerprint is zero");
     output = std::move(*dto);
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
@@ -1023,10 +1168,13 @@ persistence_codec_result_t workbench_persistence_codec_t::decode(
 persistence_codec_result_t workbench_persistence_codec_t::decode_v8_default(
     std::string_view input,
     workspace_id_t expected_workspace,
-    workbench_persistence_dto_t& output)
+    workbench_persistence_dto_t& output,
+    const persistence_codec_limits_t& limits)
 {
     if (input.empty())
         return codec_error(persistence_codec_code_t::empty_input);
+    if (auto preflight_error = preflight_json(input, limits))
+        return *preflight_error;
     json envelope;
     try {
         envelope = json::parse(input.begin(), input.end(), nullptr, false);
@@ -1041,10 +1189,17 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_v8_default(
         !envelope["payload"].is_object())
         return codec_error(persistence_codec_code_t::corrupt_payload,
                            "v8 envelope missing required fields");
-    const auto schema = envelope["schema"].get<std::uint32_t>();
+    const auto schema = envelope["schema"].get<std::uint64_t>();
     if (schema != k_persistence_codec_schema_v8)
         return codec_error(persistence_codec_code_t::v8_legacy_unsupported,
                            "expected schema v8, got " + std::to_string(schema));
+    std::size_t field_count = 0;
+    if (!count_fields_recursive(envelope, field_count, 0, limits.max_json_depth))
+        return codec_error(persistence_codec_code_t::oversized_payload,
+                           "JSON depth exceeds max_json_depth");
+    if (field_count > limits.max_field_count)
+        return codec_error(persistence_codec_code_t::field_count_exceeded,
+                           "total field count exceeds max_field_count");
     auto dto = parse_payload_json_v8(envelope["payload"]);
     if (!dto)
         return codec_error(persistence_codec_code_t::corrupt_payload,
@@ -1068,6 +1223,9 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_v8_default(
         return codec_error(persistence_codec_code_t::normalization_failed,
                            "normalize_persistence_dto rejected the v8-upgraded input");
     const auto fingerprint = persistence_fingerprint(*dto);
+    if (!fingerprint.value)
+        return codec_error(persistence_codec_code_t::fingerprint_mismatch,
+                           "decoded v8 fingerprint is zero");
     output = std::move(*dto);
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
@@ -1106,6 +1264,8 @@ bool workbench_persistence_codec_t::is_corrupt(std::string_view input) noexcept
 {
     if (input.empty())
         return true;
+    if (preflight_json(input, {}).has_value())
+        return true;
     try {
         auto value = json::parse(input.begin(), input.end(), nullptr, false);
         if (value.is_discarded() || !value.is_object())
@@ -1114,7 +1274,7 @@ bool workbench_persistence_codec_t::is_corrupt(std::string_view input) noexcept
             return true;
         if (!value.contains("payload") || !value["payload"].is_object())
             return true;
-        const auto schema = value["schema"].get<std::uint32_t>();
+        const auto schema = value["schema"].get<std::uint64_t>();
         if (schema != k_persistence_codec_schema_v9 && schema != k_persistence_codec_schema_v8)
             return true;
         return false;
@@ -1127,25 +1287,17 @@ bool workbench_persistence_codec_t::is_oversized(
     std::string_view input,
     const persistence_codec_limits_t& limits) noexcept
 {
-    if (input.size() > limits.max_serialized_bytes)
-        return true;
-    try {
-        auto value = json::parse(input.begin(), input.end(), nullptr, false);
-        if (value.is_discarded())
-            return false;
-        std::size_t field_count = 0;
-        if (!count_fields_recursive(value, field_count, 0, limits.max_json_depth))
-            return true;
-        return field_count > limits.max_field_count;
-    } catch (...) {
-        return false;
-    }
+    const auto result = preflight_json(input, limits);
+    return result &&
+        (result->code == persistence_codec_code_t::oversized_payload ||
+         result->code == persistence_codec_code_t::field_count_exceeded);
 }
 
 std::optional<persistence_envelope_t> workbench_persistence_codec_t::peek_envelope(
     std::string_view input) noexcept
 {
-    if (input.empty() || input.size() > k_persistence_codec_max_envelope_bytes)
+    if (input.empty() || input.size() > k_persistence_codec_max_envelope_bytes ||
+        preflight_json(input, {}).has_value())
         return std::nullopt;
     try {
         auto value = json::parse(input.begin(), input.end(), nullptr, false);
@@ -1153,7 +1305,10 @@ std::optional<persistence_envelope_t> workbench_persistence_codec_t::peek_envelo
             !value.contains("schema") || !value["schema"].is_number_unsigned())
             return std::nullopt;
         persistence_envelope_t envelope;
-        envelope.schema = value["schema"].get<std::uint32_t>();
+        const auto schema = value["schema"].get<std::uint64_t>();
+        if (schema > (std::numeric_limits<std::uint32_t>::max)())
+            return std::nullopt;
+        envelope.schema = static_cast<std::uint32_t>(schema);
         if (value.contains("kind") && value["kind"].is_string())
             envelope.kind = value["kind"].get<std::string>();
         envelope.is_v8_legacy = envelope.schema == k_persistence_codec_schema_v8;
@@ -1210,9 +1365,8 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_with_recovery(
 {
     if (input.empty())
         return codec_error(persistence_codec_code_t::empty_input);
-    if (input.size() > limits.max_serialized_bytes)
-        return codec_error(persistence_codec_code_t::oversized_payload,
-                           "input exceeds max_serialized_bytes");
+    if (auto preflight_error = preflight_json(input, limits))
+        return *preflight_error;
     json envelope;
     try {
         envelope = json::parse(input.begin(), input.end(), nullptr, false);
@@ -1229,7 +1383,7 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_with_recovery(
         !envelope["payload"].is_object())
         return codec_error(persistence_codec_code_t::corrupt_payload,
                            "envelope missing required fields");
-    const auto schema = envelope["schema"].get<std::uint32_t>();
+    const auto schema = envelope["schema"].get<std::uint64_t>();
     if (schema != k_persistence_codec_schema_v9)
         return codec_error(persistence_codec_code_t::schema_mismatch,
                            "expected schema v9, got " + std::to_string(schema));
@@ -1276,6 +1430,9 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_with_recovery(
         return codec_error(persistence_codec_code_t::validation_failed,
                            "validate_persistence_dto rejected the recovered normalized input");
     const auto fingerprint = persistence_fingerprint(*dto);
+    if (!fingerprint.value)
+        return codec_error(persistence_codec_code_t::fingerprint_mismatch,
+                           "recovered fingerprint is zero");
     output = std::move(*dto);
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
@@ -1283,6 +1440,91 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_with_recovery(
     result.decoded_schema = k_persistence_codec_schema_v9;
     result.detail = std::move(recovery_detail);
     return result;
+}
+
+workspace_database_workbench_persistence_adapter_t::
+workspace_database_workbench_persistence_adapter_t(
+    std::shared_ptr<analysis::workspace_database_t> database,
+    workspace_id_t workspace,
+    persistence_codec_limits_t limits)
+    : database_(std::move(database)), workspace_(workspace), limits_(limits)
+{
+}
+
+workbench_error_t workspace_database_workbench_persistence_adapter_t::load(
+    workspace_id_t workspace, workbench_persistence_dto_t& output) const
+{
+    if (!database_ || !workspace_.valid() || workspace != workspace_)
+        return {workbench_error_code_t::workspace_mismatch, workspace.value};
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(database_->options().candidate_operation_timeout_ms);
+    analysis::cancellation_source_t cancellation(deadline);
+    const auto read = database_->load_workbench_state(cancellation.token());
+    if (!read)
+        return persistence_adapter_error(read.error(), workspace.value);
+    if (!read.value())
+        return {workbench_error_code_t::adapter_rejected, workspace.value};
+    const auto& record = *read.value();
+    if (record.workspace_id != workspace.value)
+        return {workbench_error_code_t::workspace_mismatch, record.workspace_id};
+    workbench_persistence_dto_t decoded;
+    const auto decoded_result = workbench_persistence_codec_t::decode(
+        record.payload_json, workspace, decoded, limits_);
+    if (!decoded_result || decoded.schema_version != record.contract_schema_version ||
+        decoded.revision.value != record.revision ||
+        decoded_result.fingerprint.value != record.fingerprint)
+        return {workbench_error_code_t::invalid_persistence, record.revision};
+    output = std::move(decoded);
+    return {};
+}
+
+workbench_error_t workspace_database_workbench_persistence_adapter_t::store(
+    const workbench_persistence_dto_t& input)
+{
+    if (!database_ || !workspace_.valid() || input.workspace != workspace_)
+        return {workbench_error_code_t::workspace_mismatch, input.workspace.value};
+    workbench_persistence_dto_t normalized = input;
+    const auto normalized_result = normalized.normalize();
+    if (!normalized_result)
+        return normalized_result;
+    const auto validation_result = normalized.validate();
+    if (!validation_result)
+        return validation_result;
+    std::string payload;
+    const auto encoded = workbench_persistence_codec_t::encode(
+        normalized, payload, limits_);
+    if (!encoded)
+        return {workbench_error_code_t::invalid_persistence,
+                normalized.revision.value};
+    analysis::workbench_state_record_t record;
+    record.workspace_id = normalized.workspace.value;
+    record.contract_schema_version = normalized.schema_version;
+    record.revision = normalized.revision.value;
+    record.fingerprint = encoded.fingerprint.value;
+    record.payload_json = std::move(payload);
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(database_->options().candidate_operation_timeout_ms);
+    analysis::cancellation_source_t cancellation(deadline);
+    auto ticket = database_->store_workbench_state(
+        std::move(record), cancellation.token());
+    if (!ticket.accepted || !ticket.completion.valid())
+        return {workbench_error_code_t::adapter_rejected,
+                normalized.revision.value};
+    if (ticket.completion.wait_until(deadline) != std::future_status::ready) {
+        cancellation.request_cancel();
+        return {workbench_error_code_t::adapter_rejected,
+                normalized.revision.value};
+    }
+    try {
+        const auto& stored = ticket.completion.get();
+        if (!stored)
+            return persistence_adapter_error(stored.error(),
+                                             normalized.revision.value);
+    } catch (...) {
+        return {workbench_error_code_t::adapter_rejected,
+                normalized.revision.value};
+    }
+    return {};
 }
 
 }

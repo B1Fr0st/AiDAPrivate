@@ -2,17 +2,12 @@
 
 #include "../../src/core/mcp/compat/handlers/types.hpp"
 
-#include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
-#include <vector>
 
 namespace aida::standalone::tests::mcp_compat {
 
@@ -64,10 +59,12 @@ struct test_env_t {
     std::unique_ptr<workspace_adapter_t> workspace;
     std::unique_ptr<protocol::schema_runtime_t> schemas;
     std::unique_ptr<types_handlers_t> handlers;
+    target_record_t primary_target;
+    std::shared_ptr<types_overlay_store_t> primary_store;
 
     test_env_t() {
-        require(static_cast<bool>(resolver.publish(
-                    make_target(1, 4101, 0xA101ULL, "fixture-types.exe"))),
+        primary_target = make_target(1, 4101, 0xA101ULL, "fixture-types.exe");
+        require(static_cast<bool>(resolver.publish(primary_target)),
                 "first types handler target publication failed");
         require(static_cast<bool>(resolver.publish(
                     make_target(2, 4102, 0xA102ULL, "fixture-beta.exe"))),
@@ -85,7 +82,10 @@ struct test_env_t {
             resolver, locks, std::move(workspace_handlers));
         schemas = std::make_unique<protocol::schema_runtime_t>(64);
         handlers = std::make_unique<types_handlers_t>(*workspace, *schemas);
+        primary_store = overlay_store.target_scope(primary_target);
     }
+
+    types_overlay_store_t& store() noexcept { return *primary_store; }
 };
 
 void verify_contracts(const types_handlers_t& handlers,
@@ -160,9 +160,9 @@ void fixture_recursive_type(test_env_t& env, std::size_t& completed) {
     require_fixture(sc["result"].size() == 1, "declare_type", "recursive_type", "result array size");
     require_fixture(sc["result"][0].value("error", "x") == "", "declare_type", "recursive_type", "parse error");
 
-    require_fixture(env.overlay_store.has_type("LIST_NODE"), "declare_type", "recursive_type",
+    require_fixture(env.store().has_type("LIST_NODE"), "declare_type", "recursive_type",
                     "LIST_NODE not in overlay store");
-    const auto* type = env.overlay_store.find_type("LIST_NODE");
+    const auto* type = env.store().find_type("LIST_NODE");
     require_fixture(type != nullptr, "declare_type", "recursive_type", "find_type returned null");
     require_fixture(type->is_udt, "declare_type", "recursive_type", "not marked as UDT");
     require_fixture(type->members.size() == 2, "declare_type", "recursive_type",
@@ -192,14 +192,14 @@ void fixture_conflicting_type(test_env_t& env, std::size_t& completed) {
     auto r1 = adapters::declare_type(*env.handlers, routed({{"decls", json::array({decl1})}}),
                                       cancellation_token_t::create(), metadata);
     require_fixture(!r1.is_error(), "declare_type", "conflicting_type", "first declare failed");
-    const auto* type1 = env.overlay_store.find_type("CONFLICT");
+    const auto* type1 = env.store().find_type("CONFLICT");
     require_fixture(type1 != nullptr && type1->size == 8, "declare_type", "conflicting_type",
                     "first CONFLICT size should be 8");
 
     auto r2 = adapters::declare_type(*env.handlers, routed({{"decls", json::array({decl2})}}),
                                       cancellation_token_t::create(), metadata);
     require_fixture(!r2.is_error(), "declare_type", "conflicting_type", "second declare failed");
-    const auto* type2 = env.overlay_store.find_type("CONFLICT");
+    const auto* type2 = env.store().find_type("CONFLICT");
     require_fixture(type2 != nullptr && type2->size == 24, "declare_type", "conflicting_type",
                     "second CONFLICT size should be 24 (3 pointers)");
     require_fixture(type2->members.size() == 3, "declare_type", "conflicting_type",
@@ -233,7 +233,7 @@ void fixture_invalid_declaration(test_env_t& env, std::size_t& completed) {
 }
 
 void fixture_batch_rollback(test_env_t& env, std::size_t& completed) {
-    const std::uint64_t rev_before = env.overlay_store.revision();
+    const std::uint64_t rev_before = env.store().revision();
     const json metadata{{"fixture_tool", "type_apply_batch"}};
 
     json batch = json::object();
@@ -265,38 +265,56 @@ void fixture_batch_rollback(test_env_t& env, std::size_t& completed) {
     require_fixture(sc["results"][2].value("ok", true) == false, "type_apply_batch", "rollback",
                     "third edit should be skipped (ok=false)");
 
-    require_fixture(!env.overlay_store.has_application("0x140001000"),
+    require_fixture(!env.store().has_application("0x140001000"),
                     "type_apply_batch", "rollback",
                     "first application should be rolled back");
-    require_fixture(!env.overlay_store.has_application("0x140002000"),
+    require_fixture(!env.store().has_application("0x140002000"),
                     "type_apply_batch", "rollback",
                     "third application should not exist");
-    require_fixture(env.overlay_store.revision() == rev_before, "type_apply_batch", "rollback",
+    require_fixture(env.store().revision() == rev_before, "type_apply_batch", "rollback",
                     "revision should be unchanged after rollback");
+
+    batch["stop_on_error"] = false;
+    auto continued = adapters::type_apply_batch(*env.handlers, routed({{"batch", batch}}),
+                                                 cancellation_token_t::create(), metadata);
+    require_fixture(!continued.is_error(), "type_apply_batch", "continued_rollback",
+                    continued.text());
+    const auto& continued_sc = continued.structured_content();
+    require_fixture(!continued_sc.value("ok", true) &&
+                        !continued_sc.value("stopped", true) &&
+                        continued_sc.value("applied", 99) == 0 &&
+                        continued_sc.value("failed", 0) == 3,
+                    "type_apply_batch", "continued_rollback",
+                    "non-stopping failure did not roll back the complete transaction");
+    require_fixture(!env.store().has_application("0x140001000") &&
+                        !env.store().has_application("0x140002000") &&
+                        env.store().revision() == rev_before,
+                    "type_apply_batch", "continued_rollback",
+                    "non-stopping failure retained state or changed revision");
     ++completed;
 }
 
 void fixture_undo(test_env_t& env, std::size_t& completed) {
-    const std::uint64_t rev_before = env.overlay_store.revision();
+    const std::uint64_t rev_before = env.store().revision();
     const json metadata{{"fixture_tool", "declare_type"}};
 
     const std::string decl = "struct UNDO_TEST { int x; char y; };";
     auto result = adapters::declare_type(*env.handlers, routed({{"decls", json::array({decl})}}),
                                           cancellation_token_t::create(), metadata);
     require_fixture(!result.is_error(), "declare_type", "undo", "declare failed");
-    require_fixture(env.overlay_store.has_type("UNDO_TEST"), "declare_type", "undo",
+    require_fixture(env.store().has_type("UNDO_TEST"), "declare_type", "undo",
                     "UNDO_TEST should exist after declare");
-    require_fixture(env.overlay_store.revision() == rev_before + 1, "declare_type", "undo",
+    require_fixture(env.store().revision() == rev_before + 1, "declare_type", "undo",
                     "revision should increment after declare");
 
-    const bool undone = env.overlay_store.undo();
+    const bool undone = env.store().undo();
     require_fixture(undone, "declare_type", "undo", "undo should return true");
-    require_fixture(!env.overlay_store.has_type("UNDO_TEST"), "declare_type", "undo",
+    require_fixture(!env.store().has_type("UNDO_TEST"), "declare_type", "undo",
                     "UNDO_TEST should not exist after undo");
-    require_fixture(env.overlay_store.revision() == rev_before, "declare_type", "undo",
+    require_fixture(env.store().revision() == rev_before, "declare_type", "undo",
                     "revision should be restored after undo");
 
-    const bool undone2 = env.overlay_store.undo();
+    const bool undone2 = env.store().undo();
     require_fixture(!undone2, "declare_type", "undo", "undo on empty stack should return false");
     ++completed;
 }
@@ -310,7 +328,7 @@ void fixture_deterministic_output(test_env_t& env, std::size_t& completed) {
     require_fixture(!r1.is_error(), "declare_type", "deterministic", "first declare failed");
     const std::string out1 = r1.structured_content().dump();
 
-    env.overlay_store.clear();
+    env.store().clear();
     auto r2 = adapters::declare_type(*env.handlers, routed({{"decls", json::array({decl})}}),
                                       cancellation_token_t::create(), metadata);
     require_fixture(!r2.is_error(), "declare_type", "deterministic", "second declare failed");
@@ -326,6 +344,42 @@ void fixture_deterministic_output(test_env_t& env, std::size_t& completed) {
     require_fixture(search1.structured_content().dump() == search2.structured_content().dump(),
                     "search_structs", "deterministic",
                     "search output should be identical for same input");
+
+    env.store().clear();
+    auto tied_types = adapters::declare_type(*env.handlers, routed({{"decls", json::array({
+        "struct ZETA { int value; };",
+        "struct ROOT { int value; };",
+        "struct ZREF { ROOT* root; };",
+        "struct AREF { ROOT* root; };",
+        "struct ALPHA { int value; };",
+        "struct MIKE { int value; };",
+    })}}), cancellation_token_t::create(), metadata);
+    require_fixture(!tied_types.is_error(), "declare_type", "deterministic_ties",
+                    tied_types.text());
+    const json size_query = routed({{"queries", json{{"sort_by", "size"}}}});
+    auto size_result = adapters::type_query(*env.handlers, size_query,
+                                             cancellation_token_t::create(), metadata);
+    require_fixture(!size_result.is_error(), "type_query", "deterministic_ties",
+                    size_result.text());
+    const auto& size_data = size_result.structured_content()["result"][0]["data"];
+    require_fixture(size_data.size() == 6 &&
+                        size_data[0].value("name", "") == "ALPHA" &&
+                        size_data[1].value("name", "") == "MIKE" &&
+                        size_data[2].value("name", "") == "ROOT" &&
+                        size_data[3].value("name", "") == "ZETA" &&
+                        size_data[4].value("name", "") == "AREF" &&
+                        size_data[5].value("name", "") == "ZREF",
+                    "type_query", "deterministic_ties",
+                    "equal-size rows were not canonically name-ordered");
+    auto relations = adapters::type_query(*env.handlers,
+        routed({{"queries", json{{"filter", "ROOT"}, {"include_relationships", true}}}}),
+        cancellation_token_t::create(), metadata);
+    require_fixture(!relations.is_error(), "type_query", "deterministic_relations",
+                    relations.text());
+    const auto& related = relations.structured_content()["result"][0]["data"][0]["related_types"];
+    require_fixture(related == json::array({"AREF", "ZREF"}),
+                    "type_query", "deterministic_relations",
+                    "related types were not canonically ordered before truncation");
     ++completed;
 }
 
@@ -433,7 +487,7 @@ void fixture_enum_upsert(test_env_t& env, std::size_t& completed) {
     require_fixture(summary.value("conflicts", 99) == 0, "enum_upsert", "create",
                     "summary conflicts should be 0");
 
-    const auto* type = env.overlay_store.find_type("COLOR");
+    const auto* type = env.store().find_type("COLOR");
     require_fixture(type != nullptr, "enum_upsert", "create", "COLOR not in store");
     require_fixture(type->is_enum, "enum_upsert", "create", "should be enum");
     require_fixture(type->enumerators.size() == 3, "enum_upsert", "create",
@@ -460,7 +514,7 @@ void fixture_enum_upsert(test_env_t& env, std::size_t& completed) {
                     "summary created should be 1 (YELLOW)");
     require_fixture(upd_summary.value("skipped", 99) == 1, "enum_upsert", "update",
                     "summary skipped should be 1 (RED)");
-    const auto* type2 = env.overlay_store.find_type("COLOR");
+    const auto* type2 = env.store().find_type("COLOR");
     require_fixture(type2->enumerators.size() == 4, "enum_upsert", "update",
                     "should have 4 enumerators after upsert");
     ++completed;
@@ -473,18 +527,21 @@ void fixture_inference_confidence(test_env_t& env, std::size_t& completed) {
                                                cancellation_token_t::create(), metadata);
     require_fixture(!decl_result.is_error(), "infer_types", "confidence", "declare failed");
 
-    const json set_args = routed({{"edits", json{{"addr", "0x140005000"}, {"ty", "INFER_TARGET*"}}}});
+    const json set_args = routed({{"edits", json::array({
+        json{{"addr", "0x140005000"}, {"ty", "INFER_TARGET*"}},
+        json{{"addr", "0x140006000"}, {"signature", "INFER_TARGET* candidate"}},
+    })}});
     auto set_result = adapters::set_type(*env.handlers, set_args,
                                           cancellation_token_t::create(), metadata);
     require_fixture(!set_result.is_error(), "infer_types", "confidence", "set_type failed");
 
     auto infer_result = adapters::infer_types(*env.handlers,
-        routed({{"addrs", json::array({"0x140005000", "0x140006000"})}}),
+        routed({{"addrs", json::array({"0x140005000", "0x140006000", "0x140007000"})}}),
         cancellation_token_t::create(), metadata);
     require_fixture(!infer_result.is_error(), "infer_types", "confidence", infer_result.text());
     const auto& sc = infer_result.structured_content();
-    require_fixture(sc["result"].size() == 2, "infer_types", "confidence",
-                    "should have 2 results");
+    require_fixture(sc["result"].size() == 3, "infer_types", "confidence",
+                    "should have 3 results");
 
     require_fixture(sc["result"][0].value("addr", "") == "0x140005000", "infer_types", "confidence",
                     "first addr mismatch");
@@ -499,10 +556,16 @@ void fixture_inference_confidence(test_env_t& env, std::size_t& completed) {
 
     require_fixture(sc["result"][1].value("addr", "") == "0x140006000", "infer_types", "confidence",
                     "second addr mismatch");
-    require_fixture(sc["result"][1].value("confidence", "") == "low", "infer_types", "confidence",
-                    "second confidence should be low or medium (no prior application)");
-    require_fixture(!sc["result"][1]["method"].is_null(), "infer_types", "confidence",
-                    "second method should not be null when a type is inferred");
+    require_fixture(sc["result"][1].value("inferred_type", "") == "INFER_TARGET*" &&
+                        sc["result"][1].value("confidence", "") == "medium" &&
+                        sc["result"][1].value("method", "") == "xref_analysis",
+                    "infer_types", "confidence",
+                    "second address did not reach medium-confidence xref inference");
+    require_fixture(sc["result"][2].value("addr", "") == "0x140007000" &&
+                        sc["result"][2].value("confidence", "") == "low" &&
+                        sc["result"][2].value("method", "") == "size_heuristic",
+                    "infer_types", "confidence",
+                    "third address did not use deterministic low-confidence fallback");
     ++completed;
 }
 
@@ -522,16 +585,17 @@ void fixture_set_type_and_batch_success(test_env_t& env, std::size_t& completed)
                     "first edit should succeed");
     require_fixture(sc["result"][1].value("ok", false) == true, "set_type", "batch_success",
                     "second edit should succeed");
-    require_fixture(env.overlay_store.has_application("0x14001000"), "set_type", "batch_success",
+    require_fixture(env.store().has_application("0x14001000"), "set_type", "batch_success",
                     "first application should exist");
-    require_fixture(env.overlay_store.has_application("0x14002000"), "set_type", "batch_success",
+    require_fixture(env.store().has_application("0x14002000"), "set_type", "batch_success",
                     "second application should exist");
 
-    const auto* app = env.overlay_store.find_application("0x14001000");
+    const auto* app = env.store().find_application("0x14001000");
     require_fixture(app != nullptr, "set_type", "batch_success", "application not found");
     require_fixture(app->ty == "DWORD", "set_type", "batch_success", "type mismatch");
     require_fixture(app->kind == "data", "set_type", "batch_success", "kind mismatch");
 
+    const auto batch_revision = env.store().revision();
     const json batch_args = routed({{"batch", json{
         {"stop_on_error", false},
         {"edits", json::array({
@@ -557,6 +621,45 @@ void fixture_set_type_and_batch_success(test_env_t& env, std::size_t& completed)
                     "first batch edit should succeed");
     require_fixture(bsc["results"][1].value("ok", false) == true, "type_apply_batch", "batch_success",
                     "second batch edit should succeed");
+    require_fixture(env.store().revision() == batch_revision + 1,
+                    "type_apply_batch", "batch_success",
+                    "successful transaction did not commit exactly one revision");
+    require_fixture(env.store().undo() &&
+                        !env.store().has_application("0x14003000") &&
+                        !env.store().has_application("0x14004000") &&
+                        env.store().has_application("0x14001000") &&
+                        env.store().has_application("0x14002000") &&
+                        env.store().revision() == batch_revision,
+                    "type_apply_batch", "batch_success",
+                    "transactional undo did not restore the complete batch atomically");
+    ++completed;
+}
+
+void fixture_target_scoping(test_env_t& env, std::size_t& completed) {
+    const json metadata{{"fixture_tool", "target_scoping"}};
+    auto first = adapters::declare_type(*env.handlers,
+        routed({{"decls", "struct FIRST_SCOPE_ONLY { int value; };"}}),
+        cancellation_token_t::create(), metadata);
+    require_fixture(!first.is_error(), "declare_type", "target_scoping", first.text());
+
+    json second_declare{{"decls", "struct SECOND_SCOPE_ONLY { int value; };"}, {"pid", 4102}};
+    auto second = adapters::declare_type(*env.handlers, second_declare,
+        cancellation_token_t::create(), metadata);
+    require_fixture(!second.is_error(), "declare_type", "target_scoping", second.text());
+
+    json second_query{{"queries", json{{"name", "FIRST_SCOPE_ONLY"}}}, {"pid", 4102}};
+    auto second_view = adapters::type_inspect(*env.handlers, second_query,
+        cancellation_token_t::create(), metadata);
+    auto first_view = adapters::type_inspect(*env.handlers,
+        routed({{"queries", json{{"name", "SECOND_SCOPE_ONLY"}}}}),
+        cancellation_token_t::create(), metadata);
+    require_fixture(!first_view.is_error() && !second_view.is_error(),
+                    "type_inspect", "target_scoping",
+                    "cross-target inspection failed before isolation could be checked");
+    require_fixture(!first_view.structured_content()["result"][0].value("exists", true) &&
+                        !second_view.structured_content()["result"][0].value("exists", true),
+                    "type_inspect", "target_scoping",
+                    "type overlay mutations crossed resolved target scopes");
     ++completed;
 }
 
@@ -619,12 +722,13 @@ void verify_type_handlers() {
     fixture_enum_upsert(env, completed);
     fixture_inference_confidence(env, completed);
     fixture_set_type_and_batch_success(env, completed);
+    fixture_target_scoping(env, completed);
     fixture_invalid_pid(env, completed);
     fixture_cancellation(env, completed);
     fixture_collection_routing(env, completed);
 
-    require(completed == 13,
-            "types handler harness did not execute all thirteen fixture families");
+    require(completed == 14,
+            "types handler harness did not execute all fourteen fixture families");
 }
 
 }

@@ -1,7 +1,17 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
 #include "search_index.hpp"
 
 #include "checked_range.hpp"
 #include "pe_image.hpp"
+
+#include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <array>
@@ -11,6 +21,8 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace aida::analysis {
 namespace {
@@ -154,6 +166,21 @@ bool packed_address_equal(const packed_address_t& lhs, const packed_address_t& r
     return lhs.value == rhs.value && lhs.metadata == rhs.metadata;
 }
 
+search_generation_identity_t snapshot_identity(const analysis_snapshot_t& snapshot) noexcept {
+    search_generation_identity_t result;
+    result.binary_id = snapshot.binary_id;
+    result.load_profile_hash = snapshot.load_profile_hash;
+    result.generation = snapshot.generation;
+    result.analysis_revision = snapshot.analysis_revision;
+    result.overlay_revision = snapshot.overlay_revision;
+    if (snapshot.normalized_image) {
+        result.provider_size = snapshot.normalized_image->provider_size;
+        if (!snapshot.normalized_image->provider_content_hash.empty())
+            result.provider_content_hash = snapshot.normalized_image->provider_content_hash;
+    }
+    return result;
+}
+
 std::string normalize_text(std::string_view text) {
     std::string result;
     result.reserve(text.size());
@@ -181,11 +208,12 @@ std::uint32_t trigram_key(const char* value) noexcept {
         (static_cast<std::uint32_t>(static_cast<unsigned char>(value[2])) << 16U);
 }
 
-workspace_error_t stop_error(const cancellation_token_t& cancel, const char* phase) {
-    if (cancel.deadline_exceeded()) {
+workspace_error_t stop_error(const cancellation_token_t& cancel, const char* phase,
+    bool elapsed_deadline = false) {
+    if (elapsed_deadline || cancel.deadline_exceeded()) {
         auto error = make_workspace_error(workspace_error_code_t::deadline_exceeded,
             "search operation exceeded its deadline", phase);
-        error.cancellation = true;
+        error.cancellation = cancel.cancellation_requested();
         error.deadline = true;
         return error;
     }
@@ -224,6 +252,15 @@ workspace_result_t<void> validate_filter_range(const std::optional<address_t>& b
     return workspace_result_t<void>::success();
 }
 
+workspace_result_t<void> validate_running(const cancellation_token_t& cancel,
+    search_deadline_t deadline, const char* phase) {
+    if (cancel.stop_requested())
+        return workspace_result_t<void>::failure(stop_error(cancel, phase));
+    if (deadline && std::chrono::steady_clock::now() >= *deadline)
+        return workspace_result_t<void>::failure(stop_error(cancel, phase, true));
+    return workspace_result_t<void>::success();
+}
+
 bool address_matches_range(const address_t& address,
     const std::optional<address_t>& begin, const std::optional<address_t>& end) noexcept {
     return !begin || (! (address < *begin) && address < *end);
@@ -256,14 +293,21 @@ template <typename RefAt, typename Predicate, typename Materialize>
 workspace_result_t<search_page_t> filtered_page(std::size_t candidate_count,
     RefAt&& ref_at, Predicate&& predicate, Materialize&& materialize,
     std::uint64_t offset, std::uint32_t limit, std::uint32_t cancellation_interval,
-    const cancellation_token_t& cancel, const char* phase) {
+    const cancellation_token_t& cancel, search_deadline_t deadline, const char* phase) {
     search_page_t page;
     page.hits.reserve(limit);
     const auto interval = static_cast<std::size_t>(std::max<std::uint32_t>(1U,
         cancellation_interval));
     for (std::size_t index = 0; index < candidate_count; ++index) {
-        if ((index % interval) == 0 && cancel.stop_requested())
-            return workspace_result_t<search_page_t>::failure(stop_error(cancel, phase));
+        if ((index % interval) == 0) {
+            ++page.cancellation_checks;
+            if (cancel.stop_requested())
+                return workspace_result_t<search_page_t>::failure(stop_error(cancel, phase));
+            if (deadline && std::chrono::steady_clock::now() >= *deadline)
+                return workspace_result_t<search_page_t>::failure(
+                    stop_error(cancel, phase, true));
+        }
+        ++page.candidates_examined;
         const auto reference = ref_at(index);
         if (!predicate(reference))
             continue;
@@ -287,6 +331,11 @@ workspace_result_t<search_page_t> filtered_page(std::size_t candidate_count,
 
 struct search_index_t::impl_t {
     std::shared_ptr<const analysis_snapshot_t> snapshot;
+    std::weak_ptr<const analysis_snapshot_t> snapshot_owner;
+    search_generation_identity_t identity;
+    architecture_id_t architecture = architecture_id_t::unknown;
+    architecture_mode_t architecture_mode = architecture_mode_t::unknown;
+    std::array<std::uint64_t, 2> cursor_integrity_key{};
     std::vector<data_candidate_record_t> data_candidates;
     std::vector<switch_record_t> switches;
     std::vector<type_candidate_record_t> types;
@@ -481,6 +530,25 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
 
         auto impl = std::make_unique<impl_t>();
         impl->snapshot = std::move(snapshot);
+        impl->snapshot_owner = impl->snapshot;
+        impl->identity = snapshot_identity(*impl->snapshot);
+        if (impl->snapshot->normalized_image) {
+            impl->architecture = impl->snapshot->normalized_image->architecture;
+            impl->architecture_mode = impl->snapshot->normalized_image->architecture_mode;
+        } else if (impl->snapshot->image) {
+            impl->architecture = impl->snapshot->image->architecture();
+            impl->architecture_mode = impl->snapshot->image->architecture_mode();
+        }
+        const auto random_status = BCryptGenRandom(nullptr,
+            reinterpret_cast<PUCHAR>(impl->cursor_integrity_key.data()),
+            static_cast<ULONG>(sizeof(impl->cursor_integrity_key)),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!BCRYPT_SUCCESS(random_status) ||
+            (impl->cursor_integrity_key[0] == 0 && impl->cursor_integrity_key[1] == 0)) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                    "search cursor integrity entropy is unavailable", "search_index"));
+        }
         impl->data_candidates = std::move(data_candidates);
         impl->switches = std::move(switches);
         impl->types = std::move(types);
@@ -842,6 +910,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
         accounting.memory_bytes = memory_bytes;
         if (impl->metrics)
             impl->metrics->set(analysis_metric_t::indexed_bytes, memory_bytes);
+        impl->snapshot.reset();
         return workspace_result_t<std::shared_ptr<search_index_t>>::success(
             std::shared_ptr<search_index_t>(new search_index_t(std::move(impl))));
     } catch (const std::bad_alloc&) {
@@ -856,18 +925,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
 }
 
 search_generation_identity_t search_index_t::identity() const noexcept {
-    search_generation_identity_t result;
-    result.binary_id = impl_->snapshot->binary_id;
-    result.load_profile_hash = impl_->snapshot->load_profile_hash;
-    result.generation = impl_->snapshot->generation;
-    result.analysis_revision = impl_->snapshot->analysis_revision;
-    result.overlay_revision = impl_->snapshot->overlay_revision;
-    if (impl_->snapshot->normalized_image) {
-        result.provider_size = impl_->snapshot->normalized_image->provider_size;
-        if (!impl_->snapshot->normalized_image->provider_content_hash.empty())
-            result.provider_content_hash = impl_->snapshot->normalized_image->provider_content_hash;
-    }
-    return result;
+    return impl_->identity;
 }
 
 search_generation_handle_t search_index_t::generation_handle() const {
@@ -875,59 +933,56 @@ search_generation_handle_t search_index_t::generation_handle() const {
 }
 
 std::uint64_t search_index_t::generation() const noexcept {
-    return impl_->snapshot->generation;
+    return impl_->identity.generation;
 }
 
 const binary_id_t& search_index_t::binary_id() const noexcept {
-    return impl_->snapshot->binary_id;
+    return impl_->identity.binary_id;
 }
 
 const sha256_digest_t& search_index_t::load_profile_hash() const noexcept {
-    return impl_->snapshot->load_profile_hash;
+    return impl_->identity.load_profile_hash;
 }
 
 std::uint64_t search_index_t::analysis_revision() const noexcept {
-    return impl_->snapshot->analysis_revision;
+    return impl_->identity.analysis_revision;
 }
 
 std::uint64_t search_index_t::overlay_revision() const noexcept {
-    return impl_->snapshot->overlay_revision;
+    return impl_->identity.overlay_revision;
 }
 
 bool search_index_t::matches(
     const std::shared_ptr<const analysis_snapshot_t>& snapshot) const noexcept {
-    return snapshot && impl_->snapshot == snapshot &&
-        impl_->snapshot->binary_id == snapshot->binary_id &&
-        impl_->snapshot->load_profile_hash == snapshot->load_profile_hash &&
-        impl_->snapshot->generation == snapshot->generation &&
-        impl_->snapshot->analysis_revision == snapshot->analysis_revision &&
-        impl_->snapshot->overlay_revision == snapshot->overlay_revision;
+    return snapshot && impl_->identity == snapshot_identity(*snapshot) &&
+        !impl_->snapshot_owner.owner_before(snapshot) &&
+        !snapshot.owner_before(impl_->snapshot_owner);
 }
 
 bool search_index_t::matches(std::uint64_t generation_value,
     std::uint64_t analysis_revision_value, std::uint64_t overlay_revision_value) const noexcept {
-    return impl_->snapshot->generation == generation_value &&
-        impl_->snapshot->analysis_revision == analysis_revision_value &&
-        impl_->snapshot->overlay_revision == overlay_revision_value;
+    return impl_->identity.generation == generation_value &&
+        impl_->identity.analysis_revision == analysis_revision_value &&
+        impl_->identity.overlay_revision == overlay_revision_value;
 }
 
 bool search_index_t::matches(const binary_id_t& binary_id_value,
     const sha256_digest_t& load_profile_hash_value, std::uint64_t generation_value,
     std::uint64_t analysis_revision_value, std::uint64_t overlay_revision_value) const noexcept {
-    return impl_->snapshot->binary_id == binary_id_value &&
-        impl_->snapshot->load_profile_hash == load_profile_hash_value &&
+    return impl_->identity.binary_id == binary_id_value &&
+        impl_->identity.load_profile_hash == load_profile_hash_value &&
         matches(generation_value, analysis_revision_value, overlay_revision_value);
 }
 
 workspace_result_t<void> search_index_t::verify_identity(
     const binary_id_t& expected_binary_id,
     const sha256_digest_t& expected_load_profile_hash) const {
-    if (impl_->snapshot->binary_id != expected_binary_id)
+    if (impl_->identity.binary_id != expected_binary_id)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::substitution_rejected,
                 "search index binary_id does not match the expected workspace identity",
                 "search_index"));
-    if (impl_->snapshot->load_profile_hash != expected_load_profile_hash)
+    if (impl_->identity.load_profile_hash != expected_load_profile_hash)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::substitution_rejected,
                 "search index load_profile_hash does not match the expected workspace identity",
@@ -975,13 +1030,8 @@ address_t search_index_t::file_offset_address(std::uint64_t offset) const noexce
     address_t address;
     address.space = address_space_id_t::file_offset;
     address.value = offset;
-    if (impl_->snapshot->normalized_image) {
-        address.architecture = impl_->snapshot->normalized_image->architecture;
-        address.mode = impl_->snapshot->normalized_image->architecture_mode;
-    } else if (impl_->snapshot->image) {
-        address.architecture = impl_->snapshot->image->architecture();
-        address.mode = impl_->snapshot->image->architecture_mode();
-    }
+    address.architecture = impl_->architecture;
+    address.mode = impl_->architecture_mode;
     return address;
 }
 
@@ -997,8 +1047,14 @@ std::optional<search_record_view_t> search_index_t::text_record(std::size_t inde
     return impl_->view(impl_->text_references[index].record);
 }
 
+const std::array<std::uint64_t, 2>&
+search_index_t::cursor_integrity_key() const noexcept {
+    return impl_->cursor_integrity_key;
+}
+
 workspace_result_t<search_page_t> search_index_t::find_text(const std::string& text,
-    std::uint64_t offset, std::uint32_t limit, const cancellation_token_t& cancel) const {
+    std::uint64_t offset, std::uint32_t limit, const cancellation_token_t& cancel,
+    search_deadline_t deadline) const {
     auto valid = validate_page(limit, impl_->limits.max_results_per_query, "search_index");
     if (!valid)
         return workspace_result_t<search_page_t>::failure(valid.error());
@@ -1008,6 +1064,9 @@ workspace_result_t<search_page_t> search_index_t::find_text(const std::string& t
         error.details.emplace_back("maximum", std::to_string(impl_->limits.max_query_bytes));
         return workspace_result_t<search_page_t>::failure(std::move(error));
     }
+    auto running = validate_running(cancel, deadline, "search_index");
+    if (!running)
+        return workspace_result_t<search_page_t>::failure(running.error());
     const auto normalized = normalize_text(text);
     if (normalized.empty()) {
         return workspace_result_t<search_page_t>::failure(
@@ -1019,9 +1078,14 @@ workspace_result_t<search_page_t> search_index_t::find_text(const std::string& t
         std::vector<std::uint32_t> keys;
         keys.reserve(normalized.size() - 2U);
         for (std::size_t index = 0; index + 3U <= normalized.size(); ++index) {
-            if ((index & 0x3ffU) == 0 && cancel.stop_requested())
-                return workspace_result_t<search_page_t>::failure(
-                    stop_error(cancel, "search_index"));
+            if ((index & 0x3ffU) == 0) {
+                if (cancel.stop_requested())
+                    return workspace_result_t<search_page_t>::failure(
+                        stop_error(cancel, "search_index"));
+                if (deadline && std::chrono::steady_clock::now() >= *deadline)
+                    return workspace_result_t<search_page_t>::failure(
+                        stop_error(cancel, "search_index", true));
+            }
             keys.push_back(trigram_key(normalized.data() + index));
         }
         std::sort(keys.begin(), keys.end());
@@ -1054,26 +1118,30 @@ workspace_result_t<search_page_t> search_index_t::find_text(const std::string& t
         return impl_->hit(impl_->text_references[text_reference].record);
     };
     return filtered_page(candidate_count, reference_at, predicate, materialize,
-        offset, limit, impl_->limits.cancellation_check_interval, cancel, "search_index");
+        offset, limit, impl_->limits.cancellation_check_interval, cancel,
+        deadline, "search_index");
 }
 
 workspace_result_t<search_page_t> search_index_t::find_opcode(std::uint32_t opcode_id,
-    std::uint64_t offset, std::uint32_t limit, const cancellation_token_t& cancel) const {
+    std::uint64_t offset, std::uint32_t limit, const cancellation_token_t& cancel,
+    search_deadline_t deadline) const {
     search_instruction_filter_t filter;
     filter.opcode_id = opcode_id;
-    return find_instruction(filter, offset, limit, cancel);
+    return find_instruction(filter, offset, limit, cancel, deadline);
 }
 
 workspace_result_t<search_page_t> search_index_t::find_immediate(std::uint64_t value,
-    std::uint64_t offset, std::uint32_t limit, const cancellation_token_t& cancel) const {
+    std::uint64_t offset, std::uint32_t limit, const cancellation_token_t& cancel,
+    search_deadline_t deadline) const {
     search_instruction_filter_t filter;
     filter.immediate = value;
-    return find_instruction(filter, offset, limit, cancel);
+    return find_instruction(filter, offset, limit, cancel, deadline);
 }
 
 workspace_result_t<search_page_t> search_index_t::find_instruction(
     const search_instruction_filter_t& filter, std::uint64_t offset,
-    std::uint32_t limit, const cancellation_token_t& cancel) const {
+    std::uint32_t limit, const cancellation_token_t& cancel,
+    search_deadline_t deadline) const {
     auto valid = validate_page(limit, impl_->limits.max_results_per_query, "query_index");
     if (!valid)
         return workspace_result_t<search_page_t>::failure(valid.error());
@@ -1085,6 +1153,9 @@ workspace_result_t<search_page_t> search_index_t::find_instruction(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                 "instruction flow requirements contradict exclusions", "query_index"));
     }
+    auto running = validate_running(cancel, deadline, "query_index");
+    if (!running)
+        return workspace_result_t<search_page_t>::failure(running.error());
 
     const packed_key32_reference_t* opcode_begin = nullptr;
     std::size_t opcode_count = 0;
@@ -1185,12 +1256,14 @@ workspace_result_t<search_page_t> search_index_t::find_instruction(
         return hit;
     };
     return filtered_page(candidate_count, reference_at, predicate, materialize,
-        offset, limit, impl_->limits.cancellation_check_interval, cancel, "query_index");
+        offset, limit, impl_->limits.cancellation_check_interval, cancel,
+        deadline, "query_index");
 }
 
 workspace_result_t<search_page_t> search_index_t::find_entity(
     const search_entity_filter_t& filter, std::uint64_t offset,
-    std::uint32_t limit, const cancellation_token_t& cancel) const {
+    std::uint32_t limit, const cancellation_token_t& cancel,
+    search_deadline_t deadline) const {
     auto valid = validate_page(limit, impl_->limits.max_results_per_query, "query_index");
     if (!valid)
         return workspace_result_t<search_page_t>::failure(valid.error());
@@ -1204,6 +1277,9 @@ workspace_result_t<search_page_t> search_index_t::find_entity(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                 "entity search identifier is invalid", "query_index"));
     }
+    auto running = validate_running(cancel, deadline, "query_index");
+    if (!running)
+        return workspace_result_t<search_page_t>::failure(running.error());
 
     const std::vector<std::uint32_t>* references = &impl_->address_references;
     std::size_t begin_index = 0;
@@ -1247,12 +1323,14 @@ workspace_result_t<search_page_t> search_index_t::find_entity(
         return impl_->hit(reference);
     };
     return filtered_page(candidate_count, reference_at, predicate, materialize,
-        offset, limit, impl_->limits.cancellation_check_interval, cancel, "query_index");
+        offset, limit, impl_->limits.cancellation_check_interval, cancel,
+        deadline, "query_index");
 }
 
 workspace_result_t<search_page_t> search_index_t::find_address_range(
     const address_t& begin, const address_t& end, std::uint64_t offset,
-    std::uint32_t limit, const cancellation_token_t& cancel) const {
+    std::uint32_t limit, const cancellation_token_t& cancel,
+    search_deadline_t deadline) const {
     auto valid = validate_page(limit, impl_->limits.max_results_per_query, "search_index");
     if (!valid)
         return workspace_result_t<search_page_t>::failure(valid.error());
@@ -1262,6 +1340,9 @@ workspace_result_t<search_page_t> search_index_t::find_address_range(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                 "address search range is invalid", "search_index"));
     }
+    auto running = validate_running(cancel, deadline, "search_index");
+    if (!running)
+        return workspace_result_t<search_page_t>::failure(running.error());
     const auto first = std::lower_bound(impl_->address_references.begin(),
         impl_->address_references.end(), begin,
         [&](std::uint32_t reference, const address_t& address) {
@@ -1281,7 +1362,8 @@ workspace_result_t<search_page_t> search_index_t::find_address_range(
         return impl_->hit(reference);
     };
     return filtered_page(count, reference_at, predicate, materialize,
-        offset, limit, impl_->limits.cancellation_check_interval, cancel, "search_index");
+        offset, limit, impl_->limits.cancellation_check_interval, cancel,
+        deadline, "search_index");
 }
 
 }

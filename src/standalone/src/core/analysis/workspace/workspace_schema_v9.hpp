@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -18,10 +19,15 @@ inline constexpr std::uint32_t packed_page_magic = 0x5041434BU;
 inline constexpr std::uint32_t packed_page_blob_version = 1;
 inline constexpr std::uint32_t packed_page_header_size = 64;
 inline constexpr std::uint32_t packed_page_max_payload = 1U << 20;
+inline constexpr std::uint64_t packed_generation_max_payload_bytes = 512ULL << 20;
+inline constexpr std::uint32_t packed_generation_max_pages = 131072;
+inline constexpr std::uint32_t packed_generation_max_index_rows = 131072;
+inline constexpr std::uint64_t packed_generation_max_metadata_bytes = 16ULL << 20;
 inline constexpr std::uint32_t packed_page_checkpoint_type = 0xFFFFFFFFU;
 inline constexpr std::uint32_t packed_page_default_size = 4096;
 inline constexpr std::uint32_t decompiler_cache_v9_key_version = 1;
 inline constexpr std::uint32_t fixed_width_address_size = 16;
+inline constexpr std::uint64_t workbench_state_max_payload_bytes = 16ULL << 20;
 
 enum class packed_page_type_t : std::uint32_t {
     instructions = 1,
@@ -37,8 +43,16 @@ enum class packed_page_type_t : std::uint32_t {
     xrefs = 11,
     coverage = 12,
     search_index = 13,
+    call_graph = 14,
+    pointer_facts = 15,
+    type_references = 16,
+    metadata_conflicts = 17,
+    symbol_type_candidates = 18,
     checkpoint = 0xFFFFFFFFU
 };
+
+inline constexpr auto packed_page_last_data_type =
+    packed_page_type_t::symbol_type_candidates;
 
 struct packed_generation_record_t {
     std::uint64_t generation = 0;
@@ -73,16 +87,21 @@ struct packed_page_index_row_t {
     std::uint64_t address_value_max = 0;
 };
 
+struct packed_generation_publication_t {
+    packed_generation_record_t generation;
+    std::vector<packed_page_row_t> pages;
+    std::vector<packed_page_index_row_t> index;
+};
+
+using packed_stop_predicate_t = std::function<bool()>;
+using packed_publish_stop_predicate_t = packed_stop_predicate_t;
+
 struct workbench_state_record_t {
-    bool has_selection = false;
-    address_t selection;
-    std::string navigation_back_json;
-    std::string navigation_forward_json;
-    std::string bookmarks_json;
-    std::string layout_json;
-    std::int32_t active_tab = 0;
-    std::int32_t zoom_level = 100;
+    std::uint64_t workspace_id = 0;
+    std::uint32_t contract_schema_version = 0;
     std::uint64_t revision = 0;
+    std::uint64_t fingerprint = 0;
+    std::string payload_json;
     std::uint64_t updated_utc_ms = 0;
 };
 
@@ -144,19 +163,34 @@ workspace_result_t<void> write_packed_generation(
     sqlite3* database, const packed_generation_record_t& record);
 
 workspace_result_t<std::optional<packed_generation_record_t>>
-    read_packed_generation(sqlite3* database, std::uint64_t generation);
+    read_packed_generation(sqlite3* database, std::uint64_t generation,
+                           bool committed_only = true,
+                           const packed_stop_predicate_t& stop_requested = {});
 
 workspace_result_t<void> write_packed_page(
     sqlite3* database, const packed_page_row_t& row);
 
 workspace_result_t<std::vector<packed_page_row_t>>
-    read_packed_pages(sqlite3* database, std::uint64_t generation);
+    read_packed_pages(sqlite3* database, std::uint64_t generation,
+                      bool committed_only = true,
+                      const packed_stop_predicate_t& stop_requested = {});
 
 workspace_result_t<void> write_packed_page_index(
     sqlite3* database, const packed_page_index_row_t& row);
 
 workspace_result_t<std::vector<packed_page_index_row_t>>
-    read_packed_page_index(sqlite3* database, std::uint64_t generation);
+    read_packed_page_index(sqlite3* database, std::uint64_t generation,
+                           bool committed_only = true,
+                           const packed_stop_predicate_t& stop_requested = {});
+
+workspace_result_t<void> publish_packed_generation_atomic(
+    sqlite3* database, const packed_generation_publication_t& publication,
+    const packed_publish_stop_predicate_t& stop_requested = {});
+
+workspace_result_t<std::optional<packed_generation_publication_t>>
+    read_packed_generation_publication(sqlite3* database,
+                                       std::uint64_t generation,
+                                       const packed_stop_predicate_t& stop_requested = {});
 
 workspace_result_t<void> write_workbench_state(
     sqlite3* database, const workbench_state_record_t& record);

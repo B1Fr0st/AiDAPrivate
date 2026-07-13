@@ -3,7 +3,6 @@
 #include "../../src/core/mcp/compat/handlers/python.hpp"
 #include "../../src/core/mcp/compat/ida_contracts_generated.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -22,7 +21,6 @@ namespace {
 
 using namespace aida::standalone::mcp::compat;
 using namespace aida::standalone::mcp::compat::handlers;
-using namespace aida::standalone::mcp::compat::adapters;
 using protocol::cancellation_token_t;
 using protocol::json;
 
@@ -39,801 +37,484 @@ void require_fixture(bool condition, std::string_view category, std::string_view
     }
 }
 
-struct mock_executor_state_t final {
+python_workspace_response_t workspace_response(
+    const python_workspace_query_t& query,
+    const std::atomic<bool>*) {
+    python_workspace_response_t response;
+    response.success = true;
+    response.data = json{{"operation", query.operation}, {"arguments", query.arguments}};
+    return response;
+}
+
+python_target_lease_t make_target(std::uint32_t pid,
+                                  std::string workspace_id,
+                                  std::string bin_name,
+                                  std::string source_path,
+                                  std::uint64_t generation,
+                                  bool live = false) {
+    python_target_lease_t target;
+    target.owner = std::make_shared<std::uint64_t>(generation);
+    target.workspace_id = std::move(workspace_id);
+    target.pid = pid;
+    target.bin_name = std::move(bin_name);
+    target.normalized_source_path = std::move(source_path);
+    target.generation = generation;
+    target.analysis_revision = generation + 10;
+    target.overlay_revision = generation + 20;
+    target.live = live;
+    target.workspace_metadata = json{{"architecture", "x86_64"}};
+    target.workspace_api = workspace_response;
+    return target;
+}
+
+struct target_state_t final {
+    std::vector<python_target_lease_t> targets;
     std::size_t calls = 0;
-    std::uint64_t last_job_id = 0;
-    std::string last_script_path;
-    json last_workspace_metadata = json::object();
-    bool last_unsafe_approved = false;
-    bool last_cancellation_present = false;
-    bool last_deadline_present = false;
+    target_selector_t last_selector;
+    bool reject = false;
+    adapter_error_t rejection{
+        adapter_error_code_t::target_resolution_failed,
+        "fixture_target_not_found", 0, 0};
+
+    adapter_result_t<python_target_lease_t> acquire(
+        const target_selector_t& selector,
+        std::optional<std::chrono::steady_clock::time_point> deadline) {
+        ++calls;
+        last_selector = selector;
+        if (reject || !deadline || *deadline <= std::chrono::steady_clock::now()) {
+            return adapter_result_t<python_target_lease_t>::failure(rejection);
+        }
+        const python_target_lease_t* match = nullptr;
+        for (const auto& target : targets) {
+            const bool pid_match = !selector.pid || target.pid == selector.pid;
+            const bool name_match = !selector.bin_name || target.bin_name == *selector.bin_name;
+            if (pid_match && name_match) {
+                if (match != nullptr) {
+                    return adapter_result_t<python_target_lease_t>::failure({
+                        adapter_error_code_t::target_resolution_failed,
+                        "target_ambiguous", 1, 2});
+                }
+                match = &target;
+            }
+        }
+        if (match == nullptr) {
+            return adapter_result_t<python_target_lease_t>::failure(rejection);
+        }
+        return adapter_result_t<python_target_lease_t>::success(*match);
+    }
+};
+
+python_worker_execution_result_t completed_result() {
     python_worker_execution_result_t result;
+    result.status = python_worker_status_t::completed;
+    result.result = "analysis complete";
+    result.stdout_text = "worker stdout";
+    result.stderr_text.clear();
+    result.worker_generation = 7;
+    result.worker_process_id = 9911;
+    result.worker_terminated = true;
+    result.worker_replaced = false;
+    return result;
+}
+
+struct executor_state_t final {
+    std::size_t calls = 0;
+    std::filesystem::path last_root;
+    python_worker_execution_request_t last_request;
+    python_worker_execution_result_t result = completed_result();
     bool throw_exception = false;
-    std::string exception_message;
 
     python_worker_execution_result_t execute(
+        const std::filesystem::path& root,
         const python_worker_execution_request_t& request) {
         ++calls;
-        last_job_id = request.job_id;
-        last_script_path = request.script_path.string();
-        last_workspace_metadata = request.workspace_metadata;
-        last_unsafe_approved = request.unsafe_approved;
-        last_cancellation_present = request.cancellation != nullptr;
-        last_deadline_present = request.deadline.has_value();
+        last_root = root;
+        last_request = request;
         if (throw_exception) {
-            throw std::runtime_error(exception_message);
+            throw std::runtime_error("fixture executor failure");
         }
         return result;
     }
 };
 
-python_worker_execution_result_t make_completed_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::completed;
-    result.result = "{\"analysis\": \"ok\", \"functions\": 42}";
-    result.stdout_text = "script started\nscript finished\n";
-    result.stderr_text.clear();
-    result.error_code.clear();
-    result.worker_generation = 7;
-    result.worker_process_id = 9999;
-    result.worker_terminated = true;
-    result.worker_replaced = false;
-    return result;
-}
-
-python_worker_execution_result_t make_cancelled_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::cancelled;
-    result.error_code = "PYTHON_WORKER_CANCELLED";
-    result.worker_terminated = true;
-    result.worker_replaced = true;
-    result.diagnostics.push_back({
-        python_worker_error_code_t::cancelled,
-        "python_worker.cancel",
-        "worker cancellation requires replacement",
-        0, true});
-    return result;
-}
-
-python_worker_execution_result_t make_crashed_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::worker_crashed;
-    result.error_code = "PYTHON_WORKER_CRASHED";
-    result.worker_terminated = true;
-    result.worker_replaced = true;
-    result.diagnostics.push_back({
-        python_worker_error_code_t::worker_crashed,
-        "python_worker.wait",
-        "worker exited before terminal result",
-        1, true});
-    return result;
-}
-
-python_worker_execution_result_t make_host_stopped_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::host_stopped;
-    result.error_code = "PYTHON_WORKER_HOST_STOPPED";
-    result.worker_terminated = false;
-    result.worker_replaced = false;
-    result.diagnostics.push_back({
-        python_worker_error_code_t::invalid_request,
-        "python_worker.execute",
-        "worker host is stopped",
-        0, false});
-    return result;
-}
-
-python_worker_execution_result_t make_deadline_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::deadline_exceeded;
-    result.error_code = "PYTHON_WORKER_DEADLINE_EXCEEDED";
-    result.worker_terminated = true;
-    result.worker_replaced = true;
-    result.diagnostics.push_back({
-        python_worker_error_code_t::deadline_exceeded,
-        "python_worker.cancel",
-        "worker cancellation requires replacement",
-        0, true});
-    return result;
-}
-
-python_worker_execution_result_t make_protocol_failure_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::protocol_failure;
-    result.error_code = "PYTHON_WORKER_PROTOCOL_FAILURE";
-    result.worker_terminated = true;
-    result.worker_replaced = true;
-    result.diagnostics.push_back({
-        python_worker_error_code_t::protocol_malformed,
-        "python_worker.response",
-        "worker response is not a valid object",
-        0, true});
-    return result;
-}
-
-python_worker_execution_result_t make_worker_failed_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::worker_failed;
-    result.error_code = "PYTHON_WORKER_SCRIPT_FAILED";
-    result.stderr_text = "Traceback (most recent call last):\n  ValueError: bad input\n";
-    result.worker_terminated = true;
-    result.worker_replaced = true;
-    result.diagnostics.push_back({
-        python_worker_error_code_t::worker_crashed,
-        "python_worker.result",
-        "worker reported a terminal failure",
-        0, true});
-    return result;
-}
-
-python_worker_execution_result_t make_unsafe_approval_rejected_result() {
-    python_worker_execution_result_t result;
-    result.status = python_worker_status_t::rejected;
-    result.error_code = "PYTHON_WORKER_UNSAFE_APPROVAL_REQUIRED";
-    result.worker_terminated = false;
-    result.worker_replaced = false;
-    result.diagnostics.push_back({
-        python_worker_error_code_t::unsafe_approval_required,
-        "python_worker.approval",
-        "explicit unsafe approval is required",
-        0, false});
-    return result;
-}
-
-python_worker_execute_t bind_executor(mock_executor_state_t& state) {
-    return [&state](const python_worker_execution_request_t& request) {
-        return state.execute(request);
-    };
-}
-
-json valid_arguments(std::string script_path = "scripts/analyze.py") {
+json valid_arguments(std::uint32_t pid = 4101) {
     return json{
-        {"script_path", std::move(script_path)},
-        {"unsafe_approved", true},
+        {"file_path", "scripts/analyze.py"},
+        {"approve_unsafe", true},
+        {"pid", pid},
     };
 }
 
-void verify_exact_schema(python_handlers_t& handlers,
-                         protocol::schema_runtime_t& schemas,
-                         std::size_t& completed) {
-    require_fixture(handlers.size() == k_python_tool_count,
-                    "exact_schema", "handler contract count is not exactly one");
-    require_fixture(python_tool_names().size() == k_python_tool_count,
-                    "exact_schema", "python name ledger count is not exactly one");
-    const auto name = python_tool_names()[0];
-    require_fixture(name == "py_exec_file",
-                    "exact_schema", "tool name is not py_exec_file");
-    const auto& contract = handlers.contract_at(0);
-    require_fixture(contract.name == "py_exec_file",
-                    "exact_schema", "contract name mismatch");
-    require_fixture(handlers.find("py_exec_file") == &contract,
-                    "exact_schema", "find lookup differs from contract_at");
-    require_fixture(handlers.find("py_exec_file") != nullptr,
-                    "exact_schema", "find returned null for registered tool");
-    require_fixture(contract.input_schema.is_object(),
-                    "exact_schema", "input schema is not an object");
-    require_fixture(contract.output_schema.is_object(),
-                    "exact_schema", "output schema is not an object");
-    require_fixture(contract.annotations.is_object(),
-                    "exact_schema", "annotations is not an object");
-    require_fixture(
-        contract.input_schema.at("properties").at("script_path").at("type") == "string",
-        "exact_schema", "script_path property type is not string");
-    require_fixture(
-        contract.input_schema.at("properties").at("unsafe_approved").at("type") == "boolean",
-        "exact_schema", "unsafe_approved property type is not boolean");
-    require_fixture(
-        contract.input_schema.at("properties").at("unsafe_approved").at("enum") == json::array({true}),
-        "exact_schema", "unsafe_approved enum does not restrict to true");
-    require_fixture(
-        contract.input_schema.at("required") == json::array({"script_path", "unsafe_approved"}),
-        "exact_schema", "required fields do not match");
-    require_fixture(
-        contract.input_schema.value("additionalProperties", true) == false,
-        "exact_schema", "additionalProperties is not false");
-    require_fixture(
-        contract.output_schema.at("properties").at("status").at("type") == "string",
-        "exact_schema", "output status type is not string");
-    require_fixture(
-        contract.output_schema.at("required") == json::array({"status", "worker_terminated", "worker_replaced"}),
-        "exact_schema", "output required fields do not match");
-    require_fixture(
-        contract.output_schema.value("additionalProperties", true) == false,
-        "exact_schema", "output additionalProperties is not false");
-    require_fixture(
-        contract.target_policy.requirement == protocol::target_requirement_t::independent,
-        "exact_schema", "target policy is not independent");
-    require_fixture(!contract.target_policy.accepts_pid,
-                    "exact_schema", "target policy accepts_pid should be false");
-    require_fixture(!contract.target_policy.accepts_bin_name,
-                    "exact_schema", "target policy accepts_bin_name should be false");
-    require_fixture(
-        contract.effect_policy.effect == protocol::tool_effect_t::isolated_python,
-        "exact_schema", "effect is not isolated_python");
-    require_fixture(
-        contract.effect_policy.lock == protocol::effect_lock_t::python_worker,
-        "exact_schema", "lock is not python_worker");
-    require_fixture(!contract.effect_policy.read_only,
-                    "exact_schema", "effect read_only should be false");
-    require_fixture(contract.effect_policy.unsafe,
-                    "exact_schema", "effect unsafe should be true");
-    require_fixture(
-        protocol::validate_tool_contract(contract, schemas).valid,
-        "exact_schema", "contract does not validate through the schema runtime");
-    const json list_entry = contract.tool_list_entry();
-    require_fixture(list_entry.at("inputSchema") == contract.input_schema &&
-                        list_entry.at("outputSchema") == contract.output_schema &&
-                        !list_entry.contains("_meta"),
-                    "exact_schema", "tool list entry altered schema or embedded provenance");
-    const auto annotations = contract.annotations;
-    require_fixture(annotations.value("title", std::string()) == "Execute Python Script File",
-                    "exact_schema", "annotation title mismatch");
-    const auto decorators = annotations.find("decorators");
-    require_fixture(decorators != annotations.end() && decorators->is_array() &&
-                        !decorators->empty() &&
-                        (*decorators)[0].value("name", std::string()) == "tool_timeout",
-                    "exact_schema", "tool_timeout decorator is absent");
-    ++completed;
-}
-
-void verify_py_eval_absence(python_handlers_t& handlers,
-                            mock_executor_state_t& backend,
-                            std::size_t& completed) {
-    require_fixture(handlers.find("py_eval") == nullptr,
-                    "py_eval_absence", "py_eval should not be registered");
-    require_fixture(handlers.size() == 1,
-                    "py_eval_absence", "handler count should be exactly one");
-    const auto& names = python_tool_names();
-    require_fixture(std::find(names.begin(), names.end(), "py_eval") == names.end(),
-                    "py_eval_absence", "py_eval should not appear in the name ledger");
-    require_fixture(find_contract("py_eval") == nullptr,
-                    "py_eval_absence", "py_eval must not appear in the generated compatibility descriptor table");
-    for (std::size_t i = 0; i < handlers.size(); ++i) {
-        const auto& c = handlers.contract_at(i);
-        require_fixture(c.name != "py_eval",
-                        "py_eval_absence", "hidden contract named py_eval discovered at index");
-        const auto ann_str = c.annotations.dump();
-        require_fixture(ann_str.find("py_eval") == std::string::npos,
-                        "py_eval_absence", "contract annotations reference py_eval");
-        const auto aliases = c.annotations.find("aliases");
-        if (aliases != c.annotations.end() && aliases->is_array()) {
-            require_fixture(std::find(aliases->begin(), aliases->end(), "py_eval") == aliases->end(),
-                            "py_eval_absence", "contract annotations expose py_eval as an alias");
-        }
-    }
-    const auto entry = handlers.contract_at(0).tool_list_entry();
-    require_fixture(!entry.contains("resources"),
-                    "py_eval_absence", "tool list entry exposes a resources field");
-    require_fixture(!entry.contains("resourceTemplates"),
-                    "py_eval_absence", "tool list entry exposes a resourceTemplates field");
-    require_fixture(!entry.contains("resource"),
-                    "py_eval_absence", "tool list entry exposes a resource field");
-    const json metadata{{"fixture_tool", "py_eval"}};
-    const json args = valid_arguments();
-    const std::size_t before = backend.calls;
-    auto result = handlers.invoke("py_eval", args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error(),
-                    "py_eval_absence", "invoking py_eval should return an error");
-    require_fixture(result.error_code() == "MCP_TOOL_CONTRACT_INVALID",
-                    "py_eval_absence", "py_eval should be rejected as invalid_contract");
-    require_fixture(backend.calls == before,
-                    "py_eval_absence", "py_eval invocation reached the executor");
-    require_fixture(
-        result.structured_content().at("error").at("details").value("tool", std::string()) == "py_eval",
-        "py_eval_absence", "py_eval error details should name the rejected tool");
-    ++completed;
-}
-
-void verify_missing_script_path(python_handlers_t& handlers,
-                                mock_executor_state_t& backend,
-                                std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = json::object();
-    args["unsafe_approved"] = true;
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    "missing_script_path", "missing script_path was not rejected canonically");
-    require_fixture(backend.calls == before,
-                    "missing_script_path", "missing script_path reached the executor");
-    ++completed;
-}
-
-void verify_missing_unsafe_approved(python_handlers_t& handlers,
-                                    mock_executor_state_t& backend,
-                                    std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = json::object();
-    args["script_path"] = "scripts/analyze.py";
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    "missing_unsafe_approved", "missing unsafe_approved was not rejected canonically");
-    require_fixture(backend.calls == before,
-                    "missing_unsafe_approved", "missing unsafe_approved reached the executor");
-    ++completed;
-}
-
-void verify_unsafe_approved_false(python_handlers_t& handlers,
-                                  mock_executor_state_t& backend,
-                                  std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = json::object();
-    args["script_path"] = "scripts/analyze.py";
-    args["unsafe_approved"] = false;
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    "unsafe_approved_false", "unsafe_approved=false was not rejected by schema");
-    require_fixture(backend.calls == before,
-                    "unsafe_approved_false", "unsafe_approved=false reached the executor");
-    ++completed;
-}
-
-void verify_invalid_extension(python_handlers_t& handlers,
-                              mock_executor_state_t& backend,
-                              std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = json::object();
-    args["script_path"] = "scripts/analyze.txt";
-    args["unsafe_approved"] = true;
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    "invalid_extension", "non-.py script was not rejected canonically");
-    require_fixture(backend.calls == before,
-                    "invalid_extension", "non-.py script reached the executor");
-    require_fixture(
-        result.structured_content().at("error").at("details").value(
-            "reason", std::string()) == "extension_required",
-        "invalid_extension", "extension_required reason is absent");
-    require_fixture(
-        result.structured_content().at("error").at("details").value(
-            "field", std::string()) == "script_path",
-        "invalid_extension", "script_path field is absent from diagnostics");
-    ++completed;
-}
-
-void verify_oversized_script_path(python_handlers_t& handlers,
-                                  mock_executor_state_t& backend,
-                                  const python_handler_limits_t& limits,
-                                  std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = json::object();
-    args["script_path"] = std::string(limits.max_script_path_bytes + 1, 'A') + ".py";
-    args["unsafe_approved"] = true;
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    "oversized_script_path", "oversized script_path was not rejected canonically");
-    require_fixture(backend.calls == before,
-                    "oversized_script_path", "oversized script_path reached the executor");
-    ++completed;
-}
-
-void verify_oversized_workspace_metadata(python_handlers_t& handlers,
-                                         mock_executor_state_t& backend,
-                                         const python_handler_limits_t& limits,
-                                         std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = json::object();
-    args["script_path"] = "scripts/analyze.py";
-    args["unsafe_approved"] = true;
-    json large_meta = json::object();
-    const std::size_t fill_count = 32;
-    for (std::size_t i = 0; i < fill_count; ++i) {
-        large_meta[std::string(60, 'k') + std::to_string(i)] =
-            std::string(2048, 'v');
-    }
-    args["workspace_metadata"] = std::move(large_meta);
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    "oversized_workspace_metadata",
-                    "oversized workspace_metadata was not rejected canonically");
-    require_fixture(backend.calls == before,
-                    "oversized_workspace_metadata",
-                    "oversized workspace_metadata reached the executor");
-    require_fixture(
-        result.structured_content().at("error").at("details").value(
-            "reason", std::string()) == "maximum_exceeded",
-        "oversized_workspace_metadata",
-        "maximum_exceeded reason is absent for workspace_metadata");
-    ++completed;
-}
-
-void verify_additional_property_rejected(python_handlers_t& handlers,
-                                         mock_executor_state_t& backend,
-                                         std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = valid_arguments();
-    args["extra_field"] = "not allowed";
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, args, cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INPUT_INVALID",
-                    "additional_property",
-                    "additional property was not rejected by schema");
-    require_fixture(backend.calls == before,
-                    "additional_property", "additional property reached the executor");
-    ++completed;
-}
-
-void verify_cancellation_before_dispatch(python_handlers_t& handlers,
-                                         mock_executor_state_t& backend,
-                                         std::size_t& completed) {
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto cancellation = cancellation_token_t::create();
-    cancellation.cancel();
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation, metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_CANCELLED",
-                    "cancellation_before",
-                    "pre-dispatch cancellation was not observed canonically");
-    require_fixture(backend.calls == before,
-                    "cancellation_before",
-                    "pre-dispatch cancellation reached the executor");
-    require_fixture(
-        result.structured_content().at("error").at("details").value(
-            "phase", std::string()) == "python_pre_dispatch",
-        "cancellation_before", "phase diagnostic is absent");
-    ++completed;
-}
-
-void verify_completed_result(python_handlers_t& handlers,
-                             mock_executor_state_t& backend,
-                             std::size_t& completed) {
-    backend.result = make_completed_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "completed_result", result.text());
-    require_fixture(backend.calls == before + 1,
-                    "completed_result", "executor was not invoked exactly once");
-    require_fixture(backend.last_job_id != 0,
-                    "completed_result", "job_id was not generated as non-zero");
-    require_fixture(backend.last_script_path == "scripts/analyze.py",
-                    "completed_result", "script_path was not propagated to executor");
-    require_fixture(backend.last_unsafe_approved == true,
-                    "completed_result", "unsafe_approved was not propagated as true");
-    require_fixture(backend.last_workspace_metadata == json::object(),
-                    "completed_result", "workspace_metadata was not defaulted to empty object");
-    require_fixture(backend.last_cancellation_present,
-                    "completed_result", "cancellation pointer was not propagated to executor");
-    require_fixture(backend.last_deadline_present,
-                    "completed_result", "deadline was not propagated to executor");
-    const auto& structured = result.structured_content();
-    require_fixture(structured.value("status", std::string()) == "completed",
-                    "completed_result", "structured status is not completed");
-    require_fixture(structured.value("result", std::string()) == "{\"analysis\": \"ok\", \"functions\": 42}",
-                    "completed_result", "structured result text mismatch");
-    require_fixture(structured.value("stdout", std::string()) == "script started\nscript finished\n",
-                    "completed_result", "structured stdout mismatch");
-    require_fixture(structured.value("worker_generation", 0ULL) == 7ULL,
-                    "completed_result", "worker_generation was not mapped");
-    require_fixture(structured.value("worker_process_id", 0U) == 9999U,
-                    "completed_result", "worker_process_id was not mapped");
-    require_fixture(structured.value("worker_terminated", false) == true,
-                    "completed_result", "worker_terminated was not mapped");
-    require_fixture(structured.value("worker_replaced", true) == false,
-                    "completed_result", "worker_replaced was not mapped");
-    require_fixture(result.aida_metadata().value("tool", std::string()) == "py_exec_file",
-                    "completed_result", "aida_metadata tool field is not py_exec_file");
-    require_fixture(result.aida_metadata().value("effect", std::string()) == "isolated_python",
-                    "completed_result", "aida_metadata effect field is not isolated_python");
-    require_fixture(result.aida_metadata().value("lock", std::string()) == "python_worker",
-                    "completed_result", "aida_metadata lock field is not python_worker");
-    require_fixture(result.aida_metadata().value("worker_status", std::string()) == "completed",
-                    "completed_result", "aida_metadata worker_status is not completed");
-    require_fixture(result.aida_metadata().value("job_id", 0ULL) != 0,
-                    "completed_result", "aida_metadata job_id should be non-zero");
-    require_fixture(!result.aida_metadata().contains("diagnostics"),
-                    "completed_result", "aida_metadata should not contain diagnostics for success");
-    ++completed;
-}
-
-void verify_cancelled_result_mapping(python_handlers_t& handlers,
-                                     mock_executor_state_t& backend,
-                                     std::size_t& completed) {
-    backend.result = make_cancelled_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_CANCELLED",
-                    "cancelled_mapping", "worker cancelled was not mapped to MCP_TOOL_CANCELLED");
-    require_fixture(backend.calls == before + 1,
-                    "cancelled_mapping", "executor was not invoked exactly once");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("worker_status", std::string()) == "cancelled",
-                    "cancelled_mapping", "worker_status in error details is not cancelled");
-    require_fixture(details.value("worker_error_code", std::string()) == "PYTHON_WORKER_CANCELLED",
-                    "cancelled_mapping", "worker_error_code in error details is not correct");
-    require_fixture(details.contains("diagnostics"),
-                    "cancelled_mapping", "diagnostics are absent from error details");
-    require_fixture(result.aida_metadata().value("worker_status", std::string()) == "cancelled",
-                    "cancelled_mapping", "aida_metadata worker_status is not cancelled");
-    ++completed;
-}
-
-void verify_crashed_result_mapping(python_handlers_t& handlers,
-                                   mock_executor_state_t& backend,
-                                   std::size_t& completed) {
-    backend.result = make_crashed_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_HANDLER_FAILED",
-                    "crashed_mapping", "worker_crashed was not mapped to handler_failed");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("worker_status", std::string()) == "worker_crashed",
-                    "crashed_mapping", "worker_status in error details is not worker_crashed");
-    require_fixture(details.value("worker_replaced", false) == true,
-                    "crashed_mapping", "worker_replaced should be true for crash");
-    require_fixture(details.contains("diagnostics"),
-                    "crashed_mapping", "diagnostics are absent from crash error details");
-    ++completed;
-}
-
-void verify_host_stopped_result_mapping(python_handlers_t& handlers,
-                                        mock_executor_state_t& backend,
-                                        std::size_t& completed) {
-    backend.result = make_host_stopped_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INTERNAL_ERROR",
-                    "host_stopped_mapping", "host_stopped was not mapped to internal_error");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("worker_status", std::string()) == "host_stopped",
-                    "host_stopped_mapping", "worker_status in error details is not host_stopped");
-    require_fixture(details.value("worker_terminated", true) == false,
-                    "host_stopped_mapping", "worker_terminated should be false for host_stopped");
-    ++completed;
-}
-
-void verify_deadline_result_mapping(python_handlers_t& handlers,
-                                    mock_executor_state_t& backend,
-                                    std::size_t& completed) {
-    backend.result = make_deadline_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_HANDLER_FAILED",
-                    "deadline_mapping", "deadline_exceeded was not mapped to handler_failed");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("worker_status", std::string()) == "deadline_exceeded",
-                    "deadline_mapping", "worker_status in error details is not deadline_exceeded");
-    require_fixture(details.value("worker_error_code", std::string()) == "PYTHON_WORKER_DEADLINE_EXCEEDED",
-                    "deadline_mapping", "worker_error_code mismatch for deadline");
-    ++completed;
-}
-
-void verify_protocol_failure_mapping(python_handlers_t& handlers,
-                                     mock_executor_state_t& backend,
-                                     std::size_t& completed) {
-    backend.result = make_protocol_failure_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_HANDLER_FAILED",
-                    "protocol_failure_mapping",
-                    "protocol_failure was not mapped to handler_failed");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("worker_status", std::string()) == "protocol_failure",
-                    "protocol_failure_mapping",
-                    "worker_status in error details is not protocol_failure");
-    ++completed;
-}
-
-void verify_worker_failed_mapping(python_handlers_t& handlers,
-                                  mock_executor_state_t& backend,
-                                  std::size_t& completed) {
-    backend.result = make_worker_failed_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_HANDLER_FAILED",
-                    "worker_failed_mapping",
-                    "worker_failed was not mapped to handler_failed");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("worker_status", std::string()) == "worker_failed",
-                    "worker_failed_mapping",
-                    "worker_status in error details is not worker_failed");
-    require_fixture(details.value("worker_error_code", std::string()) == "PYTHON_WORKER_SCRIPT_FAILED",
-                    "worker_failed_mapping", "worker_error_code mismatch for script failure");
-    ++completed;
-}
-
-void verify_unsafe_approval_rejected_mapping(python_handlers_t& handlers,
-                                             mock_executor_state_t& backend,
-                                             std::size_t& completed) {
-    backend.result = make_unsafe_approval_rejected_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_EFFECT_POLICY_REJECTED",
-                    "unsafe_rejected_mapping",
-                    "unsafe_approval_required was not mapped to effect_policy_rejected");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("worker_status", std::string()) == "rejected",
-                    "unsafe_rejected_mapping", "worker_status in error details is not rejected");
-    require_fixture(details.value("worker_error_code", std::string()) ==
-                        "PYTHON_WORKER_UNSAFE_APPROVAL_REQUIRED",
-                    "unsafe_rejected_mapping", "worker_error_code mismatch for approval rejection");
-    ++completed;
-}
-
-void verify_executor_exception(python_handlers_t& handlers,
-                               mock_executor_state_t& backend,
+void verify_generated_contract(const python_handlers_t& handlers,
+                               protocol::schema_runtime_t& schemas,
                                std::size_t& completed) {
-    backend.throw_exception = true;
-    backend.exception_message = "simulated worker host failure";
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    const std::size_t before = backend.calls;
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    backend.throw_exception = false;
-    backend.exception_message.clear();
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_HANDLER_FAILED",
-                    "executor_exception",
-                    "executor exception was not mapped to handler_failed");
-    require_fixture(backend.calls == before + 1,
-                    "executor_exception", "executor was not invoked despite exception");
-    const auto& details = result.structured_content().at("error").at("details");
-    require_fixture(details.value("phase", std::string()) == "python_executor_exception",
-                    "executor_exception", "phase is not python_executor_exception");
-    require_fixture(details.value("exception", std::string()) == "simulated worker host failure",
-                    "executor_exception", "exception message was not captured in details");
-    require_fixture(details.value("job_id", 0ULL) != 0,
-                    "executor_exception", "job_id should be non-zero in exception details");
+    require_fixture(handlers.size() == 1 && python_tool_names().size() == 1,
+                    "generated_contract", "tool inventory is not an exact singleton");
+    require_fixture(python_tool_names()[0] == "py_exec_file" &&
+                        handlers.find("py_exec_file") == &handlers.contract_at(0),
+                    "generated_contract", "py_exec_file lookup is inconsistent");
+    require_fixture(handlers.find("py_eval") == nullptr && find_contract("py_eval") == nullptr,
+                    "generated_contract", "py_eval is present in the compatibility surface");
+    const auto* descriptor = find_contract("py_exec_file");
+    require_fixture(descriptor != nullptr,
+                    "generated_contract", "generated descriptor is absent");
+    require_fixture(descriptor->adapter_symbol ==
+                        "aida::standalone::mcp::compat::python_worker_host_t::execute" &&
+                        descriptor->target_dependent && descriptor->accepts_pid &&
+                        descriptor->accepts_bin_name && descriptor->unsafe,
+                    "generated_contract", "generated worker adapter policy is incorrect");
+    const auto& contract = handlers.contract_at(0);
+    require_fixture(
+        contract.input_schema == json::parse(
+            descriptor->input_schema_json.begin(), descriptor->input_schema_json.end()) &&
+            contract.output_schema == json::parse(
+                descriptor->output_schema_json.begin(), descriptor->output_schema_json.end()) &&
+            contract.annotations == json::parse(
+                descriptor->annotations_json.begin(), descriptor->annotations_json.end()),
+        "generated_contract", "handler contract differs from generated JSON");
+    const auto& properties = contract.input_schema.at("properties");
+    require_fixture(properties.contains("file_path") && properties.contains("approve_unsafe") &&
+                        properties.contains("pid") && properties.contains("bin_name") &&
+                        !properties.contains("script_path") &&
+                        !properties.contains("unsafe_approved"),
+                    "generated_contract", "generated input field contract is not exact");
+    require_fixture(
+        contract.target_policy.requirement == protocol::target_requirement_t::optional &&
+            contract.target_policy.accepts_pid && contract.target_policy.accepts_bin_name,
+        "generated_contract", "target routing policy is not generated-target compatible");
+    require_fixture(
+        contract.effect_policy.effect == protocol::tool_effect_t::isolated_python &&
+            contract.effect_policy.lock == protocol::effect_lock_t::python_worker &&
+            !contract.effect_policy.read_only && contract.effect_policy.unsafe,
+        "generated_contract", "isolated worker effect policy is incorrect");
+    require_fixture(protocol::validate_tool_contract(contract, schemas).valid,
+                    "generated_contract", "generated contract fails schema compilation");
+    const auto required = contract.output_schema.at("required");
+    require_fixture(required == json::array({
+                        "result", "stdout", "stderr", "worker_generation",
+                        "worker_process_id", "diagnostics"}),
+                    "generated_contract", "generated output requirements are not exact");
     ++completed;
 }
 
-void verify_workspace_metadata_propagation(python_handlers_t& handlers,
-                                           mock_executor_state_t& backend,
-                                           std::size_t& completed) {
-    backend.result = make_completed_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    json args = valid_arguments();
-    json meta = json::object();
-    meta["target_pid"] = 4101;
-    meta["analysis_mode"] = "vulnerability";
-    args["workspace_metadata"] = std::move(meta);
-    auto result = adapters::py_exec_file(handlers, args,
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "workspace_metadata_propagation", result.text());
-    require_fixture(backend.last_workspace_metadata.value("target_pid", 0U) == 4101U,
-                    "workspace_metadata_propagation",
-                    "target_pid was not propagated to executor workspace_metadata");
-    require_fixture(backend.last_workspace_metadata.value("analysis_mode", std::string()) == "vulnerability",
-                    "workspace_metadata_propagation",
-                    "analysis_mode was not propagated to executor workspace_metadata");
+void verify_old_and_unsafe_inputs(python_handlers_t& handlers,
+                                  target_state_t& targets,
+                                  executor_state_t& executor,
+                                  std::size_t& completed) {
+    const std::size_t target_calls = targets.calls;
+    const std::size_t worker_calls = executor.calls;
+    auto old_result = adapters::py_exec_file(
+        handlers,
+        json{{"script_path", "scripts/analyze.py"}, {"unsafe_approved", true}, {"pid", 4101}},
+        cancellation_token_t::create());
+    require_fixture(old_result.is_error() &&
+                        old_result.error_code() == "MCP_TOOL_INPUT_INVALID",
+                    "old_inputs", "retired Python input fields were accepted");
+    auto denied = adapters::py_exec_file(
+        handlers,
+        json{{"file_path", "scripts/analyze.py"}, {"approve_unsafe", false}, {"pid", 4101}},
+        cancellation_token_t::create());
+    require_fixture(denied.is_error() &&
+                        denied.error_code() == "MCP_TOOL_EFFECT_POLICY_REJECTED",
+                    "old_inputs", "false unsafe approval was not rejected by effect policy");
+    require_fixture(targets.calls == target_calls && executor.calls == worker_calls,
+                    "old_inputs", "invalid or unapproved input reached target or worker code");
     ++completed;
 }
 
-void verify_non_object_aida_metadata(python_handlers_t& handlers,
-                                      std::size_t& completed) {
-    const json bad_metadata = json::array({"not_an_object"});
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), bad_metadata);
-    require_fixture(result.is_error() &&
-                        result.error_code() == "MCP_TOOL_INTERNAL_ERROR",
-                    "non_object_metadata",
-                    "non-object aida_metadata was not rejected as internal_error");
+void verify_target_derived_roots(python_handlers_t& handlers,
+                                 target_state_t& targets,
+                                 executor_state_t& executor,
+                                 protocol::schema_runtime_t& schemas,
+                                 std::size_t& completed) {
+    executor.result = completed_result();
+    auto alpha = adapters::py_exec_file(
+        handlers, valid_arguments(4101), cancellation_token_t::create(),
+        json{{"fixture", "alpha"}});
+    require_fixture(!alpha.is_error(), "target_root", alpha.text());
+    require_fixture(executor.last_root.lexically_normal() ==
+                        std::filesystem::path(L"C:\\fixtures\\alpha").lexically_normal(),
+                    "target_root", "alpha script root was not derived from target source parent");
+    require_fixture(executor.last_request.script_path.lexically_normal() ==
+                        std::filesystem::path(L"C:\\fixtures\\alpha\\scripts\\analyze.py").lexically_normal(),
+                    "target_root", "alpha script path was not rooted under its target");
+    require_fixture(executor.last_request.workspace_metadata.at("workspace_id") == "workspace-alpha" &&
+                        executor.last_request.workspace_metadata.at("generation") == 11 &&
+                        executor.last_request.workspace_metadata.at("bin_name") == "alpha.exe" &&
+                        executor.last_request.unsafe_approved &&
+                        executor.last_request.workspace_api != nullptr,
+                    "target_root", "target generation metadata was not bound to the worker request");
+    const auto api_result = executor.last_request.workspace_api(
+        python_workspace_query_t{"metadata", json::object()}, nullptr);
+    require_fixture(api_result.success && api_result.data.at("operation") == "metadata",
+                    "target_root", "leased workspace API was not propagated");
+    require_fixture(
+        schemas.validate(handlers.contract_at(0).output_schema, alpha.structured_content()).valid,
+        "target_root", "completed output fails the generated schema");
+    require_fixture(alpha.structured_content().size() == 6 &&
+                        alpha.structured_content().at("diagnostics").is_array(),
+                    "target_root", "completed output contains non-generated fields");
+    require_fixture(alpha.aida_metadata().at("workspace_id") == "workspace-alpha" &&
+                        alpha.aida_metadata().at("generation_lease") == "local_immutable" &&
+                        alpha.aida_metadata().at("script_root_source") == "target_source_parent" &&
+                        alpha.aida_metadata().at("output_schema_validation") == "passed",
+                    "target_root", "target and output-validation metadata hooks are absent");
+
+    auto beta_args = json{
+        {"file_path", "tools/beta.py"},
+        {"approve_unsafe", true},
+        {"bin_name", "beta.exe"},
+    };
+    auto beta = adapters::py_exec_file(
+        handlers, beta_args, cancellation_token_t::create());
+    require_fixture(!beta.is_error(), "target_root", beta.text());
+    require_fixture(executor.last_root.lexically_normal() ==
+                        std::filesystem::path(L"D:\\workspaces\\beta").lexically_normal() &&
+                        targets.last_selector.bin_name == std::optional<std::string>("beta.exe"),
+                    "target_root", "bin_name routing did not select the beta target root");
     ++completed;
 }
 
-void verify_output_schema_validation(python_handlers_t& handlers,
-                                     protocol::schema_runtime_t& schemas,
-                                     mock_executor_state_t& backend,
-                                     std::size_t& completed) {
-    backend.result = make_completed_result();
-    const json metadata{{"fixture_tool", "py_exec_file"}};
-    auto result = adapters::py_exec_file(handlers, valid_arguments(),
-                                         cancellation_token_t::create(), metadata);
-    require_fixture(!result.is_error(), "output_schema_validation", result.text());
-    const auto& structured = result.structured_content();
-    const auto& output_schema = handlers.contract_at(0).output_schema;
-    const auto validation = schemas.validate(output_schema, structured);
-    require_fixture(validation.valid,
-                    "output_schema_validation",
-                    "completed structured result does not satisfy the output schema");
-    json bad_structured = json{
-        {"status", "completed"},
+void verify_path_containment(python_handlers_t& handlers,
+                             target_state_t& targets,
+                             executor_state_t& executor,
+                             std::size_t& completed) {
+    const std::size_t target_calls = targets.calls;
+    const std::size_t worker_calls = executor.calls;
+    for (const std::string& path : {
+            "../escape.py", "scripts/../escape.py", "C:\\escape.py",
+            "scripts/not_python.txt", "scripts/UPPER.PY"}) {
+        json arguments = valid_arguments();
+        arguments["file_path"] = path;
+        auto result = adapters::py_exec_file(
+            handlers, arguments, cancellation_token_t::create());
+        require_fixture(result.is_error() &&
+                            result.error_code() == "MCP_TOOL_INPUT_INVALID",
+                        "containment", "uncontained or non-.py path was accepted");
+    }
+    require_fixture(targets.calls == target_calls && executor.calls == worker_calls,
+                    "containment", "rejected path reached target or worker code");
+    ++completed;
+}
+
+void verify_target_failures(python_handlers_t& handlers,
+                            target_state_t& targets,
+                            executor_state_t& executor,
+                            std::size_t& completed) {
+    targets.reject = true;
+    const std::size_t before = executor.calls;
+    auto rejected = adapters::py_exec_file(
+        handlers, valid_arguments(), cancellation_token_t::create());
+    targets.reject = false;
+    require_fixture(rejected.is_error() &&
+                        rejected.error_code() == "MCP_TOOL_TARGET_POLICY_REJECTED" &&
+                        rejected.structured_content().at("error").at("details").at("adapter_code") ==
+                            "fixture_target_not_found",
+                    "target_failure", "target resolution failure was not canonical");
+
+    auto live_args = valid_arguments(4103);
+    auto live = adapters::py_exec_file(
+        handlers, live_args, cancellation_token_t::create());
+    require_fixture(live.is_error() &&
+                        live.error_code() == "MCP_TOOL_EFFECT_POLICY_REJECTED",
+                    "target_failure", "live target was not denied");
+    require_fixture(executor.calls == before,
+                    "target_failure", "failed or live target reached the worker");
+    ++completed;
+}
+
+void verify_cancellation(python_handlers_t& handlers,
+                         target_state_t& targets,
+                         executor_state_t& executor,
+                         std::size_t& completed) {
+    auto cancellation = cancellation_token_t::create(true);
+    const std::size_t target_calls = targets.calls;
+    const std::size_t worker_calls = executor.calls;
+    auto result = adapters::py_exec_file(handlers, valid_arguments(), cancellation);
+    require_fixture(result.is_error() && result.error_code() == "MCP_TOOL_CANCELLED",
+                    "cancellation", "pre-dispatch cancellation was not canonical");
+    require_fixture(targets.calls == target_calls && executor.calls == worker_calls,
+                    "cancellation", "cancelled request reached target or worker code");
+    ++completed;
+}
+
+void verify_worker_failures(python_handlers_t& handlers,
+                            executor_state_t& executor,
+                            std::size_t& completed) {
+    struct failure_case_t final {
+        python_worker_status_t status;
+        std::string error_code;
+        std::string expected_result;
+        std::string expected_status;
+    };
+    const std::vector<failure_case_t> cases{
+        {python_worker_status_t::cancelled, "FIXTURE_WORKER_FAILURE",
+         "MCP_TOOL_CANCELLED", "cancelled"},
+        {python_worker_status_t::rejected, "PYTHON_WORKER_UNSAFE_APPROVAL_REQUIRED",
+         "MCP_TOOL_EFFECT_POLICY_REJECTED", "rejected"},
+        {python_worker_status_t::rejected, "PYTHON_WORKER_INVALID_REQUEST",
+         "MCP_TOOL_INPUT_INVALID", "rejected"},
+        {python_worker_status_t::rejected, "PYTHON_WORKER_SCRIPT_REJECTED",
+         "MCP_TOOL_INPUT_INVALID", "rejected"},
+        {python_worker_status_t::rejected, "FIXTURE_WORKER_FAILURE",
+         "MCP_TOOL_HANDLER_FAILED", "rejected"},
+        {python_worker_status_t::deadline_exceeded, "FIXTURE_WORKER_FAILURE",
+         "MCP_TOOL_HANDLER_FAILED", "deadline_exceeded"},
+        {python_worker_status_t::worker_crashed, "FIXTURE_WORKER_FAILURE",
+         "MCP_TOOL_HANDLER_FAILED", "worker_crashed"},
+        {python_worker_status_t::protocol_failure, "FIXTURE_WORKER_FAILURE",
+         "MCP_TOOL_HANDLER_FAILED", "protocol_failure"},
+        {python_worker_status_t::worker_failed, "FIXTURE_WORKER_FAILURE",
+         "MCP_TOOL_HANDLER_FAILED", "worker_failed"},
+        {python_worker_status_t::host_stopped, "FIXTURE_WORKER_FAILURE",
+         "MCP_TOOL_HANDLER_FAILED", "host_stopped"},
+    };
+    for (const auto& item : cases) {
+        executor.result = {};
+        executor.result.status = item.status;
+        executor.result.error_code = item.error_code;
+        executor.result.worker_generation = 8;
+        executor.result.worker_process_id = 9912;
+        executor.result.worker_terminated =
+            item.status != python_worker_status_t::host_stopped;
+        executor.result.worker_replaced =
+            item.status != python_worker_status_t::host_stopped;
+        executor.result.diagnostics.push_back({
+            python_worker_error_code_t::worker_replaced,
+            "fixture.worker", "terminal fixture failure", 0, true});
+        auto result = adapters::py_exec_file(
+            handlers, valid_arguments(), cancellation_token_t::create());
+        require_fixture(result.is_error() && result.error_code() == item.expected_result,
+                        "worker_failure", "worker status mapping is not canonical");
+        require_fixture(result.aida_metadata().at("worker_status") ==
+                            item.expected_status,
+                        "worker_failure", "worker status metadata is absent");
+    }
+    executor.result = completed_result();
+    ++completed;
+}
+
+void verify_output_bounds(python_handlers_t& handlers,
+                          executor_state_t& executor,
+                          const python_handler_limits_t& limits,
+                          protocol::schema_runtime_t& schemas,
+                          std::size_t& completed) {
+    executor.result = completed_result();
+    executor.result.stdout_text.assign(limits.max_result_bytes, 'X');
+    auto oversized = adapters::py_exec_file(
+        handlers, valid_arguments(), cancellation_token_t::create());
+    require_fixture(oversized.is_error() &&
+                        oversized.error_code() == "MCP_TOOL_OUTPUT_INVALID",
+                    "output_bounds", "oversized completed output was accepted");
+    const json missing_diagnostics{
         {"result", "ok"},
-        {"stdout", "out"},
+        {"stdout", ""},
         {"stderr", ""},
-        {"error_code", ""},
-        {"worker_generation", 0},
-        {"worker_process_id", 0},
-        {"worker_terminated", true},
-        {"worker_replaced", false},
-        {"unexpected_extra", "should_not_be_here"},
+        {"worker_generation", 1},
+        {"worker_process_id", 2},
     };
-    const auto bad_validation = schemas.validate(output_schema, bad_structured);
-    require_fixture(!bad_validation.valid,
-                    "output_schema_validation",
-                    "output schema accepted additionalProperties which should be rejected");
-    json missing_required = json{
-        {"status", "completed"},
-        {"result", "ok"},
-    };
-    const auto missing_validation = schemas.validate(output_schema, missing_required);
-    require_fixture(!missing_validation.valid,
-                    "output_schema_validation",
-                    "output schema accepted missing required fields");
-    json invalid_status = json{
-        {"status", 42},
-        {"worker_terminated", true},
-        {"worker_replaced", false},
-    };
-    const auto status_validation = schemas.validate(output_schema, invalid_status);
-    require_fixture(!status_validation.valid,
-                    "output_schema_validation",
-                    "output schema accepted non-string status");
-    json invalid_enum = json{
-        {"status", "bogus_status"},
-        {"worker_terminated", true},
-        {"worker_replaced", false},
-    };
-    const auto enum_validation = schemas.validate(output_schema, invalid_enum);
-    require_fixture(!enum_validation.valid,
-                    "output_schema_validation",
-                    "output schema accepted status outside the enum");
+    require_fixture(
+        !schemas.validate(handlers.contract_at(0).output_schema, missing_diagnostics).valid,
+        "output_bounds", "generated output schema accepted missing diagnostics");
+    executor.result = completed_result();
+    ++completed;
+}
+
+void verify_executor_exception_and_metadata(python_handlers_t& handlers,
+                                            executor_state_t& executor,
+                                            std::size_t& completed) {
+    executor.throw_exception = true;
+    auto failure = adapters::py_exec_file(
+        handlers, valid_arguments(), cancellation_token_t::create());
+    executor.throw_exception = false;
+    require_fixture(failure.is_error() &&
+                        failure.error_code() == "MCP_TOOL_HANDLER_FAILED",
+                    "executor_exception", "executor exception was not contained");
+    auto invalid_metadata = adapters::py_exec_file(
+        handlers, valid_arguments(), cancellation_token_t::create(), json::array());
+    require_fixture(invalid_metadata.is_error() &&
+                        invalid_metadata.error_code() == "MCP_TOOL_INTERNAL_ERROR",
+                    "executor_exception", "non-object provenance metadata was accepted");
+    ++completed;
+}
+
+void verify_invalid_lease(protocol::schema_runtime_t& schemas,
+                          std::size_t& completed) {
+    target_state_t invalid_targets;
+    auto missing_owner = make_target(
+        5001, "workspace-invalid", "invalid.exe", "relative\\invalid.exe", 4);
+    missing_owner.owner.reset();
+    invalid_targets.targets.push_back(std::move(missing_owner));
+    invalid_targets.targets.push_back(make_target(
+        5002, "workspace-relative", "relative.exe", "relative\\relative.exe", 5));
+    invalid_targets.targets.push_back(make_target(
+        5003, "workspace-normalization", "normalization.exe",
+        "C:\\fixtures\\normalization\\..\\normalization.exe", 6));
+    auto oversized_identity = make_target(
+        5004, "workspace-oversized", "oversized.exe",
+        "C:\\fixtures\\oversized\\oversized.exe", 7);
+    oversized_identity.workspace_id.assign(4097, 'W');
+    invalid_targets.targets.push_back(std::move(oversized_identity));
+    executor_state_t executor;
+    python_handlers_t handlers(
+        [&invalid_targets](const target_selector_t& selector,
+                           std::optional<std::chrono::steady_clock::time_point> deadline) {
+            return invalid_targets.acquire(selector, deadline);
+        },
+        [&executor](const std::filesystem::path& root,
+                    const python_worker_execution_request_t& request) {
+            return executor.execute(root, request);
+        },
+        schemas);
+    for (const std::uint32_t pid : {5001U, 5002U, 5003U, 5004U}) {
+        auto result = adapters::py_exec_file(
+            handlers, valid_arguments(pid), cancellation_token_t::create());
+        require_fixture(result.is_error() &&
+                            result.error_code() == "MCP_TOOL_TARGET_POLICY_REJECTED",
+                        "invalid_lease", "invalid local target lease was accepted");
+    }
+    require_fixture(executor.calls == 0,
+                    "invalid_lease", "invalid local target lease reached the worker");
     ++completed;
 }
 
 void verify_python_handler() {
     protocol::schema_runtime_t schemas(64);
-    mock_executor_state_t backend;
-    auto executor = bind_executor(backend);
-    python_handlers_t handlers(std::move(executor), schemas);
-    const auto& limits = handlers.limits();
+    target_state_t targets;
+    targets.targets.push_back(make_target(
+        4101, "workspace-alpha", "alpha.exe",
+        "C:\\fixtures\\alpha\\alpha.exe", 11));
+    targets.targets.push_back(make_target(
+        4102, "workspace-beta", "beta.exe",
+        "D:\\workspaces\\beta\\beta.exe", 19));
+    targets.targets.push_back(make_target(
+        4103, "workspace-live", "live.exe",
+        "C:\\captures\\live.exe", 23, true));
+    executor_state_t executor;
+    python_handlers_t handlers(
+        [&targets](const target_selector_t& selector,
+                   std::optional<std::chrono::steady_clock::time_point> deadline) {
+            return targets.acquire(selector, deadline);
+        },
+        [&executor](const std::filesystem::path& root,
+                    const python_worker_execution_request_t& request) {
+            return executor.execute(root, request);
+        },
+        schemas);
+
     std::size_t completed = 0;
-
-    verify_exact_schema(handlers, schemas, completed);
-    verify_py_eval_absence(handlers, backend, completed);
-    verify_missing_script_path(handlers, backend, completed);
-    verify_missing_unsafe_approved(handlers, backend, completed);
-    verify_unsafe_approved_false(handlers, backend, completed);
-    verify_invalid_extension(handlers, backend, completed);
-    verify_oversized_script_path(handlers, backend, limits, completed);
-    verify_oversized_workspace_metadata(handlers, backend, limits, completed);
-    verify_additional_property_rejected(handlers, backend, completed);
-    verify_cancellation_before_dispatch(handlers, backend, completed);
-    verify_completed_result(handlers, backend, completed);
-    verify_cancelled_result_mapping(handlers, backend, completed);
-    verify_crashed_result_mapping(handlers, backend, completed);
-    verify_host_stopped_result_mapping(handlers, backend, completed);
-    verify_deadline_result_mapping(handlers, backend, completed);
-    verify_protocol_failure_mapping(handlers, backend, completed);
-    verify_worker_failed_mapping(handlers, backend, completed);
-    verify_unsafe_approval_rejected_mapping(handlers, backend, completed);
-    verify_executor_exception(handlers, backend, completed);
-    verify_workspace_metadata_propagation(handlers, backend, completed);
-    verify_non_object_aida_metadata(handlers, completed);
-    verify_output_schema_validation(handlers, schemas, backend, completed);
-
-    require(completed == 22,
-            "python handler harness did not execute all twenty-two fixture families");
+    verify_generated_contract(handlers, schemas, completed);
+    verify_old_and_unsafe_inputs(handlers, targets, executor, completed);
+    verify_target_derived_roots(handlers, targets, executor, schemas, completed);
+    verify_path_containment(handlers, targets, executor, completed);
+    verify_target_failures(handlers, targets, executor, completed);
+    verify_cancellation(handlers, targets, executor, completed);
+    verify_worker_failures(handlers, executor, completed);
+    verify_output_bounds(handlers, executor, handlers.limits(), schemas, completed);
+    verify_executor_exception_and_metadata(handlers, executor, completed);
+    verify_invalid_lease(schemas, completed);
+    require(completed == 10,
+            "python handler harness did not execute all ten fixture families");
 }
 
 }

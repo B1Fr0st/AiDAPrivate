@@ -11,6 +11,22 @@
 
 namespace aida::analysis {
 
+namespace ghidra_ir_adapter {
+struct typed_artifacts_t;
+}
+
+namespace managed_cli {
+struct analysis_t;
+}
+
+namespace jvm_ssa {
+struct jvm_method_input_t;
+}
+
+namespace dalvik_ssa {
+struct dalvik_ssa_capture_t;
+}
+
 enum class decompiler_provider_execution_status_t : std::uint8_t {
     completed = 1,
     unsupported = 2,
@@ -23,6 +39,53 @@ enum class decompiler_provider_execution_status_t : std::uint8_t {
 class decompiler_provider_context_t {
 public:
     virtual ~decompiler_provider_context_t() = default;
+};
+
+class ghidra_native_provider_context_t final : public decompiler_provider_context_t {
+public:
+    explicit ghidra_native_provider_context_t(
+        std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t> artifacts);
+
+    const std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t>& artifacts() const noexcept;
+
+private:
+    std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t> artifacts_;
+};
+
+class managed_cli_provider_context_t final : public decompiler_provider_context_t {
+public:
+    managed_cli_provider_context_t(
+        std::shared_ptr<const managed_cli::analysis_t> analysis,
+        std::uint64_t return_type_id);
+
+    const std::shared_ptr<const managed_cli::analysis_t>& analysis() const noexcept;
+    std::uint64_t return_type_id() const noexcept;
+
+private:
+    std::shared_ptr<const managed_cli::analysis_t> analysis_;
+    std::uint64_t return_type_id_ = 0;
+};
+
+class jvm_ssa_provider_context_t final : public decompiler_provider_context_t {
+public:
+    explicit jvm_ssa_provider_context_t(
+        std::shared_ptr<const jvm_ssa::jvm_method_input_t> input);
+
+    const std::shared_ptr<const jvm_ssa::jvm_method_input_t>& input() const noexcept;
+
+private:
+    std::shared_ptr<const jvm_ssa::jvm_method_input_t> input_;
+};
+
+class dalvik_ssa_provider_context_t final : public decompiler_provider_context_t {
+public:
+    explicit dalvik_ssa_provider_context_t(
+        std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t> capture);
+
+    const std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t>& capture() const noexcept;
+
+private:
+    std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t> capture_;
 };
 
 struct decompiler_provider_descriptor_t {
@@ -51,6 +114,7 @@ struct decompiler_provider_artifacts_t {
 struct decompiler_provider_result_t {
     decompiler_provider_execution_status_t status = decompiler_provider_execution_status_t::failed;
     std::optional<decompiler_provider_artifacts_t> artifacts;
+    std::optional<decompiler_document_t> attested_document;
     std::vector<decompiler_diagnostic_t> diagnostics;
     std::uint64_t elapsed_wall_clock_ms = 0;
     std::uint64_t elapsed_cpu_ms = 0;
@@ -75,6 +139,36 @@ struct decompiler_provider_route_t {
     std::shared_ptr<decompiler_provider_t> provider;
 };
 
+class decompiler_isolated_provider_host_t {
+public:
+    virtual ~decompiler_isolated_provider_host_t() = default;
+
+    virtual bool supports(const decompiler_provider_descriptor_t& descriptor) const noexcept = 0;
+    virtual decompiler_provider_result_t execute(
+        const decompiler_provider_route_t& route,
+        const decompiler_provider_request_t& request,
+        const cancellation_token_t& cancel) = 0;
+};
+
+struct decompiler_builtin_provider_registration_t {
+    decompiler_provider_identity_t identity;
+    std::vector<decompiler_profile_id_t> profiles{
+        decompiler_profile_id_t::fast,
+        decompiler_profile_id_t::balanced,
+        decompiler_profile_id_t::thorough};
+    std::uint32_t priority = 100;
+    bool isolated = false;
+};
+
+struct decompiler_builtin_provider_config_t {
+    decompiler_builtin_provider_registration_t native;
+    decompiler_builtin_provider_registration_t cli;
+    decompiler_builtin_provider_registration_t jvm;
+    decompiler_builtin_provider_registration_t dalvik;
+
+    decompiler_builtin_provider_config_t();
+};
+
 struct decompiler_provider_registry_snapshot_t {
     std::vector<decompiler_provider_descriptor_t> providers;
     std::uint64_t revision = 0;
@@ -90,6 +184,9 @@ public:
 
     workspace_result_t<void> register_provider(
         std::shared_ptr<decompiler_provider_t> provider,
+        bool replace_existing = false);
+    workspace_result_t<void> register_providers(
+        std::vector<std::shared_ptr<decompiler_provider_t>> providers,
         bool replace_existing = false);
     workspace_result_t<void> unregister_provider(const std::string& registration_id);
     workspace_result_t<decompiler_provider_route_t> resolve(
@@ -108,5 +205,10 @@ private:
     struct state_t;
     std::shared_ptr<state_t> state_;
 };
+
+workspace_result_t<void> register_builtin_decompiler_providers(
+    decompiler_provider_registry_t& registry,
+    const decompiler_builtin_provider_config_t& config,
+    bool replace_existing = false);
 
 }

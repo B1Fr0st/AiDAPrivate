@@ -157,6 +157,9 @@ struct overlay_entity_key_v9_t final {
 
 overlay_entity_key_v9_t
     overlay_entity_key_for_operation_v9(const overlay_operation_v9_t& operation);
+std::optional<overlay_operation_kind_v9_t> overlay_operation_kind_for_item_v9(
+    const overlay_entity_key_v9_t& entity,
+    const overlay_payload_v9_t& payload) noexcept;
 
 std::string serialize_overlay_target_identity_v9(
     const overlay_target_identity_v9_t& target);
@@ -170,6 +173,8 @@ std::optional<overlay_operation_record_v9_t>
 struct overlay_change_v9_t final {
     overlay_entity_key_v9_t entity;
     overlay_operation_kind_v9_t operation_kind = overlay_operation_kind_v9_t::comment;
+    std::optional<overlay_operation_kind_v9_t> before_kind;
+    std::optional<overlay_operation_kind_v9_t> after_kind;
     std::optional<overlay_payload_v9_t> before;
     std::optional<overlay_payload_v9_t> after;
 };

@@ -137,6 +137,7 @@ workspace_result_t<xref_build_result_t> build_impl(
                storage_bytes <= limits.max_result_bytes;
     };
     if (!charge_existing(data.candidates.size(), sizeof(data_candidate_record_t)) ||
+        !charge_existing(data.pointer_facts.size(), sizeof(data_pointer_fact_t)) ||
         !charge_existing(data.conflicts.size(), sizeof(data_candidate_conflict_t)) ||
         !charge_existing(type_references.size(), sizeof(type_reference_fact_t))) {
         return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
@@ -305,6 +306,7 @@ workspace_result_t<xref_build_result_t> build_impl(
             static_cast<std::uint64_t>(index + 1);
     result.type_xrefs = std::move(type_references);
     result.data_candidates = std::move(data.candidates);
+    result.data_pointer_facts = std::move(data.pointer_facts);
     result.data_conflicts = std::move(data.conflicts);
     return workspace_result_t<xref_build_result_t>::success(std::move(result));
 }
@@ -365,6 +367,90 @@ workspace_result_t<xref_build_result_t> xref_builder_t::build(
             workspace_error_code_t::limit_exceeded,
             "xref analysis allocation length is unsupported", "xrefs"));
     }
+}
+
+workspace_result_t<void> xref_builder_t::publish(
+    analysis_snapshot_t& snapshot,
+    xref_build_result_t xrefs,
+    string_discovery_result_t strings,
+    symbol_type_candidate_result_t symbols,
+    const cancellation_token_t& cancel)
+{
+    if (cancel.stop_requested())
+        return workspace_result_t<void>::failure(stop_error(cancel));
+    const auto same_reference = [](const type_reference_fact_t& lhs,
+                                   const type_reference_fact_t& rhs) noexcept {
+        return lhs.id == rhs.id && lhs.source == rhs.source && lhs.target == rhs.target &&
+            lhs.source_entity == rhs.source_entity &&
+            lhs.target_entity == rhs.target_entity && lhs.kind == rhs.kind &&
+            lhs.provenance == rhs.provenance && lhs.confidence == rhs.confidence &&
+            lhs.source_key == rhs.source_key;
+    };
+    if (!xrefs.type_xrefs.empty() && !symbols.type_references.empty()) {
+        if (xrefs.type_xrefs.size() != symbols.type_references.size() ||
+            !std::equal(xrefs.type_xrefs.begin(), xrefs.type_xrefs.end(),
+                symbols.type_references.begin(), same_reference)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "xref and symbol pipelines produced different type references",
+                "analysis_discovery_publish"));
+        }
+    } else if (xrefs.type_xrefs.empty()) {
+        xrefs.type_xrefs = std::move(symbols.type_references);
+    }
+    for (std::size_t index = 0; index < xrefs.xrefs.size(); ++index) {
+        const auto& xref = xrefs.xrefs[index];
+        if (entity_domain(xref.id) != 5 || entity_ordinal(xref.id) != index + 1 ||
+            !valid_address(xref.source) || !valid_address(xref.target) ||
+            xref.kind > xref_kind_t::relocation ||
+            xref.provenance > fact_provenance_t::decompiler_feedback ||
+            xref.confidence > 100) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "xref publication contains an invalid fact", "analysis_discovery_publish"));
+        }
+    }
+    for (std::size_t index = 0; index < strings.strings.size(); ++index) {
+        const auto& string = strings.strings[index];
+        if (entity_domain(string.id) != 6 || entity_ordinal(string.id) != index + 1 ||
+            !valid_address(string.address) || string.byte_length == 0 ||
+            string.encoding > string_encoding_t::utf16_le || string.value.empty() ||
+            string.provenance > fact_provenance_t::decompiler_feedback ||
+            string.confidence > 100) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "string publication contains an invalid fact", "analysis_discovery_publish"));
+        }
+    }
+    for (std::size_t index = 0; index < symbols.symbols.size(); ++index) {
+        const auto& symbol = symbols.symbols[index];
+        if (entity_domain(symbol.id) != 7 || entity_ordinal(symbol.id) != index + 1 ||
+            !valid_address(symbol.address) || symbol.name.empty() ||
+            symbol.kind > symbol_kind_t::metadata ||
+            symbol.provenance > fact_provenance_t::decompiler_feedback ||
+            symbol.confidence > 100) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "symbol publication contains an invalid fact", "analysis_discovery_publish"));
+        }
+    }
+    analysis_rich_fact_publication_t rich;
+    rich.data_candidates = std::move(xrefs.data_candidates);
+    rich.data_pointer_facts = std::move(xrefs.data_pointer_facts);
+    rich.data_conflicts = std::move(xrefs.data_conflicts);
+    rich.type_candidates = std::move(symbols.type_candidates);
+    rich.type_references = std::move(xrefs.type_xrefs);
+    rich.metadata_conflicts = std::move(symbols.conflicts);
+    auto validated = validate_rich_fact_publication(snapshot, rich, cancel);
+    if (!validated)
+        return validated;
+    if (cancel.stop_requested())
+        return workspace_result_t<void>::failure(stop_error(cancel));
+    snapshot.xrefs = std::move(xrefs.xrefs);
+    snapshot.strings = std::move(strings.strings);
+    snapshot.symbols = std::move(symbols.symbols);
+    snapshot.rich_facts = std::move(rich);
+    return workspace_result_t<void>::success();
 }
 
 }

@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <iterator>
 #include <limits>
@@ -13,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace aida::standalone::mcp::compat::handlers {
 
@@ -136,6 +139,45 @@ protocol::tool_contract_t make_tool_contract(const contract_descriptor_t& descri
 
 using validation_failure_t = std::optional<json>;
 
+enum class integer_endian_t : std::uint8_t {
+    little,
+    big,
+};
+
+struct integer_type_t final {
+    std::string requested;
+    std::string canonical;
+    std::size_t width = 0;
+    bool signed_value = false;
+    integer_endian_t endian = integer_endian_t::little;
+};
+
+struct normalized_range_t final {
+    std::size_t index = 0;
+    std::string address_text;
+    std::uint64_t address = 0;
+    std::uint64_t size = 0;
+};
+
+struct normalized_overlay_operation_t final {
+    std::size_t index = 0;
+    std::string address_text;
+    std::uint64_t address = 0;
+    std::string kind;
+    std::string requested_type;
+    std::string value;
+    std::vector<std::uint8_t> bytes;
+};
+
+struct normalized_request_t final {
+    json backend_arguments = json::object();
+    std::vector<normalized_range_t> ranges;
+    std::vector<integer_type_t> integer_types;
+    std::vector<normalized_overlay_operation_t> overlay_operations;
+    std::uint64_t aggregate_bytes = 0;
+    std::size_t item_count = 0;
+};
+
 json invalid_value(std::string path, std::string reason, const json& actual) {
     return json{
         {"policy", "bounded_memory_adapter"},
@@ -171,6 +213,124 @@ std::optional<std::uint64_t> unsigned_integer(const json& value) noexcept {
     return std::nullopt;
 }
 
+std::string_view trim_ascii(std::string_view value) noexcept {
+    while (!value.empty() &&
+           std::isspace(static_cast<unsigned char>(value.front())) != 0) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() &&
+           std::isspace(static_cast<unsigned char>(value.back())) != 0) {
+        value.remove_suffix(1);
+    }
+    return value;
+}
+
+std::optional<std::uint64_t> parse_address(std::string_view text) noexcept {
+    text = trim_ascii(text);
+    if (text.empty() || text.front() == '-') {
+        return std::nullopt;
+    }
+    if (text.front() == '+') {
+        text.remove_prefix(1);
+    }
+    int base = 10;
+    if (text.size() > 2 && text[0] == '0' &&
+        (text[1] == 'x' || text[1] == 'X')) {
+        text.remove_prefix(2);
+        base = 16;
+    }
+    if (text.empty()) {
+        return std::nullopt;
+    }
+    std::uint64_t result = 0;
+    const auto parsed = std::from_chars(
+        text.data(), text.data() + text.size(), result, base);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+int hex_nibble(char value) noexcept {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+bool is_hex_separator(char value) noexcept {
+    return std::isspace(static_cast<unsigned char>(value)) != 0 ||
+        value == ',' || value == ':' || value == '_' || value == '-';
+}
+
+bool parse_hex_bytes(std::string_view source, std::size_t maximum,
+                     std::vector<std::uint8_t>& bytes, std::string& reason) {
+    bytes.clear();
+    int high_nibble = -1;
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        const char value = source[index];
+        if (is_hex_separator(value)) {
+            if (high_nibble != -1) {
+                reason = "incomplete_hex_byte";
+                return false;
+            }
+            continue;
+        }
+        if (value == '0' && index + 1 < source.size() &&
+            (source[index + 1] == 'x' || source[index + 1] == 'X') &&
+            high_nibble == -1) {
+            ++index;
+            continue;
+        }
+        const int nibble = hex_nibble(value);
+        if (nibble < 0) {
+            reason = "hexadecimal_bytes_required";
+            return false;
+        }
+        if (high_nibble == -1) {
+            high_nibble = nibble;
+            continue;
+        }
+        if (bytes.size() >= maximum) {
+            reason = "maximum_exceeded";
+            return false;
+        }
+        bytes.push_back(static_cast<std::uint8_t>((high_nibble << 4) | nibble));
+        high_nibble = -1;
+    }
+    if (high_nibble != -1) {
+        reason = "incomplete_hex_byte";
+        return false;
+    }
+    if (bytes.empty()) {
+        reason = "nonempty_hex_bytes_required";
+        return false;
+    }
+    return true;
+}
+
+std::string format_hex_bytes(const std::vector<std::uint8_t>& bytes) {
+    static constexpr char k_hex[] = "0123456789ABCDEF";
+    std::string result;
+    if (!bytes.empty()) {
+        result.reserve(bytes.size() * 3U - 1U);
+    }
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        if (index != 0) {
+            result.push_back(' ');
+        }
+        result.push_back(k_hex[(bytes[index] >> 4U) & 0x0FU]);
+        result.push_back(k_hex[bytes[index] & 0x0FU]);
+    }
+    return result;
+}
+
 validation_failure_t bounded_text(const json& value, std::string path,
                                   std::size_t maximum, bool allow_empty) {
     if (!value.is_string()) {
@@ -201,25 +361,6 @@ validation_failure_t bounded_member_text(const json& object, std::string_view fi
     return bounded_text(*found, path, maximum, allow_empty);
 }
 
-validation_failure_t bounded_integer(const json& object, std::string_view field,
-                                      std::uint64_t maximum, std::string path_prefix = {}) {
-    const auto found = object.find(std::string(field));
-    if (found == object.end()) {
-        return std::nullopt;
-    }
-    const std::string path = path_prefix.empty()
-        ? std::string(field)
-        : path_prefix + "." + std::string(field);
-    const auto value = unsigned_integer(*found);
-    if (!value) {
-        return invalid_value(path, "nonnegative_integer_required", *found);
-    }
-    if (*value > maximum) {
-        return exceeded_value(path, maximum, *value);
-    }
-    return std::nullopt;
-}
-
 validation_failure_t validate_routing_bounds(const json& arguments,
                                               const memory_handler_limits_t& limits) {
     if (const auto pid = arguments.find("pid"); pid != arguments.end()) {
@@ -239,11 +380,14 @@ validation_failure_t validate_routing_bounds(const json& arguments,
 }
 
 template <typename validator_t>
-validation_failure_t scalar_or_array(const json& value, std::string_view path,
-                                      std::size_t maximum_items,
-                                      validator_t&& validator) {
+validation_failure_t for_each_scalar_or_array(const json& value, std::string_view path,
+                                               std::size_t maximum_items,
+                                               validator_t&& validator) {
     if (!value.is_array()) {
-        return validator(value, std::string(path));
+        return validator(value, std::string(path), 0U);
+    }
+    if (value.empty()) {
+        return invalid_value(std::string(path), "nonempty_value_required", value);
     }
     if (value.size() > maximum_items) {
         return exceeded_value(
@@ -252,122 +396,404 @@ validation_failure_t scalar_or_array(const json& value, std::string_view path,
     }
     for (std::size_t index = 0; index < value.size(); ++index) {
         if (auto failure = validator(
-                value[index], std::string(path) + "[" + std::to_string(index) + "]")) {
+                value[index], std::string(path) + "[" + std::to_string(index) + "]",
+                index)) {
             return failure;
         }
     }
     return std::nullopt;
 }
 
-validation_failure_t validate_get_bytes(const json& arguments,
-                                         const memory_handler_limits_t& limits) {
+validation_failure_t add_to_aggregate(std::uint64_t& aggregate, std::uint64_t amount,
+                                      std::uint64_t maximum, std::string path) {
+    const auto maximum_value = (std::numeric_limits<std::uint64_t>::max)();
+    if (aggregate > maximum || amount > maximum - aggregate) {
+        const std::uint64_t actual = amount > maximum_value - aggregate
+            ? maximum_value
+            : aggregate + amount;
+        return exceeded_value(std::move(path), maximum, actual);
+    }
+    aggregate += amount;
+    return std::nullopt;
+}
+
+validation_failure_t normalize_address_member(
+    const json& object, std::string_view field, const std::string& path,
+    const memory_handler_limits_t& limits, std::string& text,
+    std::uint64_t& address) {
+    const auto found = object.find(std::string(field));
+    if (found == object.end()) {
+        return invalid_value(path + "." + std::string(field),
+                             "field_required", json(nullptr));
+    }
+    if (auto failure = bounded_text(
+            *found, path + "." + std::string(field),
+            limits.maximum_address_bytes, false)) {
+        return failure;
+    }
+    text = found->get<std::string>();
+    const auto parsed = parse_address(text);
+    if (!parsed) {
+        return invalid_value(path + "." + std::string(field),
+                             "hex_or_decimal_address_required", *found);
+    }
+    address = *parsed;
+    return std::nullopt;
+}
+
+validation_failure_t normalize_integer_type(const json& value, std::string path,
+                                            integer_type_t& type) {
+    if (!value.is_string()) {
+        return invalid_value(std::move(path), "string_required", value);
+    }
+    type.requested = value.get<std::string>();
+    std::string normalized;
+    normalized.reserve(type.requested.size());
+    for (const char character : type.requested) {
+        normalized.push_back(static_cast<char>(
+            std::tolower(static_cast<unsigned char>(character))));
+    }
+    bool explicit_endian = false;
+    if (normalized.size() > 2) {
+        const std::string_view suffix(normalized.data() + normalized.size() - 2, 2);
+        if (suffix == "le" || suffix == "be") {
+            explicit_endian = true;
+            type.endian = suffix == "be" ? integer_endian_t::big
+                                         : integer_endian_t::little;
+            normalized.resize(normalized.size() - 2);
+        }
+    }
+    if (normalized.size() < 2 ||
+        (normalized.front() != 'i' && normalized.front() != 'u')) {
+        return invalid_value(std::move(path), "supported_integer_type_required", value);
+    }
+    type.signed_value = normalized.front() == 'i';
+    const std::string_view width_text(normalized.data() + 1, normalized.size() - 1);
+    unsigned int width_bits = 0;
+    const auto parsed = std::from_chars(
+        width_text.data(), width_text.data() + width_text.size(), width_bits, 10);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != width_text.data() + width_text.size() ||
+        (width_bits != 8U && width_bits != 16U &&
+         width_bits != 32U && width_bits != 64U)) {
+        return invalid_value(std::move(path), "supported_integer_type_required", value);
+    }
+    type.width = width_bits / 8U;
+    type.canonical = std::string(1, type.signed_value ? 'i' : 'u') +
+        std::to_string(width_bits);
+    if (explicit_endian) {
+        type.canonical += type.endian == integer_endian_t::big ? "be" : "le";
+    }
+    return std::nullopt;
+}
+
+validation_failure_t parse_integer_value(std::string_view source,
+                                         const integer_type_t& type,
+                                         std::uint64_t& encoded) {
+    source = trim_ascii(source);
+    if (source.empty()) {
+        return invalid_value("value", "integer_string_required", std::string(source));
+    }
+    bool negative = false;
+    if (source.front() == '-' || source.front() == '+') {
+        negative = source.front() == '-';
+        source.remove_prefix(1);
+    }
+    if (source.empty() || (negative && !type.signed_value)) {
+        return invalid_value("value", "integer_value_out_of_range", std::string(source));
+    }
+    int base = 10;
+    if (source.size() > 2 && source[0] == '0' &&
+        (source[1] == 'x' || source[1] == 'X')) {
+        source.remove_prefix(2);
+        base = 16;
+    }
+    if (source.empty()) {
+        return invalid_value("value", "integer_string_required", std::string(source));
+    }
+    std::uint64_t magnitude = 0;
+    const auto parsed = std::from_chars(
+        source.data(), source.data() + source.size(), magnitude, base);
+    if (parsed.ec != std::errc{} || parsed.ptr != source.data() + source.size()) {
+        return invalid_value("value", "integer_string_required", std::string(source));
+    }
+    const unsigned int bits = static_cast<unsigned int>(type.width * 8U);
+    const std::uint64_t mask = bits == 64U
+        ? (std::numeric_limits<std::uint64_t>::max)()
+        : (1ULL << bits) - 1ULL;
+    if (!type.signed_value) {
+        if (magnitude > mask) {
+            return invalid_value("value", "integer_value_out_of_range", magnitude);
+        }
+        encoded = magnitude;
+        return std::nullopt;
+    }
+    const std::uint64_t sign_limit = bits == 64U
+        ? (1ULL << 63U)
+        : (1ULL << (bits - 1U));
+    const std::uint64_t positive_limit = sign_limit - 1ULL;
+    if ((!negative && magnitude > positive_limit) ||
+        (negative && magnitude > sign_limit)) {
+        return invalid_value("value", "integer_value_out_of_range", magnitude);
+    }
+    encoded = negative ? ((~magnitude) + 1ULL) & mask : magnitude;
+    return std::nullopt;
+}
+
+std::vector<std::uint8_t> encode_integer(std::uint64_t encoded,
+                                         const integer_type_t& type) {
+    std::vector<std::uint8_t> bytes(type.width);
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        const std::size_t source_index = type.endian == integer_endian_t::big
+            ? bytes.size() - index - 1U
+            : index;
+        bytes[index] = static_cast<std::uint8_t>(
+            (encoded >> (source_index * 8U)) & 0xFFU);
+    }
+    return bytes;
+}
+
+json decode_integer(const std::vector<std::uint8_t>& bytes,
+                    const integer_type_t& type) {
+    std::uint64_t encoded = 0;
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        const std::size_t destination_index = type.endian == integer_endian_t::big
+            ? bytes.size() - index - 1U
+            : index;
+        encoded |= static_cast<std::uint64_t>(bytes[index]) <<
+            (destination_index * 8U);
+    }
+    if (!type.signed_value) {
+        return encoded;
+    }
+    const unsigned int bits = static_cast<unsigned int>(type.width * 8U);
+    const std::uint64_t sign_bit = bits == 64U
+        ? (1ULL << 63U)
+        : (1ULL << (bits - 1U));
+    if ((encoded & sign_bit) == 0) {
+        return static_cast<std::int64_t>(encoded);
+    }
+    const std::uint64_t magnitude = (~encoded) + 1ULL;
+    if (bits == 64U && magnitude == sign_bit) {
+        return (std::numeric_limits<std::int64_t>::min)();
+    }
+    const std::uint64_t mask = bits == 64U
+        ? (std::numeric_limits<std::uint64_t>::max)()
+        : (1ULL << bits) - 1ULL;
+    return -static_cast<std::int64_t>(magnitude & mask);
+}
+
+validation_failure_t normalize_get_bytes(const json& arguments,
+                                         const memory_handler_limits_t& limits,
+                                         normalized_request_t& normalized) {
     const auto regions = arguments.find("regions");
     if (regions == arguments.end()) {
         return invalid_value("regions", "field_required", json(nullptr));
     }
-    return scalar_or_array(*regions, "regions", limits.maximum_batch_items,
-        [&limits](const json& region, std::string path) -> validation_failure_t {
+    return for_each_scalar_or_array(*regions, "regions", limits.maximum_batch_items,
+        [&limits, &normalized](const json& region, std::string path,
+                               std::size_t index) -> validation_failure_t {
             if (!region.is_object()) {
                 return invalid_value(std::move(path), "object_required", region);
             }
-            if (auto failure = bounded_member_text(
-                    region, "addr", path, limits.maximum_address_bytes, false)) {
+            normalized_range_t range;
+            range.index = index;
+            if (auto failure = normalize_address_member(
+                    region, "addr", path, limits,
+                    range.address_text, range.address)) {
                 return failure;
             }
-            if (auto failure = bounded_integer(
-                    region, "size", limits.maximum_read_bytes_per_item, path)) {
+            const auto size = region.find("size");
+            const auto parsed_size = size == region.end()
+                ? std::optional<std::uint64_t>{}
+                : unsigned_integer(*size);
+            if (!parsed_size || *parsed_size == 0) {
+                return invalid_value(path + ".size", "positive_integer_required",
+                                     size == region.end() ? json(nullptr) : *size);
+            }
+            if (*parsed_size > limits.maximum_read_bytes_per_item) {
+                return exceeded_value(path + ".size",
+                                      limits.maximum_read_bytes_per_item,
+                                      *parsed_size);
+            }
+            if (auto failure = add_to_aggregate(
+                    normalized.aggregate_bytes, *parsed_size,
+                    limits.maximum_read_bytes_per_call, "aggregate_read_bytes")) {
                 return failure;
             }
+            range.size = *parsed_size;
+            normalized.ranges.push_back(std::move(range));
+            ++normalized.item_count;
             return std::nullopt;
         });
 }
 
-validation_failure_t validate_get_int(const json& arguments,
-                                       const memory_handler_limits_t& limits) {
+validation_failure_t normalize_get_int(const json& arguments,
+                                       const memory_handler_limits_t& limits,
+                                       normalized_request_t& normalized) {
     const auto queries = arguments.find("queries");
     if (queries == arguments.end()) {
         return invalid_value("queries", "field_required", json(nullptr));
     }
-    return scalar_or_array(*queries, "queries", limits.maximum_batch_items,
-        [&limits](const json& query, std::string path) -> validation_failure_t {
+    return for_each_scalar_or_array(*queries, "queries", limits.maximum_batch_items,
+        [&limits, &normalized](const json& query, std::string path,
+                               std::size_t index) -> validation_failure_t {
             if (!query.is_object()) {
                 return invalid_value(std::move(path), "object_required", query);
             }
-            if (auto failure = bounded_member_text(
-                    query, "addr", path, limits.maximum_address_bytes, false)) {
+            normalized_range_t range;
+            range.index = index;
+            if (auto failure = normalize_address_member(
+                    query, "addr", path, limits,
+                    range.address_text, range.address)) {
                 return failure;
             }
             if (auto failure = bounded_member_text(
                     query, "ty", path, limits.maximum_type_bytes, false)) {
                 return failure;
             }
+            const auto type_field = query.find("ty");
+            integer_type_t type;
+            if (type_field == query.end()) {
+                return invalid_value(path + ".ty", "field_required", json(nullptr));
+            }
+            if (auto failure = normalize_integer_type(*type_field, path + ".ty", type)) {
+                return failure;
+            }
+            range.size = static_cast<std::uint64_t>(type.width);
+            if (auto failure = add_to_aggregate(
+                    normalized.aggregate_bytes, range.size,
+                    limits.maximum_read_bytes_per_call, "aggregate_read_bytes")) {
+                return failure;
+            }
+            normalized.ranges.push_back(std::move(range));
+            normalized.integer_types.push_back(std::move(type));
+            ++normalized.item_count;
             return std::nullopt;
         });
 }
 
-validation_failure_t validate_get_string(const json& arguments,
-                                          const memory_handler_limits_t& limits) {
+validation_failure_t normalize_get_string(const json& arguments,
+                                          const memory_handler_limits_t& limits,
+                                          normalized_request_t& normalized) {
     const auto addrs = arguments.find("addrs");
     if (addrs == arguments.end()) {
         return invalid_value("addrs", "field_required", json(nullptr));
     }
-    return scalar_or_array(*addrs, "addrs", limits.maximum_batch_items,
-        [&limits](const json& addr, std::string path) {
-            return bounded_text(addr, std::move(path),
-                                limits.maximum_address_bytes, false);
-        });
-}
-
-validation_failure_t validate_get_global_value(const json& arguments,
-                                                 const memory_handler_limits_t& limits) {
-    const auto queries = arguments.find("queries");
-    if (queries == arguments.end()) {
-        return invalid_value("queries", "field_required", json(nullptr));
-    }
-    return scalar_or_array(*queries, "queries", limits.maximum_batch_items,
-        [&limits](const json& item, std::string path) {
-            return bounded_text(item, std::move(path),
-                                limits.maximum_address_bytes, false);
-        });
-}
-
-validation_failure_t validate_patch(const json& arguments,
-                                     const memory_handler_limits_t& limits) {
-    const auto patches = arguments.find("patches");
-    if (patches == arguments.end()) {
-        return invalid_value("patches", "field_required", json(nullptr));
-    }
-    return scalar_or_array(*patches, "patches", limits.maximum_batch_items,
-        [&limits](const json& patch, std::string path) -> validation_failure_t {
-            if (!patch.is_object()) {
-                return invalid_value(std::move(path), "object_required", patch);
-            }
-            if (auto failure = bounded_member_text(
-                    patch, "addr", path, limits.maximum_address_bytes, false)) {
+    return for_each_scalar_or_array(*addrs, "addrs", limits.maximum_batch_items,
+        [&limits, &normalized](const json& addr, std::string path,
+                               std::size_t index) -> validation_failure_t {
+            if (auto failure = bounded_text(
+                    addr, path, limits.maximum_address_bytes, false)) {
                 return failure;
             }
-            if (auto failure = bounded_member_text(
-                    patch, "data", path,
-                    limits.maximum_read_bytes_per_item * 2, false)) {
+            normalized_range_t range;
+            range.index = index;
+            range.address_text = addr.get<std::string>();
+            const auto parsed = parse_address(range.address_text);
+            if (!parsed) {
+                return invalid_value(std::move(path),
+                                     "hex_or_decimal_address_required", addr);
+            }
+            range.address = *parsed;
+            range.size = limits.maximum_string_bytes;
+            if (auto failure = add_to_aggregate(
+                    normalized.aggregate_bytes, range.size,
+                    limits.maximum_read_bytes_per_call, "aggregate_string_bytes")) {
                 return failure;
             }
+            normalized.ranges.push_back(std::move(range));
+            ++normalized.item_count;
             return std::nullopt;
         });
 }
 
-validation_failure_t validate_put_int(const json& arguments,
-                                       const memory_handler_limits_t& limits) {
+validation_failure_t normalize_get_global_value(const json& arguments,
+                                                const memory_handler_limits_t& limits,
+                                                normalized_request_t& normalized) {
+    const auto queries = arguments.find("queries");
+    if (queries == arguments.end()) {
+        return invalid_value("queries", "field_required", json(nullptr));
+    }
+    return for_each_scalar_or_array(*queries, "queries", limits.maximum_batch_items,
+        [&limits, &normalized](const json& item, std::string path,
+                               std::size_t) -> validation_failure_t {
+            if (auto failure = bounded_text(
+                    item, std::move(path), limits.maximum_address_bytes, false)) {
+                return failure;
+            }
+            ++normalized.item_count;
+            return std::nullopt;
+        });
+}
+
+validation_failure_t normalize_patch(const json& arguments,
+                                     const memory_handler_limits_t& limits,
+                                     normalized_request_t& normalized) {
+    const auto patches = arguments.find("patches");
+    if (patches == arguments.end()) {
+        return invalid_value("patches", "field_required", json(nullptr));
+    }
+    return for_each_scalar_or_array(*patches, "patches", limits.maximum_batch_items,
+        [&limits, &normalized](const json& patch, std::string path,
+                               std::size_t index) -> validation_failure_t {
+            if (!patch.is_object()) {
+                return invalid_value(std::move(path), "object_required", patch);
+            }
+            normalized_overlay_operation_t operation;
+            operation.index = index;
+            operation.kind = "byte_patch";
+            if (auto failure = normalize_address_member(
+                    patch, "addr", path, limits,
+                    operation.address_text, operation.address)) {
+                return failure;
+            }
+            if (auto failure = bounded_member_text(
+                    patch, "data", path, limits.maximum_request_bytes, false)) {
+                return failure;
+            }
+            const auto data = patch.find("data");
+            if (data == patch.end()) {
+                return invalid_value(path + ".data", "field_required", json(nullptr));
+            }
+            std::string reason;
+            if (!parse_hex_bytes(
+                    data->get_ref<const std::string&>(),
+                    static_cast<std::size_t>(limits.maximum_read_bytes_per_item),
+                    operation.bytes, reason)) {
+                return invalid_value(path + ".data", std::move(reason), *data);
+            }
+            if (auto failure = add_to_aggregate(
+                    normalized.aggregate_bytes,
+                    static_cast<std::uint64_t>(operation.bytes.size()),
+                    limits.maximum_read_bytes_per_call, "aggregate_overlay_bytes")) {
+                return failure;
+            }
+            normalized.overlay_operations.push_back(std::move(operation));
+            ++normalized.item_count;
+            return std::nullopt;
+        });
+}
+
+validation_failure_t normalize_put_int(const json& arguments,
+                                       const memory_handler_limits_t& limits,
+                                       normalized_request_t& normalized) {
     const auto items = arguments.find("items");
     if (items == arguments.end()) {
         return invalid_value("items", "field_required", json(nullptr));
     }
-    return scalar_or_array(*items, "items", limits.maximum_batch_items,
-        [&limits](const json& item, std::string path) -> validation_failure_t {
+    return for_each_scalar_or_array(*items, "items", limits.maximum_batch_items,
+        [&limits, &normalized](const json& item, std::string path,
+                               std::size_t index) -> validation_failure_t {
             if (!item.is_object()) {
                 return invalid_value(std::move(path), "object_required", item);
             }
-            if (auto failure = bounded_member_text(
-                    item, "addr", path, limits.maximum_address_bytes, false)) {
+            normalized_overlay_operation_t operation;
+            operation.index = index;
+            operation.kind = "integer_patch";
+            if (auto failure = normalize_address_member(
+                    item, "addr", path, limits,
+                    operation.address_text, operation.address)) {
                 return failure;
             }
             if (auto failure = bounded_member_text(
@@ -378,34 +804,171 @@ validation_failure_t validate_put_int(const json& arguments,
                     item, "value", path, limits.maximum_address_bytes, false)) {
                 return failure;
             }
+            const auto type_field = item.find("ty");
+            const auto value_field = item.find("value");
+            if (type_field == item.end() || value_field == item.end()) {
+                return invalid_value(path, "integer_patch_fields_required", item);
+            }
+            integer_type_t type;
+            if (auto failure = normalize_integer_type(
+                    *type_field, path + ".ty", type)) {
+                return failure;
+            }
+            std::uint64_t encoded = 0;
+            if (auto failure = parse_integer_value(
+                    value_field->get_ref<const std::string&>(), type, encoded)) {
+                (*failure)["field"] = path + ".value";
+                (*failure)["actual"] = *value_field;
+                return failure;
+            }
+            operation.requested_type = type.requested;
+            operation.value = value_field->get<std::string>();
+            operation.bytes = encode_integer(encoded, type);
+            if (auto failure = add_to_aggregate(
+                    normalized.aggregate_bytes,
+                    static_cast<std::uint64_t>(operation.bytes.size()),
+                    limits.maximum_read_bytes_per_call, "aggregate_overlay_bytes")) {
+                return failure;
+            }
+            normalized.integer_types.push_back(std::move(type));
+            normalized.overlay_operations.push_back(std::move(operation));
+            ++normalized.item_count;
             return std::nullopt;
         });
 }
 
-validation_failure_t validate_tool_bounds(std::string_view name, const json& arguments,
-                                          const memory_handler_limits_t& limits) {
+json read_intent(std::string_view name, const normalized_request_t& normalized,
+                 const memory_handler_limits_t& limits,
+                 const memory_invocation_t& invocation) {
+    json ranges = json::array();
+    for (std::size_t index = 0; index < normalized.ranges.size(); ++index) {
+        const auto& range = normalized.ranges[index];
+        json entry{
+            {"index", range.index},
+            {"addr", range.address_text},
+            {"address", range.address},
+            {"size", range.size},
+        };
+        if (name == "get_int") {
+            const auto& type = normalized.integer_types.at(index);
+            entry["integer_type"] = type.canonical;
+            entry["signed"] = type.signed_value;
+            entry["endian"] = type.endian == integer_endian_t::big
+                ? "big"
+                : "little";
+        }
+        if (name == "get_string") {
+            entry["null_terminated"] = true;
+        }
+        ranges.push_back(std::move(entry));
+    }
+    json intent{
+        {"protocol", "aida.memory.v1"},
+        {"operation", "read"},
+        {"tool", std::string(name)},
+        {"response_mode", name == "get_int" ? "raw_hex_bytes" : "public_result"},
+        {"source_policy", "immutable_static_or_bounded_live"},
+        {"aggregate_requested_bytes", normalized.aggregate_bytes},
+        {"aggregate_limit_bytes", limits.maximum_read_bytes_per_call},
+        {"item_count", normalized.item_count},
+        {"ranges", std::move(ranges)},
+        {"static_snapshot", json{
+            {"required", true},
+            {"immutable", true},
+            {"generation_bound", true},
+        }},
+        {"live_snapshot", json{
+            {"permitted", true},
+            {"read_only", true},
+            {"module_boundary_required", true},
+            {"identity_revalidation_required", true},
+            {"maximum_range_bytes", limits.maximum_read_bytes_per_item},
+            {"maximum_aggregate_bytes", limits.maximum_read_bytes_per_call},
+        }},
+    };
+    if (invocation.expected_generation) {
+        intent["expected_generation"] = *invocation.expected_generation;
+    }
+    return intent;
+}
+
+json overlay_intent(std::string_view name, const normalized_request_t& normalized,
+                    const memory_invocation_t& invocation) {
+    json operations = json::array();
+    for (std::size_t index = 0; index < normalized.overlay_operations.size(); ++index) {
+        const auto& operation = normalized.overlay_operations[index];
+        json entry{
+            {"index", operation.index},
+            {"kind", operation.kind},
+            {"addr", operation.address_text},
+            {"address", operation.address},
+            {"size", operation.bytes.size()},
+            {"after", format_hex_bytes(operation.bytes)},
+        };
+        if (name == "put_int") {
+            const auto& type = normalized.integer_types.at(index);
+            entry["ty"] = operation.requested_type;
+            entry["integer_type"] = type.canonical;
+            entry["value"] = operation.value;
+            entry["signed"] = type.signed_value;
+            entry["endian"] = type.endian == integer_endian_t::big
+                ? "big"
+                : "little";
+        }
+        operations.push_back(std::move(entry));
+    }
+    json intent{
+        {"protocol", "aida.memory.v1"},
+        {"operation", "overlay_transaction"},
+        {"tool", std::string(name)},
+        {"static_target_only", true},
+        {"live_write_permitted", false},
+        {"atomic", true},
+        {"reversible", true},
+        {"aggregate_write_bytes", normalized.aggregate_bytes},
+        {"item_count", normalized.item_count},
+        {"operations", std::move(operations)},
+    };
+    if (invocation.expected_generation) {
+        intent["expected_generation"] = *invocation.expected_generation;
+    }
+    return intent;
+}
+
+validation_failure_t normalize_tool_request(
+    std::string_view name, const json& arguments,
+    const memory_handler_limits_t& limits,
+    const memory_invocation_t& invocation,
+    normalized_request_t& normalized) {
     if (auto failure = validate_routing_bounds(arguments, limits)) {
         return failure;
     }
+    normalized.backend_arguments = arguments;
+    normalized.backend_arguments.erase("pid");
+    normalized.backend_arguments.erase("bin_name");
+    validation_failure_t failure;
     if (name == "get_bytes") {
-        return validate_get_bytes(arguments, limits);
+        failure = normalize_get_bytes(arguments, limits, normalized);
+    } else if (name == "get_int") {
+        failure = normalize_get_int(arguments, limits, normalized);
+    } else if (name == "get_string") {
+        failure = normalize_get_string(arguments, limits, normalized);
+    } else if (name == "get_global_value") {
+        failure = normalize_get_global_value(arguments, limits, normalized);
+    } else if (name == "patch") {
+        failure = normalize_patch(arguments, limits, normalized);
+    } else if (name == "put_int") {
+        failure = normalize_put_int(arguments, limits, normalized);
+    } else {
+        return invalid_value("tool", "memory_tool_not_registered", std::string(name));
     }
-    if (name == "get_int") {
-        return validate_get_int(arguments, limits);
+    if (failure) {
+        return failure;
     }
-    if (name == "get_string") {
-        return validate_get_string(arguments, limits);
-    }
-    if (name == "get_global_value") {
-        return validate_get_global_value(arguments, limits);
-    }
-    if (name == "patch") {
-        return validate_patch(arguments, limits);
-    }
-    if (name == "put_int") {
-        return validate_put_int(arguments, limits);
-    }
-    return invalid_value("tool", "memory_tool_not_registered", std::string(name));
+    normalized.backend_arguments["_aida_memory"] = is_overlay_tool(name)
+        ? overlay_intent(name, normalized, invocation)
+        : read_intent(name, normalized, limits, invocation);
+    return std::nullopt;
 }
 
 std::chrono::milliseconds execution_timeout(const protocol::tool_contract_t& contract,
@@ -442,6 +1005,608 @@ std::chrono::milliseconds execution_timeout(const protocol::tool_contract_t& con
         }
     }
     return maximum;
+}
+
+struct normalized_response_t final {
+    json structured = json::object();
+    json metadata = json::object();
+};
+
+struct snapshot_receipt_t final {
+    json value = json::object();
+    std::uint64_t generation = 0;
+    std::uint64_t bytes_read = 0;
+};
+
+bool member_is_true(const json& object, std::string_view name) {
+    const auto found = object.find(std::string(name));
+    return found != object.end() && found->is_boolean() && found->get<bool>();
+}
+
+bool member_is_false(const json& object, std::string_view name) {
+    const auto found = object.find(std::string(name));
+    return found != object.end() && found->is_boolean() && !found->get<bool>();
+}
+
+validation_failure_t require_unsigned_member(
+    const json& object, std::string_view name, std::string path,
+    std::uint64_t& value) {
+    const auto found = object.find(std::string(name));
+    if (found == object.end()) {
+        return invalid_value(path + "." + std::string(name),
+                             "field_required", json(nullptr));
+    }
+    const auto parsed = unsigned_integer(*found);
+    if (!parsed) {
+        return invalid_value(path + "." + std::string(name),
+                             "nonnegative_integer_required", *found);
+    }
+    value = *parsed;
+    return std::nullopt;
+}
+
+validation_failure_t require_string_member(
+    const json& object, std::string_view name, std::string path,
+    std::size_t maximum, std::string& value) {
+    const auto found = object.find(std::string(name));
+    if (found == object.end()) {
+        return invalid_value(path + "." + std::string(name),
+                             "field_required", json(nullptr));
+    }
+    if (auto failure = bounded_text(
+            *found, path + "." + std::string(name), maximum, false)) {
+        return failure;
+    }
+    value = found->get<std::string>();
+    return std::nullopt;
+}
+
+validation_failure_t normalize_snapshot_receipt(
+    const json& response, const normalized_request_t& request,
+    const memory_handler_limits_t& limits,
+    const memory_invocation_t& invocation,
+    snapshot_receipt_t& receipt) {
+    const auto memory = response.find("_aida_memory");
+    if (memory == response.end() || !memory->is_object()) {
+        return invalid_value("response._aida_memory", "object_required",
+                             memory == response.end() ? json(nullptr) : *memory);
+    }
+    const auto snapshot = memory->find("snapshot");
+    if (snapshot == memory->end() || !snapshot->is_object()) {
+        return invalid_value("response._aida_memory.snapshot", "object_required",
+                             snapshot == memory->end() ? json(nullptr) : *snapshot);
+    }
+    std::string source;
+    if (auto failure = require_string_member(
+            *snapshot, "source", "response._aida_memory.snapshot",
+            limits.maximum_type_bytes, source)) {
+        return failure;
+    }
+    if (auto failure = require_unsigned_member(
+            *snapshot, "generation", "response._aida_memory.snapshot",
+            receipt.generation)) {
+        return failure;
+    }
+    if (receipt.generation == 0 ||
+        (invocation.expected_generation &&
+         receipt.generation != *invocation.expected_generation)) {
+        return invalid_value("response._aida_memory.snapshot.generation",
+                             "snapshot_generation_mismatch", receipt.generation);
+    }
+    if (auto failure = require_unsigned_member(
+            *snapshot, "bytes_read", "response._aida_memory.snapshot",
+            receipt.bytes_read)) {
+        return failure;
+    }
+    const std::uint64_t receipt_limit = request.aggregate_bytes == 0
+        ? limits.maximum_read_bytes_per_call
+        : request.aggregate_bytes;
+    if (receipt.bytes_read > receipt_limit) {
+        return exceeded_value("response._aida_memory.snapshot.bytes_read",
+                              receipt_limit, receipt.bytes_read);
+    }
+    if (!member_is_true(*snapshot, "read_only")) {
+        return invalid_value("response._aida_memory.snapshot.read_only",
+                             "true_required", snapshot->value("read_only", json(nullptr)));
+    }
+    if (source == "immutable_workspace_snapshot") {
+        if (!member_is_true(*snapshot, "immutable")) {
+            return invalid_value("response._aida_memory.snapshot.immutable",
+                                 "true_required", snapshot->value("immutable", json(nullptr)));
+        }
+    } else if (source == "bounded_live_snapshot") {
+        if (!member_is_true(*snapshot, "module_boundary_validated") ||
+            !member_is_true(*snapshot, "identity_revalidated")) {
+            return invalid_value("response._aida_memory.snapshot",
+                                 "live_boundary_and_identity_evidence_required", *snapshot);
+        }
+    } else {
+        return invalid_value("response._aida_memory.snapshot.source",
+                             "supported_snapshot_source_required", source);
+    }
+    receipt.value = *snapshot;
+    return std::nullopt;
+}
+
+validation_failure_t require_result_array(
+    const json& response, std::size_t expected_count, const json*& result) {
+    const auto found = response.find("result");
+    if (found == response.end() || !found->is_array()) {
+        return invalid_value("response.result", "array_required",
+                             found == response.end() ? json(nullptr) : *found);
+    }
+    if (found->size() != expected_count) {
+        return invalid_value("response.result", "item_count_mismatch",
+                             json{{"expected", expected_count},
+                                  {"actual", found->size()}});
+    }
+    result = &*found;
+    return std::nullopt;
+}
+
+validation_failure_t normalize_get_bytes_response(
+    const json& response, const normalized_request_t& request,
+    const memory_handler_limits_t& limits, normalized_response_t& normalized,
+    std::uint64_t& decoded_bytes) {
+    const json* result = nullptr;
+    if (auto failure = require_result_array(response, request.item_count, result)) {
+        return failure;
+    }
+    json public_items = json::array();
+    for (std::size_t index = 0; index < result->size(); ++index) {
+        const auto& item = (*result)[index];
+        if (!item.is_object()) {
+            return invalid_value("response.result[" + std::to_string(index) + "]",
+                                 "object_required", item);
+        }
+        const auto addr = item.find("addr");
+        const auto data = item.find("data");
+        if (addr == item.end() ||
+            (!addr->is_string() && !addr->is_null()) ||
+            data == item.end() ||
+            (!data->is_string() && !data->is_null())) {
+            return invalid_value("response.result[" + std::to_string(index) + "]",
+                                 "address_and_data_required", item);
+        }
+        json output{{"addr", *addr}, {"data", *data}};
+        bool has_error = false;
+        if (const auto error = item.find("error"); error != item.end()) {
+            if (!error->is_string()) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].error",
+                    "string_required", *error);
+            }
+            output["error"] = *error;
+            has_error = !error->get_ref<const std::string&>().empty();
+        }
+        if (data->is_null()) {
+            if (!has_error) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].data",
+                    "error_required_for_null_data", *data);
+            }
+        } else {
+            std::vector<std::uint8_t> bytes;
+            std::string reason;
+            if (!parse_hex_bytes(
+                    data->get_ref<const std::string&>(),
+                    static_cast<std::size_t>(request.ranges[index].size),
+                    bytes, reason)) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].data",
+                    std::move(reason), *data);
+            }
+            if (!has_error && bytes.size() != request.ranges[index].size) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].data",
+                    "complete_read_or_explicit_error_required", *data);
+            }
+            if (auto failure = add_to_aggregate(
+                    decoded_bytes, static_cast<std::uint64_t>(bytes.size()),
+                    limits.maximum_read_bytes_per_call,
+                    "response.aggregate_read_bytes")) {
+                return failure;
+            }
+            output["data"] = format_hex_bytes(bytes);
+        }
+        public_items.push_back(std::move(output));
+    }
+    normalized.structured = json{{"result", std::move(public_items)}};
+    return std::nullopt;
+}
+
+validation_failure_t normalize_get_int_response(
+    const json& response, const normalized_request_t& request,
+    const memory_handler_limits_t& limits, normalized_response_t& normalized,
+    std::uint64_t& decoded_bytes) {
+    const json* result = nullptr;
+    if (auto failure = require_result_array(response, request.item_count, result)) {
+        return failure;
+    }
+    json public_items = json::array();
+    for (std::size_t index = 0; index < result->size(); ++index) {
+        const auto& item = (*result)[index];
+        if (!item.is_object()) {
+            return invalid_value("response.result[" + std::to_string(index) + "]",
+                                 "object_required", item);
+        }
+        const auto addr = item.find("addr");
+        if (addr == item.end() || !addr->is_string()) {
+            return invalid_value(
+                "response.result[" + std::to_string(index) + "].addr",
+                "string_required", addr == item.end() ? json(nullptr) : *addr);
+        }
+        const auto& type = request.integer_types[index];
+        json output{
+            {"addr", *addr},
+            {"ty", type.requested},
+            {"value", nullptr},
+        };
+        bool has_error = false;
+        if (const auto error = item.find("error"); error != item.end()) {
+            if (!error->is_string()) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].error",
+                    "string_required", *error);
+            }
+            output["error"] = *error;
+            has_error = !error->get_ref<const std::string&>().empty();
+        }
+        const auto data = item.find("data");
+        if (has_error) {
+            if (data != item.end() && !data->is_null()) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].data",
+                    "null_required_for_failed_integer_read", *data);
+            }
+        } else {
+            if (data == item.end() || !data->is_string()) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].data",
+                    "raw_hex_bytes_required",
+                    data == item.end() ? json(nullptr) : *data);
+            }
+            std::vector<std::uint8_t> bytes;
+            std::string reason;
+            if (!parse_hex_bytes(data->get_ref<const std::string&>(),
+                                 type.width, bytes, reason) ||
+                bytes.size() != type.width) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].data",
+                    bytes.size() == type.width ? std::move(reason)
+                                               : "integer_width_mismatch",
+                    *data);
+            }
+            if (auto failure = add_to_aggregate(
+                    decoded_bytes, static_cast<std::uint64_t>(bytes.size()),
+                    limits.maximum_read_bytes_per_call,
+                    "response.aggregate_read_bytes")) {
+                return failure;
+            }
+            output["value"] = decode_integer(bytes, type);
+        }
+        public_items.push_back(std::move(output));
+    }
+    normalized.structured = json{{"result", std::move(public_items)}};
+    return std::nullopt;
+}
+
+validation_failure_t normalize_string_response(
+    std::string_view name, const json& response,
+    const normalized_request_t& request,
+    const memory_handler_limits_t& limits,
+    normalized_response_t& normalized) {
+    const json* result = nullptr;
+    if (auto failure = require_result_array(response, request.item_count, result)) {
+        return failure;
+    }
+    const char* identity_field = name == "get_string" ? "addr" : "query";
+    std::uint64_t aggregate_value_bytes = 0;
+    json public_items = json::array();
+    for (std::size_t index = 0; index < result->size(); ++index) {
+        const auto& item = (*result)[index];
+        if (!item.is_object()) {
+            return invalid_value("response.result[" + std::to_string(index) + "]",
+                                 "object_required", item);
+        }
+        const auto identity = item.find(identity_field);
+        const auto value = item.find("value");
+        if (identity == item.end() || !identity->is_string() ||
+            value == item.end() || (!value->is_string() && !value->is_null())) {
+            return invalid_value("response.result[" + std::to_string(index) + "]",
+                                 "identity_and_value_required", item);
+        }
+        json output{{identity_field, *identity}, {"value", *value}};
+        bool has_error = false;
+        if (const auto error = item.find("error"); error != item.end()) {
+            if (!error->is_string()) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].error",
+                    "string_required", *error);
+            }
+            output["error"] = *error;
+            has_error = !error->get_ref<const std::string&>().empty();
+        }
+        if (value->is_null()) {
+            if (!has_error) {
+                return invalid_value(
+                    "response.result[" + std::to_string(index) + "].value",
+                    "error_required_for_null_value", *value);
+            }
+        } else {
+            const auto value_size = static_cast<std::uint64_t>(
+                value->get_ref<const std::string&>().size());
+            if (value_size > limits.maximum_string_bytes) {
+                return exceeded_value(
+                    "response.result[" + std::to_string(index) + "].value",
+                    limits.maximum_string_bytes, value_size);
+            }
+            if (auto failure = add_to_aggregate(
+                    aggregate_value_bytes, value_size,
+                    limits.maximum_read_bytes_per_call,
+                    "response.aggregate_string_bytes")) {
+                return failure;
+            }
+        }
+        public_items.push_back(std::move(output));
+    }
+    normalized.structured = json{{"result", std::move(public_items)}};
+    return std::nullopt;
+}
+
+validation_failure_t normalize_read_response(
+    std::string_view name, const json& response,
+    const normalized_request_t& request,
+    const memory_handler_limits_t& limits,
+    const memory_invocation_t& invocation,
+    normalized_response_t& normalized) {
+    snapshot_receipt_t receipt;
+    if (auto failure = normalize_snapshot_receipt(
+            response, request, limits, invocation, receipt)) {
+        return failure;
+    }
+    std::uint64_t decoded_bytes = 0;
+    validation_failure_t failure;
+    if (name == "get_bytes") {
+        failure = normalize_get_bytes_response(
+            response, request, limits, normalized, decoded_bytes);
+    } else if (name == "get_int") {
+        failure = normalize_get_int_response(
+            response, request, limits, normalized, decoded_bytes);
+    } else if (name == "get_string" || name == "get_global_value") {
+        failure = normalize_string_response(
+            name, response, request, limits, normalized);
+    } else {
+        return invalid_value("response", "unsupported_memory_read_response",
+                             std::string(name));
+    }
+    if (failure) {
+        return failure;
+    }
+    if ((name == "get_bytes" || name == "get_int") &&
+        decoded_bytes != receipt.bytes_read) {
+        return invalid_value("response._aida_memory.snapshot.bytes_read",
+                             "decoded_byte_count_mismatch",
+                             json{{"receipt", receipt.bytes_read},
+                                  {"decoded", decoded_bytes}});
+    }
+    normalized.metadata["memory_snapshot"] = receipt.value;
+    normalized.metadata["generation"] = receipt.generation;
+    return std::nullopt;
+}
+
+validation_failure_t normalize_overlay_response(
+    std::string_view name, const json& response,
+    const normalized_request_t& request,
+    const memory_handler_limits_t& limits,
+    const memory_invocation_t& invocation,
+    normalized_response_t& normalized) {
+    const auto memory = response.find("_aida_memory");
+    if (memory == response.end() || !memory->is_object()) {
+        return invalid_value("response._aida_memory", "object_required",
+                             memory == response.end() ? json(nullptr) : *memory);
+    }
+    const auto transaction = memory->find("transaction");
+    if (transaction == memory->end() || !transaction->is_object()) {
+        return invalid_value("response._aida_memory.transaction", "object_required",
+                             transaction == memory->end() ? json(nullptr) : *transaction);
+    }
+    if (!member_is_true(*transaction, "committed") ||
+        !member_is_true(*transaction, "reversible") ||
+        !member_is_true(*transaction, "undo_supported") ||
+        !member_is_false(*transaction, "live_write_performed")) {
+        return invalid_value("response._aida_memory.transaction",
+                             "committed_reversible_static_transaction_required",
+                             *transaction);
+    }
+    std::string transaction_id;
+    std::string undo_token;
+    if (auto failure = require_string_member(
+            *transaction, "transaction_id", "response._aida_memory.transaction",
+            limits.maximum_selector_bytes, transaction_id)) {
+        return failure;
+    }
+    if (auto failure = require_string_member(
+            *transaction, "undo_token", "response._aida_memory.transaction",
+            limits.maximum_selector_bytes, undo_token)) {
+        return failure;
+    }
+    std::uint64_t generation = 0;
+    std::uint64_t revision_before = 0;
+    std::uint64_t revision_after = 0;
+    if (auto failure = require_unsigned_member(
+            *transaction, "generation", "response._aida_memory.transaction",
+            generation)) {
+        return failure;
+    }
+    if (auto failure = require_unsigned_member(
+            *transaction, "overlay_revision_before",
+            "response._aida_memory.transaction", revision_before)) {
+        return failure;
+    }
+    if (auto failure = require_unsigned_member(
+            *transaction, "overlay_revision_after",
+            "response._aida_memory.transaction", revision_after)) {
+        return failure;
+    }
+    if (generation == 0 ||
+        (invocation.expected_generation && generation != *invocation.expected_generation)) {
+        return invalid_value("response._aida_memory.transaction.generation",
+                             "transaction_generation_mismatch", generation);
+    }
+    if (revision_after <= revision_before) {
+        return invalid_value(
+            "response._aida_memory.transaction.overlay_revision_after",
+            "revision_must_advance",
+            json{{"before", revision_before}, {"after", revision_after}});
+    }
+    const auto operations = transaction->find("operations");
+    if (operations == transaction->end() || !operations->is_array() ||
+        operations->size() != request.overlay_operations.size()) {
+        return invalid_value("response._aida_memory.transaction.operations",
+                             "complete_operation_receipts_required",
+                             operations == transaction->end() ? json(nullptr) : *operations);
+    }
+    std::vector<bool> seen(request.overlay_operations.size(), false);
+    std::vector<json> normalized_operations(request.overlay_operations.size());
+    for (std::size_t position = 0; position < operations->size(); ++position) {
+        const auto& operation = (*operations)[position];
+        if (!operation.is_object()) {
+            return invalid_value(
+                "response._aida_memory.transaction.operations[" +
+                    std::to_string(position) + "]",
+                "object_required", operation);
+        }
+        std::uint64_t operation_index = 0;
+        std::uint64_t size = 0;
+        if (auto failure = require_unsigned_member(
+                operation, "index",
+                "response._aida_memory.transaction.operations[" +
+                    std::to_string(position) + "]",
+                operation_index)) {
+            return failure;
+        }
+        if (operation_index >= request.overlay_operations.size() ||
+            seen[static_cast<std::size_t>(operation_index)]) {
+            return invalid_value(
+                "response._aida_memory.transaction.operations[" +
+                    std::to_string(position) + "].index",
+                "unique_request_index_required", operation_index);
+        }
+        seen[static_cast<std::size_t>(operation_index)] = true;
+        const auto& expected =
+            request.overlay_operations[static_cast<std::size_t>(operation_index)];
+        std::string kind;
+        std::string address_text;
+        std::string before_text;
+        std::string after_text;
+        const std::string operation_path =
+            "response._aida_memory.transaction.operations[" +
+            std::to_string(position) + "]";
+        if (auto failure = require_string_member(
+                operation, "kind", operation_path,
+                limits.maximum_type_bytes, kind)) {
+            return failure;
+        }
+        if (auto failure = require_string_member(
+                operation, "addr", operation_path,
+                limits.maximum_address_bytes, address_text)) {
+            return failure;
+        }
+        if (auto failure = require_string_member(
+                operation, "before", operation_path,
+                limits.maximum_response_bytes, before_text)) {
+            return failure;
+        }
+        if (auto failure = require_string_member(
+                operation, "after", operation_path,
+                limits.maximum_response_bytes, after_text)) {
+            return failure;
+        }
+        if (auto failure = require_unsigned_member(
+                operation, "size", operation_path, size)) {
+            return failure;
+        }
+        const auto receipt_address = parse_address(address_text);
+        if (!receipt_address || *receipt_address != expected.address ||
+            kind != expected.kind || size != expected.bytes.size()) {
+            return invalid_value(operation_path,
+                                 "operation_identity_mismatch", operation);
+        }
+        std::vector<std::uint8_t> before;
+        std::vector<std::uint8_t> after;
+        std::string reason;
+        if (!parse_hex_bytes(before_text, expected.bytes.size(), before, reason) ||
+            before.size() != expected.bytes.size()) {
+            return invalid_value(operation_path + ".before",
+                                 "before_width_mismatch", before_text);
+        }
+        reason.clear();
+        if (!parse_hex_bytes(after_text, expected.bytes.size(), after, reason) ||
+            after != expected.bytes) {
+            return invalid_value(operation_path + ".after",
+                                 "encoded_after_bytes_mismatch", after_text);
+        }
+        normalized_operations[static_cast<std::size_t>(operation_index)] = json{
+            {"index", operation_index},
+            {"kind", kind},
+            {"addr", address_text},
+            {"size", size},
+            {"before", format_hex_bytes(before)},
+            {"after", format_hex_bytes(after)},
+        };
+    }
+    json public_items = json::array();
+    for (const auto& operation : request.overlay_operations) {
+        if (name == "patch") {
+            public_items.push_back(json{
+                {"addr", operation.address_text},
+                {"size", operation.bytes.size()},
+            });
+        } else {
+            public_items.push_back(json{
+                {"addr", operation.address_text},
+                {"ty", operation.requested_type},
+                {"value", operation.value},
+            });
+        }
+    }
+    json transaction_metadata{
+        {"transaction_id", transaction_id},
+        {"committed", true},
+        {"reversible", true},
+        {"undo_supported", true},
+        {"undo_token", undo_token},
+        {"live_write_performed", false},
+        {"generation", generation},
+        {"overlay_revision_before", revision_before},
+        {"overlay_revision_after", revision_after},
+        {"operations", json::array()},
+    };
+    for (auto& operation : normalized_operations) {
+        transaction_metadata["operations"].push_back(std::move(operation));
+    }
+    normalized.structured = json{{"result", std::move(public_items)}};
+    normalized.metadata["overlay_transaction"] = std::move(transaction_metadata);
+    normalized.metadata["generation"] = generation;
+    normalized.metadata["overlay_revision"] = revision_after;
+    normalized.metadata["reversible"] = true;
+    normalized.metadata["undo_token"] = undo_token;
+    return std::nullopt;
+}
+
+validation_failure_t normalize_backend_response(
+    std::string_view name, const json& response,
+    const normalized_request_t& request,
+    const memory_handler_limits_t& limits,
+    const memory_invocation_t& invocation,
+    normalized_response_t& normalized) {
+    if (is_overlay_tool(name)) {
+        return normalize_overlay_response(
+            name, response, request, limits, invocation, normalized);
+    }
+    return normalize_read_response(
+        name, response, request, limits, invocation, normalized);
 }
 
 result_error_code_t adapter_error_code(adapter_error_code_t code) noexcept {
@@ -621,7 +1786,9 @@ private:
                     static_cast<std::uint64_t>(limits_.maximum_request_bytes),
                     static_cast<std::uint64_t>(serialized_arguments.size())));
         }
-        if (auto failure = validate_tool_bounds(name, arguments, limits_)) {
+        normalized_request_t normalized_request;
+        if (auto failure = normalize_tool_request(
+                name, arguments, limits_, invocation, normalized_request)) {
             return protocol::mcp_result_t::failure(
                 protocol::result_error_code_t::invalid_input,
                 "Memory tool arguments violate the bounded adapter policy.",
@@ -639,11 +1806,8 @@ private:
             bin_name != arguments.end()) {
             request.target.bin_name = bin_name->get<std::string>();
         }
-        protocol::json backend_arguments = arguments;
-        backend_arguments.erase("pid");
-        backend_arguments.erase("bin_name");
         try {
-            request.payload = backend_arguments.dump();
+            request.payload = normalized_request.backend_arguments.dump();
         } catch (const std::exception&) {
             return protocol::mcp_result_t::failure(
                 protocol::result_error_code_t::invalid_input,
@@ -716,14 +1880,31 @@ private:
                 "Memory tool invocation was cancelled before output validation.",
                 protocol::json{{"phase", "memory_pre_output_validation"}});
         }
+        normalized_response_t normalized_response;
+        if (auto failure = normalize_backend_response(
+                name, structured, normalized_request, limits_, invocation,
+                normalized_response)) {
+            return protocol::mcp_result_t::failure(
+                protocol::result_error_code_t::invalid_output,
+                "Memory adapter response violates the C12 snapshot or overlay contract.",
+                *failure);
+        }
         const std::size_t response_bytes = response.payload.size();
+        normalized_response.metadata["adapter_truncated"] = response.truncated;
+        normalized_response.metadata["adapter_response_bytes"] = response_bytes;
+        std::string normalized_text;
+        try {
+            normalized_text = normalized_response.structured.dump();
+        } catch (const std::exception&) {
+            return protocol::mcp_result_t::failure(
+                protocol::result_error_code_t::invalid_output,
+                "Memory normalized response cannot be serialized.",
+                protocol::json{{"phase", "memory_normalized_serialization"}});
+        }
         return protocol::mcp_result_t::success(
-            std::move(response.payload),
-            structured,
-            protocol::json{
-                {"adapter_truncated", response.truncated},
-                {"adapter_response_bytes", response_bytes},
-            });
+            std::move(normalized_text),
+            normalized_response.structured,
+            normalized_response.metadata);
     }
 
     workspace_adapter_t& workspace_;

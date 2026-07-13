@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -337,6 +338,11 @@ struct workbench_persistence_dto_t {
     std::vector<view_persistence_dto_t> views;
     std::vector<panel_state_dto_t> panels;
     navigation_history_dto_t history;
+
+    workbench_error_t validate() const;
+    workbench_error_t normalize();
+    persistence_fingerprint_t fingerprint() const;
+    bool equivalent(const workbench_persistence_dto_t& other) const;
 };
 
 struct document_descriptor_t {
@@ -385,6 +391,49 @@ public:
     virtual workbench_error_t load(workspace_id_t workspace,
                                    workbench_persistence_dto_t& output) const = 0;
     virtual workbench_error_t store(const workbench_persistence_dto_t& input) = 0;
+};
+
+struct document_navigation_bridge_request_t {
+    navigation_event_id_t id;
+    std::uint64_t sequence = 0;
+    navigation_origin_t origin = navigation_origin_t::adapter;
+    view_context_t source;
+    navigation_target_t target;
+    bool request_focus = true;
+};
+
+class workbench_document_bridge_t final : public document_catalog_adapter_t,
+                                          public navigation_adapter_t {
+public:
+    explicit workbench_document_bridge_t(workspace_id_t workspace) noexcept;
+
+    workbench_document_bridge_t(const workbench_document_bridge_t&) = delete;
+    workbench_document_bridge_t& operator=(const workbench_document_bridge_t&) = delete;
+
+    workbench_error_t publish(document_descriptor_t descriptor);
+    workbench_error_t replace(std::vector<document_descriptor_t> descriptors);
+    workbench_error_t remove(const document_identity_t& identity);
+    void clear() noexcept;
+
+    workbench_error_t describe(const document_identity_t& identity,
+                               document_descriptor_t& output) const override;
+    workbench_error_t resolve(const navigation_event_t& event,
+                              navigation_resolution_t& output) const override;
+
+    workbench_error_t resolve_target(const document_identity_t& source,
+                                     document_kind_t target_kind,
+                                     std::uint64_t address,
+                                     navigation_resolution_t& output) const;
+    workbench_error_t emit(const document_navigation_bridge_request_t& request,
+                           navigation_event_t& output) const;
+
+    std::vector<document_descriptor_t> documents() const;
+    workspace_id_t workspace() const noexcept { return workspace_; }
+
+private:
+    workspace_id_t workspace_;
+    mutable std::mutex mutex_;
+    std::vector<document_descriptor_t> documents_;
 };
 
 bool document_identity_equal(const document_identity_t& lhs, const document_identity_t& rhs);

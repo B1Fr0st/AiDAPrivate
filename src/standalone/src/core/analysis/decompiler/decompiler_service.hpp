@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -65,6 +66,10 @@ struct decompiler_pipeline_cache_identity_t {
     std::vector<decompiler_dependency_version_t> dependencies;
 };
 
+using decompiler_provider_context_factory_t = std::function<
+    workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>(
+        const decompiler_provider_request_t&, const cancellation_token_t&)>;
+
 struct decompiler_pipeline_request_t {
     decompiler_pipeline_invocation_t invocation = decompiler_pipeline_invocation_t::unspecified;
     decompiler_pipeline_cache_mode_t cache_mode = decompiler_pipeline_cache_mode_t::read_write;
@@ -79,6 +84,7 @@ struct decompiler_pipeline_request_t {
     std::optional<std::string> provider_registration_id;
     decompiler_pipeline_cache_identity_t cache_identity;
     std::shared_ptr<const decompiler_provider_context_t> provider_context;
+    decompiler_provider_context_factory_t provider_context_factory;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
@@ -104,6 +110,7 @@ struct decompiler_pipeline_service_config_t {
     typed_ast_v2_build_limits_t ast_limits;
     pseudocode_renderer_v2_limits_t renderer_limits;
     decompiler_profile_policy_t profiles = default_decompiler_profile_policy();
+    std::shared_ptr<decompiler_isolated_provider_host_t> isolated_provider_host;
     bool require_complete_source_map = true;
 };
 
@@ -117,6 +124,8 @@ struct decompiler_pipeline_service_snapshot_t {
     std::uint64_t stale_generations = 0;
     std::uint64_t resource_limits = 0;
     std::uint64_t provider_invocations = 0;
+    std::uint64_t isolated_provider_invocations = 0;
+    std::uint64_t isolated_host_rejections = 0;
     std::uint64_t provider_ir_cache_hits = 0;
     std::uint64_t normalized_cache_hits = 0;
     std::uint64_t rendered_cache_hits = 0;

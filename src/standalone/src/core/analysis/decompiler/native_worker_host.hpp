@@ -1,7 +1,8 @@
 #pragma once
 
-#include "decompiler_contracts.hpp"
+#include "decompiler_provider_registry.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -91,6 +92,14 @@ struct native_worker_launch_contract_t {
     sha256_digest_t expected_manifest_hash;
 };
 
+struct packaged_native_worker_runtime_t {
+    std::shared_ptr<decompiler_isolated_provider_host_t> provider_host;
+    decompiler_provider_identity_t provider;
+    sha256_digest_t worker_protocol_hash;
+    sha256_digest_t manifest_hash;
+    std::uint32_t worker_protocol_version = 0;
+};
+
 struct native_worker_host_limits_t {
     std::size_t max_frame_bytes = 8U * 1024U * 1024U;
     std::size_t max_snapshot_bytes = 256U * 1024U * 1024U;
@@ -134,6 +143,8 @@ std::string serialize_native_worker_manifest(const native_worker_manifest_t& val
 native_worker_manifest_decode_t deserialize_native_worker_manifest(const std::string& value);
 sha256_digest_t native_worker_protocol_hash();
 std::optional<native_worker_snapshot_t> make_native_worker_snapshot(std::vector<std::uint8_t> bytes);
+workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_worker_runtime(
+    std::filesystem::path runtime_root = {});
 
 class native_worker_host_t final {
 public:
@@ -153,6 +164,21 @@ private:
     mutable std::mutex mutex_;
     std::uint64_t worker_generation_ = 0;
     bool stopped_ = false;
+};
+
+class native_worker_provider_host_t final : public decompiler_isolated_provider_host_t {
+public:
+    explicit native_worker_provider_host_t(std::shared_ptr<native_worker_host_t> host);
+
+    bool supports(const decompiler_provider_descriptor_t& descriptor) const noexcept override;
+    decompiler_provider_result_t execute(
+        const decompiler_provider_route_t& route,
+        const decompiler_provider_request_t& request,
+        const cancellation_token_t& cancel) override;
+
+private:
+    std::shared_ptr<native_worker_host_t> host_;
+    std::atomic<std::uint64_t> next_job_id_{1};
 };
 
 }

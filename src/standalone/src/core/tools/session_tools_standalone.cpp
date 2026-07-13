@@ -1,12 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-#include "../mcp/ida_compat_schemas.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "../session/analysis_session.hpp"
-#include "../analysis/workspace/workspace_database.hpp"
-#include "../analysis/workspace/live_snapshot_provider.hpp"
-#include "../analysis/workspace/workspace_registry.hpp"
 #include "../session/session_health.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/run_target.hpp"
@@ -22,6 +18,7 @@
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -67,84 +64,6 @@ const char* readiness_name(aida::analysis::workspace_readiness_t readiness)
 	case aida::analysis::workspace_readiness_t::closed: return "closed";
 	}
 	return "unknown";
-}
-
-const char* architecture_name(aida::analysis::architecture_id_t architecture)
-{
-	switch (architecture) {
-	case aida::analysis::architecture_id_t::x86: return "x86";
-	case aida::analysis::architecture_id_t::x86_64: return "x86_64";
-	default: return "unknown";
-	}
-}
-
-const char* format_name(aida::analysis::format_id_t format)
-{
-	switch (format) {
-	case aida::analysis::format_id_t::pe32: return "pe32";
-	case aida::analysis::format_id_t::pe32_plus: return "pe32_plus";
-	default: return "unknown";
-	}
-}
-
-tool_result_t list_instances(int port)
-{
-	auto workspaces = aida::analysis::workspace_registry().list();
-	json instances = json::array();
-	std::uint32_t only_live_pid = 0;
-	std::size_t live_count = 0;
-	for (const auto& workspace : workspaces) {
-		const auto& identity = workspace->identity();
-		const bool live = identity.target_kind() == aida::analysis::target_kind_t::live_snapshot;
-		const std::uint32_t pid = live && identity.process() ? identity.process()->pid : 0;
-		std::shared_ptr<const aida::analysis::live_snapshot_provider_t> live_provider;
-		bool snapshot_stale = false;
-		if (live) {
-			live_provider = std::dynamic_pointer_cast<const aida::analysis::live_snapshot_provider_t>(
-				workspace->provider_handle());
-			snapshot_stale = !live_provider || !live_provider->validate_current_identity();
-		}
-		if (pid != 0 && !snapshot_stale) {
-			++live_count;
-			only_live_pid = pid;
-		}
-		json instance;
-		instance["pid"] = pid;
-		instance["binary"] = identity.bin_name();
-		instance["host"] = "127.0.0.1";
-		instance["port"] = port;
-		auto database = workspace->database();
-		instance["idb_path"] = database ? database->path() : std::string();
-		instance["backend"] = live ? "aida_driver_live" : "aida_static";
-		instance["binary_id"] = identity.binary_id().to_hex();
-		instance["kind"] = live ? "live" : "static";
-		instance["path"] = identity.normalized_source_path();
-		instance["process_creation_id"] = identity.process()
-			? json(std::to_string(identity.process()->creation_time_100ns))
-			: json(nullptr);
-		instance["architecture"] = architecture_name(identity.architecture());
-		instance["format"] = format_name(identity.format());
-		instance["analysis_revision"] = workspace->analysis_revision();
-		instance["overlay_revision"] = workspace->overlay_revision();
-		instance["readiness"] = readiness_name(workspace->progress().readiness);
-		instance["snapshot_stale"] = snapshot_stale;
-		if (live_provider) {
-			const auto& metadata = live_provider->metadata();
-			instance["capture_time_100ns"] = std::to_string(metadata.capture_time_100ns);
-			instance["capture_address"] = std::to_string(metadata.capture_address);
-			instance["capture_size"] = metadata.capture_size;
-			instance["capture_hash"] = metadata.capture_hash.to_hex();
-			instance["module_base"] = std::to_string(metadata.module.base);
-			instance["module_size"] = metadata.module.size;
-			instance["module_name"] = metadata.module.normalized_name;
-		}
-		instances.push_back(std::move(instance));
-	}
-	json result;
-	result["instances"] = std::move(instances);
-	result["count"] = workspaces.size();
-	result["default_pid"] = live_count == 1 ? json(only_live_pid) : json(nullptr);
-	return tool_result_t::ok(result);
 }
 
 bool parse_pid(const json& value, uint32_t& out, std::string* out_code = nullptr, std::string* out_message = nullptr, json* out_details = nullptr)
@@ -567,14 +486,6 @@ static tool_result_t sessions_run_binary(const json& params)
 void register_session_tools(mcp_standalone::server_t& srv)
 {
 	diag::log_tagged_fmt("sess_tools", "register_session_tools entry");
-	mcp_standalone::tool_def_t instances;
-	instances.name = "list_instances";
-	instances.description = "List every open AiDA static workspace and driver-backed live target without consulting or changing the active UI tab.";
-	instances.read_only = true;
-	instances.handler = [&srv](const json&) -> tool_result_t { return list_instances(srv.get_port()); };
-	if (const auto* schema = mcp_standalone::ida_compat::find_schema("list_instances"))
-		instances.input_schema = *schema;
-	srv.register_tool(std::move(instances));
 	srv.register_tool({
 		"sessions_manage",
 		"Manage static file, live process, and sandbox sessions. Actions: list, get_active, open_file, attach_pid, close, run_binary.",

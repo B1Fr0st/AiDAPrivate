@@ -1,5 +1,7 @@
 #include "native_worker_host.hpp"
 
+#include "providers/ghidra_ir_adapter.hpp"
+
 #include "../../../../workers/native_decompiler/native_worker_protocol.hpp"
 
 #include <windows.h>
@@ -8,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cwctype>
@@ -836,6 +839,13 @@ bool same_provider(const decompiler_provider_identity_t& lhs, const decompiler_p
         lhs.worker_build_hash == rhs.worker_build_hash;
 }
 
+bool same_language(const decompiler_language_identity_t& lhs, const decompiler_language_identity_t& rhs) noexcept
+{
+    return lhs.language_id == rhs.language_id && lhs.language_version == rhs.language_version &&
+        lhs.compiler_spec_id == rhs.compiler_spec_id && lhs.language_spec_hash == rhs.language_spec_hash &&
+        lhs.architecture == rhs.architecture && lhs.mode == rhs.mode && lhs.endian == rhs.endian;
+}
+
 bool send_contract(worker_instance_t& worker, const decompiler_worker_message_t& message,
                    const native_worker_host_limits_t& limits, DWORD& error)
 {
@@ -1052,6 +1062,147 @@ std::optional<native_worker_snapshot_t> make_native_worker_snapshot(std::vector<
     return result;
 }
 
+workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_worker_runtime(
+    std::filesystem::path runtime_root)
+{
+    const auto failure = [](workspace_error_code_t code, std::string message,
+                            std::string phase, DWORD win32_error = ERROR_SUCCESS) {
+        auto error = make_workspace_error(code, std::move(message), std::move(phase));
+        if (win32_error != ERROR_SUCCESS)
+            error.win32_status = win32_error;
+        return workspace_result_t<packaged_native_worker_runtime_t>::failure(std::move(error));
+    };
+    try {
+        if (runtime_root.empty()) {
+            constexpr DWORD module_path_capacity = 32768;
+            std::wstring module_path(module_path_capacity, L'\0');
+            const DWORD written = GetModuleFileNameW(
+                nullptr, module_path.data(), static_cast<DWORD>(module_path.size()));
+            if (written == 0 || written >= module_path.size()) {
+                return failure(workspace_error_code_t::provider_unavailable,
+                    "native decompiler runtime root could not be discovered",
+                    "native_worker.runtime.module", GetLastError());
+            }
+            module_path.resize(written);
+            runtime_root = std::filesystem::path(std::move(module_path)).parent_path();
+        }
+
+        std::error_code ec;
+        runtime_root = std::filesystem::absolute(runtime_root, ec).lexically_normal();
+        if (ec || runtime_root.empty()) {
+            return failure(workspace_error_code_t::invalid_argument,
+                "native decompiler runtime root is invalid",
+                "native_worker.runtime.root");
+        }
+        const DWORD root_attributes = GetFileAttributesW(runtime_root.c_str());
+        if (root_attributes == INVALID_FILE_ATTRIBUTES ||
+            (root_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (root_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            return failure(workspace_error_code_t::provider_unavailable,
+                "native decompiler runtime root is unavailable or redirected",
+                "native_worker.runtime.root", GetLastError());
+        }
+
+        const auto manifest_path = (runtime_root /
+            std::filesystem::path(std::string(k_native_worker_manifest_artifact_relative_path))).lexically_normal();
+        const auto digest_path = (runtime_root /
+            std::filesystem::path(std::string(k_native_worker_manifest_digest_relative_path))).lexically_normal();
+        const DWORD manifest_attributes = GetFileAttributesW(manifest_path.c_str());
+        const DWORD digest_attributes = GetFileAttributesW(digest_path.c_str());
+        if (manifest_attributes == INVALID_FILE_ATTRIBUTES ||
+            digest_attributes == INVALID_FILE_ATTRIBUTES ||
+            (manifest_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+            (digest_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+            return failure(workspace_error_code_t::provider_unavailable,
+                "native decompiler worker manifest package is unavailable",
+                "native_worker.runtime.package", GetLastError());
+        }
+
+        handle_t manifest_file;
+        handle_t digest_file;
+        std::vector<std::uint8_t> manifest_bytes;
+        std::vector<std::uint8_t> digest_bytes;
+        DWORD error = ERROR_SUCCESS;
+        if (!read_locked_file(manifest_path, 64U * 1024U, manifest_file, manifest_bytes, error)) {
+            return failure(workspace_error_code_t::provider_unavailable,
+                "native decompiler worker manifest could not be read",
+                "native_worker.runtime.manifest", error);
+        }
+        if (!read_locked_file(digest_path, 4096U, digest_file, digest_bytes, error)) {
+            return failure(workspace_error_code_t::provider_unavailable,
+                "native decompiler worker manifest digest could not be read",
+                "native_worker.runtime.digest", error);
+        }
+        const auto manifest_final = final_path(manifest_file.get());
+        const auto digest_final = final_path(digest_file.get());
+        const auto normalized_root = strip_extended_prefix(runtime_root.wstring());
+        if (!manifest_final || !digest_final ||
+            !path_within(normalized_root, *manifest_final) ||
+            !path_within(normalized_root, *digest_final)) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "native decompiler worker package escaped the approved runtime root",
+                "native_worker.runtime.binding", ERROR_ACCESS_DENIED);
+        }
+
+        std::string digest_text(
+            reinterpret_cast<const char*>(digest_bytes.data()), digest_bytes.size());
+        while (!digest_text.empty() &&
+               std::isspace(static_cast<unsigned char>(digest_text.back())) != 0)
+            digest_text.pop_back();
+        const auto digest_hex_size = sha256_digest_t{}.bytes.size() * 2U;
+        if (digest_text.size() != digest_hex_size) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "native decompiler worker manifest digest is malformed",
+                "native_worker.runtime.digest");
+        }
+        const auto expected_manifest_hash = sha256_digest_t::from_hex(digest_text);
+        if (!expected_manifest_hash) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "native decompiler worker manifest digest is invalid",
+                "native_worker.runtime.digest");
+        }
+        sha256_digest_t manifest_hash;
+        if (!wire::sha256(manifest_bytes.data(), manifest_bytes.size(), manifest_hash) ||
+            manifest_hash != *expected_manifest_hash) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "native decompiler worker manifest digest does not match the package",
+                "native_worker.runtime.manifest_hash", ERROR_CRC);
+        }
+        const auto decoded = deserialize_native_worker_manifest(std::string(
+            reinterpret_cast<const char*>(manifest_bytes.data()), manifest_bytes.size()));
+        SecureZeroMemory(manifest_bytes.data(), manifest_bytes.size());
+        if (!decoded.valid() || !decoded.value || !valid_manifest(*decoded.value) ||
+            std::string_view(decoded.value->worker_relative_path) !=
+                k_native_worker_binary_artifact_relative_path ||
+            decoded.value->worker_protocol_hash != native_worker_protocol_hash()) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "native decompiler worker manifest violates the production launch contract",
+                "native_worker.runtime.manifest_contract");
+        }
+
+        native_worker_launch_contract_t launch_contract;
+        launch_contract.approved_root = runtime_root;
+        launch_contract.manifest_path = manifest_path;
+        launch_contract.expected_manifest_hash = manifest_hash;
+        auto host = std::make_shared<native_worker_host_t>(std::move(launch_contract));
+        packaged_native_worker_runtime_t result;
+        result.provider_host = std::make_shared<native_worker_provider_host_t>(std::move(host));
+        result.provider = decoded.value->provider;
+        result.worker_protocol_hash = decoded.value->worker_protocol_hash;
+        result.manifest_hash = manifest_hash;
+        result.worker_protocol_version = decoded.value->worker_protocol_version;
+        return workspace_result_t<packaged_native_worker_runtime_t>::success(std::move(result));
+    } catch (const std::bad_alloc&) {
+        return failure(workspace_error_code_t::limit_exceeded,
+            "native decompiler runtime allocation failed",
+            "native_worker.runtime");
+    } catch (...) {
+        return failure(workspace_error_code_t::provider_unavailable,
+            "native decompiler runtime initialization failed",
+            "native_worker.runtime");
+    }
+}
+
 bool native_worker_snapshot_t::valid() const noexcept
 {
     return bytes && !bytes->empty() && !hash.empty();
@@ -1090,7 +1241,9 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
     result.snapshot_hash = verified_snapshot_hash;
     const auto cache_validation = validate_decompiler_pipeline_cache_key(request.cache_key);
     const auto profile_validation = validate_decompiler_profile(request.profile);
-    if (!cache_validation.valid() || !profile_validation.valid() || request.cache_key.profile.profile != request.profile.profile ||
+    if (!cache_validation.valid() || !profile_validation.valid() ||
+        request.cache_key.worker_protocol_hash != native_worker_protocol_hash() ||
+        request.cache_key.profile.profile != request.profile.profile ||
         request.cache_key.profile.max_wall_clock_ms != request.profile.max_wall_clock_ms ||
         request.cache_key.profile.max_cpu_ms != request.profile.max_cpu_ms ||
         request.cache_key.profile.max_memory_bytes != request.profile.max_memory_bytes ||
@@ -1105,6 +1258,13 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
     auto verified = verify_worker(contract_, result);
     if (!verified)
         return result;
+    if (!same_provider(request.cache_key.provider, verified->manifest.provider)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::worker_identity_mismatch,
+            "native_worker.request_identity",
+            "cache provider identity does not match the verified worker manifest",
+            ERROR_CRC, true);
+        return result;
+    }
     result.worker_generation = ++worker_generation_;
     worker_instance_t worker;
     if (!launch_worker(*verified, request, limits_, worker, result)) {
@@ -1257,6 +1417,199 @@ std::uint64_t native_worker_host_t::worker_generation() const noexcept
 {
     std::lock_guard lock(mutex_);
     return worker_generation_;
+}
+
+native_worker_provider_host_t::native_worker_provider_host_t(
+    std::shared_ptr<native_worker_host_t> host)
+    : host_(std::move(host))
+{
+}
+
+bool native_worker_provider_host_t::supports(
+    const decompiler_provider_descriptor_t& descriptor) const noexcept
+{
+    return host_ && descriptor.isolated &&
+           descriptor.entity_kind == decompiler_entity_kind_t::native_function &&
+           descriptor.identity.provider == decompiler_provider_id_t::ghidra_native;
+}
+
+decompiler_provider_result_t native_worker_provider_host_t::execute(
+    const decompiler_provider_route_t& route,
+    const decompiler_provider_request_t& request,
+    const cancellation_token_t& cancel)
+{
+    const auto started = std::chrono::steady_clock::now();
+    decompiler_provider_result_t result;
+    if (!supports(route.descriptor) || !route.provider) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::worker_protocol_failure;
+        diagnostic.localization_key = "decompiler.native_host.route_rejected";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+    if (cancel.stop_requested() || started >= request.deadline) {
+        const bool timed_out = cancel.deadline_exceeded() || started >= request.deadline;
+        result.status = timed_out ? decompiler_provider_execution_status_t::timed_out
+                                  : decompiler_provider_execution_status_t::cancelled;
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = timed_out ? decompiler_diagnostic_code_t::deadline_exceeded
+                                    : decompiler_diagnostic_code_t::cancelled;
+        diagnostic.localization_key = timed_out
+            ? "decompiler.native_host.deadline" : "decompiler.native_host.cancelled";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+
+    const auto context = std::dynamic_pointer_cast<const ghidra_native_provider_context_t>(request.context);
+    if (!context || !context->artifacts()) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
+        diagnostic.localization_key = "decompiler.native_host.context_rejected";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+
+    const auto& source = *context->artifacts();
+    if (request.cache_key.stage != decompiler_cache_stage_t::provider_ir ||
+        !validate_decompiler_pipeline_cache_key(request.cache_key).valid() ||
+        !validate_provider_ir(source.provider_ir).valid() ||
+        !validate_hir_function(source.hir).valid() ||
+        !validate_type_graph(source.type_graph).valid() ||
+        source.provider_ir.entity != request.cache_key.entity ||
+        source.hir.entity != request.cache_key.entity ||
+        source.type_graph.entity != request.cache_key.entity ||
+        !same_provider(source.provider_ir.provider, route.descriptor.identity) ||
+        !same_provider(request.cache_key.provider, route.descriptor.identity) ||
+        !same_language(source.provider_ir.language, request.cache_key.language) ||
+        source.hir.provider_ir_hash != stable_serialization_hash(source.provider_ir) ||
+        source.hir.type_graph_revision != request.cache_key.type_graph_revision ||
+        source.type_graph.revision != request.cache_key.type_graph_revision ||
+        source.hir.return_type_id == 0) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
+        diagnostic.localization_key = "decompiler.native_host.artifacts_rejected";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+
+    result.diagnostics = source.provider_ir.diagnostics;
+    std::optional<native_worker_snapshot_t> snapshot;
+    try {
+        const auto serialized = ghidra_ir_adapter::serialize_artifacts(source);
+        std::vector<std::uint8_t> bytes(serialized.begin(), serialized.end());
+        snapshot = make_native_worker_snapshot(std::move(bytes));
+    } catch (...) {
+        result.status = decompiler_provider_execution_status_t::failed;
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::resource_limit;
+        diagnostic.localization_key = "decompiler.native_host.snapshot_serialize";
+        diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+    if (!snapshot) {
+        result.status = decompiler_provider_execution_status_t::failed;
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::resource_limit;
+        diagnostic.localization_key = "decompiler.native_host.snapshot_rejected";
+        diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+
+    auto job_id = next_job_id_.fetch_add(1, std::memory_order_acq_rel);
+    if (job_id == 0)
+        job_id = next_job_id_.fetch_add(1, std::memory_order_acq_rel);
+    native_worker_execution_request_t worker_request;
+    worker_request.job_id = job_id;
+    worker_request.cache_key = request.cache_key;
+    worker_request.profile = request.cache_key.profile;
+    worker_request.snapshot = std::move(*snapshot);
+    worker_request.deadline = request.deadline;
+    worker_request.cancellation_requested = [cancel] {
+        return cancel.stop_requested();
+    };
+    auto worker_result = host_->execute(worker_request);
+    result.diagnostics.insert(result.diagnostics.end(),
+        worker_result.worker_diagnostics.begin(), worker_result.worker_diagnostics.end());
+    for (const auto& source : worker_result.diagnostics) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = source.code == native_worker_diagnostic_code_t::deadline_exceeded
+            ? decompiler_diagnostic_code_t::deadline_exceeded
+            : source.code == native_worker_diagnostic_code_t::cancelled
+                ? decompiler_diagnostic_code_t::cancelled
+                : decompiler_diagnostic_code_t::worker_protocol_failure;
+        diagnostic.localization_key = source.phase.empty()
+            ? "decompiler.native_host.failure" : source.phase;
+        diagnostic.localization_arguments = {
+            source.detail,
+            std::to_string(source.win32_error),
+            std::to_string(source.worker_generation)};
+        diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
+        diagnostic.retryable = source.retryable;
+        result.diagnostics.push_back(std::move(diagnostic));
+    }
+    switch (worker_result.status) {
+    case native_worker_execution_status_t::completed:
+        if (worker_result.document) {
+            try {
+                decompiler_provider_artifacts_t provider_artifacts;
+                provider_artifacts.provider_ir = source.provider_ir;
+                provider_artifacts.hir = source.hir;
+                provider_artifacts.type_graph = source.type_graph;
+                provider_artifacts.return_type_id = source.hir.return_type_id;
+                result.artifacts = std::move(provider_artifacts);
+                result.attested_document = std::move(worker_result.document);
+                result.status = decompiler_provider_execution_status_t::completed;
+            } catch (...) {
+                result.status = decompiler_provider_execution_status_t::failed;
+                result.artifacts.reset();
+                result.attested_document.reset();
+                decompiler_diagnostic_t diagnostic;
+                diagnostic.severity = decompiler_diagnostic_severity_t::error;
+                diagnostic.code = decompiler_diagnostic_code_t::resource_limit;
+                diagnostic.localization_key = "decompiler.native_host.result_allocation";
+                diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
+                result.diagnostics.push_back(std::move(diagnostic));
+            }
+        } else {
+            result.status = decompiler_provider_execution_status_t::failed;
+            result.artifacts.reset();
+        }
+        break;
+    case native_worker_execution_status_t::cancelled:
+        result.status = decompiler_provider_execution_status_t::cancelled;
+        result.artifacts.reset();
+        break;
+    case native_worker_execution_status_t::deadline_exceeded:
+        result.status = decompiler_provider_execution_status_t::timed_out;
+        result.artifacts.reset();
+        break;
+    case native_worker_execution_status_t::failed:
+        result.status = std::any_of(worker_result.diagnostics.begin(), worker_result.diagnostics.end(),
+            [](const native_worker_diagnostic_t& diagnostic) {
+                return diagnostic.code == native_worker_diagnostic_code_t::worker_crashed;
+            })
+            ? decompiler_provider_execution_status_t::crashed
+            : decompiler_provider_execution_status_t::failed;
+        result.artifacts.reset();
+        break;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    result.elapsed_wall_clock_ms = static_cast<std::uint64_t>((std::max<std::int64_t>)(elapsed, 0));
+    return result;
 }
 
 }

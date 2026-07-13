@@ -28,6 +28,40 @@ workspace_error_t orchestrator_error(workspace_error_code_t code, std::string me
     return error;
 }
 
+workspace_error_t cancellation_error(const cancellation_token_t& cancellation,
+                                     std::string message)
+{
+    const bool deadline = cancellation.deadline_exceeded();
+    auto error = orchestrator_error(
+        deadline ? workspace_error_code_t::deadline_exceeded
+                 : workspace_error_code_t::cancelled,
+        std::move(message));
+    error.cancellation = !deadline;
+    error.deadline = deadline;
+    return error;
+}
+
+workspace_error_t limit_error(std::string resource, std::uint64_t limit,
+                              std::uint64_t attempted,
+                              std::optional<std::uint64_t> rva = std::nullopt)
+{
+    auto error = orchestrator_error(workspace_error_code_t::limit_exceeded,
+                                    resource + " limit exhausted", rva);
+    error.details.emplace_back("resource", std::move(resource));
+    error.details.emplace_back("limit", std::to_string(limit));
+    error.details.emplace_back("attempted", std::to_string(attempted));
+    return error;
+}
+
+bool checked_add(std::uint64_t lhs, std::uint64_t rhs,
+                 std::uint64_t& result) noexcept
+{
+    if (rhs > (std::numeric_limits<std::uint64_t>::max)() - lhs)
+        return false;
+    result = lhs + rhs;
+    return true;
+}
+
 edge_kind_t flow_to_edge_kind(std::uint32_t flow_flags) noexcept
 {
     if ((flow_flags & flow_return) != 0)
@@ -57,13 +91,50 @@ decode_frontier_seed_kind_t flow_to_target_seed_kind(std::uint32_t flow_flags) n
 }
 
 bool instruction_stronger(const instruction_record_t& a,
-                          const instruction_record_t& b) noexcept
+                           const instruction_record_t& b) noexcept
 {
     if (a.provenance != b.provenance)
         return provenance_rank(a.provenance) > provenance_rank(b.provenance);
     if (a.confidence != b.confidence)
         return a.confidence > b.confidence;
-    return a.stable_source_id < b.stable_source_id;
+    if (a.stable_source_id != b.stable_source_id)
+        return a.stable_source_id < b.stable_source_id;
+    if (a.address != b.address)
+        return a.address < b.address;
+    if (a.length != b.length)
+        return a.length > b.length;
+    if (a.mnemonic_id != b.mnemonic_id)
+        return a.mnemonic_id < b.mnemonic_id;
+    if (a.opcode_id != b.opcode_id)
+        return a.opcode_id < b.opcode_id;
+    if (a.flow_flags != b.flow_flags)
+        return a.flow_flags < b.flow_flags;
+    return a.coverage < b.coverage;
+}
+
+bool target_less(const target_fact_t& lhs, const target_fact_t& rhs) noexcept
+{
+    if (lhs.target != rhs.target)
+        return lhs.target < rhs.target;
+    if (lhs.kind != rhs.kind)
+        return lhs.kind < rhs.kind;
+    if (lhs.resolution != rhs.resolution)
+        return lhs.resolution < rhs.resolution;
+    if (lhs.operand_index != rhs.operand_index)
+        return lhs.operand_index < rhs.operand_index;
+    if (lhs.access_width_bits != rhs.access_width_bits)
+        return lhs.access_width_bits < rhs.access_width_bits;
+    if (lhs.access_count != rhs.access_count)
+        return lhs.access_count < rhs.access_count;
+    if (lhs.direct != rhs.direct)
+        return lhs.direct < rhs.direct;
+    if (lhs.is_external != rhs.is_external)
+        return lhs.is_external < rhs.is_external;
+    if (lhs.instruction_id != rhs.instruction_id)
+        return lhs.instruction_id < rhs.instruction_id;
+    if (lhs.operand_fact_id != rhs.operand_fact_id)
+        return lhs.operand_fact_id < rhs.operand_fact_id;
+    return lhs.address_expression_id < rhs.address_expression_id;
 }
 
 struct tile_instruction_entry_t {
@@ -71,16 +142,58 @@ struct tile_instruction_entry_t {
     std::vector<operand_fact_t> operands;
     std::vector<target_fact_t> targets;
     std::uint8_t delay_slots = 0;
+    std::uint64_t duplicate_edge_count = 0;
 };
 
 struct tile_accumulator_t {
     const executable_decode_tile_t* tile = nullptr;
     std::map<std::uint64_t, tile_instruction_entry_t> instructions;
     std::vector<coverage_span_t> coverage;
-    std::set<std::uint64_t> decoded_rvas;
     std::uint64_t invalid_bytes = 0;
     std::uint64_t invalid_runs = 0;
-    bool cutoff = false;
+};
+
+struct correlated_tile_decode_batch_t final {
+    std::vector<tile_decode_completion_t> completions;
+    std::vector<std::size_t> completion_indices;
+};
+
+struct instruction_acceptance_t final {
+    bool accepted = false;
+};
+
+struct decoded_edge_key_t final {
+    address_t source;
+    address_t target;
+    edge_kind_t kind = edge_kind_t::fallthrough;
+};
+
+struct decoded_edge_less_t final {
+    bool operator()(const decoded_edge_key_t& lhs,
+                    const decoded_edge_key_t& rhs) const noexcept
+    {
+        if (lhs.source != rhs.source)
+            return lhs.source < rhs.source;
+        if (lhs.target != rhs.target)
+            return lhs.target < rhs.target;
+        return lhs.kind < rhs.kind;
+    }
+};
+
+struct cross_tile_edge_less_t final {
+    bool operator()(const tile_decode_cross_tile_edge_t& lhs,
+                    const tile_decode_cross_tile_edge_t& rhs) const noexcept
+    {
+        if (lhs.source_tile_id != rhs.source_tile_id)
+            return lhs.source_tile_id < rhs.source_tile_id;
+        if (lhs.target_tile_id != rhs.target_tile_id)
+            return lhs.target_tile_id < rhs.target_tile_id;
+        if (lhs.source != rhs.source)
+            return lhs.source < rhs.source;
+        if (lhs.target != rhs.target)
+            return lhs.target < rhs.target;
+        return lhs.kind < rhs.kind;
+    }
 };
 
 void merge_coverage_into(std::vector<coverage_span_t>& dest,
@@ -92,21 +205,36 @@ void merge_coverage_into(std::vector<coverage_span_t>& dest,
         dest.push_back(span);
     }
     std::sort(dest.begin(), dest.end(), [](const auto& a, const auto& b) {
-        if (a.start.space != b.start.space)
-            return a.start.space < b.start.space;
-        return a.start.value < b.start.value;
+        if (a.start != b.start)
+            return a.start < b.start;
+        if (a.reason != b.reason)
+            return a.reason < b.reason;
+        if (a.provenance != b.provenance)
+            return a.provenance < b.provenance;
+        if (a.confidence != b.confidence)
+            return a.confidence < b.confidence;
+        if (a.detail_code != b.detail_code)
+            return a.detail_code < b.detail_code;
+        return a.size < b.size;
     });
     std::vector<coverage_span_t> merged;
     merged.reserve(dest.size());
     for (auto& span : dest) {
         if (!merged.empty()) {
             auto& last = merged.back();
+            std::uint64_t last_end = 0;
+            std::uint64_t span_end = 0;
             if (last.start.space == span.start.space &&
-                last.start.value + last.size >= span.start.value &&
+                last.start.architecture == span.start.architecture &&
+                last.start.mode == span.start.mode &&
+                checked_add(last.start.value, last.size, last_end) &&
+                checked_add(span.start.value, span.size, span_end) &&
+                last_end >= span.start.value &&
                 last.reason == span.reason &&
-                last.provenance == span.provenance) {
-                const auto end_val = (std::max)(last.start.value + last.size,
-                                                span.start.value + span.size);
+                last.provenance == span.provenance &&
+                last.confidence == span.confidence &&
+                last.detail_code == span.detail_code) {
+                const auto end_val = (std::max)(last_end, span_end);
                 last.size = end_val - last.start.value;
                 continue;
             }
@@ -114,6 +242,348 @@ void merge_coverage_into(std::vector<coverage_span_t>& dest,
         merged.push_back(span);
     }
     dest = std::move(merged);
+}
+
+workspace_result_t<correlated_tile_decode_batch_t> execute_correlated_batch(
+    tile_decode_executor_t& executor,
+    const provider_snapshot_t& snapshot,
+    const std::vector<tile_decode_request_t>& requests,
+    const cancellation_token_t& cancellation,
+    const char* cancellation_message)
+{
+    if (cancellation.stop_requested())
+        return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+            cancellation_error(cancellation, cancellation_message));
+
+    auto batch_result = executor.execute_batch(snapshot, requests, cancellation);
+    if (!batch_result) {
+        if (cancellation.stop_requested())
+            return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+                cancellation_error(cancellation, cancellation_message));
+        return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+            batch_result.error());
+    }
+
+    if (cancellation.stop_requested())
+        return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+            cancellation_error(cancellation, cancellation_message));
+
+    correlated_tile_decode_batch_t batch;
+    batch.completions = batch_result.take_value();
+    batch.completion_indices.assign(
+        requests.size(), (std::numeric_limits<std::size_t>::max)());
+
+    std::map<std::uint64_t, std::size_t> request_indices;
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        if (!request_indices.emplace(requests[index].request_id, index).second) {
+            auto error = orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decode batch contains duplicate request identifiers");
+            error.details.emplace_back("request_id",
+                                       std::to_string(requests[index].request_id));
+            return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+                std::move(error));
+        }
+    }
+
+    for (std::size_t index = 0; index < batch.completions.size(); ++index) {
+        const auto request = request_indices.find(batch.completions[index].request_id);
+        if (request == request_indices.end()) {
+            auto error = orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decode completion has an unknown request identifier");
+            error.details.emplace_back("request_id",
+                std::to_string(batch.completions[index].request_id));
+            return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+                std::move(error));
+        }
+        auto& completion_index = batch.completion_indices[request->second];
+        if (completion_index != (std::numeric_limits<std::size_t>::max)()) {
+            auto error = orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decode batch contains duplicate completions");
+            error.details.emplace_back("request_id",
+                std::to_string(batch.completions[index].request_id));
+            return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+                std::move(error));
+        }
+        completion_index = index;
+    }
+
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+        const auto completion_index = batch.completion_indices[index];
+        if (completion_index == (std::numeric_limits<std::size_t>::max)()) {
+            auto error = orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decode batch is missing a completion");
+            error.details.emplace_back("request_id",
+                                       std::to_string(requests[index].request_id));
+            return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+                std::move(error));
+        }
+
+        const auto& completion = batch.completions[completion_index];
+        if (!completion.succeeded()) {
+            auto error = *completion.error;
+            error.details.emplace_back("request_id",
+                                       std::to_string(requests[index].request_id));
+            error.details.emplace_back("tile_id",
+                                       std::to_string(requests[index].tile_id));
+            return workspace_result_t<correlated_tile_decode_batch_t>::failure(
+                std::move(error));
+        }
+    }
+
+    return workspace_result_t<correlated_tile_decode_batch_t>::success(
+        std::move(batch));
+}
+
+workspace_result_t<std::optional<tile_instruction_entry_t>>
+make_owned_instruction_entry(const tile_decode_records_t& records,
+                             std::size_t instruction_index,
+                             const tile_decode_request_t& request,
+                             const executable_decode_tile_t& tile)
+{
+    const auto& instruction = records.instructions[instruction_index];
+    if (!records.delay_slot_counts.empty() &&
+        records.delay_slot_counts.size() != records.instructions.size()) {
+        return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
+            orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decoder returned misaligned delay-slot metadata",
+                instruction.address.value));
+    }
+    if (instruction.length == 0) {
+        return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
+            orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decoder returned a zero-length instruction",
+                instruction.address.value));
+    }
+    if (instruction.address.space != request.start.space ||
+        instruction.address.architecture != request.start.architecture ||
+        instruction.address.mode != request.start.mode) {
+        return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
+            orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decoder returned an instruction in the wrong address domain",
+                instruction.address.value));
+    }
+
+    const auto rva = instruction.address.value;
+    if (rva < request.start.value || rva < tile.start_rva ||
+        rva >= request.owned_end_rva) {
+        return workspace_result_t<std::optional<tile_instruction_entry_t>>::success(
+            std::nullopt);
+    }
+
+    std::uint64_t request_end = 0;
+    std::uint64_t instruction_end = 0;
+    if (!checked_add(request.start.value, request.byte_count, request_end) ||
+        !checked_add(rva, instruction.length, instruction_end) ||
+        instruction_end > request_end) {
+        return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
+            orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decoder returned an instruction outside its request window", rva));
+    }
+
+    const auto operand_begin = static_cast<std::size_t>(instruction.operand_fact_begin);
+    const auto operand_count = static_cast<std::size_t>(instruction.operand_fact_count);
+    if (operand_begin > records.operand_facts.size() ||
+        operand_count > records.operand_facts.size() - operand_begin) {
+        return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
+            orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decoder returned an invalid operand fact range", rva));
+    }
+
+    const auto target_begin = static_cast<std::size_t>(instruction.target_fact_begin);
+    const auto target_count = static_cast<std::size_t>(instruction.target_fact_count);
+    if (target_begin > records.target_facts.size() ||
+        target_count > records.target_facts.size() - target_begin) {
+        return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
+            orchestrator_error(workspace_error_code_t::integrity_failure,
+                "tile decoder returned an invalid target fact range", rva));
+    }
+
+    tile_instruction_entry_t entry;
+    entry.record = instruction;
+    if (!records.delay_slot_counts.empty())
+        entry.delay_slots = records.delay_slot_counts[instruction_index];
+    entry.operands.insert(entry.operands.end(),
+                          records.operand_facts.begin() + operand_begin,
+                          records.operand_facts.begin() + operand_begin + operand_count);
+    entry.targets.insert(entry.targets.end(),
+                         records.target_facts.begin() + target_begin,
+                         records.target_facts.begin() + target_begin + target_count);
+
+    std::sort(entry.targets.begin(), entry.targets.end(), target_less);
+    std::vector<target_fact_t> unique_targets;
+    unique_targets.reserve(entry.targets.size());
+    for (auto& target : entry.targets) {
+        if (!unique_targets.empty() &&
+            !target_less(unique_targets.back(), target) &&
+            !target_less(target, unique_targets.back())) {
+            ++entry.duplicate_edge_count;
+            continue;
+        }
+        unique_targets.push_back(std::move(target));
+    }
+    entry.targets = std::move(unique_targets);
+
+    return workspace_result_t<std::optional<tile_instruction_entry_t>>::success(
+        std::optional<tile_instruction_entry_t>(std::move(entry)));
+}
+
+workspace_result_t<instruction_acceptance_t> accept_instruction(
+    tile_accumulator_t& accumulator,
+    tile_instruction_entry_t entry,
+    const tile_decode_orchestrator_limits_t& limits,
+    tile_decode_orchestrator_statistics_t& statistics,
+    std::uint64_t& total_instructions,
+    std::uint64_t& total_operand_facts,
+    std::uint64_t& total_target_facts)
+{
+    const auto rva = entry.record.address.value;
+    const auto existing = accumulator.instructions.find(rva);
+    if (existing != accumulator.instructions.end()) {
+        ++statistics.duplicate_instruction_candidates;
+        if (!instruction_stronger(entry.record, existing->second.record))
+            return workspace_result_t<instruction_acceptance_t>::success(
+                instruction_acceptance_t{});
+
+        const auto retained_operands =
+            total_operand_facts - existing->second.operands.size();
+        const auto retained_targets =
+            total_target_facts - existing->second.targets.size();
+        if (entry.operands.size() > limits.maximum_operand_facts - retained_operands) {
+            return workspace_result_t<instruction_acceptance_t>::failure(
+                limit_error("operand_facts", limits.maximum_operand_facts,
+                            retained_operands + entry.operands.size(), rva));
+        }
+        if (entry.targets.size() > limits.maximum_target_facts - retained_targets) {
+            return workspace_result_t<instruction_acceptance_t>::failure(
+                limit_error("target_facts", limits.maximum_target_facts,
+                            retained_targets + entry.targets.size(), rva));
+        }
+        total_operand_facts = retained_operands + entry.operands.size();
+        total_target_facts = retained_targets + entry.targets.size();
+        existing->second = std::move(entry);
+        return workspace_result_t<instruction_acceptance_t>::success(
+            instruction_acceptance_t{true});
+    }
+
+    std::vector<std::uint64_t> overlapping_rvas;
+    std::uint64_t removed_operands = 0;
+    std::uint64_t removed_targets = 0;
+    for (const auto& [existing_rva, existing_entry] : accumulator.instructions) {
+        std::uint64_t existing_end = 0;
+        std::uint64_t candidate_end = 0;
+        if (!checked_add(existing_rva, existing_entry.record.length, existing_end) ||
+            !checked_add(rva, entry.record.length, candidate_end)) {
+            return workspace_result_t<instruction_acceptance_t>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "instruction overlap range overflow", rva));
+        }
+        if (rva >= existing_end || candidate_end <= existing_rva)
+            continue;
+        overlapping_rvas.push_back(existing_rva);
+        removed_operands += existing_entry.operands.size();
+        removed_targets += existing_entry.targets.size();
+        if (!instruction_stronger(entry.record, existing_entry.record)) {
+            ++statistics.overlap_instruction_candidates;
+            return workspace_result_t<instruction_acceptance_t>::success(
+                instruction_acceptance_t{});
+        }
+    }
+
+    if (!overlapping_rvas.empty())
+        ++statistics.overlap_instruction_candidates;
+
+    const auto retained_instructions = total_instructions - overlapping_rvas.size();
+    if (retained_instructions >= limits.maximum_instructions) {
+        return workspace_result_t<instruction_acceptance_t>::failure(
+            limit_error("instructions", limits.maximum_instructions,
+                        retained_instructions + 1, rva));
+    }
+    const auto retained_operands = total_operand_facts - removed_operands;
+    const auto retained_targets = total_target_facts - removed_targets;
+    if (entry.operands.size() > limits.maximum_operand_facts - retained_operands) {
+        return workspace_result_t<instruction_acceptance_t>::failure(
+            limit_error("operand_facts", limits.maximum_operand_facts,
+                        retained_operands + entry.operands.size(), rva));
+    }
+    if (entry.targets.size() > limits.maximum_target_facts - retained_targets) {
+        return workspace_result_t<instruction_acceptance_t>::failure(
+            limit_error("target_facts", limits.maximum_target_facts,
+                        retained_targets + entry.targets.size(), rva));
+    }
+
+    for (const auto existing_rva : overlapping_rvas) {
+        accumulator.instructions.erase(existing_rva);
+    }
+
+    auto inserted = accumulator.instructions.emplace(rva, std::move(entry));
+    total_instructions = retained_instructions + 1;
+    total_operand_facts = retained_operands + inserted.first->second.operands.size();
+    total_target_facts = retained_targets + inserted.first->second.targets.size();
+    return workspace_result_t<instruction_acceptance_t>::success(
+        instruction_acceptance_t{true});
+}
+
+workspace_result_t<void> merge_request_coverage(
+    tile_accumulator_t& accumulator,
+    const tile_decode_records_t& records,
+    const tile_decode_request_t& request,
+    const tile_decode_orchestrator_limits_t& limits,
+    std::uint64_t& total_coverage_spans)
+{
+    std::vector<coverage_span_t> normalized;
+    normalized.reserve(records.coverage.size());
+
+    std::uint64_t request_end = 0;
+    if (!checked_add(request.start.value, request.byte_count, request_end)) {
+        return workspace_result_t<void>::failure(
+            orchestrator_error(workspace_error_code_t::range_overflow,
+                "tile decode coverage request range overflow",
+                request.start.value));
+    }
+    const auto owned_end = (std::min)(request_end, request.owned_end_rva);
+
+    for (const auto& span : records.coverage) {
+        if (span.size == 0)
+            continue;
+        if (total_coverage_spans >= limits.maximum_coverage_spans) {
+            return workspace_result_t<void>::failure(
+                limit_error("coverage_spans", limits.maximum_coverage_spans,
+                            total_coverage_spans + 1, span.start.value));
+        }
+        ++total_coverage_spans;
+
+        if (span.start.space != request.start.space ||
+            span.start.architecture != request.start.architecture ||
+            span.start.mode != request.start.mode) {
+            return workspace_result_t<void>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "tile decoder returned coverage in the wrong address domain",
+                    span.start.value));
+        }
+
+        std::uint64_t span_end = 0;
+        if (!checked_add(span.start.value, span.size, span_end)) {
+            return workspace_result_t<void>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "tile decoder returned an overflowing coverage span",
+                    span.start.value));
+        }
+
+        const auto owned_begin = (std::max)(
+            request.start.value, accumulator.tile->start_rva);
+        const auto clipped_begin = (std::max)(span.start.value, owned_begin);
+        const auto clipped_end = (std::min)(span_end, owned_end);
+        if (clipped_begin >= clipped_end)
+            continue;
+
+        auto clipped = span;
+        clipped.start.value = clipped_begin;
+        clipped.size = clipped_end - clipped_begin;
+        normalized.push_back(std::move(clipped));
+    }
+
+    merge_coverage_into(accumulator.coverage, normalized);
+    return workspace_result_t<void>::success();
 }
 
 class production_tile_decode_executor_t final : public tile_decode_executor_t {
@@ -477,6 +947,14 @@ workspace_result_t<executable_decode_partition_t> partition_executable_decode_ra
     const tile_decode_orchestrator_limits_t& limits,
     const cancellation_token_t& cancellation)
 {
+    if (limits.target_tile_bytes == 0 || limits.maximum_tiles == 0 ||
+        capabilities.maximum_request_bytes == 0 ||
+        capabilities.maximum_instruction_bytes == 0) {
+        return workspace_result_t<executable_decode_partition_t>::failure(
+            orchestrator_error(workspace_error_code_t::invalid_argument,
+                "decode partition limits and capabilities must be non-zero"));
+    }
+
     executable_decode_partition_t partition;
 
     std::uint32_t range_id = 0;
@@ -501,37 +979,77 @@ workspace_result_t<executable_decode_partition_t> partition_executable_decode_ra
                 std::move(err));
         }
 
-        executable_decode_range_t range;
-        range.range_id = range_id++;
-        range.mapping_id = mapping.id;
-        range.start_rva = mapping.rva;
-        range.start_virtual_address = mapping.virtual_address;
-        range.provider_offset = mapping.file_offset;
-        range.byte_count = mapping.virtual_size;
-
-        partition.ranges.push_back(range);
-
         const std::uint64_t initialized = (std::min)(mapping.file_size, mapping.virtual_size);
-        partition.initialized_executable_bytes += initialized;
-        if (mapping.virtual_size > mapping.file_size)
-            partition.zero_fill_executable_bytes += mapping.virtual_size - mapping.file_size;
+        const std::uint64_t zero_fill = mapping.virtual_size - initialized;
+        std::uint64_t next_initialized = 0;
+        std::uint64_t next_zero_fill = 0;
+        if (!checked_add(partition.initialized_executable_bytes, initialized,
+                         next_initialized) ||
+            !checked_add(partition.zero_fill_executable_bytes, zero_fill,
+                         next_zero_fill)) {
+            return workspace_result_t<executable_decode_partition_t>::failure(
+                orchestrator_error(workspace_error_code_t::range_overflow,
+                    "executable decode partition byte accounting overflowed",
+                    mapping.rva));
+        }
+        partition.initialized_executable_bytes = next_initialized;
+        partition.zero_fill_executable_bytes = next_zero_fill;
+
+        std::optional<std::uint32_t> initialized_range_id;
+        if (initialized != 0) {
+            executable_decode_range_t range;
+            range.range_id = range_id++;
+            range.mapping_id = mapping.id;
+            range.start_rva = mapping.rva;
+            range.start_virtual_address = mapping.virtual_address;
+            range.provider_offset = mapping.file_offset;
+            range.byte_count = initialized;
+            initialized_range_id = range.range_id;
+            partition.ranges.push_back(range);
+        }
+
+        if (zero_fill != 0) {
+            executable_decode_range_t range;
+            range.range_id = range_id++;
+            range.mapping_id = mapping.id;
+            if (!checked_add(mapping.rva, initialized, range.start_rva) ||
+                !checked_add(mapping.virtual_address, initialized,
+                             range.start_virtual_address) ||
+                !checked_add(mapping.file_offset, initialized,
+                             range.provider_offset)) {
+                return workspace_result_t<executable_decode_partition_t>::failure(
+                    orchestrator_error(workspace_error_code_t::range_overflow,
+                        "executable zero-fill range overflowed", mapping.rva));
+            }
+            range.byte_count = zero_fill;
+            partition.zero_fill_ranges.push_back(range);
+        }
 
         std::uint64_t offset = 0;
-        std::uint64_t remaining = mapping.virtual_size;
-        while (remaining > 0 && tile_id < limits.maximum_tiles) {
+        std::uint64_t remaining = initialized;
+        while (remaining > 0) {
+            if (tile_id >= limits.maximum_tiles) {
+                return workspace_result_t<executable_decode_partition_t>::failure(
+                    limit_error("tiles", limits.maximum_tiles,
+                                static_cast<std::uint64_t>(tile_id) + 1,
+                                mapping.rva + offset));
+            }
             const auto tile_bytes = (std::min)(remaining, limits.target_tile_bytes);
 
             executable_decode_tile_t tile;
             tile.tile_id = tile_id++;
             tile.shard_id = static_cast<std::uint16_t>(
                 (tile_id - 1) > 0xFFFF ? 0xFFFF : (tile_id - 1));
-            tile.range_id = range.range_id;
+            tile.range_id = *initialized_range_id;
             tile.mapping_id = mapping.id;
             tile.start_rva = mapping.rva + offset;
             tile.start_virtual_address = mapping.virtual_address + offset;
-            tile.provider_offset = (offset < mapping.file_size)
-                ? mapping.file_offset + offset
-                : mapping.file_offset + mapping.file_size;
+            if (!checked_add(mapping.file_offset, offset, tile.provider_offset)) {
+                return workspace_result_t<executable_decode_partition_t>::failure(
+                    orchestrator_error(workspace_error_code_t::range_overflow,
+                        "executable tile provider range overflowed",
+                        mapping.rva + offset));
+            }
             tile.byte_count = tile_bytes;
             tile.lookahead_bytes = (remaining > tile_bytes)
                 ? (std::min)(static_cast<std::uint64_t>(capabilities.maximum_instruction_bytes),
@@ -575,6 +1093,11 @@ tile_decode_orchestrator_t::create(
         return workspace_result_t<tile_decode_orchestrator_t>::failure(
             orchestrator_error(workspace_error_code_t::invalid_argument,
                 "maximum tiles must be non-zero"));
+    if (limits.maximum_tiles >
+        static_cast<std::uint64_t>((std::numeric_limits<std::uint16_t>::max)()) + 1ULL)
+        return workspace_result_t<tile_decode_orchestrator_t>::failure(
+            orchestrator_error(workspace_error_code_t::invalid_argument,
+                "maximum tiles exceeds packed shard capacity"));
     if (limits.maximum_frontier_seeds == 0)
         return workspace_result_t<tile_decode_orchestrator_t>::failure(
             orchestrator_error(workspace_error_code_t::invalid_argument,
@@ -587,10 +1110,30 @@ tile_decode_orchestrator_t::create(
         return workspace_result_t<tile_decode_orchestrator_t>::failure(
             orchestrator_error(workspace_error_code_t::invalid_argument,
                 "maximum decode requests must be non-zero"));
-    if (limits.invalid_run_policy.maximum_gap_resynchronization_bytes == 0)
+    if (limits.maximum_instructions == 0 ||
+        limits.maximum_operand_facts == 0 ||
+        limits.maximum_target_facts == 0 ||
+        limits.maximum_edges == 0 ||
+        limits.maximum_coverage_spans == 0)
         return workspace_result_t<tile_decode_orchestrator_t>::failure(
             orchestrator_error(workspace_error_code_t::invalid_argument,
-                "maximum gap resynchronization bytes must be non-zero"));
+                "packed analysis limits must be non-zero"));
+    const auto packed_count_limit =
+        static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)());
+    if (limits.maximum_instructions > packed_count_limit ||
+        limits.maximum_operand_facts > packed_count_limit ||
+        limits.maximum_target_facts > packed_count_limit ||
+        limits.maximum_edges > packed_count_limit ||
+        limits.maximum_coverage_spans > packed_count_limit)
+        return workspace_result_t<tile_decode_orchestrator_t>::failure(
+            orchestrator_error(workspace_error_code_t::invalid_argument,
+                "packed analysis limits exceed 32-bit store capacity"));
+    if (limits.invalid_run_policy.maximum_gap_resynchronization_bytes == 0 ||
+        limits.invalid_run_policy.maximum_invalid_bytes_per_tile == 0 ||
+        limits.invalid_run_policy.maximum_invalid_runs_per_tile == 0)
+        return workspace_result_t<tile_decode_orchestrator_t>::failure(
+            orchestrator_error(workspace_error_code_t::invalid_argument,
+                "invalid-run policy limits must be non-zero"));
 
     return workspace_result_t<tile_decode_orchestrator_t>::success(
         tile_decode_orchestrator_t(std::move(limits)));
@@ -605,6 +1148,14 @@ tile_decode_orchestrator_t::run(
     const cancellation_token_t& cancellation) const
 {
     const auto& caps = executor.capabilities();
+    if (caps.maximum_request_bytes == 0 || caps.minimum_instruction_bytes == 0 ||
+        caps.maximum_request_bytes < caps.minimum_instruction_bytes ||
+        caps.maximum_instruction_bytes < caps.minimum_instruction_bytes ||
+        caps.instruction_alignment == 0 || caps.worker_count == 0) {
+        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+            orchestrator_error(workspace_error_code_t::invalid_argument,
+                "tile decode executor capabilities are invalid"));
+    }
 
     auto partition_result = partition_executable_decode_ranges(
         layout, caps, limits_, cancellation);
@@ -629,6 +1180,16 @@ tile_decode_orchestrator_t::run(
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             frontier_build.error());
     auto frontier = frontier_build.take_value();
+
+    std::sort(seeds.begin(), seeds.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.address != rhs.address)
+            return lhs.address < rhs.address;
+        if (lhs.provenance != rhs.provenance)
+            return provenance_rank(lhs.provenance) > provenance_rank(rhs.provenance);
+        if (lhs.confidence != rhs.confidence)
+            return lhs.confidence > rhs.confidence;
+        return lhs.stable_source_id < rhs.stable_source_id;
+    });
 
     for (const auto& seed : seeds) {
         decode_frontier_seed_t fs;
@@ -661,37 +1222,166 @@ tile_decode_orchestrator_t::run(
     for (std::size_t i = 0; i < partition.tiles.size(); ++i)
         accumulators[i].tile = &partition.tiles[i];
 
-    std::vector<executable_decode_tile_t> tiles_by_id = partition.tiles;
-    std::sort(tiles_by_id.begin(), tiles_by_id.end(),
-              [](const auto& a, const auto& b) { return a.tile_id < b.tile_id; });
-
-    std::vector<tile_decode_cross_tile_edge_t> cross_tile_edges;
     tile_decode_orchestrator_statistics_t stats;
     stats.initialized_executable_bytes = partition.initialized_executable_bytes;
     stats.zero_fill_executable_bytes = partition.zero_fill_executable_bytes;
 
     const std::uint64_t image_base = layout.identity().image_base;
-    const std::uint64_t image_size = layout.identity().provider_size;
+    std::uint64_t image_size = 0;
+    for (const auto& mapping : layout.mappings()) {
+        std::uint64_t mapping_end = 0;
+        if (!checked_add(mapping.rva, mapping.virtual_size, mapping_end)) {
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                orchestrator_error(workspace_error_code_t::range_overflow,
+                    "image layout virtual range overflowed", mapping.rva));
+        }
+        image_size = (std::max)(image_size, mapping_end);
+    }
 
     std::uint64_t request_id_counter = 0;
     std::uint64_t total_decode_requests = 0;
     std::uint64_t total_instructions = 0;
     std::uint64_t total_operand_facts = 0;
-    std::uint64_t total_edges = 0;
+    std::uint64_t total_target_facts = 0;
     std::uint64_t total_coverage_spans = 0;
 
-    while (!frontier.empty()) {
-        if (cancellation.stop_requested()) {
-            auto err = make_workspace_error(
-                cancellation.deadline_exceeded()
-                    ? workspace_error_code_t::deadline_exceeded
-                    : workspace_error_code_t::cancelled,
-                "orchestrator recursive pass cancelled", kPhase);
-            err.cancellation = !cancellation.deadline_exceeded();
-            err.deadline = cancellation.deadline_exceeded();
-            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                std::move(err));
+    auto process_records = [&](const tile_decode_request_t& request,
+                               const tile_decode_records_t& records,
+                               bool route_frontier) -> workspace_result_t<void> {
+        if (request.tile_id >= accumulators.size() ||
+            accumulators[request.tile_id].tile == nullptr ||
+            accumulators[request.tile_id].tile->tile_id != request.tile_id) {
+            return workspace_result_t<void>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "tile decode request ownership is invalid", request.start.value));
         }
+        if (records.bytes_consumed > request.byte_count ||
+            records.invalid_bytes > request.byte_count) {
+            return workspace_result_t<void>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "tile decoder usage exceeds its request window",
+                    request.start.value));
+        }
+
+        auto& accumulator = accumulators[request.tile_id];
+        std::set<std::uint64_t> changed_instruction_rvas;
+        for (std::size_t instruction_index = 0;
+             instruction_index < records.instructions.size(); ++instruction_index) {
+            auto entry_result = make_owned_instruction_entry(
+                records, instruction_index, request, *accumulator.tile);
+            if (!entry_result)
+                return workspace_result_t<void>::failure(entry_result.error());
+            auto optional_entry = entry_result.take_value();
+            if (!optional_entry)
+                continue;
+
+            ++stats.decoded_instruction_candidates;
+            const auto candidate_rva = optional_entry->record.address.value;
+            auto acceptance_result = accept_instruction(
+                accumulator, std::move(*optional_entry), limits_, stats,
+                total_instructions, total_operand_facts, total_target_facts);
+            if (!acceptance_result)
+                return workspace_result_t<void>::failure(acceptance_result.error());
+            const auto acceptance = acceptance_result.take_value();
+            if (!acceptance.accepted)
+                continue;
+
+            if (route_frontier)
+                changed_instruction_rvas.insert(candidate_rva);
+        }
+
+        for (const auto rva : changed_instruction_rvas) {
+            const auto retained = accumulator.instructions.find(rva);
+            if (retained == accumulator.instructions.end())
+                continue;
+
+            const auto& instruction = retained->second.record;
+
+            auto claim_result = frontier.mark_claimed(request.tile_id, rva);
+            if (!claim_result)
+                return workspace_result_t<void>::failure(claim_result.error());
+
+            if ((instruction.flow_flags & flow_fallthrough) != 0) {
+                std::uint64_t fallthrough_rva = 0;
+                if (!checked_add(rva, instruction.length, fallthrough_rva)) {
+                    return workspace_result_t<void>::failure(
+                        orchestrator_error(workspace_error_code_t::integrity_failure,
+                            "instruction fallthrough address overflow", rva));
+                }
+
+                decode_frontier_seed_t seed;
+                seed.rva = fallthrough_rva;
+                seed.kind = decode_frontier_seed_kind_t::fallthrough;
+                seed.provenance = instruction.provenance;
+                seed.confidence = instruction.confidence;
+                seed.stable_source_id = instruction.stable_source_id;
+                seed.source_rva = rva;
+                auto add_result = frontier.add_seed(seed, request.tile_id);
+                if (!add_result)
+                    return workspace_result_t<void>::failure(add_result.error());
+            }
+
+            for (const auto& target : retained->second.targets) {
+                if (target.target.space != address_space_id_t::relative_virtual)
+                    continue;
+                decode_frontier_seed_t seed;
+                seed.rva = target.target.value;
+                seed.kind = flow_to_target_seed_kind(instruction.flow_flags);
+                seed.provenance = instruction.provenance;
+                seed.confidence = instruction.confidence;
+                seed.stable_source_id = instruction.stable_source_id;
+                seed.source_rva = rva;
+                auto add_result = frontier.add_seed(seed, request.tile_id);
+                if (!add_result)
+                    return workspace_result_t<void>::failure(add_result.error());
+            }
+        }
+
+        auto coverage_result = merge_request_coverage(
+            accumulator, records, request, limits_, total_coverage_spans);
+        if (!coverage_result)
+            return workspace_result_t<void>::failure(coverage_result.error());
+
+        std::uint64_t next_accumulator_invalid = 0;
+        std::uint64_t next_total_invalid = 0;
+        if (!checked_add(accumulator.invalid_bytes, records.invalid_bytes,
+                         next_accumulator_invalid) ||
+            !checked_add(stats.invalid_bytes, records.invalid_bytes,
+                         next_total_invalid)) {
+            return workspace_result_t<void>::failure(
+                orchestrator_error(workspace_error_code_t::limit_exceeded,
+                    "invalid byte accounting overflow", request.start.value));
+        }
+        accumulator.invalid_bytes = next_accumulator_invalid;
+        stats.invalid_bytes = next_total_invalid;
+        if (records.invalid_bytes > 0) {
+            ++accumulator.invalid_runs;
+            ++stats.invalid_runs;
+        }
+
+        if (accumulator.invalid_bytes >
+            limits_.invalid_run_policy.maximum_invalid_bytes_per_tile) {
+            return workspace_result_t<void>::failure(
+                limit_error("invalid_bytes_per_tile",
+                    limits_.invalid_run_policy.maximum_invalid_bytes_per_tile,
+                    accumulator.invalid_bytes, request.start.value));
+        }
+        if (accumulator.invalid_runs >
+            limits_.invalid_run_policy.maximum_invalid_runs_per_tile) {
+            return workspace_result_t<void>::failure(
+                limit_error("invalid_runs_per_tile",
+                    limits_.invalid_run_policy.maximum_invalid_runs_per_tile,
+                    accumulator.invalid_runs, request.start.value));
+        }
+
+        return workspace_result_t<void>::success();
+    };
+
+    while (!frontier.empty()) {
+        if (cancellation.stop_requested())
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                cancellation_error(cancellation,
+                    "orchestrator recursive pass cancelled"));
 
         auto wave_result = frontier.take_wave(limits_.maximum_frontier_wave);
         if (!wave_result)
@@ -705,19 +1395,32 @@ tile_decode_orchestrator_t::run(
         requests.reserve(wave.size());
 
         for (const auto& seed : wave) {
-            if (total_decode_requests >= limits_.maximum_decode_requests)
-                break;
             if (seed.tile_id >= partition.tiles.size())
                 continue;
 
             const auto& tile = partition.tiles[seed.tile_id];
-            if (accumulators[seed.tile_id].cutoff)
-                continue;
+            if (total_decode_requests >= limits_.maximum_decode_requests) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    limit_error("decode_requests", limits_.maximum_decode_requests,
+                                total_decode_requests + 1, seed.rva));
+            }
+            if (request_id_counter ==
+                (std::numeric_limits<std::uint64_t>::max)()) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    limit_error("request_identifiers", request_id_counter,
+                                request_id_counter, seed.rva));
+            }
 
             const std::uint64_t offset_in_tile = seed.rva - tile.start_rva;
             const std::uint64_t remaining = tile.byte_count - offset_in_tile;
+            std::uint64_t available_bytes = 0;
+            if (!checked_add(remaining, tile.lookahead_bytes, available_bytes)) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::range_overflow,
+                        "recursive decode request range overflow", seed.rva));
+            }
             const std::uint64_t effective_bytes = (std::min)(
-                remaining + tile.lookahead_bytes, caps.maximum_request_bytes);
+                available_bytes, caps.maximum_request_bytes);
 
             tile_decode_request_t req;
             req.request_id = request_id_counter++;
@@ -746,331 +1449,235 @@ tile_decode_orchestrator_t::run(
         if (requests.empty())
             continue;
 
-        auto batch_result = executor.execute_batch(snapshot, requests, cancellation);
+        auto batch_result = execute_correlated_batch(
+            executor, snapshot, requests, cancellation,
+            "orchestrator recursive batch cancelled");
         if (!batch_result)
             return workspace_result_t<tile_decode_orchestration_result_t>::failure(
                 batch_result.error());
-        auto completions = batch_result.take_value();
+        auto batch = batch_result.take_value();
 
-        for (const auto& completion : completions) {
-            if (!completion.succeeded())
-                continue;
-
-            if (completion.request_id >= requests.size())
-                continue;
-
-            const auto& req = requests[completion.request_id];
-            if (req.tile_id >= accumulators.size())
-                continue;
-
-            auto& acc = accumulators[req.tile_id];
-            const auto& records = completion.records;
-
-            for (std::size_t i = 0; i < records.instructions.size(); ++i) {
-                const auto& instr = records.instructions[i];
-                const auto rva = instr.address.value;
-
-                if (rva < acc.tile->start_rva || rva >= acc.tile->start_rva + acc.tile->byte_count)
-                    continue;
-
-                ++stats.decoded_instruction_candidates;
-
-                auto existing = acc.instructions.find(rva);
-                if (existing != acc.instructions.end()) {
-                    ++stats.duplicate_instruction_candidates;
-                    if (instruction_stronger(instr, existing->second.record)) {
-                        tile_instruction_entry_t entry;
-                        entry.record = instr;
-                        if (i < records.delay_slot_counts.size())
-                            entry.delay_slots = records.delay_slot_counts[i];
-                        for (std::uint32_t op = instr.operand_fact_begin;
-                             op < instr.operand_fact_begin + instr.operand_fact_count &&
-                             op < records.operand_facts.size(); ++op)
-                            entry.operands.push_back(records.operand_facts[op]);
-                        for (std::uint32_t tf = instr.target_fact_begin;
-                             tf < instr.target_fact_begin + instr.target_fact_count &&
-                             tf < records.target_facts.size(); ++tf)
-                            entry.targets.push_back(records.target_facts[tf]);
-                        existing->second = std::move(entry);
-                    }
-                    continue;
-                }
-
-                auto overlap_it = acc.instructions.end();
-                for (auto it2 = acc.instructions.begin(); it2 != acc.instructions.end(); ++it2) {
-                    if (rva < it2->first + it2->second.record.length &&
-                        rva + instr.length > it2->first) {
-                        ++stats.overlap_instruction_candidates;
-                        overlap_it = it2;
-                        break;
-                    }
-                }
-                if (overlap_it != acc.instructions.end()) {
-                    if (instruction_stronger(instr, overlap_it->second.record)) {
-                        acc.instructions.erase(overlap_it);
-                    } else {
-                        continue;
-                    }
-                }
-
-                tile_instruction_entry_t entry;
-                entry.record = instr;
-                if (i < records.delay_slot_counts.size())
-                    entry.delay_slots = records.delay_slot_counts[i];
-                for (std::uint32_t op = instr.operand_fact_begin;
-                     op < instr.operand_fact_begin + instr.operand_fact_count &&
-                     op < records.operand_facts.size(); ++op) {
-                    entry.operands.push_back(records.operand_facts[op]);
-                    ++stats.accepted_operands;
-                    ++total_operand_facts;
-                }
-                for (std::uint32_t tf = instr.target_fact_begin;
-                     tf < instr.target_fact_begin + instr.target_fact_count &&
-                     tf < records.target_facts.size(); ++tf) {
-                    entry.targets.push_back(records.target_facts[tf]);
-                }
-
-                acc.instructions.emplace(rva, std::move(entry));
-                acc.decoded_rvas.insert(rva);
-                ++stats.accepted_instructions;
-                ++total_instructions;
-
-                if ((instr.flow_flags & flow_fallthrough) != 0) {
-                    const auto ft_rva = rva + instr.length;
-                    if (ft_rva < req.owned_end_rva) {
-                        decode_frontier_seed_t ft_seed;
-                        ft_seed.rva = ft_rva;
-                        ft_seed.kind = decode_frontier_seed_kind_t::fallthrough;
-                        ft_seed.provenance = instr.provenance;
-                        ft_seed.confidence = instr.confidence;
-                        ft_seed.source_rva = rva;
-                        auto add_result = frontier.add_seed(ft_seed, req.tile_id);
-                        if (!add_result)
-                            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                                add_result.error());
-                    }
-                }
-
-                for (const auto& target : entry.targets) {
-                    const auto target_rva = target.target.value;
-                    const auto target_kind = flow_to_target_seed_kind(instr.flow_flags);
-
-                    decode_frontier_seed_t target_seed;
-                    target_seed.rva = target_rva;
-                    target_seed.kind = target_kind;
-                    target_seed.provenance = instr.provenance;
-                    target_seed.confidence = instr.confidence;
-                    target_seed.source_rva = rva;
-
-                    auto add_result = frontier.add_seed(target_seed, req.tile_id);
-                    if (!add_result)
-                        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                            add_result.error());
-
-                    if (add_result.value().cross_tile) {
-                        tile_decode_cross_tile_edge_t edge;
-                        edge.source_tile_id = req.tile_id;
-                        edge.target_tile_id = add_result.value().tile_id.value_or(0);
-                        edge.source = instr.address;
-                        edge.target = target.target;
-                        edge.kind = flow_to_edge_kind(instr.flow_flags);
-                        cross_tile_edges.push_back(edge);
-                        ++stats.cross_tile_edges;
-                    }
-
-                    ++stats.accepted_edges;
-                    ++total_edges;
-                }
-            }
-
-            merge_coverage_into(acc.coverage, records.coverage);
-            for (const auto& span : records.coverage)
-                total_coverage_spans += span.size;
-
-            acc.invalid_bytes += records.invalid_bytes;
-            if (records.invalid_bytes > 0) {
-                ++acc.invalid_runs;
-                ++stats.invalid_runs;
-            }
-            stats.invalid_bytes += records.invalid_bytes;
-
-            if (acc.invalid_bytes > limits_.invalid_run_policy.maximum_invalid_bytes_per_tile ||
-                acc.invalid_runs > limits_.invalid_run_policy.maximum_invalid_runs_per_tile) {
-                acc.cutoff = true;
-                ++stats.invalid_policy_cutoffs;
-            }
-        }
-    }
-
-    if (total_instructions > limits_.maximum_instructions) {
-        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-            orchestrator_error(workspace_error_code_t::limit_exceeded,
-                "maximum instructions exceeded"));
-    }
-    if (total_operand_facts > limits_.maximum_operand_facts) {
-        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-            orchestrator_error(workspace_error_code_t::limit_exceeded,
-                "maximum operand facts exceeded"));
-    }
-    if (total_edges > limits_.maximum_edges) {
-        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-            orchestrator_error(workspace_error_code_t::limit_exceeded,
-                "maximum edges exceeded"));
-    }
-
-    if (cancellation.stop_requested()) {
-            auto err = make_workspace_error(
-                cancellation.deadline_exceeded()
-                    ? workspace_error_code_t::deadline_exceeded
-                    : workspace_error_code_t::cancelled,
-                "orchestrator gap pass cancelled", kPhase);
-            err.cancellation = !cancellation.deadline_exceeded();
-            err.deadline = cancellation.deadline_exceeded();
-            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                std::move(err));
-        }
-
-        for (std::size_t tile_idx = 0; tile_idx < partition.tiles.size(); ++tile_idx) {
-            auto& acc = accumulators[tile_idx];
-            const auto* tile = acc.tile;
-            if (!tile || acc.cutoff)
-                continue;
-
-            std::uint64_t cursor = tile->start_rva;
-            const std::uint64_t tile_end = tile->start_rva + tile->byte_count;
-
-            std::vector<tile_decode_request_t> gap_requests;
-
-            while (cursor < tile_end) {
-                if (total_decode_requests >= limits_.maximum_decode_requests)
-                    break;
-
-                if (acc.decoded_rvas.count(cursor) > 0) {
-                    auto it = acc.instructions.find(cursor);
-                    if (it != acc.instructions.end())
-                        cursor += it->second.record.length;
-                    else
-                        ++cursor;
-                    continue;
-                }
-
-                std::uint64_t gap_start = cursor;
-                while (cursor < tile_end && acc.decoded_rvas.count(cursor) == 0)
-                    ++cursor;
-
-                std::uint64_t gap_length = cursor - gap_start;
-                if (gap_length == 0)
-                    continue;
-
-                const std::uint64_t offset_in_tile = gap_start - tile->start_rva;
-                const std::uint64_t effective_bytes = (std::min)(
-                    gap_length, caps.maximum_request_bytes);
-
-                tile_decode_request_t req;
-                req.request_id = request_id_counter++;
-                req.tile_id = static_cast<decode_tile_id_t>(tile_idx);
-                req.pass = tile_decode_pass_t::gap;
-                req.seed_kind = decode_frontier_seed_kind_t::fallthrough;
-                req.start.space = address_space_id_t::relative_virtual;
-                req.start.value = gap_start;
-                req.start.architecture = caps.decoder_key.architecture;
-                req.start.mode = caps.decoder_key.mode;
-                req.provider_offset = tile->provider_offset + offset_in_tile;
-                req.runtime_address = tile->start_virtual_address + offset_in_tile;
-                req.image_base = image_base;
-                req.image_size = image_size;
-                req.byte_count = effective_bytes;
-                req.owned_end_rva = tile_end;
-                req.stable_source_id = 0;
-                req.provenance = fact_provenance_t::gap_recovery;
-                req.confidence = 50;
-
-                gap_requests.push_back(req);
-                ++total_decode_requests;
-                ++stats.gap_requests;
-            }
-
-            if (gap_requests.empty())
-                continue;
-
-            auto gap_batch = executor.execute_batch(snapshot, gap_requests, cancellation);
-            if (!gap_batch)
+        for (std::size_t request_index = 0;
+             request_index < requests.size(); ++request_index) {
+            const auto& completion =
+                batch.completions[batch.completion_indices[request_index]];
+            auto process_result = process_records(
+                requests[request_index], completion.records, true);
+            if (!process_result)
                 return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                    gap_batch.error());
-            auto gap_completions = gap_batch.take_value();
+                    process_result.error());
+        }
+    }
 
-            for (const auto& completion : gap_completions) {
-                if (!completion.succeeded())
-                    continue;
+    if (cancellation.stop_requested())
+        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+            cancellation_error(cancellation, "orchestrator gap pass cancelled"));
 
-                const auto& records = completion.records;
+    for (std::size_t tile_index = 0;
+         tile_index < partition.tiles.size(); ++tile_index) {
+        if (cancellation.stop_requested())
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                cancellation_error(cancellation, "orchestrator gap pass cancelled"));
 
-                for (std::size_t i = 0; i < records.instructions.size(); ++i) {
-                    const auto& instr = records.instructions[i];
-                    const auto rva = instr.address.value;
+        auto& accumulator = accumulators[tile_index];
+        const auto* tile = accumulator.tile;
+        if (tile == nullptr)
+            continue;
 
-                    if (rva < tile->start_rva || rva >= tile_end)
-                        continue;
+        std::uint64_t tile_end = 0;
+        if (!checked_add(tile->start_rva, tile->byte_count, tile_end)) {
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                orchestrator_error(workspace_error_code_t::range_overflow,
+                    "gap decode tile range overflow", tile->start_rva));
+        }
+        std::uint64_t cursor = tile->start_rva;
+        std::vector<tile_decode_request_t> gap_requests;
 
-                    if (acc.instructions.count(rva) > 0)
-                        continue;
+        while (cursor < tile_end) {
+            if (cancellation.stop_requested())
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    cancellation_error(cancellation,
+                        "orchestrator gap pass cancelled"));
 
-                    ++stats.decoded_instruction_candidates;
+            const auto decoded = accumulator.instructions.find(cursor);
+            if (decoded != accumulator.instructions.end()) {
+                cursor += decoded->second.record.length;
+                continue;
+            }
 
-                    tile_instruction_entry_t entry;
-                    entry.record = instr;
-                    if (i < records.delay_slot_counts.size())
-                        entry.delay_slots = records.delay_slot_counts[i];
-                    for (std::uint32_t op = instr.operand_fact_begin;
-                         op < instr.operand_fact_begin + instr.operand_fact_count &&
-                         op < records.operand_facts.size(); ++op) {
-                        entry.operands.push_back(records.operand_facts[op]);
-                        ++stats.accepted_operands;
-                        ++total_operand_facts;
-                    }
-                    for (std::uint32_t tf = instr.target_fact_begin;
-                         tf < instr.target_fact_begin + instr.target_fact_count &&
-                         tf < records.target_facts.size(); ++tf)
-                        entry.targets.push_back(records.target_facts[tf]);
+            const auto gap_start = cursor;
+            while (cursor < tile_end &&
+                   accumulator.instructions.find(cursor) ==
+                       accumulator.instructions.end())
+                ++cursor;
 
-                    acc.instructions.emplace(rva, std::move(entry));
-                    acc.decoded_rvas.insert(rva);
-                    ++stats.accepted_instructions;
-                    ++total_instructions;
+            const auto gap_length = cursor - gap_start;
+            if (gap_length == 0)
+                continue;
+            if (total_decode_requests >= limits_.maximum_decode_requests) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    limit_error("decode_requests", limits_.maximum_decode_requests,
+                                total_decode_requests + 1, gap_start));
+            }
+            if (request_id_counter ==
+                (std::numeric_limits<std::uint64_t>::max)()) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    limit_error("request_identifiers", request_id_counter,
+                                request_id_counter, gap_start));
+            }
+
+            const auto offset_in_tile = gap_start - tile->start_rva;
+            const auto effective_bytes = (std::min)(
+                (std::min)(gap_length, caps.maximum_request_bytes),
+                limits_.invalid_run_policy.maximum_gap_resynchronization_bytes);
+
+            tile_decode_request_t request;
+            request.request_id = request_id_counter++;
+            request.tile_id = tile->tile_id;
+            request.pass = tile_decode_pass_t::gap;
+            request.seed_kind = decode_frontier_seed_kind_t::fallthrough;
+            request.start.space = address_space_id_t::relative_virtual;
+            request.start.value = gap_start;
+            request.start.architecture = caps.decoder_key.architecture;
+            request.start.mode = caps.decoder_key.mode;
+            request.provider_offset = tile->provider_offset + offset_in_tile;
+            request.runtime_address = tile->start_virtual_address + offset_in_tile;
+            request.image_base = image_base;
+            request.image_size = image_size;
+            request.byte_count = effective_bytes;
+            request.owned_end_rva = tile_end;
+            request.provenance = fact_provenance_t::gap_recovery;
+            request.confidence = 50;
+
+            gap_requests.push_back(request);
+            ++total_decode_requests;
+            ++stats.gap_requests;
+        }
+
+        if (gap_requests.empty())
+            continue;
+
+        auto batch_result = execute_correlated_batch(
+            executor, snapshot, gap_requests, cancellation,
+            "orchestrator gap batch cancelled");
+        if (!batch_result)
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                batch_result.error());
+        auto batch = batch_result.take_value();
+
+        for (std::size_t request_index = 0;
+             request_index < gap_requests.size(); ++request_index) {
+            const auto& completion =
+                batch.completions[batch.completion_indices[request_index]];
+            auto process_result = process_records(
+                gap_requests[request_index], completion.records, false);
+            if (!process_result)
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    process_result.error());
+        }
+    }
+
+    std::set<decoded_edge_key_t, decoded_edge_less_t> accepted_edges;
+    std::set<tile_decode_cross_tile_edge_t, cross_tile_edge_less_t>
+        unique_cross_tile_edges;
+
+    auto record_edge = [&](decode_tile_id_t source_tile_id,
+                           const address_t& source,
+                           const address_t& target,
+                           edge_kind_t kind) -> workspace_result_t<void> {
+        decoded_edge_key_t key;
+        key.source = source;
+        key.target = target;
+        key.kind = kind;
+
+        if (accepted_edges.find(key) != accepted_edges.end()) {
+            ++stats.duplicate_edges;
+            return workspace_result_t<void>::success();
+        }
+        if (accepted_edges.size() >= limits_.maximum_edges) {
+            return workspace_result_t<void>::failure(
+                limit_error("edges", limits_.maximum_edges,
+                            static_cast<std::uint64_t>(accepted_edges.size()) + 1,
+                            source.value));
+        }
+        accepted_edges.insert(key);
+
+        if (target.space != address_space_id_t::relative_virtual)
+            return workspace_result_t<void>::success();
+        const auto target_tile_id = frontier.locate_tile(target.value);
+        if (!target_tile_id || *target_tile_id == source_tile_id)
+            return workspace_result_t<void>::success();
+
+        tile_decode_cross_tile_edge_t cross_tile_edge;
+        cross_tile_edge.source_tile_id = source_tile_id;
+        cross_tile_edge.target_tile_id = *target_tile_id;
+        cross_tile_edge.source = source;
+        cross_tile_edge.target = target;
+        cross_tile_edge.kind = kind;
+        unique_cross_tile_edges.insert(std::move(cross_tile_edge));
+        return workspace_result_t<void>::success();
+    };
+
+    for (const auto& accumulator : accumulators) {
+        if (accumulator.tile == nullptr)
+            continue;
+        for (const auto& [rva, entry] : accumulator.instructions) {
+            stats.duplicate_edges += entry.duplicate_edge_count;
+            if ((entry.record.flow_flags &
+                 (flow_branch | flow_call | flow_return | flow_indirect)) != 0) {
+                for (const auto& target : entry.targets) {
+                    auto edge_result = record_edge(
+                        accumulator.tile->tile_id, entry.record.address,
+                        target.target, flow_to_edge_kind(entry.record.flow_flags));
+                    if (!edge_result)
+                        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                            edge_result.error());
                 }
+            }
 
-                merge_coverage_into(acc.coverage, records.coverage);
-                acc.invalid_bytes += records.invalid_bytes;
-                if (records.invalid_bytes > 0) {
-                    ++acc.invalid_runs;
-                    ++stats.invalid_runs;
+            if ((entry.record.flow_flags & flow_fallthrough) != 0) {
+                std::uint64_t target_rva = 0;
+                if (!checked_add(rva, entry.record.length, target_rva)) {
+                    return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                        orchestrator_error(workspace_error_code_t::integrity_failure,
+                            "instruction fallthrough address overflow", rva));
                 }
-                stats.invalid_bytes += records.invalid_bytes;
-
-                if (acc.invalid_bytes > limits_.invalid_run_policy.maximum_invalid_bytes_per_tile ||
-                    acc.invalid_runs > limits_.invalid_run_policy.maximum_invalid_runs_per_tile) {
-                    acc.cutoff = true;
-                    ++stats.invalid_policy_cutoffs;
+                const auto target_tile_id = frontier.locate_tile(target_rva);
+                if (target_tile_id &&
+                    *target_tile_id != accumulator.tile->tile_id) {
+                    auto target = entry.record.address;
+                    target.value = target_rva;
+                    auto edge_result = record_edge(
+                        accumulator.tile->tile_id, entry.record.address,
+                        target, edge_kind_t::fallthrough);
+                    if (!edge_result)
+                        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                            edge_result.error());
+                }
             }
         }
     }
+
+    stats.accepted_instructions = total_instructions;
+    stats.accepted_operands = total_operand_facts;
+    stats.accepted_target_facts = total_target_facts;
+    stats.accepted_edges = accepted_edges.size();
+    stats.cross_tile_edges = unique_cross_tile_edges.size();
+
+    std::vector<tile_decode_cross_tile_edge_t> cross_tile_edges(
+        unique_cross_tile_edges.begin(), unique_cross_tile_edges.end());
 
     std::vector<packed_analysis_shard_t> shards;
     std::vector<tile_decode_shard_summary_t> shard_summaries;
     std::vector<coverage_span_t> merged_coverage;
+    std::vector<std::uint8_t> merged_delay_slot_counts;
+    merged_delay_slot_counts.reserve(static_cast<std::size_t>(total_instructions));
 
     for (std::size_t tile_idx = 0; tile_idx < partition.tiles.size(); ++tile_idx) {
-        if (cancellation.stop_requested()) {
-            auto err = make_workspace_error(
-                cancellation.deadline_exceeded()
-                    ? workspace_error_code_t::deadline_exceeded
-                    : workspace_error_code_t::cancelled,
-                "orchestrator shard build cancelled", kPhase);
-            err.cancellation = !cancellation.deadline_exceeded();
-            err.deadline = cancellation.deadline_exceeded();
+        if (cancellation.stop_requested())
             return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                std::move(err));
-        }
+                cancellation_error(cancellation,
+                    "orchestrator shard build cancelled"));
 
         const auto& acc = accumulators[tile_idx];
         if (!acc.tile)
@@ -1081,6 +1688,7 @@ tile_decode_orchestrator_t::run(
         std::uint64_t instruction_source_id = 1;
         std::uint32_t instruction_count = 0;
         std::uint32_t operand_count = 0;
+        std::uint32_t target_count = 0;
         std::uint32_t edge_count = 0;
 
         for (const auto& [rva, entry] : acc.instructions) {
@@ -1102,6 +1710,8 @@ tile_decode_orchestrator_t::run(
                     orchestrator_error(workspace_error_code_t::integrity_failure,
                         "packed store instruction add failed", rva));
 
+            std::map<entity_id_t, entity_id_t> operand_source_ids;
+            std::map<std::uint8_t, entity_id_t> operand_index_source_ids;
             for (const auto& op : entry.operands) {
                 packed_operand_input_t op_input;
                 op_input.source_id = static_cast<entity_id_t>(operand_count + 1);
@@ -1143,7 +1753,44 @@ tile_decode_orchestrator_t::run(
                         orchestrator_error(workspace_error_code_t::integrity_failure,
                             "packed store operand add failed", rva));
 
+                if (op.id != 0)
+                    operand_source_ids.emplace(op.id, op_input.source_id);
+                operand_index_source_ids.emplace(op.operand_index, op_input.source_id);
                 ++operand_count;
+            }
+
+            for (const auto& target : entry.targets) {
+                packed_target_fact_input_t target_input;
+                target_input.source_id = static_cast<entity_id_t>(target_count + 1);
+                target_input.instruction = packed_entity_reference_t::local(
+                    packed_entity_domain_t::instruction, instruction_source_id);
+                const auto source_by_id = operand_source_ids.find(target.operand_fact_id);
+                const auto source_by_index = operand_index_source_ids.find(target.operand_index);
+                if (source_by_id != operand_source_ids.end()) {
+                    target_input.operand = packed_entity_reference_t::local(
+                        packed_entity_domain_t::operand_fact, source_by_id->second);
+                } else if (source_by_index != operand_index_source_ids.end()) {
+                    target_input.operand = packed_entity_reference_t::local(
+                        packed_entity_domain_t::operand_fact, source_by_index->second);
+                }
+                target_input.target = target.target;
+                target_input.kind = target.kind;
+                target_input.resolution = target.resolution;
+                target_input.operand_index = target.operand_index;
+                target_input.access_width_bits = target.access_width_bits;
+                target_input.access_count = target.access_count;
+                target_input.direct = target.direct;
+                target_input.is_external = target.is_external;
+                target_input.provenance = entry.record.provenance;
+                target_input.confidence = entry.record.confidence;
+
+                auto target_result = builder.add_target_fact(target_input);
+                if (!target_result)
+                    return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                        orchestrator_error(workspace_error_code_t::integrity_failure,
+                            "packed store target fact add failed", rva));
+
+                ++target_count;
             }
 
             if ((entry.record.flow_flags & (flow_branch | flow_call | flow_return | flow_indirect)) != 0) {
@@ -1170,6 +1817,7 @@ tile_decode_orchestrator_t::run(
 
             ++instruction_source_id;
             ++instruction_count;
+            merged_delay_slot_counts.push_back(entry.delay_slots);
         }
 
         for (const auto& span : acc.coverage) {
@@ -1177,8 +1825,14 @@ tile_decode_orchestrator_t::run(
             cov_input.source_id = 0;
             cov_input.span_begin = span.start;
             cov_input.span_end = span.start;
-            cov_input.span_end.value = span.start.value + span.size;
+            if (!checked_add(span.start.value, span.size,
+                             cov_input.span_end.value)) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::integrity_failure,
+                        "packed store coverage range overflow", span.start.value));
+            }
             cov_input.reason = span.reason;
+            cov_input.undecodable_count = span.detail_code;
             cov_input.provenance = span.provenance;
             cov_input.confidence = span.confidence;
 
@@ -1204,6 +1858,7 @@ tile_decode_orchestrator_t::run(
         summary.shard_id = acc.tile->shard_id;
         summary.instruction_count = instruction_count;
         summary.operand_count = operand_count;
+        summary.target_count = target_count;
         summary.edge_count = edge_count;
         shard_summaries.push_back(summary);
     }
@@ -1214,16 +1869,25 @@ tile_decode_orchestrator_t::run(
             orchestrator_error(workspace_error_code_t::integrity_failure,
                 "packed store merge failed"));
 
-    std::sort(cross_tile_edges.begin(), cross_tile_edges.end(),
-              [](const auto& a, const auto& b) {
-                  if (a.source_tile_id != b.source_tile_id)
-                      return a.source_tile_id < b.source_tile_id;
-                  if (a.target_tile_id != b.target_tile_id)
-                      return a.target_tile_id < b.target_tile_id;
-                  if (a.source.value != b.source.value)
-                      return a.source.value < b.source.value;
-                  return a.target.value < b.target.value;
-              });
+    for (const auto& range : partition.zero_fill_ranges) {
+        if (total_coverage_spans >= limits_.maximum_coverage_spans) {
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                limit_error("coverage_spans", limits_.maximum_coverage_spans,
+                    total_coverage_spans + 1, range.start_rva));
+        }
+        ++total_coverage_spans;
+        coverage_span_t span;
+        span.start.space = address_space_id_t::relative_virtual;
+        span.start.architecture = caps.decoder_key.architecture;
+        span.start.mode = caps.decoder_key.mode;
+        span.start.value = range.start_rva;
+        span.size = range.byte_count;
+        span.reason = coverage_reason_t::undecodable;
+        span.provenance = fact_provenance_t::linear_validation;
+        span.confidence = 100;
+        span.detail_code = static_cast<std::uint32_t>(tile_coverage_detail_t::zero_fill);
+        merged_coverage.push_back(std::move(span));
+    }
 
     merge_coverage_into(merged_coverage, {});
 
@@ -1235,6 +1899,7 @@ tile_decode_orchestrator_t::run(
     tile_decode_orchestration_result_t result;
     result.packed_store = std::make_unique<packed_analysis_store_t>(
         std::move(store_result).take_value());
+    result.delay_slot_counts = std::move(merged_delay_slot_counts);
     result.coverage = std::move(merged_coverage);
     result.cross_tile_edges = std::move(cross_tile_edges);
     result.shards = std::move(shard_summaries);

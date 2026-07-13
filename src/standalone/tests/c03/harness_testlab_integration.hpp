@@ -25,10 +25,17 @@ enum class testlab_category_t : std::uint8_t {
     live_routing = 11
 };
 
+enum class testlab_execution_t : std::uint8_t {
+    in_process = 0,
+    external_ctest = 1
+};
+
 struct testlab_entry_t {
     std::string_view name;
     std::string_view harness_file;
+    std::string_view ctest_target;
     testlab_category_t category = testlab_category_t::contract;
+    testlab_execution_t execution = testlab_execution_t::external_ctest;
     bool bounded = true;
     std::uint32_t max_wall_ms = 30000;
     std::uint64_t max_private_bytes = 536870912ULL;
@@ -46,6 +53,8 @@ struct testlab_run_result_t {
 };
 
 struct testlab_summary_t {
+    std::uint32_t registered = 0;
+    std::uint32_t external_registered = 0;
     std::uint32_t total = 0;
     std::uint32_t passed = 0;
     std::uint32_t failed = 0;
@@ -58,6 +67,9 @@ inline constexpr std::size_t k_expected_archive_tool_count = 88;
 inline constexpr std::size_t k_expected_extension_count = 4;
 inline constexpr std::size_t k_expected_debugger_tool_count = 22;
 inline constexpr std::size_t k_expected_routing_extension_count = 5;
+inline constexpr std::size_t k_expected_testlab_entry_count = 24;
+inline constexpr std::size_t k_expected_testlab_in_process_count = 12;
+inline constexpr std::size_t k_expected_testlab_external_count = 12;
 
 inline constexpr std::string_view k_mcp_tool_ownership_categories[] = {
     "analysis", "core", "debugger", "memory", "modify", "python",
@@ -72,6 +84,7 @@ const testlab_entry_t* find_testlab_entry(std::string_view name);
 std::size_t testlab_entry_count() noexcept;
 
 testlab_summary_t run_testlab_integration();
+bool verify_testlab_registry(std::string& failure);
 bool verify_mcp_tool_count();
 bool verify_tool_ownership_coverage();
 

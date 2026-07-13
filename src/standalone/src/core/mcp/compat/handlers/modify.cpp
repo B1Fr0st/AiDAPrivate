@@ -4,13 +4,11 @@
 
 #include <algorithm>
 #include <cmath>
-#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <utility>
 
 namespace aida::standalone::mcp::compat::handlers {
@@ -22,6 +20,7 @@ using protocol::mcp_result_t;
 using protocol::result_error_code_t;
 
 constexpr std::array<std::string_view, k_modify_tool_count> k_modify_names{{
+    "add_bookmark",
     "set_comments",
     "append_comments",
     "rename",
@@ -32,7 +31,6 @@ constexpr std::array<std::string_view, k_modify_tool_count> k_modify_names{{
     "patch_asm",
     "force_recompile",
     "set_op_type",
-    "set_type",
 }};
 
 json parse_generated_json(std::string_view value, std::string_view field,
@@ -135,7 +133,6 @@ bool valid_limits(const modify_handler_limits_t& limits) noexcept {
         limits.max_asm_bytes != 0 && limits.max_asm_bytes <= 4096U &&
         limits.max_rename_batch_items != 0 && limits.max_rename_batch_items <= 4096U &&
         limits.max_name_bytes != 0 && limits.max_name_bytes <= 4096U &&
-        limits.max_type_batch_items != 0 && limits.max_type_batch_items <= 4096U &&
         limits.max_op_kind_bytes != 0 && limits.max_op_kind_bytes <= 64U &&
         limits.max_execution_time.count() > 0 && limits.max_execution_time.count() <= 60000;
 }
@@ -244,44 +241,56 @@ validation_failure_t validate_routing_bounds(const json& arguments,
     return std::nullopt;
 }
 
-validation_failure_t require_array(const json& value, std::string_view path,
-                                    std::size_t maximum_items) {
+template <typename validator_t>
+validation_failure_t validate_scalar_or_array(const json& value, std::string_view path,
+                                               std::size_t maximum_items,
+                                               validator_t&& validator) {
     if (!value.is_array()) {
-        return invalid_value(std::string(path), "array_required", value);
+        return validator(value, std::string(path));
     }
     if (value.size() > maximum_items) {
         return exceeded_value(
             std::string(path), static_cast<std::uint64_t>(maximum_items),
             static_cast<std::uint64_t>(value.size()));
     }
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (auto failure = validator(
+                value[index], std::string(path) + "[" + std::to_string(index) + "]")) {
+            return failure;
+        }
+    }
     return std::nullopt;
 }
 
-validation_failure_t validate_item_array(const json& arguments, std::string_view field,
-                                          std::size_t max_items,
-                                          const modify_handler_limits_t& limits,
-                                          bool check_addr = true) {
+std::size_t scalar_or_array_size(const json& value) noexcept {
+    return value.is_array() ? value.size() : 1U;
+}
+
+template <typename validator_t>
+validation_failure_t validate_item_collection(const json& arguments,
+                                               std::string_view field,
+                                               std::size_t maximum_items,
+                                               validator_t&& validator,
+                                               bool required = true) {
     const auto found = arguments.find(std::string(field));
     if (found == arguments.end()) {
-        return invalid_value(std::string(field), "field_required", json(nullptr));
-    }
-    if (auto failure = require_array(*found, field, max_items)) {
-        return failure;
-    }
-    for (std::size_t index = 0; index < found->size(); ++index) {
-        const std::string path = std::string(field) + "[" + std::to_string(index) + "]";
-        const auto& item = (*found)[index];
-        if (!item.is_object()) {
-            return invalid_value(path, "object_required", item);
+        if (required) {
+            return invalid_value(
+                std::string(field), "field_required", json(nullptr));
         }
-        if (check_addr) {
-            if (auto failure = bounded_member_text(
-                    item, "addr", path, limits.max_address_bytes, false)) {
-                return failure;
-            }
-        }
+        return std::nullopt;
     }
-    return std::nullopt;
+    return validate_scalar_or_array(
+        *found, field, maximum_items, std::forward<validator_t>(validator));
+}
+
+validation_failure_t validate_item_address(const json& item, std::string path,
+                                           const modify_handler_limits_t& limits) {
+    if (!item.is_object()) {
+        return invalid_value(std::move(path), "object_required", item);
+    }
+    return bounded_member_text(
+        item, "addr", std::move(path), limits.max_address_bytes, false);
 }
 
 validation_failure_t validate_tool_bounds(std::string_view name, const json& arguments,
@@ -289,173 +298,424 @@ validation_failure_t validate_tool_bounds(std::string_view name, const json& arg
     if (auto failure = validate_routing_bounds(arguments, limits)) {
         return failure;
     }
-    if (name == "set_comments" || name == "append_comments") {
-        if (auto failure = validate_item_array(arguments, "items",
-                                                 limits.max_batch_items, limits)) {
+    if (name == "add_bookmark") {
+        if (auto failure = bounded_member_text(
+                arguments, "addr", {}, limits.max_address_bytes, false)) {
             return failure;
         }
-        const auto& items = arguments.at("items");
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            const std::string path = "items[" + std::to_string(i) + "]";
-            if (auto failure = bounded_member_text(
-                    items[i], "comment", path, limits.max_comment_bytes, false)) {
-                return failure;
-            }
+        if (auto failure = bounded_member_text(
+                arguments, "name", {}, limits.max_name_bytes, false)) {
+            return failure;
         }
-        return std::nullopt;
+        return bounded_member_text(
+            arguments, "prefix", {}, limits.max_comment_bytes, true);
+    }
+    if (name == "set_comments" || name == "append_comments") {
+        return validate_item_collection(
+            arguments, "items", limits.max_batch_items,
+            [&limits](const json& item, std::string path) -> validation_failure_t {
+                if (auto failure = validate_item_address(item, path, limits)) {
+                    return failure;
+                }
+                if (auto failure = bounded_member_text(
+                        item, "comment", path, limits.max_comment_bytes, false)) {
+                    return failure;
+                }
+                return bounded_member_text(
+                    item, "scope", std::move(path), limits.max_op_kind_bytes, false);
+            });
     }
     if (name == "rename") {
         const auto batch = arguments.find("batch");
         if (batch == arguments.end() || !batch->is_object()) {
             return invalid_value("batch", "object_required",
-                                  batch == arguments.end() ? json(nullptr) : *batch);
+                                 batch == arguments.end() ? json(nullptr) : *batch);
         }
-        const auto func = batch->find("func");
-        if (func == batch->end() || !func->is_array()) {
-            return invalid_value("batch.func", "array_required",
-                                  func == batch->end() ? json(nullptr) : *func);
+        std::size_t total_items = 0;
+        const auto validate_collection = [&](
+            std::string_view field, const auto& validator) -> validation_failure_t {
+            const auto found = batch->find(std::string(field));
+            if (found == batch->end()) {
+                return std::nullopt;
+            }
+            const std::size_t count = scalar_or_array_size(*found);
+            if (count > limits.max_rename_batch_items - total_items) {
+                return exceeded_value(
+                    "batch", static_cast<std::uint64_t>(limits.max_rename_batch_items),
+                    static_cast<std::uint64_t>(total_items + count));
+            }
+            total_items += count;
+            return validate_scalar_or_array(
+                *found, "batch." + std::string(field), count, validator);
+        };
+        if (auto failure = validate_collection(
+                "func", [&limits](const json& item, std::string path) -> validation_failure_t {
+                    if (auto nested = validate_item_address(item, path, limits)) {
+                        return nested;
+                    }
+                    return bounded_member_text(
+                        item, "name", std::move(path), limits.max_name_bytes, false);
+                })) {
+            return failure;
         }
-        if (func->size() > limits.max_rename_batch_items) {
-            return exceeded_value("batch.func",
-                                   static_cast<std::uint64_t>(limits.max_rename_batch_items),
-                                   static_cast<std::uint64_t>(func->size()));
-        }
-        for (std::size_t i = 0; i < func->size(); ++i) {
-            const std::string path = "batch.func[" + std::to_string(i) + "]";
-            const auto& item = (*func)[i];
+        const auto validate_named_pair = [&limits](
+            const json& item, std::string path) -> validation_failure_t {
             if (!item.is_object()) {
-                return invalid_value(path, "object_required", item);
+                return invalid_value(std::move(path), "object_required", item);
             }
             if (auto failure = bounded_member_text(
-                    item, "addr", path, limits.max_address_bytes, false)) {
+                    item, "old", path, limits.max_name_bytes, false)) {
+                return failure;
+            }
+            return bounded_member_text(
+                item, "new", std::move(path), limits.max_name_bytes, false);
+        };
+        if (auto failure = validate_collection("data", validate_named_pair)) {
+            return failure;
+        }
+        const auto validate_scoped_pair = [&limits](
+            const json& item, std::string path) -> validation_failure_t {
+            if (!item.is_object()) {
+                return invalid_value(std::move(path), "object_required", item);
+            }
+            if (auto failure = bounded_member_text(
+                    item, "func_addr", path, limits.max_address_bytes, false)) {
                 return failure;
             }
             if (auto failure = bounded_member_text(
-                    item, "name", path, limits.max_name_bytes, false)) {
+                    item, "old", path, limits.max_name_bytes, false)) {
                 return failure;
             }
+            return bounded_member_text(
+                item, "new", std::move(path), limits.max_name_bytes, false);
+        };
+        if (auto failure = validate_collection("local", validate_scoped_pair)) {
+            return failure;
+        }
+        if (auto failure = validate_collection("stack", validate_scoped_pair)) {
+            return failure;
+        }
+        if (total_items == 0U) {
+            return invalid_value(
+                "batch", "at_least_one_rename_operation_required", *batch);
         }
         return std::nullopt;
     }
     if (name == "define_code" || name == "define_func") {
-        return validate_item_array(arguments, "items", limits.max_batch_items, limits);
+        return validate_item_collection(
+            arguments, "items", limits.max_batch_items,
+            [&limits](const json& item, std::string path) -> validation_failure_t {
+                if (auto failure = validate_item_address(item, path, limits)) {
+                    return failure;
+                }
+                return bounded_member_text(
+                    item, "end", std::move(path), limits.max_address_bytes, false);
+            });
     }
     if (name == "undefine") {
-        if (auto failure = validate_item_array(arguments, "items",
-                                                 limits.max_batch_items, limits)) {
-            return failure;
-        }
-        const auto& items = arguments.at("items");
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            const std::string path = "items[" + std::to_string(i) + "]";
-            if (auto failure = bounded_integer(
-                    items[i], "size", limits.max_data_bytes, path)) {
-                return failure;
-            }
-        }
-        return std::nullopt;
+        return validate_item_collection(
+            arguments, "items", limits.max_batch_items,
+            [&limits](const json& item, std::string path) -> validation_failure_t {
+                if (auto failure = validate_item_address(item, path, limits)) {
+                    return failure;
+                }
+                if (auto failure = bounded_member_text(
+                        item, "end", path, limits.max_address_bytes, false)) {
+                    return failure;
+                }
+                return bounded_integer(item, "size", limits.max_data_bytes, std::move(path));
+            });
     }
     if (name == "make_data") {
-        if (auto failure = validate_item_array(arguments, "items",
-                                                 limits.max_batch_items, limits)) {
-            return failure;
-        }
-        const auto& items = arguments.at("items");
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            const std::string path = "items[" + std::to_string(i) + "]";
-            if (auto failure = bounded_member_text(
-                    items[i], "type", path, limits.max_type_bytes, false)) {
-                return failure;
-            }
-        }
-        return std::nullopt;
+        return validate_item_collection(
+            arguments, "items", limits.max_batch_items,
+            [&limits](const json& item, std::string path) -> validation_failure_t {
+                if (auto failure = validate_item_address(item, path, limits)) {
+                    return failure;
+                }
+                if (auto failure = bounded_member_text(
+                        item, "type", path, limits.max_type_bytes, false)) {
+                    return failure;
+                }
+                return bounded_member_text(
+                    item, "name", std::move(path), limits.max_name_bytes, false);
+            });
     }
     if (name == "patch_asm") {
-        if (auto failure = validate_item_array(arguments, "items",
-                                                 limits.max_batch_items, limits)) {
-            return failure;
-        }
-        const auto& items = arguments.at("items");
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            const std::string path = "items[" + std::to_string(i) + "]";
-            if (auto failure = bounded_member_text(
-                    items[i], "asm", path, limits.max_asm_bytes, false)) {
-                return failure;
-            }
-        }
-        return std::nullopt;
+        return validate_item_collection(
+            arguments, "items", limits.max_batch_items,
+            [&limits](const json& item, std::string path) -> validation_failure_t {
+                if (auto failure = validate_item_address(item, path, limits)) {
+                    return failure;
+                }
+                return bounded_member_text(
+                    item, "asm", std::move(path), limits.max_asm_bytes, false);
+            });
     }
     if (name == "force_recompile") {
-        const auto found = arguments.find("items");
-        if (found == arguments.end()) {
-            return invalid_value("items", "field_required", json(nullptr));
-        }
-        if (!found->is_array()) {
-            return invalid_value("items", "array_required", *found);
-        }
-        if (found->size() > limits.max_batch_items) {
-            return exceeded_value("items",
-                                   static_cast<std::uint64_t>(limits.max_batch_items),
-                                   static_cast<std::uint64_t>(found->size()));
-        }
-        for (std::size_t i = 0; i < found->size(); ++i) {
-            const std::string path = "items[" + std::to_string(i) + "]";
-            const auto& item = (*found)[i];
-            if (!item.is_object()) {
-                return invalid_value(path, "object_required", item);
-            }
-            if (auto failure = bounded_member_text(
-                    item, "addr", path, limits.max_address_bytes, false)) {
-                return failure;
-            }
-        }
-        return std::nullopt;
+        return validate_item_collection(
+            arguments, "items", limits.max_batch_items,
+            [&limits](const json& item, std::string path) {
+                return validate_item_address(item, std::move(path), limits);
+            }, false);
     }
     if (name == "set_op_type") {
-        if (auto failure = validate_item_array(arguments, "items",
-                                                 limits.max_batch_items, limits)) {
-            return failure;
-        }
-        const auto& items = arguments.at("items");
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            const std::string path = "items[" + std::to_string(i) + "]";
-            if (auto failure = bounded_member_text(
-                    items[i], "kind", path, limits.max_op_kind_bytes, false)) {
-                return failure;
-            }
-            if (auto failure = bounded_integer(
-                    items[i], "op_n", (std::numeric_limits<std::uint64_t>::max)(), path)) {
-                return failure;
-            }
-        }
-        return std::nullopt;
-    }
-    if (name == "set_type") {
-        const auto found = arguments.find("edits");
-        if (found == arguments.end()) {
-            return invalid_value("edits", "field_required", json(nullptr));
-        }
-        if (auto failure = require_array(*found, "edits", limits.max_type_batch_items)) {
-            return failure;
-        }
-        for (std::size_t i = 0; i < found->size(); ++i) {
-            const std::string path = "edits[" + std::to_string(i) + "]";
-            const auto& item = (*found)[i];
-            if (!item.is_object()) {
-                return invalid_value(path, "object_required", item);
-            }
-            if (auto failure = bounded_member_text(
-                    item, "addr", path, limits.max_address_bytes, false)) {
-                return failure;
-            }
-            if (auto failure = bounded_member_text(
-                    item, "ty", path, limits.max_type_bytes, false)) {
-                return failure;
-            }
-        }
-        return std::nullopt;
+        return validate_item_collection(
+            arguments, "items", limits.max_batch_items,
+            [&limits](const json& item, std::string path) -> validation_failure_t {
+                if (auto failure = validate_item_address(item, path, limits)) {
+                    return failure;
+                }
+                if (auto failure = bounded_member_text(
+                        item, "kind", path, limits.max_op_kind_bytes, false)) {
+                    return failure;
+                }
+                if (auto failure = bounded_member_text(
+                        item, "struct", path, limits.max_type_bytes, false)) {
+                    return failure;
+                }
+                if (auto failure = bounded_member_text(
+                        item, "target_addr", path, limits.max_address_bytes, false)) {
+                    return failure;
+                }
+                return bounded_integer(
+                    item, "op_n", (std::numeric_limits<std::uint64_t>::max)(),
+                    std::move(path));
+            });
     }
     return invalid_value("tool", "modify_tool_not_registered", std::string(name));
+}
+
+std::size_t mutation_item_count(std::string_view name, const json& arguments) noexcept {
+    if (name == "add_bookmark") {
+        return 1U;
+    }
+    if (name == "rename") {
+        const auto batch = arguments.find("batch");
+        if (batch == arguments.end() || !batch->is_object()) {
+            return 0U;
+        }
+        std::size_t count = 0;
+        for (const char* field : {"func", "data", "local", "stack"}) {
+            const auto found = batch->find(field);
+            if (found != batch->end()) {
+                count += scalar_or_array_size(*found);
+            }
+        }
+        return count;
+    }
+    const auto items = arguments.find("items");
+    if (items == arguments.end()) {
+        return name == "force_recompile" ? 1U : 0U;
+    }
+    if (name == "force_recompile" && items->is_array() && items->empty()) {
+        return 1U;
+    }
+    return scalar_or_array_size(*items);
+}
+
+bool mutation_dry_run(std::string_view name, const json& arguments) noexcept {
+    if (name != "rename") {
+        return false;
+    }
+    const auto batch = arguments.find("batch");
+    if (batch == arguments.end() || !batch->is_object()) {
+        return false;
+    }
+    const auto dry_run = batch->find("dry_run");
+    return dry_run != batch->end() && dry_run->is_boolean() && dry_run->get<bool>();
+}
+
+validation_failure_t normalize_overlay_receipt(std::string_view name,
+                                               const json& arguments,
+                                               json& structured,
+                                               json& receipt_metadata) {
+    const json* proof = nullptr;
+    bool legacy_adapter_proof = false;
+    const auto explicit_proof = structured.find("_aida_overlay");
+    if (explicit_proof != structured.end()) {
+        if (!explicit_proof->is_object()) {
+            return invalid_value(
+                "response._aida_overlay", "object_required", *explicit_proof);
+        }
+        proof = &*explicit_proof;
+    } else {
+        const auto metadata = structured.find("_meta");
+        if (metadata != structured.end() && metadata->is_object()) {
+            const auto aida = metadata->find("aida");
+            if (aida != metadata->end() && aida->is_object()) {
+                proof = &*aida;
+                legacy_adapter_proof = true;
+            }
+        }
+    }
+    if (proof == nullptr) {
+        return invalid_value("response.overlay_receipt", "receipt_required", nullptr);
+    }
+
+    const auto proof_string = [proof](const char* primary,
+                                      const char* fallback = nullptr) -> std::optional<std::string> {
+        auto found = proof->find(primary);
+        if (found == proof->end() && fallback != nullptr) {
+            found = proof->find(fallback);
+        }
+        if (found == proof->end() || !found->is_string()) {
+            return std::nullopt;
+        }
+        return found->get<std::string>();
+    };
+    const auto proof_bool = [proof](const char* field) -> std::optional<bool> {
+        const auto found = proof->find(field);
+        if (found == proof->end() || !found->is_boolean()) {
+            return std::nullopt;
+        }
+        return found->get<bool>();
+    };
+    const auto response_unsigned = [&structured, proof](
+        const char* field) -> std::optional<std::uint64_t> {
+        const auto response_value = structured.find(field);
+        if (response_value != structured.end()) {
+            return unsigned_integer(*response_value);
+        }
+        const auto proof_value = proof->find(field);
+        return proof_value == proof->end()
+            ? std::nullopt
+            : unsigned_integer(*proof_value);
+    };
+    const auto response_bool = [&structured, proof](const char* field) -> std::optional<bool> {
+        auto found = structured.find(field);
+        if (found == structured.end()) {
+            found = proof->find(field);
+            if (found == proof->end()) {
+                return std::nullopt;
+            }
+        }
+        return found->is_boolean()
+            ? std::optional<bool>(found->get<bool>())
+            : std::nullopt;
+    };
+
+    const auto proof_tool = proof_string("tool");
+    if (!proof_tool || *proof_tool != name) {
+        return invalid_value(
+            "response.overlay_receipt.tool", "tool_mismatch",
+            proof_tool ? json(*proof_tool) : json(nullptr));
+    }
+    const auto mode = proof_string("mode", "mutation_mode");
+    if (!mode || *mode != "reversible_overlay") {
+        return invalid_value(
+            "response.overlay_receipt.mode", "reversible_overlay_required",
+            mode ? json(*mode) : json(nullptr));
+    }
+    const auto live_write = proof_bool("live_write");
+    if (!live_write || *live_write) {
+        return invalid_value(
+            "response.overlay_receipt.live_write", "false_required",
+            live_write ? json(*live_write) : json(nullptr));
+    }
+    const auto ui_switched = proof_bool("ui_switched");
+    if (!ui_switched || *ui_switched) {
+        return invalid_value(
+            "response.overlay_receipt.ui_switched", "false_required",
+            ui_switched ? json(*ui_switched) : json(nullptr));
+    }
+    const auto adapter = proof_string("adapter");
+    const auto target_file_write = proof_bool("target_file_write");
+    const bool trusted_file_isolation = target_file_write
+        ? !*target_file_write
+        : legacy_adapter_proof && adapter && *adapter == "ida_compat_mut";
+    if (!trusted_file_isolation) {
+        return invalid_value(
+            "response.overlay_receipt.target_file_write",
+            "verified_false_required",
+            target_file_write ? json(*target_file_write) : json(nullptr));
+    }
+    const auto non_overlapping = proof_bool("non_overlapping");
+    const bool trusted_non_overlap = non_overlapping
+        ? *non_overlapping
+        : legacy_adapter_proof && adapter && *adapter == "ida_compat_mut";
+    if (!trusted_non_overlap) {
+        return invalid_value(
+            "response.overlay_receipt.non_overlapping", "verified_true_required",
+            non_overlapping ? json(*non_overlapping) : json(nullptr));
+    }
+
+    const auto committed = response_bool("committed");
+    const bool expected_committed = !mutation_dry_run(name, arguments);
+    if (!committed || *committed != expected_committed) {
+        return invalid_value(
+            "response.overlay_receipt.committed", "commit_state_mismatch",
+            committed ? json(*committed) : json(nullptr));
+    }
+    const auto transaction_id = response_unsigned("transaction_id");
+    if (!transaction_id || *transaction_id == 0) {
+        return invalid_value(
+            "response.overlay_receipt.transaction_id", "positive_integer_required",
+            transaction_id ? json(*transaction_id) : json(nullptr));
+    }
+    const auto operations = response_unsigned("operations");
+    const std::size_t expected_operations = mutation_item_count(name, arguments);
+    if (!operations || *operations != expected_operations) {
+        return invalid_value(
+            "response.overlay_receipt.operations", "operation_count_mismatch",
+            operations ? json(*operations) : json(nullptr));
+    }
+
+    std::uint64_t revision_before = 0;
+    std::uint64_t revision_after = 0;
+    auto before = response_unsigned("revision_before");
+    auto after = response_unsigned("revision_after");
+    if (!before && legacy_adapter_proof) {
+        const auto overlay_revision = proof->find("overlay_revision");
+        if (overlay_revision != proof->end()) {
+            before = unsigned_integer(*overlay_revision);
+        }
+    }
+    if (!after) {
+        after = response_unsigned("revision");
+    }
+    if (!before || !after) {
+        return invalid_value(
+            "response.overlay_receipt.revision", "before_and_after_revisions_required",
+            json{{"before", before ? json(*before) : json(nullptr)},
+                 {"after", after ? json(*after) : json(nullptr)}});
+    }
+    revision_before = *before;
+    revision_after = *after;
+    if (expected_committed && revision_after <= revision_before) {
+        return invalid_value(
+            "response.overlay_receipt.revision_after",
+            "revision_must_advance", revision_after);
+    }
+    if (!expected_committed && revision_after != revision_before) {
+        return invalid_value(
+            "response.overlay_receipt.revision_after",
+            "dry_run_revision_changed", revision_after);
+    }
+
+    receipt_metadata = json{
+        {"tool", std::string(name)},
+        {"mode", "reversible_overlay"},
+        {"transaction_id", *transaction_id},
+        {"operations", *operations},
+        {"revision_before", revision_before},
+        {"revision_after", revision_after},
+        {"committed", *committed},
+        {"non_overlapping", true},
+        {"live_write", false},
+        {"target_file_write", false},
+        {"ui_switched", false},
+    };
+
+    structured.erase("_aida_overlay");
+    structured.erase("_meta");
+    for (const char* field : {
+             "committed", "dry_run", "item_count", "items", "revision",
+             "revision_before", "revision_after", "transaction_id",
+             "idempotent_replay", "operations"}) {
+        structured.erase(field);
+    }
+    return std::nullopt;
 }
 
 std::chrono::milliseconds execution_timeout(const protocol::tool_contract_t& contract,
@@ -583,6 +843,7 @@ const modify_handler_limits_t& modify_handlers_t::limits() const noexcept {
 protocol::mcp_result_t modify_handlers_t::invoke(
     std::string_view name, const protocol::json& arguments,
     const protocol::cancellation_token_t& cancellation,
+    const modify_invocation_options_t& options,
     const protocol::json& aida_metadata) const {
     if (!aida_metadata.is_object()) {
         return protocol::mcp_result_t::failure(
@@ -604,9 +865,9 @@ protocol::mcp_result_t modify_handlers_t::invoke(
     return protocol::invoke_tool_contract(
         *found,
         arguments,
-        [this, index](const protocol::json& validated_arguments,
-                       const protocol::cancellation_token_t& token) {
-            return dispatch(index, validated_arguments, token);
+        [this, index, &options](const protocol::json& validated_arguments,
+                                const protocol::cancellation_token_t& token) {
+            return dispatch(index, validated_arguments, token, options);
         },
         schemas_,
         cancellation,
@@ -615,7 +876,8 @@ protocol::mcp_result_t modify_handlers_t::invoke(
 
 protocol::mcp_result_t modify_handlers_t::dispatch(
     std::size_t index, const protocol::json& arguments,
-    const protocol::cancellation_token_t& cancellation) const {
+    const protocol::cancellation_token_t& cancellation,
+    const modify_invocation_options_t& options) const {
     const auto name = k_modify_names.at(index);
     const auto& contract = contracts_.at(index);
     if (cancellation.cancelled()) {
@@ -671,8 +933,24 @@ protocol::mcp_result_t modify_handlers_t::dispatch(
             "Modify backend arguments cannot be serialized.",
             protocol::json{{"phase", "modify_backend_serialization"}});
     }
-    request.deadline = std::chrono::steady_clock::now() +
-        execution_timeout(contract, limits_.max_execution_time);
+    request.expected_generation = options.expected_generation;
+    request.deadline = options.deadline;
+    if (!request.deadline) {
+        request.deadline = std::chrono::steady_clock::now() +
+            execution_timeout(contract, limits_.max_execution_time);
+    }
+    if (*request.deadline <= std::chrono::steady_clock::now()) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::cancelled,
+            "Modify tool invocation deadline expired before adapter routing.",
+            protocol::json{{"phase", "modify_deadline"}});
+    }
+    if (cancellation.cancelled()) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::cancelled,
+            "Modify tool invocation was cancelled before overlay commit.",
+            protocol::json{{"phase", "modify_pre_commit"}});
+    }
 
     auto adapter_result = workspace_.overlay(name, request);
     if (!adapter_result) {
@@ -709,6 +987,14 @@ protocol::mcp_result_t modify_handlers_t::dispatch(
             protocol::json{{"phase", "modify_output_parse"},
                            {"response_bytes", response.payload.size()}});
     }
+    protocol::json overlay_receipt;
+    if (auto failure = normalize_overlay_receipt(
+            name, arguments, structured, overlay_receipt)) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Modify adapter returned an invalid reversible-overlay receipt.",
+            *failure);
+    }
     if (cancellation.cancelled()) {
         return protocol::mcp_result_t::failure(
             protocol::result_error_code_t::cancelled,
@@ -716,12 +1002,22 @@ protocol::mcp_result_t modify_handlers_t::dispatch(
             protocol::json{{"phase", "modify_pre_output_validation"}});
     }
     const std::size_t response_bytes = response.payload.size();
+    std::string normalized_text;
+    try {
+        normalized_text = structured.dump();
+    } catch (const std::exception&) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Modify adapter output cannot be normalized after receipt validation.",
+            protocol::json{{"phase", "modify_output_normalization"}});
+    }
     return protocol::mcp_result_t::success(
-        std::move(response.payload),
+        std::move(normalized_text),
         structured,
         protocol::json{
             {"adapter_truncated", response.truncated},
             {"adapter_response_bytes", response_bytes},
+            {"overlay_receipt", std::move(overlay_receipt)},
         });
 }
 
@@ -729,81 +1025,93 @@ protocol::mcp_result_t modify_handlers_t::dispatch(
 
 namespace aida::standalone::mcp::compat::adapters {
 
+protocol::mcp_result_t add_bookmark(
+    const handlers::modify_handlers_t& handlers,
+    const protocol::json& arguments,
+    const protocol::cancellation_token_t& cancellation,
+    const handlers::modify_invocation_options_t& options,
+    const protocol::json& aida_metadata) {
+    return handlers.invoke("add_bookmark", arguments, cancellation, options, aida_metadata);
+}
+
 protocol::mcp_result_t set_comments(const handlers::modify_handlers_t& handlers,
                                     const protocol::json& arguments,
                                     const protocol::cancellation_token_t& cancellation,
+                                    const handlers::modify_invocation_options_t& options,
                                     const protocol::json& aida_metadata) {
-    return handlers.invoke("set_comments", arguments, cancellation, aida_metadata);
+    return handlers.invoke("set_comments", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t append_comments(const handlers::modify_handlers_t& handlers,
                                        const protocol::json& arguments,
                                        const protocol::cancellation_token_t& cancellation,
+                                       const handlers::modify_invocation_options_t& options,
                                        const protocol::json& aida_metadata) {
-    return handlers.invoke("append_comments", arguments, cancellation, aida_metadata);
+    return handlers.invoke("append_comments", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t rename(const handlers::modify_handlers_t& handlers,
                               const protocol::json& arguments,
                               const protocol::cancellation_token_t& cancellation,
+                              const handlers::modify_invocation_options_t& options,
                               const protocol::json& aida_metadata) {
-    return handlers.invoke("rename", arguments, cancellation, aida_metadata);
+    return handlers.invoke("rename", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t define_code(const handlers::modify_handlers_t& handlers,
                                    const protocol::json& arguments,
                                    const protocol::cancellation_token_t& cancellation,
+                                   const handlers::modify_invocation_options_t& options,
                                    const protocol::json& aida_metadata) {
-    return handlers.invoke("define_code", arguments, cancellation, aida_metadata);
+    return handlers.invoke("define_code", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t define_func(const handlers::modify_handlers_t& handlers,
                                    const protocol::json& arguments,
                                    const protocol::cancellation_token_t& cancellation,
+                                   const handlers::modify_invocation_options_t& options,
                                    const protocol::json& aida_metadata) {
-    return handlers.invoke("define_func", arguments, cancellation, aida_metadata);
+    return handlers.invoke("define_func", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t undefine(const handlers::modify_handlers_t& handlers,
                                 const protocol::json& arguments,
                                 const protocol::cancellation_token_t& cancellation,
+                                const handlers::modify_invocation_options_t& options,
                                 const protocol::json& aida_metadata) {
-    return handlers.invoke("undefine", arguments, cancellation, aida_metadata);
+    return handlers.invoke("undefine", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t make_data(const handlers::modify_handlers_t& handlers,
                                  const protocol::json& arguments,
                                  const protocol::cancellation_token_t& cancellation,
+                                 const handlers::modify_invocation_options_t& options,
                                  const protocol::json& aida_metadata) {
-    return handlers.invoke("make_data", arguments, cancellation, aida_metadata);
+    return handlers.invoke("make_data", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t patch_asm(const handlers::modify_handlers_t& handlers,
                                  const protocol::json& arguments,
                                  const protocol::cancellation_token_t& cancellation,
+                                 const handlers::modify_invocation_options_t& options,
                                  const protocol::json& aida_metadata) {
-    return handlers.invoke("patch_asm", arguments, cancellation, aida_metadata);
+    return handlers.invoke("patch_asm", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t force_recompile(const handlers::modify_handlers_t& handlers,
                                        const protocol::json& arguments,
                                        const protocol::cancellation_token_t& cancellation,
+                                       const handlers::modify_invocation_options_t& options,
                                        const protocol::json& aida_metadata) {
-    return handlers.invoke("force_recompile", arguments, cancellation, aida_metadata);
+    return handlers.invoke("force_recompile", arguments, cancellation, options, aida_metadata);
 }
 
 protocol::mcp_result_t set_op_type(const handlers::modify_handlers_t& handlers,
                                    const protocol::json& arguments,
                                    const protocol::cancellation_token_t& cancellation,
+                                   const handlers::modify_invocation_options_t& options,
                                    const protocol::json& aida_metadata) {
-    return handlers.invoke("set_op_type", arguments, cancellation, aida_metadata);
-}
-
-protocol::mcp_result_t set_type(const handlers::modify_handlers_t& handlers,
-                                const protocol::json& arguments,
-                                const protocol::cancellation_token_t& cancellation,
-                                const protocol::json& aida_metadata) {
-    return handlers.invoke("set_type", arguments, cancellation, aida_metadata);
+    return handlers.invoke("set_op_type", arguments, cancellation, options, aida_metadata);
 }
 
 }

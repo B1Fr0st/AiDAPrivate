@@ -5,14 +5,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <optional>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace aida::standalone::mcp::compat::handlers {
@@ -1202,9 +1201,10 @@ std::vector<type_relation_t> types_overlay_store_t::find_related_types(
             }
         }
     }
-    if (relations.size() > limits_.max_related_types) {
-        relations.resize(limits_.max_related_types);
-    }
+    std::sort(relations.begin(), relations.end(),
+              [](const type_relation_t& left, const type_relation_t& right) {
+                  return std::tie(left.name, left.kind) < std::tie(right.name, right.kind);
+              });
     return relations;
 }
 
@@ -1226,46 +1226,29 @@ bool types_overlay_store_t::undo() {
     if (undo_stack_.empty()) {
         return false;
     }
-    undo_entry_t entry = std::move(undo_stack_.back());
-    undo_stack_.pop_back();
-    switch (entry.action) {
-    case undo_entry_t::action_t::declare_type:
-    case undo_entry_t::action_t::enum_upsert: {
-        if (entry.old_type.has_value()) {
-            types_[entry.target_name] = std::move(*entry.old_type);
-        } else {
-            types_.erase(entry.target_name);
-        }
-        break;
-    }
-    case undo_entry_t::action_t::set_type: {
-        if (entry.old_application.has_value()) {
-            applications_[entry.target_name] = std::move(*entry.old_application);
-        } else {
-            applications_.erase(entry.target_name);
-        }
-        break;
-    }
-    case undo_entry_t::action_t::delete_type: {
-        if (entry.old_type.has_value()) {
-            types_[entry.target_name] = std::move(*entry.old_type);
-        }
-        break;
-    }
-    case undo_entry_t::action_t::rename_type: {
-        if (entry.old_type.has_value()) {
-            types_[entry.target_name] = std::move(*entry.old_type);
-            auto it = types_.find(entry.old_type->name);
-            if (it != types_.end() && it->second.name != entry.target_name) {
-                types_.erase(it);
+    const std::uint64_t restored_revision = undo_stack_.back().revision;
+    do {
+        undo_entry_t entry = std::move(undo_stack_.back());
+        undo_stack_.pop_back();
+        switch (entry.action) {
+        case undo_entry_t::action_t::declare_type:
+        case undo_entry_t::action_t::enum_upsert:
+            if (entry.old_type.has_value()) {
+                types_[entry.target_name] = std::move(*entry.old_type);
+            } else {
+                types_.erase(entry.target_name);
             }
+            break;
+        case undo_entry_t::action_t::set_type:
+            if (entry.old_application.has_value()) {
+                applications_[entry.target_name] = std::move(*entry.old_application);
+            } else {
+                applications_.erase(entry.target_name);
+            }
+            break;
         }
-        break;
-    }
-    default:
-        break;
-    }
-    --revision_;
+    } while (!undo_stack_.empty() && undo_stack_.back().revision == restored_revision);
+    revision_ = restored_revision;
     return true;
 }
 
@@ -1287,12 +1270,9 @@ void types_overlay_store_t::rollback_batch(std::vector<undo_entry_t>& batch_undo
                 applications_.erase(it->target_name);
             }
             break;
-        default:
-            break;
         }
     }
     batch_undo.clear();
-    --revision_;
 }
 
 bool types_overlay_store_t::apply_single_edit(const json& edit, json& result,
@@ -1704,6 +1684,9 @@ json types_overlay_store_t::do_type_query(const json& args) {
                 } else {
                     cmp = a->name.compare(b->name);
                 }
+                if (cmp == 0) {
+                    return a->name < b->name;
+                }
                 return descending ? cmp > 0 : cmp < 0;
             });
 
@@ -1755,6 +1738,7 @@ json types_overlay_store_t::do_type_query(const json& args) {
                 related_count = static_cast<int>(relations.size());
                 if (related_count > static_cast<int>(limits_.max_related_types)) {
                     related_truncated = true;
+                    relations.resize(limits_.max_related_types);
                 }
                 json related_arr = json::array();
                 for (const auto& r : relations) {
@@ -1909,11 +1893,11 @@ json types_overlay_store_t::do_type_apply_batch(const json& args) {
         }
     }
 
-    ++revision_;
     json results = json::array();
     int applied = 0;
     int failed = 0;
     bool stopped = false;
+    bool transaction_failed = false;
     std::vector<undo_entry_t> batch_undo;
 
     for (std::size_t i = 0; i < edits.size(); ++i) {
@@ -1922,6 +1906,7 @@ json types_overlay_store_t::do_type_apply_batch(const json& args) {
             ++applied;
         } else {
             ++failed;
+            transaction_failed = true;
             if (stop_on_error) {
                 stopped = true;
                 results.push_back(std::move(result));
@@ -1934,31 +1919,31 @@ json types_overlay_store_t::do_type_apply_batch(const json& args) {
                     };
                     results.push_back(std::move(skipped));
                 }
-                rollback_batch(batch_undo);
-                applied = 0;
-                failed = static_cast<int>(edits.size());
-                for (auto& r : results) {
-                    if (r.value("ok", false)) {
-                        r["ok"] = false;
-                        if (r.value("error", "") == "") {
-                            r["error"] = "rolled back due to batch failure";
-                        }
-                    }
-                }
                 break;
             }
         }
         results.push_back(std::move(result));
     }
 
-    if (!stopped) {
+    if (transaction_failed) {
+        rollback_batch(batch_undo);
+        applied = 0;
+        failed = static_cast<int>(edits.size());
+        for (auto& result : results) {
+            if (result.value("ok", false)) {
+                result["ok"] = false;
+                result["error"] = "rolled back due to batch failure";
+            }
+        }
+    } else if (!batch_undo.empty()) {
+        ++revision_;
         for (auto& u : batch_undo) {
             undo_stack_.push_back(std::move(u));
         }
     }
 
     return json{
-        {"ok", !stopped && failed == 0},
+        {"ok", !transaction_failed},
         {"applied", applied},
         {"failed", failed},
         {"stopped", stopped},
@@ -1979,6 +1964,17 @@ json types_overlay_store_t::do_infer_types(const json& args) {
         }
     }
 
+    std::vector<const overlay_type_t*> ordered_types;
+    ordered_types.reserve(types_.size());
+    for (const auto& entry : types_) {
+        ordered_types.push_back(&entry.second);
+    }
+    std::sort(ordered_types.begin(), ordered_types.end(),
+              [](const overlay_type_t* left, const overlay_type_t* right) {
+                  return std::tie(left->name, left->kind, left->ordinal) <
+                      std::tie(right->name, right->kind, right->ordinal);
+              });
+
     json results = json::array();
     for (const auto& addr : addrs) {
         json item = json::object();
@@ -1986,45 +1982,43 @@ json types_overlay_store_t::do_infer_types(const json& args) {
         item["error"] = "";
 
         const auto app_it = applications_.find(addr);
-        if (app_it != applications_.end()) {
+        if (app_it != applications_.end() && !app_it->second.ty.empty()) {
             item["inferred_type"] = app_it->second.ty;
             item["confidence"] = "high";
             item["method"] = "existing_type_application";
         } else {
             bool inferred = false;
-            for (const auto& [name, type] : types_) {
-                if (type.is_udt && type.size > 0 && type.size <= 256) {
-                    for (const auto& m : type.members) {
-                        if (m.type.find('*') != std::string::npos) {
-                            const auto ptr_app = applications_.find(addr);
-                            if (ptr_app != applications_.end() &&
-                                contains_ci(ptr_app->second.ty, name)) {
-                                item["inferred_type"] = name + "*";
-                                item["confidence"] = "medium";
-                                item["method"] = "xref_analysis";
-                                inferred = true;
-                                break;
-                            }
-                        }
+            if (app_it != applications_.end()) {
+                const std::string evidence = app_it->second.name + " " +
+                    app_it->second.signature + " " + app_it->second.variable;
+                for (const auto* type : ordered_types) {
+                    if (!type->is_udt || type->size == 0 || type->size > 256 ||
+                        !contains_ci(evidence, type->name)) {
+                        continue;
                     }
-                    if (inferred) {
-                        break;
-                    }
+                    const bool pointer_evidence =
+                        contains_ci(evidence, type->name + "*") ||
+                        contains_ci(evidence, type->name + " *");
+                    item["inferred_type"] = pointer_evidence ? type->name + "*" : type->name;
+                    item["confidence"] = "medium";
+                    item["method"] = "xref_analysis";
+                    inferred = true;
+                    break;
                 }
             }
 
             if (!inferred) {
-                for (const auto& [name, type] : types_) {
+                for (const auto* type : ordered_types) {
                     bool has_pointer_to = false;
-                    for (const auto& m : type.members) {
+                    for (const auto& m : type->members) {
                         if (m.type.find('*') != std::string::npos &&
-                            contains_ci(m.type, name)) {
+                            contains_ci(m.type, type->name)) {
                             has_pointer_to = true;
                             break;
                         }
                     }
                     if (has_pointer_to) {
-                        item["inferred_type"] = name + "*";
+                        item["inferred_type"] = type->name + "*";
                         item["confidence"] = "low";
                         item["method"] = "size_heuristic";
                         inferred = true;
@@ -2044,7 +2038,42 @@ json types_overlay_store_t::do_infer_types(const json& args) {
     return json{{"result", results}};
 }
 
+types_overlay_store_t::target_scope_key_t types_overlay_store_t::target_scope_key(
+    const target_record_t& target) noexcept {
+    return {
+        target.target_id,
+        target.process_creation_identity,
+        target.generation,
+        target.attach_generation,
+    };
+}
+
+std::shared_ptr<types_overlay_store_t> types_overlay_store_t::target_scope(
+    const target_record_t& target) {
+    const auto key = target_scope_key(target);
+    std::scoped_lock lock(mutex_, target_scopes_mutex_);
+    const auto existing = target_scopes_.find(key);
+    if (existing != target_scopes_.end()) {
+        return existing->second;
+    }
+    auto scope = std::make_shared<types_overlay_store_t>();
+    scope->set_limits(limits_);
+    target_scopes_.emplace(key, scope);
+    return scope;
+}
+
 adapter_result_t<adapter_response_t> types_overlay_store_t::handle_query(
+    const adapter_call_context_t& context,
+    const adapter_request_t& request) {
+    if (!context.target.has_value() || !context.target->valid()) {
+        return adapter_result_t<adapter_response_t>::failure(
+            {adapter_error_code_t::target_resolution_failed,
+             "types_query_target_context_required", 0, 0});
+    }
+    return target_scope(context.target->target())->handle_query_local(context, request);
+}
+
+adapter_result_t<adapter_response_t> types_overlay_store_t::handle_query_local(
     const adapter_call_context_t& context,
     const adapter_request_t& request) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -2074,7 +2103,7 @@ adapter_result_t<adapter_response_t> types_overlay_store_t::handle_query(
             return adapter_result_t<adapter_response_t>::failure(
                 {adapter_error_code_t::operation_not_permitted, "types_query_unknown_tool", 0, 0});
         }
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
         return adapter_result_t<adapter_response_t>::failure(
             {adapter_error_code_t::backend_rejected, "types_query_exception", 0, 0});
     }
@@ -2082,6 +2111,17 @@ adapter_result_t<adapter_response_t> types_overlay_store_t::handle_query(
 }
 
 adapter_result_t<adapter_response_t> types_overlay_store_t::handle_overlay(
+    const adapter_call_context_t& context,
+    const adapter_request_t& request) {
+    if (!context.target.has_value() || !context.target->valid()) {
+        return adapter_result_t<adapter_response_t>::failure(
+            {adapter_error_code_t::target_resolution_failed,
+             "types_overlay_target_context_required", 0, 0});
+    }
+    return target_scope(context.target->target())->handle_overlay_local(context, request);
+}
+
+adapter_result_t<adapter_response_t> types_overlay_store_t::handle_overlay_local(
     const adapter_call_context_t& context,
     const adapter_request_t& request) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -2109,7 +2149,7 @@ adapter_result_t<adapter_response_t> types_overlay_store_t::handle_overlay(
             return adapter_result_t<adapter_response_t>::failure(
                 {adapter_error_code_t::operation_not_permitted, "types_overlay_unknown_tool", 0, 0});
         }
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
         return adapter_result_t<adapter_response_t>::failure(
             {adapter_error_code_t::backend_rejected, "types_overlay_exception", 0, 0});
     }
@@ -2158,16 +2198,26 @@ std::vector<std::string> types_overlay_store_t::all_type_names() const {
 }
 
 void types_overlay_store_t::set_limits(const types_handler_limits_t& limits) {
+    if (!valid_limits(limits)) {
+        throw std::invalid_argument("types overlay limits are invalid or weaken pinned maxima");
+    }
+    std::scoped_lock lock(mutex_, target_scopes_mutex_);
     limits_ = limits;
+    for (const auto& entry : target_scopes_) {
+        entry.second->set_limits(limits);
+    }
 }
 
 void types_overlay_store_t::clear() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_, target_scopes_mutex_);
     types_.clear();
     applications_.clear();
     undo_stack_.clear();
     revision_ = 0;
     next_ordinal_ = 0;
+    for (const auto& entry : target_scopes_) {
+        entry.second->clear();
+    }
 }
 
 const std::array<std::string_view, k_types_tool_count>& types_tool_names() noexcept {

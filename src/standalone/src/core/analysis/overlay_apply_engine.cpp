@@ -196,6 +196,74 @@ bool valid_integer_type(const std::string& value, std::size_t& size) noexcept
     return false;
 }
 
+bool integer_patch_matches_value(const overlay_payload_v9_t& payload,
+                                 std::size_t byte_size) noexcept
+{
+    if (payload.integer_value.empty() || payload.bytes.size() != byte_size)
+        return false;
+    std::size_t cursor = 0;
+    bool negative = false;
+    if (payload.integer_value[cursor] == '+' ||
+        payload.integer_value[cursor] == '-') {
+        negative = payload.integer_value[cursor] == '-';
+        ++cursor;
+    }
+    int base = 10;
+    if (payload.integer_value.size() - cursor >= 2 &&
+        payload.integer_value[cursor] == '0') {
+        const char prefix = payload.integer_value[cursor + 1];
+        if (prefix == 'x' || prefix == 'X') {
+            base = 16;
+            cursor += 2;
+        } else if (prefix == 'b' || prefix == 'B') {
+            base = 2;
+            cursor += 2;
+        } else if (prefix == 'o' || prefix == 'O') {
+            base = 8;
+            cursor += 2;
+        }
+    }
+    if (cursor == payload.integer_value.size())
+        return false;
+    std::uint64_t magnitude = 0;
+    const auto parsed = std::from_chars(
+        payload.integer_value.data() + cursor,
+        payload.integer_value.data() + payload.integer_value.size(),
+        magnitude, base);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != payload.integer_value.data() + payload.integer_value.size())
+        return false;
+    const bool signed_type = payload.integer_type.front() == 'i';
+    if (negative && !signed_type)
+        return false;
+    const auto bits = static_cast<unsigned>(byte_size * 8);
+    const auto mask = bits == 64
+        ? (std::numeric_limits<std::uint64_t>::max)()
+        : (std::uint64_t{1} << bits) - 1;
+    std::uint64_t encoded = magnitude;
+    if (signed_type) {
+        const auto sign_limit = std::uint64_t{1} << (bits - 1);
+        if (negative) {
+            if (magnitude == 0 || magnitude > sign_limit)
+                return false;
+            encoded = (std::uint64_t{0} - magnitude) & mask;
+        } else if (magnitude >= sign_limit) {
+            return false;
+        }
+    } else if (magnitude > mask) {
+        return false;
+    }
+    const bool big_endian = payload.integer_type.size() >= 2 &&
+        payload.integer_type.compare(payload.integer_type.size() - 2, 2, "be") == 0;
+    for (std::size_t index = 0; index < byte_size; ++index) {
+        const auto shift = static_cast<unsigned>(
+            (big_endian ? byte_size - index - 1 : index) * 8);
+        if (payload.bytes[index] != static_cast<std::uint8_t>(encoded >> shift))
+            return false;
+    }
+    return true;
+}
+
 bool valid_operation_kind(overlay_operation_kind_v9_t kind) noexcept
 {
     return static_cast<std::uint8_t>(kind) <= k_last_overlay_operation_ordinal;
@@ -236,6 +304,24 @@ bool nonempty_for_update(const overlay_operation_v9_t& operation) noexcept
         return true;
     }
     return false;
+}
+
+bool canonical_patch_provenance(const overlay_operation_v9_t& operation) noexcept
+{
+    const auto& payload = operation.payload;
+    switch (operation.kind) {
+    case overlay_operation_kind_v9_t::byte_patch:
+        return payload.assembly.empty() && payload.integer_type.empty() &&
+               payload.integer_value.empty();
+    case overlay_operation_kind_v9_t::assembly_patch:
+        return !payload.assembly.empty() && payload.integer_type.empty() &&
+               payload.integer_value.empty();
+    case overlay_operation_kind_v9_t::integer_patch:
+        return payload.assembly.empty() && !payload.integer_type.empty() &&
+               !payload.integer_value.empty();
+    default:
+        return true;
+    }
 }
 
 overlay_apply_code_v9_t validate_operation(const overlay_operation_v9_t& operation,
@@ -291,6 +377,8 @@ overlay_apply_code_v9_t validate_operation(const overlay_operation_v9_t& operati
         operation.kind == overlay_operation_kind_v9_t::integer_patch;
     if (!patch)
         return overlay_apply_code_v9_t::ok;
+    if (!canonical_patch_provenance(operation))
+        return overlay_apply_code_v9_t::invalid_operation;
     if (payload.bytes.size() > limits.max_patch_bytes_per_operation ||
         payload.bytes.size() > limits.max_patch_bytes_per_transaction - patch_bytes)
         return overlay_apply_code_v9_t::limit_exceeded;
@@ -299,7 +387,9 @@ overlay_apply_code_v9_t validate_operation(const overlay_operation_v9_t& operati
     patch_bytes += payload.bytes.size();
     if (operation.kind == overlay_operation_kind_v9_t::integer_patch) {
         std::size_t integer_size = 0;
-        if (!valid_integer_type(payload.integer_type, integer_size) || integer_size != payload.bytes.size())
+        if (!valid_integer_type(payload.integer_type, integer_size) ||
+            integer_size != payload.bytes.size() ||
+            !integer_patch_matches_value(payload, integer_size))
             return overlay_apply_code_v9_t::invalid_operation;
     }
     return overlay_apply_code_v9_t::ok;
@@ -348,6 +438,7 @@ void apply_change(std::map<overlay_entity_key_v9_t, overlay_payload_v9_t>& items
 overlay_change_v9_t inverse_change(const overlay_change_v9_t& change)
 {
     overlay_change_v9_t result = change;
+    std::swap(result.before_kind, result.after_kind);
     std::swap(result.before, result.after);
     return result;
 }
@@ -668,6 +759,35 @@ overlay_entity_key_for_operation_v9(const overlay_operation_v9_t& operation)
     return make_entity_key(operation);
 }
 
+std::optional<overlay_operation_kind_v9_t> overlay_operation_kind_for_item_v9(
+    const overlay_entity_key_v9_t& entity,
+    const overlay_payload_v9_t& payload) noexcept
+{
+    if (!valid_operation_kind(entity.domain))
+        return std::nullopt;
+    if (entity.domain != overlay_operation_kind_v9_t::byte_patch)
+        return entity.domain;
+    if (entity.range.size != 0 || payload.bytes.empty())
+        return std::nullopt;
+    const bool has_assembly = !payload.assembly.empty();
+    const bool has_integer_type = !payload.integer_type.empty();
+    const bool has_integer_value = !payload.integer_value.empty();
+    if (has_integer_type != has_integer_value ||
+        (has_assembly && has_integer_type))
+        return std::nullopt;
+    if (has_assembly)
+        return overlay_operation_kind_v9_t::assembly_patch;
+    if (has_integer_type) {
+        std::size_t integer_size = 0;
+        if (!valid_integer_type(payload.integer_type, integer_size) ||
+            integer_size != payload.bytes.size() ||
+            !integer_patch_matches_value(payload, integer_size))
+            return std::nullopt;
+        return overlay_operation_kind_v9_t::integer_patch;
+    }
+    return overlay_operation_kind_v9_t::byte_patch;
+}
+
 std::string serialize_overlay_target_identity_v9(
     const overlay_target_identity_v9_t& target)
 {
@@ -779,13 +899,21 @@ overlay_apply_result_v9_t overlay_apply_engine_v9_t::apply(
             const auto current = state.items.find(entity);
             overlay_change_v9_t change;
             change.entity = entity;
-            change.operation_kind = operation.kind;
-            if (current != state.items.end())
+            if (current != state.items.end()) {
+                const auto current_kind = overlay_operation_kind_for_item_v9(
+                    current->first, current->second);
+                if (!current_kind)
+                    return result_for(state, overlay_apply_code_v9_t::invalid_operation);
+                change.before_kind = *current_kind;
                 change.before = current->second;
-            if (!operation.remove)
+            }
+            if (!operation.remove) {
+                change.after_kind = operation.kind;
                 change.after = operation.payload;
+            }
             if (operation.remove && !change.before)
                 return result_for(state, overlay_apply_code_v9_t::invalid_operation);
+            change.operation_kind = operation.kind;
             changes.push_back(std::move(change));
         }
 

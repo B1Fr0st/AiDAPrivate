@@ -10,44 +10,6 @@
 
 namespace aida::analysis {
 
-enum class data_candidate_kind_t : std::uint8_t {
-    relocation_slot = 0,
-    import_address_slot,
-    load_config_pointer,
-    thread_local_storage,
-    referenced_storage,
-    in_image_pointer
-};
-
-enum class data_pointer_encoding_t : std::uint8_t {
-    absolute_virtual = 0,
-    image_relative,
-    relocation_target,
-    signed_relative_to_slot,
-    signed_relative_to_next
-};
-
-struct data_candidate_record_t {
-    entity_id_t id = 0;
-    address_t address;
-    std::uint64_t size = 0;
-    data_candidate_kind_t kind = data_candidate_kind_t::referenced_storage;
-    std::optional<address_t> target;
-    fact_provenance_t provenance = fact_provenance_t::unknown;
-    std::uint8_t confidence = 0;
-};
-
-struct data_pointer_fact_t {
-    entity_id_t id = 0;
-    address_t slot;
-    address_t target;
-    data_candidate_kind_t candidate_kind = data_candidate_kind_t::in_image_pointer;
-    data_pointer_encoding_t encoding = data_pointer_encoding_t::absolute_virtual;
-    std::uint8_t width_bytes = 0;
-    fact_provenance_t provenance = fact_provenance_t::unknown;
-    std::uint8_t confidence = 0;
-};
-
 struct data_pointer_seed_t {
     address_t slot;
     std::optional<address_t> target;
@@ -58,18 +20,6 @@ struct data_pointer_seed_t {
     fact_provenance_t provenance = fact_provenance_t::unknown;
     std::uint8_t confidence = 0;
     bool read_target_from_image = false;
-};
-
-struct data_candidate_conflict_t {
-    entity_id_t id = 0;
-    address_t address;
-    data_candidate_kind_t kind = data_candidate_kind_t::referenced_storage;
-    std::optional<address_t> selected_target;
-    std::optional<address_t> rejected_target;
-    fact_provenance_t selected_provenance = fact_provenance_t::unknown;
-    fact_provenance_t rejected_provenance = fact_provenance_t::unknown;
-    std::uint8_t selected_confidence = 0;
-    std::uint8_t rejected_confidence = 0;
 };
 
 struct data_discovery_limits_t {
