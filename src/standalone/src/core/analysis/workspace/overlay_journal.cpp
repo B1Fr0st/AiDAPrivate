@@ -1334,6 +1334,24 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
                                  "static overlay image allocation failed",
                                  "overlay_journal.projection"));
     }
+    const auto image = workspace.image();
+    if (image) {
+        if (image->image_size() != target.image_size ||
+            image->headers_size() > workspace.provider().size() ||
+            image->headers_size() > target.image_size) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                make_workspace_error(workspace_error_code_t::target_conflict,
+                                     "PE image layout differs from overlay target",
+                                     "overlay_journal.projection"));
+        }
+        if (image->headers_size() != 0) {
+            auto read = workspace.provider().read_exact(
+                0, bytes.data(), image->headers_size(), cancel);
+            if (!read)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    read.error());
+        }
+    }
     const auto normalized = workspace.normalized_image();
     bool copied_mapping = false;
     if (normalized) {
@@ -1366,6 +1384,33 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
                     read.error());
             copied_mapping = true;
         }
+    }
+    if (!copied_mapping && image) {
+        for (const auto& section : image->sections()) {
+            if (section.raw_size == 0)
+                continue;
+            const auto source = static_cast<std::uint64_t>(section.raw_offset);
+            const auto destination =
+                static_cast<std::uint64_t>(section.virtual_address);
+            const auto size = static_cast<std::uint64_t>(section.raw_size);
+            if (source > workspace.provider().size() ||
+                size > workspace.provider().size() - source ||
+                destination > target.image_size ||
+                size > target.image_size - destination) {
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                                         "PE overlay section exceeds image bounds",
+                                         "overlay_journal.projection"));
+            }
+            auto read = workspace.provider().read_exact(
+                source,
+                bytes.data() + static_cast<std::size_t>(destination),
+                size, cancel);
+            if (!read)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    read.error());
+        }
+        copied_mapping = true;
     }
     if (!copied_mapping) {
         if (workspace.provider().size() < target.image_size) {
