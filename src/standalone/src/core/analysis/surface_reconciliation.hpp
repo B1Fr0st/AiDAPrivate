@@ -1,0 +1,149 @@
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace aida::analysis::c03 {
+
+enum class surface_error_code_t : std::uint8_t {
+    none = 0,
+    dead_replaced_path_detected,
+    duplicate_store_detected,
+    stale_registration_detected,
+    old_schema_v8_writer_detected,
+    legacy_invalid_ast_flow_detected,
+    unsupported_alias_detected,
+    security_regression_detected,
+    unexplained_removal_detected,
+    baseline_mismatch,
+    internal_error
+};
+
+struct surface_error_t final {
+    surface_error_code_t code = surface_error_code_t::none;
+    std::string_view stable_code;
+    std::string detail;
+
+    constexpr explicit operator bool() const noexcept {
+        return code != surface_error_code_t::none;
+    }
+};
+
+enum class surface_entry_kind_t : std::uint8_t {
+    source_file = 0,
+    contract_registration = 1,
+    handler_registration = 2,
+    tool_registration = 3,
+    schema_writer = 4,
+    ast_path = 5,
+    alias_mapping = 6,
+    security_guard = 7,
+    store_definition = 8,
+    test_harness = 9
+};
+
+struct surface_entry_t final {
+    std::string identifier;
+    std::string canonical_path;
+    surface_entry_kind_t kind = surface_entry_kind_t::source_file;
+    std::string schema_version;
+    bool is_active = true;
+    bool is_replaced = false;
+    std::string replaced_by;
+    std::string security_note;
+};
+
+struct surface_finding_t final {
+    surface_error_code_t code = surface_error_code_t::none;
+    std::string_view stable_code;
+    std::string identifier;
+    std::string detail;
+    std::string canonical_path;
+    surface_entry_kind_t kind = surface_entry_kind_t::source_file;
+    std::uint64_t severity = 0;
+};
+
+struct surface_reconciliation_result_t final {
+    std::vector<surface_finding_t> findings;
+    std::uint64_t total_entries_checked = 0;
+    std::uint64_t baseline_entry_count = 0;
+    std::uint64_t actual_entry_count = 0;
+    std::uint64_t unexplained_removals = 0;
+    bool clean = false;
+};
+
+struct surface_reconciliation_limits_t final {
+    std::size_t maximum_entries = 100000;
+    std::size_t maximum_findings = 10000;
+    std::uint64_t maximum_severity = 1000;
+};
+
+class surface_reconciliation_t final {
+public:
+    surface_reconciliation_t(surface_reconciliation_limits_t limits = {});
+
+    surface_reconciliation_t(const surface_reconciliation_t&) = delete;
+    surface_reconciliation_t& operator=(const surface_reconciliation_t&) = delete;
+    surface_reconciliation_t(surface_reconciliation_t&&) = delete;
+    surface_reconciliation_t& operator=(surface_reconciliation_t&&) = delete;
+
+    void register_baseline_entry(const surface_entry_t& entry);
+    void register_actual_entry(const surface_entry_t& entry);
+
+    void mark_dead_replaced_path(std::string_view identifier, std::string_view replaced_by);
+    void mark_duplicate_store(std::string_view identifier, std::string_view other_path);
+    void mark_stale_registration(std::string_view identifier);
+    void mark_old_schema_v8_writer(std::string_view identifier, std::string_view canonical_path);
+    void mark_legacy_invalid_ast_flow(std::string_view identifier);
+    void mark_unsupported_alias(std::string_view alias, std::string_view canonical_name);
+    void mark_security_regression(std::string_view identifier, std::string_view detail);
+
+    surface_reconciliation_result_t reconcile() const;
+
+    std::size_t baseline_entry_count() const noexcept;
+    std::size_t actual_entry_count() const noexcept;
+    std::uint64_t reconciliations_performed() const noexcept;
+    std::uint64_t total_findings() const noexcept;
+
+    static std::string_view stable_code_for(surface_error_code_t code) noexcept;
+    static std::string_view entry_kind_name(surface_entry_kind_t kind) noexcept;
+
+private:
+    static surface_finding_t make_finding(
+        surface_error_code_t code, std::string_view identifier,
+        std::string detail, std::string canonical_path,
+        surface_entry_kind_t kind, std::uint64_t severity);
+
+    void check_dead_replaced_paths(surface_reconciliation_result_t& result) const;
+    void check_duplicate_stores(surface_reconciliation_result_t& result) const;
+    void check_stale_registrations(surface_reconciliation_result_t& result) const;
+    void check_old_schema_v8_writers(surface_reconciliation_result_t& result) const;
+    void check_legacy_invalid_ast_flows(surface_reconciliation_result_t& result) const;
+    void check_unsupported_aliases(surface_reconciliation_result_t& result) const;
+    void check_security_regressions(surface_reconciliation_result_t& result) const;
+    void check_unexplained_removals(surface_reconciliation_result_t& result) const;
+
+    surface_reconciliation_limits_t limits_;
+    std::vector<surface_entry_t> baseline_;
+    std::vector<surface_entry_t> actual_;
+    std::unordered_map<std::string, std::string> dead_replaced_paths_;
+    std::unordered_map<std::string, std::string> duplicate_stores_;
+    std::unordered_set<std::string> stale_registrations_;
+    std::unordered_map<std::string, std::string> old_schema_v8_writers_;
+    std::unordered_set<std::string> legacy_ast_flows_;
+    std::unordered_map<std::string, std::string> unsupported_aliases_;
+    std::unordered_map<std::string, std::string> security_regressions_;
+
+    mutable std::atomic_uint64_t reconciliations_{0};
+    mutable std::atomic_uint64_t total_findings_{0};
+};
+
+}

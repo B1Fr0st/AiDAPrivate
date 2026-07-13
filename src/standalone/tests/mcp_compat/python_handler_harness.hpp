@@ -1,0 +1,9 @@
+#pragma once
+
+#include <string>
+
+namespace aida::standalone::tests::mcp_compat {
+
+bool run_python_handler_harness(std::string& failure);
+
+}

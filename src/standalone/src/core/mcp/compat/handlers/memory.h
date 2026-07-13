@@ -3,6 +3,7 @@
 #include "../workspace_adapter.hpp"
 #include "../../protocol/mcp_tool_contract.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -12,15 +13,25 @@
 
 namespace aida::standalone::mcp::compat::handlers {
 
+inline constexpr std::size_t k_memory_tool_count = 6;
+
 struct memory_handler_limits_t final {
     std::size_t maximum_batch_items = 4096;
     std::uint64_t maximum_read_bytes_per_item = 1ULL << 20;
     std::uint64_t maximum_read_bytes_per_call = 16ULL << 20;
     std::uint64_t maximum_string_bytes = 1ULL << 20;
     std::size_t maximum_backend_payload_bytes = 64ULL << 20;
+    std::size_t maximum_selector_bytes = 1024U;
+    std::size_t maximum_address_bytes = 4096U;
+    std::size_t maximum_type_bytes = 64U;
+    std::size_t maximum_request_bytes = 1024U * 1024U;
+    std::size_t maximum_response_bytes = 16U * 1024U * 1024U;
+    std::chrono::milliseconds maximum_execution_time{120000};
 
     bool valid() const noexcept;
 };
+
+const std::array<std::string_view, k_memory_tool_count>& memory_tool_names() noexcept;
 
 struct memory_invocation_t final {
     std::optional<std::uint64_t> expected_generation;
@@ -38,6 +49,11 @@ public:
     memory_handlers_t& operator=(const memory_handlers_t&) = delete;
     memory_handlers_t(memory_handlers_t&&) noexcept;
     memory_handlers_t& operator=(memory_handlers_t&&) noexcept;
+
+    std::size_t size() const noexcept;
+    const protocol::tool_contract_t& contract_at(std::size_t index) const;
+    const protocol::tool_contract_t* find(std::string_view name) const noexcept;
+    const memory_handler_limits_t& limits() const noexcept;
 
     protocol::mcp_result_t invoke(
         std::string_view tool_name,

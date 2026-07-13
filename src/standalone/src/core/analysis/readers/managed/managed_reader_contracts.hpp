@@ -26,8 +26,8 @@ enum class managed_artifact_kind_t : std::uint8_t {
 };
 
 enum class managed_token_type_t : std::uint8_t {
-    unknown = 0,
-    module = 0x1A,
+    unknown = 0xFF,
+    module = 0x00,
     type_ref = 0x01,
     type_def = 0x02,
     field_def = 0x04,

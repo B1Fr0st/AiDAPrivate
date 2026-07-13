@@ -705,7 +705,7 @@ type_descriptor_t parse_type_descriptor(const std::string& descriptor, std::size
             std::size_t elem_start = pos;
             auto inner = parse_type_descriptor(descriptor, pos);
             result.element_descriptor = descriptor.substr(elem_start, pos - elem_start);
-            result.descriptor = descriptor.substr(pos - (pos - elem_start) - 1);
+            result.descriptor = "[" + result.element_descriptor;
         }
         return result;
     default:
@@ -2094,6 +2094,7 @@ private:
         case 0xAF: return types_.id_for_descriptor("D");
         case 0xB0: return types_.register_class("java/lang/Object");
         case 0xB1: return types_.id_for_descriptor("V");
+        case 0xA8: case 0xC9: return types_.register_return_address();
         default:
             if (info.flags & flag_cat2_result)
                 return types_.id_for_descriptor("J");
@@ -2189,11 +2190,6 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
 
     if (input.context.code.empty()) {
         fail(decompiler_diagnostic_code_t::malformed_provider_ir, "jvm_ssa.empty_code");
-        return result;
-    }
-
-    if (input.context.max_locals == 0 && !input.context.code.empty()) {
-        fail(decompiler_diagnostic_code_t::malformed_provider_ir, "jvm_ssa.zero_max_locals");
         return result;
     }
 

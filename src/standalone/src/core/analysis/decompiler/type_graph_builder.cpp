@@ -154,6 +154,8 @@ void type_graph_builder_t::merge_field_conflict(
     const type_provenance_record_t& resolved_prov,
     const type_provenance_record_t& rejected_prov)
 {
+    if (!config_.strict_conflict_reporting && rejected_prov.source == decompiler_fact_provenance_t::unknown)
+        return;
     type_conflict_record_t conflict;
     conflict.canonical_name = canonical_name;
     conflict.field_name = field_name;
@@ -265,6 +267,18 @@ void type_graph_builder_t::merge_edges(merged_node_t& merged, const type_candida
                 auto existing_score = effective_score(to_provenance_record(existing));
                 auto incoming_score = effective_score(to_provenance_record(edge));
                 if (incoming_score > existing_score) {
+                    if (config_.strict_conflict_reporting ||
+                        to_provenance_record(existing).source != decompiler_fact_provenance_t::unknown) {
+                        provenance_conflict_t econflict;
+                        econflict.canonical_name = merged.canonical_name;
+                        econflict.field_name = edge_stable_name(edge);
+                        econflict.winner = to_provenance_record(edge);
+                        econflict.loser = to_provenance_record(existing);
+                        econflict.winner_value = edge.target_canonical_name;
+                        econflict.loser_value = existing.target_canonical_name;
+                        edge_conflicts_.push_back(std::move(econflict));
+                        stats_.conflicts++;
+                    }
                     existing = edge;
                 }
                 break;
@@ -280,7 +294,9 @@ void type_graph_builder_t::detect_recursive_types(std::unordered_map<std::string
 {
     for (auto& [name, node] : merged_nodes) {
         std::unordered_set<std::string> visited;
-        std::function<bool(const std::string&)> check_recursive = [&](const std::string& current) -> bool {
+        std::function<bool(const std::string&, std::uint32_t)> check_recursive = [&](const std::string& current, std::uint32_t depth) -> bool {
+            if (depth >= config_.max_recursion_depth)
+                return false;
             if (visited.count(current))
                 return current == name;
             visited.insert(current);
@@ -295,14 +311,14 @@ void type_graph_builder_t::detect_recursive_types(std::unordered_map<std::string
                     edge.kind == decompiler_type_edge_kind_t::element) {
                     if (edge.target_canonical_name == name)
                         return true;
-                    if (check_recursive(edge.target_canonical_name))
+                    if (check_recursive(edge.target_canonical_name, depth + 1))
                         return true;
                 }
             }
             return false;
         };
 
-        if (check_recursive(name)) {
+        if (check_recursive(name, 0)) {
             node.is_recursive = true;
             stats_.recursive_types++;
         }
@@ -485,6 +501,26 @@ void type_graph_builder_t::emit_diagnostics(type_graph_t& graph, std::uint32_t& 
             conflict.rejected_value,
             provenance_label(conflict.resolved_provenance.source),
             provenance_label(conflict.rejected_provenance.source),
+        };
+        graph.diagnostics.push_back(diagnostic);
+    }
+
+    for (const auto& conflict : edge_conflicts_) {
+        std::ostringstream ss;
+        ss << "type_graph.edge_conflict." << conflict.canonical_name << "." << conflict.field_name;
+        auto diagnostic = make_diagnostic(
+            decompiler_diagnostic_severity_t::note,
+            decompiler_diagnostic_code_t::malformed_type_graph,
+            ss.str(),
+            ++ordinal_counter,
+            conflict.winner.confidence);
+        diagnostic.localization_arguments = {
+            conflict.canonical_name,
+            conflict.field_name,
+            conflict.winner_value,
+            conflict.loser_value,
+            provenance_label(conflict.winner.source),
+            provenance_label(conflict.loser.source),
         };
         graph.diagnostics.push_back(diagnostic);
     }

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <iterator>
 #include <limits>
+#include <locale>
 #include <sstream>
 
 namespace aida::analysis {
@@ -38,6 +39,7 @@ std::uint64_t analysis_metrics_snapshot_t::value(analysis_metric_t metric) const
 
 std::string analysis_metrics_snapshot_t::to_json() const {
     std::ostringstream out;
+    out.imbue(std::locale::classic());
     out << "{\"generation\":" << generation
         << ",\"started_steady_ns\":" << started_steady_ns
         << ",\"finished_steady_ns\":" << finished_steady_ns
@@ -80,6 +82,8 @@ analysis_metrics_t::analysis_metrics_t(std::uint64_t generation) noexcept {
 }
 
 void analysis_metrics_t::reset(std::uint64_t generation) noexcept {
+    std::lock_guard<std::mutex> lock(mutation_mutex_);
+    begin_mutation();
     for (auto& counter : counters_)
         counter.store(0, std::memory_order_relaxed);
     for (auto& phase : phases_) {
@@ -101,6 +105,7 @@ void analysis_metrics_t::reset(std::uint64_t generation) noexcept {
     process_cpu_start_ns_.store(current_process_cpu_ns(), std::memory_order_release);
     started_steady_ns_.store(steady_now_ns(), std::memory_order_release);
     sample_process_memory();
+    end_mutation();
 }
 
 void analysis_metrics_t::mark_finished() noexcept {
@@ -253,34 +258,59 @@ void analysis_metrics_t::record_decompile_latency(bool warm, std::uint64_t laten
     set_max(maximum, latency_ns);
 }
 
-analysis_metrics_snapshot_t analysis_metrics_t::snapshot() const noexcept {
+void analysis_metrics_t::begin_mutation() noexcept {
+    coherence_sequence_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void analysis_metrics_t::end_mutation() noexcept {
+    coherence_sequence_.fetch_add(1, std::memory_order_release);
+}
+
+analysis_metrics_snapshot_t analysis_metrics_t::load_snapshot_relaxed() const noexcept {
     analysis_metrics_snapshot_t result;
     for (std::size_t i = 0; i < counters_.size(); ++i)
-        result.counters[i] = counters_[i].load(std::memory_order_acquire);
+        result.counters[i] = counters_[i].load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < phases_.size(); ++i) {
         const auto& source = phases_[i];
         auto& target = result.phases[i];
-        target.invocations = source.invocations.load(std::memory_order_acquire);
-        target.wall_ns = source.wall_ns.load(std::memory_order_acquire);
-        target.cpu_ns = source.cpu_ns.load(std::memory_order_acquire);
-        target.bytes_in = source.bytes_in.load(std::memory_order_acquire);
-        target.bytes_out = source.bytes_out.load(std::memory_order_acquire);
-        target.work_items = source.work_items.load(std::memory_order_acquire);
-        target.cancellation_checks = source.cancellation_checks.load(std::memory_order_acquire);
-        target.failures = source.failures.load(std::memory_order_acquire);
-        target.queue_depth_peak = source.queue_depth_peak.load(std::memory_order_acquire);
-        target.active_workers_peak = source.active_workers_peak.load(std::memory_order_acquire);
+        target.invocations = source.invocations.load(std::memory_order_relaxed);
+        target.wall_ns = source.wall_ns.load(std::memory_order_relaxed);
+        target.cpu_ns = source.cpu_ns.load(std::memory_order_relaxed);
+        target.bytes_in = source.bytes_in.load(std::memory_order_relaxed);
+        target.bytes_out = source.bytes_out.load(std::memory_order_relaxed);
+        target.work_items = source.work_items.load(std::memory_order_relaxed);
+        target.cancellation_checks = source.cancellation_checks.load(std::memory_order_relaxed);
+        target.failures = source.failures.load(std::memory_order_relaxed);
+        target.queue_depth_peak = source.queue_depth_peak.load(std::memory_order_relaxed);
+        target.active_workers_peak = source.active_workers_peak.load(std::memory_order_relaxed);
     }
-    result.started_steady_ns = started_steady_ns_.load(std::memory_order_acquire);
-    result.finished_steady_ns = finished_steady_ns_.load(std::memory_order_acquire);
+    result.started_steady_ns = started_steady_ns_.load(std::memory_order_relaxed);
+    result.finished_steady_ns = finished_steady_ns_.load(std::memory_order_relaxed);
     const auto end = result.finished_steady_ns != 0
         ? result.finished_steady_ns : steady_now_ns();
     result.wall_ns = end >= result.started_steady_ns ? end - result.started_steady_ns : 0;
     const auto cpu_now = current_process_cpu_ns();
-    const auto cpu_start = process_cpu_start_ns_.load(std::memory_order_acquire);
+    const auto cpu_start = process_cpu_start_ns_.load(std::memory_order_relaxed);
     result.process_cpu_ns = cpu_now >= cpu_start ? cpu_now - cpu_start : 0;
-    result.generation = generation_.load(std::memory_order_acquire);
+    result.generation = generation_.load(std::memory_order_relaxed);
     return result;
+}
+
+analysis_metrics_snapshot_t analysis_metrics_t::snapshot() const noexcept {
+    constexpr std::size_t optimistic_attempt_count = 8;
+    for (std::size_t attempt = 0; attempt < optimistic_attempt_count; ++attempt) {
+        const auto sequence_before = coherence_sequence_.load(std::memory_order_acquire);
+        if ((sequence_before & 1U) != 0)
+            continue;
+        auto result = load_snapshot_relaxed();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const auto sequence_after = coherence_sequence_.load(std::memory_order_acquire);
+        if (sequence_before == sequence_after)
+            return result;
+    }
+
+    std::lock_guard<std::mutex> lock(mutation_mutex_);
+    return load_snapshot_relaxed();
 }
 
 const char* analysis_metrics_t::phase_name(baseline_phase_t phase) noexcept {

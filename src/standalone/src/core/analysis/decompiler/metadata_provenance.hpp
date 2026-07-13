@@ -9,8 +9,6 @@
 
 namespace aida::analysis::type_graph {
 
-constexpr std::uint32_t k_provenance_schema_version = 1;
-
 constexpr std::uint8_t k_max_confidence = 100;
 
 std::uint32_t provenance_priority(decompiler_fact_provenance_t provenance) noexcept;

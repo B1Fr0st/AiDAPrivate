@@ -1230,7 +1230,7 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         if (std::holds_alternative<decompiler_worker_document_message_t>(*decoded.value)) {
             const auto& document = std::get<decompiler_worker_document_message_t>(*decoded.value);
             const auto document_validation = validate_decompiler_document(document.document);
-            if (document.job_id != request.job_id || !document_validation.valid() || document.document.entity != request.cache_key.entity ||
+            if (document.job_id != request.job_id || !document_validation.valid() || !(document.document.entity == request.cache_key.entity) ||
                 document.document.profile != request.profile.profile) {
                 append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.document", "worker document is not bound to the requested entity and profile", ERROR_INVALID_DATA, true);
                 terminate_worker(worker, ERROR_CRC, result, true);

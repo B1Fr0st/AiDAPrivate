@@ -104,6 +104,33 @@ bool run_contract_generation_harness(std::string& failure) {
             return reject("generated contract ledger SHA-256 is a degenerate constant, not a genuine hash of the contract descriptors");
         }
     }
+    if (k_generated_contract_ledger_sha256 != "B71EA3261783880718E7585900D720642C32A68370F9E97EEE0D50B36B44EB51") {
+        return reject("generated contract ledger SHA-256 does not match the expected canonical value B71EA3261783880718E7585900D720642C32A68370F9E97EEE0D50B36B44EB51, re-generation byte-match failure");
+    }
+    if (k_generated_effect_ledger_sha256.empty()) {
+        return reject("generated effect ledger SHA-256 is empty");
+    }
+    {
+        bool effect_all_zero = true;
+        bool effect_all_same = true;
+        const char effect_first_char = k_generated_effect_ledger_sha256[0];
+        for (const char c : k_generated_effect_ledger_sha256) {
+            if (c != '0') effect_all_zero = false;
+            if (c != effect_first_char) effect_all_same = false;
+        }
+        if (effect_all_zero || effect_all_same) {
+            return reject("generated effect ledger SHA-256 is a degenerate constant, not a genuine hash of the effect descriptors");
+        }
+    }
+    if (k_generated_effect_ledger_sha256 != "E8E4AECA80C597FAE5A9C33BCBE4BBA9B0BC0D0B67A5FBE50B338504AB06563C") {
+        return reject("generated effect ledger SHA-256 does not match the expected canonical value E8E4AECA80C597FAE5A9C33BCBE4BBA9B0BC0D0B67A5FBE50B338504AB06563C");
+    }
+    if (k_generated_effect_ledger_sha256 == k_generated_contract_ledger_sha256) {
+        return reject("generated effect ledger SHA-256 must not equal the contract ledger SHA-256");
+    }
+    if (k_generated_effect_ledger_sha256 == k_generated_archive_manifest_sha256) {
+        return reject("generated effect ledger SHA-256 must not equal the archive manifest SHA-256");
+    }
     if (contract_count() != k_compatibility_tool_count) {
         return reject("generated compatibility contract count is incorrect");
     }
@@ -126,7 +153,7 @@ bool run_contract_generation_harness(std::string& failure) {
             contains_forbidden_resource(contract.output_schema_json) || contains_forbidden_resource(contract.annotations_json)) {
             return reject("generated compatibility table contains an excluded MCP surface");
         }
-        if (contract.input_schema_json.empty() || contract.output_schema_json.empty() || contract.annotations_json.empty() || contract.adapter_symbol.empty()) {
+        if (contract.description.empty() || contract.input_schema_json.empty() || contract.output_schema_json.empty() || contract.annotations_json.empty() || contract.adapter_symbol.empty()) {
             return reject("generated compatibility contract is missing required metadata");
         }
         if (!valid_effect_lock_pair(contract.effect, contract.lock)) {
@@ -189,6 +216,22 @@ bool run_contract_generation_harness(std::string& failure) {
         idb_save->annotations_json.find("IdbSaveResult") != std::string_view::npos ||
         idb_save->annotations_json.find("WorkspaceCheckpointResult") == std::string_view::npos) {
         return reject("idb_save must describe AiDA workspace checkpoint and flush semantics");
+    }
+    const auto* py_exec_file = find_contract("py_exec_file");
+    if (py_exec_file == nullptr) {
+        return reject("py_exec_file contract is missing from the compatibility table");
+    }
+    if (!py_exec_file->archive_backed) {
+        return reject("py_exec_file must be archive-backed with source provenance");
+    }
+    if (py_exec_file->source_line != 205u) {
+        return reject("py_exec_file source_line must be 205");
+    }
+    if (py_exec_file->source_path == "proxy-local") {
+        return reject("py_exec_file source_path must not be proxy-local");
+    }
+    if (!py_exec_file->accepts_pid || !py_exec_file->accepts_bin_name || !py_exec_file->target_dependent) {
+        return reject("py_exec_file must be target-dependent with accepts_pid and accepts_bin_name");
     }
     for (const auto extension : k_aida_extension_names) {
         if (find_contract(extension) != nullptr) {

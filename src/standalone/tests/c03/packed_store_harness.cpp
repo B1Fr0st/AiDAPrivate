@@ -394,6 +394,348 @@ void verify_rejections()
             "dangling edge target in an unmaterialized domain was accepted");
 }
 
+packed_analysis_shard_t new_domains_first_fixture()
+{
+    packed_analysis_shard_builder_t builder(20);
+
+    packed_instruction_input_t instruction;
+    instruction.source_id = 1;
+    instruction.address = fixture_address(0x1000);
+    instruction.length = 5;
+    instruction.mnemonic_id = 10;
+    instruction.mnemonic = "mov";
+    instruction.opcode_id = 0xb8;
+    instruction.flow_flags = flow_fallthrough;
+    instruction.provenance = fact_provenance_t::linear_validation;
+    instruction.confidence = 98;
+    instruction.stable_source_id = 0x1001;
+    require_success(builder.add_instruction(instruction), "new domain fixture instruction was rejected");
+
+    packed_address_expression_input_t addr_expr;
+    addr_expr.source_id = 3;
+    addr_expr.instruction = packed_entity_reference_t::local(packed_entity_domain_t::instruction, 1);
+    addr_expr.base_reg = 1;
+    addr_expr.index_reg = 0;
+    addr_expr.scale = 1;
+    addr_expr.displacement = 0x1000;
+    addr_expr.address_components = address_component_base | address_component_displacement;
+    addr_expr.kind = address_expression_kind_t::base_displacement;
+    addr_expr.resolution = target_resolution_t::image_relative;
+    addr_expr.provenance = fact_provenance_t::recursive_decode;
+    addr_expr.confidence = 90;
+    require_success(builder.add_address_expression(addr_expr),
+                    "address_expression was rejected");
+
+    packed_basic_block_input_t basic_block;
+    basic_block.source_id = 2;
+    basic_block.start_address = fixture_address(0x1000);
+    basic_block.end_address = fixture_address(0x1010);
+    basic_block.instruction_begin = 0;
+    basic_block.instruction_count = 1;
+    basic_block.predecessor_count = 1;
+    basic_block.successor_count = 1;
+    basic_block.flags = 0;
+    basic_block.provenance = fact_provenance_t::linear_validation;
+    basic_block.confidence = 95;
+    require_success(builder.add_basic_block(basic_block), "basic_block was rejected");
+
+    packed_function_input_t function;
+    function.source_id = 4;
+    function.start_address = fixture_address(0x1000);
+    function.end_address = fixture_address(0x2000);
+    function.entry_block = packed_entity_reference_t::local(packed_entity_domain_t::basic_block, 2);
+    function.name = "test_func";
+    function.chunk_count = 1;
+    function.flags = 0;
+    function.return_type_id = 0;
+    function.provenance = fact_provenance_t::debug_symbol;
+    function.confidence = 98;
+    require_success(builder.add_function(function), "function was rejected");
+
+    packed_function_chunk_input_t function_chunk;
+    function_chunk.source_id = 5;
+    function_chunk.function = packed_entity_reference_t::local(packed_entity_domain_t::function, 4);
+    function_chunk.start_address = fixture_address(0x1000);
+    function_chunk.end_address = fixture_address(0x2000);
+    function_chunk.block_begin = 0;
+    function_chunk.block_count = 1;
+    function_chunk.flags = 0;
+    function_chunk.provenance = fact_provenance_t::debug_symbol;
+    function_chunk.confidence = 95;
+    require_success(builder.add_function_chunk(function_chunk), "function_chunk was rejected");
+
+    packed_target_fact_input_t target_fact;
+    target_fact.source_id = 6;
+    target_fact.instruction = packed_entity_reference_t::local(packed_entity_domain_t::instruction, 1);
+    target_fact.target = fixture_address(0x2000);
+    target_fact.kind = target_kind_record_t::call;
+    target_fact.resolution = target_resolution_t::image_relative;
+    target_fact.operand_index = 0;
+    target_fact.direct = true;
+    target_fact.is_external = false;
+    target_fact.provenance = fact_provenance_t::call_target;
+    target_fact.confidence = 92;
+    require_success(builder.add_target_fact(target_fact), "target_fact was rejected");
+
+    packed_xref_input_t xref;
+    xref.source_id = 7;
+    xref.source_entity = packed_entity_reference_t::local(packed_entity_domain_t::instruction, 1);
+    xref.source_address = fixture_address(0x1000);
+    xref.target_address = fixture_address(0x1000);
+    xref.kind = xref_kind_t::code;
+    xref.is_direct = true;
+    xref.provenance = fact_provenance_t::linear_validation;
+    xref.confidence = 88;
+    require_success(builder.add_xref(xref), "xref was rejected");
+
+    packed_coverage_input_t coverage;
+    coverage.source_id = 8;
+    coverage.span_begin = fixture_address(0x1000);
+    coverage.span_end = fixture_address(0x2000);
+    coverage.reason = coverage_reason_t::decoded;
+    coverage.undecodable_count = 0;
+    coverage.provenance = fact_provenance_t::linear_validation;
+    coverage.confidence = 100;
+    require_success(builder.add_coverage(coverage), "coverage was rejected");
+
+    return require_value(std::move(builder).finalize(),
+                         "new domains first fixture finalization failed");
+}
+
+packed_analysis_shard_t new_domains_second_fixture()
+{
+    packed_analysis_shard_builder_t builder(21);
+
+    packed_basic_block_input_t basic_block;
+    basic_block.source_id = 1;
+    basic_block.start_address = fixture_address(0x2000);
+    basic_block.end_address = fixture_address(0x3000);
+    basic_block.instruction_begin = 0;
+    basic_block.instruction_count = 0;
+    basic_block.predecessor_count = 0;
+    basic_block.successor_count = 0;
+    basic_block.flags = 0;
+    basic_block.provenance = fact_provenance_t::gap_recovery;
+    basic_block.confidence = 80;
+    require_success(builder.add_basic_block(basic_block),
+                    "new domains second fixture basic_block was rejected");
+
+    packed_coverage_input_t coverage;
+    coverage.source_id = 1;
+    coverage.span_begin = fixture_address(0x2000);
+    coverage.span_end = fixture_address(0x3000);
+    coverage.reason = coverage_reason_t::padding;
+    coverage.undecodable_count = 2;
+    coverage.provenance = fact_provenance_t::gap_recovery;
+    coverage.confidence = 70;
+    require_success(builder.add_coverage(coverage),
+                    "new domains second fixture coverage was rejected");
+
+    return require_value(std::move(builder).finalize(),
+                         "new domains second fixture finalization failed");
+}
+
+void verify_new_domains()
+{
+    std::vector<packed_analysis_shard_t> shards;
+    shards.push_back(new_domains_first_fixture());
+    shards.push_back(new_domains_second_fixture());
+    auto store = require_value(packed_analysis_store_t::merge(std::move(shards)),
+                               "new domains merge failed");
+    require(store.valid(), "new domains store failed integrity validation");
+
+    require(store.address_expression_count() == 1, "address_expression count mismatch");
+    require(store.basic_block_count() == 2, "basic_block count mismatch");
+    require(store.function_count() == 1, "function count mismatch");
+    require(store.function_chunk_count() == 1, "function_chunk count mismatch");
+    require(store.target_fact_count() == 1, "target_fact count mismatch");
+    require(store.xref_count() == 1, "xref count mismatch");
+    require(store.coverage_count() == 2, "coverage count mismatch");
+
+    const auto addr_expr = store.address_expression(0);
+    require(addr_expr.has_value(), "address_expression view was absent");
+    require(addr_expr->base_reg == 1 && addr_expr->displacement == 0x1000 &&
+            addr_expr->kind == address_expression_kind_t::base_displacement &&
+            addr_expr->instruction_id.valid() &&
+            addr_expr->instruction_id.parts().domain == packed_entity_domain_t::instruction,
+            "address_expression view fields changed");
+
+    const auto block0 = store.basic_block(0);
+    const auto block1 = store.basic_block(1);
+    require(block0.has_value() && block1.has_value(), "basic_block views were absent");
+    require(block0->start_address.value == 0x1000 && block0->end_address.value == 0x1010 &&
+            block0->instruction_count == 1 && block0->predecessor_count == 1,
+            "first basic_block view fields changed");
+    require(block1->start_address.value == 0x2000 && block1->end_address.value == 0x3000 &&
+            block1->predecessor_count == 0,
+            "second basic_block view fields changed");
+
+    const auto func = store.function(0);
+    require(func.has_value(), "function view was absent");
+    require(func->start_address.value == 0x1000 && func->end_address.value == 0x2000 &&
+            func->name == "test_func" && func->chunk_count == 1 &&
+            func->entry_block_id.valid() &&
+            func->entry_block_id.parts().domain == packed_entity_domain_t::basic_block,
+            "function view fields changed");
+
+    const auto chunk = store.function_chunk(0);
+    require(chunk.has_value(), "function_chunk view was absent");
+    require(chunk->start_address.value == 0x1000 && chunk->end_address.value == 0x2000 &&
+            chunk->block_count == 1 &&
+            chunk->function_id.valid() &&
+            chunk->function_id.parts().domain == packed_entity_domain_t::function,
+            "function_chunk view fields changed");
+
+    const auto tFact = store.target_fact(0);
+    require(tFact.has_value(), "target_fact view was absent");
+    require(tFact->target.value == 0x2000 && tFact->kind == target_kind_record_t::call &&
+            tFact->direct && !tFact->is_external &&
+            tFact->instruction_id.valid() &&
+            tFact->instruction_id.parts().domain == packed_entity_domain_t::instruction,
+            "target_fact view fields changed");
+
+    const auto xr = store.xref(0);
+    require(xr.has_value(), "xref view was absent");
+    require(xr->source_address.value == 0x1000 && xr->target_address.value == 0x1000 &&
+            xr->kind == xref_kind_t::code && xr->is_direct &&
+            xr->source_entity.valid() &&
+            xr->source_entity.parts().domain == packed_entity_domain_t::instruction,
+            "xref view fields changed");
+
+    const auto cov0 = store.coverage(0);
+    const auto cov1 = store.coverage(1);
+    require(cov0.has_value() && cov1.has_value(), "coverage views were absent");
+    require(cov0->span_begin.value == 0x1000 && cov0->span_end.value == 0x2000 &&
+            cov0->reason == coverage_reason_t::decoded && cov0->undecodable_count == 0,
+            "first coverage view fields changed");
+    require(cov1->span_begin.value == 0x2000 && cov1->span_end.value == 0x3000 &&
+            cov1->reason == coverage_reason_t::padding && cov1->undecodable_count == 2,
+            "second coverage view fields changed");
+
+    const auto compat = store.compatibility_view();
+    const auto compat_block = compat.basic_block(0);
+    const auto compat_func = compat.function(0);
+    const auto compat_chunk = compat.function_chunk(0);
+    const auto compat_tfact = compat.target_fact(0);
+    const auto compat_xref = compat.xref(0);
+    const auto compat_cov = compat.coverage(0);
+    require(compat_block && compat_func && compat_chunk && compat_tfact && compat_xref &&
+            compat_cov,
+            "compatibility view was absent for new domains");
+    require(compat_block->id != 0 && compat_block->start.value == 0x1000 &&
+            compat_block->end.value == 0x1010 && compat_block->instruction_count == 1,
+            "compatibility basic_block fields changed");
+    require(compat_func->id != 0 && compat_func->start.value == 0x1000 &&
+            compat_func->end.value == 0x2000 && compat_func->chunk_count == 1,
+            "compatibility function fields changed");
+    require(compat_chunk->id != 0 && compat_chunk->function_id != 0 &&
+            compat_chunk->start.value == 0x1000 && compat_chunk->block_count == 1,
+            "compatibility function_chunk fields changed");
+    require(compat_tfact->target.value == 0x2000 &&
+            compat_tfact->kind == target_kind_record_t::call && compat_tfact->direct,
+            "compatibility target_fact fields changed");
+    require(compat_xref->id != 0 && compat_xref->source.value == 0x1000 &&
+            compat_xref->kind == xref_kind_t::code,
+            "compatibility xref fields changed");
+    require(compat_cov->start.value == 0x1000 && compat_cov->size == 0x1000 &&
+            compat_cov->reason == coverage_reason_t::decoded,
+            "compatibility coverage fields changed");
+
+    const auto sizes = store.size_accounting();
+    require(sizes.payload_bytes > 0 && sizes.reserved_bytes >= sizes.payload_bytes,
+            "new domains size accounting payload mismatch");
+    require(sizes.address_expression_bytes > 0 && sizes.basic_block_bytes > 0 &&
+            sizes.function_bytes > 0 && sizes.function_chunk_bytes > 0 &&
+            sizes.target_fact_bytes > 0 && sizes.xref_bytes > 0 && sizes.coverage_bytes > 0,
+            "new domains size accounting omitted domain columns");
+}
+
+void verify_new_domain_rejections()
+{
+    packed_analysis_shard_builder_t dup_builder(22);
+    packed_basic_block_input_t block1;
+    block1.source_id = 1;
+    block1.start_address = fixture_address(0x1000);
+    block1.end_address = fixture_address(0x1010);
+    block1.provenance = fact_provenance_t::linear_validation;
+    require_success(dup_builder.add_basic_block(block1), "first basic_block was rejected");
+    packed_basic_block_input_t block2 = block1;
+    require(!dup_builder.add_basic_block(block2), "duplicate basic_block source id was accepted");
+    require(dup_builder.add_basic_block(block2).error().code ==
+                packed_store_error_code_t::duplicate_source_id,
+            "duplicate basic_block error code changed");
+
+    packed_analysis_shard_builder_t bad_builder(23);
+    packed_basic_block_input_t bad_block;
+    bad_block.source_id = 1;
+    bad_block.start_address = fixture_address(0x1000);
+    bad_block.end_address = fixture_address(0x1010);
+    bad_block.provenance = static_cast<fact_provenance_t>(200);
+    require(!bad_builder.add_basic_block(bad_block), "invalid basic_block provenance was accepted");
+    require(bad_builder.add_basic_block(bad_block).error().code ==
+                packed_store_error_code_t::invalid_row,
+            "invalid basic_block error code changed");
+
+    packed_analysis_shard_builder_t bad_func_builder(24);
+    packed_function_chunk_input_t bad_chunk;
+    bad_chunk.source_id = 1;
+    bad_chunk.function = packed_entity_reference_t::local(packed_entity_domain_t::instruction, 1);
+    bad_chunk.start_address = fixture_address(0x1000);
+    bad_chunk.end_address = fixture_address(0x2000);
+    bad_chunk.provenance = fact_provenance_t::linear_validation;
+    require(!bad_func_builder.add_function_chunk(bad_chunk),
+            "function_chunk with wrong function domain was accepted");
+    require(bad_func_builder.add_function_chunk(bad_chunk).error().code ==
+                packed_store_error_code_t::invalid_row,
+            "function_chunk wrong domain error code changed");
+
+    packed_analysis_shard_builder_t bad_xref_builder(25);
+    packed_xref_input_t bad_xref;
+    bad_xref.source_id = 1;
+    bad_xref.source_address = fixture_address(0x1000);
+    bad_xref.target_address = fixture_address(0x2000);
+    bad_xref.kind = static_cast<xref_kind_t>(200);
+    bad_xref.provenance = fact_provenance_t::linear_validation;
+    require(!bad_xref_builder.add_xref(bad_xref), "invalid xref kind was accepted");
+    require(bad_xref_builder.add_xref(bad_xref).error().code ==
+                packed_store_error_code_t::invalid_row,
+            "invalid xref error code changed");
+
+    packed_analysis_shard_builder_t bad_cov_builder(26);
+    packed_coverage_input_t bad_cov;
+    bad_cov.source_id = 1;
+    bad_cov.span_begin = fixture_address(0x1000);
+    bad_cov.span_end = fixture_address(0x2000);
+    bad_cov.reason = static_cast<coverage_reason_t>(200);
+    bad_cov.provenance = fact_provenance_t::linear_validation;
+    require(!bad_cov_builder.add_coverage(bad_cov), "invalid coverage reason was accepted");
+    require(bad_cov_builder.add_coverage(bad_cov).error().code ==
+                packed_store_error_code_t::invalid_row,
+            "invalid coverage error code changed");
+
+    packed_analysis_shard_builder_t bad_tfact_builder(27);
+    packed_target_fact_input_t bad_tfact;
+    bad_tfact.source_id = 1;
+    bad_tfact.target = fixture_address(0x2000);
+    bad_tfact.kind = static_cast<target_kind_record_t>(200);
+    bad_tfact.provenance = fact_provenance_t::linear_validation;
+    require(!bad_tfact_builder.add_target_fact(bad_tfact), "invalid target_fact kind was accepted");
+    require(bad_tfact_builder.add_target_fact(bad_tfact).error().code ==
+                packed_store_error_code_t::invalid_row,
+            "invalid target_fact error code changed");
+
+    packed_analysis_shard_builder_t bad_expr_builder(28);
+    packed_address_expression_input_t bad_expr;
+    bad_expr.source_id = 1;
+    bad_expr.kind = static_cast<address_expression_kind_t>(200);
+    bad_expr.provenance = fact_provenance_t::linear_validation;
+    require(!bad_expr_builder.add_address_expression(bad_expr),
+            "invalid address_expression kind was accepted");
+    require(bad_expr_builder.add_address_expression(bad_expr).error().code ==
+                packed_store_error_code_t::invalid_row,
+            "invalid address_expression error code changed");
+}
+
 }
 
 void run_packed_store_harness()
@@ -401,6 +743,8 @@ void run_packed_store_harness()
     verify_ids_and_string_pool();
     verify_store_merge_and_compatibility();
     verify_rejections();
+    verify_new_domains();
+    verify_new_domain_rejections();
 }
 
 }

@@ -58,26 +58,6 @@ constexpr std::uint8_t elf_magic_1 = 0x45u;
 constexpr std::uint8_t elf_magic_2 = 0x4Cu;
 constexpr std::uint8_t elf_magic_3 = 0x46u;
 
-bool probe_bytes(const byte_provider_t& provider, std::uint64_t offset,
-                 const std::uint8_t* expected, std::size_t length,
-                 const cancellation_token_t& cancel) {
-    if (provider.size() < offset + length)
-        return false;
-    auto result = provider.read_exact(offset, nullptr, 0, cancel);
-    if (!result)
-        return false;
-    std::array<std::uint8_t, 64> buffer{};
-    if (length > buffer.size())
-        return false;
-    auto lease_result = provider.lease(offset, length, cancel);
-    if (!lease_result)
-        return false;
-    const auto& view = lease_result.value();
-    if (view.size() < length)
-        return false;
-    return std::memcmp(view.data(), expected, length) == 0;
-}
-
 bool is_zip(const byte_provider_t& provider, const cancellation_token_t& cancel) {
     if (provider.size() < 4)
         return false;
@@ -353,6 +333,21 @@ bool is_debug_companion_extension(std::string_view path) noexcept {
     return ext == ".pdb" || ext == ".dwarf" || ext == ".debug";
 }
 
+bool is_standalone_binary_extension(std::string_view path) noexcept {
+    auto dot_pos = path.rfind('.');
+    if (dot_pos == std::string_view::npos)
+        return false;
+    auto ext_lower = [](std::string_view ext) noexcept {
+        std::string lower(ext);
+        for (auto& c : lower)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return lower;
+    };
+    auto ext = ext_lower(path.substr(dot_pos));
+    return ext == ".exe" || ext == ".dll" || ext == ".so" ||
+           ext == ".dylib" || ext == ".elf" || ext == ".bin";
+}
+
 std::string display_name_from_path(std::string_view path) noexcept {
     auto slash_pos = path.rfind('/');
     if (slash_pos == std::string_view::npos)
@@ -461,6 +456,17 @@ collection_kind_t classify_zip_kind(const std::vector<zip_member_t>& zip_members
         return collection_kind_t::ipa;
     if (has_manifest_mf || has_class_file)
         return collection_kind_t::jar;
+
+    std::uint32_t standalone_binary_count = 0;
+    for (const auto& member : zip_members) {
+        if (member.kind == zip_member_kind_t::directory)
+            continue;
+        if (is_standalone_binary_extension(member.normalized_path))
+            ++standalone_binary_count;
+    }
+    if (standalone_binary_count >= 2)
+        return collection_kind_t::multi_binary_project;
+
     return collection_kind_t::zip_archive;
 }
 
@@ -656,7 +662,8 @@ bool collection_kind_is_zip_based(collection_kind_t kind) noexcept {
            kind == collection_kind_t::apk ||
            kind == collection_kind_t::aab ||
            kind == collection_kind_t::ipa ||
-           kind == collection_kind_t::jar;
+           kind == collection_kind_t::jar ||
+           kind == collection_kind_t::multi_binary_project;
 }
 
 bool collection_kind_is_container(collection_kind_t kind) noexcept {
@@ -843,6 +850,11 @@ artifact_collection_t::open(std::shared_ptr<const byte_provider_t> provider,
 
             if (descriptor.is_nested_collection)
                 descriptor.member_kind = collection_member_kind_t::nested_archive;
+
+            if (kind == collection_kind_t::multi_binary_project &&
+                is_standalone_binary_extension(zm.normalized_path)) {
+                descriptor.is_nested_collection = true;
+            }
 
             state->members.push_back(std::move(descriptor));
         }

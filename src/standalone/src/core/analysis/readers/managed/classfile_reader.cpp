@@ -75,64 +75,110 @@ std::string jvm_member_ref_descriptor(const classfile_image_t& image, std::uint1
     return jvm_name_and_type_descriptor(image, ref.ref_index2);
 }
 
-void extract_annotation_types_from_attribute(const jvm_attribute_t& attr,
-                                              std::vector<std::string>& types) {
+std::string jvm_resolve_utf8(const classfile_image_t& image, std::uint16_t index) {
+    if (index == 0 || index >= image.constant_pool.size())
+        return {};
+    const auto& entry = image.constant_pool[index];
+    if (entry.tag != jvm_constant_tag_t::utf8)
+        return {};
+    return entry.utf8_value;
+}
+
+bool skip_element_value(const std::vector<std::uint8_t>& data, std::size_t& cursor);
+
+bool skip_annotation(const std::vector<std::uint8_t>& data, std::size_t& cursor) {
+    if (cursor + 4 > data.size())
+        return false;
+    cursor += 2;
+    const auto num_pairs = (static_cast<std::uint16_t>(data[cursor]) << 8) |
+                           static_cast<std::uint16_t>(data[cursor + 1]);
+    cursor += 2;
+    for (std::uint16_t i = 0; i < num_pairs; ++i) {
+        if (cursor + 2 > data.size())
+            return false;
+        cursor += 2;
+        if (!skip_element_value(data, cursor))
+            return false;
+    }
+    return true;
+}
+
+bool skip_element_value(const std::vector<std::uint8_t>& data, std::size_t& cursor) {
+    if (cursor >= data.size())
+        return false;
+    const auto tag = data[cursor++];
+    switch (tag) {
+        case 'B': case 'C': case 'D': case 'F':
+        case 'I': case 'J': case 'S': case 'Z':
+        case 's':
+            if (cursor + 2 > data.size()) return false;
+            cursor += 2;
+            return true;
+        case 'e':
+            if (cursor + 4 > data.size()) return false;
+            cursor += 4;
+            return true;
+        case 'c':
+            if (cursor + 2 > data.size()) return false;
+            cursor += 2;
+            return true;
+        case '@':
+            return skip_annotation(data, cursor);
+        case '[': {
+            if (cursor + 2 > data.size()) return false;
+            const auto array_count = (static_cast<std::uint16_t>(data[cursor]) << 8) |
+                                     static_cast<std::uint16_t>(data[cursor + 1]);
+            cursor += 2;
+            for (std::uint16_t i = 0; i < array_count; ++i) {
+                if (!skip_element_value(data, cursor))
+                    return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+void extract_annotations_from_attribute(const classfile_image_t& image,
+                                        const jvm_attribute_t& attr,
+                                        std::vector<classfile_annotation_info_t>& annotations) {
     if (attr.name != "RuntimeVisibleAnnotations" && attr.name != "RuntimeInvisibleAnnotations")
         return;
     if (attr.raw_data.size() < 2)
         return;
-    std::uint16_t count = (static_cast<std::uint16_t>(attr.raw_data[0]) << 8) |
-                          static_cast<std::uint16_t>(attr.raw_data[1]);
-    std::uint64_t cursor = 2;
+
+    const bool is_runtime_visible = (attr.name == "RuntimeVisibleAnnotations");
+
+    const auto count = (static_cast<std::uint16_t>(attr.raw_data[0]) << 8) |
+                       static_cast<std::uint16_t>(attr.raw_data[1]);
+    std::size_t cursor = 2;
     for (std::uint16_t i = 0; i < count; ++i) {
         if (cursor + 2 > attr.raw_data.size())
-            break;
+            return;
         const auto type_index = (static_cast<std::uint16_t>(attr.raw_data[cursor]) << 8) |
                                 static_cast<std::uint16_t>(attr.raw_data[cursor + 1]);
         cursor += 2;
-        types.push_back("L" + std::to_string(type_index) + ";");
-        while (cursor < attr.raw_data.size()) {
-            const auto element_tag = attr.raw_data[cursor++];
-            if (element_tag == 0)
-                break;
+
+        const auto type_desc = jvm_resolve_utf8(image, type_index);
+        if (!type_desc.empty()) {
+            classfile_annotation_info_t info;
+            info.type_descriptor = type_desc;
+            info.is_runtime_visible = is_runtime_visible;
+            annotations.push_back(std::move(info));
+        }
+
+        if (cursor + 2 > attr.raw_data.size())
+            return;
+        const auto num_pairs = (static_cast<std::uint16_t>(attr.raw_data[cursor]) << 8) |
+                               static_cast<std::uint16_t>(attr.raw_data[cursor + 1]);
+        cursor += 2;
+        for (std::uint16_t j = 0; j < num_pairs; ++j) {
             if (cursor + 2 > attr.raw_data.size())
-                break;
-            const auto name_index = (static_cast<std::uint16_t>(attr.raw_data[cursor]) << 8) |
-                                    static_cast<std::uint16_t>(attr.raw_data[cursor + 1]);
+                return;
             cursor += 2;
-            switch (element_tag) {
-                case 'B': case 'C': case 'D': case 'F':
-                case 'I': case 'J': case 'S': case 'Z':
-                case 's':
-                    if (cursor + 2 > attr.raw_data.size()) return;
-                    cursor += 2;
-                    break;
-                case 'e':
-                    if (cursor + 4 > attr.raw_data.size()) return;
-                    cursor += 4;
-                    break;
-                case 'c':
-                    if (cursor + 2 > attr.raw_data.size()) return;
-                    cursor += 2;
-                    break;
-                case '@':
-                    break;
-                case '[': {
-                    if (cursor + 2 > attr.raw_data.size()) return;
-                    const auto array_count = (static_cast<std::uint16_t>(attr.raw_data[cursor]) << 8) |
-                                             static_cast<std::uint16_t>(attr.raw_data[cursor + 1]);
-                    cursor += 2;
-                    for (std::uint16_t ai = 0; ai < array_count; ++ai) {
-                        if (cursor >= attr.raw_data.size()) return;
-                        cursor++;
-                        if (cursor + 2 > attr.raw_data.size()) return;
-                        cursor += 2;
-                    }
-                    break;
-                }
-                default:
-                    return;
-            }
+            if (!skip_element_value(attr.raw_data, cursor))
+                return;
         }
     }
 }
@@ -150,16 +196,16 @@ parse_classfile_metadata(const byte_provider_t& provider,
     metadata.image = image_result.take_value();
 
     for (const auto& attr : metadata.image.attributes) {
-        extract_annotation_types_from_attribute(attr, metadata.annotation_types);
+        extract_annotations_from_attribute(metadata.image, attr, metadata.annotations);
     }
     for (const auto& method : metadata.image.methods) {
         for (const auto& attr : method.attributes) {
-            extract_annotation_types_from_attribute(attr, metadata.annotation_types);
+            extract_annotations_from_attribute(metadata.image, attr, metadata.annotations);
         }
     }
     for (const auto& field : metadata.image.fields) {
         for (const auto& attr : field.attributes) {
-            extract_annotation_types_from_attribute(attr, metadata.annotation_types);
+            extract_annotations_from_attribute(metadata.image, attr, metadata.annotations);
         }
     }
 
@@ -342,14 +388,15 @@ build_classfile_artifact(const classfile_metadata_t& metadata,
         }
     }
 
-    for (const auto& ann_type : metadata.annotation_types) {
+    for (const auto& ann : metadata.annotations) {
         if (artifact.annotations.size() >= limits.max_annotations)
             return workspace_result_t<managed_artifact_t>::failure(
                 classfile_managed_error(workspace_error_code_t::limit_exceeded,
                                         "JVM annotation count exceeds limit", "classfile.build"));
         managed_annotation_t annotation;
-        annotation.annotation_type = ann_type;
-        annotation.is_runtime_visible = true;
+        annotation.annotation_type = ann.type_descriptor;
+        annotation.is_runtime_visible = ann.is_runtime_visible;
+        annotation.is_runtime_invisible = !ann.is_runtime_visible;
         artifact.annotations.push_back(std::move(annotation));
     }
 

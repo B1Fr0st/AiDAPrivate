@@ -19,6 +19,11 @@ constexpr std::array<std::string_view, 4> k_aida_extensions = {
     "analyze_funcs", "find_insns", "calculator", "calculate"
 };
 
+constexpr std::string_view k_archive_version = "2.0.0";
+constexpr std::string_view k_archive_license = "MIT";
+constexpr std::string_view k_archive_sha256 =
+    "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7";
+
 authority_surface_ledger_result_t fail(std::string failure) {
     return {false, std::move(failure)};
 }
@@ -69,6 +74,10 @@ authority_surface_ledger_result_t validate_surface(const names_t& upstream, cons
 }
 
 authority_surface_ledger_result_t run_authority_surface_ledger_harness() {
+    if (k_archive_license != "MIT") return fail("pinned archive license must be MIT");
+    if (k_archive_version != "2.0.0") return fail("pinned archive version must be 2.0.0");
+    if (k_archive_sha256 != "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7")
+        return fail("pinned archive SHA-256 fingerprint must match the authority ledger");
     const names_t upstream(k_upstream_tool_names.begin(), k_upstream_tool_names.end());
     const names_t exclusions = {"py_eval"};
     const names_t local_compatibility = {"list_instances"};

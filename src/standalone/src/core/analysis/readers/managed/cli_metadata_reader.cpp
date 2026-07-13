@@ -176,6 +176,10 @@ cli_coded_index_info_t coded_index_custom_attribute_type() {
                 static_cast<std::uint8_t>(cli_table_id_t::member_ref), 0}};
 }
 
+cli_coded_index_info_t coded_index_has_semantics() {
+    return {1, {0x14, 0x17}};
+}
+
 std::uint32_t coded_index_size(const cli_coded_index_info_t& info,
                                 const cli_table_row_counts_t& counts) noexcept {
     std::uint32_t max_rows = 0;
@@ -254,10 +258,10 @@ std::uint32_t table_row_size(std::uint8_t table_id, const cli_heap_sizes_t& heap
         case cli_table_id_t::field_layout:
             return 4 + simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::field)]);
         case cli_table_id_t::semantics:
-            return 2 + simple_index_size(0x0E) + simple_index_size(0x0F);
+            return 2 + simple_index_size(counts.counts[0x14]) + coded_index_size(coded_index_has_semantics(), counts);
         case cli_table_id_t::impl_map:
-            return 2 + 2 + coded_index_size({1, {static_cast<std::uint8_t>(cli_table_id_t::field),
-                                                   static_cast<std::uint8_t>(cli_table_id_t::method_def)}}, counts) +
+            return 2 + coded_index_size({1, {static_cast<std::uint8_t>(cli_table_id_t::field),
+                                              static_cast<std::uint8_t>(cli_table_id_t::method_def)}}, counts) +
                    string_index_size(heaps) + simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::assembly_ref)]);
         case cli_table_id_t::field_rva:
             return 4 + simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::field)]);
@@ -737,16 +741,14 @@ private:
             type_def.is_abstract = (type_def.flags & 0x80u) != 0;
             type_def.is_sealed = (type_def.flags & 0x100u) != 0;
             const auto row_index_value = row + 1;
-            if (type_def.extends_tag == 0 && type_def.extends_index != 0) {
-                if (type_def.extends_tag == 0 && type_def.extends_index <= result_.type_defs.size()) {
-                    const auto& base = result_.type_defs[type_def.extends_index - 1];
-                    type_def.base_type_name = base.type_namespace.empty()
-                        ? base.type_name : base.type_namespace + "." + base.type_name;
-                } else if (type_def.extends_tag == 1 && type_def.extends_index <= result_.type_refs.size()) {
-                    const auto& base = result_.type_refs[type_def.extends_index - 1];
-                    type_def.base_type_name = base.type_namespace.empty()
-                        ? base.type_name : base.type_namespace + "." + base.type_name;
-                }
+            if (type_def.extends_tag == 0 && type_def.extends_index > 0 && type_def.extends_index <= result_.type_defs.size()) {
+                const auto& base = result_.type_defs[type_def.extends_index - 1];
+                type_def.base_type_name = base.type_namespace.empty()
+                    ? base.type_name : base.type_namespace + "." + base.type_name;
+            } else if (type_def.extends_tag == 1 && type_def.extends_index > 0 && type_def.extends_index <= result_.type_refs.size()) {
+                const auto& base = result_.type_refs[type_def.extends_index - 1];
+                type_def.base_type_name = base.type_namespace.empty()
+                    ? base.type_name : base.type_namespace + "." + base.type_name;
             }
             result_.type_defs.push_back(std::move(type_def));
         }
@@ -1209,6 +1211,17 @@ std::uint32_t count_generic_params_for_method(const std::vector<cli_generic_para
     return count;
 }
 
+std::string signature_blob_to_hex(const std::vector<std::uint8_t>& blob) {
+    static constexpr char hex_chars[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(blob.size() * 2);
+    for (const auto byte : blob) {
+        result.push_back(hex_chars[byte >> 4]);
+        result.push_back(hex_chars[byte & 0x0F]);
+    }
+    return result;
+}
+
 }
 
 workspace_result_t<cli_metadata_t>
@@ -1261,6 +1274,8 @@ parse_cli_metadata(const byte_provider_t& provider,
     if (!metadata_result)
         return workspace_result_t<cli_metadata_t>::failure(std::move(metadata_result.error()));
     const auto entry_point_token = read_u32_le(cli_header.data() + 20);
+    const auto resources_rva = read_u32_le(cli_header.data() + 24);
+    const auto resources_size = read_u32_le(cli_header.data() + 28);
     cli_metadata_parser_t parser(metadata_result.take_value(), metadata_offset, pe_image, limits, cancel);
     auto parsed = parser.parse();
     if (!parsed)
@@ -1270,6 +1285,8 @@ parse_cli_metadata(const byte_provider_t& provider,
     metadata.metadata_size = metadata_size;
     metadata.image_base = pe_image->image_base();
     metadata.entry_point_token = entry_point_token;
+    metadata.resources_rva = resources_rva;
+    metadata.resources_size = resources_size;
     return workspace_result_t<cli_metadata_t>::success(std::move(metadata));
 }
 
@@ -1359,6 +1376,7 @@ build_cli_artifact(const cli_metadata_t& metadata,
         const auto& md = metadata.method_defs[row];
         managed_method_identity_t method;
         method.method_name = md.name;
+        method.method_signature = signature_blob_to_hex(md.signature_blob);
         method.metadata_token = (static_cast<std::uint32_t>(cli_table_id_t::method_def) << 24) | (row + 1);
         method.method_index = row;
         method.generic_arity = count_generic_params_for_method(metadata.generic_params, row);
@@ -1397,6 +1415,13 @@ build_cli_artifact(const cli_metadata_t& metadata,
             if (!method.declaring_type_name.empty())
                 break;
         }
+        if (!md.signature_blob.empty()) {
+            managed_signature_t sig;
+            sig.raw_signature = method.method_signature;
+            sig.method_token = method.metadata_token;
+            sig.artifact_kind = managed_artifact_kind_t::cli_metadata;
+            artifact.signatures.push_back(std::move(sig));
+        }
         method_identities.push_back(std::move(method));
         if (method_identities.size() >= limits.max_methods)
             return workspace_result_t<managed_artifact_t>::failure(
@@ -1414,6 +1439,7 @@ build_cli_artifact(const cli_metadata_t& metadata,
         const auto& fd = metadata.fields[row];
         managed_field_identity_t field;
         field.field_name = fd.name;
+        field.field_signature = signature_blob_to_hex(fd.signature_blob);
         field.metadata_token = (static_cast<std::uint32_t>(cli_table_id_t::field) << 24) | (row + 1);
         field.field_index = row;
         field.access_flags = fd.flags;
@@ -1447,6 +1473,7 @@ build_cli_artifact(const cli_metadata_t& metadata,
         ref.kind = mr.reference_kind;
         ref.declaring_type_name = mr.declaring_type_name;
         ref.member_name = mr.name;
+        ref.member_signature = signature_blob_to_hex(mr.signature_blob);
         ref.reference_token = (static_cast<std::uint32_t>(cli_table_id_t::member_ref) << 24) |
             (static_cast<std::uint32_t>(&mr - &metadata.member_refs[0]) + 1);
         artifact.member_references.push_back(std::move(ref));
@@ -1505,16 +1532,27 @@ build_cli_artifact(const cli_metadata_t& metadata,
         artifact.annotations.push_back(std::move(annotation));
     }
 
-    for (const auto& mr : metadata.manifest_resources) {
+    for (std::size_t ri = 0; ri < metadata.manifest_resources.size(); ++ri) {
         if (artifact.resources.size() >= limits.max_resources)
             return workspace_result_t<managed_artifact_t>::failure(
                 cli_error(workspace_error_code_t::limit_exceeded,
                           "CLI resource count exceeds limit", "cli.build"));
+        const auto& mr = metadata.manifest_resources[ri];
         managed_resource_t resource;
         resource.name = mr.name;
         resource.offset = mr.offset;
-        resource.size = 0;
         resource.flags = mr.flags;
+        if (ri + 1 < metadata.manifest_resources.size() &&
+            metadata.manifest_resources[ri + 1].offset > mr.offset) {
+            resource.size = metadata.manifest_resources[ri + 1].offset - mr.offset;
+        } else if (metadata.resources_size > 0 && mr.offset < metadata.resources_size) {
+            resource.size = metadata.resources_size - mr.offset;
+        }
+        const auto impl_info = coded_index_implementation();
+        if (mr.implementation_tag < impl_info.table_ids.size()) {
+            const auto table_id = impl_info.table_ids[mr.implementation_tag];
+            resource.implementation_token = (static_cast<std::uint32_t>(table_id) << 24) | mr.implementation_index;
+        }
         if (mr.implementation_tag == 1 && mr.implementation_index <= metadata.assembly_refs.size())
             resource.file_name = metadata.assembly_refs[mr.implementation_index - 1].name;
         artifact.resources.push_back(std::move(resource));

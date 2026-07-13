@@ -26,9 +26,14 @@ struct classfile_parse_limits_t {
     std::uint64_t max_string_bytes = 64ULL * 1024ULL * 1024ULL;
 };
 
+struct classfile_annotation_info_t {
+    std::string type_descriptor;
+    bool is_runtime_visible = false;
+};
+
 struct classfile_metadata_t {
     classfile_image_t image;
-    std::vector<std::string> annotation_types;
+    std::vector<classfile_annotation_info_t> annotations;
     std::vector<std::pair<std::uint16_t, std::string>> constant_pool_refs;
     std::vector<std::string> interface_names_resolved;
     std::vector<jvm_code_exception_t> all_exception_regions;

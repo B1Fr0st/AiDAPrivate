@@ -52,6 +52,11 @@ value_t require_value(workspace_result_t<value_t> result, const char* message) {
     return result.take_value();
 }
 
+inline void require_value(workspace_result_t<void> result, const char* message) {
+    if (!result)
+        throw std::runtime_error(std::string(message) + ":" + result.error().stable_code());
+}
+
 void require(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);

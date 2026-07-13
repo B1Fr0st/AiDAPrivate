@@ -193,6 +193,99 @@ struct packed_symbol_input_t final {
     std::uint8_t confidence = 0;
 };
 
+struct packed_address_expression_input_t final {
+    entity_id_t source_id = 0;
+    packed_entity_reference_t instruction;
+    std::uint16_t base_reg = 0;
+    std::uint16_t index_reg = 0;
+    std::uint8_t scale = 0;
+    std::int64_t displacement = 0;
+    std::uint16_t segment_reg = 0;
+    std::uint16_t address_components = address_component_none;
+    address_expression_kind_t kind = address_expression_kind_t::none;
+    target_resolution_t resolution = target_resolution_t::unresolved_indirect;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_basic_block_input_t final {
+    entity_id_t source_id = 0;
+    address_t start_address;
+    address_t end_address;
+    std::uint32_t instruction_begin = 0;
+    std::uint16_t instruction_count = 0;
+    std::uint16_t predecessor_count = 0;
+    std::uint16_t successor_count = 0;
+    std::uint32_t flags = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_function_input_t final {
+    entity_id_t source_id = 0;
+    address_t start_address;
+    address_t end_address;
+    packed_entity_reference_t entry_block;
+    packed_entity_reference_t symbol;
+    std::string_view name;
+    std::uint16_t chunk_count = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t return_type_id = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_function_chunk_input_t final {
+    entity_id_t source_id = 0;
+    packed_entity_reference_t function;
+    address_t start_address;
+    address_t end_address;
+    std::uint32_t block_begin = 0;
+    std::uint16_t block_count = 0;
+    std::uint8_t flags = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_target_fact_input_t final {
+    entity_id_t source_id = 0;
+    packed_entity_reference_t instruction;
+    packed_entity_reference_t operand;
+    packed_entity_reference_t address_expression;
+    address_t target;
+    target_kind_record_t kind = target_kind_record_t::branch;
+    target_resolution_t resolution = target_resolution_t::image_relative;
+    std::uint8_t operand_index = 0xFFU;
+    std::uint16_t access_width_bits = 0;
+    std::uint16_t access_count = 0;
+    bool direct = false;
+    bool is_external = false;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_xref_input_t final {
+    entity_id_t source_id = 0;
+    packed_entity_reference_t source_entity;
+    packed_entity_reference_t target_entity;
+    address_t source_address;
+    address_t target_address;
+    xref_kind_t kind = xref_kind_t::code;
+    bool is_direct = false;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_coverage_input_t final {
+    entity_id_t source_id = 0;
+    address_t span_begin;
+    address_t span_end;
+    coverage_reason_t reason = coverage_reason_t::pending;
+    std::uint32_t undecodable_count = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
 struct packed_instruction_view_t final {
     packed_entity_id_t id;
     address_t address;
@@ -274,6 +367,99 @@ struct packed_symbol_view_t final {
     std::uint8_t confidence = 0;
 };
 
+struct packed_address_expression_view_t final {
+    packed_entity_id_t id;
+    packed_entity_id_t instruction_id;
+    std::uint16_t base_reg = 0;
+    std::uint16_t index_reg = 0;
+    std::uint8_t scale = 0;
+    std::int64_t displacement = 0;
+    std::uint16_t segment_reg = 0;
+    std::uint16_t address_components = address_component_none;
+    address_expression_kind_t kind = address_expression_kind_t::none;
+    target_resolution_t resolution = target_resolution_t::unresolved_indirect;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_basic_block_view_t final {
+    packed_entity_id_t id;
+    address_t start_address;
+    address_t end_address;
+    std::uint32_t instruction_begin = 0;
+    std::uint16_t instruction_count = 0;
+    std::uint16_t predecessor_count = 0;
+    std::uint16_t successor_count = 0;
+    std::uint32_t flags = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_function_view_t final {
+    packed_entity_id_t id;
+    address_t start_address;
+    address_t end_address;
+    packed_entity_id_t entry_block_id;
+    packed_entity_id_t symbol_id;
+    std::string_view name;
+    std::uint16_t chunk_count = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t return_type_id = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_function_chunk_view_t final {
+    packed_entity_id_t id;
+    packed_entity_id_t function_id;
+    address_t start_address;
+    address_t end_address;
+    std::uint32_t block_begin = 0;
+    std::uint16_t block_count = 0;
+    std::uint8_t flags = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_target_fact_view_t final {
+    packed_entity_id_t id;
+    packed_entity_id_t instruction_id;
+    packed_entity_id_t operand_id;
+    packed_entity_id_t address_expression_id;
+    address_t target;
+    target_kind_record_t kind = target_kind_record_t::branch;
+    target_resolution_t resolution = target_resolution_t::image_relative;
+    std::uint8_t operand_index = 0xFFU;
+    std::uint16_t access_width_bits = 0;
+    std::uint16_t access_count = 0;
+    bool direct = false;
+    bool is_external = false;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_xref_view_t final {
+    packed_entity_id_t id;
+    packed_entity_id_t source_entity;
+    packed_entity_id_t target_entity;
+    address_t source_address;
+    address_t target_address;
+    xref_kind_t kind = xref_kind_t::code;
+    bool is_direct = false;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
+struct packed_coverage_view_t final {
+    packed_entity_id_t id;
+    address_t span_begin;
+    address_t span_end;
+    coverage_reason_t reason = coverage_reason_t::pending;
+    std::uint32_t undecodable_count = 0;
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+};
+
 struct packed_size_accounting_t final {
     std::uint64_t string_pool_bytes = 0;
     std::uint64_t instruction_bytes = 0;
@@ -281,6 +467,13 @@ struct packed_size_accounting_t final {
     std::uint64_t edge_bytes = 0;
     std::uint64_t string_record_bytes = 0;
     std::uint64_t symbol_bytes = 0;
+    std::uint64_t address_expression_bytes = 0;
+    std::uint64_t basic_block_bytes = 0;
+    std::uint64_t function_bytes = 0;
+    std::uint64_t function_chunk_bytes = 0;
+    std::uint64_t target_fact_bytes = 0;
+    std::uint64_t xref_bytes = 0;
+    std::uint64_t coverage_bytes = 0;
     std::uint64_t payload_bytes = 0;
     std::uint64_t reserved_bytes = 0;
 };
@@ -323,6 +516,13 @@ public:
     packed_store_result_t<void> add_edge(const packed_edge_input_t& input);
     packed_store_result_t<void> add_string(const packed_string_input_t& input);
     packed_store_result_t<void> add_symbol(const packed_symbol_input_t& input);
+    packed_store_result_t<void> add_address_expression(const packed_address_expression_input_t& input);
+    packed_store_result_t<void> add_basic_block(const packed_basic_block_input_t& input);
+    packed_store_result_t<void> add_function(const packed_function_input_t& input);
+    packed_store_result_t<void> add_function_chunk(const packed_function_chunk_input_t& input);
+    packed_store_result_t<void> add_target_fact(const packed_target_fact_input_t& input);
+    packed_store_result_t<void> add_xref(const packed_xref_input_t& input);
+    packed_store_result_t<void> add_coverage(const packed_coverage_input_t& input);
     packed_store_result_t<packed_analysis_shard_t> finalize() &&;
 
     std::uint16_t shard_id() const noexcept;
@@ -342,6 +542,12 @@ public:
     std::optional<edge_record_t> edge(std::size_t index) const;
     std::optional<string_record_t> string(std::size_t index) const;
     std::optional<symbol_record_t> symbol(std::size_t index) const;
+    std::optional<basic_block_record_t> basic_block(std::size_t index) const;
+    std::optional<function_record_t> function(std::size_t index) const;
+    std::optional<function_chunk_record_t> function_chunk(std::size_t index) const;
+    std::optional<target_fact_t> target_fact(std::size_t index) const;
+    std::optional<xref_record_t> xref(std::size_t index) const;
+    std::optional<coverage_span_t> coverage(std::size_t index) const;
 
 private:
     explicit packed_analysis_compatibility_view_t(const packed_analysis_store_t* store) noexcept;
@@ -369,6 +575,13 @@ public:
     std::uint32_t edge_count() const noexcept;
     std::uint32_t string_record_count() const noexcept;
     std::uint32_t symbol_count() const noexcept;
+    std::uint32_t address_expression_count() const noexcept;
+    std::uint32_t basic_block_count() const noexcept;
+    std::uint32_t function_count() const noexcept;
+    std::uint32_t function_chunk_count() const noexcept;
+    std::uint32_t target_fact_count() const noexcept;
+    std::uint32_t xref_count() const noexcept;
+    std::uint32_t coverage_count() const noexcept;
     const packed_string_pool_t& string_pool() const noexcept;
     packed_size_accounting_t size_accounting() const noexcept;
     packed_store_result_t<void> validate() const;
@@ -378,6 +591,13 @@ public:
     std::optional<packed_edge_view_t> edge(std::size_t index) const;
     std::optional<packed_string_view_t> string(std::size_t index) const;
     std::optional<packed_symbol_view_t> symbol(std::size_t index) const;
+    std::optional<packed_address_expression_view_t> address_expression(std::size_t index) const;
+    std::optional<packed_basic_block_view_t> basic_block(std::size_t index) const;
+    std::optional<packed_function_view_t> function(std::size_t index) const;
+    std::optional<packed_function_chunk_view_t> function_chunk(std::size_t index) const;
+    std::optional<packed_target_fact_view_t> target_fact(std::size_t index) const;
+    std::optional<packed_xref_view_t> xref(std::size_t index) const;
+    std::optional<packed_coverage_view_t> coverage(std::size_t index) const;
     packed_analysis_compatibility_view_t compatibility_view() const noexcept;
 
 private:

@@ -1,0 +1,113 @@
+#pragma once
+
+#include "overlay_projection.hpp"
+#include "overlay_apply_engine.hpp"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace aida {
+namespace analysis {
+
+enum class reanalysis_stage_t : std::uint8_t {
+    none = 0,
+    disassembly = 1,
+    basic_blocks = 2,
+    functions = 3,
+    decompilation = 4,
+    xrefs = 5,
+    strings = 6,
+    types = 7,
+    symbols = 8,
+    coverage = 9
+};
+
+struct reanalysis_scope_t final {
+    std::vector<projected_range_t> ranges;
+    std::vector<overlay_entity_key_v9_t> entities;
+    projection_stage_flag_t stage_flags = projection_stage_flag_t::none;
+    std::uint64_t generation = 0;
+    std::uint64_t total_patched_bytes = 0;
+    bool requires_full_reanalysis = false;
+
+    bool empty() const noexcept
+    {
+        return ranges.empty() && entities.empty() &&
+               stage_flags == projection_stage_flag_t::none && !requires_full_reanalysis;
+    }
+};
+
+struct reanalysis_result_t final {
+    bool ok = false;
+    reanalysis_scope_t scope;
+    std::uint64_t new_generation = 0;
+    std::string detail;
+
+    explicit operator bool() const noexcept { return ok; }
+};
+
+struct undo_redo_identity_t final {
+    overlay_entity_key_v9_t entity;
+    bool forward_valid = false;
+    bool inverse_valid = false;
+    bool keys_match = false;
+    bool payloads_are_inverse = false;
+
+    bool identity_preserved() const noexcept
+    {
+        return forward_valid && inverse_valid && keys_match && payloads_are_inverse;
+    }
+};
+
+struct cache_invalidation_check_t final {
+    bool cache_invalidated = false;
+    std::size_t invalidated_entry_count = 0;
+    std::vector<projected_range_t> invalidated_ranges;
+    projection_stage_flag_t invalidated_stages = projection_stage_flag_t::none;
+};
+
+class incremental_reanalysis_t final {
+public:
+    static reanalysis_result_t compute_scope(
+        const std::vector<overlay_change_v9_t>& changes,
+        const overlay_static_state_v9_t& state,
+        std::uint64_t current_generation);
+
+    static reanalysis_scope_t minimal_invalidation(
+        const overlay_change_v9_t& change);
+
+    static bool stage_requires_reanalysis(
+        reanalysis_stage_t stage,
+        overlay_operation_kind_v9_t operation_kind) noexcept;
+
+    static projection_stage_flag_t stage_flags_for_operation(
+        overlay_operation_kind_v9_t kind) noexcept;
+
+    static undo_redo_identity_t validate_undo_redo_identity(
+        const overlay_change_v9_t& forward_change,
+        const overlay_change_v9_t& inverse_change);
+
+    static cache_invalidation_check_t check_cache_invalidation(
+        const reanalysis_scope_t& scope,
+        const overlay_static_state_v9_t& state);
+
+    static reanalysis_result_t publish_reanalysis(
+        overlay_static_state_v9_t& state,
+        std::uint64_t expected_generation,
+        const reanalysis_scope_t& scope);
+
+    static std::vector<reanalysis_stage_t> stages_for_flags(
+        projection_stage_flag_t flags);
+
+    static bool scope_contains_range(
+        const reanalysis_scope_t& scope,
+        const projected_range_t& range) noexcept;
+
+    static reanalysis_scope_t merge_scopes(
+        const reanalysis_scope_t& lhs,
+        const reanalysis_scope_t& rhs);
+};
+
+}
+}

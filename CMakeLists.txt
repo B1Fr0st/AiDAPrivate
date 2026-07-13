@@ -730,7 +730,9 @@ set(xz_SOURCE_DIR "${DEPS_DIR}/xz-5.8.3")
 set(xz_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/xz")
 add_subdirectory("${xz_SOURCE_DIR}" "${xz_BINARY_DIR}")
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_XZ}")
-target_include_directories(liblzma PUBLIC "${xz_SOURCE_DIR}/src/liblzma/api")
+target_include_directories(liblzma PUBLIC
+    $<BUILD_INTERFACE:${xz_SOURCE_DIR}/src/liblzma/api>
+    $<INSTALL_INTERFACE:include>)
 
 # zlib manages its own include dirs; expose them for our consumers via a convenience variable
 # but do NOT set PUBLIC includes on zlibstatic (causes CMP0070 errors with newer CMake)

@@ -141,6 +141,18 @@ std::string_view contract_error_code_name(contract_error_code_t code) noexcept
         return "C03_INVALID_LIVE_TARGET_IDENTITY";
     case contract_error_code_t::target_identity_provenance_mismatch:
         return "C03_TARGET_IDENTITY_PROVENANCE_MISMATCH";
+    case contract_error_code_t::invalid_binary_format:
+        return "C03_INVALID_BINARY_FORMAT";
+    case contract_error_code_t::invalid_binary_architecture:
+        return "C03_INVALID_BINARY_ARCHITECTURE";
+    case contract_error_code_t::invalid_binary_mode:
+        return "C03_INVALID_BINARY_MODE";
+    case contract_error_code_t::invalid_binary_endian:
+        return "C03_INVALID_BINARY_ENDIAN";
+    case contract_error_code_t::invalid_metadata_revision:
+        return "C03_INVALID_METADATA_REVISION";
+    case contract_error_code_t::invalid_decompiler_cache_namespace:
+        return "C03_INVALID_DECOMPILER_CACHE_NAMESPACE";
     }
     return "C03_UNKNOWN_ERROR";
 }
@@ -332,16 +344,50 @@ contract_result_t<void> validate_live_target_identity(
     return contract_result_t<void>::success();
 }
 
+contract_result_t<void> validate_binary_identity_fields(
+    binary_format_t format, binary_architecture_t architecture,
+    binary_mode_t mode, binary_endian_t endian) noexcept
+{
+    if (!is_known_binary_format(format)) {
+        return contract_result_t<void>::failure(make_contract_error(
+            contract_error_code_t::invalid_binary_format, "target_binary_format",
+            0, static_cast<std::uint64_t>(format)));
+    }
+    if (!is_known_binary_architecture(architecture)) {
+        return contract_result_t<void>::failure(make_contract_error(
+            contract_error_code_t::invalid_binary_architecture, "target_binary_architecture",
+            0, static_cast<std::uint64_t>(architecture)));
+    }
+    if (!is_known_binary_mode(mode)) {
+        return contract_result_t<void>::failure(make_contract_error(
+            contract_error_code_t::invalid_binary_mode, "target_binary_mode",
+            0, static_cast<std::uint64_t>(mode)));
+    }
+    if (!is_known_binary_endian(endian)) {
+        return contract_result_t<void>::failure(make_contract_error(
+            contract_error_code_t::invalid_binary_endian, "target_binary_endian",
+            0, static_cast<std::uint64_t>(endian)));
+    }
+    return contract_result_t<void>::success();
+}
+
 contract_result_t<target_contract_identity_t>
 target_contract_identity_t::make(const workspace_contract_identity_t& workspace,
                                  const target_id_t& target, analysis_target_kind_t kind,
                                  std::optional<static_provider_provenance_t> static_provider_provenance,
-                                 std::optional<live_target_identity_t> live_identity) noexcept
+                                 std::optional<live_target_identity_t> live_identity,
+                                 binary_format_t format,
+                                 binary_architecture_t architecture,
+                                 binary_mode_t mode,
+                                 binary_endian_t endian) noexcept
 {
     if (!workspace.valid() || !target.valid() || !is_known_target_kind(kind)) {
         return contract_result_t<target_contract_identity_t>::failure(make_contract_error(
             contract_error_code_t::invalid_target_identity, "target_identity"));
     }
+    const auto binary_result = validate_binary_identity_fields(format, architecture, mode, endian);
+    if (!binary_result)
+        return contract_result_t<target_contract_identity_t>::failure(binary_result.error());
     const auto payload_mask = target_provenance_payload_mask(static_provider_provenance, live_identity);
     if (is_static_target_kind(kind)) {
         if (!static_provider_provenance || live_identity) {
@@ -364,7 +410,7 @@ target_contract_identity_t::make(const workspace_contract_identity_t& workspace,
     }
     return contract_result_t<target_contract_identity_t>::success(
         target_contract_identity_t(workspace, target, kind, std::move(static_provider_provenance),
-                                   std::move(live_identity)));
+                                   std::move(live_identity), format, architecture, mode, endian));
 }
 
 contract_result_t<generation_contract_identity_t>
@@ -429,14 +475,26 @@ contract_result_t<immutable_snapshot_contract_t>
 immutable_snapshot_contract_t::make(const generation_contract_identity_t& generation,
                                     std::uint64_t snapshot_revision,
                                     std::uint64_t layout_revision,
-                                    std::uint64_t overlay_revision) noexcept
+                                    std::uint64_t overlay_revision,
+                                    std::uint64_t metadata_revision,
+                                    decompiler_cache_namespace_t decompiler_cache_namespace) noexcept
 {
     if (!generation.valid() || snapshot_revision == 0 || layout_revision == 0) {
         return contract_result_t<immutable_snapshot_contract_t>::failure(make_contract_error(
             contract_error_code_t::invalid_generation_identity, "immutable_snapshot"));
     }
+    if (metadata_revision == 0) {
+        return contract_result_t<immutable_snapshot_contract_t>::failure(make_contract_error(
+            contract_error_code_t::invalid_metadata_revision, "immutable_snapshot_metadata_revision"));
+    }
+    if (!decompiler_cache_namespace_present(decompiler_cache_namespace)) {
+        return contract_result_t<immutable_snapshot_contract_t>::failure(make_contract_error(
+            contract_error_code_t::invalid_decompiler_cache_namespace,
+            "immutable_snapshot_decompiler_cache_namespace"));
+    }
     return contract_result_t<immutable_snapshot_contract_t>::success(
-        immutable_snapshot_contract_t(generation, snapshot_revision, layout_revision, overlay_revision));
+        immutable_snapshot_contract_t(generation, snapshot_revision, layout_revision, overlay_revision,
+                                      metadata_revision, decompiler_cache_namespace));
 }
 
 contract_result_t<immutable_publication_contract_t>

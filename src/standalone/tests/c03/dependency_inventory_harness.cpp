@@ -50,6 +50,66 @@ void require_absent(const std::string& text, std::string_view needle, const std:
         throw std::runtime_error(source.string() + " contains prohibited " + std::string(needle));
 }
 
+std::string extract_json_string_value(const std::string& json, std::string_view key)
+{
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t search_from = 0;
+    while (true) {
+        auto pos = json.find(needle, search_from);
+        if (pos == std::string::npos)
+            throw std::runtime_error("JSON is missing string key " + std::string(key));
+        pos += needle.size();
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r'))
+            ++pos;
+        if (pos < json.size() && json[pos] == '"') {
+            ++pos;
+            std::string value;
+            while (pos < json.size() && json[pos] != '"') {
+                if (json[pos] == '\\' && pos + 1 < json.size())
+                    ++pos;
+                value.push_back(json[pos++]);
+            }
+            return value;
+        }
+        search_from = pos;
+    }
+}
+
+long long extract_json_number_value(const std::string& json, std::string_view key)
+{
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t search_from = 0;
+    while (true) {
+        auto pos = json.find(needle, search_from);
+        if (pos == std::string::npos)
+            throw std::runtime_error("JSON is missing numeric key " + std::string(key));
+        pos += needle.size();
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r'))
+            ++pos;
+        if (pos < json.size() && (std::isdigit(static_cast<unsigned char>(json[pos])) || json[pos] == '-')) {
+            std::string number;
+            while (pos < json.size() && (std::isdigit(static_cast<unsigned char>(json[pos])) || json[pos] == '-'))
+                number.push_back(json[pos++]);
+            return std::stoll(number);
+        }
+        search_from = pos;
+    }
+}
+
+bool is_valid_sha256_hex(const std::string& value)
+{
+    if (value.size() != 64)
+        return false;
+    return std::all_of(value.begin(), value.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+bool is_valid_hash_field(const std::string& value)
+{
+    return value.empty() || is_valid_sha256_hex(value);
+}
+
 std::vector<std::string> parse_gitignore_rules(std::string_view source)
 {
     std::vector<std::string> rules;
@@ -497,10 +557,65 @@ void verify_worker_schema(const std::filesystem::path& root)
              "raw_standalone_download_forbidden", "fileless_launch_forbidden", "camoufox",
              "AIDA_CAMOUFOX_EXECUTABLE", "AIDA_CAMOUFOX_MCP_EXECUTABLE", "AIDA_CAMOUFOX_PYTHON",
              "\"notices\"", "notices/THIRD_PARTY_NOTICES.md", "managed_package_notices",
-             "THIRD-PARTY-NOTICES\\.TXT"})
+             "THIRD-PARTY-NOTICES\\\\.TXT"})
         require_contains(text, required, source);
+    for (const auto& structural : {"\"additionalProperties\"", "\"required\"", "\"properties\"", "\"type\""})
+        require_contains(text, structural, source);
+    for (const auto& property_key : {"\"native_decompiler\"", "\"managed_cli_decompiler\"",
+             "\"analysis_python\"", "\"manifest_bound\"", "\"acl_restricted\"",
+             "\"session_nonce\"", "\"monotonic_sequence\"", "\"kill_on_parent_close\"",
+             "\"restricted_token\"", "\"network_denied\"", "\"child_process_denied\"",
+             "\"unrelated_handles_denied\"", "\"process_mitigations\"",
+             "\"cancellation_replaces_worker\"", "\"target_execution_forbidden\"",
+             "\"raw_standalone_download_forbidden\"", "\"fileless_launch_forbidden\"",
+             "\"camoufox\"", "\"AIDA_CAMOUFOX_EXECUTABLE\"",
+             "\"AIDA_CAMOUFOX_MCP_EXECUTABLE\"", "\"AIDA_CAMOUFOX_PYTHON\""})
+        require_contains(text, property_key, source);
     for (const auto& prohibited : {"chrome", "edge", "firefox"})
         require_absent(text, prohibited, source);
+}
+
+void verify_native_worker_manifest(const std::filesystem::path& root)
+{
+    const auto source = root / "packaging/c03_native_worker_manifest.json";
+    const auto text = read_file(source);
+
+    const auto magic = extract_json_string_value(text, "magic");
+    if (magic != "NWMF")
+        throw std::runtime_error(source.string() + " has invalid magic '" + magic + "'");
+
+    const auto schema_version = extract_json_number_value(text, "schema_version");
+    if (schema_version != 1)
+        throw std::runtime_error(source.string() + " has invalid schema_version");
+
+    const auto format = extract_json_string_value(text, "format");
+    if (format != "aida.native-worker-manifest")
+        throw std::runtime_error(source.string() + " has invalid format '" + format + "'");
+
+    const auto provider_name = extract_json_string_value(text, "name");
+    if (provider_name != "aida-native-decompiler")
+        throw std::runtime_error(source.string() + " has invalid provider name '" + provider_name + "'");
+
+    const auto protocol_version = extract_json_number_value(text, "version");
+    if (protocol_version != 1)
+        throw std::runtime_error(source.string() + " has invalid protocol version");
+
+    const auto hash_material = extract_json_string_value(text, "hash_material");
+    if (hash_material.find("hmac-sha256") == std::string::npos ||
+        hash_material.find("readonly-snapshot") == std::string::npos)
+        throw std::runtime_error(source.string() + " has invalid protocol hash_material");
+
+    const auto worker_binary_hash = extract_json_string_value(text, "worker_binary_hash");
+    if (!is_valid_hash_field(worker_binary_hash))
+        throw std::runtime_error(source.string() + " has invalid worker_binary_hash '" + worker_binary_hash + "'");
+
+    const auto provider_binary_hash = extract_json_string_value(text, "provider_binary_hash");
+    if (!is_valid_hash_field(provider_binary_hash))
+        throw std::runtime_error(source.string() + " has invalid provider_binary_hash '" + provider_binary_hash + "'");
+
+    const auto manifest_digest = extract_json_string_value(text, "manifest_digest");
+    if (!is_valid_hash_field(manifest_digest))
+        throw std::runtime_error(source.string() + " has invalid manifest_digest '" + manifest_digest + "'");
 }
 
 void verify_notice_ledger(const std::filesystem::path& root)
@@ -530,7 +645,8 @@ int main(int argc, char** argv)
         const auto root = locate_root(argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::current_path());
         require_files(root, {".gitignore", "cmake/aida_c03_dependencies.cmake", "licenses/c03/MIT.txt",
             "licenses/c03/SQLite-Public-Domain.txt", "licenses/c03/THIRD_PARTY_NOTICES.md", "packaging/c03_worker_manifest.schema.json",
-            "packaging/c03_worker_manifest.lock.json", ".deps/nuget-offline/ICSharpCode.Decompiler.10.1.0.8386.nupkg",
+            "packaging/c03_worker_manifest.lock.json", "packaging/c03_native_worker_manifest.json",
+            ".deps/nuget-offline/ICSharpCode.Decompiler.10.1.0.8386.nupkg",
             ".deps/nuget-offline/System.Collections.Immutable.9.0.0.nupkg",
             ".deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg", ".deps/LIEF-0.17.6/LICENSE",
             ".deps/remill-6.0.1/remill-6.0.1/LICENSE", "camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe",
@@ -539,6 +655,7 @@ int main(int argc, char** argv)
         verify_cmake_policy(root);
         verify_lock_policy(root);
         verify_worker_schema(root);
+        verify_native_worker_manifest(root);
         verify_notice_ledger(root);
         std::cout << "C03 dependency inventory source contract satisfied\n";
         return 0;

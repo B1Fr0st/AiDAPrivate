@@ -9,6 +9,9 @@ set(AIDA_C03_B01_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/mapped_window_cache.cpp"
     "${STANDALONE_ROOT}/core/analysis/subrange_provider.cpp"
     "${STANDALONE_ROOT}/core/analysis/spill_provider.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/live_snapshot_provider.cpp"
+    "${STANDALONE_ROOT}/core/analysis/live_request_budget.cpp"
+    "${STANDALONE_ROOT}/../tests/c03/driver_bridge_stub.cpp"
 )
 
 set(AIDA_C03_B05_STANDALONE_SOURCES
@@ -26,6 +29,7 @@ set(AIDA_C03_B13_STANDALONE_SOURCES
 
 set(AIDA_C03_DECOMPILER_CONTRACT_SOURCES
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
 )
 
 set(AIDA_C03_B14_STANDALONE_SOURCES
@@ -246,6 +250,8 @@ function(aida_c03_register_native_decompiler_worker_package application_target)
         "${STANDALONE_ROOT}/../workers/native_decompiler/native_decompiler_worker.cpp")
     set(_aida_c03_native_worker_contract_source
         "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp")
+    set(_aida_c03_native_worker_identity_source
+        "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp")
     set(_aida_c03_native_worker_manifest_tool
         "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_native_worker_manifest.py")
     set(_aida_c03_native_worker_manifest_contract
@@ -253,12 +259,14 @@ function(aida_c03_register_native_decompiler_worker_package application_target)
     aida_c03_require_sources("B14 native decompiler worker"
         "${_aida_c03_native_worker_source}"
         "${_aida_c03_native_worker_contract_source}"
+        "${_aida_c03_native_worker_identity_source}"
         "${_aida_c03_native_worker_manifest_tool}"
         "${_aida_c03_native_worker_manifest_contract}")
 
     add_executable(aida_c03_b14_native_decompiler_worker
         "${_aida_c03_native_worker_source}"
-        "${_aida_c03_native_worker_contract_source}")
+        "${_aida_c03_native_worker_contract_source}"
+        "${_aida_c03_native_worker_identity_source}")
     aida_c03_configure_safe_headless_target(aida_c03_b14_native_decompiler_worker B14 BUILD_ONLY)
     target_link_libraries(aida_c03_b14_native_decompiler_worker PRIVATE bcrypt)
     set_target_properties(aida_c03_b14_native_decompiler_worker PROPERTIES
@@ -317,6 +325,9 @@ function(aida_c03_register_safe_headless_targets)
             "${STANDALONE_ROOT}/core/analysis/mapped_window_cache.cpp"
             "${STANDALONE_ROOT}/core/analysis/subrange_provider.cpp"
             "${STANDALONE_ROOT}/core/analysis/spill_provider.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/live_snapshot_provider.cpp"
+            "${STANDALONE_ROOT}/core/analysis/live_request_budget.cpp"
+            "${STANDALONE_ROOT}/../tests/c03/driver_bridge_stub.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/byte_provider.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
         INCLUDE_DIRECTORIES "${STANDALONE_ROOT}/../tests/c03"
@@ -354,6 +365,10 @@ function(aida_c03_register_safe_headless_targets)
             "${STANDALONE_ROOT}/core/analysis/subrange_provider.cpp"
             "${STANDALONE_ROOT}/core/analysis/spill_provider.cpp"
             "${STANDALONE_ROOT}/core/analysis/mapped_window_cache.cpp"
+            "${STANDALONE_ROOT}/core/analysis/provider_snapshot.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/live_snapshot_provider.cpp"
+            "${STANDALONE_ROOT}/core/analysis/live_request_budget.cpp"
+            "${STANDALONE_ROOT}/../tests/c03/driver_bridge_stub.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/byte_provider.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
         INCLUDE_DIRECTORIES
@@ -380,6 +395,7 @@ function(aida_c03_register_safe_headless_targets)
             "${STANDALONE_ROOT}/../tests/c03/native_worker_protocol_harness.cpp"
             "${STANDALONE_ROOT}/core/analysis/decompiler/native_worker_host.cpp"
             "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
         LINK_LIBRARIES bcrypt advapi32 userenv
     )
     aida_c03_register_safe_headless_target(
@@ -390,6 +406,7 @@ function(aida_c03_register_safe_headless_targets)
         SOURCES
             "${STANDALONE_ROOT}/../workers/native_decompiler/fake_native_decompiler_worker.cpp"
             "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
         LINK_LIBRARIES bcrypt advapi32 ws2_32
     )
     aida_c03_require_z3("B20 semantic refiner harness")
@@ -402,6 +419,7 @@ function(aida_c03_register_safe_headless_targets)
             "${STANDALONE_ROOT}/core/analysis/decompiler/semantic_refiner.cpp"
             "${STANDALONE_ROOT}/core/analysis/decompiler/triton_z3_adapter.cpp"
             "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
         INCLUDE_DIRECTORIES "${Z3_INCLUDE_DIRS}"
         LINK_LIBRARIES "${Z3_LIBRARIES}"
     )
@@ -414,6 +432,7 @@ function(aida_c03_register_safe_headless_targets)
             "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer_v2.cpp"
             "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast_v2.cpp"
             "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
     )
     aida_c03_register_safe_headless_target(
         TARGET aida_c03_b22_protocol_core_harness
@@ -423,7 +442,10 @@ function(aida_c03_register_safe_headless_targets)
             "${AIDA_C03_B22_PROTOCOL_CORE_HARNESS_MAIN}"
             "${STANDALONE_ROOT}/../tests/mcp_compat/protocol_core_harness.cpp"
             ${AIDA_C03_B22_STANDALONE_SOURCES}
-        INCLUDE_DIRECTORIES "${STANDALONE_ROOT}/../tests/mcp_compat"
+        INCLUDE_DIRECTORIES
+            "${STANDALONE_ROOT}/../tests/mcp_compat"
+            "${json_schema_validator_SOURCE_DIR}/src"
+        LINK_LIBRARIES nlohmann_json_schema_validator
     )
     aida_c03_register_safe_headless_target(
         TARGET aida_c03_b23_workspace_adapter_harness

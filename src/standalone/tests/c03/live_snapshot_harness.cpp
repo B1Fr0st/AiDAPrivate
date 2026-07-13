@@ -156,7 +156,7 @@ public:
     void set_module_remap_after_read(bool enabled) noexcept { module_remap_after_read_ = enabled; }
     void set_read_elapsed(std::chrono::milliseconds elapsed) noexcept { read_elapsed_ = elapsed; }
 
-    void remap_now() noexcept
+    void remap_now() const noexcept
     {
         ++module_.mapping_identity;
         module_.fingerprint[0] ^= 0xA5U;
@@ -345,9 +345,9 @@ void verify_no_bulk_baseline_and_bounded_cache()
     require(cached && adapter->page_reads() == 1,
             "cached snapshot read re-read a live page");
 
-    require(provider->read(adapter->module().base + 0x20U, 1U),
+    require(provider->read(adapter->module().base + 0x20U, 1U).has_value(),
             "second page read failed");
-    require(provider->read(adapter->module().base + 0x40U, 1U),
+    require(provider->read(adapter->module().base + 0x40U, 1U).has_value(),
             "third page read failed");
     const auto stats = provider->cache_stats();
     require(stats.cached_pages == 2U && stats.cached_bytes == 32U && stats.cache_hits == 1U &&

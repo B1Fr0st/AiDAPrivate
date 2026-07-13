@@ -93,6 +93,16 @@ bool valid_symbol_kind(symbol_kind_t kind) noexcept
     return static_cast<std::uint8_t>(kind) <= static_cast<std::uint8_t>(symbol_kind_t::metadata);
 }
 
+bool valid_xref_kind(xref_kind_t kind) noexcept
+{
+    return static_cast<std::uint8_t>(kind) <= static_cast<std::uint8_t>(xref_kind_t::relocation);
+}
+
+bool valid_target_kind(target_kind_record_t kind) noexcept
+{
+    return static_cast<std::uint8_t>(kind) <= static_cast<std::uint8_t>(target_kind_record_t::fallthrough);
+}
+
 template <typename value_t>
 std::uint64_t vector_payload_bytes(const std::vector<value_t>& values) noexcept
 {
@@ -167,6 +177,11 @@ struct symbol_draft_t final {
     packed_string_id_t name;
 };
 
+struct function_draft_t final {
+    packed_function_input_t input;
+    packed_string_id_t name;
+};
+
 struct instruction_row_t final {
     packed_entity_id_t id;
     packed_instruction_input_t input;
@@ -197,6 +212,51 @@ struct symbol_row_t final {
     packed_entity_id_t id;
     packed_symbol_input_t input;
     packed_string_id_t name;
+};
+
+struct address_expression_row_t final {
+    packed_entity_id_t id;
+    packed_address_expression_input_t input;
+    packed_entity_id_t instruction;
+};
+
+struct basic_block_row_t final {
+    packed_entity_id_t id;
+    packed_basic_block_input_t input;
+};
+
+struct function_row_t final {
+    packed_entity_id_t id;
+    packed_function_input_t input;
+    packed_string_id_t name;
+    packed_entity_id_t entry_block;
+    packed_entity_id_t symbol;
+};
+
+struct function_chunk_row_t final {
+    packed_entity_id_t id;
+    packed_function_chunk_input_t input;
+    packed_entity_id_t function;
+};
+
+struct target_fact_row_t final {
+    packed_entity_id_t id;
+    packed_target_fact_input_t input;
+    packed_entity_id_t instruction;
+    packed_entity_id_t operand;
+    packed_entity_id_t address_expression;
+};
+
+struct xref_row_t final {
+    packed_entity_id_t id;
+    packed_xref_input_t input;
+    packed_entity_id_t source_entity;
+    packed_entity_id_t target_entity;
+};
+
+struct coverage_row_t final {
+    packed_entity_id_t id;
+    packed_coverage_input_t input;
 };
 
 struct instruction_columns_t final {
@@ -592,6 +652,476 @@ struct symbol_columns_t final {
     }
 };
 
+struct address_expression_columns_t final {
+    std::vector<packed_entity_id_t> ids;
+    std::vector<packed_entity_id_t> instruction_ids;
+    std::vector<std::uint16_t> base_regs;
+    std::vector<std::uint16_t> index_regs;
+    std::vector<std::uint8_t> scales;
+    std::vector<std::int64_t> displacements;
+    std::vector<std::uint16_t> segment_regs;
+    std::vector<std::uint16_t> address_components;
+    std::vector<address_expression_kind_t> kinds;
+    std::vector<target_resolution_t> resolutions;
+    std::vector<fact_provenance_t> provenances;
+    std::vector<std::uint8_t> confidences;
+
+    void reserve(std::size_t count)
+    {
+        ids.reserve(count);
+        instruction_ids.reserve(count);
+        base_regs.reserve(count);
+        index_regs.reserve(count);
+        scales.reserve(count);
+        displacements.reserve(count);
+        segment_regs.reserve(count);
+        address_components.reserve(count);
+        kinds.reserve(count);
+        resolutions.reserve(count);
+        provenances.reserve(count);
+        confidences.reserve(count);
+    }
+
+    void append(const address_expression_row_t& row)
+    {
+        const auto& input = row.input;
+        ids.push_back(row.id);
+        instruction_ids.push_back(row.instruction);
+        base_regs.push_back(input.base_reg);
+        index_regs.push_back(input.index_reg);
+        scales.push_back(input.scale);
+        displacements.push_back(input.displacement);
+        segment_regs.push_back(input.segment_reg);
+        address_components.push_back(input.address_components);
+        kinds.push_back(input.kind);
+        resolutions.push_back(input.resolution);
+        provenances.push_back(input.provenance);
+        confidences.push_back(input.confidence);
+    }
+
+    bool valid(std::size_t count) const noexcept
+    {
+        return ids.size() == count && instruction_ids.size() == count && base_regs.size() == count &&
+            index_regs.size() == count && scales.size() == count && displacements.size() == count &&
+            segment_regs.size() == count && address_components.size() == count &&
+            kinds.size() == count && resolutions.size() == count && provenances.size() == count &&
+            confidences.size() == count;
+    }
+
+    void account(std::uint64_t& payload, std::uint64_t& reserved) const noexcept
+    {
+        add_vector_accounting(ids, payload, reserved);
+        add_vector_accounting(instruction_ids, payload, reserved);
+        add_vector_accounting(base_regs, payload, reserved);
+        add_vector_accounting(index_regs, payload, reserved);
+        add_vector_accounting(scales, payload, reserved);
+        add_vector_accounting(displacements, payload, reserved);
+        add_vector_accounting(segment_regs, payload, reserved);
+        add_vector_accounting(address_components, payload, reserved);
+        add_vector_accounting(kinds, payload, reserved);
+        add_vector_accounting(resolutions, payload, reserved);
+        add_vector_accounting(provenances, payload, reserved);
+        add_vector_accounting(confidences, payload, reserved);
+    }
+};
+
+struct basic_block_columns_t final {
+    std::vector<packed_entity_id_t> ids;
+    packed_address_columns_t start_addresses;
+    packed_address_columns_t end_addresses;
+    std::vector<std::uint32_t> instruction_begins;
+    std::vector<std::uint16_t> instruction_counts;
+    std::vector<std::uint16_t> predecessor_counts;
+    std::vector<std::uint16_t> successor_counts;
+    std::vector<std::uint32_t> flags;
+    std::vector<fact_provenance_t> provenances;
+    std::vector<std::uint8_t> confidences;
+
+    void reserve(std::size_t count)
+    {
+        ids.reserve(count);
+        start_addresses.values.reserve(count);
+        start_addresses.metadata.reserve(count);
+        end_addresses.values.reserve(count);
+        end_addresses.metadata.reserve(count);
+        instruction_begins.reserve(count);
+        instruction_counts.reserve(count);
+        predecessor_counts.reserve(count);
+        successor_counts.reserve(count);
+        flags.reserve(count);
+        provenances.reserve(count);
+        confidences.reserve(count);
+    }
+
+    void append(const basic_block_row_t& row)
+    {
+        const auto& input = row.input;
+        ids.push_back(row.id);
+        start_addresses.append(input.start_address);
+        end_addresses.append(input.end_address);
+        instruction_begins.push_back(input.instruction_begin);
+        instruction_counts.push_back(input.instruction_count);
+        predecessor_counts.push_back(input.predecessor_count);
+        successor_counts.push_back(input.successor_count);
+        flags.push_back(input.flags);
+        provenances.push_back(input.provenance);
+        confidences.push_back(input.confidence);
+    }
+
+    bool valid(std::size_t count) const noexcept
+    {
+        return ids.size() == count && start_addresses.valid(count) && end_addresses.valid(count) &&
+            instruction_begins.size() == count && instruction_counts.size() == count &&
+            predecessor_counts.size() == count && successor_counts.size() == count &&
+            flags.size() == count && provenances.size() == count && confidences.size() == count;
+    }
+
+    void account(std::uint64_t& payload, std::uint64_t& reserved) const noexcept
+    {
+        add_vector_accounting(ids, payload, reserved);
+        start_addresses.account(payload, reserved);
+        end_addresses.account(payload, reserved);
+        add_vector_accounting(instruction_begins, payload, reserved);
+        add_vector_accounting(instruction_counts, payload, reserved);
+        add_vector_accounting(predecessor_counts, payload, reserved);
+        add_vector_accounting(successor_counts, payload, reserved);
+        add_vector_accounting(flags, payload, reserved);
+        add_vector_accounting(provenances, payload, reserved);
+        add_vector_accounting(confidences, payload, reserved);
+    }
+};
+
+struct function_columns_t final {
+    std::vector<packed_entity_id_t> ids;
+    packed_address_columns_t start_addresses;
+    packed_address_columns_t end_addresses;
+    std::vector<packed_entity_id_t> entry_block_ids;
+    std::vector<packed_entity_id_t> symbol_ids;
+    std::vector<packed_string_id_t> names;
+    std::vector<std::uint16_t> chunk_counts;
+    std::vector<std::uint32_t> flags;
+    std::vector<std::uint64_t> return_type_ids;
+    std::vector<fact_provenance_t> provenances;
+    std::vector<std::uint8_t> confidences;
+
+    void reserve(std::size_t count)
+    {
+        ids.reserve(count);
+        start_addresses.values.reserve(count);
+        start_addresses.metadata.reserve(count);
+        end_addresses.values.reserve(count);
+        end_addresses.metadata.reserve(count);
+        entry_block_ids.reserve(count);
+        symbol_ids.reserve(count);
+        names.reserve(count);
+        chunk_counts.reserve(count);
+        flags.reserve(count);
+        return_type_ids.reserve(count);
+        provenances.reserve(count);
+        confidences.reserve(count);
+    }
+
+    void append(const function_row_t& row)
+    {
+        const auto& input = row.input;
+        ids.push_back(row.id);
+        start_addresses.append(input.start_address);
+        end_addresses.append(input.end_address);
+        entry_block_ids.push_back(row.entry_block);
+        symbol_ids.push_back(row.symbol);
+        names.push_back(row.name);
+        chunk_counts.push_back(input.chunk_count);
+        flags.push_back(input.flags);
+        return_type_ids.push_back(input.return_type_id);
+        provenances.push_back(input.provenance);
+        confidences.push_back(input.confidence);
+    }
+
+    bool valid(std::size_t count) const noexcept
+    {
+        return ids.size() == count && start_addresses.valid(count) && end_addresses.valid(count) &&
+            entry_block_ids.size() == count && symbol_ids.size() == count && names.size() == count &&
+            chunk_counts.size() == count && flags.size() == count && return_type_ids.size() == count &&
+            provenances.size() == count && confidences.size() == count;
+    }
+
+    void account(std::uint64_t& payload, std::uint64_t& reserved) const noexcept
+    {
+        add_vector_accounting(ids, payload, reserved);
+        start_addresses.account(payload, reserved);
+        end_addresses.account(payload, reserved);
+        add_vector_accounting(entry_block_ids, payload, reserved);
+        add_vector_accounting(symbol_ids, payload, reserved);
+        add_vector_accounting(names, payload, reserved);
+        add_vector_accounting(chunk_counts, payload, reserved);
+        add_vector_accounting(flags, payload, reserved);
+        add_vector_accounting(return_type_ids, payload, reserved);
+        add_vector_accounting(provenances, payload, reserved);
+        add_vector_accounting(confidences, payload, reserved);
+    }
+};
+
+struct function_chunk_columns_t final {
+    std::vector<packed_entity_id_t> ids;
+    std::vector<packed_entity_id_t> function_ids;
+    packed_address_columns_t start_addresses;
+    packed_address_columns_t end_addresses;
+    std::vector<std::uint32_t> block_begins;
+    std::vector<std::uint16_t> block_counts;
+    std::vector<std::uint8_t> flags;
+    std::vector<fact_provenance_t> provenances;
+    std::vector<std::uint8_t> confidences;
+
+    void reserve(std::size_t count)
+    {
+        ids.reserve(count);
+        function_ids.reserve(count);
+        start_addresses.values.reserve(count);
+        start_addresses.metadata.reserve(count);
+        end_addresses.values.reserve(count);
+        end_addresses.metadata.reserve(count);
+        block_begins.reserve(count);
+        block_counts.reserve(count);
+        flags.reserve(count);
+        provenances.reserve(count);
+        confidences.reserve(count);
+    }
+
+    void append(const function_chunk_row_t& row)
+    {
+        const auto& input = row.input;
+        ids.push_back(row.id);
+        function_ids.push_back(row.function);
+        start_addresses.append(input.start_address);
+        end_addresses.append(input.end_address);
+        block_begins.push_back(input.block_begin);
+        block_counts.push_back(input.block_count);
+        flags.push_back(input.flags);
+        provenances.push_back(input.provenance);
+        confidences.push_back(input.confidence);
+    }
+
+    bool valid(std::size_t count) const noexcept
+    {
+        return ids.size() == count && function_ids.size() == count &&
+            start_addresses.valid(count) && end_addresses.valid(count) &&
+            block_begins.size() == count && block_counts.size() == count &&
+            flags.size() == count && provenances.size() == count && confidences.size() == count;
+    }
+
+    void account(std::uint64_t& payload, std::uint64_t& reserved) const noexcept
+    {
+        add_vector_accounting(ids, payload, reserved);
+        add_vector_accounting(function_ids, payload, reserved);
+        start_addresses.account(payload, reserved);
+        end_addresses.account(payload, reserved);
+        add_vector_accounting(block_begins, payload, reserved);
+        add_vector_accounting(block_counts, payload, reserved);
+        add_vector_accounting(flags, payload, reserved);
+        add_vector_accounting(provenances, payload, reserved);
+        add_vector_accounting(confidences, payload, reserved);
+    }
+};
+
+struct target_fact_columns_t final {
+    std::vector<packed_entity_id_t> ids;
+    std::vector<packed_entity_id_t> instruction_ids;
+    std::vector<packed_entity_id_t> operand_ids;
+    std::vector<packed_entity_id_t> address_expression_ids;
+    packed_address_columns_t targets;
+    std::vector<target_kind_record_t> kinds;
+    std::vector<target_resolution_t> resolutions;
+    std::vector<std::uint8_t> operand_indices;
+    std::vector<std::uint16_t> access_width_bits;
+    std::vector<std::uint16_t> access_counts;
+    std::vector<std::uint8_t> directs;
+    std::vector<std::uint8_t> is_externals;
+    std::vector<fact_provenance_t> provenances;
+    std::vector<std::uint8_t> confidences;
+
+    void reserve(std::size_t count)
+    {
+        ids.reserve(count);
+        instruction_ids.reserve(count);
+        operand_ids.reserve(count);
+        address_expression_ids.reserve(count);
+        targets.values.reserve(count);
+        targets.metadata.reserve(count);
+        kinds.reserve(count);
+        resolutions.reserve(count);
+        operand_indices.reserve(count);
+        access_width_bits.reserve(count);
+        access_counts.reserve(count);
+        directs.reserve(count);
+        is_externals.reserve(count);
+        provenances.reserve(count);
+        confidences.reserve(count);
+    }
+
+    void append(const target_fact_row_t& row)
+    {
+        const auto& input = row.input;
+        ids.push_back(row.id);
+        instruction_ids.push_back(row.instruction);
+        operand_ids.push_back(row.operand);
+        address_expression_ids.push_back(row.address_expression);
+        targets.append(input.target);
+        kinds.push_back(input.kind);
+        resolutions.push_back(input.resolution);
+        operand_indices.push_back(input.operand_index);
+        access_width_bits.push_back(input.access_width_bits);
+        access_counts.push_back(input.access_count);
+        directs.push_back(input.direct ? 1U : 0U);
+        is_externals.push_back(input.is_external ? 1U : 0U);
+        provenances.push_back(input.provenance);
+        confidences.push_back(input.confidence);
+    }
+
+    bool valid(std::size_t count) const noexcept
+    {
+        return ids.size() == count && instruction_ids.size() == count &&
+            operand_ids.size() == count && address_expression_ids.size() == count &&
+            targets.valid(count) && kinds.size() == count && resolutions.size() == count &&
+            operand_indices.size() == count && access_width_bits.size() == count &&
+            access_counts.size() == count && directs.size() == count &&
+            is_externals.size() == count && provenances.size() == count &&
+            confidences.size() == count;
+    }
+
+    void account(std::uint64_t& payload, std::uint64_t& reserved) const noexcept
+    {
+        add_vector_accounting(ids, payload, reserved);
+        add_vector_accounting(instruction_ids, payload, reserved);
+        add_vector_accounting(operand_ids, payload, reserved);
+        add_vector_accounting(address_expression_ids, payload, reserved);
+        targets.account(payload, reserved);
+        add_vector_accounting(kinds, payload, reserved);
+        add_vector_accounting(resolutions, payload, reserved);
+        add_vector_accounting(operand_indices, payload, reserved);
+        add_vector_accounting(access_width_bits, payload, reserved);
+        add_vector_accounting(access_counts, payload, reserved);
+        add_vector_accounting(directs, payload, reserved);
+        add_vector_accounting(is_externals, payload, reserved);
+        add_vector_accounting(provenances, payload, reserved);
+        add_vector_accounting(confidences, payload, reserved);
+    }
+};
+
+struct xref_columns_t final {
+    std::vector<packed_entity_id_t> ids;
+    std::vector<packed_entity_id_t> source_entities;
+    std::vector<packed_entity_id_t> target_entities;
+    packed_address_columns_t source_addresses;
+    packed_address_columns_t target_addresses;
+    std::vector<xref_kind_t> kinds;
+    std::vector<std::uint8_t> directs;
+    std::vector<fact_provenance_t> provenances;
+    std::vector<std::uint8_t> confidences;
+
+    void reserve(std::size_t count)
+    {
+        ids.reserve(count);
+        source_entities.reserve(count);
+        target_entities.reserve(count);
+        source_addresses.values.reserve(count);
+        source_addresses.metadata.reserve(count);
+        target_addresses.values.reserve(count);
+        target_addresses.metadata.reserve(count);
+        kinds.reserve(count);
+        directs.reserve(count);
+        provenances.reserve(count);
+        confidences.reserve(count);
+    }
+
+    void append(const xref_row_t& row)
+    {
+        const auto& input = row.input;
+        ids.push_back(row.id);
+        source_entities.push_back(row.source_entity);
+        target_entities.push_back(row.target_entity);
+        source_addresses.append(input.source_address);
+        target_addresses.append(input.target_address);
+        kinds.push_back(input.kind);
+        directs.push_back(input.is_direct ? 1U : 0U);
+        provenances.push_back(input.provenance);
+        confidences.push_back(input.confidence);
+    }
+
+    bool valid(std::size_t count) const noexcept
+    {
+        return ids.size() == count && source_entities.size() == count &&
+            target_entities.size() == count && source_addresses.valid(count) &&
+            target_addresses.valid(count) && kinds.size() == count && directs.size() == count &&
+            provenances.size() == count && confidences.size() == count;
+    }
+
+    void account(std::uint64_t& payload, std::uint64_t& reserved) const noexcept
+    {
+        add_vector_accounting(ids, payload, reserved);
+        add_vector_accounting(source_entities, payload, reserved);
+        add_vector_accounting(target_entities, payload, reserved);
+        source_addresses.account(payload, reserved);
+        target_addresses.account(payload, reserved);
+        add_vector_accounting(kinds, payload, reserved);
+        add_vector_accounting(directs, payload, reserved);
+        add_vector_accounting(provenances, payload, reserved);
+        add_vector_accounting(confidences, payload, reserved);
+    }
+};
+
+struct coverage_columns_t final {
+    std::vector<packed_entity_id_t> ids;
+    packed_address_columns_t span_begins;
+    packed_address_columns_t span_ends;
+    std::vector<coverage_reason_t> reasons;
+    std::vector<std::uint32_t> undecodable_counts;
+    std::vector<fact_provenance_t> provenances;
+    std::vector<std::uint8_t> confidences;
+
+    void reserve(std::size_t count)
+    {
+        ids.reserve(count);
+        span_begins.values.reserve(count);
+        span_begins.metadata.reserve(count);
+        span_ends.values.reserve(count);
+        span_ends.metadata.reserve(count);
+        reasons.reserve(count);
+        undecodable_counts.reserve(count);
+        provenances.reserve(count);
+        confidences.reserve(count);
+    }
+
+    void append(const coverage_row_t& row)
+    {
+        const auto& input = row.input;
+        ids.push_back(row.id);
+        span_begins.append(input.span_begin);
+        span_ends.append(input.span_end);
+        reasons.push_back(input.reason);
+        undecodable_counts.push_back(input.undecodable_count);
+        provenances.push_back(input.provenance);
+        confidences.push_back(input.confidence);
+    }
+
+    bool valid(std::size_t count) const noexcept
+    {
+        return ids.size() == count && span_begins.valid(count) && span_ends.valid(count) &&
+            reasons.size() == count && undecodable_counts.size() == count &&
+            provenances.size() == count && confidences.size() == count;
+    }
+
+    void account(std::uint64_t& payload, std::uint64_t& reserved) const noexcept
+    {
+        add_vector_accounting(ids, payload, reserved);
+        span_begins.account(payload, reserved);
+        span_ends.account(payload, reserved);
+        add_vector_accounting(reasons, payload, reserved);
+        add_vector_accounting(undecodable_counts, payload, reserved);
+        add_vector_accounting(provenances, payload, reserved);
+        add_vector_accounting(confidences, payload, reserved);
+    }
+};
+
 packed_store_result_t<packed_entity_id_t>
 resolve_reference(const packed_entity_reference_t& reference, std::uint16_t local_shard,
                   std::string_view phase) noexcept
@@ -661,12 +1191,93 @@ packed_store_result_t<void> validate_string_input(const packed_string_input_t& i
 }
 
 packed_store_result_t<void> validate_symbol_input(const packed_symbol_input_t& input,
-                                                  std::uint16_t shard) noexcept
+                                                   std::uint16_t shard) noexcept
 {
     if (!valid_address(input.address) || !valid_symbol_kind(input.kind) ||
         !valid_provenance(input.provenance)) {
         return packed_store_result_t<void>::failure(make_error(
             packed_store_error_code_t::invalid_row, "symbol", shard, input.source_id));
+    }
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+validate_address_expression_input(const packed_address_expression_input_t& input,
+                                  std::uint16_t shard) noexcept
+{
+    if (!valid_expression_kind(input.kind) || !valid_resolution(input.resolution) ||
+        !valid_provenance(input.provenance)) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_row, "address_expression", shard, input.source_id));
+    }
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+validate_basic_block_input(const packed_basic_block_input_t& input, std::uint16_t shard) noexcept
+{
+    if (!valid_address(input.start_address) || !valid_address(input.end_address) ||
+        !valid_provenance(input.provenance)) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_row, "basic_block", shard, input.source_id));
+    }
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+validate_function_input(const packed_function_input_t& input, std::uint16_t shard) noexcept
+{
+    if (!valid_address(input.start_address) || !valid_address(input.end_address) ||
+        !valid_provenance(input.provenance)) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_row, "function", shard, input.source_id));
+    }
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+validate_function_chunk_input(const packed_function_chunk_input_t& input,
+                              std::uint16_t shard) noexcept
+{
+    if (input.function.empty() || input.function.domain != packed_entity_domain_t::function ||
+        !valid_address(input.start_address) || !valid_address(input.end_address) ||
+        !valid_provenance(input.provenance)) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_row, "function_chunk", shard, input.source_id));
+    }
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+validate_target_fact_input(const packed_target_fact_input_t& input,
+                           std::uint16_t shard) noexcept
+{
+    if (!valid_address(input.target) || !valid_target_kind(input.kind) ||
+        !valid_resolution(input.resolution) || !valid_provenance(input.provenance)) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_row, "target_fact", shard, input.source_id));
+    }
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+validate_xref_input(const packed_xref_input_t& input, std::uint16_t shard) noexcept
+{
+    if (!valid_address(input.source_address) || !valid_address(input.target_address) ||
+        !valid_xref_kind(input.kind) || !valid_provenance(input.provenance)) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_row, "xref", shard, input.source_id));
+    }
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+validate_coverage_input(const packed_coverage_input_t& input, std::uint16_t shard) noexcept
+{
+    if (!valid_address(input.span_begin) || !valid_address(input.span_end) ||
+        !valid_coverage(input.reason) || !valid_provenance(input.provenance)) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_row, "coverage", shard, input.source_id));
     }
     return packed_store_result_t<void>::success();
 }
@@ -725,6 +1336,13 @@ struct packed_analysis_shard_t::impl_t final {
     std::vector<packed_edge_input_t> edges;
     std::vector<string_draft_t> string_records;
     std::vector<symbol_draft_t> symbols;
+    std::vector<packed_address_expression_input_t> address_expressions;
+    std::vector<packed_basic_block_input_t> basic_blocks;
+    std::vector<function_draft_t> functions;
+    std::vector<packed_function_chunk_input_t> function_chunks;
+    std::vector<packed_target_fact_input_t> target_facts;
+    std::vector<packed_xref_input_t> xrefs;
+    std::vector<packed_coverage_input_t> coverage_spans;
 };
 
 struct packed_analysis_shard_builder_t::impl_t final {
@@ -738,11 +1356,25 @@ struct packed_analysis_shard_builder_t::impl_t final {
     std::unordered_set<entity_id_t> edge_sources;
     std::unordered_set<entity_id_t> string_sources;
     std::unordered_set<entity_id_t> symbol_sources;
+    std::unordered_set<entity_id_t> address_expression_sources;
+    std::unordered_set<entity_id_t> basic_block_sources;
+    std::unordered_set<entity_id_t> function_sources;
+    std::unordered_set<entity_id_t> function_chunk_sources;
+    std::unordered_set<entity_id_t> target_fact_sources;
+    std::unordered_set<entity_id_t> xref_sources;
+    std::unordered_set<entity_id_t> coverage_sources;
     std::vector<instruction_draft_t> instructions;
     std::vector<packed_operand_input_t> operands;
     std::vector<packed_edge_input_t> edges;
     std::vector<string_draft_t> string_records;
     std::vector<symbol_draft_t> symbols;
+    std::vector<packed_address_expression_input_t> address_expressions;
+    std::vector<packed_basic_block_input_t> basic_blocks;
+    std::vector<function_draft_t> functions;
+    std::vector<packed_function_chunk_input_t> function_chunks;
+    std::vector<packed_target_fact_input_t> target_facts;
+    std::vector<packed_xref_input_t> xrefs;
+    std::vector<packed_coverage_input_t> coverage_spans;
 };
 
 struct packed_analysis_store_t::impl_t final {
@@ -752,6 +1384,13 @@ struct packed_analysis_store_t::impl_t final {
     edge_columns_t edges;
     string_columns_t string_records;
     symbol_columns_t symbols;
+    address_expression_columns_t address_expressions;
+    basic_block_columns_t basic_blocks;
+    function_columns_t functions;
+    function_chunk_columns_t function_chunks;
+    target_fact_columns_t target_facts;
+    xref_columns_t xrefs;
+    coverage_columns_t coverage_spans;
 };
 
 packed_store_result_t<packed_entity_id_t>
@@ -945,6 +1584,151 @@ packed_analysis_shard_builder_t::add_symbol(const packed_symbol_input_t& input)
     return packed_store_result_t<void>::success();
 }
 
+packed_store_result_t<void>
+packed_analysis_shard_builder_t::add_address_expression(const packed_address_expression_input_t& input)
+{
+    if (!impl_ || impl_->finalized) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::builder_finalized, "address_expression", shard_id()));
+    }
+    const auto valid_input = validate_address_expression_input(input, impl_->shard);
+    if (!valid_input)
+        return valid_input;
+    const auto valid_primary = validate_primary(impl_->address_expression_sources, input.source_id,
+                                                 packed_entity_domain_t::address_expression,
+                                                 impl_->shard, "address_expression");
+    if (!valid_primary)
+        return valid_primary;
+    impl_->address_expressions.push_back(input);
+    insert_primary(impl_->address_expression_sources, input.source_id);
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+packed_analysis_shard_builder_t::add_basic_block(const packed_basic_block_input_t& input)
+{
+    if (!impl_ || impl_->finalized) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::builder_finalized, "basic_block", shard_id()));
+    }
+    const auto valid_input = validate_basic_block_input(input, impl_->shard);
+    if (!valid_input)
+        return valid_input;
+    const auto valid_primary = validate_primary(impl_->basic_block_sources, input.source_id,
+                                                 packed_entity_domain_t::basic_block,
+                                                 impl_->shard, "basic_block");
+    if (!valid_primary)
+        return valid_primary;
+    impl_->basic_blocks.push_back(input);
+    insert_primary(impl_->basic_block_sources, input.source_id);
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+packed_analysis_shard_builder_t::add_function(const packed_function_input_t& input)
+{
+    if (!impl_ || impl_->finalized) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::builder_finalized, "function", shard_id()));
+    }
+    const auto valid_input = validate_function_input(input, impl_->shard);
+    if (!valid_input)
+        return valid_input;
+    const auto valid_primary = validate_primary(impl_->function_sources, input.source_id,
+                                                 packed_entity_domain_t::function, impl_->shard,
+                                                 "function");
+    if (!valid_primary)
+        return valid_primary;
+    const auto name = impl_->strings.intern(input.name);
+    if (!name)
+        return packed_store_result_t<void>::failure(name.error());
+    auto stored = input;
+    stored.name = {};
+    impl_->functions.push_back(function_draft_t{stored, name.value()});
+    insert_primary(impl_->function_sources, input.source_id);
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+packed_analysis_shard_builder_t::add_function_chunk(const packed_function_chunk_input_t& input)
+{
+    if (!impl_ || impl_->finalized) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::builder_finalized, "function_chunk", shard_id()));
+    }
+    const auto valid_input = validate_function_chunk_input(input, impl_->shard);
+    if (!valid_input)
+        return valid_input;
+    const auto valid_primary = validate_primary(impl_->function_chunk_sources, input.source_id,
+                                                 packed_entity_domain_t::function_chunk,
+                                                 impl_->shard, "function_chunk");
+    if (!valid_primary)
+        return valid_primary;
+    impl_->function_chunks.push_back(input);
+    insert_primary(impl_->function_chunk_sources, input.source_id);
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+packed_analysis_shard_builder_t::add_target_fact(const packed_target_fact_input_t& input)
+{
+    if (!impl_ || impl_->finalized) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::builder_finalized, "target_fact", shard_id()));
+    }
+    const auto valid_input = validate_target_fact_input(input, impl_->shard);
+    if (!valid_input)
+        return valid_input;
+    const auto valid_primary = validate_primary(impl_->target_fact_sources, input.source_id,
+                                                 packed_entity_domain_t::target_fact,
+                                                 impl_->shard, "target_fact");
+    if (!valid_primary)
+        return valid_primary;
+    impl_->target_facts.push_back(input);
+    insert_primary(impl_->target_fact_sources, input.source_id);
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+packed_analysis_shard_builder_t::add_xref(const packed_xref_input_t& input)
+{
+    if (!impl_ || impl_->finalized) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::builder_finalized, "xref", shard_id()));
+    }
+    const auto valid_input = validate_xref_input(input, impl_->shard);
+    if (!valid_input)
+        return valid_input;
+    const auto valid_primary = validate_primary(impl_->xref_sources, input.source_id,
+                                                 packed_entity_domain_t::xref, impl_->shard,
+                                                 "xref");
+    if (!valid_primary)
+        return valid_primary;
+    impl_->xrefs.push_back(input);
+    insert_primary(impl_->xref_sources, input.source_id);
+    return packed_store_result_t<void>::success();
+}
+
+packed_store_result_t<void>
+packed_analysis_shard_builder_t::add_coverage(const packed_coverage_input_t& input)
+{
+    if (!impl_ || impl_->finalized) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::builder_finalized, "coverage", shard_id()));
+    }
+    const auto valid_input = validate_coverage_input(input, impl_->shard);
+    if (!valid_input)
+        return valid_input;
+    const auto valid_primary = validate_primary(impl_->coverage_sources, input.source_id,
+                                                 packed_entity_domain_t::coverage,
+                                                 impl_->shard, "coverage");
+    if (!valid_primary)
+        return valid_primary;
+    impl_->coverage_spans.push_back(input);
+    insert_primary(impl_->coverage_sources, input.source_id);
+    return packed_store_result_t<void>::success();
+}
+
 packed_store_result_t<packed_analysis_shard_t> packed_analysis_shard_builder_t::finalize() &&
 {
     if (!impl_ || impl_->finalized) {
@@ -962,6 +1746,13 @@ packed_store_result_t<packed_analysis_shard_t> packed_analysis_shard_builder_t::
     shard_impl->edges = std::move(impl_->edges);
     shard_impl->string_records = std::move(impl_->string_records);
     shard_impl->symbols = std::move(impl_->symbols);
+    shard_impl->address_expressions = std::move(impl_->address_expressions);
+    shard_impl->basic_blocks = std::move(impl_->basic_blocks);
+    shard_impl->functions = std::move(impl_->functions);
+    shard_impl->function_chunks = std::move(impl_->function_chunks);
+    shard_impl->target_facts = std::move(impl_->target_facts);
+    shard_impl->xrefs = std::move(impl_->xrefs);
+    shard_impl->coverage_spans = std::move(impl_->coverage_spans);
     impl_->finalized = true;
     return packed_store_result_t<packed_analysis_shard_t>::success(
         packed_analysis_shard_t(std::move(shard_impl)));
@@ -1055,6 +1846,13 @@ packed_analysis_store_t::merge(std::vector<packed_analysis_shard_t> shards)
     std::vector<edge_row_t> edges;
     std::vector<string_row_t> string_records;
     std::vector<symbol_row_t> symbols;
+    std::vector<address_expression_row_t> address_expressions;
+    std::vector<basic_block_row_t> basic_blocks;
+    std::vector<function_row_t> functions;
+    std::vector<function_chunk_row_t> function_chunks;
+    std::vector<target_fact_row_t> target_facts;
+    std::vector<xref_row_t> xrefs;
+    std::vector<coverage_row_t> coverage_spans;
     for (const auto& shard : shards) {
         const auto& data = *shard.impl_;
         for (const auto& draft : data.instructions) {
@@ -1117,6 +1915,92 @@ packed_analysis_store_t::merge(std::vector<packed_analysis_shard_t> shards)
                 return packed_store_result_t<packed_analysis_store_t>::failure(name.error());
             symbols.push_back(symbol_row_t{id.value(), draft.input, name.value()});
         }
+        for (const auto& input : data.address_expressions) {
+            const auto id = packed_entity_id_t::make(packed_entity_domain_t::address_expression,
+                                                       data.shard, input.source_id);
+            if (!id)
+                return packed_store_result_t<packed_analysis_store_t>::failure(id.error());
+            const auto instruction = resolve_reference(input.instruction, data.shard,
+                                                        "address_expression");
+            if (!instruction)
+                return packed_store_result_t<packed_analysis_store_t>::failure(instruction.error());
+            address_expressions.push_back(
+                address_expression_row_t{id.value(), input, instruction.value()});
+        }
+        for (const auto& input : data.basic_blocks) {
+            const auto id = packed_entity_id_t::make(packed_entity_domain_t::basic_block,
+                                                       data.shard, input.source_id);
+            if (!id)
+                return packed_store_result_t<packed_analysis_store_t>::failure(id.error());
+            basic_blocks.push_back(basic_block_row_t{id.value(), input});
+        }
+        for (const auto& draft : data.functions) {
+            const auto id = packed_entity_id_t::make(packed_entity_domain_t::function,
+                                                       data.shard, draft.input.source_id);
+            if (!id)
+                return packed_store_result_t<packed_analysis_store_t>::failure(id.error());
+            const auto name = translate_string(data, draft.name);
+            if (!name)
+                return packed_store_result_t<packed_analysis_store_t>::failure(name.error());
+            const auto entry_block = resolve_reference(draft.input.entry_block, data.shard,
+                                                        "function");
+            if (!entry_block)
+                return packed_store_result_t<packed_analysis_store_t>::failure(entry_block.error());
+            const auto symbol = resolve_reference(draft.input.symbol, data.shard, "function");
+            if (!symbol)
+                return packed_store_result_t<packed_analysis_store_t>::failure(symbol.error());
+            functions.push_back(function_row_t{id.value(), draft.input, name.value(),
+                                                entry_block.value(), symbol.value()});
+        }
+        for (const auto& input : data.function_chunks) {
+            const auto id = packed_entity_id_t::make(packed_entity_domain_t::function_chunk,
+                                                       data.shard, input.source_id);
+            if (!id)
+                return packed_store_result_t<packed_analysis_store_t>::failure(id.error());
+            const auto function = resolve_reference(input.function, data.shard, "function_chunk");
+            if (!function)
+                return packed_store_result_t<packed_analysis_store_t>::failure(function.error());
+            function_chunks.push_back(function_chunk_row_t{id.value(), input, function.value()});
+        }
+        for (const auto& input : data.target_facts) {
+            const auto id = packed_entity_id_t::make(packed_entity_domain_t::target_fact,
+                                                       data.shard, input.source_id);
+            if (!id)
+                return packed_store_result_t<packed_analysis_store_t>::failure(id.error());
+            const auto instruction = resolve_reference(input.instruction, data.shard,
+                                                        "target_fact");
+            if (!instruction)
+                return packed_store_result_t<packed_analysis_store_t>::failure(instruction.error());
+            const auto operand = resolve_reference(input.operand, data.shard, "target_fact");
+            if (!operand)
+                return packed_store_result_t<packed_analysis_store_t>::failure(operand.error());
+            const auto expression = resolve_reference(input.address_expression, data.shard,
+                                                        "target_fact");
+            if (!expression)
+                return packed_store_result_t<packed_analysis_store_t>::failure(expression.error());
+            target_facts.push_back(target_fact_row_t{id.value(), input, instruction.value(),
+                                                       operand.value(), expression.value()});
+        }
+        for (const auto& input : data.xrefs) {
+            const auto id = packed_entity_id_t::make(packed_entity_domain_t::xref, data.shard,
+                                                       input.source_id);
+            if (!id)
+                return packed_store_result_t<packed_analysis_store_t>::failure(id.error());
+            const auto source = resolve_reference(input.source_entity, data.shard, "xref");
+            if (!source)
+                return packed_store_result_t<packed_analysis_store_t>::failure(source.error());
+            const auto target = resolve_reference(input.target_entity, data.shard, "xref");
+            if (!target)
+                return packed_store_result_t<packed_analysis_store_t>::failure(target.error());
+            xrefs.push_back(xref_row_t{id.value(), input, source.value(), target.value()});
+        }
+        for (const auto& input : data.coverage_spans) {
+            const auto id = packed_entity_id_t::make(packed_entity_domain_t::coverage,
+                                                       data.shard, input.source_id);
+            if (!id)
+                return packed_store_result_t<packed_analysis_store_t>::failure(id.error());
+            coverage_spans.push_back(coverage_row_t{id.value(), input});
+        }
     }
 
     const auto valid_instruction_count = ensure_count<instruction_row_t>(instructions.size(), "instruction");
@@ -1124,6 +2008,18 @@ packed_analysis_store_t::merge(std::vector<packed_analysis_shard_t> shards)
     const auto valid_edge_count = ensure_count<edge_row_t>(edges.size(), "edge");
     const auto valid_string_count = ensure_count<string_row_t>(string_records.size(), "string");
     const auto valid_symbol_count = ensure_count<symbol_row_t>(symbols.size(), "symbol");
+    const auto valid_address_expression_count = ensure_count<address_expression_row_t>(
+        address_expressions.size(), "address_expression");
+    const auto valid_basic_block_count = ensure_count<basic_block_row_t>(
+        basic_blocks.size(), "basic_block");
+    const auto valid_function_count = ensure_count<function_row_t>(functions.size(), "function");
+    const auto valid_function_chunk_count = ensure_count<function_chunk_row_t>(
+        function_chunks.size(), "function_chunk");
+    const auto valid_target_fact_count = ensure_count<target_fact_row_t>(
+        target_facts.size(), "target_fact");
+    const auto valid_xref_count = ensure_count<xref_row_t>(xrefs.size(), "xref");
+    const auto valid_coverage_count = ensure_count<coverage_row_t>(
+        coverage_spans.size(), "coverage");
     if (!valid_instruction_count)
         return packed_store_result_t<packed_analysis_store_t>::failure(valid_instruction_count.error());
     if (!valid_operand_count)
@@ -1134,6 +2030,25 @@ packed_analysis_store_t::merge(std::vector<packed_analysis_shard_t> shards)
         return packed_store_result_t<packed_analysis_store_t>::failure(valid_string_count.error());
     if (!valid_symbol_count)
         return packed_store_result_t<packed_analysis_store_t>::failure(valid_symbol_count.error());
+    if (!valid_address_expression_count)
+        return packed_store_result_t<packed_analysis_store_t>::failure(
+            valid_address_expression_count.error());
+    if (!valid_basic_block_count)
+        return packed_store_result_t<packed_analysis_store_t>::failure(
+            valid_basic_block_count.error());
+    if (!valid_function_count)
+        return packed_store_result_t<packed_analysis_store_t>::failure(valid_function_count.error());
+    if (!valid_function_chunk_count)
+        return packed_store_result_t<packed_analysis_store_t>::failure(
+            valid_function_chunk_count.error());
+    if (!valid_target_fact_count)
+        return packed_store_result_t<packed_analysis_store_t>::failure(
+            valid_target_fact_count.error());
+    if (!valid_xref_count)
+        return packed_store_result_t<packed_analysis_store_t>::failure(valid_xref_count.error());
+    if (!valid_coverage_count)
+        return packed_store_result_t<packed_analysis_store_t>::failure(
+            valid_coverage_count.error());
 
     std::sort(instructions.begin(), instructions.end(), id_less<instruction_row_t>);
     std::sort(operands.begin(), operands.end(), [](const operand_row_t& left, const operand_row_t& right) {
@@ -1144,6 +2059,14 @@ packed_analysis_store_t::merge(std::vector<packed_analysis_shard_t> shards)
     std::sort(edges.begin(), edges.end(), id_less<edge_row_t>);
     std::sort(string_records.begin(), string_records.end(), id_less<string_row_t>);
     std::sort(symbols.begin(), symbols.end(), id_less<symbol_row_t>);
+    std::sort(address_expressions.begin(), address_expressions.end(),
+              id_less<address_expression_row_t>);
+    std::sort(basic_blocks.begin(), basic_blocks.end(), id_less<basic_block_row_t>);
+    std::sort(functions.begin(), functions.end(), id_less<function_row_t>);
+    std::sort(function_chunks.begin(), function_chunks.end(), id_less<function_chunk_row_t>);
+    std::sort(target_facts.begin(), target_facts.end(), id_less<target_fact_row_t>);
+    std::sort(xrefs.begin(), xrefs.end(), id_less<xref_row_t>);
+    std::sort(coverage_spans.begin(), coverage_spans.end(), id_less<coverage_row_t>);
 
     auto store_impl = std::make_unique<impl_t>();
     store_impl->strings = pool.value();
@@ -1152,6 +2075,13 @@ packed_analysis_store_t::merge(std::vector<packed_analysis_shard_t> shards)
     store_impl->edges.reserve(edges.size());
     store_impl->string_records.reserve(string_records.size());
     store_impl->symbols.reserve(symbols.size());
+    store_impl->address_expressions.reserve(address_expressions.size());
+    store_impl->basic_blocks.reserve(basic_blocks.size());
+    store_impl->functions.reserve(functions.size());
+    store_impl->function_chunks.reserve(function_chunks.size());
+    store_impl->target_facts.reserve(target_facts.size());
+    store_impl->xrefs.reserve(xrefs.size());
+    store_impl->coverage_spans.reserve(coverage_spans.size());
     for (const auto& row : instructions)
         store_impl->instructions.append(row);
     for (const auto& row : operands)
@@ -1162,6 +2092,20 @@ packed_analysis_store_t::merge(std::vector<packed_analysis_shard_t> shards)
         store_impl->string_records.append(row);
     for (const auto& row : symbols)
         store_impl->symbols.append(row);
+    for (const auto& row : address_expressions)
+        store_impl->address_expressions.append(row);
+    for (const auto& row : basic_blocks)
+        store_impl->basic_blocks.append(row);
+    for (const auto& row : functions)
+        store_impl->functions.append(row);
+    for (const auto& row : function_chunks)
+        store_impl->function_chunks.append(row);
+    for (const auto& row : target_facts)
+        store_impl->target_facts.append(row);
+    for (const auto& row : xrefs)
+        store_impl->xrefs.append(row);
+    for (const auto& row : coverage_spans)
+        store_impl->coverage_spans.append(row);
 
     std::size_t operand_index = 0;
     for (std::size_t instruction_index = 0;
@@ -1224,6 +2168,41 @@ std::uint32_t packed_analysis_store_t::symbol_count() const noexcept
     return impl_ ? static_cast<std::uint32_t>(impl_->symbols.ids.size()) : 0;
 }
 
+std::uint32_t packed_analysis_store_t::address_expression_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->address_expressions.ids.size()) : 0;
+}
+
+std::uint32_t packed_analysis_store_t::basic_block_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->basic_blocks.ids.size()) : 0;
+}
+
+std::uint32_t packed_analysis_store_t::function_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->functions.ids.size()) : 0;
+}
+
+std::uint32_t packed_analysis_store_t::function_chunk_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->function_chunks.ids.size()) : 0;
+}
+
+std::uint32_t packed_analysis_store_t::target_fact_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->target_facts.ids.size()) : 0;
+}
+
+std::uint32_t packed_analysis_store_t::xref_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->xrefs.ids.size()) : 0;
+}
+
+std::uint32_t packed_analysis_store_t::coverage_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->coverage_spans.ids.size()) : 0;
+}
+
 const packed_string_pool_t& packed_analysis_store_t::string_pool() const noexcept
 {
     return impl_ ? impl_->strings : empty_string_pool();
@@ -1244,17 +2223,46 @@ packed_size_accounting_t packed_analysis_store_t::size_accounting() const noexce
     std::uint64_t string_reserved = 0;
     std::uint64_t symbol_payload = 0;
     std::uint64_t symbol_reserved = 0;
+    std::uint64_t address_expression_payload = 0;
+    std::uint64_t address_expression_reserved = 0;
+    std::uint64_t basic_block_payload = 0;
+    std::uint64_t basic_block_reserved = 0;
+    std::uint64_t function_payload = 0;
+    std::uint64_t function_reserved = 0;
+    std::uint64_t function_chunk_payload = 0;
+    std::uint64_t function_chunk_reserved = 0;
+    std::uint64_t target_fact_payload = 0;
+    std::uint64_t target_fact_reserved = 0;
+    std::uint64_t xref_payload = 0;
+    std::uint64_t xref_reserved = 0;
+    std::uint64_t coverage_payload = 0;
+    std::uint64_t coverage_reserved = 0;
     impl_->instructions.account(instruction_payload, instruction_reserved);
     impl_->operands.account(operand_payload, operand_reserved);
     impl_->edges.account(edge_payload, edge_reserved);
     impl_->string_records.account(string_payload, string_reserved);
     impl_->symbols.account(symbol_payload, symbol_reserved);
+    impl_->address_expressions.account(address_expression_payload, address_expression_reserved);
+    impl_->basic_blocks.account(basic_block_payload, basic_block_reserved);
+    impl_->functions.account(function_payload, function_reserved);
+    impl_->function_chunks.account(function_chunk_payload, function_chunk_reserved);
+    impl_->target_facts.account(target_fact_payload, target_fact_reserved);
+    impl_->xrefs.account(xref_payload, xref_reserved);
+    impl_->coverage_spans.account(coverage_payload, coverage_reserved);
     const auto payload = string_size.payload_bytes + instruction_payload + operand_payload + edge_payload +
-        string_payload + symbol_payload;
+        string_payload + symbol_payload + address_expression_payload + basic_block_payload +
+        function_payload + function_chunk_payload + target_fact_payload + xref_payload +
+        coverage_payload;
     const auto reserved = string_size.reserved_bytes + instruction_reserved + operand_reserved + edge_reserved +
-        string_reserved + symbol_reserved;
+        string_reserved + symbol_reserved + address_expression_reserved + basic_block_reserved +
+        function_reserved + function_chunk_reserved + target_fact_reserved + xref_reserved +
+        coverage_reserved;
     return packed_size_accounting_t{string_size.payload_bytes, instruction_payload, operand_payload,
-                                    edge_payload, string_payload, symbol_payload, payload, reserved};
+                                    edge_payload, string_payload, symbol_payload,
+                                    address_expression_payload, basic_block_payload,
+                                    function_payload, function_chunk_payload,
+                                    target_fact_payload, xref_payload, coverage_payload,
+                                    payload, reserved};
 }
 
 packed_store_result_t<void> packed_analysis_store_t::validate() const
@@ -1271,9 +2279,23 @@ packed_store_result_t<void> packed_analysis_store_t::validate() const
     const auto edge_count = impl_->edges.ids.size();
     const auto string_count = impl_->string_records.ids.size();
     const auto symbol_count = impl_->symbols.ids.size();
+    const auto address_expression_count = impl_->address_expressions.ids.size();
+    const auto basic_block_count = impl_->basic_blocks.ids.size();
+    const auto function_count = impl_->functions.ids.size();
+    const auto function_chunk_count = impl_->function_chunks.ids.size();
+    const auto target_fact_count = impl_->target_facts.ids.size();
+    const auto xref_count = impl_->xrefs.ids.size();
+    const auto coverage_count = impl_->coverage_spans.ids.size();
     if (!impl_->instructions.valid(instruction_count) || !impl_->operands.valid(operand_count) ||
         !impl_->edges.valid(edge_count) || !impl_->string_records.valid(string_count) ||
-        !impl_->symbols.valid(symbol_count)) {
+        !impl_->symbols.valid(symbol_count) ||
+        !impl_->address_expressions.valid(address_expression_count) ||
+        !impl_->basic_blocks.valid(basic_block_count) ||
+        !impl_->functions.valid(function_count) ||
+        !impl_->function_chunks.valid(function_chunk_count) ||
+        !impl_->target_facts.valid(target_fact_count) ||
+        !impl_->xrefs.valid(xref_count) ||
+        !impl_->coverage_spans.valid(coverage_count)) {
         return packed_store_result_t<void>::failure(make_error(
             packed_store_error_code_t::integrity_mismatch, "columns"));
     }
@@ -1283,6 +2305,13 @@ packed_store_result_t<void> packed_analysis_store_t::validate() const
     std::unordered_set<std::uint64_t> edge_ids;
     std::unordered_set<std::uint64_t> string_ids;
     std::unordered_set<std::uint64_t> symbol_ids;
+    std::unordered_set<std::uint64_t> address_expression_ids;
+    std::unordered_set<std::uint64_t> basic_block_ids;
+    std::unordered_set<std::uint64_t> function_ids;
+    std::unordered_set<std::uint64_t> function_chunk_ids;
+    std::unordered_set<std::uint64_t> target_fact_ids;
+    std::unordered_set<std::uint64_t> xref_ids;
+    std::unordered_set<std::uint64_t> coverage_ids;
     auto validate_ids = [](const std::vector<packed_entity_id_t>& ids,
                            packed_entity_domain_t domain, std::string_view phase,
                            bool require_monotonic,
@@ -1320,7 +2349,28 @@ packed_store_result_t<void> packed_analysis_store_t::validate() const
     const auto valid_string_ids = validate_ids(impl_->string_records.ids, packed_entity_domain_t::string,
                                                "string", true, string_ids);
     const auto valid_symbol_ids = validate_ids(impl_->symbols.ids, packed_entity_domain_t::symbol,
-                                               "symbol", true, symbol_ids);
+                                                "symbol", true, symbol_ids);
+    const auto valid_address_expression_ids = validate_ids(
+        impl_->address_expressions.ids, packed_entity_domain_t::address_expression,
+        "address_expression", true, address_expression_ids);
+    const auto valid_basic_block_ids = validate_ids(impl_->basic_blocks.ids,
+                                                     packed_entity_domain_t::basic_block,
+                                                     "basic_block", true, basic_block_ids);
+    const auto valid_function_ids = validate_ids(impl_->functions.ids,
+                                                  packed_entity_domain_t::function, "function",
+                                                  true, function_ids);
+    const auto valid_function_chunk_ids = validate_ids(impl_->function_chunks.ids,
+                                                        packed_entity_domain_t::function_chunk,
+                                                        "function_chunk", true,
+                                                        function_chunk_ids);
+    const auto valid_target_fact_ids = validate_ids(impl_->target_facts.ids,
+                                                     packed_entity_domain_t::target_fact,
+                                                     "target_fact", true, target_fact_ids);
+    const auto valid_xref_ids = validate_ids(impl_->xrefs.ids, packed_entity_domain_t::xref,
+                                              "xref", true, xref_ids);
+    const auto valid_coverage_ids = validate_ids(impl_->coverage_spans.ids,
+                                                  packed_entity_domain_t::coverage, "coverage",
+                                                  true, coverage_ids);
     if (!valid_instruction_ids)
         return valid_instruction_ids;
     if (!valid_operand_ids)
@@ -1331,6 +2381,20 @@ packed_store_result_t<void> packed_analysis_store_t::validate() const
         return valid_string_ids;
     if (!valid_symbol_ids)
         return valid_symbol_ids;
+    if (!valid_address_expression_ids)
+        return valid_address_expression_ids;
+    if (!valid_basic_block_ids)
+        return valid_basic_block_ids;
+    if (!valid_function_ids)
+        return valid_function_ids;
+    if (!valid_function_chunk_ids)
+        return valid_function_chunk_ids;
+    if (!valid_target_fact_ids)
+        return valid_target_fact_ids;
+    if (!valid_xref_ids)
+        return valid_xref_ids;
+    if (!valid_coverage_ids)
+        return valid_coverage_ids;
 
     auto validate_reference = [&](packed_entity_id_t id, bool required,
                                   std::string_view phase) -> packed_store_result_t<void> {
@@ -1357,6 +2421,27 @@ packed_store_result_t<void> packed_analysis_store_t::validate() const
             break;
         case packed_entity_domain_t::symbol:
             exists = symbol_ids.find(id.value()) != symbol_ids.end();
+            break;
+        case packed_entity_domain_t::address_expression:
+            exists = address_expression_ids.find(id.value()) != address_expression_ids.end();
+            break;
+        case packed_entity_domain_t::basic_block:
+            exists = basic_block_ids.find(id.value()) != basic_block_ids.end();
+            break;
+        case packed_entity_domain_t::function:
+            exists = function_ids.find(id.value()) != function_ids.end();
+            break;
+        case packed_entity_domain_t::function_chunk:
+            exists = function_chunk_ids.find(id.value()) != function_chunk_ids.end();
+            break;
+        case packed_entity_domain_t::target_fact:
+            exists = target_fact_ids.find(id.value()) != target_fact_ids.end();
+            break;
+        case packed_entity_domain_t::xref:
+            exists = xref_ids.find(id.value()) != xref_ids.end();
+            break;
+        case packed_entity_domain_t::coverage:
+            exists = coverage_ids.find(id.value()) != coverage_ids.end();
             break;
         default:
             break;
@@ -1457,6 +2542,103 @@ packed_store_result_t<void> packed_analysis_store_t::validate() const
                 columns.ids[index].value()));
         }
     }
+    for (std::size_t index = 0; index < address_expression_count; ++index) {
+        const auto& columns = impl_->address_expressions;
+        if (!valid_expression_kind(columns.kinds[index]) ||
+            !valid_resolution(columns.resolutions[index]) ||
+            !valid_provenance(columns.provenances[index])) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_row, "address_expression",
+                columns.ids[index].parts().shard, columns.ids[index].value()));
+        }
+        const auto instruction = validate_reference(columns.instruction_ids[index], false,
+                                                      "address_expression");
+        if (!instruction)
+            return instruction;
+    }
+    for (std::size_t index = 0; index < basic_block_count; ++index) {
+        const auto& columns = impl_->basic_blocks;
+        if (!valid_provenance(columns.provenances[index])) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_row, "basic_block",
+                columns.ids[index].parts().shard, columns.ids[index].value()));
+        }
+    }
+    for (std::size_t index = 0; index < function_count; ++index) {
+        const auto& columns = impl_->functions;
+        if (!valid_provenance(columns.provenances[index]) ||
+            (columns.names[index].valid() && !impl_->strings.lookup(columns.names[index]))) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_row, "function",
+                columns.ids[index].parts().shard, columns.ids[index].value()));
+        }
+        const auto entry_block = validate_reference(columns.entry_block_ids[index], false,
+                                                      "function");
+        if (!entry_block)
+            return entry_block;
+        const auto symbol = validate_reference(columns.symbol_ids[index], false, "function");
+        if (!symbol)
+            return symbol;
+    }
+    for (std::size_t index = 0; index < function_chunk_count; ++index) {
+        const auto& columns = impl_->function_chunks;
+        if (!valid_provenance(columns.provenances[index]) ||
+            columns.function_ids[index].parts().domain != packed_entity_domain_t::function) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_row, "function_chunk",
+                columns.ids[index].parts().shard, columns.ids[index].value()));
+        }
+        const auto function = validate_reference(columns.function_ids[index], true,
+                                                   "function_chunk");
+        if (!function)
+            return function;
+    }
+    for (std::size_t index = 0; index < target_fact_count; ++index) {
+        const auto& columns = impl_->target_facts;
+        if (!valid_target_kind(columns.kinds[index]) ||
+            !valid_resolution(columns.resolutions[index]) ||
+            !valid_provenance(columns.provenances[index]) || columns.directs[index] > 1U ||
+            columns.is_externals[index] > 1U) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_row, "target_fact",
+                columns.ids[index].parts().shard, columns.ids[index].value()));
+        }
+        const auto instruction = validate_reference(columns.instruction_ids[index], false,
+                                                      "target_fact");
+        if (!instruction)
+            return instruction;
+        const auto operand = validate_reference(columns.operand_ids[index], false, "target_fact");
+        if (!operand)
+            return operand;
+        const auto expression = validate_reference(columns.address_expression_ids[index], false,
+                                                     "target_fact");
+        if (!expression)
+            return expression;
+    }
+    for (std::size_t index = 0; index < xref_count; ++index) {
+        const auto& columns = impl_->xrefs;
+        if (!valid_xref_kind(columns.kinds[index]) || !valid_provenance(columns.provenances[index]) ||
+            columns.directs[index] > 1U) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_row, "xref",
+                columns.ids[index].parts().shard, columns.ids[index].value()));
+        }
+        const auto source = validate_reference(columns.source_entities[index], false, "xref");
+        if (!source)
+            return source;
+        const auto target = validate_reference(columns.target_entities[index], false, "xref");
+        if (!target)
+            return target;
+    }
+    for (std::size_t index = 0; index < coverage_count; ++index) {
+        const auto& columns = impl_->coverage_spans;
+        if (!valid_coverage(columns.reasons[index]) ||
+            !valid_provenance(columns.provenances[index])) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_row, "coverage",
+                columns.ids[index].parts().shard, columns.ids[index].value()));
+        }
+    }
     return packed_store_result_t<void>::success();
 }
 
@@ -1551,6 +2733,126 @@ std::optional<packed_symbol_view_t> packed_analysis_store_t::symbol(std::size_t 
     return packed_symbol_view_t{impl_->symbols.ids[index], *address, *name,
                                 impl_->symbols.kinds[index], impl_->symbols.provenances[index],
                                 impl_->symbols.confidences[index]};
+}
+
+std::optional<packed_address_expression_view_t>
+packed_analysis_store_t::address_expression(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->address_expressions.ids.size())
+        return std::nullopt;
+    const auto& columns = impl_->address_expressions;
+    return packed_address_expression_view_t{
+        columns.ids[index], columns.instruction_ids[index], columns.base_regs[index],
+        columns.index_regs[index], columns.scales[index], columns.displacements[index],
+        columns.segment_regs[index], columns.address_components[index], columns.kinds[index],
+        columns.resolutions[index], columns.provenances[index], columns.confidences[index]};
+}
+
+std::optional<packed_basic_block_view_t>
+packed_analysis_store_t::basic_block(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->basic_blocks.ids.size())
+        return std::nullopt;
+    const auto start = impl_->basic_blocks.start_addresses.at(index);
+    const auto end = impl_->basic_blocks.end_addresses.at(index);
+    if (!start || !end)
+        return std::nullopt;
+    const auto& columns = impl_->basic_blocks;
+    return packed_basic_block_view_t{
+        columns.ids[index], *start, *end, columns.instruction_begins[index],
+        columns.instruction_counts[index], columns.predecessor_counts[index],
+        columns.successor_counts[index], columns.flags[index], columns.provenances[index],
+        columns.confidences[index]};
+}
+
+std::optional<packed_function_view_t>
+packed_analysis_store_t::function(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->functions.ids.size())
+        return std::nullopt;
+    const auto start = impl_->functions.start_addresses.at(index);
+    const auto end = impl_->functions.end_addresses.at(index);
+    if (!start || !end)
+        return std::nullopt;
+    std::string_view name;
+    const auto name_id = impl_->functions.names[index];
+    if (name_id.valid()) {
+        const auto value = impl_->strings.lookup(name_id);
+        if (!value)
+            return std::nullopt;
+        name = *value;
+    }
+    const auto& columns = impl_->functions;
+    return packed_function_view_t{
+        columns.ids[index], *start, *end, columns.entry_block_ids[index],
+        columns.symbol_ids[index], name, columns.chunk_counts[index], columns.flags[index],
+        columns.return_type_ids[index], columns.provenances[index], columns.confidences[index]};
+}
+
+std::optional<packed_function_chunk_view_t>
+packed_analysis_store_t::function_chunk(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->function_chunks.ids.size())
+        return std::nullopt;
+    const auto start = impl_->function_chunks.start_addresses.at(index);
+    const auto end = impl_->function_chunks.end_addresses.at(index);
+    if (!start || !end)
+        return std::nullopt;
+    const auto& columns = impl_->function_chunks;
+    return packed_function_chunk_view_t{
+        columns.ids[index], columns.function_ids[index], *start, *end,
+        columns.block_begins[index], columns.block_counts[index], columns.flags[index],
+        columns.provenances[index], columns.confidences[index]};
+}
+
+std::optional<packed_target_fact_view_t>
+packed_analysis_store_t::target_fact(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->target_facts.ids.size())
+        return std::nullopt;
+    const auto target = impl_->target_facts.targets.at(index);
+    if (!target)
+        return std::nullopt;
+    const auto& columns = impl_->target_facts;
+    return packed_target_fact_view_t{
+        columns.ids[index], columns.instruction_ids[index], columns.operand_ids[index],
+        columns.address_expression_ids[index], *target, columns.kinds[index],
+        columns.resolutions[index], columns.operand_indices[index],
+        columns.access_width_bits[index], columns.access_counts[index],
+        columns.directs[index] != 0, columns.is_externals[index] != 0,
+        columns.provenances[index], columns.confidences[index]};
+}
+
+std::optional<packed_xref_view_t>
+packed_analysis_store_t::xref(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->xrefs.ids.size())
+        return std::nullopt;
+    const auto source = impl_->xrefs.source_addresses.at(index);
+    const auto target = impl_->xrefs.target_addresses.at(index);
+    if (!source || !target)
+        return std::nullopt;
+    const auto& columns = impl_->xrefs;
+    return packed_xref_view_t{
+        columns.ids[index], columns.source_entities[index], columns.target_entities[index],
+        *source, *target, columns.kinds[index], columns.directs[index] != 0,
+        columns.provenances[index], columns.confidences[index]};
+}
+
+std::optional<packed_coverage_view_t>
+packed_analysis_store_t::coverage(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->coverage_spans.ids.size())
+        return std::nullopt;
+    const auto begin = impl_->coverage_spans.span_begins.at(index);
+    const auto end = impl_->coverage_spans.span_ends.at(index);
+    if (!begin || !end)
+        return std::nullopt;
+    const auto& columns = impl_->coverage_spans;
+    return packed_coverage_view_t{
+        columns.ids[index], *begin, *end, columns.reasons[index],
+        columns.undecodable_counts[index], columns.provenances[index],
+        columns.confidences[index]};
 }
 
 packed_analysis_compatibility_view_t packed_analysis_store_t::compatibility_view() const noexcept
@@ -1684,6 +2986,125 @@ std::optional<symbol_record_t> packed_analysis_compatibility_view_t::symbol(std:
     result.kind = view->kind;
     result.provenance = view->provenance;
     result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<basic_block_record_t>
+packed_analysis_compatibility_view_t::basic_block(std::size_t index) const
+{
+    if (!store_)
+        return std::nullopt;
+    const auto view = store_->basic_block(index);
+    if (!view)
+        return std::nullopt;
+    basic_block_record_t result;
+    result.id = view->id.value();
+    result.start = view->start_address;
+    result.end = view->end_address;
+    result.first_instruction = view->instruction_begin;
+    result.instruction_count = view->instruction_count;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<function_record_t>
+packed_analysis_compatibility_view_t::function(std::size_t index) const
+{
+    if (!store_)
+        return std::nullopt;
+    const auto view = store_->function(index);
+    if (!view)
+        return std::nullopt;
+    function_record_t result;
+    result.id = view->id.value();
+    result.start = view->start_address;
+    result.end = view->end_address;
+    result.chunk_count = view->chunk_count;
+    if (view->symbol_id.valid())
+        result.symbol_id = view->symbol_id.value();
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<function_chunk_record_t>
+packed_analysis_compatibility_view_t::function_chunk(std::size_t index) const
+{
+    if (!store_)
+        return std::nullopt;
+    const auto view = store_->function_chunk(index);
+    if (!view)
+        return std::nullopt;
+    function_chunk_record_t result;
+    result.id = view->id.value();
+    result.function_id = view->function_id.value();
+    result.start = view->start_address;
+    result.end = view->end_address;
+    result.first_block = view->block_begin;
+    result.block_count = view->block_count;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<target_fact_t>
+packed_analysis_compatibility_view_t::target_fact(std::size_t index) const
+{
+    if (!store_)
+        return std::nullopt;
+    const auto view = store_->target_fact(index);
+    if (!view)
+        return std::nullopt;
+    target_fact_t result;
+    result.instruction_id = view->instruction_id.value();
+    result.operand_fact_id = view->operand_id.value();
+    result.address_expression_id = view->address_expression_id.value();
+    result.target = view->target;
+    result.kind = view->kind;
+    result.resolution = view->resolution;
+    result.operand_index = view->operand_index;
+    result.access_width_bits = view->access_width_bits;
+    result.access_count = view->access_count;
+    result.direct = view->direct;
+    result.is_external = view->is_external;
+    return result;
+}
+
+std::optional<xref_record_t>
+packed_analysis_compatibility_view_t::xref(std::size_t index) const
+{
+    if (!store_)
+        return std::nullopt;
+    const auto view = store_->xref(index);
+    if (!view)
+        return std::nullopt;
+    xref_record_t result;
+    result.id = view->id.value();
+    result.source = view->source_address;
+    result.target = view->target_address;
+    result.kind = view->kind;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<coverage_span_t>
+packed_analysis_compatibility_view_t::coverage(std::size_t index) const
+{
+    if (!store_)
+        return std::nullopt;
+    const auto view = store_->coverage(index);
+    if (!view)
+        return std::nullopt;
+    coverage_span_t result;
+    result.start = view->span_begin;
+    result.size = view->span_end.value >= view->span_begin.value
+        ? view->span_end.value - view->span_begin.value : 0;
+    result.reason = view->reason;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    result.detail_code = view->undecodable_count;
     return result;
 }
 

@@ -95,6 +95,11 @@ def verify_archive_contract(ledger: dict[str, Any], archive_path: Path) -> dict[
     observed_version, observed_tools = archive_tool_names(archive_path)
     if observed_version != archive["version"]:
         raise LedgerError(f"pinned archive version mismatch: expected {archive['version']}, observed {observed_version}")
+    archive_license = archive.get("license")
+    if archive_license is None:
+        raise LedgerError("pinned archive ledger is missing the license field")
+    if archive_license != "MIT":
+        raise LedgerError(f"pinned archive license must be MIT, observed {archive_license}")
     compatibility = ledger["mcp_compatibility"]
     upstream = compatibility["upstream_tool_names"]
     upstream_set = require_unique(upstream, "upstream tool ledger")
@@ -127,6 +132,7 @@ def verify_archive_contract(ledger: dict[str, Any], archive_path: Path) -> dict[
     return {
         "archive_sha256": actual_hash,
         "archive_version": observed_version,
+        "archive_license": archive_license,
         "upstream_tool_count": len(upstream_set),
         "excluded_tools": exclusions,
         "required_compatibility_count": len(required_set),
@@ -147,8 +153,7 @@ def verify_preservation_baseline(ledger: dict[str, Any], root: Path) -> dict[str
         raise LedgerError("C02 source surface manifest schema version does not match the preservation baseline")
     mcp = source.get("mcp", {})
     registration_names = sorted(record["name"] for record in mcp.get("registrations", []))
-    if require_unique(registration_names, "C02 MCP registration inventory") != set(registration_names):
-        raise LedgerError("unreachable MCP uniqueness failure")
+    require_unique(registration_names, "C02 MCP registration inventory")
     expected_mcp = baseline["aida_mcp"]
     if len(registration_names) != expected_mcp["registration_count"] or len(registration_names) != expected_mcp["unique_name_count"]:
         raise LedgerError("C02 MCP registration count does not match the preservation baseline")

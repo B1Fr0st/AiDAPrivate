@@ -478,7 +478,7 @@ workspace_result_t<void> validate_request(const container_stream_member_request_
     auto range = validate_span(request.data_offset, request.compressed_size,
                                request.source->size(), "container_stream_open");
     if (!range)
-        return range;
+        return workspace_result_t<void>::failure(range.error());
     return workspace_result_t<void>::success();
 }
 

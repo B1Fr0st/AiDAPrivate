@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -372,6 +373,7 @@ struct instruction_info_t {
 };
 
 dalvik_format_t format_table[256];
+std::once_flag format_table_once;
 
 void init_format_table()
 {
@@ -1192,14 +1194,6 @@ std::vector<basic_block_t> build_basic_blocks(
         }
     }
 
-    for (auto& block : blocks) {
-        for (const auto succ : block.successor_ids) {
-            if (succ > 0 && succ <= blocks.size()) {
-                blocks[succ - 1].predecessor_ids.push_back(block.id ? block.id : static_cast<std::uint64_t>(&block - blocks.data() + 1));
-            }
-        }
-    }
-
     for (std::size_t i = 0; i < blocks.size(); ++i) {
         blocks[i].id = static_cast<std::uint64_t>(i + 1);
     }
@@ -1693,11 +1687,7 @@ std::map<std::uint64_t, std::set<std::uint64_t>> build_dom_children(
 
 dalvik_format_t instruction_format(std::uint8_t opcode) noexcept
 {
-    static bool initialized = false;
-    if (!initialized) {
-        init_format_table();
-        initialized = true;
-    }
+    std::call_once(format_table_once, init_format_table);
     if (opcode >= 256) return dalvik_format_t::funknown;
     return format_table[opcode];
 }
@@ -1738,11 +1728,7 @@ const char* format_name(dalvik_format_t format) noexcept
 
 dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
 {
-    static bool format_table_initialized = false;
-    if (!format_table_initialized) {
-        init_format_table();
-        format_table_initialized = true;
-    }
+    std::call_once(format_table_once, init_format_table);
 
     dalvik_ssa_result_t result;
     std::uint32_t diagnostic_ordinal = 1;

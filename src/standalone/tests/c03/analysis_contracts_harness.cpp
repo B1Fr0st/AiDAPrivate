@@ -17,7 +17,8 @@ using namespace aida::analysis::c03;
 
 static_assert(sizeof(workspace_id_t::bytes_t) == 16, "workspace identity width changed");
 static_assert(sizeof(packed_analysis_id_t) == 8, "packed analysis id width changed");
-static_assert(c03_contract_schema_version == 2, "contract schema version changed");
+static_assert(sizeof(decompiler_cache_namespace_t) == 16, "decompiler cache namespace width changed");
+static_assert(c03_contract_schema_version == 3, "contract schema version changed");
 static_assert(static_cast<std::uint16_t>(contract_schema_t::workspace_identity) == 1,
               "workspace schema value changed");
 static_assert(static_cast<std::uint16_t>(contract_schema_t::immutable_publication) == 5,
@@ -32,6 +33,12 @@ static_assert(static_cast<std::uint16_t>(contract_error_code_t::resource_budget_
               "resource budget error value changed");
 static_assert(static_cast<std::uint16_t>(contract_error_code_t::target_identity_provenance_mismatch) == 17,
               "target provenance mismatch error value changed");
+static_assert(static_cast<std::uint16_t>(contract_error_code_t::invalid_binary_format) == 18,
+              "invalid binary format error value changed");
+static_assert(static_cast<std::uint16_t>(contract_error_code_t::invalid_metadata_revision) == 22,
+              "invalid metadata revision error value changed");
+static_assert(static_cast<std::uint16_t>(contract_error_code_t::invalid_decompiler_cache_namespace) == 23,
+              "invalid decompiler cache namespace error value changed");
 
 void require(bool condition, std::string_view message)
 {
@@ -949,6 +956,218 @@ void verify_provider_kinds()
             "streaming provider provenance was rejected by the validator");
 }
 
+void verify_binary_identity_fields()
+{
+    const auto workspace = make_workspace(91);
+    const auto target_id = require_value(target_id_t::from_value(0x5001), "target id creation failed");
+
+    const auto static_target = require_value(target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::x64,
+        binary_mode_t::bit64, binary_endian_t::little),
+        "binary identity target creation failed");
+    require(static_target.valid(), "binary identity target was not valid");
+    require(static_target.format() == binary_format_t::pe32_plus,
+            "binary format was not retained");
+    require(static_target.architecture() == binary_architecture_t::x64,
+            "binary architecture was not retained");
+    require(static_target.mode() == binary_mode_t::bit64,
+            "binary mode was not retained");
+    require(static_target.endian() == binary_endian_t::little,
+            "binary endian was not retained");
+
+    const auto unknown_format = target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::unknown, binary_architecture_t::x64,
+        binary_mode_t::bit64, binary_endian_t::little);
+    require(!unknown_format &&
+            unknown_format.error().code == contract_error_code_t::invalid_binary_format,
+            "unknown binary format was accepted");
+
+    const auto unknown_arch = target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::unknown,
+        binary_mode_t::bit64, binary_endian_t::little);
+    require(!unknown_arch &&
+            unknown_arch.error().code == contract_error_code_t::invalid_binary_architecture,
+            "unknown binary architecture was accepted");
+
+    const auto unknown_mode = target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::x64,
+        binary_mode_t::unknown, binary_endian_t::little);
+    require(!unknown_mode &&
+            unknown_mode.error().code == contract_error_code_t::invalid_binary_mode,
+            "unknown binary mode was accepted");
+
+    const auto unknown_endian = target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::x64,
+        binary_mode_t::bit64, binary_endian_t::unknown);
+    require(!unknown_endian &&
+            unknown_endian.error().code == contract_error_code_t::invalid_binary_endian,
+            "unknown binary endian was accepted");
+
+    const auto elf_target = require_value(target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(93)}, std::nullopt,
+        binary_format_t::elf64, binary_architecture_t::aarch64,
+        binary_mode_t::bit64, binary_endian_t::little),
+        "elf binary identity target creation failed");
+    require(static_target != elf_target,
+            "different binary format was omitted from target equality");
+
+    const auto x86_target = require_value(target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::x86,
+        binary_mode_t::bit64, binary_endian_t::little),
+        "x86 binary identity target creation failed");
+    require(static_target != x86_target,
+            "different binary architecture was omitted from target equality");
+
+    const auto bit32_target = require_value(target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::x64,
+        binary_mode_t::bit32, binary_endian_t::little),
+        "bit32 binary identity target creation failed");
+    require(static_target != bit32_target,
+            "different binary mode was omitted from target equality");
+
+    const auto big_endian_target = require_value(target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::x64,
+        binary_mode_t::bit64, binary_endian_t::big),
+        "big endian binary identity target creation failed");
+    require(static_target != big_endian_target,
+            "different binary endian was omitted from target equality");
+
+    const auto same_binary_target = require_value(target_contract_identity_t::make(
+        workspace, target_id, analysis_target_kind_t::static_image,
+        std::optional<static_provider_provenance_t>{make_static_provider_provenance(92)}, std::nullopt,
+        binary_format_t::pe32_plus, binary_architecture_t::x64,
+        binary_mode_t::bit64, binary_endian_t::little),
+        "same binary identity target creation failed");
+    require(static_target == same_binary_target,
+            "equal binary identity targets diverged");
+
+    require(is_known_binary_format(binary_format_t::pe32), "pe32 format was not known");
+    require(is_known_binary_format(binary_format_t::pe32_plus), "pe32_plus format was not known");
+    require(is_known_binary_format(binary_format_t::elf32), "elf32 format was not known");
+    require(is_known_binary_format(binary_format_t::elf64), "elf64 format was not known");
+    require(is_known_binary_format(binary_format_t::mach_o32), "mach_o32 format was not known");
+    require(is_known_binary_format(binary_format_t::mach_o64), "mach_o64 format was not known");
+    require(is_known_binary_format(binary_format_t::raw), "raw format was not known");
+    require(!is_known_binary_format(binary_format_t::unknown), "unknown format was known");
+
+    require(is_known_binary_architecture(binary_architecture_t::x86), "x86 architecture was not known");
+    require(is_known_binary_architecture(binary_architecture_t::x64), "x64 architecture was not known");
+    require(is_known_binary_architecture(binary_architecture_t::arm), "arm architecture was not known");
+    require(is_known_binary_architecture(binary_architecture_t::aarch64), "aarch64 architecture was not known");
+    require(is_known_binary_architecture(binary_architecture_t::mips), "mips architecture was not known");
+    require(is_known_binary_architecture(binary_architecture_t::ppc), "ppc architecture was not known");
+    require(is_known_binary_architecture(binary_architecture_t::riscv), "riscv architecture was not known");
+    require(!is_known_binary_architecture(binary_architecture_t::unknown), "unknown architecture was known");
+
+    require(is_known_binary_mode(binary_mode_t::bit32), "bit32 mode was not known");
+    require(is_known_binary_mode(binary_mode_t::bit64), "bit64 mode was not known");
+    require(is_known_binary_mode(binary_mode_t::thumb), "thumb mode was not known");
+    require(!is_known_binary_mode(binary_mode_t::unknown), "unknown mode was known");
+
+    require(is_known_binary_endian(binary_endian_t::little), "little endian was not known");
+    require(is_known_binary_endian(binary_endian_t::big), "big endian was not known");
+    require(is_known_binary_endian(binary_endian_t::mixed), "mixed endian was not known");
+    require(!is_known_binary_endian(binary_endian_t::unknown), "unknown endian was known");
+
+    require(contract_error_code_name(contract_error_code_t::invalid_binary_format) ==
+                "C03_INVALID_BINARY_FORMAT",
+            "invalid_binary_format error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_binary_architecture) ==
+                "C03_INVALID_BINARY_ARCHITECTURE",
+            "invalid_binary_architecture error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_binary_mode) ==
+                "C03_INVALID_BINARY_MODE",
+            "invalid_binary_mode error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_binary_endian) ==
+                "C03_INVALID_BINARY_ENDIAN",
+            "invalid_binary_endian error code name changed");
+}
+
+void verify_generation_metadata_fields()
+{
+    const auto workspace = make_workspace(101);
+    const auto generation = make_generation(workspace, 0x6001, 9);
+
+    decompiler_cache_namespace_t cache_ns = make_identity_bytes<16>(111);
+    const auto snapshot = require_value(immutable_snapshot_contract_t::make(
+        generation, 20, 10, 5, 7, cache_ns),
+        "generation metadata snapshot creation failed");
+    require(snapshot.valid(), "generation metadata snapshot was not valid");
+    require(snapshot.metadata_revision() == 7,
+            "metadata revision was not retained");
+    require(snapshot.decompiler_cache_namespace() == cache_ns,
+            "decompiler cache namespace was not retained");
+
+    const auto zero_metadata = immutable_snapshot_contract_t::make(
+        generation, 20, 10, 5, 0, cache_ns);
+    require(!zero_metadata &&
+            zero_metadata.error().code == contract_error_code_t::invalid_metadata_revision,
+            "zero metadata revision was accepted");
+
+    const auto zero_cache_ns = immutable_snapshot_contract_t::make(
+        generation, 20, 10, 5, 7, decompiler_cache_namespace_t{});
+    require(!zero_cache_ns &&
+            zero_cache_ns.error().code == contract_error_code_t::invalid_decompiler_cache_namespace,
+            "all-zero decompiler cache namespace was accepted");
+
+    const auto same_snapshot = require_value(immutable_snapshot_contract_t::make(
+        generation, 20, 10, 5, 7, cache_ns),
+        "generation metadata snapshot creation failed");
+    require(snapshot == same_snapshot,
+            "equal generation metadata snapshots diverged");
+
+    const auto diff_metadata = require_value(immutable_snapshot_contract_t::make(
+        generation, 20, 10, 5, 8, cache_ns),
+        "generation metadata snapshot creation failed");
+    require(snapshot != diff_metadata,
+            "metadata revision was omitted from snapshot equality");
+
+    decompiler_cache_namespace_t other_cache_ns = make_identity_bytes<16>(222);
+    const auto diff_cache_ns = require_value(immutable_snapshot_contract_t::make(
+        generation, 20, 10, 5, 7, other_cache_ns),
+        "generation metadata snapshot creation failed");
+    require(snapshot != diff_cache_ns,
+            "decompiler cache namespace was omitted from snapshot equality");
+
+    require(decompiler_cache_namespace_present(cache_ns),
+            "non-zero decompiler cache namespace was not present");
+    require(!decompiler_cache_namespace_present(decompiler_cache_namespace_t{}),
+            "all-zero decompiler cache namespace was present");
+
+    require(contract_error_code_name(contract_error_code_t::invalid_metadata_revision) ==
+                "C03_INVALID_METADATA_REVISION",
+            "invalid_metadata_revision error code name changed");
+    require(contract_error_code_name(contract_error_code_t::invalid_decompiler_cache_namespace) ==
+                "C03_INVALID_DECOMPILER_CACHE_NAMESPACE",
+            "invalid_decompiler_cache_namespace error code name changed");
+
+    const auto default_snapshot = require_value(immutable_snapshot_contract_t::make(
+        generation, 20, 10, 5),
+        "default generation metadata snapshot creation failed");
+    require(default_snapshot.valid(), "default generation metadata snapshot was not valid");
+    require(default_snapshot.metadata_revision() == 1,
+            "default metadata revision was not 1");
+    require(default_snapshot.decompiler_cache_namespace() == default_decompiler_cache_namespace,
+            "default decompiler cache namespace was not the default constant");
+}
+
 }
 
 int main()
@@ -965,6 +1184,8 @@ int main()
         verify_equality_operators();
         verify_primitive_id_rejection();
         verify_provider_kinds();
+        verify_binary_identity_fields();
+        verify_generation_metadata_fields();
         std::cout << "analysis contracts harness passed\n";
         return 0;
     } catch (const std::exception& error) {

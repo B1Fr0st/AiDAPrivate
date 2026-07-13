@@ -27,11 +27,16 @@ struct dex_parse_limits_t {
     std::uint32_t max_dex_files = 64;
 };
 
+struct dex_annotation_info_t {
+    std::string type_descriptor;
+    std::uint8_t visibility = 0;
+};
+
 struct dex_metadata_t {
     dex_image_t image;
     dex_container_info_t container;
     std::uint32_t dex_ordinal = 0;
-    std::vector<std::string> annotation_type_descriptors;
+    std::vector<dex_annotation_info_t> annotations;
     std::vector<std::pair<std::uint32_t, std::string>> method_references;
     std::vector<std::pair<std::uint32_t, std::string>> field_references;
     std::vector<std::pair<std::uint32_t, std::string>> type_references;

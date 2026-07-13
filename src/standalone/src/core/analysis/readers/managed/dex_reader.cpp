@@ -73,14 +73,155 @@ void collect_dex_references(const dex_image_t& image,
     }
 }
 
-void collect_annotation_descriptors(const dex_image_t& image,
-                                     std::vector<std::string>& descriptors) {
+std::uint32_t read_u32_le(const std::vector<std::uint8_t>& data, std::size_t offset) {
+    if (offset + 4 > data.size())
+        return 0;
+    return static_cast<std::uint32_t>(data[offset]) |
+           (static_cast<std::uint32_t>(data[offset + 1]) << 8) |
+           (static_cast<std::uint32_t>(data[offset + 2]) << 16) |
+           (static_cast<std::uint32_t>(data[offset + 3]) << 24);
+}
+
+std::optional<std::uint32_t> read_uleb128(const std::vector<std::uint8_t>& data,
+                                           std::size_t& cursor) {
+    std::uint32_t result = 0;
+    std::uint32_t shift = 0;
+    while (cursor < data.size()) {
+        const auto byte = data[cursor++];
+        result |= static_cast<std::uint32_t>(byte & 0x7fu) << shift;
+        if ((byte & 0x80u) == 0u)
+            return result;
+        shift += 7;
+        if (shift >= 35)
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<std::uint8_t>> read_dex_bytes(
+    const byte_provider_t& provider, std::uint64_t abs_offset, std::uint64_t needed,
+    std::uint64_t dex_end, const cancellation_token_t& cancel) {
+    if (abs_offset >= dex_end)
+        return std::nullopt;
+    const auto available = dex_end - abs_offset;
+    const auto to_read = (std::min)(needed, available);
+    auto result = provider.read_vector(abs_offset, to_read, 64ULL * 1024ULL * 1024ULL, cancel);
+    if (!result)
+        return std::nullopt;
+    return result.take_value();
+}
+
+void collect_annotation_item(const dex_image_t& image,
+                             const byte_provider_t& provider,
+                             std::uint32_t item_offset,
+                             std::vector<dex_annotation_info_t>& annotations,
+                             std::uint32_t max_annotations,
+                             std::uint64_t dex_end,
+                             const cancellation_token_t& cancel) {
+    if (annotations.size() >= max_annotations || item_offset == 0)
+        return;
+    const auto abs = image.dex_offset + item_offset;
+    auto data_opt = read_dex_bytes(provider, abs, 16, dex_end, cancel);
+    if (!data_opt || data_opt->empty())
+        return;
+    const auto& data = *data_opt;
+    dex_annotation_info_t info;
+    info.visibility = data[0];
+    std::size_t cursor = 1;
+    auto type_idx = read_uleb128(data, cursor);
+    if (!type_idx || *type_idx >= image.types.size())
+        return;
+    info.type_descriptor = image.types[*type_idx].descriptor;
+    annotations.push_back(std::move(info));
+}
+
+void collect_annotation_set(const dex_image_t& image,
+                            const byte_provider_t& provider,
+                            std::uint32_t set_offset,
+                            std::vector<dex_annotation_info_t>& annotations,
+                            std::uint32_t max_annotations,
+                            std::uint64_t dex_end,
+                            const cancellation_token_t& cancel) {
+    if (set_offset == 0)
+        return;
+    const auto abs = image.dex_offset + set_offset;
+    auto header_opt = read_dex_bytes(provider, abs, 4, dex_end, cancel);
+    if (!header_opt || header_opt->size() < 4)
+        return;
+    const auto set_size = read_u32_le(*header_opt, 0);
+    if (set_size == 0 || set_size > 65536)
+        return;
+    const auto set_total = 4u + static_cast<std::uint64_t>(set_size) * 4u;
+    auto set_data_opt = read_dex_bytes(provider, abs, set_total, dex_end, cancel);
+    if (!set_data_opt)
+        return;
+    const auto& set_data = *set_data_opt;
+    for (std::uint32_t i = 0; i < set_size; ++i) {
+        if (annotations.size() >= max_annotations)
+            return;
+        if (cancel.stop_requested())
+            return;
+        const auto entry_off = read_u32_le(set_data, 4 + i * 4);
+        if (entry_off == 0)
+            continue;
+        collect_annotation_item(image, provider, entry_off, annotations,
+                                max_annotations, dex_end, cancel);
+    }
+}
+
+void collect_dex_annotations(const dex_image_t& image,
+                             const byte_provider_t& provider,
+                             std::vector<dex_annotation_info_t>& annotations,
+                             std::uint32_t max_annotations,
+                             const cancellation_token_t& cancel) {
+    const auto dex_end = image.dex_offset + image.header.file_size;
     for (const auto& cls : image.classes) {
-        if (cls.annotations_offset != 0 && cls.class_data_offset != 0) {
-            for (const auto& iface : cls.interface_type_indices) {
-                if (iface < image.types.size())
-                    descriptors.push_back(image.types[iface].descriptor);
-            }
+        if (cancel.stop_requested())
+            return;
+        if (annotations.size() >= max_annotations)
+            return;
+        if (cls.annotations_offset == 0)
+            continue;
+        const auto abs = image.dex_offset + cls.annotations_offset;
+        auto hdr_opt = read_dex_bytes(provider, abs, 16, dex_end, cancel);
+        if (!hdr_opt || hdr_opt->size() < 16)
+            continue;
+        const auto& hdr = *hdr_opt;
+        const auto class_annotations_off = read_u32_le(hdr, 0);
+        const auto fields_size = read_u32_le(hdr, 4);
+        const auto methods_size = read_u32_le(hdr, 8);
+        const auto params_size = read_u32_le(hdr, 12);
+        if (class_annotations_off != 0)
+            collect_annotation_set(image, provider, class_annotations_off,
+                                   annotations, max_annotations, dex_end, cancel);
+        const auto dir_total = 16u +
+            static_cast<std::uint64_t>(fields_size) * 8u +
+            static_cast<std::uint64_t>(methods_size) * 8u +
+            static_cast<std::uint64_t>(params_size) * 8u;
+        if (dir_total <= 16u || dir_total > 4u * 1024u * 1024u)
+            continue;
+        auto dir_opt = read_dex_bytes(provider, abs, dir_total, dex_end, cancel);
+        if (!dir_opt)
+            continue;
+        const auto& dir = *dir_opt;
+        std::size_t cursor = 16;
+        for (std::uint32_t i = 0; i < fields_size; ++i) {
+            if (cursor + 8 > dir.size())
+                break;
+            const auto ann_off = read_u32_le(dir, cursor + 4);
+            cursor += 8;
+            if (ann_off != 0)
+                collect_annotation_set(image, provider, ann_off,
+                                       annotations, max_annotations, dex_end, cancel);
+        }
+        for (std::uint32_t i = 0; i < methods_size; ++i) {
+            if (cursor + 8 > dir.size())
+                break;
+            const auto ann_off = read_u32_le(dir, cursor + 4);
+            cursor += 8;
+            if (ann_off != 0)
+                collect_annotation_set(image, provider, ann_off,
+                                       annotations, max_annotations, dex_end, cancel);
         }
     }
 }
@@ -107,7 +248,8 @@ parse_dex_metadata(const byte_provider_t& provider,
         metadata.dex_ordinal = 0;
         collect_dex_references(metadata.image, metadata.method_references,
                                metadata.field_references, metadata.type_references);
-        collect_annotation_descriptors(metadata.image, metadata.annotation_type_descriptors);
+        collect_dex_annotations(metadata.image, provider, metadata.annotations,
+                                limits.max_annotations, cancel);
         return workspace_result_t<dex_metadata_t>::success(std::move(metadata));
     }
 
@@ -127,7 +269,8 @@ parse_dex_metadata(const byte_provider_t& provider,
     metadata.dex_ordinal = 0;
     collect_dex_references(metadata.image, metadata.method_references,
                            metadata.field_references, metadata.type_references);
-    collect_annotation_descriptors(metadata.image, metadata.annotation_type_descriptors);
+    collect_dex_annotations(metadata.image, provider, metadata.annotations,
+                            limits.max_annotations, cancel);
     return workspace_result_t<dex_metadata_t>::success(std::move(metadata));
 }
 
@@ -162,14 +305,31 @@ parse_multidex_metadata(const byte_provider_t& provider,
     }
 
     std::uint32_t ordinal = 0;
-    for (const auto offset : container.embedded_dex_offsets) {
+    for (std::size_t off_idx = 0; off_idx < container.embedded_dex_offsets.size(); ++off_idx) {
         if (ordinal >= limits.max_dex_files)
             break;
         if (cancel.stop_requested())
             return workspace_result_t<multidex_metadata_t>::failure(
                 dex_managed_error(workspace_error_code_t::cancelled,
                                   "Multidex parsing cancelled", "dex.multidex"));
-        auto image_result = parse_dex_image(provider, limits.parser_limits, cancel);
+        const auto dex_offset = container.embedded_dex_offsets[off_idx];
+        if (dex_offset >= provider.size())
+            continue;
+        const auto end_offset = (off_idx + 1 < container.embedded_dex_offsets.size())
+            ? container.embedded_dex_offsets[off_idx + 1]
+            : provider.size();
+        if (end_offset <= dex_offset)
+            continue;
+        const auto dex_length = end_offset - dex_offset;
+        auto provider_ptr = std::shared_ptr<const byte_provider_t>(
+            std::addressof(provider), [](const byte_provider_t*) {});
+        auto subrange_result = subrange_provider_t::create(
+            std::move(provider_ptr), dex_offset, dex_length,
+            "dex_" + std::to_string(ordinal));
+        if (!subrange_result)
+            continue;
+        auto subrange = subrange_result.take_value();
+        auto image_result = parse_dex_image(*subrange, limits.parser_limits, cancel);
         if (!image_result)
             continue;
         dex_metadata_t entry;
@@ -178,7 +338,8 @@ parse_multidex_metadata(const byte_provider_t& provider,
         entry.dex_ordinal = ordinal;
         collect_dex_references(entry.image, entry.method_references,
                                entry.field_references, entry.type_references);
-        collect_annotation_descriptors(entry.image, entry.annotation_type_descriptors);
+        collect_dex_annotations(entry.image, *subrange, entry.annotations,
+                                limits.max_annotations, cancel);
         multidex.dex_entries.push_back(std::move(entry));
         ++ordinal;
     }
@@ -488,14 +649,15 @@ build_dex_artifact(const dex_metadata_t& metadata,
         }
     }
 
-    for (const auto& ann_desc : metadata.annotation_type_descriptors) {
+    for (const auto& ann : metadata.annotations) {
         if (artifact.annotations.size() >= limits.max_annotations)
             return workspace_result_t<managed_artifact_t>::failure(
                 dex_managed_error(workspace_error_code_t::limit_exceeded,
                                   "DEX annotation count exceeds limit", "dex.build"));
         managed_annotation_t annotation;
-        annotation.annotation_type = ann_desc;
-        annotation.is_runtime_visible = true;
+        annotation.annotation_type = ann.type_descriptor;
+        annotation.is_runtime_visible = (ann.visibility == 0x01u || ann.visibility == 0x02u);
+        annotation.is_runtime_invisible = (ann.visibility == 0x00u);
         artifact.annotations.push_back(std::move(annotation));
     }
 

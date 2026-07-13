@@ -10,7 +10,7 @@
 
 namespace aida::analysis::c03 {
 
-inline constexpr std::uint32_t c03_contract_schema_version = 2;
+inline constexpr std::uint32_t c03_contract_schema_version = 3;
 inline constexpr std::uint64_t kibibyte = 1024ULL;
 inline constexpr std::uint64_t mebibyte = 1024ULL * kibibyte;
 inline constexpr std::uint64_t gibibyte = 1024ULL * mebibyte;
@@ -54,7 +54,13 @@ enum class contract_error_code_t : std::uint16_t {
     serialization_schema_mismatch = 14,
     invalid_static_provider_provenance = 15,
     invalid_live_target_identity = 16,
-    target_identity_provenance_mismatch = 17
+    target_identity_provenance_mismatch = 17,
+    invalid_binary_format = 18,
+    invalid_binary_architecture = 19,
+    invalid_binary_mode = 20,
+    invalid_binary_endian = 21,
+    invalid_metadata_revision = 22,
+    invalid_decompiler_cache_namespace = 23
 };
 
 struct contract_error_t final {
@@ -232,8 +238,50 @@ enum class static_provider_kind_t : std::uint8_t {
     streaming = 4
 };
 
+enum class binary_format_t : std::uint8_t {
+    unknown = 0,
+    pe32 = 1,
+    pe32_plus = 2,
+    elf32 = 3,
+    elf64 = 4,
+    mach_o32 = 5,
+    mach_o64 = 6,
+    raw = 7
+};
+
+enum class binary_architecture_t : std::uint8_t {
+    unknown = 0,
+    x86 = 1,
+    x64 = 2,
+    arm = 3,
+    aarch64 = 4,
+    mips = 5,
+    ppc = 6,
+    riscv = 7
+};
+
+enum class binary_mode_t : std::uint8_t {
+    unknown = 0,
+    bit32 = 1,
+    bit64 = 2,
+    thumb = 3
+};
+
+enum class binary_endian_t : std::uint8_t {
+    unknown = 0,
+    little = 1,
+    big = 2,
+    mixed = 3
+};
+
 using identity_fingerprint_t = std::array<std::uint8_t, 32>;
 using source_file_identity_t = std::array<std::uint8_t, 16>;
+using decompiler_cache_namespace_t = std::array<std::uint8_t, 16>;
+
+inline constexpr decompiler_cache_namespace_t default_decompiler_cache_namespace{
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10
+};
 
 template <std::size_t size>
 constexpr bool identity_bytes_present(const std::array<std::uint8_t, size>& bytes) noexcept
@@ -249,6 +297,36 @@ constexpr bool range_is_present(std::uint64_t base, std::uint64_t size) noexcept
 {
     return base != 0 && size != 0 && size <= (std::numeric_limits<std::uint64_t>::max)() - base;
 }
+
+constexpr bool is_known_binary_format(binary_format_t format) noexcept
+{
+    return format != binary_format_t::unknown;
+}
+
+constexpr bool is_known_binary_architecture(binary_architecture_t architecture) noexcept
+{
+    return architecture != binary_architecture_t::unknown;
+}
+
+constexpr bool is_known_binary_mode(binary_mode_t mode) noexcept
+{
+    return mode != binary_mode_t::unknown;
+}
+
+constexpr bool is_known_binary_endian(binary_endian_t endian) noexcept
+{
+    return endian != binary_endian_t::unknown;
+}
+
+constexpr bool decompiler_cache_namespace_present(
+    const decompiler_cache_namespace_t& namespace_id) noexcept
+{
+    return identity_bytes_present(namespace_id);
+}
+
+contract_result_t<void> validate_binary_identity_fields(
+    binary_format_t format, binary_architecture_t architecture,
+    binary_mode_t mode, binary_endian_t endian) noexcept;
 
 struct static_provider_provenance_t final {
     static_provider_kind_t provider_kind = static_provider_kind_t::unknown;
@@ -372,7 +450,11 @@ public:
         make(const workspace_contract_identity_t& workspace, const target_id_t& target,
              analysis_target_kind_t kind,
              std::optional<static_provider_provenance_t> static_provider_provenance,
-             std::optional<live_target_identity_t> live_identity) noexcept;
+             std::optional<live_target_identity_t> live_identity,
+             binary_format_t format = binary_format_t::pe32_plus,
+             binary_architecture_t architecture = binary_architecture_t::x64,
+             binary_mode_t mode = binary_mode_t::bit64,
+             binary_endian_t endian = binary_endian_t::little) noexcept;
 
     constexpr const workspace_contract_identity_t& workspace() const noexcept { return workspace_; }
     constexpr const target_id_t& target_id() const noexcept { return target_id_; }
@@ -383,20 +465,28 @@ public:
     constexpr const std::optional<live_target_identity_t>& live_identity() const noexcept {
         return live_identity_;
     }
+    constexpr binary_format_t format() const noexcept { return format_; }
+    constexpr binary_architecture_t architecture() const noexcept { return architecture_; }
+    constexpr binary_mode_t mode() const noexcept { return mode_; }
+    constexpr binary_endian_t endian() const noexcept { return endian_; }
     constexpr bool valid() const noexcept {
         const bool static_kind = kind_ == analysis_target_kind_t::static_image ||
             kind_ == analysis_target_kind_t::collection_member;
-        return workspace_.valid() && target_id_.valid() &&
+        const bool binary_known = format_ != binary_format_t::unknown &&
+            architecture_ != binary_architecture_t::unknown &&
+            mode_ != binary_mode_t::unknown && endian_ != binary_endian_t::unknown;
+        return workspace_.valid() && target_id_.valid() && binary_known &&
             ((static_kind && static_provider_provenance_ && static_provider_provenance_->valid() &&
               !live_identity_) ||
              (kind_ == analysis_target_kind_t::live_module && live_identity_ && live_identity_->valid() &&
-              !static_provider_provenance_));
+               !static_provider_provenance_));
     }
 
     constexpr bool operator==(const target_contract_identity_t& other) const noexcept {
         return workspace_ == other.workspace_ && target_id_ == other.target_id_ && kind_ == other.kind_ &&
             static_provider_provenance_ == other.static_provider_provenance_ &&
-            live_identity_ == other.live_identity_;
+            live_identity_ == other.live_identity_ && format_ == other.format_ &&
+            architecture_ == other.architecture_ && mode_ == other.mode_ && endian_ == other.endian_;
     }
 
     constexpr bool operator!=(const target_contract_identity_t& other) const noexcept {
@@ -407,18 +497,30 @@ private:
     constexpr target_contract_identity_t(workspace_contract_identity_t workspace, target_id_t target,
                                          analysis_target_kind_t kind,
                                          std::optional<static_provider_provenance_t> static_provider_provenance,
-                                         std::optional<live_target_identity_t> live_identity) noexcept
+                                         std::optional<live_target_identity_t> live_identity,
+                                         binary_format_t format,
+                                         binary_architecture_t architecture,
+                                         binary_mode_t mode,
+                                         binary_endian_t endian) noexcept
         : workspace_(workspace),
           target_id_(target),
           kind_(kind),
           static_provider_provenance_(static_provider_provenance),
-          live_identity_(live_identity) {}
+          live_identity_(live_identity),
+          format_(format),
+          architecture_(architecture),
+          mode_(mode),
+          endian_(endian) {}
 
     workspace_contract_identity_t workspace_{};
     target_id_t target_id_{};
     analysis_target_kind_t kind_ = analysis_target_kind_t::unknown;
     std::optional<static_provider_provenance_t> static_provider_provenance_;
     std::optional<live_target_identity_t> live_identity_;
+    binary_format_t format_ = binary_format_t::unknown;
+    binary_architecture_t architecture_ = binary_architecture_t::unknown;
+    binary_mode_t mode_ = binary_mode_t::unknown;
+    binary_endian_t endian_ = binary_endian_t::unknown;
 };
 
 class generation_contract_identity_t final {
@@ -476,19 +578,28 @@ public:
 
     static contract_result_t<immutable_snapshot_contract_t>
         make(const generation_contract_identity_t& generation, std::uint64_t snapshot_revision,
-             std::uint64_t layout_revision, std::uint64_t overlay_revision) noexcept;
+             std::uint64_t layout_revision, std::uint64_t overlay_revision,
+             std::uint64_t metadata_revision = 1,
+             decompiler_cache_namespace_t decompiler_cache_namespace = default_decompiler_cache_namespace) noexcept;
 
     constexpr const generation_contract_identity_t& generation() const noexcept { return generation_; }
     constexpr std::uint64_t snapshot_revision() const noexcept { return snapshot_revision_; }
     constexpr std::uint64_t layout_revision() const noexcept { return layout_revision_; }
     constexpr std::uint64_t overlay_revision() const noexcept { return overlay_revision_; }
+    constexpr std::uint64_t metadata_revision() const noexcept { return metadata_revision_; }
+    constexpr const decompiler_cache_namespace_t& decompiler_cache_namespace() const noexcept {
+        return decompiler_cache_namespace_;
+    }
     constexpr bool valid() const noexcept {
-        return generation_.valid() && snapshot_revision_ != 0 && layout_revision_ != 0;
+        return generation_.valid() && snapshot_revision_ != 0 && layout_revision_ != 0 &&
+            metadata_revision_ != 0 && identity_bytes_present(decompiler_cache_namespace_);
     }
 
     constexpr bool operator==(const immutable_snapshot_contract_t& other) const noexcept {
         return generation_ == other.generation_ && snapshot_revision_ == other.snapshot_revision_ &&
-            layout_revision_ == other.layout_revision_ && overlay_revision_ == other.overlay_revision_;
+            layout_revision_ == other.layout_revision_ && overlay_revision_ == other.overlay_revision_ &&
+            metadata_revision_ == other.metadata_revision_ &&
+            decompiler_cache_namespace_ == other.decompiler_cache_namespace_;
     }
 
     constexpr bool operator!=(const immutable_snapshot_contract_t& other) const noexcept {
@@ -499,16 +610,22 @@ private:
     constexpr immutable_snapshot_contract_t(generation_contract_identity_t generation,
                                             std::uint64_t snapshot_revision,
                                             std::uint64_t layout_revision,
-                                            std::uint64_t overlay_revision) noexcept
+                                            std::uint64_t overlay_revision,
+                                            std::uint64_t metadata_revision,
+                                            decompiler_cache_namespace_t decompiler_cache_namespace) noexcept
         : generation_(generation),
           snapshot_revision_(snapshot_revision),
           layout_revision_(layout_revision),
-          overlay_revision_(overlay_revision) {}
+          overlay_revision_(overlay_revision),
+          metadata_revision_(metadata_revision),
+          decompiler_cache_namespace_(decompiler_cache_namespace) {}
 
     generation_contract_identity_t generation_{};
     std::uint64_t snapshot_revision_ = 0;
     std::uint64_t layout_revision_ = 0;
     std::uint64_t overlay_revision_ = 0;
+    std::uint64_t metadata_revision_ = 0;
+    decompiler_cache_namespace_t decompiler_cache_namespace_{};
 };
 
 class immutable_publication_contract_t final {
@@ -702,6 +819,7 @@ static_assert(sizeof(std::uint32_t) == 4, "C03 contracts require 32-bit schema f
 static_assert(sizeof(std::uint64_t) == 8, "C03 contracts require 64-bit identifiers");
 static_assert(sizeof(workspace_id_t::bytes_t) == 16, "C03 workspace identifiers are 128-bit");
 static_assert(sizeof(source_file_identity_t) == 16, "C03 source file identities are 128-bit");
+static_assert(sizeof(decompiler_cache_namespace_t) == 16, "C03 decompiler cache namespaces are 128-bit");
 static_assert(sizeof(identity_fingerprint_t) == 32, "C03 identity fingerprints are 256-bit");
 static_assert(sizeof(packed_analysis_id_t) == sizeof(std::uint64_t),
               "C03 packed analysis identifiers are 64-bit");
@@ -713,6 +831,12 @@ static_assert(static_cast<std::uint16_t>(contract_error_code_t::generation_misma
               "C03 generation mismatch code is stable");
 static_assert(static_cast<std::uint16_t>(contract_error_code_t::arithmetic_overflow) == 11,
               "C03 arithmetic overflow code is stable");
+static_assert(static_cast<std::uint16_t>(contract_error_code_t::invalid_binary_format) == 18,
+              "C03 invalid binary format code is stable");
+static_assert(static_cast<std::uint16_t>(contract_error_code_t::invalid_metadata_revision) == 22,
+              "C03 invalid metadata revision code is stable");
+static_assert(static_cast<std::uint16_t>(contract_error_code_t::invalid_decompiler_cache_namespace) == 23,
+              "C03 invalid decompiler cache namespace code is stable");
 static_assert(std::numeric_limits<std::uint64_t>::digits == 64,
               "C03 contracts require 64-bit unsigned arithmetic");
 

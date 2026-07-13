@@ -96,14 +96,6 @@ public:
                        const collection_member_descriptor_t& descriptor,
                        bool is_collection);
 
-    workspace_result_t<member_node_id_t>
-        register_companion(member_node_id_t parent_id,
-                           const collection_member_descriptor_t& descriptor,
-                           bool is_debug_companion);
-
-    workspace_result_t<void>
-        link_companion(member_node_id_t binary_id, member_node_id_t debug_id);
-
     const member_node_t* node(member_node_id_t id) const;
     std::vector<member_node_id_t> children(member_node_id_t parent_id) const;
     std::vector<member_node_id_t> children_by_name(member_node_id_t parent_id,

@@ -753,6 +753,126 @@ void verify_graph_traversal_cancellation(const std::filesystem::path& root) {
             "cancelled traversal should report cancellation");
 }
 
+void append_u32_be(std::vector<std::uint8_t>& output, std::uint32_t value) {
+    output.push_back(static_cast<std::uint8_t>(value >> 24));
+    output.push_back(static_cast<std::uint8_t>(value >> 16));
+    output.push_back(static_cast<std::uint8_t>(value >> 8));
+    output.push_back(static_cast<std::uint8_t>(value));
+}
+
+std::vector<std::uint8_t> build_minimal_macho64(std::int32_t cputype,
+                                                std::int32_t cpusubtype) {
+    std::vector<std::uint8_t> macho;
+    append_u32(macho, 0xFEEDFACFu);
+    append_u32(macho, static_cast<std::uint32_t>(cputype));
+    append_u32(macho, static_cast<std::uint32_t>(cpusubtype));
+    append_u32(macho, 2u);
+    append_u32(macho, 0u);
+    append_u32(macho, 0u);
+    append_u32(macho, 0u);
+    append_u32(macho, 0u);
+    return macho;
+}
+
+std::vector<std::uint8_t> build_fat_macho_two_slices() {
+    constexpr std::int32_t CPU_TYPE_X86_64 = 0x01000007;
+    constexpr std::int32_t CPU_TYPE_ARM64 = 0x0100000C;
+    constexpr std::int32_t CPU_SUBTYPE_X86_64_ALL = 3;
+    constexpr std::int32_t CPU_SUBTYPE_ARM64_ALL = 0;
+
+    auto slice0 = build_minimal_macho64(CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL);
+    auto slice1 = build_minimal_macho64(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL);
+
+    const std::uint32_t header_size = 8 + 2 * 20;
+    const std::uint32_t slice0_offset = header_size;
+    const std::uint32_t slice0_size = static_cast<std::uint32_t>(slice0.size());
+    const std::uint32_t slice1_offset = slice0_offset + slice0_size;
+    const std::uint32_t slice1_size = static_cast<std::uint32_t>(slice1.size());
+
+    std::vector<std::uint8_t> fat;
+    append_u32_be(fat, 0xCAFEBABEu);
+    append_u32_be(fat, 2u);
+
+    append_u32_be(fat, static_cast<std::uint32_t>(CPU_TYPE_X86_64));
+    append_u32_be(fat, static_cast<std::uint32_t>(CPU_SUBTYPE_X86_64_ALL));
+    append_u32_be(fat, slice0_offset);
+    append_u32_be(fat, slice0_size);
+    append_u32_be(fat, 12u);
+
+    append_u32_be(fat, static_cast<std::uint32_t>(CPU_TYPE_ARM64));
+    append_u32_be(fat, static_cast<std::uint32_t>(CPU_SUBTYPE_ARM64_ALL));
+    append_u32_be(fat, slice1_offset);
+    append_u32_be(fat, slice1_size);
+    append_u32_be(fat, 14u);
+
+    fat.insert(fat.end(), slice0.begin(), slice0.end());
+    fat.insert(fat.end(), slice1.begin(), slice1.end());
+    return fat;
+}
+
+void verify_fat_macho_slices(const std::filesystem::path& root) {
+    const auto fat_bytes = build_fat_macho_two_slices();
+    const auto path = root / "test_fat.macho";
+    write_fixture(path, fat_bytes);
+    auto collection = open_collection(path);
+    require(collection->kind() == collection_kind_t::fat_macho,
+            "fat Mach-O was not classified as fat_macho");
+    require(collection->member_count() == 2,
+            "fat Mach-O collection should have 2 slice members");
+
+    const auto& slice0 = collection->members()[0];
+    const auto& slice1 = collection->members()[1];
+    require(slice0.member_kind == collection_member_kind_t::fat_slice,
+            "slice 0 should be classified as fat_slice");
+    require(slice1.member_kind == collection_member_kind_t::fat_slice,
+            "slice 1 should be classified as fat_slice");
+    require(slice0.normalized_path == "slice_0",
+            "slice 0 should have stable identity slice_0");
+    require(slice1.normalized_path == "slice_1",
+            "slice 1 should have stable identity slice_1");
+    require(slice0.architecture != slice1.architecture,
+            "slices should have distinct architectures");
+    require(slice0.architecture == architecture_id_t::x86_64,
+            "slice 0 should be x86_64");
+    require(slice1.architecture == architecture_id_t::aarch64,
+            "slice 1 should be aarch64");
+    require(slice0.container_offset != slice1.container_offset,
+            "slices should have distinct container offsets");
+    require(slice0.ordinal == 0, "slice 0 ordinal should be 0");
+    require(slice1.ordinal == 1, "slice 1 ordinal should be 1");
+}
+
+void verify_aab_classification(const std::filesystem::path& root) {
+    const auto archive_bytes = build_zip({
+        {"AndroidManifest.xml", {0x03, 0x00, 0x08, 0x00}, false},
+        {"base/dex/classes.dex", {0x64, 0x65, 0x78, 0x0a, 0x03, 0x00, 0x00, 0x00}, false},
+        {"base/assets/config.json", {0x7b, 0x7d, 0x00, 0x00}, false},
+        {"base/lib/arm64-v8a/libnative.so", {0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00}, false},
+    });
+    const auto path = root / "test.aab";
+    write_fixture(path, archive_bytes);
+    auto collection = open_collection(path);
+    require(collection->kind() == collection_kind_t::aab,
+            "ZIP with base/dex/ and AndroidManifest.xml was not classified as AAB");
+    require(collection->member_count() >= 3,
+            "AAB collection should have at least 3 members");
+
+    const auto* manifest_member = collection->find_member("AndroidManifest.xml");
+    require(manifest_member != nullptr, "AndroidManifest.xml member not found in AAB");
+    require(manifest_member->member_kind == collection_member_kind_t::manifest,
+            "AndroidManifest.xml was not classified as manifest in AAB");
+
+    const auto* dex_member = collection->find_member("base/dex/classes.dex");
+    require(dex_member != nullptr, "base/dex/classes.dex member not found in AAB");
+    require(dex_member->member_kind == collection_member_kind_t::dex,
+            "base/dex/classes.dex was not classified as dex in AAB");
+
+    const auto* so_member = collection->find_member("base/lib/arm64-v8a/libnative.so");
+    require(so_member != nullptr, "base/lib/arm64-v8a/libnative.so member not found in AAB");
+    require(so_member->member_kind == collection_member_kind_t::native_library,
+            "libnative.so in AAB was not classified as native_library");
+}
+
 }
 
 void run_collection_graph_harness(const std::filesystem::path& root) {
@@ -772,6 +892,8 @@ void run_collection_graph_harness(const std::filesystem::path& root) {
         verify_provenance_chain_tracking(root);
         verify_duplicate_name_tracking_within_collection(root);
         verify_graph_traversal_cancellation(root);
+        verify_fat_macho_slices(root);
+        verify_aab_classification(root);
     } catch (...) {
         std::error_code ignored;
         std::filesystem::remove_all(root, ignored);

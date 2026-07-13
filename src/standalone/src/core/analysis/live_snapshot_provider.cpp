@@ -452,7 +452,7 @@ live_snapshot_result_t<void> live_snapshot_provider_t::validate_current_identity
     const auto identity = validate_identity(budget, context);
     if (!identity && invalidates_cached_identity(identity.error().code)) {
         std::unique_lock<std::timed_mutex> cache_lock(cache_mutex_);
-        clear_cache();
+        const_cast<live_snapshot_provider_t*>(this)->clear_cache();
     }
     return identity;
 }

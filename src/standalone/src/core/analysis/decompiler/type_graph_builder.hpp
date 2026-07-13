@@ -11,8 +11,6 @@
 
 namespace aida::analysis::type_graph {
 
-constexpr std::uint32_t k_type_graph_builder_version = 1;
-
 constexpr std::uint32_t k_default_max_nodes = 65536;
 constexpr std::uint32_t k_default_max_edges_per_node = 4096;
 constexpr std::uint32_t k_default_max_total_edges = 1U << 20;
@@ -93,6 +91,7 @@ public:
     type_graph_t build();
 
     const std::vector<type_conflict_record_t>& conflicts() const noexcept { return conflicts_; }
+    const std::vector<provenance_conflict_t>& edge_conflicts() const noexcept { return edge_conflicts_; }
     const type_graph_builder_stats_t& stats() const noexcept { return stats_; }
     const provenance_journal_t& provenance() const noexcept { return provenance_; }
 
@@ -128,6 +127,7 @@ private:
     type_graph_builder_config_t config_;
     std::vector<type_seed_batch_t> batches_;
     std::vector<type_conflict_record_t> conflicts_;
+    std::vector<provenance_conflict_t> edge_conflicts_;
     type_graph_builder_stats_t stats_;
     provenance_journal_t provenance_;
 

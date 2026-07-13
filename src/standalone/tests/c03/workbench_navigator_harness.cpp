@@ -438,6 +438,296 @@ void verify_invalid_requests()
             "invalid query domain was not preserved in the error contract");
 }
 
+std::string make_func_name(std::uint64_t index)
+{
+    std::string name = "func_";
+    name += static_cast<char>('0' + (index / 10000) % 10);
+    name += static_cast<char>('0' + (index / 1000) % 10);
+    name += static_cast<char>('0' + (index / 100) % 10);
+    name += static_cast<char>('0' + (index / 10) % 10);
+    name += static_cast<char>('0' + index % 10);
+    return name;
+}
+
+void verify_large_synthetic_model()
+{
+    constexpr std::uint64_t k_row_count = 10000;
+
+    fixture_store_t store;
+    for (std::uint64_t i = 0; i < k_row_count; ++i)
+        store.add(row(navigator_domain_t::functions, i + 1, make_func_name(i),
+                       0x1000 + i * 0x10));
+
+    navigator_query_model_t chunked_query(store);
+    navigator_query_t chunked_request;
+    chunked_request.domain = navigator_domain_t::functions;
+    require(chunked_query.begin(chunked_request).ok(), "large model chunked begin failed");
+    std::uint64_t advance_count = 0;
+    while (chunked_query.status() == navigator_query_status_t::filtering ||
+           chunked_query.status() == navigator_query_status_t::sorting) {
+        const auto result = chunked_query.advance(1, nullptr);
+        require(result.ok(), "large model chunked advance failed");
+        ++advance_count;
+        require(advance_count <= k_row_count * 10,
+                "large model chunked advance exceeded iteration budget");
+    }
+    require(chunked_query.status() == navigator_query_status_t::ready,
+            "large model chunked query did not finish");
+    require(chunked_query.indexed_row_count() == k_row_count,
+            "large model chunked query did not index all rows");
+    require(advance_count > 1, "large model chunked query did not require multiple advances");
+
+    navigator_query_model_t addr_asc_query(store);
+    navigator_query_t addr_asc_request;
+    addr_asc_request.domain = navigator_domain_t::functions;
+    addr_asc_request.sort.key = navigator_sort_key_t::address;
+    addr_asc_request.sort.descending = false;
+    require(addr_asc_query.begin(addr_asc_request).ok(), "large model address asc begin failed");
+    advance_to_ready(addr_asc_query);
+    require(addr_asc_query.indexed_row_count() == k_row_count,
+            "large model address asc indexed wrong count");
+    navigator_query_page_t addr_asc_first;
+    require(addr_asc_query.page({0, 1}, addr_asc_first).ok(),
+            "large model address asc first page failed");
+    require(addr_asc_first.total_rows == k_row_count && addr_asc_first.rows.size() == 1,
+            "large model address asc total was wrong");
+    require(addr_asc_first.rows.front().address == 0x1000,
+            "large model address asc first row not lowest address");
+    navigator_query_page_t addr_asc_last;
+    require(addr_asc_query.page({k_row_count - 1, 1}, addr_asc_last).ok(),
+            "large model address asc last page failed");
+    require(addr_asc_last.rows.size() == 1 &&
+                addr_asc_last.rows.front().address == 0x1000 + (k_row_count - 1) * 0x10,
+            "large model address asc last row not highest address");
+
+    navigator_query_model_t addr_desc_query(store);
+    navigator_query_t addr_desc_request;
+    addr_desc_request.domain = navigator_domain_t::functions;
+    addr_desc_request.sort.key = navigator_sort_key_t::address;
+    addr_desc_request.sort.descending = true;
+    require(addr_desc_query.begin(addr_desc_request).ok(), "large model address desc begin failed");
+    advance_to_ready(addr_desc_query);
+    require(addr_desc_query.indexed_row_count() == k_row_count,
+            "large model address desc indexed wrong count");
+    navigator_query_page_t addr_desc_first;
+    require(addr_desc_query.page({0, 1}, addr_desc_first).ok(),
+            "large model address desc first page failed");
+    require(addr_desc_first.total_rows == k_row_count && addr_desc_first.rows.size() == 1,
+            "large model address desc total was wrong");
+    require(addr_desc_first.rows.front().address == 0x1000 + (k_row_count - 1) * 0x10,
+            "large model address desc first row not highest address");
+    navigator_query_page_t addr_desc_last;
+    require(addr_desc_query.page({k_row_count - 1, 1}, addr_desc_last).ok(),
+            "large model address desc last page failed");
+    require(addr_desc_last.rows.size() == 1 && addr_desc_last.rows.front().address == 0x1000,
+            "large model address desc last row not lowest address");
+
+    navigator_query_model_t page_query(store);
+    navigator_query_t page_request;
+    page_request.domain = navigator_domain_t::functions;
+    page_request.sort.key = navigator_sort_key_t::address;
+    page_request.sort.descending = false;
+    require(page_query.begin(page_request).ok(), "large model pagination begin failed");
+    advance_to_ready(page_query);
+    constexpr std::uint32_t k_page_size = 100;
+    constexpr std::uint64_t k_page_count = k_row_count / k_page_size;
+    for (std::uint64_t p = 0; p < k_page_count; ++p) {
+        navigator_query_page_t page;
+        require(page_query.page({p * k_page_size, k_page_size}, page).ok(),
+                "large model pagination page failed");
+        require(page.total_rows == k_row_count, "large model pagination total was wrong");
+        require(page.rows.size() == k_page_size, "large model pagination page size was wrong");
+        if (p == 0 || p == k_page_count / 2 || p == k_page_count - 1) {
+            const std::uint64_t expected_first = 0x1000 + p * k_page_size * 0x10;
+            const std::uint64_t expected_last =
+                0x1000 + (p * k_page_size + k_page_size - 1) * 0x10;
+            require(page.rows.front().address == expected_first,
+                    "large model pagination page first address wrong");
+            require(page.rows.back().address == expected_last,
+                    "large model pagination page last address wrong");
+        }
+    }
+
+    navigator_query_model_t cancel_query(store);
+    navigator_query_t cancel_request;
+    cancel_request.domain = navigator_domain_t::functions;
+    require(cancel_query.begin(cancel_request).ok(), "large model cancellation begin failed");
+    require(cancel_query.advance(1, nullptr).ok(), "large model cancellation first advance failed");
+    require(cancel_query.advance(1, nullptr).ok(), "large model cancellation second advance failed");
+    cancellation_t cancellation;
+    cancellation.cancel();
+    const auto cancelled = cancel_query.advance(1, &cancellation);
+    require(cancelled.code == navigator_error_code_t::cancelled &&
+                cancel_query.status() == navigator_query_status_t::cancelled,
+            "large model cancellation did not produce clean cancellation");
+
+    navigator_query_model_t bounded_query(store);
+    navigator_query_t bounded_request;
+    bounded_request.domain = navigator_domain_t::functions;
+    bounded_request.sort.key = navigator_sort_key_t::address;
+    bounded_request.sort.descending = false;
+    require(bounded_query.begin(bounded_request).ok(), "large model read count begin failed");
+    advance_to_ready(bounded_query);
+    const std::uint64_t baseline_reads = store.record_reads();
+    navigator_query_page_t bounded_page;
+    require(bounded_query.page({0, k_page_size}, bounded_page).ok(),
+            "large model read count page failed");
+    const std::uint64_t page_reads = store.record_reads() - baseline_reads;
+    require(page_reads <= k_page_size, "large model page read count exceeded page size");
+
+    store.add(row(navigator_domain_t::functions, 10001, "func_00050", 0xAAAA));
+    store.add(row(navigator_domain_t::functions, 10002, "func_00050", 0xBBBB));
+    store.add(row(navigator_domain_t::functions, 10003, "func_00050", 0xCCCC));
+
+    navigator_query_model_t stable_query(store);
+    navigator_query_t stable_request;
+    stable_request.domain = navigator_domain_t::functions;
+    stable_request.sort.key = navigator_sort_key_t::label;
+    stable_request.sort.descending = false;
+    require(stable_query.begin(stable_request).ok(), "large model stable sort begin failed");
+    advance_to_ready(stable_query);
+    require(stable_query.indexed_row_count() == k_row_count + 3,
+            "large model stable sort indexed wrong count");
+    navigator_query_page_t stable_page;
+    require(stable_query.page({50, 4}, stable_page).ok(),
+            "large model stable sort page failed");
+    require(stable_page.rows.size() == 4, "large model stable sort page size wrong");
+    require(stable_page.rows[0].label == "func_00050" && stable_page.rows[0].id.value == 51,
+            "large model stable sort first duplicate not original row");
+    require(stable_page.rows[1].label == "func_00050" && stable_page.rows[1].id.value == 10001,
+            "large model stable sort second duplicate not first extra");
+    require(stable_page.rows[2].label == "func_00050" && stable_page.rows[2].id.value == 10002,
+            "large model stable sort third duplicate not second extra");
+    require(stable_page.rows[3].label == "func_00050" && stable_page.rows[3].id.value == 10003,
+            "large model stable sort fourth duplicate not third extra");
+}
+
+void verify_additional_sort_keys()
+{
+    fixture_store_t store;
+
+    auto r1 = row(navigator_domain_t::functions, 1, "alpha", 0x3000);
+    r1.severity = navigator_severity_t::warning;
+    store.add(r1);
+
+    auto r2 = row(navigator_domain_t::functions, 2, "Alpha", 0x1000);
+    r2.severity = navigator_severity_t::error;
+    store.add(r2);
+
+    auto r3 = row(navigator_domain_t::functions, 3, "ALPHA", 0x2000);
+    r3.severity = navigator_severity_t::information;
+    store.add(r3);
+
+    auto r4 = row(navigator_domain_t::functions, 4, "beta", 0x4000);
+    r4.severity = navigator_severity_t::fatal;
+    store.add(r4);
+
+    navigator_query_model_t addr_asc_query(store);
+    navigator_query_t addr_asc_request;
+    addr_asc_request.domain = navigator_domain_t::functions;
+    addr_asc_request.sort.key = navigator_sort_key_t::address;
+    addr_asc_request.sort.descending = false;
+    require(addr_asc_query.begin(addr_asc_request).ok(), "additional sort address asc begin failed");
+    advance_to_ready(addr_asc_query);
+    require(addr_asc_query.indexed_row_count() == 4, "additional sort address asc indexed wrong count");
+    navigator_query_page_t addr_asc_page;
+    require(addr_asc_query.page({0, 4}, addr_asc_page).ok(), "additional sort address asc page failed");
+    require(addr_asc_page.rows.size() == 4, "additional sort address asc page size wrong");
+    require(addr_asc_page.rows[0].id.value == 2 && addr_asc_page.rows[0].address == 0x1000,
+            "additional sort address asc first row wrong");
+    require(addr_asc_page.rows[1].id.value == 3 && addr_asc_page.rows[1].address == 0x2000,
+            "additional sort address asc second row wrong");
+    require(addr_asc_page.rows[2].id.value == 1 && addr_asc_page.rows[2].address == 0x3000,
+            "additional sort address asc third row wrong");
+    require(addr_asc_page.rows[3].id.value == 4 && addr_asc_page.rows[3].address == 0x4000,
+            "additional sort address asc fourth row wrong");
+
+    navigator_query_model_t addr_desc_query(store);
+    navigator_query_t addr_desc_request;
+    addr_desc_request.domain = navigator_domain_t::functions;
+    addr_desc_request.sort.key = navigator_sort_key_t::address;
+    addr_desc_request.sort.descending = true;
+    require(addr_desc_query.begin(addr_desc_request).ok(), "additional sort address desc begin failed");
+    advance_to_ready(addr_desc_query);
+    navigator_query_page_t addr_desc_page;
+    require(addr_desc_query.page({0, 4}, addr_desc_page).ok(), "additional sort address desc page failed");
+    require(addr_desc_page.rows.size() == 4, "additional sort address desc page size wrong");
+    require(addr_desc_page.rows[0].id.value == 4 && addr_desc_page.rows[0].address == 0x4000,
+            "additional sort address desc first row wrong");
+    require(addr_desc_page.rows[1].id.value == 1 && addr_desc_page.rows[1].address == 0x3000,
+            "additional sort address desc second row wrong");
+    require(addr_desc_page.rows[2].id.value == 3 && addr_desc_page.rows[2].address == 0x2000,
+            "additional sort address desc third row wrong");
+    require(addr_desc_page.rows[3].id.value == 2 && addr_desc_page.rows[3].address == 0x1000,
+            "additional sort address desc fourth row wrong");
+
+    navigator_query_model_t sev_asc_query(store);
+    navigator_query_t sev_asc_request;
+    sev_asc_request.domain = navigator_domain_t::functions;
+    sev_asc_request.sort.key = navigator_sort_key_t::severity;
+    sev_asc_request.sort.descending = false;
+    require(sev_asc_query.begin(sev_asc_request).ok(), "additional sort severity asc begin failed");
+    advance_to_ready(sev_asc_query);
+    navigator_query_page_t sev_asc_page;
+    require(sev_asc_query.page({0, 4}, sev_asc_page).ok(), "additional sort severity asc page failed");
+    require(sev_asc_page.rows.size() == 4, "additional sort severity asc page size wrong");
+    require(sev_asc_page.rows[0].id.value == 3 &&
+                sev_asc_page.rows[0].severity == navigator_severity_t::information,
+            "additional sort severity asc first row wrong");
+    require(sev_asc_page.rows[1].id.value == 1 &&
+                sev_asc_page.rows[1].severity == navigator_severity_t::warning,
+            "additional sort severity asc second row wrong");
+    require(sev_asc_page.rows[2].id.value == 2 &&
+                sev_asc_page.rows[2].severity == navigator_severity_t::error,
+            "additional sort severity asc third row wrong");
+    require(sev_asc_page.rows[3].id.value == 4 &&
+                sev_asc_page.rows[3].severity == navigator_severity_t::fatal,
+            "additional sort severity asc fourth row wrong");
+
+    navigator_query_model_t sev_desc_query(store);
+    navigator_query_t sev_desc_request;
+    sev_desc_request.domain = navigator_domain_t::functions;
+    sev_desc_request.sort.key = navigator_sort_key_t::severity;
+    sev_desc_request.sort.descending = true;
+    require(sev_desc_query.begin(sev_desc_request).ok(), "additional sort severity desc begin failed");
+    advance_to_ready(sev_desc_query);
+    navigator_query_page_t sev_desc_page;
+    require(sev_desc_query.page({0, 4}, sev_desc_page).ok(), "additional sort severity desc page failed");
+    require(sev_desc_page.rows.size() == 4, "additional sort severity desc page size wrong");
+    require(sev_desc_page.rows[0].id.value == 4 &&
+                sev_desc_page.rows[0].severity == navigator_severity_t::fatal,
+            "additional sort severity desc first row wrong");
+    require(sev_desc_page.rows[1].id.value == 2 &&
+                sev_desc_page.rows[1].severity == navigator_severity_t::error,
+            "additional sort severity desc second row wrong");
+    require(sev_desc_page.rows[2].id.value == 1 &&
+                sev_desc_page.rows[2].severity == navigator_severity_t::warning,
+            "additional sort severity desc third row wrong");
+    require(sev_desc_page.rows[3].id.value == 3 &&
+                sev_desc_page.rows[3].severity == navigator_severity_t::information,
+            "additional sort severity desc fourth row wrong");
+
+    navigator_query_model_t ci_query(store);
+    navigator_query_t ci_request;
+    ci_request.domain = navigator_domain_t::functions;
+    ci_request.filter.text = "alpha";
+    ci_request.filter.case_sensitive = false;
+    require(ci_query.begin(ci_request).ok(), "additional sort case-insensitive filter begin failed");
+    advance_to_ready(ci_query);
+    require(ci_query.indexed_row_count() == 3,
+            "additional sort case-insensitive filter matched wrong count");
+
+    navigator_query_model_t cs_query(store);
+    navigator_query_t cs_request;
+    cs_request.domain = navigator_domain_t::functions;
+    cs_request.filter.text = "alpha";
+    cs_request.filter.case_sensitive = true;
+    require(cs_query.begin(cs_request).ok(), "additional sort case-sensitive filter begin failed");
+    advance_to_ready(cs_query);
+    require(cs_query.indexed_row_count() == 1,
+            "additional sort case-sensitive filter matched wrong count");
+}
+
 }
 
 bool run_workbench_navigator_harness(std::string& failure)
@@ -448,6 +738,8 @@ bool run_workbench_navigator_harness(std::string& failure)
         verify_cancellation_and_stale_snapshot();
         verify_address_navigation();
         verify_invalid_requests();
+        verify_large_synthetic_model();
+        verify_additional_sort_keys();
         failure.clear();
         return true;
     } catch (const std::exception& exception) {

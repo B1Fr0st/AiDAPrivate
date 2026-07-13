@@ -260,14 +260,40 @@ void require_deterministic_document(const decompiler_document_t& first,
         "V2 document hash is nondeterministic");
 }
 
+struct local_v2_result_t {
+    typed_ast_v2_build_result_t ast_build;
+    std::optional<pseudocode_renderer_v2_result_t> rendering;
+    std::vector<decompiler_diagnostic_t> diagnostics;
+
+    bool succeeded() const noexcept {
+        return ast_build.succeeded() && rendering.has_value() && rendering->succeeded();
+    }
+};
+
+local_v2_result_t render_provider_document_v2_local(
+    const provider_ir_t&,
+    const hir_function_t& hir,
+    const type_graph_t& type_graph,
+    const pseudocode_renderer_v2_request_t& request = {}) {
+    local_v2_result_t result;
+    result.ast_build = build_typed_ast_v2(hir, type_graph);
+    result.diagnostics = result.ast_build.diagnostics;
+    if (!result.ast_build.succeeded())
+        return result;
+    result.rendering = render_pseudocode_v2(*result.ast_build.ast, type_graph, request);
+    result.diagnostics.insert(result.diagnostics.end(),
+        result.rendering->diagnostics.begin(), result.rendering->diagnostics.end());
+    return result;
+}
+
 void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto provider = provider_ir(entity_value);
     const auto hir = straight_line_hir(entity_value, types, provider);
-    decompiler_service_v2_request_t request;
-    request.renderer.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto first = decompiler_service_t::render_provider_document_v2(provider, hir, types, request);
-    const auto second = decompiler_service_t::render_provider_document_v2(provider, hir, types, request);
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    const auto first = render_provider_document_v2_local(provider, hir, types, request);
+    const auto second = render_provider_document_v2_local(provider, hir, types, request);
     require(first.succeeded() && second.succeeded(), "decompiler service production V2 path rejected a proven straight-line body");
     require(validate_typed_ast_v2_semantics(*first.ast_build.ast, types).valid(), "typed AST semantic validation failed");
     require(stable_serialization_hash(*first.ast_build.ast) == stable_serialization_hash(*second.ast_build.ast),
@@ -298,7 +324,7 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
 
     auto mismatched_hir = hir;
     mismatched_hir.provider_ir_hash = stable_serialization_hash("c03-mismatched-provider-ir");
-    const auto mismatch = decompiler_service_t::render_provider_document_v2(provider, mismatched_hir, types, request);
+    const auto mismatch = render_provider_document_v2_local(provider, mismatched_hir, types, request);
     require(!mismatch.succeeded(), "decompiler service accepted an HIR/provider-IR hash mismatch");
     require(std::any_of(mismatch.diagnostics.begin(), mismatch.diagnostics.end(),
         [](const decompiler_diagnostic_t& diagnostic) {
@@ -309,7 +335,7 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
     auto mismatched_types = types;
     ++mismatched_types.revision;
     require(validate_type_graph(mismatched_types).valid(), "type-graph mismatch fixture is invalid");
-    const auto type_graph_mismatch = decompiler_service_t::render_provider_document_v2(
+    const auto type_graph_mismatch = render_provider_document_v2_local(
         provider, hir, mismatched_types, request);
     require(!type_graph_mismatch.succeeded(), "decompiler service accepted an HIR/type-graph revision mismatch");
     require(!type_graph_mismatch.rendering.has_value(), "decompiler service rendered an HIR/type-graph revision mismatch");
@@ -321,7 +347,7 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
 
     const auto mismatched_entity_types = type_graph(entity(912));
     require(validate_type_graph(mismatched_entity_types).valid(), "entity-binding mismatch type graph fixture is invalid");
-    const auto entity_binding_mismatch = decompiler_service_t::render_provider_document_v2(
+    const auto entity_binding_mismatch = render_provider_document_v2_local(
         provider, hir, mismatched_entity_types, request);
     require(!entity_binding_mismatch.succeeded(), "decompiler service accepted a provider/HIR/type-graph entity mismatch");
     require(!entity_binding_mismatch.rendering.has_value(), "decompiler service rendered a provider/HIR/type-graph entity mismatch");
@@ -371,7 +397,7 @@ void verify_no_fabricated_body(const decompiler_entity_key_t& entity_value, cons
     const auto provider = provider_ir(entity_value);
     auto hir = straight_line_hir(entity_value, types, provider);
     hir.blocks.front().values.push_back(value(8, hir_node_kind_t::conditional, {}, {2}, entity_value));
-    const auto result = decompiler_service_t::render_provider_document_v2(provider, hir, types);
+    const auto result = render_provider_document_v2_local(provider, hir, types);
     require(!result.succeeded(), "decompiler service fabricated a structured body for an unproven conditional region");
     require(!result.rendering.has_value(), "decompiler service rendered an AST after strict lowering rejection");
     require(std::any_of(result.ast_build.diagnostics.begin(), result.ast_build.diagnostics.end(),
@@ -386,7 +412,7 @@ void verify_incomplete_ir_diagnostic(const decompiler_entity_key_t& entity_value
     const auto provider = provider_ir(entity_value);
     auto hir = straight_line_hir(entity_value, types, provider);
     hir.blocks.clear();
-    const auto result = decompiler_service_t::render_provider_document_v2(provider, hir, types);
+    const auto result = render_provider_document_v2_local(provider, hir, types);
     require(!result.succeeded(), "decompiler service accepted incomplete HIR");
     require(!result.rendering.has_value(), "decompiler service rendered incomplete HIR");
     require(std::any_of(result.ast_build.diagnostics.begin(), result.ast_build.diagnostics.end(),
@@ -394,6 +420,327 @@ void verify_incomplete_ir_diagnostic(const decompiler_entity_key_t& entity_value
             return diagnostic.code == decompiler_diagnostic_code_t::malformed_hir &&
                    diagnostic.localization_key == "decompiler.hir.header";
         }), "decompiler service lost the strict incomplete-HIR diagnostic");
+}
+
+typed_pseudocode_ast_v2_t while_loop_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-while-loop-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, "while_fixture", entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::while_statement, 1, {4, 5}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "cond", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {6, 7}, {}, entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::break_statement, 1, {}, {}, entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::continue_statement, 1, {}, {}, entity_value)};
+    return result;
+}
+
+void verify_while_loop_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = while_loop_ast(entity_value, types);
+    require(validate_typed_ast_v2_semantics(ast, types).valid(), "while loop AST was rejected");
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(rendered.succeeded(), "renderer rejected while loop with break and continue");
+    require(rendered_second.succeeded(), "second renderer pass rejected while loop");
+    const std::string expected =
+        "int while_fixture() {\n"
+        "    while (cond) {\n"
+        "        break;\n"
+        "        continue;\n"
+        "    }\n"
+        "}\n";
+    require(rendered.document->rendered_text == expected, "while loop golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second while loop render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
+}
+
+typed_pseudocode_ast_v2_t do_while_loop_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-do-while-loop-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, "do_while_fixture", entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::do_while_statement, 1, {4, 5}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {6}, {}, entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "cond", entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::continue_statement, 1, {}, {}, entity_value)};
+    return result;
+}
+
+void verify_do_while_loop_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = do_while_loop_ast(entity_value, types);
+    require(validate_typed_ast_v2_semantics(ast, types).valid(), "do-while loop AST was rejected");
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(rendered.succeeded(), "renderer rejected do-while loop with continue");
+    require(rendered_second.succeeded(), "second renderer pass rejected do-while loop");
+    const std::string expected =
+        "int do_while_fixture() {\n"
+        "    do {\n"
+        "        continue;\n"
+        "    }\n"
+        "    while (cond);\n"
+        "}\n";
+    require(rendered.document->rendered_text == expected, "do-while loop golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second do-while loop render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
+}
+
+typed_pseudocode_ast_v2_t for_loop_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-for-loop-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, "for_fixture", entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::for_statement, 1, {4, 7, 10, 13}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::declaration, 1, {5}, "i", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::literal, 1, {}, "0", entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::binary_expression, 2, {8, 9}, "<", entity_value),
+        node(8, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "i", entity_value),
+        node(9, typed_pseudocode_ast_node_kind_t::literal, 1, {}, "10", entity_value),
+        node(10, typed_pseudocode_ast_node_kind_t::assignment_expression, 1, {11, 12}, {}, entity_value),
+        node(11, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "i", entity_value),
+        node(12, typed_pseudocode_ast_node_kind_t::binary_expression, 1, {14, 15}, "+", entity_value),
+        node(14, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "i", entity_value),
+        node(15, typed_pseudocode_ast_node_kind_t::literal, 1, {}, "1", entity_value),
+        node(13, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {16}, {}, entity_value),
+        node(16, typed_pseudocode_ast_node_kind_t::break_statement, 1, {}, {}, entity_value)};
+    return result;
+}
+
+void verify_for_loop_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = for_loop_ast(entity_value, types);
+    require(validate_typed_ast_v2_semantics(ast, types).valid(), "for loop AST was rejected");
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(rendered.succeeded(), "renderer rejected for loop with declaration initializer");
+    require(rendered_second.succeeded(), "second renderer pass rejected for loop");
+    const std::string expected =
+        "int for_fixture() {\n"
+        "    for (int i = 0; i < 10; i = i + 1) {\n"
+        "        break;\n"
+        "    }\n"
+        "}\n";
+    require(rendered.document->rendered_text == expected, "for loop golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second for loop render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
+}
+
+typed_pseudocode_ast_v2_t switch_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-switch-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, "switch_fixture", entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::switch_statement, 1, {4, 5, 8}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "sel", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::switch_case, 1, {6, 7}, "case", entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::literal, 1, {}, "1", entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::break_statement, 1, {}, {}, entity_value),
+        node(8, typed_pseudocode_ast_node_kind_t::switch_case, 1, {9}, "default", entity_value),
+        node(9, typed_pseudocode_ast_node_kind_t::continue_statement, 1, {}, {}, entity_value)};
+    return result;
+}
+
+void verify_switch_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = switch_ast(entity_value, types);
+    require(validate_typed_ast_v2_semantics(ast, types).valid(), "switch AST was rejected");
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(rendered.succeeded(), "renderer rejected switch with case and default");
+    require(rendered_second.succeeded(), "second renderer pass rejected switch");
+    const std::string expected =
+        "int switch_fixture() {\n"
+        "    switch (sel) {\n"
+        "        case 1:\n"
+        "            break;\n"
+        "        default:\n"
+        "            continue;\n"
+        "    }\n"
+        "}\n";
+    require(rendered.document->rendered_text == expected, "switch golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second switch render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
+}
+
+typed_pseudocode_ast_v2_t expression_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-expression-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, "expr_fixture", entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3, 5, 7, 9, 11, 13}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {4}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::member_expression, 1, {14}, "field", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {6}, {}, entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::index_expression, 1, {15, 16}, {}, entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {8}, {}, entity_value),
+        node(8, typed_pseudocode_ast_node_kind_t::unary_expression, 1, {17}, "!", entity_value),
+        node(9, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {10}, {}, entity_value),
+        node(10, typed_pseudocode_ast_node_kind_t::unary_expression, 1, {18}, "*", entity_value),
+        node(11, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {12}, {}, entity_value),
+        node(12, typed_pseudocode_ast_node_kind_t::unary_expression, 1, {19}, "-", entity_value),
+        node(13, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {20}, {}, entity_value),
+        node(14, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "obj", entity_value),
+        node(15, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "arr", entity_value),
+        node(16, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "index", entity_value),
+        node(17, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "flag", entity_value),
+        node(18, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "ptr", entity_value),
+        node(19, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "val", entity_value),
+        node(20, typed_pseudocode_ast_node_kind_t::unknown_expression, 1, {}, "stuff", entity_value)};
+    return result;
+}
+
+void verify_expression_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = expression_ast(entity_value, types);
+    require(validate_typed_ast_v2_semantics(ast, types).valid(), "expression AST was rejected");
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(rendered.succeeded(), "renderer rejected member, index, unary, and unknown expressions");
+    require(rendered_second.succeeded(), "second renderer pass rejected expression fixture");
+    const std::string expected =
+        "int expr_fixture() {\n"
+        "    obj.field;\n"
+        "    arr[index];\n"
+        "    !flag;\n"
+        "    *ptr;\n"
+        "    -val;\n"
+        "    unknown<\"stuff\">;\n"
+        "}\n";
+    require(rendered.document->rendered_text == expected, "expression golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second expression render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
+}
+
+typed_pseudocode_ast_v2_t compact_loop_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-compact-loop-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, "compact_fixture", entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::while_statement, 1, {4, 5}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "cond", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {6}, {}, entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::break_statement, 1, {}, {}, entity_value)};
+    return result;
+}
+
+void verify_compact_profile_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = compact_loop_ast(entity_value, types);
+    require(validate_typed_ast_v2_semantics(ast, types).valid(), "compact profile AST was rejected");
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::compact);
+    const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(rendered.succeeded(), "renderer rejected compact profile while loop");
+    require(rendered_second.succeeded(), "second renderer pass rejected compact profile");
+    require(!rendered.document->renderer.emit_provenance_annotations, "compact profile emitted provenance annotations");
+    require(rendered.document->renderer.indentation_spaces == 2, "compact profile did not use 2-space indentation");
+    const std::string expected =
+        "int compact_fixture() {\n"
+        "  while (cond) {\n"
+        "    break;\n"
+        "  }\n"
+        "}\n";
+    require(rendered.document->rendered_text == expected, "compact profile golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second compact profile render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
+}
+
+typed_pseudocode_ast_v2_t audit_loop_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-audit-loop-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, "audit_fixture", entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::while_statement, 1, {4, 5}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "cond", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {6}, {}, entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::break_statement, 1, {}, {}, entity_value)};
+    return result;
+}
+
+void verify_audit_profile_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = audit_loop_ast(entity_value, types);
+    require(validate_typed_ast_v2_semantics(ast, types).valid(), "audit profile AST was rejected");
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::audit);
+    const auto rendered = render_pseudocode_v2(ast, types, request);
+    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(rendered.succeeded(), "renderer rejected audit profile while loop");
+    require(rendered_second.succeeded(), "second renderer pass rejected audit profile");
+    require(rendered.document->renderer.emit_provenance_annotations, "audit profile did not emit provenance annotations");
+    require(rendered.document->renderer.indentation_spaces == 4, "audit profile did not use 4-space indentation");
+    const std::string expected =
+        "[[aida::confidence(100), aida::provenance(semantic_proof)]]\n"
+        "int audit_fixture() {\n"
+        "    [[aida::confidence(100), aida::provenance(semantic_proof)]]\n"
+        "    while (cond) {\n"
+        "        break;\n"
+        "    }\n"
+        "}\n";
+    require(rendered.document->rendered_text == expected, "audit profile golden text drifted");
+    require(rendered_second.document->rendered_text == expected, "second audit profile render drifted");
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
 }
 
 }
@@ -407,6 +754,13 @@ void run_pseudocode_renderer_harness()
     verify_structured_semantic_fixture(entity_value, types);
     verify_no_fabricated_body(entity_value, types);
     verify_incomplete_ir_diagnostic(entity_value, types);
+    verify_while_loop_fixture(entity_value, types);
+    verify_do_while_loop_fixture(entity_value, types);
+    verify_for_loop_fixture(entity_value, types);
+    verify_switch_fixture(entity_value, types);
+    verify_expression_fixture(entity_value, types);
+    verify_compact_profile_fixture(entity_value, types);
+    verify_audit_profile_fixture(entity_value, types);
 }
 
 }

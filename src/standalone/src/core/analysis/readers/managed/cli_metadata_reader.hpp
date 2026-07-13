@@ -268,6 +268,8 @@ struct cli_metadata_t {
     std::vector<std::uint8_t> tables_raw;
     std::uint64_t metadata_rva = 0;
     std::uint64_t metadata_size = 0;
+    std::uint32_t resources_rva = 0;
+    std::uint32_t resources_size = 0;
     std::uint64_t image_base = 0;
     std::uint32_t entry_point_token = 0;
     std::shared_ptr<const pe_image_t> pe_image;

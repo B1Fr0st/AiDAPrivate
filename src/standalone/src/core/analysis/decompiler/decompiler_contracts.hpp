@@ -325,6 +325,7 @@ struct decompiler_entity_key_t {
     decompiler_entity_identity_t identity;
 
     bool operator==(const decompiler_entity_key_t& other) const noexcept;
+    bool operator!=(const decompiler_entity_key_t& other) const noexcept { return !(*this == other); }
     bool operator<(const decompiler_entity_key_t& other) const noexcept;
 };
 

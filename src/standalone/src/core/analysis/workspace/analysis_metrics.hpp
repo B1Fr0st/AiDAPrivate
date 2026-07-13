@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 namespace aida::analysis {
@@ -173,7 +174,12 @@ private:
     static void atomic_add_saturating(std::atomic<std::uint64_t>& target,
         std::uint64_t value) noexcept;
     static void atomic_set_max(std::atomic<std::uint64_t>& target, std::uint64_t value) noexcept;
+    void begin_mutation() noexcept;
+    void end_mutation() noexcept;
+    analysis_metrics_snapshot_t load_snapshot_relaxed() const noexcept;
 
+    mutable std::mutex mutation_mutex_;
+    std::atomic<std::uint64_t> coherence_sequence_{0};
     std::array<std::atomic<std::uint64_t>, analysis_metric_count> counters_{};
     std::array<phase_atomic_t, baseline_phase_count> phases_{};
     std::atomic<std::uint64_t> started_steady_ns_{0};
