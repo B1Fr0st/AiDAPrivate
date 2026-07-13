@@ -143,18 +143,18 @@ workspace_result_t<void> overlay_exec(sqlite3* database, const char* sql,
 
 class overlay_rollback_guard_t final {
 public:
-    overlay_rollback_guard_t(sqlite3* database, const char* phase) noexcept
-        : database_(database), phase_(phase) {
+    explicit overlay_rollback_guard_t(sqlite3* database) noexcept
+        : database_(database) {
     }
 
     ~overlay_rollback_guard_t() {
         if (database_ && sqlite3_get_autocommit(database_) == 0)
-            static_cast<void>(overlay_exec(database_, "ROLLBACK", phase_));
+            static_cast<void>(sqlite3_exec(
+                database_, "ROLLBACK", nullptr, nullptr, nullptr));
     }
 
 private:
     sqlite3* database_ = nullptr;
-    const char* phase_ = nullptr;
 };
 
 workspace_result_t<void> persist_fixed_target(
@@ -1884,8 +1884,7 @@ workspace_result_t<void> overlay_journal_t::ensure_fixed_target_binding(
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.target");
             if (!begin)
                 return begin;
-            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
-                writer, "overlay_journal.target");
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(writer);
             overlay_statement_t query;
             auto current = query.prepare(writer,
                 "SELECT value FROM metadata WHERE key='overlay_v9_fixed_target'",
@@ -2031,8 +2030,7 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
             }
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.recovery");
             if (!begin) return begin;
-            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
-                writer, "overlay_journal.recovery");
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(writer);
             auto migrated = migrate_operation_payloads(writer, target);
             if (!migrated) {
                 overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery");
@@ -2524,8 +2522,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                     "overlay commit cancelled", "overlay_journal.commit"));
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.commit");
             if (!begin) return begin;
-            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
-                writer, "overlay_journal.commit");
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(writer);
             auto state_result = read_overlay_state(writer, "overlay_journal.commit");
             if (!state_result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return workspace_result_t<void>::failure(state_result.error()); }
             auto state = state_result.take_value();
@@ -3025,8 +3022,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                     "overlay history action cancelled", "overlay_journal.history"));
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.history");
             if (!begin) return begin;
-            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
-                writer, "overlay_journal.history");
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(writer);
             auto state_result = read_overlay_state(writer, "overlay_journal.history");
             if (!state_result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return workspace_result_t<void>::failure(state_result.error()); }
             auto state = state_result.take_value();
