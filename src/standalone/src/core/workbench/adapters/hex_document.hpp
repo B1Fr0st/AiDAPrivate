@@ -10,7 +10,7 @@ namespace aida {
 namespace workbench {
 namespace hex_document {
 
-inline constexpr std::uint32_t k_hex_document_schema_version = 1;
+inline constexpr std::uint32_t k_hex_document_schema_version = 2;
 inline constexpr std::uint32_t k_hex_document_max_page_size = 1024;
 inline constexpr std::uint32_t k_hex_document_bytes_per_row = 16;
 inline constexpr std::uint32_t k_hex_document_max_overlays = 8192;

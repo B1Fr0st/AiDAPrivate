@@ -11,7 +11,7 @@ namespace aida {
 namespace workbench {
 namespace disasm_document {
 
-inline constexpr std::uint32_t k_disasm_document_schema_version = 1;
+inline constexpr std::uint32_t k_disasm_document_schema_version = 2;
 inline constexpr std::uint32_t k_disasm_document_max_page_size = 512;
 inline constexpr std::uint32_t k_disasm_document_max_overlays = 4096;
 inline constexpr std::uint32_t k_disasm_document_max_row_text_bytes = 256;
