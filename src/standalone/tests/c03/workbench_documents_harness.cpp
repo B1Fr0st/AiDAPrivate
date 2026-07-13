@@ -675,6 +675,73 @@ void verify_navigation_event_bridge()
             "disasm navigation bridge must reject the source's newer generation before refresh");
 }
 
+void verify_production_document_bridge()
+{
+    const workspace_id_t workspace{41};
+    workbench_document_bridge_t bridge(workspace);
+
+    document_descriptor_t disassembly;
+    disassembly.identity.workspace = workspace;
+    disassembly.identity.kind = document_kind_t::disassembly;
+    disassembly.identity.object_id = 7;
+    disassembly.identity.provider_key = "analysis";
+    disassembly.title = "Disassembly";
+    disassembly.can_open = true;
+
+    auto hex = disassembly;
+    hex.identity.kind = document_kind_t::hex;
+    hex.title = "Hex";
+
+    auto graph = disassembly;
+    graph.identity.kind = document_kind_t::graph;
+    graph.title = "Graph";
+
+    auto error = bridge.replace({disassembly, hex, graph});
+    require(error.ok() && bridge.documents().size() == 3,
+            "production document bridge must publish the shell document catalog");
+
+    navigation_resolution_t target;
+    error = bridge.resolve_target(disassembly.identity, document_kind_t::hex,
+                                  0x401240U, target);
+    require(error.ok() && target.requires_document_open &&
+                target.document.kind == document_kind_t::hex &&
+                target.document.has_address &&
+                target.document.address == 0x401240U &&
+                target.selection.kind == selection_kind_t::address &&
+                target.selection.address == 0x401240U,
+            "production document bridge must resolve an address-bearing center view");
+
+    document_descriptor_t described;
+    error = bridge.describe(target.document, described);
+    require(error.ok() && described.identity.has_address &&
+                described.identity.address == target.document.address &&
+                described.title == hex.title,
+            "production document bridge must describe dynamic address identities");
+
+    document_navigation_bridge_request_t request;
+    request.id = {9};
+    request.sequence = 12;
+    request.origin = navigation_origin_t::adapter;
+    request.source.workspace = workspace;
+    request.source.document = {3};
+    request.source.view = {5};
+    request.target.document = target.document;
+    request.target.selection = target.selection;
+    request.target.cursor = target.cursor;
+
+    navigation_event_t event;
+    error = bridge.emit(request, event);
+    require(error.ok() && validate_navigation_event(event).ok(),
+            "production document bridge must emit a valid workbench event");
+
+    navigation_resolution_t resolved;
+    error = bridge.resolve(event, resolved);
+    require(error.ok() && resolved.requires_document_open &&
+                document_identity_equal(resolved.document, target.document) &&
+                selection_context_equal(resolved.selection, target.selection),
+            "production document bridge must resolve its emitted event");
+}
+
 void verify_hex_large_virtual_model()
 {
     constexpr std::uint64_t row_count = 50'000;
@@ -1851,7 +1918,6 @@ void verify_graph_deterministic_ids()
 void verify_graph_cross_generation_diff()
 {
     graph_source_t source(10, 9);
-    graph_document::graph_document_model_t model(source);
 
     const auto old_gen = source.current_generation();
     source.advance_generation();
@@ -2379,6 +2445,7 @@ bool run_workbench_documents_harness(std::string& failure)
         verify_disasm_command_routing();
         verify_disasm_limits_and_selection();
         verify_navigation_event_bridge();
+        verify_production_document_bridge();
 
         verify_hex_large_virtual_model();
         verify_hex_stale_and_overlay();
