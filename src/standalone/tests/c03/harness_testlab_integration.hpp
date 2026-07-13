@@ -67,9 +67,9 @@ inline constexpr std::size_t k_expected_archive_tool_count = 88;
 inline constexpr std::size_t k_expected_extension_count = 4;
 inline constexpr std::size_t k_expected_debugger_tool_count = 22;
 inline constexpr std::size_t k_expected_routing_extension_count = 5;
-inline constexpr std::size_t k_expected_testlab_entry_count = 24;
+inline constexpr std::size_t k_expected_testlab_entry_count = 26;
 inline constexpr std::size_t k_expected_testlab_in_process_count = 12;
-inline constexpr std::size_t k_expected_testlab_external_count = 12;
+inline constexpr std::size_t k_expected_testlab_external_count = 14;
 
 inline constexpr std::string_view k_mcp_tool_ownership_categories[] = {
     "analysis", "core", "debugger", "memory", "modify", "python",

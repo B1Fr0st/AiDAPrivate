@@ -252,6 +252,24 @@ public:
     virtual bool cancelled() const noexcept = 0;
 };
 
+enum class graph_source_result_t : std::uint8_t {
+    success = 0,
+    not_found,
+    limit_exceeded,
+    cancelled,
+    rejected
+};
+
+struct graph_source_limits_t {
+    std::uint64_t max_nodes = k_graph_document_max_nodes;
+    std::uint64_t max_edges = k_graph_document_max_edges;
+};
+
+struct graph_source_counts_t {
+    std::uint64_t nodes = 0;
+    std::uint64_t edges = 0;
+};
+
 class graph_source_adapter_t {
 public:
     virtual ~graph_source_adapter_t() = default;
@@ -259,38 +277,55 @@ public:
     virtual bool generation_current(std::uint64_t generation) const noexcept = 0;
     virtual bool generation_available(std::uint64_t generation) const noexcept = 0;
     virtual bool supports_kind(graph_kind_t kind) const noexcept = 0;
-    virtual std::uint64_t node_count(std::uint64_t generation,
-                                     graph_kind_t kind,
-                                     std::uint64_t function_address) const noexcept = 0;
-    virtual std::uint64_t edge_count(std::uint64_t generation,
-                                     graph_kind_t kind,
-                                     std::uint64_t function_address) const noexcept = 0;
-    virtual bool node_at(std::uint64_t generation, graph_kind_t kind,
-                         std::uint64_t function_address, std::uint64_t ordinal,
-                         graph_node_view_t& output) const noexcept = 0;
-    virtual bool edge_at(std::uint64_t generation, graph_kind_t kind,
-                         std::uint64_t function_address, std::uint64_t ordinal,
-                         graph_edge_view_t& output) const noexcept = 0;
-    virtual bool node_by_address(std::uint64_t generation, graph_kind_t kind,
-                                 std::uint64_t function_address, std::uint64_t address,
-                                 graph_node_view_t& output,
-                                 std::uint64_t& ordinal) const noexcept = 0;
-    virtual bool node_by_id(std::uint64_t generation, graph_kind_t kind,
-                            std::uint64_t function_address, graph_node_id_t id,
-                            graph_node_view_t& output,
-                            std::uint64_t& ordinal) const noexcept = 0;
-    virtual bool edge_by_id(std::uint64_t generation, graph_kind_t kind,
-                            std::uint64_t function_address, graph_edge_id_t id,
-                            graph_edge_view_t& output,
-                            std::uint64_t& ordinal) const noexcept = 0;
+    virtual graph_source_result_t counts(
+        std::uint64_t generation, graph_kind_t kind,
+        std::uint64_t function_address, const graph_source_limits_t& limits,
+        const graph_cancellation_t* cancellation,
+        graph_source_counts_t& output) const noexcept = 0;
+    virtual graph_source_result_t node_at(
+        std::uint64_t generation, graph_kind_t kind,
+        std::uint64_t function_address, std::uint64_t ordinal,
+        const graph_source_limits_t& limits,
+        const graph_cancellation_t* cancellation,
+        graph_node_view_t& output) const noexcept = 0;
+    virtual graph_source_result_t edge_at(
+        std::uint64_t generation, graph_kind_t kind,
+        std::uint64_t function_address, std::uint64_t ordinal,
+        const graph_source_limits_t& limits,
+        const graph_cancellation_t* cancellation,
+        graph_edge_view_t& output) const noexcept = 0;
+    virtual graph_source_result_t node_by_address(
+        std::uint64_t generation, graph_kind_t kind,
+        std::uint64_t function_address, std::uint64_t address,
+        const graph_source_limits_t& limits,
+        const graph_cancellation_t* cancellation,
+        graph_node_view_t& output, std::uint64_t& ordinal) const noexcept = 0;
+    virtual graph_source_result_t node_by_id(
+        std::uint64_t generation, graph_kind_t kind,
+        std::uint64_t function_address, graph_node_id_t id,
+        const graph_source_limits_t& limits,
+        const graph_cancellation_t* cancellation,
+        graph_node_view_t& output, std::uint64_t& ordinal) const noexcept = 0;
+    virtual graph_source_result_t edge_by_id(
+        std::uint64_t generation, graph_kind_t kind,
+        std::uint64_t function_address, graph_edge_id_t id,
+        const graph_source_limits_t& limits,
+        const graph_cancellation_t* cancellation,
+        graph_edge_view_t& output, std::uint64_t& ordinal) const noexcept = 0;
 };
 
 class graph_overlay_adapter_t {
 public:
     virtual ~graph_overlay_adapter_t() = default;
-    virtual std::uint32_t overlay_count(std::uint64_t generation) const noexcept = 0;
-    virtual bool overlay_node(std::uint64_t generation, graph_node_id_t node,
-                              std::string& text) const noexcept = 0;
+    virtual graph_source_result_t overlay_count(
+        std::uint64_t generation, std::uint32_t limit,
+        const graph_cancellation_t* cancellation,
+        std::uint32_t& output) const noexcept = 0;
+    virtual graph_source_result_t overlay_node(
+        std::uint64_t generation, graph_node_id_t node,
+        std::uint32_t max_label_bytes,
+        const graph_cancellation_t* cancellation,
+        std::string& text) const noexcept = 0;
 };
 
 class graph_layout_cancellation_t : public graph_cancellation_t {};
@@ -308,14 +343,17 @@ public:
                            std::uint64_t expected_generation,
                            graph_kind_t kind,
                            std::uint64_t function_address,
-                           graph_navigation_result_t& output);
+                           graph_navigation_result_t& output,
+                           const graph_cancellation_t* cancellation = nullptr);
 
     graph_error_t select(const graph_selection_t& selection,
-                         std::uint64_t expected_generation);
+                         std::uint64_t expected_generation,
+                         const graph_cancellation_t* cancellation = nullptr);
     graph_error_t select(const graph_selection_t& selection,
                          std::uint64_t expected_generation,
                          graph_kind_t kind,
-                         std::uint64_t function_address);
+                         std::uint64_t function_address,
+                         const graph_cancellation_t* cancellation = nullptr);
 
     graph_error_t clear_selection(std::uint64_t expected_generation) noexcept;
 
@@ -336,6 +374,10 @@ public:
     bool generation_current(std::uint64_t generation) const noexcept;
     bool is_stale() const noexcept;
     std::uint64_t bound_generation() const noexcept;
+    graph_error_t counts(graph_kind_t kind,
+                         std::uint64_t function_address,
+                         const graph_cancellation_t* cancellation,
+                         graph_source_counts_t& output) const;
     std::uint64_t node_count(graph_kind_t kind, std::uint64_t function_address) const noexcept;
     std::uint64_t edge_count(graph_kind_t kind, std::uint64_t function_address) const noexcept;
 
@@ -346,12 +388,20 @@ private:
     graph_error_t layout_layered(std::uint64_t generation, graph_kind_t kind,
                                  std::uint64_t function_address,
                                  const graph_layout_request_t& request,
+                                 const graph_source_counts_t& counts,
                                  const graph_layout_cancellation_t* cancellation,
                                  graph_layout_t& output) const;
+    graph_error_t read_counts(
+        std::uint64_t generation, graph_kind_t kind,
+        std::uint64_t function_address, const graph_source_limits_t& limits,
+        const graph_cancellation_t* cancellation,
+        graph_error_code_t limit_error,
+        graph_source_counts_t& output) const;
     graph_error_t canonicalize_selection(
         const graph_selection_t& selection,
         graph_kind_t kind,
         std::uint64_t function_address,
+        const graph_cancellation_t* cancellation,
         graph_selection_t& output) const;
 
     const graph_source_adapter_t* source_;
@@ -365,6 +415,7 @@ graph_node_id_t compute_deterministic_node_id(std::uint64_t address) noexcept;
 graph_edge_id_t compute_deterministic_edge_id(
     const graph_edge_identity_t& identity) noexcept;
 bool graph_edge_identity_valid(const graph_edge_identity_t& identity) noexcept;
+bool graph_source_limits_valid(const graph_source_limits_t& limits) noexcept;
 bool graph_page_request_valid(const graph_page_request_t& request) noexcept;
 bool graph_layout_request_valid(const graph_layout_request_t& request) noexcept;
 bool graph_selection_valid(const graph_selection_t& selection) noexcept;

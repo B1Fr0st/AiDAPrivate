@@ -166,21 +166,43 @@ public:
     virtual bool cancelled() const noexcept = 0;
 };
 
+enum class diff_source_result_t : std::uint8_t {
+    success = 0,
+    not_found,
+    limit_exceeded,
+    cancelled,
+    rejected
+};
+
+struct diff_source_limits_t {
+    std::uint64_t max_entries = k_diff_document_max_entries;
+};
+
 class diff_source_adapter_t {
 public:
     virtual ~diff_source_adapter_t() = default;
     virtual std::uint64_t current_generation() const noexcept = 0;
     virtual bool generation_current(std::uint64_t generation) const noexcept = 0;
     virtual bool supports_kind(diff_kind_t kind) const noexcept = 0;
-    virtual bool scope_available(std::uint64_t generation,
-                                 const diff_scope_t& scope) const noexcept = 0;
-    virtual std::uint64_t entry_count(std::uint64_t generation,
-                                      const diff_scope_t& scope) const noexcept = 0;
-    virtual bool entry_at(std::uint64_t generation, const diff_scope_t& scope,
-                          std::uint64_t ordinal,
-                          diff_entry_t& output) const noexcept = 0;
-    virtual bool summary(std::uint64_t generation, const diff_scope_t& scope,
-                         diff_summary_t& output) const noexcept = 0;
+    virtual diff_source_result_t scope_available(
+        std::uint64_t generation, const diff_scope_t& scope,
+        const diff_source_limits_t& limits,
+        const diff_cancellation_t* cancellation) const noexcept = 0;
+    virtual diff_source_result_t entry_count(
+        std::uint64_t generation, const diff_scope_t& scope,
+        const diff_source_limits_t& limits,
+        const diff_cancellation_t* cancellation,
+        std::uint64_t& output) const noexcept = 0;
+    virtual diff_source_result_t entry_at(
+        std::uint64_t generation, const diff_scope_t& scope,
+        std::uint64_t ordinal, const diff_source_limits_t& limits,
+        const diff_cancellation_t* cancellation,
+        diff_entry_t& output) const noexcept = 0;
+    virtual diff_source_result_t summary(
+        std::uint64_t generation, const diff_scope_t& scope,
+        const diff_source_limits_t& limits,
+        const diff_cancellation_t* cancellation,
+        diff_summary_t& output) const noexcept = 0;
 };
 
 enum class diff_command_kind_t : std::uint8_t {
@@ -223,16 +245,19 @@ public:
     diff_error_t navigate(const diff_navigation_request_t& request,
                           std::uint64_t expected_generation,
                           const diff_scope_t& scope,
-                          diff_navigation_result_t& output);
+                          diff_navigation_result_t& output,
+                          const diff_cancellation_t* cancellation = nullptr);
 
     diff_error_t select(const diff_selection_t& selection,
                         std::uint64_t expected_generation,
-                        const diff_scope_t& scope);
+                        const diff_scope_t& scope,
+                        const diff_cancellation_t* cancellation = nullptr);
     diff_error_t clear_selection(std::uint64_t expected_generation) noexcept;
 
     diff_error_t compute_summary(std::uint64_t expected_generation,
                                  const diff_scope_t& scope,
-                                 diff_summary_t& output) const;
+                                 diff_summary_t& output,
+                                 const diff_cancellation_t* cancellation = nullptr) const;
 
     diff_command_result_t execute(const diff_command_t& command,
                                   const diff_cancellation_t* cancellation = nullptr);
@@ -247,6 +272,13 @@ private:
     diff_error_t fail(diff_error_code_t code,
                       std::uint64_t subject = 0) const noexcept;
     diff_error_t stale() const noexcept;
+    diff_error_t validate_source_scope(
+        const diff_scope_t& scope,
+        const diff_cancellation_t* cancellation) const;
+    diff_error_t read_entry_count(
+        const diff_scope_t& scope,
+        const diff_cancellation_t* cancellation,
+        std::uint64_t& output) const;
 
     const diff_source_adapter_t* source_;
     std::uint64_t bound_generation_;
@@ -256,6 +288,7 @@ private:
 bool diff_page_request_valid(const diff_page_request_t& request) noexcept;
 bool diff_selection_valid(const diff_selection_t& selection) noexcept;
 bool diff_scope_valid(const diff_scope_t& scope) noexcept;
+bool diff_source_limits_valid(const diff_source_limits_t& limits) noexcept;
 bool diff_domain_filter_matches(diff_domain_t entry_domain,
                                 diff_domain_t filter) noexcept;
 

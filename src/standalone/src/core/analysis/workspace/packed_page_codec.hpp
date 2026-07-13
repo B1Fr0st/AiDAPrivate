@@ -84,7 +84,8 @@ public:
     static workspace_result_t<packed_page_batch_t> encode_batch(
         packed_page_type_t page_type,
         const std::vector<std::uint8_t>& data,
-        const packed_page_encode_options_t& options);
+        const packed_page_encode_options_t& options,
+        const packed_stop_predicate_t& stop_requested = {});
 
     static workspace_result_t<std::vector<std::uint8_t>> decode_batch(
         const packed_page_batch_t& batch,
@@ -120,7 +121,23 @@ public:
 
     static workspace_result_t<packed_page_batch_t> encode_multi_domain_batch(
         const std::vector<std::pair<packed_page_type_t, std::vector<std::uint8_t>>>& domains,
-        const packed_page_encode_options_t& options);
+        const packed_page_encode_options_t& options,
+        const packed_stop_predicate_t& stop_requested = {});
+
+    static workspace_result_t<packed_generation_publication_t> build_publication(
+        const packed_page_batch_t& batch,
+        std::vector<std::uint8_t> metadata = {},
+        const packed_stop_predicate_t& stop_requested = {});
+
+    static workspace_result_t<packed_page_batch_t> restore_publication(
+        const packed_generation_publication_t& publication,
+        const packed_stop_predicate_t& stop_requested = {});
+
+    static workspace_result_t<
+        std::vector<std::pair<packed_page_type_t, std::vector<std::uint8_t>>>>
+        decode_multi_domain_publication(
+            const packed_generation_publication_t& publication,
+            const packed_stop_predicate_t& stop_requested = {});
 };
 
 }

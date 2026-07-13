@@ -142,6 +142,7 @@ set(AIDA_C03_WAVE_C_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/workbench/adapters/graph_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/diff_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_persistence.cpp"
+    "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp"
     "${STANDALONE_ROOT}/core/analysis/overlay_projection.cpp"
     "${STANDALONE_ROOT}/core/analysis/incremental_reanalysis.cpp"
 )
@@ -857,6 +858,13 @@ function(aida_c03_register_safe_headless_targets)
     add_dependencies(aida_c03_b24_python_worker_harness
         aida_c03_b24_fake_analysis_python_worker)
     aida_c03_register_safe_headless_target(
+        TARGET aida_c03_c22_workbench_shell_integration
+        PACKAGE C22
+        MODE COMPILE_ONLY
+        SOURCES
+            "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp"
+    )
+    aida_c03_register_safe_headless_target(
         TARGET aida_c03_c20_c22_workbench_documents_harness
         PACKAGE C22
         MODE RUNNABLE
@@ -874,6 +882,8 @@ function(aida_c03_register_safe_headless_targets)
         INCLUDE_DIRECTORIES "${STANDALONE_ROOT}/../tests/c03"
         LINK_LIBRARIES bcrypt
     )
+    add_dependencies(aida_c03_c20_c22_workbench_documents_harness
+        aida_c03_c22_workbench_shell_integration)
     set_target_properties(aida_c03_c20_c22_workbench_documents_harness PROPERTIES
         AIDA_C03_PACKAGES "C20;C21;C22"
         LABELS "c03;safe-headless;wave-c;C20;C21;C22")
@@ -911,6 +921,21 @@ function(aida_c03_register_safe_headless_targets)
             "${STANDALONE_ROOT}/core/analysis/incremental_reanalysis.cpp"
             "${STANDALONE_ROOT}/core/analysis/overlay_apply_engine.cpp"
         INCLUDE_DIRECTORIES "${STANDALONE_ROOT}/../tests/c03"
+    )
+    aida_c03_register_safe_headless_target(
+        TARGET aida_c03_c19_live_routing_integration_harness
+        PACKAGE C19
+        MODE RUNNABLE
+        SOURCES
+            "${STANDALONE_ROOT}/../tests/c03/live_routing_integration_harness.cpp"
+            "${STANDALONE_ROOT}/core/mcp/compat/live_routing_integration.cpp"
+            "${STANDALONE_ROOT}/core/mcp/compat/debugger_lane.cpp"
+            ${AIDA_C03_B22_STANDALONE_SOURCES}
+            ${AIDA_C03_B23_STANDALONE_SOURCES}
+        INCLUDE_DIRECTORIES
+            "${STANDALONE_ROOT}/../tests/c03"
+            "${json_schema_validator_SOURCE_DIR}/src"
+        LINK_LIBRARIES nlohmann_json_schema_validator
     )
     aida_c03_register_safe_headless_target(
         TARGET aida_c03_c19_mcp_handler_testlab_harness
@@ -951,7 +976,7 @@ function(aida_c03_register_safe_headless_targets)
     get_property(_aida_c03_runnable_targets GLOBAL PROPERTY AIDA_C03_SAFE_HEADLESS_RUNNABLE_TARGETS)
     list(LENGTH _aida_c03_targets _aida_c03_target_count)
     list(LENGTH _aida_c03_runnable_targets _aida_c03_runnable_count)
-    if(NOT _aida_c03_target_count EQUAL 25 OR NOT _aida_c03_runnable_count EQUAL 21)
+    if(NOT _aida_c03_target_count EQUAL 27 OR NOT _aida_c03_runnable_count EQUAL 22)
         message(FATAL_ERROR "AiDA C03 safe-headless manifest cardinality is invalid: targets=${_aida_c03_target_count} runnable=${_aida_c03_runnable_count}")
     endif()
     aida_c03_reject_forbidden_target_links(${_aida_c03_targets})
