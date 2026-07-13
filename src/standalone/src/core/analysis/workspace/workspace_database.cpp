@@ -35,6 +35,7 @@ constexpr std::size_t kInstructionBlobHeaderSize = 16;
 constexpr std::size_t kInstructionBlobRecordSize = 53;
 constexpr std::size_t kDatabaseRecordPollStride = 256;
 constexpr std::size_t kDatabaseBlobCopyChunk = 4096;
+constexpr std::uint64_t kMaximumInstructionChunkRecords = 1048576;
 
 workspace_error_t database_error(sqlite3* database, int status, std::string message,
                                  const char* phase) {
@@ -369,7 +370,7 @@ std::vector<std::uint8_t> encode_instruction_chunk(
 workspace_result_t<void> decode_instruction_chunk(
     const void* data, std::size_t size,
     std::vector<instruction_record_t>& output,
-    std::uint64_t max_records,
+    std::uint64_t max_records, std::uint64_t max_chunk_records,
     const cancellation_token_t& cancel) {
     if (cancel.stop_requested()) {
         return workspace_result_t<void>::failure(database_cancellation_error(
@@ -392,7 +393,8 @@ workspace_result_t<void> decode_instruction_chunk(
                                  "instruction chunk version is unsupported", "workspace_database"));
     }
     auto count_result = read_unsigned_le<std::uint64_t>(cursor, end);
-    if (!count_result || count_result.value() > 1ULL << 24) {
+    if (!count_result || count_result.value() == 0 ||
+        count_result.value() > max_chunk_records) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "instruction chunk record count is invalid", "workspace_database"));
@@ -990,6 +992,7 @@ workspace_result_t<void> initialize_identity_and_versions(
 DELETE FROM call_graph_conflicts;DELETE FROM call_graph_edges;DELETE FROM call_candidates;DELETE FROM call_sites;DELETE FROM call_graph_nodes;DELETE FROM call_graph_state;DELETE FROM data_pointer_facts;DELETE FROM data_conflicts;DELETE FROM rich_data_candidates;DELETE FROM type_references;DELETE FROM metadata_conflicts;DELETE FROM symbol_type_candidates;DELETE FROM switch_cases;DELETE FROM switches;DELETE FROM segments;DELETE FROM instruction_chunks;DELETE FROM operand_facts;DELETE FROM target_facts;DELETE FROM function_block_memberships;DELETE FROM function_chunks;DELETE FROM functions;DELETE FROM blocks;DELETE FROM edges;DELETE FROM xrefs;DELETE FROM strings;DELETE FROM symbols;DELETE FROM coverage;DELETE FROM data_candidates;DELETE FROM type_candidates;DELETE FROM search_index_blob;DELETE FROM analysis_state;
 DELETE FROM alternate_call_graph_conflicts;DELETE FROM alternate_call_graph_edges;DELETE FROM alternate_call_candidates;DELETE FROM alternate_call_sites;DELETE FROM alternate_call_graph_nodes;DELETE FROM alternate_call_graph_state;DELETE FROM alternate_data_pointer_facts;DELETE FROM alternate_data_conflicts;DELETE FROM alternate_rich_data_candidates;DELETE FROM alternate_type_references;DELETE FROM alternate_metadata_conflicts;DELETE FROM alternate_symbol_type_candidates;DELETE FROM alternate_switch_cases;DELETE FROM alternate_switches;DELETE FROM alternate_segments;DELETE FROM alternate_instruction_chunks;DELETE FROM alternate_operand_facts;DELETE FROM alternate_target_facts;DELETE FROM alternate_function_block_memberships;DELETE FROM alternate_function_chunks;DELETE FROM alternate_functions;DELETE FROM alternate_blocks;DELETE FROM alternate_edges;DELETE FROM alternate_xrefs;DELETE FROM alternate_strings;DELETE FROM alternate_symbols;DELETE FROM alternate_coverage;DELETE FROM alternate_data_candidates;DELETE FROM alternate_type_candidates;DELETE FROM alternate_search_index_blob;DELETE FROM alternate_analysis_state;
 UPDATE workspace_commit_state SET active_slot=0,committed_token='',committed_generation=0,committed_analysis_revision=0,committed_overlay_revision=0,candidate_slot=NULL,candidate_token=NULL,candidate_generation=NULL,candidate_analysis_revision=NULL,candidate_overlay_revision=NULL,candidate_ready=0,updated_utc_ms=0 WHERE singleton=1;
+DELETE FROM packed_page_index;DELETE FROM packed_pages;DELETE FROM packed_generations;
 DELETE FROM decompiler_cache;DELETE FROM decompiler_cache_v9;
 )SQL", "workspace_database.invalidate");
         if (!cleared) {
@@ -2531,7 +2534,7 @@ workspace_database_t::open(workspace_database_options_t options) {
         options.candidate_operation_timeout_ms == 0 ||
         options.passive_checkpoint_pages == 0 ||
         options.instruction_chunk_records == 0 ||
-        options.instruction_chunk_records > (1ULL << 20) ||
+        options.instruction_chunk_records > kMaximumInstructionChunkRecords ||
         options.max_persisted_fact_records == 0) {
         return workspace_result_t<std::shared_ptr<workspace_database_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -3298,17 +3301,30 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
                     return workspace_result_t<void>::failure(make_workspace_error(
                         workspace_error_code_t::integrity_failure,
                         "persisted instruction chunk is empty", "workspace_database.load.instructions"));
+                const auto previous_size = loaded->instructions.size();
                 auto decoded = decode_instruction_chunk(
                     payload, static_cast<std::size_t>(bytes), loaded->instructions,
-                    options_.max_persisted_fact_records, cancel);
+                    options_.max_persisted_fact_records,
+                    kMaximumInstructionChunkRecords, cancel);
                 if (!decoded)
                     return decoded;
-                if (loaded->instructions.size() > options_.max_persisted_fact_records) {
+                const auto decoded_records =
+                    loaded->instructions.size() - previous_size;
+                if (total_rows == 0) {
+                    return workspace_result_t<void>::failure(make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "persisted instruction accounting underflowed",
+                        "workspace_database.load.instructions"));
+                }
+                --total_rows;
+                if (decoded_records >
+                    options_.max_persisted_fact_records - total_rows) {
                     return workspace_result_t<void>::failure(make_workspace_error(
                         workspace_error_code_t::limit_exceeded,
                         "persisted instructions exceed the reopen budget",
                         "workspace_database.load.instructions"));
                 }
+                total_rows += decoded_records;
                 return workspace_result_t<void>::success();
             });
         if (!current) return current;

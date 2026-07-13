@@ -15,11 +15,7 @@
 #include "adapters/diff_document.hpp"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
-#include <optional>
-#include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace aida {

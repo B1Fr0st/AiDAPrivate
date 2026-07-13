@@ -482,6 +482,7 @@ capture_native_provider_context(
     adapter_request.load_image = load_image.value();
     adapter_request.function_database = function_database.value();
     adapter_request.function = function->key;
+    adapter_request.typed_entity = key.entity;
     adapter_request.type_revision = key.type_graph_revision;
     adapter_request.cancellation = cancel;
     adapter_request.cancel_check = [cancel] { return cancel.stop_requested(); };

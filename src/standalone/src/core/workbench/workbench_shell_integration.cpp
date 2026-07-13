@@ -7,8 +7,6 @@
 #include "../analysis/workspace/overlay_journal.hpp"
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <chrono>
 #include <deque>
 #include <future>
@@ -16,14 +14,16 @@
 #include <limits>
 #include <map>
 #include <mutex>
-#include <set>
+#include <optional>
 #include <sstream>
-#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace aida {
 namespace workbench {
@@ -2598,12 +2598,26 @@ public:
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(request.timeout_ms);
         auto cancellation = std::make_shared<analysis::cancellation_source_t>(deadline);
-        job_state_t job;
-        job.cancellation = cancellation;
         const auto source = lease_.source;
         const auto publication = lease_.publication;
         try {
-            job.future = std::async(std::launch::async,
+            std::lock_guard<std::mutex> lock(mutex_);
+            reap_cancelled_locked();
+            if (jobs_.find(job_id) != jobs_.end())
+                return shell_error(workbench_error_code_t::duplicate_identifier,
+                                   job_id);
+            if (jobs_.size() >=
+                pseudocode_document::k_pseudocode_document_max_cached_documents) {
+                return shell_error(workbench_error_code_t::adapter_rejected,
+                                   static_cast<std::uint64_t>(jobs_.size()));
+            }
+            const auto inserted = jobs_.try_emplace(job_id);
+            if (!inserted.second)
+                return shell_error(workbench_error_code_t::duplicate_identifier,
+                                   job_id);
+            inserted.first->second.cancellation = cancellation;
+            try {
+                inserted.first->second.future = std::async(std::launch::async,
                 [service, source, publication, request, identity_value = *identity,
                  cancellation]() mutable {
                     pseudocode_job_payload_t payload;
@@ -2644,23 +2658,13 @@ public:
                     payload.succeeded = true;
                     return payload;
                 });
+            } catch (...) {
+                jobs_.erase(inserted.first);
+                throw;
+            }
         } catch (...) {
             return shell_error(workbench_error_code_t::adapter_rejected, job_id);
         }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        reap_cancelled_locked();
-        if (jobs_.find(job_id) != jobs_.end()) {
-            job.cancellation->request_cancel();
-            return shell_error(workbench_error_code_t::duplicate_identifier, job_id);
-        }
-        if (jobs_.size() >=
-            pseudocode_document::k_pseudocode_document_max_cached_documents) {
-            job.cancellation->request_cancel();
-            return shell_error(workbench_error_code_t::adapter_rejected,
-                               static_cast<std::uint64_t>(jobs_.size()));
-        }
-        jobs_.emplace(job_id, std::move(job));
         return {};
     }
 
@@ -2806,7 +2810,9 @@ public:
                                        address);
                 output.line_number = static_cast<std::uint32_t>(std::count(
                     document.rendered_text.begin(),
-                    document.rendered_text.begin() + output.token_begin, '\n'));
+                    document.rendered_text.begin() +
+                        static_cast<std::string::difference_type>(output.token_begin),
+                    '\n'));
                 return {};
             }
         }
@@ -2838,7 +2844,9 @@ public:
                                        token_begin);
                 output.line_number = static_cast<std::uint32_t>(std::count(
                     document.rendered_text.begin(),
-                    document.rendered_text.begin() + output.token_begin, '\n'));
+                    document.rendered_text.begin() +
+                        static_cast<std::string::difference_type>(output.token_begin),
+                    '\n'));
                 return {};
             }
         }
@@ -2864,6 +2872,7 @@ public:
           hex_navigation_(bridge_),
           hex_model_(hex_source_, &hex_overlay_, &hex_navigation_),
           pseudocode_source_(lease),
+          pseudocode_navigation_(),
           pseudocode_model_(pseudocode_source_, &pseudocode_navigation_),
           graph_source_(lease, config.cached_graph_scope_limit),
           graph_overlay_(source_, graph_source_),
@@ -3434,6 +3443,20 @@ workbench_shell_integration_t::integrate_analysis_workspace(
         analysis_workspace->closed())
         return shell_error(workbench_error_code_t::adapter_rejected,
                            workspace.value);
+    std::shared_ptr<workbench_persistence_adapter_t> persistence;
+    if (impl_->state.config.integrate_persistence) {
+        const auto database = analysis_workspace->database();
+        if (database) {
+            try {
+                persistence = std::make_shared<
+                    workspace_database_workbench_persistence_adapter_t>(
+                        database, workspace);
+            } catch (...) {
+                return shell_error(workbench_error_code_t::adapter_rejected,
+                                   workspace.value);
+            }
+        }
+    }
     auto workspace_state = impl_->ensure_state(workspace);
     std::shared_ptr<workbench_analysis_source_t> source;
     {
@@ -3457,21 +3480,6 @@ workbench_shell_integration_t::integrate_analysis_workspace(
     const auto rebuild_error = impl_->rebuild_documents(workspace_state, source);
     if (!rebuild_error)
         return rebuild_error;
-
-    std::shared_ptr<workbench_persistence_adapter_t> persistence;
-    if (impl_->state.config.integrate_persistence) {
-        const auto database = analysis_workspace->database();
-        if (database) {
-            try {
-                persistence = std::make_shared<
-                    workspace_database_workbench_persistence_adapter_t>(
-                        database, workspace);
-            } catch (...) {
-                return shell_error(workbench_error_code_t::adapter_rejected,
-                                   workspace.value);
-            }
-        }
-    }
     {
         std::lock_guard<std::mutex> lock(workspace_state->mutex);
         workspace_state->persistence_adapter = std::move(persistence);
@@ -3500,14 +3508,24 @@ workbench_shell_integration_t::refresh_analysis_documents(
     if (!source || !analysis_workspace)
         return shell_error(workbench_error_code_t::adapter_rejected,
                            workspace.value);
+    std::shared_ptr<workbench_persistence_adapter_t> persistence;
+    if (impl_->state.config.integrate_persistence) {
+        const auto database = analysis_workspace->database();
+        if (database) {
+            try {
+                persistence = std::make_shared<
+                    workspace_database_workbench_persistence_adapter_t>(
+                        database, workspace);
+            } catch (...) {
+                return shell_error(workbench_error_code_t::adapter_rejected,
+                                   workspace.value);
+            }
+        }
+    }
     const auto rebuild_error = impl_->rebuild_documents(workspace_state, source);
     if (!rebuild_error)
         return rebuild_error;
-    if (impl_->state.config.integrate_persistence &&
-        analysis_workspace->database()) {
-        auto persistence = std::make_shared<
-            workspace_database_workbench_persistence_adapter_t>(
-                analysis_workspace->database(), workspace);
+    {
         std::lock_guard<std::mutex> lock(workspace_state->mutex);
         workspace_state->persistence_adapter = std::move(persistence);
     }

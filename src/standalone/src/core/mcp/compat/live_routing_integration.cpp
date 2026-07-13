@@ -158,6 +158,12 @@ live_routing_integration_t::bind_identity(
 live_routing_result_t<live_routing_snapshot_result_t>
 live_routing_integration_t::capture_bounded_snapshot(
     const live_routing_snapshot_request_t& request) const {
+    const auto completed = completed_snapshots_.load(std::memory_order_acquire);
+    if (completed >= limits_.maximum_snapshots_per_request) {
+        return live_routing_result_t<live_routing_snapshot_result_t>::failure(
+            make_error(live_routing_error_code_t::snapshot_budget_exceeded,
+                       limits_.maximum_snapshots_per_request, completed));
+    }
     if (request.size == 0 || request.size > limits_.maximum_snapshot_bytes) {
         return live_routing_result_t<live_routing_snapshot_result_t>::failure(
             make_error(live_routing_error_code_t::snapshot_budget_exceeded,

@@ -1060,9 +1060,11 @@ workbench_error_t workbench_document_bridge_t::publish(
 workbench_error_t workbench_document_bridge_t::replace(
     std::vector<document_descriptor_t> descriptors)
 {
-    if (!workspace_.valid() ||
-        descriptors.size() > k_max_documents_per_workspace)
+    if (!workspace_.valid())
         return error(workbench_error_code_t::invalid_workspace, workspace_.value);
+    if (descriptors.size() > k_max_documents_per_workspace)
+        return error(workbench_error_code_t::invalid_document,
+                     static_cast<std::uint64_t>(descriptors.size()));
     for (const auto& descriptor : descriptors) {
         const auto identity_error = validate_document_identity(descriptor.identity);
         if (!identity_error)

@@ -442,6 +442,106 @@ UPDATE analysis_state SET generation=12 WHERE singleton=1;
     return result;
 }
 
+schema_v9_fixture_result_t run_partial_v9_repair() {
+    schema_v9_fixture_result_t result;
+    result.name = "partial_v9_repair";
+    const auto path = temp_db_path("partial_v9");
+    sqlite3* db = nullptr;
+
+    auto run = [&]() {
+        if (!open_db(path, &db) || !configure_wal(db)) {
+            result.message = "failed to open partial v9 database";
+            return;
+        }
+        if (!exec_sql(db, R"SQL(
+CREATE TABLE packed_generations(
+    generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation INTEGER NOT NULL CHECK(generation<>0),
+    analysis_revision INTEGER NOT NULL,
+    overlay_revision INTEGER NOT NULL,
+    shard_count INTEGER NOT NULL CHECK(shard_count BETWEEN 1 AND 13),
+    total_payload_bytes INTEGER NOT NULL CHECK(total_payload_bytes BETWEEN 0 AND 536870912),
+    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 1 AND 131072),
+    batch_checksum INTEGER NOT NULL,
+    created_utc_ms INTEGER NOT NULL,
+    committed INTEGER NOT NULL CHECK(committed IN (0,1)),
+    payload_blob BLOB NOT NULL CHECK(length(payload_blob)<=16777216),
+    UNIQUE(generation)
+);
+CREATE TABLE packed_pages(
+    page_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation INTEGER NOT NULL,
+    page_index INTEGER NOT NULL CHECK(page_index BETWEEN 0 AND 131071),
+    page_count INTEGER NOT NULL CHECK(page_count BETWEEN 1 AND 131072),
+    page_type INTEGER NOT NULL CHECK(page_type BETWEEN 1 AND 13),
+    payload_length INTEGER NOT NULL CHECK(payload_length BETWEEN 0 AND 1048576),
+    checksum INTEGER NOT NULL,
+    payload BLOB NOT NULL CHECK(length(payload)=payload_length),
+    UNIQUE(generation,page_index),
+    FOREIGN KEY(generation) REFERENCES packed_generations(generation) ON DELETE CASCADE
+);
+CREATE TABLE packed_page_index(
+    index_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation INTEGER NOT NULL,
+    domain INTEGER NOT NULL CHECK(domain BETWEEN 1 AND 13),
+    ordinal_begin INTEGER NOT NULL CHECK(ordinal_begin BETWEEN 0 AND 4294967295),
+    count INTEGER NOT NULL CHECK(count BETWEEN 0 AND 1048576),
+    page_index INTEGER NOT NULL CHECK(page_index BETWEEN 0 AND 131071),
+    address_value_min INTEGER NOT NULL,
+    address_value_max INTEGER NOT NULL,
+    UNIQUE(generation,domain,page_index),
+    FOREIGN KEY(generation) REFERENCES packed_generations(generation) ON DELETE CASCADE
+);
+PRAGMA user_version=9;
+)SQL")) {
+            result.message = "failed to create partial v9 packed schema";
+            return;
+        }
+        bool invalidate_derived_facts = false;
+        auto migrated = migrate_workspace_database_schema(
+            db, invalidate_derived_facts);
+        if (!migrated || invalidate_derived_facts ||
+            user_version(db) != workspace_schema_v9_version) {
+            result.message = "production migration did not repair partial schema v9";
+            return;
+        }
+        packed_page_encode_options_t options;
+        options.generation = 109;
+        options.analysis_revision = 19;
+        options.overlay_revision = 7;
+        options.page_size = packed_page_default_size;
+        auto batch = packed_page_codec_t::encode_batch(
+            packed_page_type_t::symbol_type_candidates,
+            std::vector<std::uint8_t>(fixed_width_address_size, 0x5AU),
+            options);
+        if (!batch) {
+            result.message = "repaired v9 schema could not encode the new packed domain";
+            return;
+        }
+        auto publication = publication_from_batch(batch.value());
+        if (!publication ||
+            !publish_packed_generation_atomic(db, publication.value())) {
+            result.message = "repaired v9 schema rejected the new packed domain";
+            return;
+        }
+        auto loaded = read_packed_generation_publication(db, options.generation);
+        if (!loaded || !loaded.value() || loaded.value()->pages.size() != 1 ||
+            loaded.value()->pages.front().page_type !=
+                static_cast<std::uint32_t>(
+                    packed_page_type_t::symbol_type_candidates)) {
+            result.message = "repaired v9 packed domain did not round-trip";
+            return;
+        }
+        result.passed = true;
+        result.message = "partial schema-v9 packed domain was repaired in production migration";
+    };
+    result.elapsed_us = measure_us(run);
+    if (db)
+        sqlite3_close_v2(db);
+    cleanup_db(path);
+    return result;
+}
+
 schema_v9_fixture_result_t run_interrupted_commit() {
     schema_v9_fixture_result_t result;
     result.name = "interrupted_commit";
@@ -1147,16 +1247,17 @@ schema_v9_fixture_result_t run_generation_atomicity() {
             result.message = "failed to construct multi-domain publication";
             return;
         }
-        std::size_t cancellation_checks = 0;
-        const auto cancellation_check = publication.value().pages.size() +
-            publication.value().index.size() + 4U;
+        std::size_t transaction_cancellation_checks = 0;
         auto cancelled = publish_packed_generation_atomic(
-            db, publication.value(), [&cancellation_checks, cancellation_check] {
-                ++cancellation_checks;
-                return cancellation_checks == cancellation_check;
+            db, publication.value(), [db, &transaction_cancellation_checks] {
+                if (sqlite3_get_autocommit(db) != 0)
+                    return false;
+                ++transaction_cancellation_checks;
+                return transaction_cancellation_checks == 5;
             });
         if (cancelled ||
-            cancelled.error().code != workspace_error_code_t::cancelled) {
+            cancelled.error().code != workspace_error_code_t::cancelled ||
+            transaction_cancellation_checks != 5) {
             result.message = "bulk publication cancellation did not fail closed";
             return;
         }
@@ -1588,8 +1689,33 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
             result.message = "closed database accepted a new packed-generation read";
             return;
         }
+        auto drained = database->drain(
+            std::chrono::steady_clock::now() + std::chrono::seconds(10));
+        if (!drained) {
+            result.message = "workspace database did not drain before invalidation reopen";
+            return;
+        }
+        database.reset();
+        workspace_database_options_t reopened_options;
+        reopened_options.identity = workspace_identity;
+        reopened_options.versions.engine_version = "schema-v9-harness-updated";
+        reopened_options.versions.specification_version = "schema-v9";
+        reopened_options.versions.analysis_settings_hash = "queue-path-settings";
+        reopened_options.candidate_operation_timeout_ms = 10000;
+        auto reopened_database = workspace_database_t::open(
+            std::move(reopened_options));
+        if (!reopened_database) {
+            result.message = "workspace invalidation reopen failed";
+            return;
+        }
+        database = reopened_database.take_value();
+        auto invalidated_generation = database->load_packed_generation(7001);
+        if (!invalidated_generation || invalidated_generation.value()) {
+            result.message = "derived-data invalidation retained a packed generation";
+            return;
+        }
         result.passed = true;
-        result.message = "real open, queue publication, committed read, and close gate passed";
+        result.message = "real queue publication, rich reopen, close gate, and packed invalidation passed";
     };
 
     result.elapsed_us = measure_us(run);
@@ -1609,6 +1735,7 @@ schema_v9_harness_summary_t run_all_schema_v9_fixtures() {
     schema_v9_harness_summary_t summary;
     std::vector<schema_v9_fixture_result_t> results;
     results.push_back(run_golden_v8_migration());
+    results.push_back(run_partial_v9_repair());
     results.push_back(run_interrupted_commit());
     results.push_back(run_corruption_detection());
     results.push_back(run_rollback_after_failed_migration());

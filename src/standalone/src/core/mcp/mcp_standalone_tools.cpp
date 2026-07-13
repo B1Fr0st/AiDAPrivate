@@ -3676,7 +3676,9 @@ namespace mcp_standalone
                     record.live_snapshot_permitted = metadata.capture_size != 0 &&
                         provider->validate_current_identity().has_value();
                     record.live_snapshot_maximum_bytes = record.live_snapshot_permitted
-                        ? (std::min)(metadata.capture_size, 1024ULL * 1024ULL)
+                        ? (std::min)(metadata.capture_size,
+                            wave_c_compat::live_routing_limits_t{}
+                                .maximum_snapshot_bytes)
                         : 0;
                     record.pid = metadata.process.pid;
                     record.process_creation_identity = metadata.process.creation_time_100ns;
@@ -5243,7 +5245,7 @@ namespace mcp_standalone
 
             void remember_query_cursor_binding(
                 std::uint64_t integrity_tag,
-                std::string semantics) const
+                std::string_view semantics) const
             {
                 std::string key = std::to_string(integrity_tag);
                 key.push_back('\0');
@@ -5383,7 +5385,7 @@ namespace mcp_standalone
                 output.next = source_exhausted ? std::nullopt : cursor;
                 if (output.next) {
                     remember_query_cursor_binding(
-                        output.next->integrity_tag, std::string(route_semantics));
+                        output.next->integrity_tag, route_semantics);
                 }
                 return aida::analysis::workspace_result_t<
                     wave_c_query_page_t>::success(std::move(output));
@@ -5964,43 +5966,49 @@ namespace mcp_standalone
                                 return tool_result_t::error(
                                     "Reference searches use the integrity-bound cursor instead of offset.",
                                     "QUERY_CURSOR_REQUIRED");
-                            if (*address == (std::numeric_limits<std::uint64_t>::max)())
-                                return tool_result_t::error(
-                                    "Reference target cannot be represented as an address range.",
-                                    "INVALID_REFERENCE_TARGET");
-                            aida::analysis::address_search_query_t address_query;
-                            address_query.begin = {
-                                aida::analysis::address_space_id_t::relative_virtual,
-                                *address,
-                                context.workspace->identity().architecture(),
-                                context.workspace->identity().architecture_mode(),
-                            };
-                            address_query.end = address_query.begin;
-                            ++address_query.end.value;
-                            auto address_bound = execute_query_index(
-                                context,
-                                aida::analysis::search_query_t{address_query},
-                                0, 1, nullptr, route_semantics + ":address");
-                            if (!address_bound)
-                                return workspace_tool_error(address_bound.error());
-
-                            aida::analysis::instruction_search_query_t instruction_query;
-                            auto queried = execute_query_index(
-                                context,
-                                aida::analysis::search_query_t{instruction_query},
-                                0, limit, cursor, route_semantics);
-                            if (!queried)
-                                return workspace_tool_error(queried.error());
-                            page = queried.take_value();
                             std::unordered_set<std::uint64_t> sources;
                             for (const auto& xref : snapshot->xrefs) {
                                 if (xref.target.value == *address &&
                                     (search_type == "code_ref") == code_xref(xref.kind))
                                     sources.insert(xref.source.value);
                             }
-                            for (const auto& hit : page.hits) {
-                                if (sources.find(hit.address.value) != sources.end())
-                                    matches.push_back(hex_addr(hit.address.value));
+                            if (sources.empty()) {
+                                if (cursor)
+                                    return tool_result_t::error(
+                                        "Reference query cursor has no current source set.",
+                                        "INVALID_QUERY_CURSOR");
+                            } else {
+                                const auto bounds = (std::minmax_element)(
+                                    sources.begin(), sources.end());
+                                if (*bounds.second ==
+                                    (std::numeric_limits<std::uint64_t>::max)()) {
+                                    return tool_result_t::error(
+                                        "Reference sources cannot be represented as an address range.",
+                                        "INVALID_REFERENCE_TARGET");
+                                }
+                                aida::analysis::address_search_query_t address_query;
+                                address_query.begin = {
+                                    aida::analysis::address_space_id_t::relative_virtual,
+                                    *bounds.first,
+                                    context.workspace->identity().architecture(),
+                                    context.workspace->identity().architecture_mode(),
+                                };
+                                address_query.end = address_query.begin;
+                                address_query.end.value = *bounds.second + 1U;
+                                auto queried = execute_query_index(
+                                    context,
+                                    aida::analysis::search_query_t{address_query},
+                                    0, limit, cursor, route_semantics);
+                                if (!queried)
+                                    return workspace_tool_error(queried.error());
+                                page = queried.take_value();
+                                std::unordered_set<std::uint64_t> emitted;
+                                for (const auto& hit : page.hits) {
+                                    if (sources.find(hit.address.value) != sources.end() &&
+                                        emitted.insert(hit.address.value).second) {
+                                        matches.push_back(hex_addr(hit.address.value));
+                                    }
+                                }
                             }
                         } else {
                             aida::analysis::search_query_t query;

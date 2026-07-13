@@ -731,8 +731,12 @@ graph_error_t graph_document_model_t::diff_generations(
     if (!source_->supports_kind(kind))
         return fail(graph_error_code_t::adapter_rejected,
                     static_cast<std::uint64_t>(kind));
+    const auto cancelled_error = [this, &output](std::uint64_t subject) {
+        output = {};
+        return fail(graph_error_code_t::cancelled, subject);
+    };
     if (cancellation_requested(cancellation))
-        return fail(graph_error_code_t::cancelled, 0);
+        return cancelled_error(0);
 
     const auto old_nc = source_->node_count(old_generation, kind, function_address);
     const auto new_nc = source_->node_count(new_generation, kind, function_address);
@@ -766,7 +770,7 @@ graph_error_t graph_document_model_t::diff_generations(
 
     for (std::uint64_t i = 0; i < old_nc; ++i) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, i);
+            return cancelled_error(i);
         graph_node_view_t node;
         if (!source_->node_at(old_generation, kind, function_address, i, node) ||
             !graph_node_valid(node)) {
@@ -785,7 +789,7 @@ graph_error_t graph_document_model_t::diff_generations(
     }
     for (std::uint64_t i = 0; i < new_nc; ++i) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, old_nc + i);
+            return cancelled_error(old_nc + i);
         graph_node_view_t node;
         if (!source_->node_at(new_generation, kind, function_address, i, node) ||
             !graph_node_valid(node)) {
@@ -809,7 +813,7 @@ graph_error_t graph_document_model_t::diff_generations(
               [](const auto& a, const auto& b) { return a.id < b.id; });
 
     if (cancellation_requested(cancellation))
-        return fail(graph_error_code_t::cancelled, old_nc + new_nc);
+        return cancelled_error(old_nc + new_nc);
     const auto duplicate_node = [](const auto& nodes) {
         return std::adjacent_find(nodes.begin(), nodes.end(),
             [](const auto& lhs, const auto& rhs) { return lhs.id == rhs.id; }) != nodes.end();
@@ -836,7 +840,7 @@ graph_error_t graph_document_model_t::diff_generations(
     std::size_t oi = 0, ni = 0;
     while (oi < old_nodes.size() && ni < new_nodes.size()) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, oi + ni);
+            return cancelled_error(oi + ni);
         if (old_nodes[oi].id < new_nodes[ni].id) {
             graph_diff_entry_t entry;
             entry.kind = graph_diff_entry_t::kind_t::node_removed;
@@ -874,7 +878,7 @@ graph_error_t graph_document_model_t::diff_generations(
     }
     while (oi < old_nodes.size()) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, oi + ni);
+            return cancelled_error(oi + ni);
         graph_diff_entry_t entry;
         entry.kind = graph_diff_entry_t::kind_t::node_removed;
         entry.node = old_nodes[oi].id;
@@ -887,7 +891,7 @@ graph_error_t graph_document_model_t::diff_generations(
     }
     while (ni < new_nodes.size()) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, oi + ni);
+            return cancelled_error(oi + ni);
         graph_diff_entry_t entry;
         entry.kind = graph_diff_entry_t::kind_t::node_added;
         entry.node = new_nodes[ni].id;
@@ -912,7 +916,7 @@ graph_error_t graph_document_model_t::diff_generations(
 
     for (std::uint64_t i = 0; i < old_ec; ++i) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, old_nc + new_nc + i);
+            return cancelled_error(old_nc + new_nc + i);
         graph_edge_view_t edge;
         if (!source_->edge_at(old_generation, kind, function_address, i, edge) ||
             !graph_edge_valid(edge)) {
@@ -927,8 +931,7 @@ graph_error_t graph_document_model_t::diff_generations(
     }
     for (std::uint64_t i = 0; i < new_ec; ++i) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled,
-                        old_nc + new_nc + old_ec + i);
+            return cancelled_error(old_nc + new_nc + old_ec + i);
         graph_edge_view_t edge;
         if (!source_->edge_at(new_generation, kind, function_address, i, edge) ||
             !graph_edge_valid(edge)) {
@@ -949,8 +952,7 @@ graph_error_t graph_document_model_t::diff_generations(
     std::sort(new_edges.begin(), new_edges.end(), edge_less);
 
     if (cancellation_requested(cancellation))
-        return fail(graph_error_code_t::cancelled,
-                    old_nc + new_nc + old_ec + new_ec);
+        return cancelled_error(old_nc + new_nc + old_ec + new_ec);
     const auto duplicate_edge = [](const auto& edges) {
         return std::adjacent_find(edges.begin(), edges.end(),
             [](const auto& lhs, const auto& rhs) { return lhs.id == rhs.id; }) != edges.end();
@@ -961,7 +963,7 @@ graph_error_t graph_document_model_t::diff_generations(
     oi = 0; ni = 0;
     while (oi < old_edges.size() && ni < new_edges.size()) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, oi + ni);
+            return cancelled_error(oi + ni);
         if (old_edges[oi].id < new_edges[ni].id) {
             graph_diff_entry_t entry;
             entry.kind = graph_diff_entry_t::kind_t::edge_removed;
@@ -999,7 +1001,7 @@ graph_error_t graph_document_model_t::diff_generations(
     }
     while (oi < old_edges.size()) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, oi + ni);
+            return cancelled_error(oi + ni);
         graph_diff_entry_t entry;
         entry.kind = graph_diff_entry_t::kind_t::edge_removed;
         entry.edge = old_edges[oi].id;
@@ -1012,7 +1014,7 @@ graph_error_t graph_document_model_t::diff_generations(
     }
     while (ni < new_edges.size()) {
         if (cancellation_requested(cancellation))
-            return fail(graph_error_code_t::cancelled, oi + ni);
+            return cancelled_error(oi + ni);
         graph_diff_entry_t entry;
         entry.kind = graph_diff_entry_t::kind_t::edge_added;
         entry.edge = new_edges[ni].id;

@@ -1407,11 +1407,17 @@ workspace_result_t<void> pe_baseline_analyzer_t::blocks_phase(
     impl_->metrics->set(analysis_metric_t::data_candidates,
         impl_->data_result.candidates.size());
     impl_->metrics->add(analysis_metric_t::provider_leases,
-        impl_->data_result.provider_leases + impl_->function_result.provider_leases);
+        impl_->data_result.provider_leases);
+    impl_->metrics->add(analysis_metric_t::provider_leases,
+        impl_->function_result.provider_leases);
     impl_->metrics->add(analysis_metric_t::mapped_bytes,
-        impl_->data_result.mapped_bytes + impl_->function_result.mapped_bytes);
+        impl_->data_result.mapped_bytes);
+    impl_->metrics->add(analysis_metric_t::mapped_bytes,
+        impl_->function_result.mapped_bytes);
     impl_->metrics->add(analysis_metric_t::read_bytes,
-        impl_->data_result.bytes_scanned + impl_->function_result.bytes_read);
+        impl_->data_result.bytes_scanned);
+    impl_->metrics->add(analysis_metric_t::read_bytes,
+        impl_->function_result.bytes_read);
     impl_->metrics->set(analysis_metric_t::blocks,
         impl_->function_result.blocks.size());
     impl_->metrics->end_phase(measurement,

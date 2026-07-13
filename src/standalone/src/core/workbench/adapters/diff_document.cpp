@@ -43,10 +43,8 @@ bool diff_entry_valid(const diff_entry_t& entry) noexcept
     if (entry.kind == diff_entry_kind_t::removed && entry.new_address != 0)
         return false;
     if (entry.kind == diff_entry_kind_t::moved) {
-        const auto has_old_address = entry.old_address != 0;
-        const auto has_new_address = entry.new_address != 0;
-        if (has_old_address != has_new_address ||
-            (has_old_address && entry.old_address == entry.new_address)) {
+        if (entry.old_address == 0 || entry.new_address == 0 ||
+            entry.old_address == entry.new_address) {
             return false;
         }
     }

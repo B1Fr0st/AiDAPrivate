@@ -79,7 +79,8 @@ struct decompiler_ui_result_t {
     std::uint64_t elapsed_ms = 0;
     std::optional<decompiler_cache_stage_t> cache_hit_stage;
     bool succeeded() const noexcept {
-        return status == decompiler_pipeline_status_t::completed;
+        return status == decompiler_pipeline_status_t::completed && document &&
+               !rendered_text.empty();
     }
 };
 

@@ -289,7 +289,7 @@ public:
             source.hir.entity != request.cache_key.entity ||
             source.type_graph.entity != request.cache_key.entity ||
             !equal_provider_identity(source.provider_ir.provider, descriptor_.identity) ||
-            !equal_language_identity(source.provider_ir.language, language_) ||
+            !equal_language_identity(source.provider_ir.language, request.cache_key.language) ||
             source.hir.provider_ir_hash != stable_serialization_hash(source.provider_ir) ||
             source.hir.type_graph_revision != request.cache_key.type_graph_revision ||
             source.type_graph.revision != request.cache_key.type_graph_revision ||

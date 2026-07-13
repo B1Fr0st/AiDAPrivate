@@ -21,6 +21,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace aida::analysis {
@@ -1537,7 +1538,7 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
             return result;
         }
         const auto after = service->snapshot().memory_cache_entries;
-        result.invalidated_entry_count = before >= after ? before - after : before;
+        result.invalidated_entry_count = before >= after ? before - after : 0;
         result.succeeded = true;
         return result;
     }
@@ -1573,58 +1574,61 @@ projection_finalize_result_t publish_projected_overlay(
     std::function<workspace_result_t<void>()> persistence_finalizer,
     const cancellation_token_t& cancel) {
     try {
-    projection_invalidation_hooks_t hooks;
-    hooks.decompiler_cache =
-        [workspace, database, cancel](
-            const decompiler_cache_invalidation_request_t& request) {
-            return invalidate_decompiler_cache(
-                request, workspace, database, cancel);
-        };
-    hooks.packed_index =
-        [workspace, generation, persistence_finalizer =
-             std::move(persistence_finalizer)](
-            const packed_index_invalidation_request_t& request) {
-            projection_invalidation_hook_result_t result;
-            if (!generation || !generation->snapshot ||
-                generation->snapshot->generation != request.target_generation) {
-                result.detail =
-                    "packed-index generation does not match overlay publication";
+        projection_invalidation_hooks_t hooks;
+        hooks.decompiler_cache =
+            [workspace, database, cancel](
+                const decompiler_cache_invalidation_request_t& request) {
+                return invalidate_decompiler_cache(
+                    request, workspace, database, cancel);
+            };
+        hooks.packed_index =
+            [workspace, generation, persistence_finalizer =
+                 std::move(persistence_finalizer)](
+                const packed_index_invalidation_request_t& request) {
+                projection_invalidation_hook_result_t result;
+                if (!generation || !generation->snapshot ||
+                    generation->snapshot->generation != request.target_generation) {
+                    result.detail =
+                        "packed-index generation does not match overlay publication";
+                    return result;
+                }
+                const auto source = workspace->analysis_publication();
+                if (!source || !source->snapshot ||
+                    source->generation != request.source_generation) {
+                    result.detail =
+                        "workspace generation changed before packed-index publication";
+                    return result;
+                }
+                auto published = workspace->publish_analysis_bundle(
+                    request.source_generation,
+                    source->snapshot->analysis_revision,
+                    generation->snapshot,
+                    generation->search_index,
+                    generation->snapshot->baseline_complete,
+                    persistence_finalizer);
+                if (!published) {
+                    result.detail = published.error().message;
+                    return result;
+                }
+                result.invalidated_entry_count =
+                    generation->retired_index_entries;
+                result.succeeded = true;
                 return result;
-            }
-            const auto source = workspace->analysis_publication();
-            if (!source || !source->snapshot ||
-                source->generation != request.source_generation) {
-                result.detail =
-                    "workspace generation changed before packed-index publication";
-                return result;
-            }
-            auto published = workspace->publish_analysis_bundle(
-                request.source_generation,
-                source->snapshot->analysis_revision,
-                generation->snapshot,
-                generation->search_index,
-                generation->snapshot->baseline_complete,
-                persistence_finalizer);
-            if (!published) {
-                result.detail = published.error().message;
-                return result;
-            }
-            result.invalidated_entry_count = generation->retired_index_entries;
-            result.succeeded = true;
-            return result;
-        };
-    return overlay_projection_t::finalize_publication(
-        state, prepared, hooks,
-        [](const projection_publication_view_t& view,
-           const projection_invalidation_hooks_t& publication_hooks) {
-            projection_publication_commit_t commit;
-            commit.invalidation = overlay_projection_t::dispatch_invalidation(
-                view.invalidation, publication_hooks);
-            commit.committed = commit.invalidation.satisfies(view.invalidation);
-            if (!commit.committed)
-                commit.detail = commit.invalidation.detail;
-            return commit;
-        });
+            };
+        return overlay_projection_t::finalize_publication(
+            state, prepared, hooks,
+            [](const projection_publication_view_t& view,
+               const projection_invalidation_hooks_t& publication_hooks) {
+                projection_publication_commit_t commit;
+                commit.invalidation =
+                    overlay_projection_t::dispatch_invalidation(
+                        view.invalidation, publication_hooks);
+                commit.committed =
+                    commit.invalidation.satisfies(view.invalidation);
+                if (!commit.committed)
+                    commit.detail = commit.invalidation.detail;
+                return commit;
+            });
     } catch (...) {
         projection_finalize_result_t result;
         result.code = projection_code_t::finalizer_failed;
@@ -1835,7 +1839,7 @@ workspace_result_t<void> overlay_journal_t::ensure_fixed_target_binding(
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.target");
             if (!begin)
                 return begin;
-            overlay_rollback_guard_t rollback_guard(
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
                 writer, "overlay_journal.target");
             overlay_statement_t query;
             auto current = query.prepare(writer,
@@ -1982,7 +1986,7 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
             }
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.recovery");
             if (!begin) return begin;
-            overlay_rollback_guard_t rollback_guard(
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
                 writer, "overlay_journal.recovery");
             auto migrated = migrate_operation_payloads(writer, target);
             if (!migrated) {
@@ -2389,6 +2393,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
         prepared.changes, preflight_state.value(), target.generation);
     if (!reanalysis ||
         reanalysis.scope.ranges != prepared.invalidation.affected_ranges ||
+        reanalysis.invalidation.affected_entities !=
+            prepared.invalidation.affected_entities ||
         reanalysis.scope.stage_flags != prepared.invalidation.invalidated_stages ||
         reanalysis.scope.total_patched_bytes !=
             prepared.invalidation.total_patched_bytes) {
@@ -2473,7 +2479,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                     "overlay commit cancelled", "overlay_journal.commit"));
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.commit");
             if (!begin) return begin;
-            overlay_rollback_guard_t rollback_guard(
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
                 writer, "overlay_journal.commit");
             auto state_result = read_overlay_state(writer, "overlay_journal.commit");
             if (!state_result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return workspace_result_t<void>::failure(state_result.error()); }
@@ -2651,6 +2657,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
         auto waited = wait_ticket(ticket, cancel);
         if (!waited)
             return waited;
+        publication_epoch_.fetch_add(1, std::memory_order_acq_rel);
         {
             std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
             items_.swap(*next_items);
@@ -2665,6 +2672,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     const auto finalized = publish_projected_overlay(
         preflight_state.value(), prepared, workspace, database_,
         workspace_generation, std::move(persistence_finalizer), cancel);
+    if ((publication_epoch_.load(std::memory_order_acquire) & 1U) != 0)
+        publication_epoch_.fetch_add(1, std::memory_order_release);
     if (!finalized)
         return workspace_result_t<overlay_transaction_result_t>::failure(
             projection_finalize_error(finalized, "overlay_journal.transact"));
@@ -2899,6 +2908,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
         prepared.changes, preflight_state.value(), target.generation);
     if (!reanalysis ||
         reanalysis.scope.ranges != prepared.invalidation.affected_ranges ||
+        reanalysis.invalidation.affected_entities !=
+            prepared.invalidation.affected_entities ||
         reanalysis.scope.stage_flags != prepared.invalidation.invalidated_stages ||
         reanalysis.scope.total_patched_bytes !=
             prepared.invalidation.total_patched_bytes) {
@@ -2969,7 +2980,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                     "overlay history action cancelled", "overlay_journal.history"));
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.history");
             if (!begin) return begin;
-            overlay_rollback_guard_t rollback_guard(
+            [[maybe_unused]] overlay_rollback_guard_t rollback_guard(
                 writer, "overlay_journal.history");
             auto state_result = read_overlay_state(writer, "overlay_journal.history");
             if (!state_result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return workspace_result_t<void>::failure(state_result.error()); }
@@ -3133,6 +3144,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
         auto waited = wait_ticket(ticket, cancel);
         if (!waited)
             return waited;
+        publication_epoch_.fetch_add(1, std::memory_order_acq_rel);
         {
             std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
             items_.swap(*next_items);
@@ -3147,6 +3159,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
     const auto finalized = publish_projected_overlay(
         preflight_state.value(), prepared, workspace, database_,
         workspace_generation, std::move(persistence_finalizer), cancel);
+    if ((publication_epoch_.load(std::memory_order_acquire) & 1U) != 0)
+        publication_epoch_.fetch_add(1, std::memory_order_release);
     if (!finalized)
         return workspace_result_t<overlay_transaction_result_t>::failure(
             projection_finalize_error(finalized, "overlay_journal.history"));
@@ -3165,47 +3179,85 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::redo(
     return history_action(true, expected_revision, cancel);
 }
 
+std::uint64_t overlay_journal_t::wait_for_publication() const noexcept {
+    for (;;) {
+        const auto epoch = publication_epoch_.load(std::memory_order_acquire);
+        if ((epoch & 1U) == 0)
+            return epoch;
+        std::this_thread::yield();
+    }
+}
+
 overlay_snapshot_t overlay_journal_t::snapshot() const {
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    overlay_snapshot_t result;
-    result.revision = revision_;
-    result.history_cursor = history_cursor_;
-    result.history_epoch = history_epoch_;
-    result.items.reserve(items_.size());
-    for (const auto& item : items_)
-        result.items.push_back(item);
-    std::sort(result.items.begin(), result.items.end(),
-        [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
-    return result;
+    for (;;) {
+        const auto epoch = wait_for_publication();
+        overlay_snapshot_t result;
+        {
+            std::shared_lock<std::shared_mutex> lock(state_mutex_);
+            result.revision = revision_;
+            result.history_cursor = history_cursor_;
+            result.history_epoch = history_epoch_;
+            result.items.reserve(items_.size());
+            for (const auto& item : items_)
+                result.items.push_back(item);
+        }
+        std::sort(result.items.begin(), result.items.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.first < rhs.first;
+            });
+        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
+            return result;
+    }
 }
 
 overlay_target_identity_v9_t overlay_journal_t::fixed_target() const {
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    return fixed_target_;
+    for (;;) {
+        const auto epoch = wait_for_publication();
+        overlay_target_identity_v9_t result;
+        {
+            std::shared_lock<std::shared_mutex> lock(state_mutex_);
+            result = fixed_target_;
+        }
+        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
+            return result;
+    }
 }
 
 std::optional<overlay_operation_t> overlay_journal_t::find(
     const std::string& entity) const {
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    auto found = items_.find(entity);
-    if (found == items_.end())
-        return std::nullopt;
-    return found->second;
+    for (;;) {
+        const auto epoch = wait_for_publication();
+        std::optional<overlay_operation_t> result;
+        {
+            std::shared_lock<std::shared_mutex> lock(state_mutex_);
+            auto found = items_.find(entity);
+            if (found != items_.end())
+                result = found->second;
+        }
+        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
+            return result;
+    }
 }
 
 std::vector<overlay_operation_t> overlay_journal_t::patch_operations() const {
-    std::vector<overlay_operation_t> result;
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    for (const auto& item : items_) {
-        if (item.second.kind == overlay_operation_kind_t::byte_patch ||
-            item.second.kind == overlay_operation_kind_t::assembly_patch ||
-            item.second.kind == overlay_operation_kind_t::integer_patch)
-            result.push_back(item.second);
+    for (;;) {
+        const auto epoch = wait_for_publication();
+        std::vector<overlay_operation_t> result;
+        {
+            std::shared_lock<std::shared_mutex> lock(state_mutex_);
+            for (const auto& item : items_) {
+                if (item.second.kind == overlay_operation_kind_t::byte_patch ||
+                    item.second.kind == overlay_operation_kind_t::assembly_patch ||
+                    item.second.kind == overlay_operation_kind_t::integer_patch)
+                    result.push_back(item.second);
+            }
+        }
+        std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.address < rhs.address;
+        });
+        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
+            return result;
     }
-    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.address < rhs.address;
-    });
-    return result;
 }
 
 void overlay_journal_t::request_cancel() noexcept {

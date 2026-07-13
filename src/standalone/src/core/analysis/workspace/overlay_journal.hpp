@@ -4,6 +4,7 @@
 #include "analysis_workspace.hpp"
 #include "workspace_database.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -162,6 +163,7 @@ private:
         const cancellation_token_t& cancel);
     workspace_result_t<void> recover_and_load(const cancellation_token_t& cancel);
     workspace_result_t<void> reload_items();
+    std::uint64_t wait_for_publication() const noexcept;
     workspace_result_t<overlay_transaction_result_t> history_action(
         bool redo, std::optional<std::uint64_t> expected_revision,
         const cancellation_token_t& cancel);
@@ -171,6 +173,7 @@ private:
     overlay_limits_t limits_;
     overlay_target_identity_v9_t fixed_target_;
     mutable std::mutex publication_mutex_;
+    std::atomic<std::uint64_t> publication_epoch_{0};
     mutable std::shared_mutex state_mutex_;
     std::unordered_map<std::string, overlay_operation_t> items_;
     std::uint64_t revision_ = 0;

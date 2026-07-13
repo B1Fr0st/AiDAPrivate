@@ -1150,7 +1150,11 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
                std::isspace(static_cast<unsigned char>(digest_text.back())) != 0)
             digest_text.pop_back();
         const auto digest_hex_size = sha256_digest_t{}.bytes.size() * 2U;
-        if (digest_text.size() != digest_hex_size) {
+        if (digest_text.size() != digest_hex_size ||
+            !std::all_of(digest_text.begin(), digest_text.end(), [](const unsigned char value) {
+                return (value >= '0' && value <= '9') ||
+                       (value >= 'a' && value <= 'f');
+            })) {
             return failure(workspace_error_code_t::integrity_failure,
                 "native decompiler worker manifest digest is malformed",
                 "native_worker.runtime.digest");

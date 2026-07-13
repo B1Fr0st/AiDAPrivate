@@ -62,6 +62,15 @@ bool checked_add(std::uint64_t lhs, std::uint64_t rhs,
     return true;
 }
 
+bool checked_multiply(std::uint64_t lhs, std::uint64_t rhs,
+                      std::uint64_t& result) noexcept
+{
+    if (lhs != 0 && rhs > (std::numeric_limits<std::uint64_t>::max)() / lhs)
+        return false;
+    result = lhs * rhs;
+    return true;
+}
+
 edge_kind_t flow_to_edge_kind(std::uint32_t flow_flags) noexcept
 {
     if ((flow_flags & flow_return) != 0)
@@ -600,6 +609,28 @@ public:
         if (options.worker_count == 0)
             options.worker_count = 1;
 
+        const auto budget_validation =
+            validate_analysis_budget(options.analysis_budget);
+        if (!budget_validation) {
+            auto error = orchestrator_error(workspace_error_code_t::invalid_argument,
+                "production tile decode resource budget is invalid");
+            error.details.emplace_back("resource",
+                std::string(analysis_resource_kind_name(budget_validation.kind)));
+            error.details.emplace_back("reason",
+                std::string(budget_validation.stable_code));
+            error.details.emplace_back("limit",
+                std::to_string(budget_validation.limit));
+            error.details.emplace_back("requested",
+                std::to_string(budget_validation.requested));
+            return workspace_result_t<std::unique_ptr<tile_decode_executor_t>>::failure(
+                std::move(error));
+        }
+        if (options.worker_count > options.analysis_budget.max_worker_slots) {
+            return workspace_result_t<std::unique_ptr<tile_decode_executor_t>>::failure(
+                limit_error("worker_slots", options.analysis_budget.max_worker_slots,
+                    options.worker_count));
+        }
+
         const bool use_x86 =
             (options.decoder_key.architecture == architecture_id_t::x86 ||
              options.decoder_key.architecture == architecture_id_t::x86_64);
@@ -626,6 +657,19 @@ public:
             caps.instruction_alignment = reg.limits.instruction_alignment;
         }
 
+        std::uint64_t maximum_concurrent_window_bytes = 0;
+        if (!checked_multiply(caps.maximum_request_bytes, options.worker_count,
+                maximum_concurrent_window_bytes) ||
+            maximum_concurrent_window_bytes >
+                options.analysis_budget.max_mapped_window_bytes) {
+            return workspace_result_t<std::unique_ptr<tile_decode_executor_t>>::failure(
+                limit_error("mapped_window_bytes",
+                    options.analysis_budget.max_mapped_window_bytes,
+                    maximum_concurrent_window_bytes == 0
+                        ? (std::numeric_limits<std::uint64_t>::max)()
+                        : maximum_concurrent_window_bytes));
+        }
+
         auto* raw = new production_tile_decode_executor_t();
         raw->options_ = std::move(options);
         raw->capabilities_ = caps;
@@ -648,6 +692,13 @@ public:
     {
         std::vector<tile_decode_completion_t> completions;
         completions.reserve(requests.size());
+
+        if (requests.size() > options_.analysis_budget.max_queued_tasks) {
+            return workspace_result_t<std::vector<tile_decode_completion_t>>::failure(
+                limit_error("queued_decode_requests",
+                    options_.analysis_budget.max_queued_tasks,
+                    static_cast<std::uint64_t>(requests.size())));
+        }
 
         if (capabilities_.worker_count <= 1) {
             for (const auto& request : requests) {
