@@ -700,6 +700,19 @@ void verify_production_document_bridge()
     require(error.ok() && bridge.documents().size() == 3,
             "production document bridge must publish the shell document catalog");
 
+    error = bridge.replace({disassembly, disassembly});
+    require(error.code == workbench_error_code_t::duplicate_identifier &&
+                bridge.documents().size() == 3,
+            "production document bridge replacement must be atomic on rejection");
+
+    auto unknown_source = disassembly.identity;
+    unknown_source.object_id = 99;
+    navigation_resolution_t rejected_target;
+    error = bridge.resolve_target(unknown_source, document_kind_t::hex,
+                                  0x401240U, rejected_target);
+    require(error.code == workbench_error_code_t::invalid_document,
+            "production document bridge must reject an unpublished source");
+
     navigation_resolution_t target;
     error = bridge.resolve_target(disassembly.identity, document_kind_t::hex,
                                   0x401240U, target);

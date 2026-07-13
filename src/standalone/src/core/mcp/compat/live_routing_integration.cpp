@@ -233,6 +233,14 @@ live_routing_integration_t::capture_bounded_snapshot(
         return live_routing_result_t<live_routing_snapshot_result_t>::failure(
             make_error(live_routing_error_code_t::debugger_lane_busy));
     }
+    if (request.cancellation.cancelled()) {
+        return live_routing_result_t<live_routing_snapshot_result_t>::failure(
+            make_error(live_routing_error_code_t::snapshot_cancelled));
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        return live_routing_result_t<live_routing_snapshot_result_t>::failure(
+            make_error(live_routing_error_code_t::snapshot_deadline_exceeded));
+    }
 
     auto pin_result = resolver_.pin_current(target, request.expected_generation);
     if (!pin_result) {
@@ -265,9 +273,11 @@ live_routing_integration_t::capture_bounded_snapshot(
             ? live_routing_error_code_t::module_identity_mismatch
             : source.error().code == adapter_error_code_t::live_snapshot_invalid
                 ? live_routing_error_code_t::process_identity_mismatch
-                : source.error().code == adapter_error_code_t::live_snapshot_denied
-                    ? live_routing_error_code_t::target_not_resolved
-                    : live_routing_error_code_t::internal_error;
+                : source.error().code == adapter_error_code_t::target_resolution_failed
+                    ? live_routing_error_code_t::attach_generation_stale
+                    : source.error().code == adapter_error_code_t::live_snapshot_denied
+                        ? live_routing_error_code_t::target_not_resolved
+                        : live_routing_error_code_t::internal_error;
         return live_routing_result_t<live_routing_snapshot_result_t>::failure(
             make_error(code, source.error().expected, source.error().actual));
     }
@@ -392,6 +402,14 @@ live_routing_integration_t::dispatch_debugger(
     if (!lease) {
         return live_routing_result_t<live_routing_dispatch_result_t>::failure(
             make_error(live_routing_error_code_t::debugger_lane_busy));
+    }
+    if (context.cancellation.cancelled()) {
+        return live_routing_result_t<live_routing_dispatch_result_t>::failure(
+            make_error(live_routing_error_code_t::debugger_cancelled));
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        return live_routing_result_t<live_routing_dispatch_result_t>::failure(
+            make_error(live_routing_error_code_t::debugger_deadline_exceeded));
     }
 
     auto execution_pin = resolver_.pin_current(target, context.expected_generation);

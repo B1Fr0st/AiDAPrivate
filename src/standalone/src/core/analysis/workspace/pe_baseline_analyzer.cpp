@@ -501,6 +501,109 @@ function_seed_sources_t group_function_seeds(const std::vector<function_seed_t>&
     return sources;
 }
 
+workspace_result_t<std::vector<indirect_call_candidate_t>>
+build_indirect_call_candidates(
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<target_fact_t>& targets,
+    const std::vector<data_pointer_fact_t>& pointers,
+    std::uint64_t maximum_candidates,
+    std::uint32_t cancellation_check_interval,
+    const cancellation_token_t& cancel)
+{
+    if (maximum_candidates == 0 || cancellation_check_interval == 0) {
+        return workspace_result_t<std::vector<indirect_call_candidate_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                "indirect call candidate limits are invalid", "call_graph_evidence"));
+    }
+    if (!std::is_sorted(pointers.begin(), pointers.end(),
+            [](const data_pointer_fact_t& lhs, const data_pointer_fact_t& rhs) {
+                return lhs.slot < rhs.slot;
+            })) {
+        return workspace_result_t<std::vector<indirect_call_candidate_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                "data pointer facts are not ordered by slot", "call_graph_evidence"));
+    }
+    std::vector<indirect_call_candidate_t> candidates;
+    std::uint64_t checks = 0;
+    for (const auto& instruction : instructions) {
+        if (++checks >= cancellation_check_interval) {
+            checks = 0;
+            if (cancel.stop_requested()) {
+                return workspace_result_t<
+                    std::vector<indirect_call_candidate_t>>::failure(
+                    cancellation_error(cancel, cancel, "call_graph_evidence"));
+            }
+        }
+        if ((instruction.flow_flags & flow_indirect) == 0 ||
+            (instruction.flow_flags & (flow_call | flow_branch)) == 0)
+            continue;
+        std::uint64_t target_end = 0;
+        if (!checked_add_u64(instruction.target_fact_begin,
+                instruction.target_fact_count, target_end) ||
+            target_end > targets.size()) {
+            return workspace_result_t<
+                std::vector<indirect_call_candidate_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                    "indirect call target range is invalid", "call_graph_evidence"));
+        }
+        for (std::uint64_t target_index = instruction.target_fact_begin;
+             target_index < target_end; ++target_index) {
+            const auto& target = targets[static_cast<std::size_t>(target_index)];
+            if (target.instruction_id != 0 &&
+                target.instruction_id != instruction.id) {
+                return workspace_result_t<
+                    std::vector<indirect_call_candidate_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                        "indirect call target owner is invalid",
+                        "call_graph_evidence"));
+            }
+            if (target.kind != target_kind_record_t::data)
+                continue;
+            auto pointer = std::lower_bound(pointers.begin(), pointers.end(),
+                target.target,
+                [](const data_pointer_fact_t& fact, const address_t& slot) {
+                    return fact.slot < slot;
+                });
+            for (; pointer != pointers.end() && pointer->slot == target.target;
+                 ++pointer) {
+                if (++checks >= cancellation_check_interval) {
+                    checks = 0;
+                    if (cancel.stop_requested()) {
+                        return workspace_result_t<
+                            std::vector<indirect_call_candidate_t>>::failure(
+                            cancellation_error(
+                                cancel, cancel, "call_graph_evidence"));
+                    }
+                }
+                if (candidates.size() >= maximum_candidates) {
+                    return workspace_result_t<
+                        std::vector<indirect_call_candidate_t>>::failure(
+                        make_workspace_error(workspace_error_code_t::limit_exceeded,
+                            "indirect call candidate storage exceeds analysis budget",
+                            "call_graph_evidence"));
+                }
+                indirect_call_candidate_t candidate;
+                candidate.instruction_id = instruction.id;
+                candidate.call_site = instruction.address;
+                candidate.target = pointer->target;
+                candidate.kind =
+                    pointer->candidate_kind == data_candidate_kind_t::relocation_slot
+                        ? indirect_call_candidate_kind_t::relocation
+                        : pointer->candidate_kind ==
+                                data_candidate_kind_t::import_address_slot
+                            ? indirect_call_candidate_kind_t::import_slot
+                            : indirect_call_candidate_kind_t::pointer_scan;
+                candidate.provenance = pointer->provenance;
+                candidate.confidence = pointer->confidence;
+                candidate.stable_source_id = pointer->id;
+                candidates.push_back(std::move(candidate));
+            }
+        }
+    }
+    return workspace_result_t<std::vector<indirect_call_candidate_t>>::success(
+        std::move(candidates));
+}
+
 fact_provenance_t legacy_type_provenance(metadata_provenance_t provenance) noexcept {
     switch (provenance) {
         case metadata_provenance_t::decoded:
@@ -1165,11 +1268,16 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
     if (!registration)
         return workspace_result_t<void>::failure(registration.error());
 
+    const auto executor_queue_limit = (std::min)(
+        impl_->settings.max_decode_queue,
+        static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)()));
     auto limits = impl_->settings.tile_decode_limits;
     limits.maximum_frontier_seeds = (std::min)({
         limits.maximum_frontier_seeds,
         impl_->settings.max_seed_count,
         impl_->settings.max_decode_queue});
+    limits.maximum_frontier_wave = (std::min)(
+        limits.maximum_frontier_wave, executor_queue_limit);
     limits.maximum_decode_requests = (std::min)(
         limits.maximum_decode_requests, impl_->settings.max_decode_queue);
     limits.maximum_instructions = (std::min)(
@@ -1183,10 +1291,9 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
     production_tile_decode_executor_options_t options;
     options.decoder_key = impl_->decoder_key;
     options.worker_count = impl_->decode_workers;
-    options.analysis_budget.max_queued_tasks = static_cast<std::uint32_t>((std::min)(
-        impl_->settings.max_decode_queue,
-        static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)())));
-    options.analysis_budget.max_worker_slots = impl_->decode_workers;
+    options.analysis_budget.max_queued_tasks =
+        static_cast<std::uint32_t>(executor_queue_limit);
+    options.analysis_budget.max_worker_slots = impl_->decode_workers + 1U;
     options.analysis_budget.reserved_control_worker_slots = 1;
     options.analysis_budget.max_private_bytes = impl_->settings.max_analysis_memory_bytes;
     options.analysis_budget.max_mapped_window_bytes =
@@ -1453,10 +1560,18 @@ workspace_result_t<void> pe_baseline_analyzer_t::functions_phase(
     limits.cancellation_check_interval = (std::min)(
         limits.cancellation_check_interval,
         impl_->settings.cancellation_check_interval);
-    const std::vector<indirect_call_candidate_t> indirect_candidates;
+    const auto maximum_indirect_candidates = (std::min)(
+        limits.max_candidates,
+        limits.max_result_bytes / sizeof(indirect_call_candidate_t));
+    auto indirect_candidates = build_indirect_call_candidates(
+        impl_->draft->instructions, impl_->draft->target_facts,
+        impl_->data_result.pointer_facts, maximum_indirect_candidates,
+        limits.cancellation_check_interval, impl_->cancellation.token());
+    if (!indirect_candidates)
+        return workspace_result_t<void>::failure(indirect_candidates.error());
     auto graph = call_graph_builder_t::build(impl_->draft->instructions,
-        impl_->draft->target_facts, impl_->function_result, indirect_candidates,
-        limits, impl_->cancellation.token());
+        impl_->draft->target_facts, impl_->function_result,
+        indirect_candidates.value(), limits, impl_->cancellation.token());
     if (!graph)
         return workspace_result_t<void>::failure(graph.error());
     impl_->call_graph_result = graph.take_value();

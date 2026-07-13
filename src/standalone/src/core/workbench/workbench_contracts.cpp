@@ -1199,6 +1199,22 @@ workbench_error_t workbench_document_bridge_t::resolve_target(
         return error(workbench_error_code_t::invalid_document);
 
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto source_known = std::any_of(
+        documents_.begin(), documents_.end(),
+        [&source](const document_descriptor_t& candidate) {
+            return candidate.can_open &&
+                   candidate.identity.workspace == source.workspace &&
+                   candidate.identity.kind == source.kind &&
+                   candidate.identity.object_id == source.object_id &&
+                   candidate.identity.variant_id == source.variant_id &&
+                   candidate.identity.provider_key == source.provider_key &&
+                   (!candidate.identity.has_address ||
+                    (source.has_address &&
+                     candidate.identity.address == source.address));
+        });
+    if (!source_known)
+        return error(workbench_error_code_t::invalid_document,
+                     source.object_id);
     const document_descriptor_t* selected = nullptr;
     for (const auto& candidate : documents_) {
         if (candidate.identity.kind != target_kind || !candidate.can_open)

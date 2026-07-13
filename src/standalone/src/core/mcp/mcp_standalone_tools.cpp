@@ -5148,10 +5148,18 @@ namespace mcp_standalone
                     ? json_nonnegative_u64(value.at("matches_consumed")) : std::nullopt;
                 const auto integrity_tag = value.contains("integrity_tag")
                     ? json_nonnegative_u64(value.at("integrity_tag")) : std::nullopt;
+                const auto next = value.contains("next")
+                    ? json_nonnegative_u64(value.at("next")) : std::nullopt;
                 if (!binary_id || !load_profile_hash || !generation ||
                     !analysis_revision || !overlay_revision || !provider_size ||
                     !query_fingerprint || !position || !matches_consumed ||
-                    !integrity_tag || *generation == 0 || *integrity_tag == 0) {
+                    !integrity_tag || *generation == 0 || *integrity_tag == 0 ||
+                    (value.contains("next") && (!next || *next != *position)) ||
+                    (value.contains("done") &&
+                     (!value.at("done").is_boolean() || value.at("done").get<bool>())) ||
+                    (value.contains("cancelled") &&
+                     (!value.at("cancelled").is_boolean() ||
+                      value.at("cancelled").get<bool>()))) {
                     return aida::analysis::workspace_result_t<
                         aida::analysis::query_cursor_t>::failure(
                             wave_c_query_error(
@@ -5229,6 +5237,33 @@ namespace mcp_standalone
                 case kind_t::byte_sequence: return "bytes";
                 }
                 return "unknown";
+            }
+
+            static bool query_address_is_executable(
+                const aida::analysis::workspace_image_t* image,
+                const aida::analysis::address_t& address) noexcept
+            {
+                if (!image)
+                    return false;
+                std::uint64_t rva = address.value;
+                if (address.space ==
+                        aida::analysis::address_space_id_t::virtual_address ||
+                    address.space ==
+                        aida::analysis::address_space_id_t::live_virtual) {
+                    if (address.value < image->image_base)
+                        return false;
+                    rva = address.value - image->image_base;
+                }
+                const auto executable = [rva](const auto& region) {
+                    return (region.permissions &
+                            aida::analysis::image_permission_execute) != 0 &&
+                        rva >= region.virtual_address &&
+                        rva - region.virtual_address < region.virtual_size;
+                };
+                return std::any_of(
+                           image->segments.begin(), image->segments.end(), executable) ||
+                    std::any_of(
+                           image->sections.begin(), image->sections.end(), executable);
             }
 
             bool validate_query_cursor_binding(
@@ -5400,7 +5435,7 @@ namespace mcp_standalone
                 };
                 if (name == "decompile") {
                     const auto legacy = invoke_legacy(
-                        name, json{{"address", arguments.at("addr")}}, context);
+                        "decompile", json{{"address", arguments.at("addr")}}, context);
                     if (!legacy.success)
                         return tool_result_t::ok(json{
                             {"addr", arguments.at("addr")}, {"code", nullptr},
@@ -5426,7 +5461,7 @@ namespace mcp_standalone
                     const auto requested = offset > (std::numeric_limits<std::uint64_t>::max)() - maximum
                         ? (std::numeric_limits<std::uint64_t>::max)() : offset + maximum;
                     const auto legacy = invoke_legacy(
-                        name, json{{"address", arguments.at("addr")},
+                        "disasm", json{{"address", arguments.at("addr")},
                                    {"max_instructions", (std::min)(requested, std::uint64_t{4096})}},
                         context);
                     if (!legacy.success)
@@ -5477,7 +5512,7 @@ namespace mcp_standalone
                         if (cancelled())
                             return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
                         const auto legacy = invoke_legacy(
-                            name, json{{"address", target},
+                            "xrefs_to", json{{"address", target},
                                        {"limit", arguments.value("limit", 100U)}}, context);
                         json item{{"addr", target.get<std::string>()}};
                         if (!legacy.success) {
@@ -5501,7 +5536,7 @@ namespace mcp_standalone
                         if (cancelled())
                             return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
                         const auto legacy = invoke_legacy(
-                            name, json{{"struct_name", query.at("struct")},
+                            "xrefs_to_field", json{{"struct_name", query.at("struct")},
                                        {"field_name", query.at("field")}}, context);
                         json item{{"struct", query.at("struct")}, {"field", query.at("field")}};
                         if (!legacy.success) {
@@ -5523,7 +5558,7 @@ namespace mcp_standalone
                         if (cancelled())
                             return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
                         const auto legacy = invoke_legacy(
-                            name, json{{"address", target}}, context);
+                            "callees", json{{"address", target}}, context);
                         json item{{"addr", target.get<std::string>()}};
                         if (!legacy.success) {
                             item["error"] = backend_error(legacy);
@@ -5906,7 +5941,7 @@ namespace mcp_standalone
                         if (cancelled())
                             return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
                         const auto legacy = invoke_legacy(
-                            name, json{{"address", target}}, context);
+                            "basic_blocks", json{{"address", target}}, context);
                         json item{{"addr", target.get<std::string>()}};
                         if (!legacy.success) {
                             item["error"] = backend_error(legacy);
@@ -6245,7 +6280,7 @@ namespace mcp_standalone
                         if (cancelled())
                             return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
                         const auto legacy = invoke_legacy(
-                            name, json{{"address", root},
+                            "callgraph", json{{"address", root},
                                        {"depth", arguments.value("max_depth", 5U)},
                                        {"direction", "both"},
                                        {"limit", (std::min)(max_nodes, std::size_t{5000})}},
@@ -6363,11 +6398,13 @@ namespace mcp_standalone
                     for (const auto& query : scalar_or_array_items(arguments.at("queries"))) {
                         const auto offset = query.value("offset", std::uint64_t{0});
                         const auto count = query_count(query, 100, 10000);
-                        const auto legacy = invoke_legacy(
-                            name,
-                            json{{"offset", offset}, {"limit", count},
-                                 {"filter", query.value("filter", std::string())}},
-                            context);
+                        const json request{
+                            {"offset", offset}, {"limit", count},
+                            {"filter", query.value("filter", std::string())},
+                        };
+                        const auto legacy = name == "list_funcs"
+                            ? invoke_legacy("list_funcs", request, context)
+                            : invoke_legacy("list_globals", request, context);
                         if (!legacy.success)
                             return legacy;
                         const char* collection = name == "list_funcs" ? "functions" : "globals";
@@ -6646,11 +6683,37 @@ namespace mcp_standalone
                     const json* cursor = nullptr;
                     if (const auto found = arguments.find("cursor"); found != arguments.end())
                         cursor = &*found;
-                    const auto start = arguments.contains("start")
-                        ? wave_c_address_value(arguments.at("start")) : std::nullopt;
-                    const auto end = arguments.contains("end")
-                        ? wave_c_address_value(arguments.at("end")) : std::nullopt;
-                    const bool code_only = arguments.value("code_only", false);
+                    wave_c_signature_source_t address_source(context);
+                    const auto resolve_bound = [&arguments, &address_source](
+                        const char* key) -> std::optional<std::uint64_t> {
+                        const auto found = arguments.find(key);
+                        if (found == arguments.end() || found->is_null() ||
+                            (found->is_string() && found->get_ref<
+                                const std::string&>().empty()))
+                            return std::nullopt;
+                        if (found->is_string())
+                            return address_source.resolve_address(
+                                found->get_ref<const std::string&>());
+                        return wave_c_address_value(*found);
+                    };
+                    const auto start = resolve_bound("start");
+                    const auto end = resolve_bound("end");
+                    if ((arguments.contains("start") &&
+                         !arguments.at("start").is_null() &&
+                         !(arguments.at("start").is_string() &&
+                           arguments.at("start").get_ref<
+                               const std::string&>().empty()) && !start) ||
+                        (arguments.contains("end") &&
+                         !arguments.at("end").is_null() &&
+                         !(arguments.at("end").is_string() &&
+                           arguments.at("end").get_ref<
+                               const std::string&>().empty()) && !end) ||
+                        (start && end && *end < *start)) {
+                        return tool_result_t::error(
+                            "Search text bounds are invalid.",
+                            "INVALID_SEARCH_RANGE");
+                    }
+                    const bool code_only = arguments.value("code_only", true);
                     const std::string include_mode =
                         arguments.value("include", std::string("all"));
                     const std::string route_semantics = json{
@@ -6666,15 +6729,16 @@ namespace mcp_standalone
                     if (!queried)
                         return workspace_tool_error(queried.error());
                     auto page = queried.take_value();
+                    const auto image = context.workspace->normalized_image();
                     json hits = json::array();
                     for (const auto& hit : page.hits) {
                         const std::string kind = query_hit_kind_name(hit.kind);
+                        const bool executable = query_address_is_executable(
+                            image.get(), hit.address);
                         if ((start && hit.address.value < *start) ||
                             (end && hit.address.value >= *end) ||
-                            (code_only && hit.kind !=
-                                aida::analysis::search_entity_kind_t::instruction) ||
-                            (include_mode == "disasm" && hit.kind !=
-                                aida::analysis::search_entity_kind_t::instruction) ||
+                            (code_only && !executable) ||
+                            (include_mode == "disasm" && !executable) ||
                             (include_mode == "comments" && hit.kind ==
                                 aida::analysis::search_entity_kind_t::instruction))
                             continue;
@@ -7270,6 +7334,24 @@ namespace mcp_standalone
                         "Live snapshot identity is stale or unavailable.",
                         "LIVE_SNAPSHOT_IDENTITY_INVALID");
                 const auto ranges = memory->find("ranges");
+                if (context.kind == aida::analysis::target_kind_t::live_snapshot) {
+                    std::size_t requested = 0;
+                    if (name == "get_global_value") {
+                        const auto queries = arguments.find("queries");
+                        if (queries != arguments.end())
+                            requested = queries->is_array()
+                                ? queries->size() : std::size_t{1};
+                    } else if (ranges != memory->end()) {
+                        requested = ranges->is_array()
+                            ? ranges->size() : std::size_t{1};
+                    }
+                    if (requested >
+                        live_routing.limits().maximum_snapshots_per_request) {
+                        return tool_result_t::error(
+                            "Live memory request exceeds the snapshot quota.",
+                            "LIVE_SNAPSHOT_BUDGET_EXCEEDED");
+                    }
+                }
                 json result = json::array();
                 std::uint64_t bytes_read = 0;
                 std::optional<wave_c_compat::live_routing_identity_binding_t> binding;
@@ -7526,7 +7608,13 @@ namespace mcp_standalone
                     {"items", std::move(legacy_items)},
                     {"aida_tx", json{{"expected_revision", context.overlay_revision}}},
                 };
-                auto committed = invoke_legacy(name, legacy_arguments, context);
+                if (name != "patch" && name != "put_int")
+                    return tool_result_t::error(
+                        "Memory overlay tool has no production handler.",
+                        "MCP_BACKEND_UNAVAILABLE");
+                auto committed = name == "patch"
+                    ? invoke_legacy("patch", legacy_arguments, context)
+                    : invoke_legacy("put_int", legacy_arguments, context);
                 if (!committed.success)
                     return committed;
                 const auto transaction_id = committed.data.find("transaction_id");
@@ -8219,6 +8307,12 @@ namespace mcp_standalone
                         {wave_c_compat::adapter_error_code_t::live_snapshot_denied,
                          "live_snapshot_target_unbound", 0, request.size});
                 const auto& target = call.target->target();
+                const auto generation_before = wave_c_workspace_generation(context);
+                if (generation_before != target.generation)
+                    return wave_c_live_snapshot_result_t::failure(
+                        {wave_c_compat::adapter_error_code_t::target_resolution_failed,
+                         "live_snapshot_generation_stale",
+                         target.generation, generation_before});
                 const auto provider = std::dynamic_pointer_cast<
                     const aida::analysis::live_snapshot_provider_t>(
                         context.workspace->provider_handle());
@@ -8266,6 +8360,12 @@ namespace mcp_standalone
                     return wave_c_live_snapshot_result_t::failure(
                         {wave_c_compat::adapter_error_code_t::live_snapshot_invalid,
                          "live_snapshot_identity_changed", request.size, 0});
+                const auto generation_after = wave_c_workspace_generation(context);
+                if (generation_after != target.generation)
+                    return wave_c_live_snapshot_result_t::failure(
+                        {wave_c_compat::adapter_error_code_t::target_resolution_failed,
+                         "live_snapshot_generation_changed",
+                         target.generation, generation_after});
                 wave_c_compat::bounded_live_snapshot_t result;
                 result.bytes = read.value();
                 result.process_creation_identity = target.process_creation_identity;
@@ -8281,7 +8381,9 @@ namespace mcp_standalone
                 const workspace_request_context_t& context) const
             {
                 wave_c_handlers::composite_step_response_t response;
-                response.workspace_generation = context.workspace->generation();
+                response.workspace_generation = wave_c_workspace_generation(context);
+                response.observed_overlay_generation =
+                    context.workspace->overlay_revision();
                 if (cancellation.cancelled()) {
                     response.status = wave_c_handlers::composite_step_status_t::cancelled;
                     response.diagnostic_code = "cancelled";
@@ -8292,10 +8394,13 @@ namespace mcp_standalone
                 const std::uint64_t address = parsed.value_or(0);
                 if (request.kind == wave_c_handlers::composite_step_kind_t::decompile_function ||
                     request.kind == wave_c_handlers::composite_step_kind_t::disassemble_function) {
-                    const std::string tool = request.kind ==
-                        wave_c_handlers::composite_step_kind_t::decompile_function
-                        ? "decompile" : "disasm";
-                    auto result = invoke_legacy(tool, json{{"address", request.subject}}, context);
+                    const bool decompile = request.kind ==
+                        wave_c_handlers::composite_step_kind_t::decompile_function;
+                    auto result = decompile
+                        ? invoke_legacy(
+                            "decompile", json{{"address", request.subject}}, context)
+                        : invoke_legacy(
+                            "disasm", json{{"address", request.subject}}, context);
                     wave_c_handlers::composite_text_snapshot_t text;
                     if (result.success) {
                         const json normalized = result.data;
@@ -8384,13 +8489,63 @@ namespace mcp_standalone
                     return response;
                 }
                 if (request.kind == wave_c_handlers::composite_step_kind_t::apply_overlay_action) {
-                    auto result = invoke_legacy(request.action, request.action_arguments, context);
+                    if (request.expected_overlay_generation &&
+                        *request.expected_overlay_generation !=
+                            *response.observed_overlay_generation) {
+                        response.status =
+                            wave_c_handlers::composite_step_status_t::rejected;
+                        response.diagnostic_code = "overlay_generation_stale";
+                        return response;
+                    }
+                    json item{{"address", request.subject}};
+                    if (request.action == "rename_func") {
+                        item["name"] = request.action_arguments.at("name");
+                    } else if (request.action == "set_type") {
+                        item["type"] = request.action_arguments.at("type");
+                    } else if (request.action == "set_comment") {
+                        item["comment"] = request.action_arguments.at("comment");
+                    } else {
+                        response.status =
+                            wave_c_handlers::composite_step_status_t::rejected;
+                        response.diagnostic_code = "unsupported_overlay_action";
+                        return response;
+                    }
+                    const json backend_arguments{
+                        {"items", json::array({std::move(item)})},
+                        {"aida_tx", json{{"expected_revision",
+                            *response.observed_overlay_generation}}},
+                    };
+                    auto result = request.action == "rename_func"
+                        ? invoke_legacy("rename", backend_arguments, context)
+                        : request.action == "set_type"
+                            ? invoke_legacy("set_type", backend_arguments, context)
+                            : invoke_legacy(
+                                "set_comments", backend_arguments, context);
                     response.payload = wave_c_handlers::composite_overlay_result_t{
                         result.success, request.action};
                     response.status = result.success
                         ? wave_c_handlers::composite_step_status_t::complete
                         : wave_c_handlers::composite_step_status_t::rejected;
                     response.diagnostic_message = result.text;
+                    response.diagnostic_code = result.error_code;
+                    if (result.success) {
+                        const auto revision = result.data.contains("revision")
+                            ? json_nonnegative_u64(result.data.at("revision"))
+                            : std::nullopt;
+                        if (!revision || *revision <=
+                                *response.observed_overlay_generation) {
+                            response.payload =
+                                wave_c_handlers::composite_overlay_result_t{
+                                    false, request.action};
+                            response.status =
+                                wave_c_handlers::composite_step_status_t::rejected;
+                            response.diagnostic_code =
+                                "overlay_commit_receipt_invalid";
+                        } else {
+                            response.committed_overlay_generation = *revision;
+                            response.items_consumed = 1;
+                        }
+                    }
                     return response;
                 }
                 response.status = wave_c_handlers::composite_step_status_t::rejected;
@@ -8410,7 +8565,7 @@ namespace mcp_standalone
                 lease.identity.normalized_source_path =
                     context.workspace->identity().normalized_source_path();
                 lease.identity.sha256 = context.binary_id.to_hex();
-                lease.identity.generation = context.workspace->generation();
+                lease.identity.generation = wave_c_workspace_generation(context);
                 lease.identity.analysis_revision = context.analysis_revision;
                 lease.identity.overlay_revision = context.overlay_revision;
                 lease.identity.live =

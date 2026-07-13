@@ -92,6 +92,7 @@ struct workbench_shell_workspace_context_t {
     diff_document::diff_document_model_t* diff_document = nullptr;
     const workbench_document_bridge_t* document_bridge = nullptr;
     std::uint64_t analysis_generation = 0;
+    std::uint64_t analysis_revision = 0;
     std::uint64_t overlay_revision = 0;
     workbench_shell_center_view_t center_view;
     std::shared_ptr<const void> lifetime;

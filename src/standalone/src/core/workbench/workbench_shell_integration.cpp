@@ -685,9 +685,9 @@ public:
             return static_cast<std::uint32_t>((std::min)(
                 entries(generation).size(),
                 static_cast<std::size_t>(
-                    (std::numeric_limits<std::uint32_t>::max)())));
+                        (std::numeric_limits<std::uint32_t>::max)())));
         } catch (...) {
-            return 0;
+            return disasm_document::k_disasm_document_max_overlays + 1U;
         }
     }
 
@@ -750,6 +750,7 @@ public:
         case disasm_document::disasm_overlay_kind_t::type_override:
             operation.kind = analysis::overlay_operation_kind_t::type_application;
             operation.type = entry.text;
+            operation.variable = "address";
             break;
         case disasm_document::disasm_overlay_kind_t::patch:
             return shell_error(workbench_error_code_t::invalid_document_state,
@@ -796,8 +797,12 @@ private:
         for (const auto& item : snapshot.items) {
             disasm_document::disasm_overlay_entry_t projected;
             if (project_disasm_overlay(item.second, snapshot.revision,
-                                       projected))
+                                       projected)) {
                 output.push_back(std::move(projected));
+                if (output.size() >
+                    disasm_document::k_disasm_document_max_overlays)
+                    break;
+            }
         }
         return output;
     }
@@ -1091,9 +1096,9 @@ public:
             return static_cast<std::uint32_t>((std::min)(
                 entries(generation).size(),
                 static_cast<std::size_t>(
-                    (std::numeric_limits<std::uint32_t>::max)())));
+                        (std::numeric_limits<std::uint32_t>::max)())));
         } catch (...) {
-            return 0;
+            return hex_document::k_hex_document_max_overlays + 1U;
         }
     }
 
@@ -1196,8 +1201,12 @@ private:
                 hex_document::k_hex_document_max_overlays + 1U)));
         for (const auto& item : snapshot.items) {
             hex_document::hex_overlay_entry_t projected;
-            if (project_hex_overlay(item.second, snapshot.revision, projected))
+            if (project_hex_overlay(item.second, snapshot.revision, projected)) {
                 output.push_back(std::move(projected));
+                if (output.size() >
+                    hex_document::k_hex_document_max_overlays)
+                    break;
+            }
         }
         return output;
     }
@@ -1349,34 +1358,75 @@ struct graph_materialization_t final {
     std::vector<graph_node_range_t> ranges;
 };
 
+void sort_graph_ranges(std::vector<graph_node_range_t>& ranges)
+{
+    std::sort(ranges.begin(), ranges.end(),
+        [](const graph_node_range_t& lhs, const graph_node_range_t& rhs) {
+            return std::tie(lhs.begin, lhs.end, lhs.node.value) <
+                   std::tie(rhs.begin, rhs.end, rhs.node.value);
+        });
+}
+
+graph_document::graph_node_id_t graph_node_for_address(
+    const std::vector<graph_node_range_t>& ranges,
+    std::uint64_t address) noexcept
+{
+    auto range = std::upper_bound(
+        ranges.begin(), ranges.end(), address,
+        [](std::uint64_t candidate, const graph_node_range_t& item) {
+            return candidate < item.begin;
+        });
+    if (range == ranges.begin())
+        return {};
+    --range;
+    if (address < range->begin)
+        return {};
+    if (range->end > range->begin)
+        return address < range->end ? range->node
+                                    : graph_document::graph_node_id_t{};
+    return address == range->begin ? range->node
+                                   : graph_document::graph_node_id_t{};
+}
+
 graph_document::graph_node_id_t graph_node_identity(
     std::uint64_t entity_id,
     std::uint64_t address,
     std::string_view domain) noexcept
 {
-    if (entity_id != 0)
-        return {entity_id};
-    const auto text = std::string(domain) + ":" + std::to_string(address);
-    return {stable_hash(text)};
+    std::uint64_t hash = k_shell_fnv_offset;
+    const auto append = [&hash](std::uint8_t byte) {
+        hash ^= byte;
+        hash *= k_shell_fnv_prime;
+    };
+    for (const auto character : domain)
+        append(static_cast<std::uint8_t>(character));
+    append(static_cast<std::uint8_t>(0xFFU));
+    append(static_cast<std::uint8_t>(entity_id != 0 ? 1U : 0U));
+    auto identity = entity_id != 0 ? entity_id : address;
+    for (std::size_t index = 0; index < sizeof(identity); ++index) {
+        append(static_cast<std::uint8_t>(identity & 0xFFU));
+        identity >>= 8U;
+    }
+    return {hash == 0 ? 1 : hash};
 }
 
-std::string function_label(const analysis::analysis_snapshot_t& snapshot,
+using graph_function_index_t =
+    std::unordered_map<analysis::entity_id_t,
+                       const analysis::function_record_t*>;
+using graph_symbol_index_t =
+    std::unordered_map<analysis::entity_id_t,
+                       const analysis::symbol_record_t*>;
+
+std::string function_label(const graph_function_index_t& functions,
+                           const graph_symbol_index_t& symbols,
                            analysis::entity_id_t function_id,
                            std::uint64_t address)
 {
-    const auto function = std::find_if(
-        snapshot.functions.begin(), snapshot.functions.end(),
-        [function_id](const analysis::function_record_t& candidate) {
-            return candidate.id == function_id;
-        });
-    if (function != snapshot.functions.end() && function->symbol_id) {
-        const auto symbol = std::find_if(
-            snapshot.symbols.begin(), snapshot.symbols.end(),
-            [function](const analysis::symbol_record_t& candidate) {
-                return candidate.id == *function->symbol_id;
-            });
-        if (symbol != snapshot.symbols.end() && !symbol->name.empty())
-            return symbol->name;
+    const auto function = functions.find(function_id);
+    if (function != functions.end() && function->second->symbol_id) {
+        const auto symbol = symbols.find(*function->second->symbol_id);
+        if (symbol != symbols.end() && !symbol->second->name.empty())
+            return symbol->second->name;
     }
     return "sub_" + hexadecimal(address);
 }
@@ -1399,10 +1449,19 @@ void finalize_graph_edges(graph_materialization_t& output,
         return;
 
     std::map<std::uint64_t, std::size_t> node_indices;
-    for (std::size_t index = 0; index < output.nodes.size(); ++index)
-        node_indices.emplace(output.nodes[index].id.value, index);
+    for (std::size_t index = 0; index < output.nodes.size(); ++index) {
+        if (!output.nodes[index].id.valid() ||
+            !node_indices.emplace(output.nodes[index].id.value, index).second) {
+            output.total_edges =
+                graph_document::k_graph_document_max_edges + 1U;
+            output.edges.clear();
+            return;
+        }
+    }
 
     output.edges.reserve(candidates.size());
+    std::unordered_set<std::uint64_t> edge_ids;
+    edge_ids.reserve(candidates.size());
     std::tuple<std::uint64_t, std::uint64_t,
                graph_document::graph_edge_kind_t, std::uint64_t> previous{};
     bool have_previous = false;
@@ -1428,8 +1487,16 @@ void finalize_graph_edges(graph_materialization_t& output,
         edge.id = graph_document::compute_deterministic_edge_id(
             {edge.source, edge.target, edge.kind, edge.site_address,
              edge.parallel_ordinal});
-        if (!edge.id.valid())
-            continue;
+        if (!edge.id.valid() || !edge_ids.insert(edge.id.value).second) {
+            for (auto& node : output.nodes) {
+                node.in_degree = 0;
+                node.out_degree = 0;
+            }
+            output.edges.clear();
+            output.total_edges =
+                graph_document::k_graph_document_max_edges + 1U;
+            return;
+        }
         const auto source = node_indices.find(edge.source.value);
         const auto target = node_indices.find(edge.target.value);
         if (source == node_indices.end() || target == node_indices.end())
@@ -1455,34 +1522,64 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
     output->function_address = function_address;
     const auto& snapshot = *publication->snapshot;
 
-    analysis::entity_id_t function_id = 0;
+    std::size_t first_block = 0;
+    std::size_t block_count = snapshot.blocks.size();
     if (function_address != 0) {
-        const auto function = std::find_if(
-            snapshot.functions.begin(), snapshot.functions.end(),
-            [function_address](const analysis::function_record_t& candidate) {
-                return function_address >= candidate.start.value &&
-                       function_address < candidate.end.value;
-            });
-        if (function == snapshot.functions.end())
+        const analysis::function_record_t* function = nullptr;
+        std::size_t traversed_functions = 0;
+        for (const auto& candidate : snapshot.functions) {
+            if (traversed_functions >=
+                graph_document::k_graph_document_max_nodes)
+                break;
+            ++traversed_functions;
+            if (function_address >= candidate.start.value &&
+                function_address < candidate.end.value) {
+                function = &candidate;
+                break;
+            }
+        }
+        if (!function) {
+            if (traversed_functions < snapshot.functions.size())
+                output->total_nodes =
+                    graph_document::k_graph_document_max_nodes + 1U;
             return output;
-        function_id = function->id;
+        }
+        first_block = function->first_block;
+        block_count = function->block_count;
+        if (first_block > snapshot.blocks.size() ||
+            block_count > snapshot.blocks.size() - first_block) {
+            output->total_nodes =
+                graph_document::k_graph_document_max_nodes + 1U;
+            return output;
+        }
     }
 
     std::unordered_map<analysis::entity_id_t,
                        graph_document::graph_node_id_t> block_nodes;
-    for (const auto& block : snapshot.blocks) {
-        if (function_id != 0 && block.function_id != function_id)
-            continue;
+    std::unordered_set<std::uint64_t> stable_node_ids;
+    stable_node_ids.reserve((std::min)(
+        block_count,
+        static_cast<std::size_t>(
+            graph_document::k_graph_document_max_nodes + 1U)));
+    const auto block_end = first_block + block_count;
+    for (auto block_index = first_block; block_index < block_end; ++block_index) {
+        const auto& block = snapshot.blocks[block_index];
         ++output->total_nodes;
         if (output->total_nodes > graph_document::k_graph_document_max_nodes)
-            continue;
+            break;
         graph_document::graph_node_view_t node;
         node.id = graph_node_identity(block.id, block.start.value, "cfg");
         node.kind = graph_document::graph_node_kind_t::basic_block;
         node.address = block.start.value;
         node.label = "loc_" + hexadecimal(block.start.value);
         node.instruction_count = block.instruction_count;
-        block_nodes.emplace(block.id, node.id);
+        if (!stable_node_ids.insert(node.id.value).second) {
+            output->total_nodes =
+                graph_document::k_graph_document_max_nodes + 1U;
+            break;
+        }
+        if (block.id != 0)
+            block_nodes.emplace(block.id, node.id);
         output->nodes.push_back(std::move(node));
         graph_node_range_t range;
         range.begin = block.start.value;
@@ -1496,24 +1593,27 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
         output->total_edges = snapshot.edges.size();
         return output;
     }
-
-    const auto node_for_address = [&output](std::uint64_t address) {
-        const auto range = std::find_if(
-            output->ranges.begin(), output->ranges.end(),
-            [address](const graph_node_range_t& candidate) {
-                return address >= candidate.begin && address < candidate.end;
-            });
-        return range == output->ranges.end()
-            ? graph_document::graph_node_id_t{} : range->node;
-    };
+    sort_graph_ranges(output->ranges);
 
     std::vector<graph_edge_candidate_t> edges;
     edges.reserve((std::min)(snapshot.edges.size(),
         static_cast<std::size_t>(graph_document::k_graph_document_max_edges + 1U)));
+    std::uint64_t traversed_edges = 0;
     for (const auto& source_edge : snapshot.edges) {
+        ++traversed_edges;
+        if (traversed_edges > graph_document::k_graph_document_max_edges) {
+            output->nodes.clear();
+            output->ranges.clear();
+            output->total_nodes =
+                graph_document::k_graph_document_max_nodes + 1U;
+            output->total_edges = traversed_edges;
+            return output;
+        }
         auto source = block_nodes.find(source_edge.source_entity);
         auto source_node = source != block_nodes.end()
-            ? source->second : node_for_address(source_edge.source.value);
+            ? source->second
+            : graph_node_for_address(output->ranges,
+                                     source_edge.source.value);
         graph_document::graph_node_id_t target_node;
         if (source_edge.target_entity) {
             const auto target = block_nodes.find(*source_edge.target_entity);
@@ -1521,7 +1621,8 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
                 target_node = target->second;
         }
         if (!target_node.valid())
-            target_node = node_for_address(source_edge.target.value);
+            target_node = graph_node_for_address(output->ranges,
+                                                 source_edge.target.value);
         if (!source_node.valid() || !target_node.valid())
             continue;
         graph_edge_candidate_t edge;
@@ -1548,6 +1649,53 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
     output->function_address = function_address;
     const auto& snapshot = *publication->snapshot;
 
+    if (snapshot.call_graph.nodes.size() >
+            graph_document::k_graph_document_max_nodes ||
+        snapshot.call_graph.edges.size() >
+            graph_document::k_graph_document_max_edges) {
+        output->total_nodes = snapshot.call_graph.nodes.size();
+        output->total_edges = snapshot.call_graph.edges.size();
+        return output;
+    }
+
+    std::unordered_set<analysis::entity_id_t> required_functions;
+    required_functions.reserve(snapshot.call_graph.nodes.size());
+    for (const auto& node : snapshot.call_graph.nodes)
+        required_functions.insert(node.function_id);
+
+    graph_function_index_t functions;
+    functions.reserve(required_functions.size());
+    std::size_t traversed_functions = 0;
+    for (const auto& function : snapshot.functions) {
+        if (traversed_functions >=
+            graph_document::k_graph_document_max_nodes)
+            break;
+        ++traversed_functions;
+        if (required_functions.find(function.id) != required_functions.end())
+            functions.emplace(function.id, &function);
+        if (functions.size() == required_functions.size())
+            break;
+    }
+
+    std::unordered_set<analysis::entity_id_t> required_symbols;
+    required_symbols.reserve(functions.size());
+    for (const auto& [function_id, function] : functions) {
+        static_cast<void>(function_id);
+        if (function->symbol_id)
+            required_symbols.insert(*function->symbol_id);
+    }
+    graph_symbol_index_t symbols;
+    symbols.reserve(required_symbols.size());
+    std::size_t traversed_symbols = 0;
+    for (const auto& symbol : snapshot.symbols) {
+        if (traversed_symbols >= graph_document::k_graph_document_max_nodes ||
+            symbols.size() == required_symbols.size())
+            break;
+        ++traversed_symbols;
+        if (required_symbols.find(symbol.id) != required_symbols.end())
+            symbols.emplace(symbol.id, &symbol);
+    }
+
     std::optional<analysis::entity_id_t> focus_function;
     std::unordered_set<analysis::entity_id_t> included_functions;
     if (function_address != 0) {
@@ -1560,7 +1708,15 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
             return output;
         focus_function = focus->function_id;
         included_functions.insert(focus->function_id);
+        std::uint64_t traversed_edges = 0;
         for (const auto& edge : snapshot.call_graph.edges) {
+            ++traversed_edges;
+            if (traversed_edges > graph_document::k_graph_document_max_edges) {
+                output->total_nodes =
+                    graph_document::k_graph_document_max_nodes + 1U;
+                output->total_edges = traversed_edges;
+                return output;
+            }
             if (edge.source_function_id == *focus_function) {
                 if (edge.target_function_id)
                     included_functions.insert(*edge.target_function_id);
@@ -1573,6 +1729,8 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
 
     std::unordered_map<analysis::entity_id_t,
                         graph_document::graph_node_id_t> function_nodes;
+    std::unordered_set<std::uint64_t> stable_node_ids;
+    stable_node_ids.reserve(snapshot.call_graph.nodes.size());
     for (const auto& source_node : snapshot.call_graph.nodes) {
         if (focus_function &&
             included_functions.find(source_node.function_id) ==
@@ -1580,14 +1738,14 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
             continue;
         ++output->total_nodes;
         if (output->total_nodes > graph_document::k_graph_document_max_nodes)
-            continue;
+            break;
         graph_document::graph_node_view_t node;
         node.id = graph_node_identity(source_node.function_id,
                                       source_node.address.value,
                                       "call");
         node.kind = graph_document::graph_node_kind_t::function;
         node.address = source_node.address.value;
-        node.label = function_label(snapshot, source_node.function_id,
+        node.label = function_label(functions, symbols, source_node.function_id,
                                     source_node.address.value);
         node.in_degree = static_cast<std::uint32_t>((std::min)(
             source_node.incoming_edges,
@@ -1597,19 +1755,21 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
             source_node.outgoing_edges,
             static_cast<std::uint64_t>(
                 (std::numeric_limits<std::uint32_t>::max)())));
-        function_nodes.emplace(source_node.function_id, node.id);
+        if (!stable_node_ids.insert(node.id.value).second) {
+            output->total_nodes =
+                graph_document::k_graph_document_max_nodes + 1U;
+            break;
+        }
+        if (source_node.function_id != 0)
+            function_nodes.emplace(source_node.function_id, node.id);
         output->nodes.push_back(std::move(node));
-        const auto function = std::find_if(
-            snapshot.functions.begin(), snapshot.functions.end(),
-            [&source_node](const analysis::function_record_t& candidate) {
-                return candidate.id == source_node.function_id;
-            });
+        const auto function = functions.find(source_node.function_id);
         graph_node_range_t range;
         range.begin = source_node.address.value;
         range.end = graph_range_end(
             source_node.address.value,
-            function != snapshot.functions.end()
-                ? function->end.value : source_node.address.value);
+            function != functions.end()
+                ? function->second->end.value : source_node.address.value);
         range.node = output->nodes.back().id;
         output->ranges.push_back(range);
     }
@@ -1619,6 +1779,7 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
         output->total_edges = snapshot.call_graph.edges.size();
         return output;
     }
+    sort_graph_ranges(output->ranges);
 
     std::vector<graph_edge_candidate_t> edges;
     edges.reserve((std::min)(snapshot.call_graph.edges.size(),
@@ -1696,7 +1857,8 @@ public:
                              std::uint64_t function_address) const noexcept override
     {
         const auto graph = materialize(generation, kind, function_address);
-        return graph ? graph->total_nodes : 0;
+        return graph ? graph->total_nodes
+                     : graph_document::k_graph_document_max_nodes + 1U;
     }
 
     std::uint64_t edge_count(std::uint64_t generation,
@@ -1704,7 +1866,8 @@ public:
                              std::uint64_t function_address) const noexcept override
     {
         const auto graph = materialize(generation, kind, function_address);
-        return graph ? graph->total_edges : 0;
+        return graph ? graph->total_edges
+                     : graph_document::k_graph_document_max_edges + 1U;
     }
 
     bool node_at(std::uint64_t generation, graph_document::graph_kind_t kind,
@@ -1712,11 +1875,16 @@ public:
                  graph_document::graph_node_view_t& output) const noexcept override
     {
         output = {};
-        const auto graph = materialize(generation, kind, function_address);
-        if (!graph || ordinal >= graph->nodes.size())
+        try {
+            const auto graph = materialize(generation, kind, function_address);
+            if (!graph || ordinal >= graph->nodes.size())
+                return false;
+            output = graph->nodes[static_cast<std::size_t>(ordinal)];
+            return true;
+        } catch (...) {
+            output = {};
             return false;
-        output = graph->nodes[ordinal];
-        return true;
+        }
     }
 
     bool edge_at(std::uint64_t generation, graph_document::graph_kind_t kind,
@@ -1724,11 +1892,16 @@ public:
                  graph_document::graph_edge_view_t& output) const noexcept override
     {
         output = {};
-        const auto graph = materialize(generation, kind, function_address);
-        if (!graph || ordinal >= graph->edges.size())
+        try {
+            const auto graph = materialize(generation, kind, function_address);
+            if (!graph || ordinal >= graph->edges.size())
+                return false;
+            output = graph->edges[static_cast<std::size_t>(ordinal)];
+            return true;
+        } catch (...) {
+            output = {};
             return false;
-        output = graph->edges[ordinal];
-        return true;
+        }
     }
 
     bool node_by_address(
@@ -1739,18 +1912,20 @@ public:
     {
         output = {};
         ordinal = 0;
-        const auto graph = materialize(generation, kind, function_address);
-        if (!graph)
+        try {
+            const auto graph = materialize(generation, kind, function_address);
+            if (!graph)
+                return false;
+            const auto node = graph_node_for_address(graph->ranges, address);
+            if (!node.valid())
+                return false;
+            return node_by_id(generation, kind, function_address, node,
+                              output, ordinal);
+        } catch (...) {
+            output = {};
+            ordinal = 0;
             return false;
-        const auto range = std::find_if(
-            graph->ranges.begin(), graph->ranges.end(),
-            [address](const graph_node_range_t& candidate) {
-                return address >= candidate.begin && address < candidate.end;
-            });
-        if (range == graph->ranges.end())
-            return false;
-        return node_by_id(generation, kind, function_address, range->node,
-                          output, ordinal);
+        }
     }
 
     bool node_by_id(std::uint64_t generation,
@@ -1762,17 +1937,23 @@ public:
     {
         output = {};
         ordinal = 0;
-        const auto graph = materialize(generation, kind, function_address);
-        if (!graph)
+        try {
+            const auto graph = materialize(generation, kind, function_address);
+            if (!graph)
+                return false;
+            const auto found = std::find_if(
+                graph->nodes.begin(), graph->nodes.end(),
+                [id](const auto& node) { return node.id == id; });
+            if (found == graph->nodes.end())
+                return false;
+            ordinal = static_cast<std::uint64_t>(found - graph->nodes.begin());
+            output = *found;
+            return true;
+        } catch (...) {
+            output = {};
+            ordinal = 0;
             return false;
-        const auto found = std::find_if(
-            graph->nodes.begin(), graph->nodes.end(),
-            [id](const auto& node) { return node.id == id; });
-        if (found == graph->nodes.end())
-            return false;
-        ordinal = static_cast<std::uint64_t>(found - graph->nodes.begin());
-        output = *found;
-        return true;
+        }
     }
 
     bool edge_by_id(std::uint64_t generation,
@@ -1784,17 +1965,23 @@ public:
     {
         output = {};
         ordinal = 0;
-        const auto graph = materialize(generation, kind, function_address);
-        if (!graph)
+        try {
+            const auto graph = materialize(generation, kind, function_address);
+            if (!graph)
+                return false;
+            const auto found = std::find_if(
+                graph->edges.begin(), graph->edges.end(),
+                [id](const auto& edge) { return edge.id == id; });
+            if (found == graph->edges.end())
+                return false;
+            ordinal = static_cast<std::uint64_t>(found - graph->edges.begin());
+            output = *found;
+            return true;
+        } catch (...) {
+            output = {};
+            ordinal = 0;
             return false;
-        const auto found = std::find_if(
-            graph->edges.begin(), graph->edges.end(),
-            [id](const auto& edge) { return edge.id == id; });
-        if (found == graph->edges.end())
-            return false;
-        ordinal = static_cast<std::uint64_t>(found - graph->edges.begin());
-        output = *found;
-        return true;
+        }
     }
 
     bool address_for_node(std::uint64_t generation,
@@ -1802,22 +1989,35 @@ public:
                           std::uint64_t& address) const noexcept
     {
         address = 0;
-        const auto publication = lease_.source->publication(generation);
-        if (!publication)
+        try {
+            const auto publication = lease_.source->publication(generation);
+            if (!publication)
+                return false;
+            if (publication->snapshot->blocks.size() >
+                    graph_document::k_graph_document_max_nodes ||
+                publication->snapshot->call_graph.nodes.size() >
+                    graph_document::k_graph_document_max_nodes)
+                return false;
+            for (const auto& block : publication->snapshot->blocks) {
+                if (graph_node_identity(block.id, block.start.value, "cfg") == node) {
+                    address = block.start.value;
+                    return true;
+                }
+            }
+            for (const auto& source_node :
+                 publication->snapshot->call_graph.nodes) {
+                if (graph_node_identity(source_node.function_id,
+                                        source_node.address.value,
+                                        "call") == node) {
+                    address = source_node.address.value;
+                    return true;
+                }
+            }
             return false;
-        for (const auto& block : publication->snapshot->blocks) {
-            if (graph_node_identity(block.id, block.start.value, "cfg") == node) {
-                address = block.start.value;
-                return true;
-            }
+        } catch (...) {
+            address = 0;
+            return false;
         }
-        for (const auto& function : publication->snapshot->functions) {
-            if (graph_node_identity(function.id, function.start.value, "call") == node) {
-                address = function.start.value;
-                return true;
-            }
-        }
-        return false;
     }
 
 private:
@@ -1898,11 +2098,22 @@ public:
             const auto publication = source_->publication(generation);
             if (!publication || !publication->snapshot)
                 return 0;
+            if (publication->snapshot->blocks.size() >
+                    graph_document::k_graph_document_max_nodes ||
+                publication->snapshot->call_graph.nodes.size() >
+                    graph_document::k_graph_document_max_nodes) {
+                return graph_document::k_graph_document_max_overlays + 1U;
+            }
             std::unordered_set<std::uint64_t> graph_addresses;
-            for (const auto& block : publication->snapshot->blocks)
+            graph_addresses.reserve(publication->snapshot->blocks.size() +
+                                    publication->snapshot->call_graph.nodes.size());
+            for (const auto& block : publication->snapshot->blocks) {
                 graph_addresses.insert(block.start.value);
-            for (const auto& function : publication->snapshot->functions)
-                graph_addresses.insert(function.start.value);
+            }
+            for (const auto& source_node :
+                 publication->snapshot->call_graph.nodes) {
+                graph_addresses.insert(source_node.address.value);
+            }
             std::size_t count = 0;
             for (const auto& [entity_key, operation] : snapshot.items) {
                 static_cast<void>(entity_key);
@@ -1913,15 +2124,18 @@ public:
                 if (operation.kind == analysis::overlay_operation_kind_t::name ||
                     operation.kind == analysis::overlay_operation_kind_t::comment ||
                     operation.kind ==
-                        analysis::overlay_operation_kind_t::comment_update)
+                        analysis::overlay_operation_kind_t::comment_update) {
                     ++count;
+                    if (count > graph_document::k_graph_document_max_overlays)
+                        return graph_document::k_graph_document_max_overlays + 1U;
+                }
             }
             return static_cast<std::uint32_t>((std::min)(
                 count,
                 static_cast<std::size_t>(
                     (std::numeric_limits<std::uint32_t>::max)())));
         } catch (...) {
-            return 0;
+            return graph_document::k_graph_document_max_overlays + 1U;
         }
     }
 
@@ -2116,21 +2330,30 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 section.virtual_address, value.str()))
             return false;
     }
-    for (std::size_t index = 0; index < image->imports.size(); ++index) {
-        const auto& imported = image->imports[index];
-        std::ostringstream identity;
-        identity << imported.library << ':'
-                 << (imported.name ? *imported.name : std::string{}) << ':'
-                 << (imported.ordinal ? *imported.ordinal : 0) << ':'
-                 << imported.lookup_address.value << ':' << index;
+    std::unordered_map<std::string, std::uint64_t> import_occurrences;
+    import_occurrences.reserve((std::min)(image->imports.size(), limit));
+    for (const auto& imported : image->imports) {
+        const auto imported_name =
+            imported.name ? *imported.name : std::string{};
+        std::ostringstream logical_identity;
+        logical_identity << imported.library.size() << ':'
+                         << imported.library << ':'
+                         << imported.name.has_value() << ':'
+                         << imported_name.size() << ':' << imported_name << ':'
+                         << imported.ordinal.has_value() << ':'
+                         << (imported.ordinal ? *imported.ordinal : 0) << ':'
+                         << imported.delayed;
+        const auto logical_key = logical_identity.str();
+        const auto occurrence = import_occurrences[logical_key]++;
+        const auto identity = logical_key + ':' + std::to_string(occurrence);
         std::ostringstream value;
         value << "library=" << imported.library
-              << ";name=" << (imported.name ? *imported.name : std::string{})
+              << ";name=" << imported_name
               << ";ordinal=" << (imported.ordinal ? *imported.ordinal : 0)
               << ";lookup=" << hexadecimal(imported.lookup_address.value)
               << ";delayed=" << imported.delayed;
         if (!append_diff_entity(output, limit,
-                diff_key("import", stable_hash(identity.str())),
+                diff_key("import", stable_hash(identity)),
                 diff_document::diff_domain_t::import,
                 imported.address.value, value.str()))
             return false;
@@ -2355,12 +2578,12 @@ public:
         try {
             const auto materialization = materialize(generation, scope);
             if (!materialization)
-                return 0;
+                return diff_document::k_diff_document_max_entries + 1U;
             return materialization->exhausted
                 ? diff_document::k_diff_document_max_entries + 1U
                 : static_cast<std::uint64_t>(materialization->entries.size());
         } catch (...) {
-            return 0;
+            return diff_document::k_diff_document_max_entries + 1U;
         }
     }
 
@@ -2578,7 +2801,7 @@ public:
         const auto* identity = std::get_if<analysis::native_decompiler_entity_identity_t>(
             &request.entity.identity);
         if (request.entity.kind != analysis::decompiler_entity_kind_t::native_function ||
-            !identity || identity->function_id == 0 || identity->entry.value == 0)
+            !identity || identity->function_id == 0)
             return shell_error(workbench_error_code_t::invalid_document, job_id);
         const auto& functions = lease_.publication->snapshot->functions;
         const auto function = std::find_if(
@@ -2621,11 +2844,16 @@ public:
                 [service, source, publication, request, identity_value = *identity,
                  cancellation]() mutable {
                     pseudocode_job_payload_t payload;
-                    if (!source->publication_current(publication) ||
-                        cancellation->token().stop_requested()) {
+                    if (cancellation->token().stop_requested()) {
                         payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
                             analysis::decompiler_diagnostic_code_t::cancelled,
                             "workbench.pseudocode.cancelled", true));
+                        return payload;
+                    }
+                    if (!source->publication_current(publication)) {
+                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                            analysis::decompiler_diagnostic_code_t::cache_key_rejected,
+                            "workbench.pseudocode.stale_generation", true));
                         return payload;
                     }
                     analysis::decompiler_request_t service_request;
@@ -2643,6 +2871,12 @@ public:
                                 ? "workbench.pseudocode.cancelled"
                                 : "workbench.pseudocode.decompiler_failure",
                             true));
+                        return payload;
+                    }
+                    if (cancellation->token().stop_requested()) {
+                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                            analysis::decompiler_diagnostic_code_t::cancelled,
+                            "workbench.pseudocode.cancelled", true));
                         return payload;
                     }
                     if (!source->publication_current(publication) ||
@@ -2762,6 +2996,13 @@ private:
                 "workbench.pseudocode.worker_exception", true));
             job.payload = std::move(payload);
         }
+        if (job.cancelled && job.payload->succeeded) {
+            pseudocode_job_payload_t payload;
+            payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                analysis::decompiler_diagnostic_code_t::cancelled,
+                "workbench.pseudocode.cancelled", true));
+            job.payload = std::move(payload);
+        }
         return true;
     }
 
@@ -2805,10 +3046,11 @@ public:
                                 coordinate.address_range->begin.value;
                 output.token_begin = source_map.document_range.begin;
                 output.token_end = source_map.document_range.end;
-                if (output.token_begin > document.rendered_text.size())
+                if (output.token_begin >= output.token_end ||
+                    output.token_end > document.rendered_text.size())
                     return shell_error(workbench_error_code_t::invalid_navigation,
                                        address);
-                output.line_number = static_cast<std::uint32_t>(std::count(
+                output.line_number = 1U + static_cast<std::uint32_t>(std::count(
                     document.rendered_text.begin(),
                     document.rendered_text.begin() +
                         static_cast<std::string::difference_type>(output.token_begin),
@@ -2839,10 +3081,11 @@ public:
                                 coordinate.address_range->begin.value;
                 output.token_begin = source_map.document_range.begin;
                 output.token_end = source_map.document_range.end;
-                if (output.token_begin > document.rendered_text.size())
+                if (output.token_begin >= output.token_end ||
+                    output.token_end > document.rendered_text.size())
                     return shell_error(workbench_error_code_t::invalid_navigation,
                                        token_begin);
-                output.line_number = static_cast<std::uint32_t>(std::count(
+                output.line_number = 1U + static_cast<std::uint32_t>(std::count(
                     document.rendered_text.begin(),
                     document.rendered_text.begin() +
                         static_cast<std::string::difference_type>(output.token_begin),
@@ -2882,8 +3125,7 @@ public:
                        config.materialized_diff_entry_limit),
           diff_model_(diff_source_),
           generation_(lease.publication->generation),
-          analysis_revision_(lease.publication->analysis_revision),
-          overlay_revision_(source_->current_overlay_revision(generation_))
+          analysis_revision_(lease.publication->analysis_revision)
     {
     }
 
@@ -2910,19 +3152,12 @@ public:
         return result;
     }
 
-    std::shared_ptr<workbench_analysis_source_t> source() const noexcept
-    {
-        return source_;
-    }
-
-    std::shared_ptr<workbench_document_bridge_t> bridge() const noexcept
-    {
-        return bridge_;
-    }
-
     std::uint64_t generation() const noexcept { return generation_; }
     std::uint64_t analysis_revision() const noexcept { return analysis_revision_; }
-    std::uint64_t overlay_revision() const noexcept { return overlay_revision_; }
+    std::uint64_t overlay_revision() const noexcept
+    {
+        return source_->current_overlay_revision(generation_);
+    }
 
     disasm_document::disasm_document_model_t* disassembly() noexcept
     {
@@ -2967,7 +3202,6 @@ private:
     diff_document::diff_document_model_t diff_model_;
     std::uint64_t generation_;
     std::uint64_t analysis_revision_;
-    std::uint64_t overlay_revision_;
 };
 
 struct workspace_integration_state_t final {
@@ -3163,6 +3397,7 @@ struct workbench_shell_integration_t::impl_t {
             output.graph_document = lifetime->documents->graph();
             output.diff_document = lifetime->documents->diff();
             output.analysis_generation = lifetime->documents->generation();
+            output.analysis_revision = lifetime->documents->analysis_revision();
             output.overlay_revision = lifetime->documents->overlay_revision();
         }
         output.lifetime = std::static_pointer_cast<const void>(lifetime);
@@ -3437,8 +3672,6 @@ workbench_shell_integration_t::integrate_analysis_workspace(
     std::shared_ptr<analysis::analysis_workspace_t> analysis_workspace) {
     if (!impl_ || !workspace.valid())
         return shell_error(workbench_error_code_t::invalid_workspace);
-    if (!impl_->state.config.integrate_analysis_documents)
-        return {};
     if (!analysis_workspace || analysis_workspace->closing() ||
         analysis_workspace->closed())
         return shell_error(workbench_error_code_t::adapter_rejected,
@@ -3458,6 +3691,12 @@ workbench_shell_integration_t::integrate_analysis_workspace(
         }
     }
     auto workspace_state = impl_->ensure_state(workspace);
+    if (!impl_->state.config.integrate_analysis_documents) {
+        std::lock_guard<std::mutex> lock(workspace_state->mutex);
+        workspace_state->analysis_workspace = std::move(analysis_workspace);
+        workspace_state->persistence_adapter = std::move(persistence);
+        return {};
+    }
     std::shared_ptr<workbench_analysis_source_t> source;
     {
         std::lock_guard<std::mutex> lock(workspace_state->mutex);
@@ -3505,7 +3744,7 @@ workbench_shell_integration_t::refresh_analysis_documents(
         source = workspace_state->analysis_source;
         analysis_workspace = workspace_state->analysis_workspace;
     }
-    if (!source || !analysis_workspace)
+    if (!analysis_workspace)
         return shell_error(workbench_error_code_t::adapter_rejected,
                            workspace.value);
     std::shared_ptr<workbench_persistence_adapter_t> persistence;
@@ -3522,6 +3761,14 @@ workbench_shell_integration_t::refresh_analysis_documents(
             }
         }
     }
+    if (!impl_->state.config.integrate_analysis_documents) {
+        std::lock_guard<std::mutex> lock(workspace_state->mutex);
+        workspace_state->persistence_adapter = std::move(persistence);
+        return {};
+    }
+    if (!source)
+        return shell_error(workbench_error_code_t::adapter_rejected,
+                           workspace.value);
     const auto rebuild_error = impl_->rebuild_documents(workspace_state, source);
     if (!rebuild_error)
         return rebuild_error;

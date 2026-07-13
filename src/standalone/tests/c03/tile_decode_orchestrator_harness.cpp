@@ -163,7 +163,8 @@ enum class mock_completion_fault_t : std::uint8_t {
     none = 0,
     duplicate,
     missing,
-    unknown
+    unknown,
+    partial
 };
 
 struct mock_tile_decode_executor_options_t final {
@@ -239,6 +240,9 @@ public:
             } else if (options_.completion_fault == mock_completion_fault_t::unknown) {
                 completions.front().request_id =
                     (std::numeric_limits<std::uint64_t>::max)();
+            } else if (options_.completion_fault == mock_completion_fault_t::partial &&
+                       completions.front().records.bytes_consumed != 0) {
+                --completions.front().records.bytes_consumed;
             }
         }
         return workspace_result_t<std::vector<tile_decode_completion_t>>::success(
@@ -392,6 +396,45 @@ private:
                 instr.flow_flags = flow_fallthrough;
                 instr.coverage = coverage_reason_t::decoded;
                 decoded = true;
+
+                std::int32_t displacement = 0;
+                std::memcpy(&displacement, data + offset + 3, 4);
+                const auto target_rva = static_cast<std::uint64_t>(
+                    static_cast<std::int64_t>(rva) + 7 + displacement);
+
+                operand_fact_t operand;
+                operand.id = static_cast<entity_id_t>(operand_idx) + 1;
+                operand.address_expression_id = operand.id;
+                operand.operand_index = 0;
+                operand.kind = operand_kind_t::memory;
+                operand.access_width_bits = 64;
+                operand.access_count = 1;
+                operand.address_width_bits = 64;
+                operand.base_reg = 1;
+                operand.has_displacement = true;
+                operand.has_resolved_expression_value = true;
+                operand.displacement = displacement;
+                operand.resolved_expression_value = target_rva;
+                operand.address_components = address_component_base |
+                    address_component_displacement |
+                    address_component_instruction_pointer;
+                operand.address_expression =
+                    address_expression_kind_t::instruction_relative;
+                operand.address_resolution = target_resolution_t::image_relative;
+                completion.records.operand_facts.push_back(operand);
+                ++operand_idx;
+
+                target_fact_t target;
+                target.operand_fact_id = operand.id;
+                target.address_expression_id = operand.address_expression_id;
+                target.target = rva_address(target_rva);
+                target.kind = target_kind_record_t::data;
+                target.resolution = target_resolution_t::image_relative;
+                target.operand_index = operand.operand_index;
+                target.access_width_bits = operand.access_width_bits;
+                target.access_count = operand.access_count;
+                completion.records.target_facts.push_back(target);
+                ++target_idx;
             }
 
             if (!decoded) {
@@ -429,8 +472,6 @@ private:
             }
 
             offset += instr.length;
-            if ((instr.flow_flags & flow_terminal) != 0)
-                break;
         }
 
         completion.records.bytes_consumed = offset;
@@ -535,6 +576,16 @@ public:
                 outside_coverage.size = 1;
                 completion.records.coverage.push_back(outside_coverage);
                 completion.records.bytes_consumed = request.byte_count;
+            } else {
+                coverage_span_t undecodable;
+                undecodable.start = request.start;
+                undecodable.size = request.byte_count;
+                undecodable.reason = coverage_reason_t::undecodable;
+                undecodable.provenance = request.provenance;
+                undecodable.confidence = request.confidence;
+                completion.records.coverage.push_back(undecodable);
+                completion.records.bytes_consumed = request.byte_count;
+                completion.records.invalid_bytes = request.byte_count;
             }
             completions.push_back(std::move(completion));
         }
@@ -764,6 +815,43 @@ std::vector<std::uint8_t> orchestration_bytes(
         append_enum(output, operand->address_resolution);
     }
 
+    for (std::size_t index = 0; index < store.address_expression_count(); ++index) {
+        const auto expression = store.address_expression(index);
+        require(expression.has_value(),
+                "packed address-expression view is unavailable");
+        append_integral(output, expression->id.value());
+        append_integral(output, expression->instruction_id.value());
+        append_integral(output, expression->base_reg);
+        append_integral(output, expression->index_reg);
+        append_integral(output, expression->scale);
+        append_integral(output, expression->displacement);
+        append_integral(output, expression->segment_reg);
+        append_integral(output, expression->address_components);
+        append_enum(output, expression->kind);
+        append_enum(output, expression->resolution);
+        append_enum(output, expression->provenance);
+        append_integral(output, expression->confidence);
+    }
+
+    for (std::size_t index = 0; index < store.target_fact_count(); ++index) {
+        const auto target = store.target_fact(index);
+        require(target.has_value(), "packed target-fact view is unavailable");
+        append_integral(output, target->id.value());
+        append_integral(output, target->instruction_id.value());
+        append_integral(output, target->operand_id.value());
+        append_integral(output, target->address_expression_id.value());
+        append_address(output, target->target);
+        append_enum(output, target->kind);
+        append_enum(output, target->resolution);
+        append_integral(output, target->operand_index);
+        append_integral(output, target->access_width_bits);
+        append_integral(output, target->access_count);
+        append_integral(output, target->direct);
+        append_integral(output, target->is_external);
+        append_enum(output, target->provenance);
+        append_integral(output, target->confidence);
+    }
+
     for (std::size_t index = 0; index < store.edge_count(); ++index) {
         const auto edge = store.edge(index);
         require(edge.has_value(), "packed edge view is unavailable");
@@ -870,7 +958,8 @@ void test_request_correlation_and_completion_contract()
     const mock_completion_fault_t faults[] = {
         mock_completion_fault_t::duplicate,
         mock_completion_fault_t::missing,
-        mock_completion_fault_t::unknown};
+        mock_completion_fault_t::unknown,
+        mock_completion_fault_t::partial};
     for (const auto fault : faults) {
         mock_tile_decode_executor_options_t fault_options;
         fault_options.maximum_request_bytes = text.size();
@@ -925,11 +1014,20 @@ void test_duplicate_overlap_and_ownership()
     require(result.statistics.accepted_instructions == 1 &&
                 result.statistics.accepted_operands == 2,
             "accepted instruction or operand totals do not reflect retained ownership");
-    require(result.coverage.size() == 1,
-            "out-of-ownership coverage was not discarded");
-    require(result.coverage.front().start.value == 0x1007 &&
-                result.coverage.front().size == 1,
+    const auto clipped_coverage = std::find_if(result.coverage.begin(),
+        result.coverage.end(), [](const coverage_span_t& span) {
+            return span.reason == coverage_reason_t::decoded &&
+                span.start.value == 0x1007 && span.size == 1;
+        });
+    require(clipped_coverage != result.coverage.end(),
             "cross-boundary coverage was not clipped to tile ownership");
+    const auto escaped_coverage = std::find_if(result.coverage.begin(),
+        result.coverage.end(), [](const coverage_span_t& span) {
+            return span.reason == coverage_reason_t::decoded &&
+                span.start.value >= 0x1008;
+        });
+    require(escaped_coverage == result.coverage.end(),
+            "out-of-ownership decoded coverage was retained");
 }
 
 void test_typed_exhaustion_failures()
@@ -1207,7 +1305,9 @@ void test_gap_decode()
     seed.stable_source_id = 1;
     seeds.push_back(seed);
 
-    mock_tile_decode_executor_t executor;
+    mock_tile_decode_executor_options_t executor_options;
+    executor_options.maximum_request_bytes = 32;
+    mock_tile_decode_executor_t executor(executor_options);
     auto run_result = orch.run(fixture.snapshot(), layout, seeds, executor);
     require(run_result.has_value(), "gap decode run failed");
 
@@ -1216,9 +1316,19 @@ void test_gap_decode()
             "gap pass did not produce any gap requests");
     require(result.statistics.accepted_instructions > 2,
             "gap decode did not recover instructions beyond recursive pass");
+    require(result.statistics.gap_requests > 1,
+            "gap recovery did not traverse a multi-window gap");
     require(executor.maximum_observed_gap_request_bytes() ==
                 limits.invalid_run_policy.maximum_gap_resynchronization_bytes,
             "gap decode request exceeded the resynchronization byte limit");
+    require(result.packed_store != nullptr &&
+                result.packed_store->instruction_count() > 0,
+            "gap recovery did not publish instructions");
+    const auto final_instruction = result.packed_store->compatibility_view().instruction(
+        result.packed_store->instruction_count() - 1);
+    require(final_instruction.has_value() &&
+                final_instruction->address.value == 0x11FF,
+            "gap recovery returned success before attempting the full gap");
 }
 
 void test_invalid_run_handling()
@@ -1290,6 +1400,60 @@ void test_zero_fill_is_not_submitted_for_decode()
         });
     require(zero_fill != result.coverage.end(),
             "zero-fill range did not publish a typed undecodable span");
+}
+
+void test_address_expression_publication_and_data_frontier_filter()
+{
+    std::vector<std::uint8_t> text(0x200, 0xCC);
+    text[0] = 0x48;
+    text[1] = 0x8B;
+    text[2] = 0x05;
+    const std::int32_t displacement = 0xF9;
+    std::memcpy(text.data() + 3, &displacement, sizeof(displacement));
+    text[7] = 0xC3;
+    text[0x100] = 0x90;
+
+    std::vector<std::uint8_t> file_bytes(0x800, 0x00);
+    std::copy(text.begin(), text.end(), file_bytes.begin() + 0x400);
+
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, text.size(), 0x400,
+        file_bytes.size());
+    auto orch_result = tile_decode_orchestrator_t::create(small_limits());
+    require(orch_result.has_value(),
+            "address-expression orchestrator create failed");
+
+    mock_tile_decode_executor_options_t executor_options;
+    executor_options.maximum_request_bytes = 32;
+    mock_tile_decode_executor_t executor(executor_options);
+    auto run_result = orch_result.value().run(
+        fixture.snapshot(), layout, {export_seed(0x1000)}, executor);
+    require(run_result.has_value(), "address-expression decode run failed");
+
+    const auto recursive_data_request = std::find_if(
+        executor.observed_requests().begin(), executor.observed_requests().end(),
+        [](const tile_decode_request_t& request) {
+            return request.pass == tile_decode_pass_t::recursive &&
+                request.start.value == 0x1100;
+        });
+    require(recursive_data_request == executor.observed_requests().end(),
+            "data target was routed into the recursive code frontier");
+
+    const auto& result = run_result.value();
+    require(result.packed_store != nullptr &&
+                result.packed_store->operand_count() > 0 &&
+                result.packed_store->target_fact_count() > 0 &&
+                result.packed_store->address_expression_count() > 0,
+            "address-expression facts did not reach packed publication");
+    const auto view = result.packed_store->compatibility_view();
+    const auto operand = view.operand(0);
+    const auto target = view.target_fact(0);
+    require(operand.has_value() && target.has_value() &&
+                operand->address_expression_id != 0 &&
+                target->operand_fact_id == operand->id &&
+                target->address_expression_id == operand->address_expression_id &&
+                target->kind == target_kind_record_t::data,
+            "packed data target lost its operand or address-expression relation");
 }
 
 void test_cancellation()
@@ -1481,6 +1645,7 @@ bool run_tile_decode_orchestrator_harness(std::string& failure)
         test_gap_decode();
         test_invalid_run_handling();
         test_zero_fill_is_not_submitted_for_decode();
+        test_address_expression_publication_and_data_frontier_filter();
         test_cancellation();
         test_in_flight_cancellation();
         test_shard_output();

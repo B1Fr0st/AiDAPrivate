@@ -71,6 +71,48 @@ bool checked_multiply(std::uint64_t lhs, std::uint64_t rhs,
     return true;
 }
 
+workspace_result_t<void> validate_completion_storage(
+    const std::vector<tile_decode_completion_t>& completions,
+    std::uint64_t maximum_private_bytes)
+{
+    std::uint64_t retained_bytes = 0;
+    const auto add = [&](std::uint64_t count, std::uint64_t width)
+        -> workspace_result_t<void> {
+        std::uint64_t bytes = 0;
+        std::uint64_t updated = 0;
+        if (!checked_multiply(count, width, bytes) ||
+            !checked_add(retained_bytes, bytes, updated)) {
+            return workspace_result_t<void>::failure(
+                limit_error("private_bytes", maximum_private_bytes,
+                    (std::numeric_limits<std::uint64_t>::max)()));
+        }
+        if (updated > maximum_private_bytes) {
+            return workspace_result_t<void>::failure(
+                limit_error("private_bytes", maximum_private_bytes, updated));
+        }
+        retained_bytes = updated;
+        return workspace_result_t<void>::success();
+    };
+    auto added = add(completions.capacity(), sizeof(tile_decode_completion_t));
+    if (!added)
+        return added;
+    for (const auto& completion : completions) {
+        const std::pair<std::uint64_t, std::uint64_t> allocations[] = {
+            {completion.records.instructions.capacity(),
+                sizeof(instruction_record_t)},
+            {completion.records.operand_facts.capacity(), sizeof(operand_fact_t)},
+            {completion.records.target_facts.capacity(), sizeof(target_fact_t)},
+            {completion.records.delay_slot_counts.capacity(), sizeof(std::uint8_t)},
+            {completion.records.coverage.capacity(), sizeof(coverage_span_t)}};
+        for (const auto& allocation : allocations) {
+            added = add(allocation.first, allocation.second);
+            if (!added)
+                return added;
+        }
+    }
+    return workspace_result_t<void>::success();
+}
+
 edge_kind_t flow_to_edge_kind(std::uint32_t flow_flags) noexcept
 {
     if ((flow_flags & flow_return) != 0)
@@ -97,6 +139,16 @@ decode_frontier_seed_kind_t flow_to_target_seed_kind(std::uint32_t flow_flags) n
     if ((flow_flags & flow_branch) != 0)
         return decode_frontier_seed_kind_t::branch_target;
     return decode_frontier_seed_kind_t::fallthrough;
+}
+
+bool control_flow_target_matches(std::uint32_t flow_flags,
+                                 target_kind_record_t kind) noexcept
+{
+    if (kind == target_kind_record_t::call)
+        return (flow_flags & flow_call) != 0;
+    if (kind == target_kind_record_t::branch)
+        return (flow_flags & flow_branch) != 0;
+    return false;
 }
 
 bool instruction_stronger(const instruction_record_t& a,
@@ -350,13 +402,6 @@ make_owned_instruction_entry(const tile_decode_records_t& records,
                              const executable_decode_tile_t& tile)
 {
     const auto& instruction = records.instructions[instruction_index];
-    if (!records.delay_slot_counts.empty() &&
-        records.delay_slot_counts.size() != records.instructions.size()) {
-        return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
-            orchestrator_error(workspace_error_code_t::integrity_failure,
-                "tile decoder returned misaligned delay-slot metadata",
-                instruction.address.value));
-    }
     if (instruction.length == 0) {
         return workspace_result_t<std::optional<tile_instruction_entry_t>>::failure(
             orchestrator_error(workspace_error_code_t::integrity_failure,
@@ -625,9 +670,12 @@ public:
             return workspace_result_t<std::unique_ptr<tile_decode_executor_t>>::failure(
                 std::move(error));
         }
-        if (options.worker_count > options.analysis_budget.max_worker_slots) {
+        const auto non_control_worker_slots =
+            options.analysis_budget.max_worker_slots -
+            options.analysis_budget.reserved_control_worker_slots;
+        if (options.worker_count > non_control_worker_slots) {
             return workspace_result_t<std::unique_ptr<tile_decode_executor_t>>::failure(
-                limit_error("worker_slots", options.analysis_budget.max_worker_slots,
+                limit_error("worker_slots", non_control_worker_slots,
                     options.worker_count));
         }
 
@@ -638,6 +686,7 @@ public:
         tile_decode_executor_capabilities_t caps;
         caps.decoder_key = options.decoder_key;
         caps.worker_count = options.worker_count;
+        caps.maximum_batch_requests = options.analysis_budget.max_queued_tasks;
 
         if (use_x86) {
             caps.maximum_request_bytes = options.x86_limits.maximum_window_bytes;
@@ -690,15 +739,27 @@ public:
         const std::vector<tile_decode_request_t>& requests,
         const cancellation_token_t& cancellation) override
     {
-        std::vector<tile_decode_completion_t> completions;
-        completions.reserve(requests.size());
-
         if (requests.size() > options_.analysis_budget.max_queued_tasks) {
             return workspace_result_t<std::vector<tile_decode_completion_t>>::failure(
                 limit_error("queued_decode_requests",
                     options_.analysis_budget.max_queued_tasks,
                     static_cast<std::uint64_t>(requests.size())));
         }
+
+        std::uint64_t completion_storage = 0;
+        if (!checked_multiply(requests.size(), sizeof(tile_decode_completion_t),
+                completion_storage) ||
+            completion_storage > options_.analysis_budget.max_private_bytes) {
+            return workspace_result_t<std::vector<tile_decode_completion_t>>::failure(
+                limit_error("private_bytes",
+                    options_.analysis_budget.max_private_bytes,
+                    completion_storage == 0
+                        ? (std::numeric_limits<std::uint64_t>::max)()
+                        : completion_storage));
+        }
+
+        std::vector<tile_decode_completion_t> completions;
+        completions.reserve(requests.size());
 
         if (capabilities_.worker_count <= 1) {
             for (const auto& request : requests) {
@@ -717,6 +778,12 @@ public:
             }
         } else {
             completions = execute_parallel(snapshot, requests, cancellation);
+        }
+        auto storage = validate_completion_storage(
+            completions, options_.analysis_budget.max_private_bytes);
+        if (!storage) {
+            return workspace_result_t<std::vector<tile_decode_completion_t>>::failure(
+                storage.error());
         }
         return workspace_result_t<std::vector<tile_decode_completion_t>>::success(
             std::move(completions));
@@ -1202,11 +1269,17 @@ tile_decode_orchestrator_t::run(
     if (caps.maximum_request_bytes == 0 || caps.minimum_instruction_bytes == 0 ||
         caps.maximum_request_bytes < caps.minimum_instruction_bytes ||
         caps.maximum_instruction_bytes < caps.minimum_instruction_bytes ||
-        caps.instruction_alignment == 0 || caps.worker_count == 0) {
+        caps.instruction_alignment == 0 ||
+        caps.instruction_alignment > caps.maximum_instruction_bytes ||
+        caps.worker_count == 0) {
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             orchestrator_error(workspace_error_code_t::invalid_argument,
                 "tile decode executor capabilities are invalid"));
     }
+    const auto batch_request_limit = caps.maximum_batch_requests == 0
+        ? limits_.maximum_frontier_wave
+        : (std::min)(limits_.maximum_frontier_wave,
+            static_cast<std::uint64_t>(caps.maximum_batch_requests));
 
     auto partition_result = partition_executable_decode_ranges(
         layout, caps, limits_, cancellation);
@@ -1306,11 +1379,18 @@ tile_decode_orchestrator_t::run(
                 orchestrator_error(workspace_error_code_t::integrity_failure,
                     "tile decode request ownership is invalid", request.start.value));
         }
-        if (records.bytes_consumed > request.byte_count ||
-            records.invalid_bytes > request.byte_count) {
+        if (records.bytes_consumed != request.byte_count ||
+            records.invalid_bytes > records.bytes_consumed) {
             return workspace_result_t<void>::failure(
                 orchestrator_error(workspace_error_code_t::integrity_failure,
-                    "tile decoder usage exceeds its request window",
+                    "tile decoder returned a partial or invalid usage record",
+                    request.start.value));
+        }
+        if (!records.delay_slot_counts.empty() &&
+            records.delay_slot_counts.size() != records.instructions.size()) {
+            return workspace_result_t<void>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "tile decoder returned misaligned delay-slot metadata",
                     request.start.value));
         }
 
@@ -1373,6 +1453,9 @@ tile_decode_orchestrator_t::run(
             }
 
             for (const auto& target : retained->second.targets) {
+                if (!control_flow_target_matches(
+                        instruction.flow_flags, target.kind))
+                    continue;
                 if (target.target.space != address_space_id_t::relative_virtual)
                     continue;
                 decode_frontier_seed_t seed;
@@ -1434,7 +1517,7 @@ tile_decode_orchestrator_t::run(
                 cancellation_error(cancellation,
                     "orchestrator recursive pass cancelled"));
 
-        auto wave_result = frontier.take_wave(limits_.maximum_frontier_wave);
+        auto wave_result = frontier.take_wave(batch_request_limit);
         if (!wave_result)
             return workspace_result_t<tile_decode_orchestration_result_t>::failure(
                 wave_result.error());
@@ -1453,7 +1536,11 @@ tile_decode_orchestrator_t::run(
             if (total_decode_requests >= limits_.maximum_decode_requests) {
                 return workspace_result_t<tile_decode_orchestration_result_t>::failure(
                     limit_error("decode_requests", limits_.maximum_decode_requests,
-                                total_decode_requests + 1, seed.rva));
+                                total_decode_requests ==
+                                        (std::numeric_limits<std::uint64_t>::max)()
+                                    ? total_decode_requests
+                                    : total_decode_requests + 1,
+                                seed.rva));
             }
             if (request_id_counter ==
                 (std::numeric_limits<std::uint64_t>::max)()) {
@@ -1472,6 +1559,19 @@ tile_decode_orchestrator_t::run(
             }
             const std::uint64_t effective_bytes = (std::min)(
                 available_bytes, caps.maximum_request_bytes);
+            std::uint64_t provider_offset = 0;
+            std::uint64_t runtime_address = 0;
+            std::uint64_t owned_end = 0;
+            if (!checked_add(tile.provider_offset, offset_in_tile,
+                    provider_offset) ||
+                !checked_add(tile.start_virtual_address, offset_in_tile,
+                    runtime_address) ||
+                !checked_add(tile.start_rva, tile.byte_count, owned_end)) {
+                return workspace_result_t<
+                    tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::range_overflow,
+                        "recursive decode request range overflow", seed.rva));
+            }
 
             tile_decode_request_t req;
             req.request_id = request_id_counter++;
@@ -1482,12 +1582,12 @@ tile_decode_orchestrator_t::run(
             req.start.value = seed.rva;
             req.start.architecture = caps.decoder_key.architecture;
             req.start.mode = caps.decoder_key.mode;
-            req.provider_offset = tile.provider_offset + offset_in_tile;
-            req.runtime_address = tile.start_virtual_address + offset_in_tile;
+            req.provider_offset = provider_offset;
+            req.runtime_address = runtime_address;
             req.image_base = image_base;
             req.image_size = image_size;
             req.byte_count = effective_bytes;
-            req.owned_end_rva = tile.start_rva + tile.byte_count;
+            req.owned_end_rva = owned_end;
             req.stable_source_id = seed.stable_source_id;
             req.provenance = seed.provenance;
             req.confidence = seed.confidence;
@@ -1543,6 +1643,27 @@ tile_decode_orchestrator_t::run(
         }
         std::uint64_t cursor = tile->start_rva;
         std::vector<tile_decode_request_t> gap_requests;
+        const auto flush_gap_requests = [&]() -> workspace_result_t<void> {
+            if (gap_requests.empty())
+                return workspace_result_t<void>::success();
+            auto batch_result = execute_correlated_batch(
+                executor, snapshot, gap_requests, cancellation,
+                "orchestrator gap batch cancelled");
+            if (!batch_result)
+                return workspace_result_t<void>::failure(batch_result.error());
+            auto batch = batch_result.take_value();
+            for (std::size_t request_index = 0;
+                 request_index < gap_requests.size(); ++request_index) {
+                const auto& completion =
+                    batch.completions[batch.completion_indices[request_index]];
+                auto process_result = process_records(
+                    gap_requests[request_index], completion.records, false);
+                if (!process_result)
+                    return process_result;
+            }
+            gap_requests.clear();
+            return workspace_result_t<void>::success();
+        };
 
         while (cursor < tile_end) {
             if (cancellation.stop_requested())
@@ -1559,72 +1680,144 @@ tile_decode_orchestrator_t::run(
             const auto gap_start = cursor;
             while (cursor < tile_end &&
                    accumulator.instructions.find(cursor) ==
-                       accumulator.instructions.end())
+                       accumulator.instructions.end()) {
+                if (cancellation.stop_requested()) {
+                    return workspace_result_t<
+                        tile_decode_orchestration_result_t>::failure(
+                        cancellation_error(cancellation,
+                            "orchestrator gap pass cancelled"));
+                }
                 ++cursor;
+            }
 
             const auto gap_length = cursor - gap_start;
             if (gap_length == 0)
                 continue;
-            if (total_decode_requests >= limits_.maximum_decode_requests) {
-                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                    limit_error("decode_requests", limits_.maximum_decode_requests,
-                                total_decode_requests + 1, gap_start));
-            }
-            if (request_id_counter ==
-                (std::numeric_limits<std::uint64_t>::max)()) {
-                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                    limit_error("request_identifiers", request_id_counter,
-                                request_id_counter, gap_start));
-            }
-
-            const auto offset_in_tile = gap_start - tile->start_rva;
-            const auto effective_bytes = (std::min)(
-                (std::min)(gap_length, caps.maximum_request_bytes),
+            const auto request_capacity = (std::min)(
+                caps.maximum_request_bytes,
                 limits_.invalid_run_policy.maximum_gap_resynchronization_bytes);
+            if (request_capacity < caps.minimum_instruction_bytes) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::invalid_argument,
+                        "gap resynchronization window is below the decoder minimum",
+                        gap_start));
+            }
+            const auto maximum_lookahead =
+                static_cast<std::uint64_t>(caps.maximum_instruction_bytes -
+                    caps.instruction_alignment);
+            const auto minimum_owned_bytes = (std::min)(
+                request_capacity,
+                static_cast<std::uint64_t>(caps.instruction_alignment));
+            const auto lookahead_reserve = (std::min)(maximum_lookahead,
+                request_capacity - minimum_owned_bytes);
+            auto owned_capacity = request_capacity - lookahead_reserve;
+            if (owned_capacity >= caps.instruction_alignment) {
+                owned_capacity -= owned_capacity % caps.instruction_alignment;
+            }
+            if (owned_capacity == 0) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::invalid_argument,
+                        "gap resynchronization window has no aligned ownership",
+                        gap_start));
+            }
 
-            tile_decode_request_t request;
-            request.request_id = request_id_counter++;
-            request.tile_id = tile->tile_id;
-            request.pass = tile_decode_pass_t::gap;
-            request.seed_kind = decode_frontier_seed_kind_t::fallthrough;
-            request.start.space = address_space_id_t::relative_virtual;
-            request.start.value = gap_start;
-            request.start.architecture = caps.decoder_key.architecture;
-            request.start.mode = caps.decoder_key.mode;
-            request.provider_offset = tile->provider_offset + offset_in_tile;
-            request.runtime_address = tile->start_virtual_address + offset_in_tile;
-            request.image_base = image_base;
-            request.image_size = image_size;
-            request.byte_count = effective_bytes;
-            request.owned_end_rva = tile_end;
-            request.provenance = fact_provenance_t::gap_recovery;
-            request.confidence = 50;
+            std::uint64_t gap_offset = 0;
+            while (gap_offset < gap_length) {
+                if (cancellation.stop_requested()) {
+                    return workspace_result_t<
+                        tile_decode_orchestration_result_t>::failure(
+                        cancellation_error(cancellation,
+                            "orchestrator gap pass cancelled"));
+                }
+                if (total_decode_requests >= limits_.maximum_decode_requests) {
+                    return workspace_result_t<
+                        tile_decode_orchestration_result_t>::failure(
+                        limit_error("decode_requests",
+                            limits_.maximum_decode_requests,
+                            total_decode_requests ==
+                                    (std::numeric_limits<std::uint64_t>::max)()
+                                ? total_decode_requests
+                                : total_decode_requests + 1,
+                            gap_start));
+                }
+                if (request_id_counter ==
+                    (std::numeric_limits<std::uint64_t>::max)()) {
+                    return workspace_result_t<
+                        tile_decode_orchestration_result_t>::failure(
+                        limit_error("request_identifiers", request_id_counter,
+                            request_id_counter, gap_start));
+                }
 
-            gap_requests.push_back(request);
-            ++total_decode_requests;
-            ++stats.gap_requests;
+                std::uint64_t request_start = 0;
+                std::uint64_t offset_in_tile = 0;
+                if (!checked_add(gap_start, gap_offset, request_start) ||
+                    request_start < tile->start_rva) {
+                    return workspace_result_t<
+                        tile_decode_orchestration_result_t>::failure(
+                        orchestrator_error(workspace_error_code_t::range_overflow,
+                            "gap decode request start overflowed", gap_start));
+                }
+                offset_in_tile = request_start - tile->start_rva;
+                const auto remaining_gap_bytes = gap_length - gap_offset;
+                const auto owned_bytes = (std::min)(
+                    remaining_gap_bytes, owned_capacity);
+                const auto lookahead_bytes = (std::min)({
+                    remaining_gap_bytes - owned_bytes,
+                    request_capacity - owned_bytes,
+                    lookahead_reserve});
+                std::uint64_t request_bytes = 0;
+                std::uint64_t owned_end = 0;
+                std::uint64_t provider_offset = 0;
+                std::uint64_t runtime_address = 0;
+                if (!checked_add(owned_bytes, lookahead_bytes, request_bytes) ||
+                    !checked_add(request_start, owned_bytes, owned_end) ||
+                    !checked_add(tile->provider_offset, offset_in_tile,
+                        provider_offset) ||
+                    !checked_add(tile->start_virtual_address, offset_in_tile,
+                        runtime_address)) {
+                    return workspace_result_t<
+                        tile_decode_orchestration_result_t>::failure(
+                        orchestrator_error(workspace_error_code_t::range_overflow,
+                            "gap decode request range overflowed", request_start));
+                }
+
+                tile_decode_request_t request;
+                request.request_id = request_id_counter++;
+                request.tile_id = tile->tile_id;
+                request.pass = tile_decode_pass_t::gap;
+                request.seed_kind = decode_frontier_seed_kind_t::fallthrough;
+                request.start.space = address_space_id_t::relative_virtual;
+                request.start.value = request_start;
+                request.start.architecture = caps.decoder_key.architecture;
+                request.start.mode = caps.decoder_key.mode;
+                request.provider_offset = provider_offset;
+                request.runtime_address = runtime_address;
+                request.image_base = image_base;
+                request.image_size = image_size;
+                request.byte_count = request_bytes;
+                request.owned_end_rva = owned_end;
+                request.provenance = fact_provenance_t::gap_recovery;
+                request.confidence = 50;
+
+                gap_requests.push_back(request);
+                ++total_decode_requests;
+                ++stats.gap_requests;
+                gap_offset += owned_bytes;
+                if (gap_requests.size() >= batch_request_limit) {
+                    auto flushed = flush_gap_requests();
+                    if (!flushed) {
+                        return workspace_result_t<
+                            tile_decode_orchestration_result_t>::failure(
+                            flushed.error());
+                    }
+                }
+            }
         }
 
-        if (gap_requests.empty())
-            continue;
-
-        auto batch_result = execute_correlated_batch(
-            executor, snapshot, gap_requests, cancellation,
-            "orchestrator gap batch cancelled");
-        if (!batch_result)
+        auto flushed = flush_gap_requests();
+        if (!flushed) {
             return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                batch_result.error());
-        auto batch = batch_result.take_value();
-
-        for (std::size_t request_index = 0;
-             request_index < gap_requests.size(); ++request_index) {
-            const auto& completion =
-                batch.completions[batch.completion_indices[request_index]];
-            auto process_result = process_records(
-                gap_requests[request_index], completion.records, false);
-            if (!process_result)
-                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-                    process_result.error());
+                flushed.error());
         }
     }
 
@@ -1677,6 +1870,9 @@ tile_decode_orchestrator_t::run(
             if ((entry.record.flow_flags &
                  (flow_branch | flow_call | flow_return | flow_indirect)) != 0) {
                 for (const auto& target : entry.targets) {
+                    if (!control_flow_target_matches(
+                            entry.record.flow_flags, target.kind))
+                        continue;
                     auto edge_result = record_edge(
                         accumulator.tile->tile_id, entry.record.address,
                         target.target, flow_to_edge_kind(entry.record.flow_flags));
@@ -1737,6 +1933,7 @@ tile_decode_orchestrator_t::run(
         packed_analysis_shard_builder_t builder(acc.tile->shard_id);
 
         std::uint64_t instruction_source_id = 1;
+        std::uint64_t address_expression_source_id = 1;
         std::uint32_t instruction_count = 0;
         std::uint32_t operand_count = 0;
         std::uint32_t target_count = 0;
@@ -1763,11 +1960,65 @@ tile_decode_orchestrator_t::run(
 
             std::map<entity_id_t, entity_id_t> operand_source_ids;
             std::map<std::uint8_t, entity_id_t> operand_index_source_ids;
+            std::map<entity_id_t, entity_id_t> address_expression_source_ids;
+            std::map<entity_id_t, entity_id_t> operand_expression_source_ids;
+            std::map<std::uint8_t, entity_id_t>
+                operand_index_expression_source_ids;
             for (const auto& op : entry.operands) {
                 packed_operand_input_t op_input;
                 op_input.source_id = static_cast<entity_id_t>(operand_count + 1);
                 op_input.instruction = packed_entity_reference_t::local(
                     packed_entity_domain_t::instruction, instruction_source_id);
+                entity_id_t expression_source_id = 0;
+                const auto existing_expression =
+                    address_expression_source_ids.find(op.address_expression_id);
+                if (op.address_expression_id != 0 &&
+                    existing_expression != address_expression_source_ids.end()) {
+                    expression_source_id = existing_expression->second;
+                } else if (op.address_expression_id != 0 ||
+                           op.address_expression != address_expression_kind_t::none ||
+                           op.address_components != address_component_none) {
+                    expression_source_id = address_expression_source_id++;
+                    packed_address_expression_input_t expression_input;
+                    expression_input.source_id = expression_source_id;
+                    expression_input.instruction = packed_entity_reference_t::local(
+                        packed_entity_domain_t::instruction, instruction_source_id);
+                    expression_input.base_reg = op.base_reg;
+                    expression_input.index_reg = op.index_reg;
+                    expression_input.scale = op.scale;
+                    expression_input.displacement = op.displacement;
+                    expression_input.segment_reg = op.segment_reg;
+                    expression_input.address_components = op.address_components;
+                    expression_input.kind = op.address_expression;
+                    expression_input.resolution = op.address_resolution;
+                    expression_input.provenance = entry.record.provenance;
+                    expression_input.confidence = entry.record.confidence;
+                    auto expression_result =
+                        builder.add_address_expression(expression_input);
+                    if (!expression_result) {
+                        return workspace_result_t<
+                            tile_decode_orchestration_result_t>::failure(
+                            orchestrator_error(
+                                workspace_error_code_t::integrity_failure,
+                                "packed store address expression add failed", rva));
+                    }
+                    if (op.address_expression_id != 0) {
+                        address_expression_source_ids.emplace(
+                            op.address_expression_id, expression_source_id);
+                    }
+                }
+                if (expression_source_id != 0) {
+                    op_input.address_expression =
+                        packed_entity_reference_t::local(
+                            packed_entity_domain_t::address_expression,
+                            expression_source_id);
+                    if (op.id != 0) {
+                        operand_expression_source_ids.emplace(
+                            op.id, expression_source_id);
+                    }
+                    operand_index_expression_source_ids.emplace(
+                        op.operand_index, expression_source_id);
+                }
                 op_input.operand_index = op.operand_index;
                 op_input.decoder_operand_id = op.decoder_operand_id;
                 op_input.kind = op.kind;
@@ -1824,6 +2075,31 @@ tile_decode_orchestrator_t::run(
                     target_input.operand = packed_entity_reference_t::local(
                         packed_entity_domain_t::operand_fact, source_by_index->second);
                 }
+                entity_id_t target_expression_source_id = 0;
+                const auto by_expression_id =
+                    address_expression_source_ids.find(
+                        target.address_expression_id);
+                if (by_expression_id != address_expression_source_ids.end()) {
+                    target_expression_source_id = by_expression_id->second;
+                } else {
+                    const auto by_operand_id =
+                        operand_expression_source_ids.find(
+                            target.operand_fact_id);
+                    if (by_operand_id != operand_expression_source_ids.end())
+                        target_expression_source_id = by_operand_id->second;
+                }
+                if (target_expression_source_id == 0) {
+                    const auto by_index = operand_index_expression_source_ids.find(
+                        target.operand_index);
+                    if (by_index != operand_index_expression_source_ids.end())
+                        target_expression_source_id = by_index->second;
+                }
+                if (target_expression_source_id != 0) {
+                    target_input.address_expression =
+                        packed_entity_reference_t::local(
+                            packed_entity_domain_t::address_expression,
+                            target_expression_source_id);
+                }
                 target_input.target = target.target;
                 target_input.kind = target.kind;
                 target_input.resolution = target.resolution;
@@ -1846,6 +2122,9 @@ tile_decode_orchestrator_t::run(
 
             if ((entry.record.flow_flags & (flow_branch | flow_call | flow_return | flow_indirect)) != 0) {
                 for (const auto& target : entry.targets) {
+                    if (!control_flow_target_matches(
+                            entry.record.flow_flags, target.kind))
+                        continue;
                     packed_edge_input_t edge_input;
                     edge_input.source_id = static_cast<entity_id_t>(edge_count + 1);
                     edge_input.source_entity = packed_entity_reference_t::local(

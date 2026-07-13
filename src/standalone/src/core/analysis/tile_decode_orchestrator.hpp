@@ -33,6 +33,7 @@ struct tile_decode_executor_capabilities_t final {
     std::uint16_t maximum_instruction_bytes = 0;
     std::uint16_t instruction_alignment = 0;
     std::uint32_t worker_count = 0;
+    std::uint32_t maximum_batch_requests = 0;
 };
 
 struct tile_decode_request_t final {

@@ -277,6 +277,9 @@ json query_cursor_schema() {
             {"position", nonnegative_integer_schema()},
             {"matches_consumed", nonnegative_integer_schema()},
             {"integrity_tag", nonnegative_integer_schema()},
+            {"next", nonnegative_integer_schema()},
+            {"done", json{{"type", "boolean"}}},
+            {"cancelled", json{{"type", "boolean"}}},
         }},
         {"required", json::array({
             "binary_id", "load_profile_hash", "provider_content_hash", "generation",
