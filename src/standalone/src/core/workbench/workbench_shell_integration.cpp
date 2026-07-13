@@ -2261,7 +2261,8 @@ std::shared_ptr<diff_materialization_t> build_diff_materialization(
             if (old_record.address == new_record.address &&
                 old_record.value == new_record.value)
                 continue;
-            entry.kind = old_record.address != new_record.address
+            entry.kind = old_record.address != 0 && new_record.address != 0 &&
+                         old_record.address != new_record.address
                 ? diff_document::diff_entry_kind_t::moved
                 : diff_document::diff_entry_kind_t::modified;
             entry.domain = new_record.domain;

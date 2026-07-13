@@ -95,8 +95,10 @@ bool selection_matches(const diff_selection_t& requested,
         requested.has_address != canonical.has_address) {
         return false;
     }
-    if (canonical.has_address)
-        return requested.address == canonical.address;
+    if (canonical.has_address) {
+        return requested.address == canonical.address &&
+               requested.entity_key == canonical.entity_key;
+    }
     return requested.address == 0 && requested.entity_key == canonical.entity_key;
 }
 
@@ -159,8 +161,10 @@ bool diff_selection_valid(const diff_selection_t& selection) noexcept
         return !selection.has_address && selection.address == 0 &&
                selection.entry_index == 0 && selection.entity_key.empty();
     }
-    if (selection.kind == selection_kind_t::address)
-        return selection.has_address && selection.address != 0;
+    if (selection.kind == selection_kind_t::address) {
+        return selection.has_address && selection.address != 0 &&
+               !selection.entity_key.empty();
+    }
     if (selection.kind == selection_kind_t::entity) {
         return !selection.has_address && selection.address == 0 &&
                !selection.entity_key.empty();

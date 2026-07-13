@@ -5082,7 +5082,6 @@ namespace mcp_standalone
             };
 
             struct wave_c_query_cursor_binding_t final {
-                std::string semantics;
                 std::uint64_t sequence = 0;
             };
 
@@ -5234,18 +5233,23 @@ namespace mcp_standalone
                 std::uint64_t integrity_tag,
                 std::string_view semantics) const
             {
+                std::string key = std::to_string(integrity_tag);
+                key.push_back('\0');
+                key.append(semantics);
                 std::lock_guard<std::mutex> lock(query_cursor_bindings_mutex_);
-                const auto found = query_cursor_bindings_.find(integrity_tag);
-                return found != query_cursor_bindings_.end() &&
-                    found->second.semantics == semantics;
+                return query_cursor_bindings_.find(key) !=
+                    query_cursor_bindings_.end();
             }
 
             void remember_query_cursor_binding(
                 std::uint64_t integrity_tag,
                 std::string semantics) const
             {
+                std::string key = std::to_string(integrity_tag);
+                key.push_back('\0');
+                key.append(semantics);
                 std::lock_guard<std::mutex> lock(query_cursor_bindings_mutex_);
-                auto found = query_cursor_bindings_.find(integrity_tag);
+                auto found = query_cursor_bindings_.find(key);
                 if (found == query_cursor_bindings_.end() &&
                     query_cursor_bindings_.size() >= k_query_cursor_binding_capacity) {
                     const auto oldest = (std::min_element)(
@@ -5263,8 +5267,7 @@ namespace mcp_standalone
                         entry.second.sequence = 0;
                 }
                 const auto sequence = ++query_cursor_binding_sequence_;
-                query_cursor_bindings_[integrity_tag] = {
-                    std::move(semantics), sequence};
+                query_cursor_bindings_[std::move(key)] = {sequence};
             }
 
             aida::analysis::workspace_result_t<wave_c_query_page_t>
@@ -8489,7 +8492,7 @@ namespace mcp_standalone
             static constexpr std::size_t k_query_cursor_binding_capacity = 1024U;
             mutable std::mutex query_cursor_bindings_mutex_;
             mutable std::unordered_map<
-                std::uint64_t, wave_c_query_cursor_binding_t> query_cursor_bindings_;
+                std::string, wave_c_query_cursor_binding_t> query_cursor_bindings_;
             mutable std::uint64_t query_cursor_binding_sequence_ = 0;
             wave_c_compat::effect_lock_manager_t adapter_lock_manager_;
             wave_c_compat::target_resolver_t registry_resolver_;

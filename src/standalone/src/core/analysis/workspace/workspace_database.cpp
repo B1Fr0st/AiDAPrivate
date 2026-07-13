@@ -31,6 +31,8 @@ namespace aida::analysis {
 namespace {
 
 constexpr std::uint32_t kInstructionBlobMagic = 0x49444941U;
+constexpr std::size_t kInstructionBlobHeaderSize = 16;
+constexpr std::size_t kInstructionBlobRecordSize = 53;
 constexpr std::size_t kDatabaseRecordPollStride = 256;
 constexpr std::size_t kDatabaseBlobCopyChunk = 4096;
 
@@ -336,7 +338,8 @@ std::vector<std::uint8_t> encode_instruction_chunk(
     const std::vector<instruction_record_t>& instructions,
     std::size_t begin, std::size_t end) {
     std::vector<std::uint8_t> output;
-    output.reserve(16 + (end - begin) * 52);
+    output.reserve(kInstructionBlobHeaderSize +
+                   (end - begin) * kInstructionBlobRecordSize);
     append_u32(output, kInstructionBlobMagic);
     append_u32(output, workspace_instruction_blob_version);
     append_u64(output, static_cast<std::uint64_t>(end - begin));
@@ -366,6 +369,7 @@ std::vector<std::uint8_t> encode_instruction_chunk(
 workspace_result_t<void> decode_instruction_chunk(
     const void* data, std::size_t size,
     std::vector<instruction_record_t>& output,
+    std::uint64_t max_records,
     const cancellation_token_t& cancel) {
     if (cancel.stop_requested()) {
         return workspace_result_t<void>::failure(database_cancellation_error(
@@ -394,6 +398,26 @@ workspace_result_t<void> decode_instruction_chunk(
                                  "instruction chunk record count is invalid", "workspace_database"));
     }
     const std::uint64_t count = count_result.value();
+    std::uint64_t encoded_records_size = 0;
+    if (!checked_mul_u64(count, kInstructionBlobRecordSize,
+                         encoded_records_size) ||
+        encoded_records_size != static_cast<std::uint64_t>(end - cursor)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "instruction chunk record payload is malformed",
+                                 "workspace_database"));
+    }
+    if (output.size() > max_records || count > max_records - output.size()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "persisted instructions exceed the reopen budget",
+            "workspace_database.load.instructions"));
+    }
+    if (cancel.stop_requested()) {
+        return workspace_result_t<void>::failure(database_cancellation_error(
+            cancel, "instruction chunk decode was cancelled",
+            "workspace_database.load.instructions"));
+    }
     output.reserve(output.size() + static_cast<std::size_t>(count));
     for (std::uint64_t index = 0; index < count; ++index) {
         if (index % kDatabaseRecordPollStride == 0 &&
@@ -3276,7 +3300,7 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
                         "persisted instruction chunk is empty", "workspace_database.load.instructions"));
                 auto decoded = decode_instruction_chunk(
                     payload, static_cast<std::size_t>(bytes), loaded->instructions,
-                    cancel);
+                    options_.max_persisted_fact_records, cancel);
                 if (!decoded)
                     return decoded;
                 if (loaded->instructions.size() > options_.max_persisted_fact_records) {

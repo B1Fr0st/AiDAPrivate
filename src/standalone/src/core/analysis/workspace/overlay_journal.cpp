@@ -140,6 +140,22 @@ workspace_result_t<void> overlay_exec(sqlite3* database, const char* sql,
     return workspace_result_t<void>::failure(std::move(error));
 }
 
+class overlay_rollback_guard_t final {
+public:
+    overlay_rollback_guard_t(sqlite3* database, const char* phase) noexcept
+        : database_(database), phase_(phase) {
+    }
+
+    ~overlay_rollback_guard_t() {
+        if (database_ && sqlite3_get_autocommit(database_) == 0)
+            static_cast<void>(overlay_exec(database_, "ROLLBACK", phase_));
+    }
+
+private:
+    sqlite3* database_ = nullptr;
+    const char* phase_ = nullptr;
+};
+
 workspace_result_t<void> persist_fixed_target(
     sqlite3* database,
     const overlay_target_identity_v9_t& target,
@@ -1556,6 +1572,7 @@ projection_finalize_result_t publish_projected_overlay(
     const std::shared_ptr<overlay_workspace_generation_t>& generation,
     std::function<workspace_result_t<void>()> persistence_finalizer,
     const cancellation_token_t& cancel) {
+    try {
     projection_invalidation_hooks_t hooks;
     hooks.decompiler_cache =
         [workspace, database, cancel](
@@ -1608,6 +1625,12 @@ projection_finalize_result_t publish_projected_overlay(
                 commit.detail = commit.invalidation.detail;
             return commit;
         });
+    } catch (...) {
+        projection_finalize_result_t result;
+        result.code = projection_code_t::finalizer_failed;
+        result.detail = "overlay publication hook allocation failed";
+        return result;
+    }
 }
 
 workspace_result_t<void> apply_item(sqlite3* database, const std::string& entity,
@@ -1812,6 +1835,8 @@ workspace_result_t<void> overlay_journal_t::ensure_fixed_target_binding(
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.target");
             if (!begin)
                 return begin;
+            overlay_rollback_guard_t rollback_guard(
+                writer, "overlay_journal.target");
             overlay_statement_t query;
             auto current = query.prepare(writer,
                 "SELECT value FROM metadata WHERE key='overlay_v9_fixed_target'",
@@ -1957,6 +1982,8 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
             }
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.recovery");
             if (!begin) return begin;
+            overlay_rollback_guard_t rollback_guard(
+                writer, "overlay_journal.recovery");
             auto migrated = migrate_operation_payloads(writer, target);
             if (!migrated) {
                 overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery");
@@ -2446,6 +2473,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                     "overlay commit cancelled", "overlay_journal.commit"));
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.commit");
             if (!begin) return begin;
+            overlay_rollback_guard_t rollback_guard(
+                writer, "overlay_journal.commit");
             auto state_result = read_overlay_state(writer, "overlay_journal.commit");
             if (!state_result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return workspace_result_t<void>::failure(state_result.error()); }
             auto state = state_result.take_value();
@@ -2610,13 +2639,13 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 current = idempotency_statement.bind_uint(5, overlay_utc_ms()); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = idempotency_statement.step_done(); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
             }
-            auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.commit");
-            if (!committed) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return committed; }
             state.revision = new_revision;
             state.cursor = transaction_id;
             state.next_transaction = transaction_id + 1;
             *committed_state = state;
             *result_holder = std::move(transaction_result);
+            auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.commit");
+            if (!committed) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return committed; }
             return workspace_result_t<void>::success();
         }, cancel);
         auto waited = wait_ticket(ticket, cancel);
@@ -2940,6 +2969,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                     "overlay history action cancelled", "overlay_journal.history"));
             auto begin = overlay_exec(writer, "BEGIN IMMEDIATE", "overlay_journal.history");
             if (!begin) return begin;
+            overlay_rollback_guard_t rollback_guard(
+                writer, "overlay_journal.history");
             auto state_result = read_overlay_state(writer, "overlay_journal.history");
             if (!state_result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return workspace_result_t<void>::failure(state_result.error()); }
             auto state = state_result.take_value();
@@ -3091,12 +3122,12 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
             current = event_statement.bind_uint(5, cursor); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
             current = event_statement.bind_uint(6, overlay_utc_ms()); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
             current = event_statement.step_done(); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
-            auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.history");
-            if (!committed) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return committed; }
             state.revision = new_revision;
             state.cursor = cursor;
             *committed_state = state;
             *result_holder = std::move(action_result);
+            auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.history");
+            if (!committed) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return committed; }
             return workspace_result_t<void>::success();
         }, cancel);
         auto waited = wait_ticket(ticket, cancel);
