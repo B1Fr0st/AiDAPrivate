@@ -392,16 +392,27 @@ void verify_disasm_stale_generation()
 
     disasm_document::disasm_command_t cmd;
     cmd.kind = disasm_document::disasm_command_kind_t::refresh;
+    cmd.expected_generation = original_gen;
     auto result = model.execute(cmd);
-    require(result.changed, "disasm refresh must update bound generation");
-    require(!model.is_stale(), "disasm model must not be stale after refresh");
+    require(result.error.code ==
+                disasm_document::disasm_error_code_t::stale_generation &&
+                !result.changed,
+            "disasm refresh must reject an expired generation lease");
+    require(model.is_stale(),
+            "disasm refresh must not rebind an expired generation lease");
+
+    disasm_document::disasm_document_model_t rebound_model(source, &overlays);
+    require(!rebound_model.is_stale() &&
+                rebound_model.bound_generation() == source.current_generation(),
+            "a new disasm model must bind the current immutable generation");
 
     disasm_document::disasm_page_request_t req;
     req.offset = 0;
     req.limit = 10;
     disasm_document::disasm_page_t page;
-    err = model.page(req, nullptr, page);
-    require(err.ok() && page.rows.size() == 10, "disasm page must work after refresh");
+    err = rebound_model.page(req, nullptr, page);
+    require(err.ok() && page.rows.size() == 10,
+            "disasm page must work after shell-style model replacement");
 }
 
 void verify_disasm_overlay_visualization()
@@ -720,9 +731,18 @@ void verify_hex_stale_and_overlay()
 
     hex_document::hex_command_t cmd;
     cmd.kind = hex_document::hex_command_kind_t::refresh;
+    cmd.expected_generation = model.bound_generation();
     auto result = model.execute(cmd);
-    require(result.changed, "hex refresh must update generation");
-    require(!model.is_stale(), "hex model must not be stale after refresh");
+    require(result.error.code == hex_document::hex_error_code_t::stale_generation &&
+                !result.changed,
+            "hex refresh must reject an expired generation lease");
+    require(model.is_stale(),
+            "hex refresh must not rebind an expired generation lease");
+
+    hex_document::hex_document_model_t rebound_model(source, &overlays);
+    require(!rebound_model.is_stale() &&
+                rebound_model.bound_generation() == source.current_generation(),
+            "a new hex model must bind the current immutable generation");
 }
 
 void verify_hex_patch_projection_limits_and_selection()
@@ -1739,8 +1759,9 @@ void verify_graph_large_cap()
 
     const auto old_generation = global_edge_source.current_generation();
     global_edge_source.advance_generation();
+    graph_document::graph_document_model_t current_edge_model(global_edge_source);
     graph_document::graph_diff_result_t diff;
-    err = global_edge_model.diff_generations(
+    err = current_edge_model.diff_generations(
         old_generation, global_edge_source.current_generation(),
         graph_document::graph_kind_t::cfg, 0, nullptr, diff);
     require(err.code == graph_document::graph_error_code_t::graph_too_large,
@@ -1835,11 +1856,11 @@ void verify_graph_cross_generation_diff()
     const auto old_gen = source.current_generation();
     source.advance_generation();
     const auto new_gen = source.current_generation();
+    graph_document::graph_document_model_t current_model(source);
 
     graph_document::graph_diff_result_t diff;
-    auto err = model.diff_generations(old_gen, new_gen,
-                                      graph_document::graph_kind_t::cfg, 0,
-                                      nullptr, diff);
+    auto err = current_model.diff_generations(
+        old_gen, new_gen, graph_document::graph_kind_t::cfg, 0, nullptr, diff);
     require(err.ok(), "graph cross-generation diff must succeed");
     require(diff.old_generation == old_gen, "graph diff old generation must match");
     require(diff.new_generation == new_gen, "graph diff new generation must match");
@@ -2192,8 +2213,16 @@ void verify_diff_stale_generation()
     cmd.kind = diff_document::diff_command_kind_t::refresh;
     cmd.expected_generation = bound_generation;
     auto result = model.execute(cmd);
-    require(result.changed, "diff refresh must update generation");
-    require(!model.is_stale(), "diff model must not be stale after refresh");
+    require(result.error.code == diff_document::diff_error_code_t::stale_generation &&
+                !result.changed,
+            "diff refresh must reject an expired generation lease");
+    require(model.is_stale(),
+            "diff refresh must not rebind an expired generation lease");
+
+    diff_document::diff_document_model_t rebound_model(source);
+    require(!rebound_model.is_stale() &&
+                rebound_model.bound_generation() == source.current_generation(),
+            "a new diff model must bind the current immutable generation");
 }
 
 void verify_diff_domain_filter()
