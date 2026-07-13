@@ -310,7 +310,10 @@ graph_error_t graph_document_model_t::page(
             return stale();
         if (overlay_result == graph_source_result_t::limit_exceeded ||
             overlay_count > k_graph_document_max_overlays) {
-            return fail(graph_error_code_t::resource_exhausted, overlay_count);
+            return fail(graph_error_code_t::resource_exhausted,
+                        overlay_count > k_graph_document_max_overlays
+                            ? overlay_count
+                            : k_graph_document_max_overlays + 1U);
         }
         if (overlay_result != graph_source_result_t::success)
             return fail(graph_error_code_t::adapter_rejected, gen);
@@ -422,7 +425,10 @@ graph_error_t graph_document_model_t::page(
                 if (overlay_result == graph_source_result_t::limit_exceeded) {
                     output = {};
                     return fail(graph_error_code_t::resource_exhausted,
-                                projected_label.size());
+                                projected_label.size() >
+                                        k_graph_document_max_label_bytes
+                                    ? projected_label.size()
+                                    : k_graph_document_max_label_bytes + 1U);
                 }
                 if (overlay_result == graph_source_result_t::success) {
                     if (projected_label.size() > k_graph_document_max_label_bytes) {
@@ -532,6 +538,9 @@ graph_error_t graph_document_model_t::select(
     if (expected_generation != bound_generation_ ||
         !source_->generation_current(bound_generation_))
         return stale();
+    if (!graph_selection_valid(selection))
+        return fail(graph_error_code_t::selection_rejected,
+                    static_cast<std::uint64_t>(selection.kind));
     if (selection.kind == selection_kind_t::none) {
         selection_ = {};
         return {};
@@ -629,7 +638,7 @@ graph_error_t graph_document_model_t::canonicalize_selection(
         if (source_result != graph_source_result_t::success ||
             ordinal >= counts.nodes)
             return fail(graph_error_code_t::adapter_rejected, ordinal);
-        if (!graph_node_valid(node) ||
+        if (!graph_node_valid(node) || node.address == 0 ||
             (selection.node.valid() && selection.node != node.id))
             return fail(graph_error_code_t::selection_rejected, selection.address);
         output = selection;
@@ -876,7 +885,15 @@ graph_error_t graph_document_model_t::layout_layered(
                 [](std::uint64_t lhs, std::uint64_t rhs) { return lhs < rhs; },
                 cancellation, subject))
             return cancelled();
-        adjacent.erase(std::unique(adjacent.begin(), adjacent.end()), adjacent.end());
+        std::size_t write = 0;
+        for (std::size_t read = 0; read < adjacent.size(); ++read) {
+            if (cancellation_requested(cancellation))
+                return cancelled();
+            if (write == 0 || adjacent[read] != adjacent[write - 1])
+                adjacent[write++] = adjacent[read];
+            increment_subject(subject);
+        }
+        adjacent.resize(write);
     }
 
     std::vector<std::uint32_t> layer(nodes.size(), 0);
@@ -1099,18 +1116,26 @@ graph_error_t graph_document_model_t::diff_generations(
         if (cancellation_requested(cancellation) ||
             new_overlay_result == graph_source_result_t::cancelled)
             return cancelled_error(0);
-        if (old_overlay_result == graph_source_result_t::rejected ||
-            old_overlay_result == graph_source_result_t::not_found ||
-            new_overlay_result == graph_source_result_t::rejected ||
-            new_overlay_result == graph_source_result_t::not_found) {
+        if (!source_->generation_current(bound_generation_)) {
+            output = {};
+            return stale();
+        }
+        if ((old_overlay_result != graph_source_result_t::success &&
+             old_overlay_result != graph_source_result_t::limit_exceeded) ||
+            (new_overlay_result != graph_source_result_t::success &&
+             new_overlay_result != graph_source_result_t::limit_exceeded)) {
             return fail(graph_error_code_t::adapter_rejected, old_generation);
         }
         if (old_overlay_count > k_graph_document_max_overlays ||
             new_overlay_count > k_graph_document_max_overlays ||
             old_overlay_result == graph_source_result_t::limit_exceeded ||
             new_overlay_result == graph_source_result_t::limit_exceeded) {
+            const auto reported = (std::max)(old_overlay_count,
+                                              new_overlay_count);
             return fail(graph_error_code_t::resource_exhausted,
-                        (std::max)(old_overlay_count, new_overlay_count));
+                        reported > k_graph_document_max_overlays
+                            ? reported
+                            : k_graph_document_max_overlays + 1U);
         }
     }
 
@@ -1149,6 +1174,10 @@ graph_error_t graph_document_model_t::diff_generations(
         if (cancellation_requested(cancellation) ||
             source_result == graph_source_result_t::cancelled)
             return cancelled_error(work_subject);
+        if (!source_->generation_current(bound_generation_)) {
+            output = {};
+            return stale();
+        }
         if (source_result == graph_source_result_t::limit_exceeded)
             return fail(graph_error_code_t::graph_too_large, i);
         if (source_result != graph_source_result_t::success ||
@@ -1164,9 +1193,16 @@ graph_error_t graph_document_model_t::diff_generations(
             if (cancellation_requested(cancellation) ||
                 overlay_result == graph_source_result_t::cancelled)
                 return cancelled_error(work_subject);
+            if (!source_->generation_current(bound_generation_)) {
+                output = {};
+                return stale();
+            }
             if (overlay_result == graph_source_result_t::limit_exceeded)
                 return fail(graph_error_code_t::resource_exhausted,
-                            projected_label.size());
+                            projected_label.size() >
+                                    k_graph_document_max_label_bytes
+                                ? projected_label.size()
+                                : k_graph_document_max_label_bytes + 1U);
             if (overlay_result == graph_source_result_t::success) {
                 if (projected_label.size() > k_graph_document_max_label_bytes)
                     return fail(graph_error_code_t::resource_exhausted,
@@ -1189,6 +1225,10 @@ graph_error_t graph_document_model_t::diff_generations(
         if (cancellation_requested(cancellation) ||
             source_result == graph_source_result_t::cancelled)
             return cancelled_error(work_subject);
+        if (!source_->generation_current(bound_generation_)) {
+            output = {};
+            return stale();
+        }
         if (source_result == graph_source_result_t::limit_exceeded)
             return fail(graph_error_code_t::graph_too_large, i);
         if (source_result != graph_source_result_t::success ||
@@ -1204,9 +1244,16 @@ graph_error_t graph_document_model_t::diff_generations(
             if (cancellation_requested(cancellation) ||
                 overlay_result == graph_source_result_t::cancelled)
                 return cancelled_error(work_subject);
+            if (!source_->generation_current(bound_generation_)) {
+                output = {};
+                return stale();
+            }
             if (overlay_result == graph_source_result_t::limit_exceeded)
                 return fail(graph_error_code_t::resource_exhausted,
-                            projected_label.size());
+                            projected_label.size() >
+                                    k_graph_document_max_label_bytes
+                                ? projected_label.size()
+                                : k_graph_document_max_label_bytes + 1U);
             if (overlay_result == graph_source_result_t::success) {
                 if (projected_label.size() > k_graph_document_max_label_bytes)
                     return fail(graph_error_code_t::resource_exhausted,
@@ -1342,6 +1389,10 @@ graph_error_t graph_document_model_t::diff_generations(
         if (cancellation_requested(cancellation) ||
             source_result == graph_source_result_t::cancelled)
             return cancelled_error(work_subject);
+        if (!source_->generation_current(bound_generation_)) {
+            output = {};
+            return stale();
+        }
         if (source_result == graph_source_result_t::limit_exceeded)
             return fail(graph_error_code_t::graph_too_large, i);
         if (source_result != graph_source_result_t::success ||
@@ -1369,6 +1420,10 @@ graph_error_t graph_document_model_t::diff_generations(
         if (cancellation_requested(cancellation) ||
             source_result == graph_source_result_t::cancelled)
             return cancelled_error(work_subject);
+        if (!source_->generation_current(bound_generation_)) {
+            output = {};
+            return stale();
+        }
         if (source_result == graph_source_result_t::limit_exceeded)
             return fail(graph_error_code_t::graph_too_large, i);
         if (source_result != graph_source_result_t::success ||

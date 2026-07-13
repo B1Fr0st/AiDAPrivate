@@ -1,6 +1,7 @@
 #include "workspace_database.hpp"
 
 #include "checked_range.hpp"
+#include "packed_page_codec.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -15,8 +16,10 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <system_error>
@@ -36,6 +39,1122 @@ constexpr std::size_t kInstructionBlobRecordSize = 53;
 constexpr std::size_t kDatabaseRecordPollStride = 256;
 constexpr std::size_t kDatabaseBlobCopyChunk = 4096;
 constexpr std::uint64_t kMaximumInstructionChunkRecords = 1048576;
+constexpr std::uint32_t kPackedBaselineDomainMagic = 0x44424941U;
+constexpr std::uint32_t kPackedBaselineManifestMagic = 0x4d424941U;
+constexpr std::uint16_t kPackedBaselinePayloadVersion = 1;
+constexpr std::uint32_t kPackedBaselineRequiredDomains = 0x3ffffU;
+
+workspace_error_t packed_baseline_error(workspace_error_code_t code,
+                                        std::string message) {
+    return make_workspace_error(code, std::move(message),
+                                "workspace_database.packed_baseline");
+}
+
+workspace_error_t packed_baseline_cancelled(const cancellation_token_t& cancel) {
+    auto error = packed_baseline_error(
+        cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                                   : workspace_error_code_t::cancelled,
+        "packed baseline operation was cancelled");
+    error.deadline = cancel.deadline_exceeded();
+    error.cancellation = !error.deadline;
+    return error;
+}
+
+class packed_payload_writer_t final {
+public:
+    explicit packed_payload_writer_t(const cancellation_token_t& cancel)
+        : cancel_(cancel) {}
+
+    void u8(std::uint8_t value) { append(&value, sizeof(value)); }
+
+    void u16(std::uint16_t value) {
+        std::array<std::uint8_t, 2> bytes{
+            static_cast<std::uint8_t>(value),
+            static_cast<std::uint8_t>(value >> 8U)};
+        append(bytes.data(), bytes.size());
+    }
+
+    void u32(std::uint32_t value) {
+        std::array<std::uint8_t, 4> bytes{};
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            bytes[shift / 8] = static_cast<std::uint8_t>(value >> shift);
+        append(bytes.data(), bytes.size());
+    }
+
+    void u64(std::uint64_t value) {
+        std::array<std::uint8_t, 8> bytes{};
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            bytes[shift / 8] = static_cast<std::uint8_t>(value >> shift);
+        append(bytes.data(), bytes.size());
+    }
+
+    void i64(std::int64_t value) {
+        std::uint64_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        u64(bits);
+    }
+
+    void boolean(bool value) { u8(value ? 1U : 0U); }
+
+    void bytes(const std::uint8_t* data, std::size_t size) {
+        u64(size);
+        append(data, size);
+    }
+
+    template <std::size_t Size>
+    void fixed_bytes(const std::array<std::uint8_t, Size>& bytes) {
+        append(bytes.data(), bytes.size());
+    }
+
+    void string(const std::string& value) {
+        bytes(reinterpret_cast<const std::uint8_t*>(value.data()), value.size());
+    }
+
+    void count(std::size_t value) { u64(static_cast<std::uint64_t>(value)); }
+
+    bool failed() const noexcept { return error_.has_value(); }
+
+    workspace_result_t<std::vector<std::uint8_t>> finish() {
+        if (!error_)
+            poll();
+        if (error_)
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(*error_);
+        return workspace_result_t<std::vector<std::uint8_t>>::success(
+            std::move(output_));
+    }
+
+private:
+    void poll() {
+        if (!error_ && cancel_.stop_requested())
+            error_ = packed_baseline_cancelled(cancel_);
+    }
+
+    void append(const std::uint8_t* data, std::size_t size) {
+        if (error_)
+            return;
+        if (!data && size != 0) {
+            error_ = packed_baseline_error(
+                workspace_error_code_t::invalid_argument,
+                "packed baseline encoder received a null byte range");
+            return;
+        }
+        if (size > packed_generation_max_payload_bytes - output_.size()) {
+            error_ = packed_baseline_error(
+                workspace_error_code_t::limit_exceeded,
+                "packed baseline domain exceeds its bounded payload limit");
+            return;
+        }
+        for (std::size_t offset = 0; offset < size;) {
+            poll();
+            if (error_)
+                return;
+            const auto end = (std::min)(size, offset + kDatabaseBlobCopyChunk);
+            output_.insert(output_.end(), data + offset, data + end);
+            offset = end;
+        }
+    }
+
+    const cancellation_token_t& cancel_;
+    std::vector<std::uint8_t> output_;
+    std::optional<workspace_error_t> error_;
+};
+
+class packed_payload_reader_t final {
+public:
+    packed_payload_reader_t(const std::vector<std::uint8_t>& input,
+                            const cancellation_token_t& cancel,
+                            std::uint64_t maximum_records,
+                            std::uint64_t* aggregate_records = nullptr)
+        : input_(input), cancel_(cancel), maximum_records_(maximum_records),
+          aggregate_records_(aggregate_records) {}
+
+    std::uint8_t u8() {
+        const auto* data = take(sizeof(std::uint8_t));
+        return data ? data[0] : 0;
+    }
+
+    std::uint16_t u16() {
+        const auto* data = take(sizeof(std::uint16_t));
+        return data ? static_cast<std::uint16_t>(data[0]) |
+                          static_cast<std::uint16_t>(data[1] << 8U)
+                    : 0;
+    }
+
+    std::uint32_t u32() {
+        const auto* data = take(sizeof(std::uint32_t));
+        if (!data)
+            return 0;
+        std::uint32_t value = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            value |= static_cast<std::uint32_t>(data[shift / 8]) << shift;
+        return value;
+    }
+
+    std::uint64_t u64() {
+        const auto* data = take(sizeof(std::uint64_t));
+        if (!data)
+            return 0;
+        std::uint64_t value = 0;
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            value |= static_cast<std::uint64_t>(data[shift / 8]) << shift;
+        return value;
+    }
+
+    std::int64_t i64() {
+        const auto bits = u64();
+        std::int64_t value = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    bool boolean() {
+        const auto value = u8();
+        if (value > 1U)
+            fail("packed baseline boolean is not canonical");
+        return value != 0;
+    }
+
+    std::vector<std::uint8_t> bytes() {
+        const auto size = u64();
+        if (failed())
+            return {};
+        if (size > remaining() ||
+            size > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
+            fail("packed baseline byte range exceeds its domain boundary");
+            return {};
+        }
+        std::vector<std::uint8_t> output;
+        output.reserve(static_cast<std::size_t>(size));
+        std::size_t copied = 0;
+        while (copied < static_cast<std::size_t>(size)) {
+            poll();
+            if (failed())
+                return {};
+            const auto count = (std::min)(
+                static_cast<std::size_t>(size) - copied,
+                kDatabaseBlobCopyChunk);
+            const auto* data = take(count);
+            if (!data)
+                return {};
+            output.insert(output.end(), data, data + count);
+            copied += count;
+        }
+        return output;
+    }
+
+    template <std::size_t Size>
+    std::array<std::uint8_t, Size> fixed_bytes() {
+        std::array<std::uint8_t, Size> output{};
+        const auto* data = take(Size);
+        if (data)
+            std::memcpy(output.data(), data, Size);
+        return output;
+    }
+
+    std::string string() {
+        auto value = bytes();
+        if (failed())
+            return {};
+        if (value.empty())
+            return {};
+        return std::string(reinterpret_cast<const char*>(value.data()), value.size());
+    }
+
+    std::size_t count() {
+        const auto value = u64();
+        if (failed())
+            return 0;
+        if (value > maximum_records_ || value > remaining() ||
+            (aggregate_records_ &&
+             (*aggregate_records_ > maximum_records_ ||
+              value > maximum_records_ - *aggregate_records_)) ||
+            value > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
+            fail("packed baseline record count exceeds its bounded domain");
+            return 0;
+        }
+        if (aggregate_records_)
+            *aggregate_records_ += value;
+        return static_cast<std::size_t>(value);
+    }
+
+    bool failed() const noexcept { return error_.has_value(); }
+
+    void reject(std::string message) { fail(std::move(message)); }
+
+    workspace_result_t<void> finish() {
+        if (!error_)
+            poll();
+        if (!error_ && offset_ != input_.size())
+            fail("packed baseline domain contains trailing bytes");
+        if (error_)
+            return workspace_result_t<void>::failure(*error_);
+        return workspace_result_t<void>::success();
+    }
+
+private:
+    std::uint64_t remaining() const noexcept {
+        return static_cast<std::uint64_t>(input_.size() - offset_);
+    }
+
+    void poll() {
+        if (!error_ && cancel_.stop_requested())
+            error_ = packed_baseline_cancelled(cancel_);
+    }
+
+    void fail(std::string message) {
+        if (!error_)
+            error_ = packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                           std::move(message));
+    }
+
+    const std::uint8_t* take(std::size_t size) {
+        if (error_)
+            return nullptr;
+        poll();
+        if (error_)
+            return nullptr;
+        if (size > input_.size() - offset_) {
+            fail("packed baseline domain is truncated");
+            return nullptr;
+        }
+        const auto* result = input_.data() + offset_;
+        offset_ += size;
+        return result;
+    }
+
+    const std::vector<std::uint8_t>& input_;
+    const cancellation_token_t& cancel_;
+    std::uint64_t maximum_records_ = 0;
+    std::uint64_t* aggregate_records_ = nullptr;
+    std::size_t offset_ = 0;
+    std::optional<workspace_error_t> error_;
+};
+
+void write_domain_header(packed_payload_writer_t& writer,
+                         packed_page_type_t domain) {
+    writer.u32(kPackedBaselineDomainMagic);
+    writer.u16(kPackedBaselinePayloadVersion);
+    writer.u16(static_cast<std::uint16_t>(domain));
+}
+
+void read_domain_header(packed_payload_reader_t& reader,
+                        packed_page_type_t expected_domain) {
+    if (reader.u32() != kPackedBaselineDomainMagic ||
+        reader.u16() != kPackedBaselinePayloadVersion ||
+        reader.u16() != static_cast<std::uint16_t>(expected_domain)) {
+        reader.reject("packed baseline domain header is invalid");
+    }
+}
+
+void write_address(packed_payload_writer_t& writer, const address_t& address) {
+    writer.u8(static_cast<std::uint8_t>(address.space));
+    writer.u8(static_cast<std::uint8_t>(address.architecture));
+    writer.u8(static_cast<std::uint8_t>(address.mode));
+    writer.u8(0);
+    writer.u32(0);
+    writer.u64(address.value);
+}
+
+address_t read_address(packed_payload_reader_t& reader) {
+    address_t address;
+    address.space = static_cast<address_space_id_t>(reader.u8());
+    address.architecture = static_cast<architecture_id_t>(reader.u8());
+    address.mode = static_cast<architecture_mode_t>(reader.u8());
+    const auto reserved_byte = reader.u8();
+    const auto reserved_word = reader.u32();
+    address.value = reader.u64();
+    if (reserved_byte != 0 || reserved_word != 0)
+        reader.reject("packed baseline address reserved bytes are non-zero");
+    return address;
+}
+
+void write_optional_address(packed_payload_writer_t& writer,
+                            const std::optional<address_t>& address) {
+    writer.boolean(address.has_value());
+    if (address)
+        write_address(writer, *address);
+}
+
+std::optional<address_t> read_optional_address(packed_payload_reader_t& reader) {
+    if (!reader.boolean())
+        return std::nullopt;
+    return read_address(reader);
+}
+
+void write_optional_entity(packed_payload_writer_t& writer,
+                           const std::optional<entity_id_t>& entity) {
+    writer.boolean(entity.has_value());
+    if (entity)
+        writer.u64(*entity);
+}
+
+std::optional<entity_id_t> read_optional_entity(packed_payload_reader_t& reader) {
+    if (!reader.boolean())
+        return std::nullopt;
+    return reader.u64();
+}
+
+void write_instruction(packed_payload_writer_t& writer,
+                       const instruction_record_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.address);
+    writer.u8(record.length);
+    writer.u16(record.mnemonic_id);
+    writer.u32(record.opcode_id);
+    writer.u32(record.flow_flags);
+    writer.u32(record.operand_fact_begin);
+    writer.u16(record.operand_fact_count);
+    writer.u32(record.target_fact_begin);
+    writer.u16(record.target_fact_count);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+    writer.u8(static_cast<std::uint8_t>(record.coverage));
+    writer.u64(record.stable_source_id);
+}
+
+void write_operand(packed_payload_writer_t& writer,
+                   const operand_fact_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.instruction_id);
+    writer.u64(record.address_expression_id);
+    writer.u8(record.operand_index);
+    writer.u8(record.decoder_operand_id);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.u8(record.access);
+    writer.u8(record.visibility);
+    writer.u8(record.encoding);
+    writer.u8(record.memory_type);
+    writer.u8(record.access_width);
+    writer.u16(record.bit_width);
+    writer.u16(record.access_width_bits);
+    writer.u16(record.access_count);
+    writer.u16(record.element_width_bits);
+    writer.u16(record.element_count);
+    writer.u16(record.address_width_bits);
+    writer.u16(record.reg);
+    writer.u16(record.segment_reg);
+    writer.u16(record.base_reg);
+    writer.u16(record.index_reg);
+    writer.u8(record.scale);
+    writer.boolean(record.relative);
+    writer.boolean(record.signed_value);
+    writer.boolean(record.has_displacement);
+    writer.boolean(record.has_resolved_expression_value);
+    writer.i64(record.displacement);
+    writer.u64(record.immediate);
+    writer.u64(record.resolved_expression_value);
+    writer.u16(record.address_components);
+    writer.u8(static_cast<std::uint8_t>(record.address_expression));
+    writer.u8(static_cast<std::uint8_t>(record.address_resolution));
+}
+
+void write_target(packed_payload_writer_t& writer,
+                  const target_fact_t& record) {
+    writer.u64(record.instruction_id);
+    writer.u64(record.operand_fact_id);
+    writer.u64(record.address_expression_id);
+    write_address(writer, record.target);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.u8(static_cast<std::uint8_t>(record.resolution));
+    writer.u8(record.operand_index);
+    writer.u16(record.access_width_bits);
+    writer.u16(record.access_count);
+    writer.boolean(record.direct);
+    writer.boolean(record.is_external);
+}
+
+void write_block(packed_payload_writer_t& writer,
+                 const basic_block_record_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.function_id);
+    write_address(writer, record.start);
+    write_address(writer, record.end);
+    writer.u32(record.first_instruction);
+    writer.u32(record.instruction_count);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_function_chunk(packed_payload_writer_t& writer,
+                          const function_chunk_record_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.function_id);
+    write_address(writer, record.start);
+    write_address(writer, record.end);
+    writer.u32(record.first_block);
+    writer.u32(record.block_count);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+    writer.boolean(record.cold);
+    writer.boolean(record.shared);
+}
+
+void write_function_membership(
+    packed_payload_writer_t& writer,
+    const function_block_membership_record_t& record) {
+    writer.u64(record.function_id);
+    writer.u64(record.chunk_id);
+    writer.u64(record.block_id);
+    writer.u32(record.block_index);
+    writer.u32(record.ordinal);
+    writer.boolean(record.shared);
+}
+
+void write_function(packed_payload_writer_t& writer,
+                    const function_record_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.start);
+    write_address(writer, record.end);
+    writer.u32(record.first_block);
+    writer.u32(record.block_count);
+    writer.u32(record.first_chunk);
+    writer.u32(record.chunk_count);
+    writer.u32(record.first_block_membership);
+    writer.u32(record.block_membership_count);
+    write_optional_entity(writer, record.symbol_id);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+    writer.boolean(record.thunk);
+    writer.boolean(record.noreturn);
+    writer.count(record.chunks.size());
+    for (const auto& chunk : record.chunks) {
+        writer.u64(chunk.rva_start);
+        writer.u64(chunk.rva_end);
+        writer.u8(chunk.chunk_kind);
+    }
+}
+
+void write_edge(packed_payload_writer_t& writer,
+                const edge_record_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.source_entity);
+    write_optional_entity(writer, record.target_entity);
+    write_address(writer, record.source);
+    write_address(writer, record.target);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_xref(packed_payload_writer_t& writer,
+                const xref_record_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.source);
+    write_address(writer, record.target);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_string_record(packed_payload_writer_t& writer,
+                         const string_record_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.address);
+    writer.u64(record.byte_length);
+    writer.u8(static_cast<std::uint8_t>(record.encoding));
+    writer.string(record.value);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_symbol(packed_payload_writer_t& writer,
+                  const symbol_record_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.address);
+    writer.string(record.name);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_coverage(packed_payload_writer_t& writer,
+                    const coverage_span_t& record) {
+    write_address(writer, record.start);
+    writer.u64(record.size);
+    writer.u8(static_cast<std::uint8_t>(record.reason));
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+    writer.u32(record.detail_code);
+}
+
+void write_data_candidate(packed_payload_writer_t& writer,
+                          const data_candidate_record_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.address);
+    writer.u64(record.size);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    write_optional_address(writer, record.target);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_data_pointer(packed_payload_writer_t& writer,
+                        const data_pointer_fact_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.slot);
+    write_address(writer, record.target);
+    writer.u8(static_cast<std::uint8_t>(record.candidate_kind));
+    writer.u8(static_cast<std::uint8_t>(record.encoding));
+    writer.u8(record.width_bytes);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_data_conflict(packed_payload_writer_t& writer,
+                         const data_candidate_conflict_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.address);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    write_optional_address(writer, record.selected_target);
+    write_optional_address(writer, record.rejected_target);
+    writer.u8(static_cast<std::uint8_t>(record.selected_provenance));
+    writer.u8(static_cast<std::uint8_t>(record.rejected_provenance));
+    writer.u8(record.selected_confidence);
+    writer.u8(record.rejected_confidence);
+}
+
+void write_symbol_type_candidate(
+    packed_payload_writer_t& writer,
+    const symbol_type_candidate_record_t& record) {
+    writer.u64(record.id);
+    write_optional_address(writer, record.address);
+    write_optional_address(writer, record.related_address);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.string(record.display_name);
+    writer.string(record.canonical_type);
+    writer.string(record.source_key);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+    writer.boolean(record.explicitly_unknown);
+}
+
+void write_type_reference(packed_payload_writer_t& writer,
+                          const type_reference_fact_t& record) {
+    writer.u64(record.id);
+    write_optional_address(writer, record.source);
+    write_optional_address(writer, record.target);
+    writer.u64(record.source_entity);
+    writer.u64(record.target_entity);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+    writer.string(record.source_key);
+}
+
+void write_metadata_conflict(packed_payload_writer_t& writer,
+                             const metadata_conflict_record_t& record) {
+    writer.u64(record.id);
+    write_optional_address(writer, record.address);
+    writer.string(record.identity);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.string(record.selected_value);
+    writer.string(record.rejected_value);
+    writer.u8(static_cast<std::uint8_t>(record.selected_provenance));
+    writer.u8(static_cast<std::uint8_t>(record.rejected_provenance));
+    writer.u8(record.selected_confidence);
+    writer.u8(record.rejected_confidence);
+}
+
+void write_call_quality(packed_payload_writer_t& writer,
+                        const call_graph_quality_t& quality) {
+    writer.u8(static_cast<std::uint8_t>(quality.provenance));
+    writer.u8(quality.confidence);
+    writer.u32(quality.contributor_count);
+    writer.boolean(quality.conflicted);
+}
+
+void write_call_node(packed_payload_writer_t& writer,
+                     const call_graph_node_record_t& record) {
+    writer.u64(record.function_id);
+    write_address(writer, record.address);
+    writer.u64(record.incoming_edges);
+    writer.u64(record.outgoing_edges);
+    writer.u64(record.indirect_edges);
+    writer.u64(record.unresolved_sites);
+}
+
+void write_call_site(packed_payload_writer_t& writer,
+                     const recovered_call_site_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.source_function_id);
+    writer.u64(record.source_block_id);
+    writer.u64(record.instruction_id);
+    write_address(writer, record.address);
+    writer.u32(record.first_candidate);
+    writer.u32(record.candidate_count);
+    writer.boolean(record.indirect);
+    writer.boolean(record.tail_call);
+    writer.boolean(record.unresolved);
+}
+
+void write_call_candidate(packed_payload_writer_t& writer,
+                          const recovered_call_candidate_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.call_site_id);
+    write_address(writer, record.target);
+    write_optional_entity(writer, record.target_function_id);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    write_call_quality(writer, record.quality);
+    writer.u64(record.stable_source_id);
+    writer.u32(record.rank);
+    writer.boolean(record.external_target);
+}
+
+void write_call_edge(packed_payload_writer_t& writer,
+                     const call_graph_edge_record_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.call_site_id);
+    writer.u64(record.source_function_id);
+    writer.u64(record.source_block_id);
+    write_optional_entity(writer, record.target_function_id);
+    write_address(writer, record.call_site);
+    write_address(writer, record.target);
+    writer.u8(static_cast<std::uint8_t>(record.resolution));
+    write_call_quality(writer, record.quality);
+    writer.u32(record.candidate_rank);
+    writer.boolean(record.external_target);
+    writer.boolean(record.target_noreturn);
+}
+
+void write_call_conflict(packed_payload_writer_t& writer,
+                         const call_graph_conflict_t& record) {
+    writer.u64(record.id);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.u64(record.instruction_id);
+    writer.u64(record.source_function_id);
+    writer.u64(record.call_site_rva);
+    writer.u64(record.selected_target_rva);
+    writer.u64(record.competing_target_rva);
+    writer.u64(record.selected_target_function_id);
+    writer.u64(record.competing_target_function_id);
+}
+
+void write_switch(packed_payload_writer_t& writer,
+                  const switch_record_t& record) {
+    writer.u64(record.id);
+    writer.u64(record.function_id);
+    write_address(writer, record.dispatch);
+    write_address(writer, record.table);
+    write_optional_address(writer, record.default_target);
+    writer.count(record.case_targets.size());
+    for (const auto& target : record.case_targets)
+        write_address(writer, target);
+    writer.u8(record.entry_size);
+    writer.boolean(record.relative_entries);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+}
+
+void write_search_type(packed_payload_writer_t& writer,
+                       const type_candidate_record_t& record) {
+    writer.u64(record.id);
+    write_address(writer, record.address);
+    writer.u8(static_cast<std::uint8_t>(record.kind));
+    writer.string(record.display_name);
+    writer.string(record.canonical_type);
+    writer.u8(static_cast<std::uint8_t>(record.provenance));
+    writer.u8(record.confidence);
+    writer.boolean(record.explicitly_unknown);
+}
+
+instruction_record_t read_instruction(packed_payload_reader_t& reader) {
+    instruction_record_t record;
+    record.id = reader.u64();
+    record.address = read_address(reader);
+    record.length = reader.u8();
+    record.mnemonic_id = reader.u16();
+    record.opcode_id = reader.u32();
+    record.flow_flags = reader.u32();
+    record.operand_fact_begin = reader.u32();
+    record.operand_fact_count = reader.u16();
+    record.target_fact_begin = reader.u32();
+    record.target_fact_count = reader.u16();
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    record.coverage = static_cast<coverage_reason_t>(reader.u8());
+    record.stable_source_id = reader.u64();
+    return record;
+}
+
+operand_fact_t read_operand(packed_payload_reader_t& reader) {
+    operand_fact_t record;
+    record.id = reader.u64();
+    record.instruction_id = reader.u64();
+    record.address_expression_id = reader.u64();
+    record.operand_index = reader.u8();
+    record.decoder_operand_id = reader.u8();
+    record.kind = static_cast<operand_kind_t>(reader.u8());
+    record.access = reader.u8();
+    record.visibility = reader.u8();
+    record.encoding = reader.u8();
+    record.memory_type = reader.u8();
+    record.access_width = reader.u8();
+    record.bit_width = reader.u16();
+    record.access_width_bits = reader.u16();
+    record.access_count = reader.u16();
+    record.element_width_bits = reader.u16();
+    record.element_count = reader.u16();
+    record.address_width_bits = reader.u16();
+    record.reg = reader.u16();
+    record.segment_reg = reader.u16();
+    record.base_reg = reader.u16();
+    record.index_reg = reader.u16();
+    record.scale = reader.u8();
+    record.relative = reader.boolean();
+    record.signed_value = reader.boolean();
+    record.has_displacement = reader.boolean();
+    record.has_resolved_expression_value = reader.boolean();
+    record.displacement = reader.i64();
+    record.immediate = reader.u64();
+    record.resolved_expression_value = reader.u64();
+    record.address_components = reader.u16();
+    record.address_expression =
+        static_cast<address_expression_kind_t>(reader.u8());
+    record.address_resolution = static_cast<target_resolution_t>(reader.u8());
+    return record;
+}
+
+target_fact_t read_target(packed_payload_reader_t& reader) {
+    target_fact_t record;
+    record.instruction_id = reader.u64();
+    record.operand_fact_id = reader.u64();
+    record.address_expression_id = reader.u64();
+    record.target = read_address(reader);
+    record.kind = static_cast<target_kind_record_t>(reader.u8());
+    record.resolution = static_cast<target_resolution_t>(reader.u8());
+    record.operand_index = reader.u8();
+    record.access_width_bits = reader.u16();
+    record.access_count = reader.u16();
+    record.direct = reader.boolean();
+    record.is_external = reader.boolean();
+    return record;
+}
+
+basic_block_record_t read_block(packed_payload_reader_t& reader) {
+    basic_block_record_t record;
+    record.id = reader.u64();
+    record.function_id = reader.u64();
+    record.start = read_address(reader);
+    record.end = read_address(reader);
+    record.first_instruction = reader.u32();
+    record.instruction_count = reader.u32();
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+function_chunk_record_t read_function_chunk(packed_payload_reader_t& reader) {
+    function_chunk_record_t record;
+    record.id = reader.u64();
+    record.function_id = reader.u64();
+    record.start = read_address(reader);
+    record.end = read_address(reader);
+    record.first_block = reader.u32();
+    record.block_count = reader.u32();
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    record.cold = reader.boolean();
+    record.shared = reader.boolean();
+    return record;
+}
+
+function_block_membership_record_t read_function_membership(
+    packed_payload_reader_t& reader) {
+    function_block_membership_record_t record;
+    record.function_id = reader.u64();
+    record.chunk_id = reader.u64();
+    record.block_id = reader.u64();
+    record.block_index = reader.u32();
+    record.ordinal = reader.u32();
+    record.shared = reader.boolean();
+    return record;
+}
+
+function_record_t read_function(packed_payload_reader_t& reader) {
+    function_record_t record;
+    record.id = reader.u64();
+    record.start = read_address(reader);
+    record.end = read_address(reader);
+    record.first_block = reader.u32();
+    record.block_count = reader.u32();
+    record.first_chunk = reader.u32();
+    record.chunk_count = reader.u32();
+    record.first_block_membership = reader.u32();
+    record.block_membership_count = reader.u32();
+    record.symbol_id = read_optional_entity(reader);
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    record.thunk = reader.boolean();
+    record.noreturn = reader.boolean();
+    const auto chunk_count = reader.count();
+    record.chunks.reserve(chunk_count);
+    for (std::size_t index = 0; index < chunk_count; ++index) {
+        address_range_t chunk;
+        chunk.rva_start = reader.u64();
+        chunk.rva_end = reader.u64();
+        chunk.chunk_kind = reader.u8();
+        record.chunks.push_back(chunk);
+    }
+    return record;
+}
+
+edge_record_t read_edge(packed_payload_reader_t& reader) {
+    edge_record_t record;
+    record.id = reader.u64();
+    record.source_entity = reader.u64();
+    record.target_entity = read_optional_entity(reader);
+    record.source = read_address(reader);
+    record.target = read_address(reader);
+    record.kind = static_cast<edge_kind_t>(reader.u8());
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+xref_record_t read_xref(packed_payload_reader_t& reader) {
+    xref_record_t record;
+    record.id = reader.u64();
+    record.source = read_address(reader);
+    record.target = read_address(reader);
+    record.kind = static_cast<xref_kind_t>(reader.u8());
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+string_record_t read_string_record(packed_payload_reader_t& reader) {
+    string_record_t record;
+    record.id = reader.u64();
+    record.address = read_address(reader);
+    record.byte_length = reader.u64();
+    record.encoding = static_cast<string_encoding_t>(reader.u8());
+    record.value = reader.string();
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+symbol_record_t read_symbol(packed_payload_reader_t& reader) {
+    symbol_record_t record;
+    record.id = reader.u64();
+    record.address = read_address(reader);
+    record.name = reader.string();
+    record.kind = static_cast<symbol_kind_t>(reader.u8());
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+coverage_span_t read_coverage(packed_payload_reader_t& reader) {
+    coverage_span_t record;
+    record.start = read_address(reader);
+    record.size = reader.u64();
+    record.reason = static_cast<coverage_reason_t>(reader.u8());
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    record.detail_code = reader.u32();
+    return record;
+}
+
+data_candidate_record_t read_data_candidate(packed_payload_reader_t& reader) {
+    data_candidate_record_t record;
+    record.id = reader.u64();
+    record.address = read_address(reader);
+    record.size = reader.u64();
+    record.kind = static_cast<data_candidate_kind_t>(reader.u8());
+    record.target = read_optional_address(reader);
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+data_pointer_fact_t read_data_pointer(packed_payload_reader_t& reader) {
+    data_pointer_fact_t record;
+    record.id = reader.u64();
+    record.slot = read_address(reader);
+    record.target = read_address(reader);
+    record.candidate_kind = static_cast<data_candidate_kind_t>(reader.u8());
+    record.encoding = static_cast<data_pointer_encoding_t>(reader.u8());
+    record.width_bytes = reader.u8();
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+data_candidate_conflict_t read_data_conflict(
+    packed_payload_reader_t& reader) {
+    data_candidate_conflict_t record;
+    record.id = reader.u64();
+    record.address = read_address(reader);
+    record.kind = static_cast<data_candidate_kind_t>(reader.u8());
+    record.selected_target = read_optional_address(reader);
+    record.rejected_target = read_optional_address(reader);
+    record.selected_provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.rejected_provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.selected_confidence = reader.u8();
+    record.rejected_confidence = reader.u8();
+    return record;
+}
+
+symbol_type_candidate_record_t read_symbol_type_candidate(
+    packed_payload_reader_t& reader) {
+    symbol_type_candidate_record_t record;
+    record.id = reader.u64();
+    record.address = read_optional_address(reader);
+    record.related_address = read_optional_address(reader);
+    record.kind = static_cast<symbol_type_candidate_kind_t>(reader.u8());
+    record.display_name = reader.string();
+    record.canonical_type = reader.string();
+    record.source_key = reader.string();
+    record.provenance = static_cast<metadata_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    record.explicitly_unknown = reader.boolean();
+    return record;
+}
+
+type_reference_fact_t read_type_reference(packed_payload_reader_t& reader) {
+    type_reference_fact_t record;
+    record.id = reader.u64();
+    record.source = read_optional_address(reader);
+    record.target = read_optional_address(reader);
+    record.source_entity = reader.u64();
+    record.target_entity = reader.u64();
+    record.kind = static_cast<type_reference_kind_t>(reader.u8());
+    record.provenance = static_cast<metadata_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    record.source_key = reader.string();
+    return record;
+}
+
+metadata_conflict_record_t read_metadata_conflict(
+    packed_payload_reader_t& reader) {
+    metadata_conflict_record_t record;
+    record.id = reader.u64();
+    record.address = read_optional_address(reader);
+    record.identity = reader.string();
+    record.kind = static_cast<metadata_conflict_kind_t>(reader.u8());
+    record.selected_value = reader.string();
+    record.rejected_value = reader.string();
+    record.selected_provenance = static_cast<metadata_provenance_t>(reader.u8());
+    record.rejected_provenance = static_cast<metadata_provenance_t>(reader.u8());
+    record.selected_confidence = reader.u8();
+    record.rejected_confidence = reader.u8();
+    return record;
+}
+
+call_graph_quality_t read_call_quality(packed_payload_reader_t& reader) {
+    call_graph_quality_t quality;
+    quality.provenance = static_cast<fact_provenance_t>(reader.u8());
+    quality.confidence = reader.u8();
+    quality.contributor_count = reader.u32();
+    quality.conflicted = reader.boolean();
+    return quality;
+}
+
+call_graph_node_record_t read_call_node(packed_payload_reader_t& reader) {
+    call_graph_node_record_t record;
+    record.function_id = reader.u64();
+    record.address = read_address(reader);
+    record.incoming_edges = reader.u64();
+    record.outgoing_edges = reader.u64();
+    record.indirect_edges = reader.u64();
+    record.unresolved_sites = reader.u64();
+    return record;
+}
+
+recovered_call_site_t read_call_site(packed_payload_reader_t& reader) {
+    recovered_call_site_t record;
+    record.id = reader.u64();
+    record.source_function_id = reader.u64();
+    record.source_block_id = reader.u64();
+    record.instruction_id = reader.u64();
+    record.address = read_address(reader);
+    record.first_candidate = reader.u32();
+    record.candidate_count = reader.u32();
+    record.indirect = reader.boolean();
+    record.tail_call = reader.boolean();
+    record.unresolved = reader.boolean();
+    return record;
+}
+
+recovered_call_candidate_t read_call_candidate(
+    packed_payload_reader_t& reader) {
+    recovered_call_candidate_t record;
+    record.id = reader.u64();
+    record.call_site_id = reader.u64();
+    record.target = read_address(reader);
+    record.target_function_id = read_optional_entity(reader);
+    record.kind = static_cast<indirect_call_candidate_kind_t>(reader.u8());
+    record.quality = read_call_quality(reader);
+    record.stable_source_id = reader.u64();
+    record.rank = reader.u32();
+    record.external_target = reader.boolean();
+    return record;
+}
+
+call_graph_edge_record_t read_call_edge(packed_payload_reader_t& reader) {
+    call_graph_edge_record_t record;
+    record.id = reader.u64();
+    record.call_site_id = reader.u64();
+    record.source_function_id = reader.u64();
+    record.source_block_id = reader.u64();
+    record.target_function_id = read_optional_entity(reader);
+    record.call_site = read_address(reader);
+    record.target = read_address(reader);
+    record.resolution = static_cast<call_graph_resolution_t>(reader.u8());
+    record.quality = read_call_quality(reader);
+    record.candidate_rank = reader.u32();
+    record.external_target = reader.boolean();
+    record.target_noreturn = reader.boolean();
+    return record;
+}
+
+call_graph_conflict_t read_call_conflict(packed_payload_reader_t& reader) {
+    call_graph_conflict_t record;
+    record.id = reader.u64();
+    record.kind = static_cast<call_graph_conflict_kind_t>(reader.u8());
+    record.instruction_id = reader.u64();
+    record.source_function_id = reader.u64();
+    record.call_site_rva = reader.u64();
+    record.selected_target_rva = reader.u64();
+    record.competing_target_rva = reader.u64();
+    record.selected_target_function_id = reader.u64();
+    record.competing_target_function_id = reader.u64();
+    return record;
+}
+
+switch_record_t read_switch(packed_payload_reader_t& reader) {
+    switch_record_t record;
+    record.id = reader.u64();
+    record.function_id = reader.u64();
+    record.dispatch = read_address(reader);
+    record.table = read_address(reader);
+    record.default_target = read_optional_address(reader);
+    const auto case_count = reader.count();
+    record.case_targets.reserve(case_count);
+    for (std::size_t index = 0; index < case_count; ++index)
+        record.case_targets.push_back(read_address(reader));
+    record.entry_size = reader.u8();
+    record.relative_entries = reader.boolean();
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    return record;
+}
+
+type_candidate_record_t read_search_type(packed_payload_reader_t& reader) {
+    type_candidate_record_t record;
+    record.id = reader.u64();
+    record.address = read_address(reader);
+    record.kind = static_cast<type_candidate_kind_t>(reader.u8());
+    record.display_name = reader.string();
+    record.canonical_type = reader.string();
+    record.provenance = static_cast<fact_provenance_t>(reader.u8());
+    record.confidence = reader.u8();
+    record.explicitly_unknown = reader.boolean();
+    return record;
+}
 
 workspace_error_t database_error(sqlite3* database, int status, std::string message,
                                  const char* phase) {
@@ -2413,6 +3532,314 @@ struct workspace_database_t::connection_state_t {
     }
 };
 
+workspace_result_t<packed_baseline_domains_t> encode_packed_baseline_domains(
+    const analysis_snapshot_t& snapshot,
+    const persisted_search_products_t& search_products,
+    const cancellation_token_t& cancel) {
+    if (cancel.stop_requested())
+        return workspace_result_t<packed_baseline_domains_t>::failure(
+            packed_baseline_cancelled(cancel));
+    if (snapshot.generation == 0 ||
+        search_products.generation != snapshot.generation ||
+        search_products.analysis_revision != snapshot.analysis_revision ||
+        search_products.overlay_revision != snapshot.overlay_revision) {
+        return workspace_result_t<packed_baseline_domains_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::stale_generation,
+                "packed baseline search products do not match the snapshot"));
+    }
+    auto validated = validate_analysis_snapshot(
+        snapshot, snapshot.baseline_complete, cancel);
+    if (!validated)
+        return workspace_result_t<packed_baseline_domains_t>::failure(
+            validated.error());
+
+    packed_baseline_domains_t domains;
+    domains.reserve(static_cast<std::size_t>(packed_page_last_data_type));
+    const auto append_domain = [&](packed_page_type_t domain,
+                                   packed_payload_writer_t& writer)
+        -> workspace_result_t<void> {
+        auto payload = writer.finish();
+        if (!payload)
+            return workspace_result_t<void>::failure(payload.error());
+        domains.emplace_back(domain, payload.take_value());
+        return workspace_result_t<void>::success();
+    };
+
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::instructions);
+        writer.count(snapshot.instructions.size());
+        for (const auto& record : snapshot.instructions)
+            write_instruction(writer, record);
+        writer.count(snapshot.delay_slot_counts.size());
+        for (const auto value : snapshot.delay_slot_counts)
+            writer.u8(value);
+        auto appended = append_domain(packed_page_type_t::instructions, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::operands);
+        writer.count(snapshot.operand_facts.size());
+        for (const auto& record : snapshot.operand_facts)
+            write_operand(writer, record);
+        auto appended = append_domain(packed_page_type_t::operands, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::target_facts);
+        writer.count(snapshot.target_facts.size());
+        for (const auto& record : snapshot.target_facts)
+            write_target(writer, record);
+        auto appended = append_domain(packed_page_type_t::target_facts, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::edges);
+        writer.count(snapshot.edges.size());
+        for (const auto& record : snapshot.edges)
+            write_edge(writer, record);
+        auto appended = append_domain(packed_page_type_t::edges, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::strings);
+        writer.count(snapshot.strings.size());
+        for (const auto& record : snapshot.strings)
+            write_string_record(writer, record);
+        auto appended = append_domain(packed_page_type_t::strings, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::symbols);
+        writer.count(snapshot.symbols.size());
+        for (const auto& record : snapshot.symbols)
+            write_symbol(writer, record);
+        auto appended = append_domain(packed_page_type_t::symbols, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::address_expressions);
+        writer.count(0);
+        auto appended = append_domain(
+            packed_page_type_t::address_expressions, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::basic_blocks);
+        writer.count(snapshot.blocks.size());
+        for (const auto& record : snapshot.blocks)
+            write_block(writer, record);
+        auto appended = append_domain(packed_page_type_t::basic_blocks, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::functions);
+        writer.count(snapshot.functions.size());
+        for (const auto& record : snapshot.functions)
+            write_function(writer, record);
+        auto appended = append_domain(packed_page_type_t::functions, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::function_chunks);
+        writer.count(snapshot.function_chunks.size());
+        for (const auto& record : snapshot.function_chunks)
+            write_function_chunk(writer, record);
+        writer.count(snapshot.function_block_memberships.size());
+        for (const auto& record : snapshot.function_block_memberships)
+            write_function_membership(writer, record);
+        auto appended = append_domain(packed_page_type_t::function_chunks, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::xrefs);
+        writer.count(snapshot.xrefs.size());
+        for (const auto& record : snapshot.xrefs)
+            write_xref(writer, record);
+        auto appended = append_domain(packed_page_type_t::xrefs, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::coverage);
+        writer.count(snapshot.coverage.size());
+        for (const auto& record : snapshot.coverage)
+            write_coverage(writer, record);
+        auto appended = append_domain(packed_page_type_t::coverage, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::search_index);
+        writer.count(search_products.data_candidates.size());
+        for (const auto& record : search_products.data_candidates)
+            write_data_candidate(writer, record);
+        writer.count(search_products.switches.size());
+        for (const auto& record : search_products.switches)
+            write_switch(writer, record);
+        writer.count(search_products.types.size());
+        for (const auto& record : search_products.types)
+            write_search_type(writer, record);
+        writer.u32(search_products.search_index_blob_version);
+        writer.bytes(search_products.search_index_blob.data(),
+                     search_products.search_index_blob.size());
+        auto appended = append_domain(packed_page_type_t::search_index, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::call_graph);
+        writer.count(snapshot.call_graph.nodes.size());
+        for (const auto& record : snapshot.call_graph.nodes)
+            write_call_node(writer, record);
+        writer.count(snapshot.call_graph.call_sites.size());
+        for (const auto& record : snapshot.call_graph.call_sites)
+            write_call_site(writer, record);
+        writer.count(snapshot.call_graph.candidates.size());
+        for (const auto& record : snapshot.call_graph.candidates)
+            write_call_candidate(writer, record);
+        writer.count(snapshot.call_graph.edges.size());
+        for (const auto& record : snapshot.call_graph.edges)
+            write_call_edge(writer, record);
+        writer.count(snapshot.call_graph.conflicts.size());
+        for (const auto& record : snapshot.call_graph.conflicts)
+            write_call_conflict(writer, record);
+        writer.u64(snapshot.call_graph.indirect_site_count);
+        writer.u64(snapshot.call_graph.unresolved_site_count);
+        writer.boolean(snapshot.call_graph.bounded);
+        auto appended = append_domain(packed_page_type_t::call_graph, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::pointer_facts);
+        writer.count(snapshot.rich_facts.data_candidates.size());
+        for (const auto& record : snapshot.rich_facts.data_candidates)
+            write_data_candidate(writer, record);
+        writer.count(snapshot.rich_facts.data_pointer_facts.size());
+        for (const auto& record : snapshot.rich_facts.data_pointer_facts)
+            write_data_pointer(writer, record);
+        writer.count(snapshot.rich_facts.data_conflicts.size());
+        for (const auto& record : snapshot.rich_facts.data_conflicts)
+            write_data_conflict(writer, record);
+        auto appended = append_domain(packed_page_type_t::pointer_facts, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::type_references);
+        writer.count(snapshot.rich_facts.type_references.size());
+        for (const auto& record : snapshot.rich_facts.type_references)
+            write_type_reference(writer, record);
+        auto appended = append_domain(
+            packed_page_type_t::type_references, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer, packed_page_type_t::metadata_conflicts);
+        writer.count(snapshot.rich_facts.metadata_conflicts.size());
+        for (const auto& record : snapshot.rich_facts.metadata_conflicts)
+            write_metadata_conflict(writer, record);
+        auto appended = append_domain(
+            packed_page_type_t::metadata_conflicts, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    {
+        packed_payload_writer_t writer(cancel);
+        write_domain_header(writer,
+                            packed_page_type_t::symbol_type_candidates);
+        writer.count(snapshot.rich_facts.type_candidates.size());
+        for (const auto& record : snapshot.rich_facts.type_candidates)
+            write_symbol_type_candidate(writer, record);
+        auto appended = append_domain(
+            packed_page_type_t::symbol_type_candidates, writer);
+        if (!appended)
+            return workspace_result_t<packed_baseline_domains_t>::failure(
+                appended.error());
+    }
+    if (domains.size() !=
+        static_cast<std::size_t>(packed_page_last_data_type)) {
+        return workspace_result_t<packed_baseline_domains_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed baseline encoder omitted a required domain"));
+    }
+    return workspace_result_t<packed_baseline_domains_t>::success(
+        std::move(domains));
+}
+
+workspace_result_t<std::vector<std::uint8_t>> encode_packed_baseline_manifest(
+    const analysis_snapshot_t& snapshot,
+    const std::string& candidate_token,
+    const cancellation_token_t& cancel) {
+    if (snapshot.generation == 0 ||
+        (!candidate_token.empty() && !valid_candidate_token(candidate_token))) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::invalid_argument,
+                "packed baseline manifest identity is invalid"));
+    }
+    packed_payload_writer_t writer(cancel);
+    writer.u32(kPackedBaselineManifestMagic);
+    writer.u16(kPackedBaselinePayloadVersion);
+    writer.u16(static_cast<std::uint16_t>(workspace_schema_v9_version));
+    writer.u64(snapshot.generation);
+    writer.u64(snapshot.analysis_revision);
+    writer.u64(snapshot.overlay_revision);
+    writer.boolean(snapshot.baseline_complete);
+    writer.fixed_bytes(snapshot.binary_id.bytes);
+    writer.fixed_bytes(snapshot.load_profile_hash.bytes);
+    writer.u32(kPackedBaselineRequiredDomains);
+    writer.string(candidate_token);
+    return writer.finish();
+}
+
 workspace_result_t<void> migrate_workspace_database_schema(
     sqlite3* database, bool& invalidate_derived_facts) {
     if (!database) {
@@ -2437,6 +3864,539 @@ void publish_commit_metrics(workspace_database_t::connection_state_t& state,
     saturating_atomic_add(state.cumulative_logical_bytes, metrics.logical_bytes);
     saturating_atomic_add(state.cumulative_rows, metrics.rows);
     saturating_atomic_add(state.cumulative_page_write_bytes, metrics.page_write_bytes);
+}
+
+struct packed_baseline_manifest_t {
+    std::uint64_t generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
+    bool baseline_complete = false;
+    binary_id_t binary_id;
+    sha256_digest_t load_profile_hash;
+    std::uint32_t required_domains = 0;
+    std::string candidate_token;
+};
+
+workspace_result_t<packed_baseline_manifest_t> decode_packed_baseline_manifest(
+    const std::vector<std::uint8_t>& payload,
+    const cancellation_token_t& cancel) {
+    packed_payload_reader_t reader(payload, cancel, 1);
+    if (reader.u32() != kPackedBaselineManifestMagic ||
+        reader.u16() != kPackedBaselinePayloadVersion ||
+        reader.u16() != workspace_schema_v9_version) {
+        reader.reject("packed baseline manifest header is invalid");
+    }
+    packed_baseline_manifest_t manifest;
+    manifest.generation = reader.u64();
+    manifest.analysis_revision = reader.u64();
+    manifest.overlay_revision = reader.u64();
+    manifest.baseline_complete = reader.boolean();
+    manifest.binary_id.bytes = reader.fixed_bytes<32>();
+    manifest.load_profile_hash.bytes = reader.fixed_bytes<32>();
+    manifest.required_domains = reader.u32();
+    manifest.candidate_token = reader.string();
+    auto finished = reader.finish();
+    if (!finished)
+        return workspace_result_t<packed_baseline_manifest_t>::failure(
+            finished.error());
+    if (manifest.generation == 0 ||
+        manifest.required_domains != kPackedBaselineRequiredDomains ||
+        (!manifest.candidate_token.empty() &&
+         !valid_candidate_token(manifest.candidate_token))) {
+        return workspace_result_t<packed_baseline_manifest_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed baseline manifest invariants are invalid"));
+    }
+    return workspace_result_t<packed_baseline_manifest_t>::success(
+        std::move(manifest));
+}
+
+struct decoded_packed_baseline_t {
+    std::shared_ptr<analysis_snapshot_t> snapshot;
+    persisted_search_products_t search_products;
+    std::string candidate_token;
+};
+
+struct packed_baseline_envelope_t {
+    packed_baseline_manifest_t manifest;
+    std::map<packed_page_type_t, std::vector<std::uint8_t>> domains;
+};
+
+workspace_result_t<packed_baseline_envelope_t> decode_packed_baseline_envelope(
+    const packed_generation_publication_t& publication,
+    const workspace_identity_t& identity,
+    const cancellation_token_t& cancel) {
+    auto manifest = decode_packed_baseline_manifest(
+        publication.generation.payload_blob, cancel);
+    if (!manifest)
+        return workspace_result_t<packed_baseline_envelope_t>::failure(
+            manifest.error());
+    if (manifest.value().generation != publication.generation.generation ||
+        manifest.value().analysis_revision !=
+            publication.generation.analysis_revision ||
+        manifest.value().overlay_revision !=
+            publication.generation.overlay_revision ||
+        !manifest.value().binary_id.constant_time_equal(identity.binary_id()) ||
+        !manifest.value().load_profile_hash.constant_time_equal(
+            identity.load_profile_hash())) {
+        return workspace_result_t<packed_baseline_envelope_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::target_conflict,
+                "packed baseline manifest does not match the workspace identity"));
+    }
+
+    auto decoded_domains = packed_page_codec_t::decode_multi_domain_publication(
+        publication, [&cancel] { return cancel.stop_requested(); });
+    if (!decoded_domains)
+        return workspace_result_t<packed_baseline_envelope_t>::failure(
+            decoded_domains.error());
+    if (decoded_domains.value().size() !=
+        static_cast<std::size_t>(packed_page_last_data_type)) {
+        return workspace_result_t<packed_baseline_envelope_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed baseline publication omits required domains"));
+    }
+    packed_baseline_envelope_t envelope;
+    envelope.manifest = manifest.take_value();
+    std::uint32_t observed_domains = 0;
+    for (auto& [type, payload] : decoded_domains.value()) {
+        const auto encoded = static_cast<std::uint32_t>(type);
+        if (encoded == 0 ||
+            encoded > static_cast<std::uint32_t>(packed_page_last_data_type) ||
+            !envelope.domains.emplace(type, std::move(payload)).second) {
+            return workspace_result_t<packed_baseline_envelope_t>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "packed baseline domain inventory is invalid"));
+        }
+        observed_domains |= 1U << (encoded - 1U);
+    }
+    if (observed_domains != envelope.manifest.required_domains) {
+        return workspace_result_t<packed_baseline_envelope_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed baseline domain inventory does not match its manifest"));
+    }
+    return workspace_result_t<packed_baseline_envelope_t>::success(
+        std::move(envelope));
+}
+
+workspace_result_t<persisted_search_products_t> decode_packed_search_products(
+    const packed_generation_publication_t& publication,
+    const workspace_identity_t& identity,
+    std::uint64_t maximum_records,
+    const cancellation_token_t& cancel) {
+    auto envelope = decode_packed_baseline_envelope(
+        publication, identity, cancel);
+    if (!envelope)
+        return workspace_result_t<persisted_search_products_t>::failure(
+            envelope.error());
+    persisted_search_products_t products;
+    products.generation = envelope.value().manifest.generation;
+    products.analysis_revision = envelope.value().manifest.analysis_revision;
+    products.overlay_revision = envelope.value().manifest.overlay_revision;
+    std::uint64_t decoded_records = 0;
+    packed_payload_reader_t reader(
+        envelope.value().domains.at(packed_page_type_t::search_index), cancel,
+        maximum_records, &decoded_records);
+    read_domain_header(reader, packed_page_type_t::search_index);
+    const auto data_count = reader.count();
+    products.data_candidates.reserve(data_count);
+    for (std::size_t index = 0; index < data_count; ++index)
+        products.data_candidates.push_back(read_data_candidate(reader));
+    const auto switch_count = reader.count();
+    products.switches.reserve(switch_count);
+    for (std::size_t index = 0; index < switch_count; ++index)
+        products.switches.push_back(read_switch(reader));
+    const auto type_count = reader.count();
+    products.types.reserve(type_count);
+    for (std::size_t index = 0; index < type_count; ++index)
+        products.types.push_back(read_search_type(reader));
+    products.search_index_blob_version = reader.u32();
+    products.search_index_blob = reader.bytes();
+    if (products.search_index_blob.size() > workspace_search_blob_limit)
+        reader.reject("packed search-index blob exceeds its bounded limit");
+    auto finished = reader.finish();
+    if (!finished)
+        return workspace_result_t<persisted_search_products_t>::failure(
+            finished.error());
+    return workspace_result_t<persisted_search_products_t>::success(
+        std::move(products));
+}
+
+workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
+    const packed_generation_publication_t& publication,
+    std::shared_ptr<const workspace_image_t> normalized_image,
+    std::shared_ptr<const pe_image_t> pe_adapter,
+    const workspace_identity_t& identity,
+    std::uint64_t maximum_records,
+    const cancellation_token_t& cancel) {
+    auto envelope = decode_packed_baseline_envelope(
+        publication, identity, cancel);
+    if (!envelope)
+        return workspace_result_t<decoded_packed_baseline_t>::failure(
+            envelope.error());
+
+    auto snapshot = std::make_shared<analysis_snapshot_t>();
+    snapshot->binary_id = envelope.value().manifest.binary_id;
+    snapshot->load_profile_hash = envelope.value().manifest.load_profile_hash;
+    snapshot->generation = envelope.value().manifest.generation;
+    snapshot->analysis_revision = envelope.value().manifest.analysis_revision;
+    snapshot->overlay_revision = envelope.value().manifest.overlay_revision;
+    snapshot->baseline_complete = envelope.value().manifest.baseline_complete;
+    snapshot->normalized_image = std::move(normalized_image);
+    snapshot->image = std::move(pe_adapter);
+    persisted_search_products_t products;
+    products.generation = snapshot->generation;
+    products.analysis_revision = snapshot->analysis_revision;
+    products.overlay_revision = snapshot->overlay_revision;
+    std::uint64_t decoded_records = 0;
+    const auto payload_for = [&](packed_page_type_t domain)
+        -> const std::vector<std::uint8_t>& {
+        return envelope.value().domains.at(domain);
+    };
+
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::instructions),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::instructions);
+        const auto count = reader.count();
+        snapshot->instructions.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->instructions.push_back(read_instruction(reader));
+        const auto delay_count = reader.count();
+        snapshot->delay_slot_counts.reserve(delay_count);
+        for (std::size_t index = 0; index < delay_count; ++index)
+            snapshot->delay_slot_counts.push_back(reader.u8());
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::operands),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::operands);
+        const auto count = reader.count();
+        snapshot->operand_facts.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->operand_facts.push_back(read_operand(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::target_facts),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::target_facts);
+        const auto count = reader.count();
+        snapshot->target_facts.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->target_facts.push_back(read_target(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::edges),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::edges);
+        const auto count = reader.count();
+        snapshot->edges.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->edges.push_back(read_edge(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::strings),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::strings);
+        const auto count = reader.count();
+        snapshot->strings.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->strings.push_back(read_string_record(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::symbols),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::symbols);
+        const auto count = reader.count();
+        snapshot->symbols.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->symbols.push_back(read_symbol(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(
+            payload_for(packed_page_type_t::address_expressions),
+            cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::address_expressions);
+        if (reader.count() != 0)
+            reader.reject("packed address-expression compatibility domain is not empty");
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::basic_blocks),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::basic_blocks);
+        const auto count = reader.count();
+        snapshot->blocks.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->blocks.push_back(read_block(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::functions),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::functions);
+        const auto count = reader.count();
+        snapshot->functions.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->functions.push_back(read_function(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(
+            payload_for(packed_page_type_t::function_chunks), cancel,
+            maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::function_chunks);
+        const auto chunk_count = reader.count();
+        snapshot->function_chunks.reserve(chunk_count);
+        for (std::size_t index = 0; index < chunk_count; ++index)
+            snapshot->function_chunks.push_back(read_function_chunk(reader));
+        const auto membership_count = reader.count();
+        snapshot->function_block_memberships.reserve(membership_count);
+        for (std::size_t index = 0; index < membership_count; ++index)
+            snapshot->function_block_memberships.push_back(
+                read_function_membership(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::xrefs),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::xrefs);
+        const auto count = reader.count();
+        snapshot->xrefs.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->xrefs.push_back(read_xref(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::coverage),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::coverage);
+        const auto count = reader.count();
+        snapshot->coverage.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->coverage.push_back(read_coverage(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(
+            payload_for(packed_page_type_t::search_index), cancel,
+            maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::search_index);
+        const auto data_count = reader.count();
+        products.data_candidates.reserve(data_count);
+        for (std::size_t index = 0; index < data_count; ++index)
+            products.data_candidates.push_back(read_data_candidate(reader));
+        const auto switch_count = reader.count();
+        products.switches.reserve(switch_count);
+        for (std::size_t index = 0; index < switch_count; ++index)
+            products.switches.push_back(read_switch(reader));
+        const auto type_count = reader.count();
+        products.types.reserve(type_count);
+        for (std::size_t index = 0; index < type_count; ++index)
+            products.types.push_back(read_search_type(reader));
+        products.search_index_blob_version = reader.u32();
+        products.search_index_blob = reader.bytes();
+        if (products.search_index_blob.size() > workspace_search_blob_limit)
+            reader.reject("packed search-index blob exceeds its bounded limit");
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(payload_for(packed_page_type_t::call_graph),
+                                       cancel, maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::call_graph);
+        const auto node_count = reader.count();
+        snapshot->call_graph.nodes.reserve(node_count);
+        for (std::size_t index = 0; index < node_count; ++index)
+            snapshot->call_graph.nodes.push_back(read_call_node(reader));
+        const auto site_count = reader.count();
+        snapshot->call_graph.call_sites.reserve(site_count);
+        for (std::size_t index = 0; index < site_count; ++index)
+            snapshot->call_graph.call_sites.push_back(read_call_site(reader));
+        const auto candidate_count = reader.count();
+        snapshot->call_graph.candidates.reserve(candidate_count);
+        for (std::size_t index = 0; index < candidate_count; ++index)
+            snapshot->call_graph.candidates.push_back(read_call_candidate(reader));
+        const auto edge_count = reader.count();
+        snapshot->call_graph.edges.reserve(edge_count);
+        for (std::size_t index = 0; index < edge_count; ++index)
+            snapshot->call_graph.edges.push_back(read_call_edge(reader));
+        const auto conflict_count = reader.count();
+        snapshot->call_graph.conflicts.reserve(conflict_count);
+        for (std::size_t index = 0; index < conflict_count; ++index)
+            snapshot->call_graph.conflicts.push_back(read_call_conflict(reader));
+        snapshot->call_graph.indirect_site_count = reader.u64();
+        snapshot->call_graph.unresolved_site_count = reader.u64();
+        snapshot->call_graph.bounded = reader.boolean();
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(
+            payload_for(packed_page_type_t::pointer_facts), cancel,
+            maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::pointer_facts);
+        const auto data_count = reader.count();
+        snapshot->rich_facts.data_candidates.reserve(data_count);
+        for (std::size_t index = 0; index < data_count; ++index)
+            snapshot->rich_facts.data_candidates.push_back(
+                read_data_candidate(reader));
+        const auto pointer_count = reader.count();
+        snapshot->rich_facts.data_pointer_facts.reserve(pointer_count);
+        for (std::size_t index = 0; index < pointer_count; ++index)
+            snapshot->rich_facts.data_pointer_facts.push_back(
+                read_data_pointer(reader));
+        const auto conflict_count = reader.count();
+        snapshot->rich_facts.data_conflicts.reserve(conflict_count);
+        for (std::size_t index = 0; index < conflict_count; ++index)
+            snapshot->rich_facts.data_conflicts.push_back(
+                read_data_conflict(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(
+            payload_for(packed_page_type_t::type_references), cancel,
+            maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::type_references);
+        const auto count = reader.count();
+        snapshot->rich_facts.type_references.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->rich_facts.type_references.push_back(
+                read_type_reference(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(
+            payload_for(packed_page_type_t::metadata_conflicts), cancel,
+            maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::metadata_conflicts);
+        const auto count = reader.count();
+        snapshot->rich_facts.metadata_conflicts.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->rich_facts.metadata_conflicts.push_back(
+                read_metadata_conflict(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+    {
+        packed_payload_reader_t reader(
+            payload_for(packed_page_type_t::symbol_type_candidates), cancel,
+            maximum_records, &decoded_records);
+        read_domain_header(reader, packed_page_type_t::symbol_type_candidates);
+        const auto count = reader.count();
+        snapshot->rich_facts.type_candidates.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->rich_facts.type_candidates.push_back(
+                read_symbol_type_candidate(reader));
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                finished.error());
+    }
+
+    auto validated = validate_analysis_snapshot(
+        *snapshot, snapshot->baseline_complete, cancel);
+    if (!validated)
+        return workspace_result_t<decoded_packed_baseline_t>::failure(
+            validated.error());
+    decoded_packed_baseline_t decoded;
+    decoded.snapshot = std::move(snapshot);
+    decoded.search_products = std::move(products);
+    decoded.candidate_token =
+        std::move(envelope.value().manifest.candidate_token);
+    return workspace_result_t<decoded_packed_baseline_t>::success(
+        std::move(decoded));
+}
+
+workspace_result_t<void> await_persistence_completion(
+    const persistence_ticket_t& ticket,
+    const cancellation_token_t& cancel,
+    const char* phase) {
+    if (!ticket.accepted || !ticket.completion.valid()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::persistence_failure,
+            "workspace persistence queue rejected the packed generation",
+            phase));
+    }
+    for (;;) {
+        if (ticket.completion.wait_for(std::chrono::milliseconds(2)) ==
+            std::future_status::ready) {
+            break;
+        }
+        if (cancel.stop_requested())
+            return workspace_result_t<void>::failure(
+                packed_baseline_cancelled(cancel));
+    }
+    try {
+        const auto& completed = ticket.completion.get();
+        if (!completed)
+            return workspace_result_t<void>::failure(completed.error());
+    } catch (const std::exception& exception) {
+        auto error = make_workspace_error(
+            workspace_error_code_t::persistence_failure,
+            "packed-generation persistence completion failed", phase);
+        error.details.emplace_back("exception", exception.what());
+        return workspace_result_t<void>::failure(std::move(error));
+    }
+    return workspace_result_t<void>::success();
 }
 
 }
@@ -2468,6 +4428,10 @@ std::uint64_t workspace_persistence_candidate_t::analysis_revision() const noexc
 
 std::uint64_t workspace_persistence_candidate_t::overlay_revision() const noexcept {
     return overlay_revision_;
+}
+
+bool workspace_persistence_candidate_t::packed_generation_required() const noexcept {
+    return packed_generation_required_.load(std::memory_order_acquire);
 }
 
 workspace_result_t<void> workspace_persistence_candidate_t::finalize(
@@ -3036,6 +5000,42 @@ workspace_result_t<void> workspace_database_t::finalize_candidate(
             "candidate fact slot does not match its promotion marker",
             "workspace_database.candidate.finalize"));
     }
+    if (candidate.packed_generation_required()) {
+        auto packed = read_packed_generation(
+            database, candidate.generation_, false,
+            [&cancel] { return cancel.stop_requested(); });
+        if (!packed) {
+            rollback(database, "workspace_database.candidate.finalize");
+            return workspace_result_t<void>::failure(packed.error());
+        }
+        if (!packed.value() || packed.value()->committed ||
+            packed.value()->analysis_revision != candidate.analysis_revision_ ||
+            packed.value()->overlay_revision != candidate.overlay_revision_) {
+            rollback(database, "workspace_database.candidate.finalize");
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "candidate packed generation is missing or revision-inconsistent",
+                "workspace_database.candidate.finalize"));
+        }
+        auto manifest = decode_packed_baseline_manifest(
+            packed.value()->payload_blob, cancel);
+        if (!manifest || manifest.value().candidate_token != candidate.token_) {
+            rollback(database, "workspace_database.candidate.finalize");
+            return manifest
+                ? workspace_result_t<void>::failure(make_workspace_error(
+                      workspace_error_code_t::integrity_failure,
+                      "candidate packed generation token is inconsistent",
+                      "workspace_database.candidate.finalize"))
+                : workspace_result_t<void>::failure(manifest.error());
+        }
+        auto packed_published = aida::analysis::publish_packed_generation(
+            database, candidate.generation_,
+            [&cancel] { return cancel.stop_requested(); });
+        if (!packed_published) {
+            rollback(database, "workspace_database.candidate.finalize");
+            return packed_published;
+        }
+    }
     statement_t promote;
     current = promote.prepare(database,
         "UPDATE workspace_commit_state SET active_slot=?1,committed_token=?2,committed_generation=?3,committed_analysis_revision=?4,committed_overlay_revision=?5,candidate_slot=NULL,candidate_token=NULL,candidate_generation=NULL,candidate_analysis_revision=NULL,candidate_overlay_revision=NULL,candidate_ready=0,updated_utc_ms=?6 WHERE singleton=1 AND candidate_ready=1 AND candidate_token=?2",
@@ -3165,6 +5165,14 @@ workspace_result_t<void> workspace_database_t::discard_candidate(
             "a different persistence candidate is pending",
             "workspace_database.candidate.discard"));
     }
+    if (candidate.packed_generation_required()) {
+        auto rolled_back = rollback_packed_generation(
+            database, candidate.generation_);
+        if (!rolled_back) {
+            rollback(database, "workspace_database.candidate.discard");
+            return rolled_back;
+        }
+    }
     auto cleared = clear_snapshot_slot(database, *state.value().candidate_slot,
                                        "workspace_database.candidate.discard");
     if (!cleared) {
@@ -3200,20 +5208,62 @@ workspace_result_t<void> workspace_database_t::discard_candidate(
 
 workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>
 workspace_database_t::load_snapshot(std::shared_ptr<const pe_image_t> image,
-                                    const cancellation_token_t& cancel) const {
+                                    const cancellation_token_t& cancel) {
     return load_snapshot(std::shared_ptr<const workspace_image_t>{}, std::move(image), cancel);
 }
 
 workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>
 workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> image,
                                     std::shared_ptr<const pe_image_t> pe_adapter,
-                                    const cancellation_token_t& cancel) const {
+                                    const cancellation_token_t& cancel) {
     if ((image && !image_matches_identity(*image, *options_.identity)) ||
         (pe_adapter && !image_matches_identity(*pe_adapter, *options_.identity))) {
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
             make_workspace_error(workspace_error_code_t::target_conflict,
                 "requested image identity does not match the workspace database",
                 "workspace_database.load"));
+    }
+    const auto committed_generation =
+        state_->persisted_generation.load(std::memory_order_acquire);
+    const auto committed_analysis_revision =
+        state_->persisted_analysis_revision.load(std::memory_order_acquire);
+    const auto committed_overlay_revision =
+        state_->persisted_overlay_revision.load(std::memory_order_acquire);
+    if (committed_generation != 0) {
+        auto packed = load_packed_generation(committed_generation, cancel);
+        if (!packed) {
+            return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+                packed.error());
+        }
+        if (packed.value()) {
+            auto decoded = decode_packed_baseline(
+                *packed.value(), std::move(image), std::move(pe_adapter),
+                *options_.identity, options_.max_persisted_fact_records, cancel);
+            if (!decoded) {
+                return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+                    decoded.error());
+            }
+            if (decoded.value().snapshot->generation != committed_generation ||
+                decoded.value().snapshot->analysis_revision !=
+                    committed_analysis_revision ||
+                decoded.value().snapshot->overlay_revision !=
+                    committed_overlay_revision ||
+                state_->persisted_generation.load(std::memory_order_acquire) !=
+                    committed_generation ||
+                state_->persisted_analysis_revision.load(
+                    std::memory_order_acquire) != committed_analysis_revision ||
+                state_->persisted_overlay_revision.load(
+                    std::memory_order_acquire) != committed_overlay_revision) {
+                return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::stale_generation,
+                        "packed baseline changed during reopen",
+                        "workspace_database.load.packed"));
+            }
+            return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::success(
+                std::shared_ptr<const analysis_snapshot_t>(
+                    std::move(decoded.value().snapshot)));
+        }
     }
     auto loaded = std::make_shared<analysis_snapshot_t>();
     loaded->binary_id = options_.identity->binary_id();
@@ -3766,8 +5816,72 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
     state_->persisted_generation.store(loaded->generation, std::memory_order_release);
     state_->persisted_analysis_revision.store(loaded->analysis_revision, std::memory_order_release);
     state_->persisted_overlay_revision.store(loaded->overlay_revision, std::memory_order_release);
+
+    auto products = load_search_products(
+        loaded->generation, loaded->analysis_revision, loaded->overlay_revision,
+        cancel);
+    if (!products) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            products.error());
+    }
+    auto domains = encode_packed_baseline_domains(*loaded, products.value(), cancel);
+    if (!domains) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            domains.error());
+    }
+    packed_page_encode_options_t encode_options;
+    encode_options.generation = loaded->generation;
+    encode_options.analysis_revision = loaded->analysis_revision;
+    encode_options.overlay_revision = loaded->overlay_revision;
+    auto batch = packed_page_codec_t::encode_multi_domain_batch(
+        domains.value(), encode_options,
+        [&cancel] { return cancel.stop_requested(); });
+    if (!batch) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            batch.error());
+    }
+    auto manifest = encode_packed_baseline_manifest(*loaded, {}, cancel);
+    if (!manifest) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            manifest.error());
+    }
+    auto publication = packed_page_codec_t::build_publication(
+        batch.value(), manifest.take_value(),
+        [&cancel] { return cancel.stop_requested(); });
+    if (!publication) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            publication.error());
+    }
+    auto ticket = publish_packed_generation(
+        publication.take_value(), cancel);
+    auto published = await_persistence_completion(
+        ticket, cancel, "workspace_database.load.migrate_packed");
+    if (!published) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            published.error());
+    }
+    auto migrated = load_packed_generation(loaded->generation, cancel);
+    if (!migrated) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            migrated.error());
+    }
+    if (!migrated.value()) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "packed baseline migration did not publish a readable generation",
+                "workspace_database.load.migrate_packed"));
+    }
+    auto decoded = decode_packed_baseline(
+        *migrated.value(), loaded->normalized_image, loaded->image,
+        *options_.identity, options_.max_persisted_fact_records, cancel);
+    if (!decoded) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            decoded.error());
+    }
     return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::success(
-        std::shared_ptr<const analysis_snapshot_t>(std::move(loaded)));
+        std::shared_ptr<const analysis_snapshot_t>(
+            std::move(decoded.value().snapshot)));
 }
 
 workspace_result_t<persisted_search_products_t>
@@ -3776,6 +5890,47 @@ workspace_database_t::load_search_products(
     std::uint64_t expected_analysis_revision,
     std::uint64_t expected_overlay_revision,
     const cancellation_token_t& cancel) const {
+    if (state_->persisted_generation.load(std::memory_order_acquire) !=
+            expected_generation ||
+        state_->persisted_analysis_revision.load(std::memory_order_acquire) !=
+            expected_analysis_revision ||
+        state_->persisted_overlay_revision.load(std::memory_order_acquire) !=
+            expected_overlay_revision) {
+        return workspace_result_t<persisted_search_products_t>::failure(
+            make_workspace_error(
+                workspace_error_code_t::stale_generation,
+                "requested search products are not the committed workspace revision",
+                "workspace_database.load_search.packed"));
+    }
+    if (expected_generation != 0) {
+        auto packed = load_packed_generation(expected_generation, cancel);
+        if (!packed)
+            return workspace_result_t<persisted_search_products_t>::failure(
+                packed.error());
+        if (packed.value()) {
+            auto decoded = decode_packed_search_products(
+                *packed.value(), *options_.identity,
+                options_.max_persisted_fact_records, cancel);
+            if (!decoded)
+                return decoded;
+            if (decoded.value().generation != expected_generation ||
+                decoded.value().analysis_revision != expected_analysis_revision ||
+                decoded.value().overlay_revision != expected_overlay_revision ||
+                state_->persisted_generation.load(std::memory_order_acquire) !=
+                    expected_generation ||
+                state_->persisted_analysis_revision.load(
+                    std::memory_order_acquire) != expected_analysis_revision ||
+                state_->persisted_overlay_revision.load(
+                    std::memory_order_acquire) != expected_overlay_revision) {
+                return workspace_result_t<persisted_search_products_t>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::stale_generation,
+                        "packed search products changed during reopen",
+                        "workspace_database.load_search.packed"));
+            }
+            return decoded;
+        }
+    }
     persisted_search_products_t products;
     products.generation = expected_generation;
     products.analysis_revision = expected_analysis_revision;
@@ -4173,6 +6328,125 @@ persistence_ticket_t workspace_database_t::publish_packed_generation(
                            !state->open.load(std::memory_order_acquire);
                 });
         }, std::move(cancel));
+}
+
+persistence_ticket_t workspace_database_t::publish_packed_generation(
+    packed_generation_publication_t publication,
+    std::shared_ptr<const workspace_persistence_candidate_t> candidate,
+    cancellation_token_t cancel) {
+    const auto reject = [&](workspace_error_t error) {
+        return queue_->enqueue(
+            "analysis.persistence.packed_generation.invalid_candidate",
+            [error = std::move(error)](const cancellation_token_t&) {
+                return workspace_result_t<void>::failure(error);
+            }, std::move(cancel));
+    };
+    if (!candidate || candidate->database_.lock().get() != this ||
+        publication.generation.generation != candidate->generation_ ||
+        publication.generation.analysis_revision != candidate->analysis_revision_ ||
+        publication.generation.overlay_revision != candidate->overlay_revision_ ||
+        publication.generation.committed) {
+        return reject(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "packed publication does not match its snapshot candidate",
+            "workspace_database.packed_generation.stage"));
+    }
+    auto manifest = decode_packed_baseline_manifest(
+        publication.generation.payload_blob, cancel);
+    if (!manifest)
+        return reject(manifest.error());
+    if (manifest.value().candidate_token != candidate->token_ ||
+        manifest.value().generation != candidate->generation_ ||
+        manifest.value().analysis_revision != candidate->analysis_revision_ ||
+        manifest.value().overlay_revision != candidate->overlay_revision_) {
+        return reject(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "packed baseline manifest is not bound to its snapshot candidate",
+            "workspace_database.packed_generation.stage"));
+    }
+
+    candidate->packed_generation_required_.store(true, std::memory_order_release);
+    auto state = state_;
+    auto measurement = std::make_shared<persistence_commit_metrics_t>();
+    const std::string candidate_token = candidate->token_;
+    auto ticket = enqueue_write(
+        "analysis.persistence.packed_generation.stage",
+        [state, publication = std::move(publication), candidate_token,
+         measurement](sqlite3* database, const cancellation_token_t& token) {
+            auto page_size = database_page_size(database);
+            if (!page_size)
+                return workspace_result_t<void>::failure(page_size.error());
+            int writes_before = 0;
+            int ignored_highwater = 0;
+            const int before_status = sqlite3_db_status(
+                database, SQLITE_DBSTATUS_CACHE_WRITE, &writes_before,
+                &ignored_highwater, 0);
+            if (before_status != SQLITE_OK) {
+                return workspace_result_t<void>::failure(database_error(
+                    database, before_status,
+                    "unable to query packed-generation cache-write counter",
+                    "workspace_database.packed_generation.stage"));
+            }
+            const auto started = std::chrono::steady_clock::now();
+            auto staged = stage_packed_generation_atomic(
+                database, publication, candidate_token,
+                [&state, &token] {
+                    return token.stop_requested() ||
+                           !state->open.load(std::memory_order_acquire);
+                });
+            if (!staged)
+                return staged;
+            int writes_after = 0;
+            const int after_status = sqlite3_db_status(
+                database, SQLITE_DBSTATUS_CACHE_WRITE, &writes_after,
+                &ignored_highwater, 0);
+            if (after_status != SQLITE_OK) {
+                return workspace_result_t<void>::failure(database_error(
+                    database, after_status,
+                    "unable to query packed-generation cache-write accounting",
+                    "workspace_database.packed_generation.stage"));
+            }
+            std::uint64_t logical_bytes = publication.generation.payload_blob.size();
+            std::uint64_t rows = 1;
+            for (const auto& page : publication.pages) {
+                if (!checked_add_u64(logical_bytes, page.payload.size(),
+                                     logical_bytes) ||
+                    !checked_add_u64(rows, 1, rows)) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(
+                            workspace_error_code_t::range_overflow,
+                            "packed-generation commit metrics overflowed",
+                            "workspace_database.packed_generation.stage"));
+                }
+            }
+            if (!checked_add_u64(rows, publication.index.size(), rows)) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::range_overflow,
+                    "packed-generation row metrics overflowed",
+                    "workspace_database.packed_generation.stage"));
+            }
+            const auto written_pages = writes_after >= writes_before
+                ? static_cast<std::uint64_t>(writes_after - writes_before)
+                : static_cast<std::uint64_t>(writes_after);
+            std::uint64_t page_write_bytes = 0;
+            if (!checked_mul_u64(written_pages, page_size.value(),
+                                 page_write_bytes)) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::range_overflow,
+                    "packed-generation page-write metrics overflowed",
+                    "workspace_database.packed_generation.stage"));
+            }
+            measurement->logical_bytes = logical_bytes;
+            measurement->rows = rows;
+            measurement->page_write_bytes = page_write_bytes;
+            measurement->elapsed_us = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+            publish_commit_metrics(*state, *measurement);
+            return workspace_result_t<void>::success();
+        }, std::move(cancel));
+    ticket.commit_metrics = std::move(measurement);
+    return ticket;
 }
 
 workspace_result_t<std::optional<packed_generation_publication_t>>

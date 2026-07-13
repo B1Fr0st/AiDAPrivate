@@ -1,10 +1,5 @@
 #include "decompiler_provider_registry.hpp"
 
-#include "providers/cli_provider.hpp"
-#include "providers/dalvik_ssa.hpp"
-#include "providers/ghidra_ir_adapter.hpp"
-#include "providers/jvm_ssa.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <mutex>
@@ -124,29 +119,6 @@ workspace_result_t<decompiler_provider_descriptor_t> canonical_descriptor(
     return workspace_result_t<decompiler_provider_descriptor_t>::success(std::move(descriptor));
 }
 
-bool equal_provider_identity(
-    const decompiler_provider_identity_t& left,
-    const decompiler_provider_identity_t& right) noexcept
-{
-    return left.provider == right.provider && left.provider_name == right.provider_name &&
-           left.provider_version == right.provider_version &&
-           left.provider_binary_hash == right.provider_binary_hash &&
-           left.worker_build_id == right.worker_build_id &&
-           left.worker_build_hash == right.worker_build_hash;
-}
-
-bool equal_language_identity(
-    const decompiler_language_identity_t& left,
-    const decompiler_language_identity_t& right) noexcept
-{
-    return left.language_id == right.language_id &&
-           left.language_version == right.language_version &&
-           left.compiler_spec_id == right.compiler_spec_id &&
-           left.language_spec_hash == right.language_spec_hash &&
-           left.architecture == right.architecture && left.mode == right.mode &&
-           left.endian == right.endian;
-}
-
 decompiler_diagnostic_t provider_diagnostic(
     const decompiler_diagnostic_code_t code,
     std::string key,
@@ -177,58 +149,18 @@ decompiler_provider_result_t stopped_provider_result(
     return result;
 }
 
-decompiler_provider_result_t rejected_provider_result(std::string key)
+decompiler_provider_result_t isolated_provider_result(
+    const cancellation_token_t& cancel,
+    const std::chrono::steady_clock::time_point deadline,
+    std::string key)
 {
+    if (cancel.stop_requested() || std::chrono::steady_clock::now() >= deadline)
+        return stopped_provider_result(cancel, deadline);
     decompiler_provider_result_t result;
     result.status = decompiler_provider_execution_status_t::failed;
     result.diagnostics.push_back(provider_diagnostic(
-        decompiler_diagnostic_code_t::invalid_contract, std::move(key)));
+        decompiler_diagnostic_code_t::worker_protocol_failure, std::move(key)));
     return result;
-}
-
-decompiler_provider_result_t unsupported_provider_result(std::string key)
-{
-    decompiler_provider_result_t result;
-    result.status = decompiler_provider_execution_status_t::unsupported;
-    result.diagnostics.push_back(provider_diagnostic(
-        decompiler_diagnostic_code_t::unsupported_architecture, std::move(key)));
-    return result;
-}
-
-void ensure_failure_diagnostic(
-    decompiler_provider_result_t& result,
-    std::string key)
-{
-    if (result.diagnostics.empty()) {
-        result.diagnostics.push_back(provider_diagnostic(
-            decompiler_diagnostic_code_t::provider_failure, std::move(key), true));
-    }
-}
-
-bool request_matches_descriptor(
-    const decompiler_provider_request_t& request,
-    const decompiler_provider_descriptor_t& descriptor)
-{
-    return request.cache_key.stage == decompiler_cache_stage_t::provider_ir &&
-           request.cache_key.entity.kind == descriptor.entity_kind &&
-           equal_provider_identity(request.cache_key.provider, descriptor.identity) &&
-           validate_decompiler_pipeline_cache_key(request.cache_key).valid();
-}
-
-void finish_provider_result(
-    decompiler_provider_result_t& result,
-    const std::chrono::steady_clock::time_point started,
-    const cancellation_token_t& cancel,
-    const std::chrono::steady_clock::time_point deadline)
-{
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - started).count();
-    result.elapsed_wall_clock_ms = static_cast<std::uint64_t>((std::max<std::int64_t>)(elapsed, 0));
-    if (cancel.stop_requested() || std::chrono::steady_clock::now() >= deadline) {
-        auto stopped = stopped_provider_result(cancel, deadline);
-        stopped.elapsed_wall_clock_ms = result.elapsed_wall_clock_ms;
-        result = std::move(stopped);
-    }
 }
 
 decompiler_provider_descriptor_t builtin_descriptor(
@@ -269,42 +201,8 @@ public:
         const decompiler_provider_request_t& request,
         const cancellation_token_t& cancel) override
     {
-        const auto started = std::chrono::steady_clock::now();
-        if (cancel.stop_requested() || started >= request.deadline)
-            return stopped_provider_result(cancel, request.deadline);
-        if (!request_matches_descriptor(request, descriptor_))
-            return rejected_provider_result("decompiler.provider.native.request");
-        if (!supports_language(request.cache_key.language))
-            return unsupported_provider_result("decompiler.provider.native.language_unsupported");
-        const auto context = std::dynamic_pointer_cast<const ghidra_native_provider_context_t>(request.context);
-        if (!context || !context->artifacts())
-            return rejected_provider_result("decompiler.provider.native.context");
-        const auto& source = *context->artifacts();
-        decompiler_provider_result_t result;
-        result.diagnostics = source.provider_ir.diagnostics;
-        if (!validate_provider_ir(source.provider_ir).valid() ||
-            !validate_hir_function(source.hir).valid() ||
-            !validate_type_graph(source.type_graph).valid() ||
-            source.provider_ir.entity != request.cache_key.entity ||
-            source.hir.entity != request.cache_key.entity ||
-            source.type_graph.entity != request.cache_key.entity ||
-            !equal_provider_identity(source.provider_ir.provider, descriptor_.identity) ||
-            !equal_language_identity(source.provider_ir.language, request.cache_key.language) ||
-            source.hir.provider_ir_hash != stable_serialization_hash(source.provider_ir) ||
-            source.hir.type_graph_revision != request.cache_key.type_graph_revision ||
-            source.type_graph.revision != request.cache_key.type_graph_revision ||
-            source.hir.return_type_id == 0) {
-            return rejected_provider_result("decompiler.provider.native.artifacts");
-        }
-        decompiler_provider_artifacts_t artifacts;
-        artifacts.provider_ir = source.provider_ir;
-        artifacts.hir = source.hir;
-        artifacts.type_graph = source.type_graph;
-        artifacts.return_type_id = source.hir.return_type_id;
-        result.artifacts = std::move(artifacts);
-        result.status = decompiler_provider_execution_status_t::completed;
-        finish_provider_result(result, started, cancel, request.deadline);
-        return result;
+        return isolated_provider_result(cancel, request.deadline,
+            "decompiler.provider.native.isolated_execution_required");
     }
 
 private:
@@ -345,41 +243,8 @@ public:
         const decompiler_provider_request_t& request,
         const cancellation_token_t& cancel) override
     {
-        const auto started = std::chrono::steady_clock::now();
-        if (cancel.stop_requested() || started >= request.deadline)
-            return stopped_provider_result(cancel, request.deadline);
-        if (!request_matches_descriptor(request, descriptor_))
-            return rejected_provider_result("decompiler.provider.cli.request");
-        if (!supports_language(request.cache_key.language))
-            return unsupported_provider_result("decompiler.provider.cli.language_unsupported");
-        const auto context = std::dynamic_pointer_cast<const managed_cli_provider_context_t>(request.context);
-        if (!context || !context->analysis() || context->return_type_id() == 0)
-            return rejected_provider_result("decompiler.provider.cli.context");
-        const auto& source = *context->analysis();
-        if (!validate_provider_ir(source.provider_ir).valid() ||
-            !validate_type_graph(source.type_graph).valid() ||
-            source.provider_ir.entity != request.cache_key.entity ||
-            source.type_graph.entity != request.cache_key.entity ||
-            !equal_provider_identity(source.provider_ir.provider, descriptor_.identity) ||
-            !equal_language_identity(source.provider_ir.language, request.cache_key.language) ||
-            source.type_graph.revision != request.cache_key.type_graph_revision ||
-            std::none_of(source.type_graph.nodes.begin(), source.type_graph.nodes.end(),
-                [context](const decompiler_type_node_t& node) {
-                    return node.id == context->return_type_id();
-                })) {
-            return rejected_provider_result("decompiler.provider.cli.artifacts");
-        }
-        decompiler_provider_result_t result;
-        result.diagnostics = source.diagnostics;
-        decompiler_provider_artifacts_t artifacts;
-        artifacts.provider_ir = source.provider_ir;
-        artifacts.provider_ir.language = request.cache_key.language;
-        artifacts.type_graph = source.type_graph;
-        artifacts.return_type_id = context->return_type_id();
-        result.artifacts = std::move(artifacts);
-        result.status = decompiler_provider_execution_status_t::completed;
-        finish_provider_result(result, started, cancel, request.deadline);
-        return result;
+        return isolated_provider_result(cancel, request.deadline,
+            "decompiler.provider.cli.isolated_execution_required");
     }
 
 private:
@@ -409,54 +274,8 @@ public:
         const decompiler_provider_request_t& request,
         const cancellation_token_t& cancel) override
     {
-        const auto started = std::chrono::steady_clock::now();
-        if (cancel.stop_requested() || started >= request.deadline)
-            return stopped_provider_result(cancel, request.deadline);
-        if (!request_matches_descriptor(request, descriptor_))
-            return rejected_provider_result("decompiler.provider.jvm.request");
-        if (!supports_language(request.cache_key.language))
-            return unsupported_provider_result("decompiler.provider.jvm.language_unsupported");
-        const auto context = std::dynamic_pointer_cast<const jvm_ssa_provider_context_t>(request.context);
-        if (!context || !context->input())
-            return rejected_provider_result("decompiler.provider.jvm.context");
-        const auto& input = *context->input();
-        if (input.entity != request.cache_key.entity ||
-            !equal_provider_identity(input.provider, descriptor_.identity) ||
-            !equal_language_identity(input.language, request.cache_key.language) ||
-            input.workspace_generation != request.cache_key.workspace_generation ||
-            input.type_graph_revision != request.cache_key.type_graph_revision) {
-            return rejected_provider_result("decompiler.provider.jvm.binding");
-        }
-        const auto source = jvm_ssa::decompile_method(input);
-        decompiler_provider_result_t result;
-        result.diagnostics = source.diagnostics;
-        if (!source.succeeded() || !source.provider_ir || !source.hir || !source.type_graph ||
-            !validate_provider_ir(*source.provider_ir).valid() ||
-            !validate_hir_function(*source.hir).valid() ||
-            !validate_type_graph(*source.type_graph).valid() ||
-            source.provider_ir->entity != request.cache_key.entity ||
-            source.hir->entity != request.cache_key.entity ||
-            source.type_graph->entity != request.cache_key.entity ||
-            !equal_provider_identity(source.provider_ir->provider, descriptor_.identity) ||
-            !equal_language_identity(source.provider_ir->language, request.cache_key.language) ||
-            source.hir->provider_ir_hash != stable_serialization_hash(*source.provider_ir) ||
-            source.hir->type_graph_revision != request.cache_key.type_graph_revision ||
-            source.type_graph->revision != request.cache_key.type_graph_revision ||
-            source.hir->return_type_id == 0) {
-            result.status = decompiler_provider_execution_status_t::failed;
-            ensure_failure_diagnostic(result, "decompiler.provider.jvm.output_rejected");
-            finish_provider_result(result, started, cancel, request.deadline);
-            return result;
-        }
-        decompiler_provider_artifacts_t artifacts;
-        artifacts.provider_ir = *source.provider_ir;
-        artifacts.hir = *source.hir;
-        artifacts.type_graph = *source.type_graph;
-        artifacts.return_type_id = source.hir->return_type_id;
-        result.artifacts = std::move(artifacts);
-        result.status = decompiler_provider_execution_status_t::completed;
-        finish_provider_result(result, started, cancel, request.deadline);
-        return result;
+        return isolated_provider_result(cancel, request.deadline,
+            "decompiler.provider.jvm.isolated_execution_required");
     }
 
 private:
@@ -485,55 +304,8 @@ public:
         const decompiler_provider_request_t& request,
         const cancellation_token_t& cancel) override
     {
-        const auto started = std::chrono::steady_clock::now();
-        if (cancel.stop_requested() || started >= request.deadline)
-            return stopped_provider_result(cancel, request.deadline);
-        if (!request_matches_descriptor(request, descriptor_))
-            return rejected_provider_result("decompiler.provider.dalvik.request");
-        if (!supports_language(request.cache_key.language))
-            return unsupported_provider_result("decompiler.provider.dalvik.language_unsupported");
-        const auto context = std::dynamic_pointer_cast<const dalvik_ssa_provider_context_t>(request.context);
-        if (!context || !context->capture())
-            return rejected_provider_result("decompiler.provider.dalvik.context");
-        const auto& capture = *context->capture();
-        if (capture.request.entity != request.cache_key.entity ||
-            !equal_provider_identity(capture.request.provider, descriptor_.identity) ||
-            !equal_language_identity(capture.request.language, request.cache_key.language) ||
-            capture.request.workspace_generation != request.cache_key.workspace_generation ||
-            capture.request.type_graph_revision != request.cache_key.type_graph_revision) {
-            return rejected_provider_result("decompiler.provider.dalvik.binding");
-        }
-        const auto source = dalvik_ssa::normalize(capture);
-        decompiler_provider_result_t result;
-        result.diagnostics = source.diagnostics;
-        if (!source.succeeded() || !source.artifacts ||
-            !validate_provider_ir(source.artifacts->provider_ir).valid() ||
-            !validate_hir_function(source.artifacts->hir).valid() ||
-            !validate_type_graph(source.artifacts->type_graph).valid() ||
-            source.artifacts->provider_ir.entity != request.cache_key.entity ||
-            source.artifacts->hir.entity != request.cache_key.entity ||
-            source.artifacts->type_graph.entity != request.cache_key.entity ||
-            !equal_provider_identity(source.artifacts->provider_ir.provider, descriptor_.identity) ||
-            !equal_language_identity(source.artifacts->provider_ir.language, request.cache_key.language) ||
-            source.artifacts->hir.provider_ir_hash !=
-                stable_serialization_hash(source.artifacts->provider_ir) ||
-            source.artifacts->hir.type_graph_revision != request.cache_key.type_graph_revision ||
-            source.artifacts->type_graph.revision != request.cache_key.type_graph_revision ||
-            source.artifacts->hir.return_type_id == 0) {
-            result.status = decompiler_provider_execution_status_t::failed;
-            ensure_failure_diagnostic(result, "decompiler.provider.dalvik.output_rejected");
-            finish_provider_result(result, started, cancel, request.deadline);
-            return result;
-        }
-        decompiler_provider_artifacts_t artifacts;
-        artifacts.provider_ir = source.artifacts->provider_ir;
-        artifacts.hir = source.artifacts->hir;
-        artifacts.type_graph = source.artifacts->type_graph;
-        artifacts.return_type_id = source.artifacts->hir.return_type_id;
-        result.artifacts = std::move(artifacts);
-        result.status = decompiler_provider_execution_status_t::completed;
-        finish_provider_result(result, started, cancel, request.deadline);
-        return result;
+        return isolated_provider_result(cancel, request.deadline,
+            "decompiler.provider.dalvik.isolated_execution_required");
     }
 
 private:
@@ -554,33 +326,33 @@ struct decompiler_provider_registry_t::state_t {
 };
 
 ghidra_native_provider_context_t::ghidra_native_provider_context_t(
-    std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t> artifacts)
-    : artifacts_(std::move(artifacts))
+    std::shared_ptr<const std::vector<std::uint8_t>> snapshot,
+    sha256_digest_t snapshot_hash)
+    : snapshot_(std::move(snapshot)), snapshot_hash_(snapshot_hash)
 {
 }
 
-const std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t>&
-ghidra_native_provider_context_t::artifacts() const noexcept
+const std::shared_ptr<const std::vector<std::uint8_t>>&
+ghidra_native_provider_context_t::snapshot() const noexcept
 {
-    return artifacts_;
+    return snapshot_;
+}
+
+const sha256_digest_t& ghidra_native_provider_context_t::snapshot_hash() const noexcept
+{
+    return snapshot_hash_;
 }
 
 managed_cli_provider_context_t::managed_cli_provider_context_t(
-    std::shared_ptr<const managed_cli::analysis_t> analysis,
-    const std::uint64_t return_type_id)
-    : analysis_(std::move(analysis)), return_type_id_(return_type_id)
+    std::shared_ptr<const managed_cli::request_t> request)
+    : request_(std::move(request))
 {
 }
 
-const std::shared_ptr<const managed_cli::analysis_t>&
-managed_cli_provider_context_t::analysis() const noexcept
+const std::shared_ptr<const managed_cli::request_t>&
+managed_cli_provider_context_t::request() const noexcept
 {
-    return analysis_;
-}
-
-std::uint64_t managed_cli_provider_context_t::return_type_id() const noexcept
-{
-    return return_type_id_;
+    return request_;
 }
 
 jvm_ssa_provider_context_t::jvm_ssa_provider_context_t(
@@ -610,9 +382,9 @@ dalvik_ssa_provider_context_t::capture() const noexcept
 decompiler_builtin_provider_config_t::decompiler_builtin_provider_config_t()
 {
     native.isolated = true;
-    cli.isolated = false;
-    jvm.isolated = false;
-    dalvik.isolated = false;
+    cli.isolated = true;
+    jvm.isolated = true;
+    dalvik.isolated = true;
 }
 
 bool decompiler_provider_result_t::succeeded() const noexcept

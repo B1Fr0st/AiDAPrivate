@@ -258,12 +258,14 @@ routing_test_result_t test_metadata_effect_fields_for_extensions() {
 
     const auto* calc_meta = find_routing_metadata("calculator");
     if (!calc_meta) { r.message = "missing calculator metadata"; return r; }
-    if (calc_meta->effect != protocol::tool_effect_t::unspecified) { r.message = "calculator effect should be unspecified"; return r; }
+    if (calc_meta->effect != protocol::tool_effect_t::registry_read) { r.message = "calculator effect should be registry_read"; return r; }
+    if (calc_meta->lock != protocol::effect_lock_t::registry_read) { r.message = "calculator lock should be registry_read"; return r; }
     if (!calc_meta->read_only) { r.message = "calculator should be read_only"; return r; }
 
     const auto* calc2_meta = find_routing_metadata("calculate");
     if (!calc2_meta) { r.message = "missing calculate metadata"; return r; }
-    if (calc2_meta->effect != protocol::tool_effect_t::unspecified) { r.message = "calculate effect should be unspecified"; return r; }
+    if (calc2_meta->effect != protocol::tool_effect_t::registry_read) { r.message = "calculate effect should be registry_read"; return r; }
+    if (calc2_meta->lock != protocol::effect_lock_t::registry_read) { r.message = "calculate lock should be registry_read"; return r; }
     r.passed = true;
     return r;
 }
@@ -444,7 +446,7 @@ routing_test_result_t test_list_instances_empty_resolver() {
     const auto& structured = result.structured_content();
     auto instances = json_array(structured, "instances");
     if (!instances.empty()) { r.message = "expected empty instances array"; return r; }
-    if (json_int(structured, "count") != 0) { r.message = "expected count=0"; return r; }
+    if (structured.contains("count")) { r.message = "generated list_instances output must not contain count"; return r; }
     r.passed = true;
     return r;
 }
@@ -497,7 +499,7 @@ routing_test_result_t test_list_instances_multiple_targets() {
     const auto& structured = result.structured_content();
     auto instances = json_array(structured, "instances");
     if (instances.size() != 10) { r.message = "expected 10 instances, got " + std::to_string(instances.size()); return r; }
-    if (json_int(structured, "count") != 10) { r.message = "expected count=10"; return r; }
+    if (structured.contains("count")) { r.message = "generated list_instances output must not contain count"; return r; }
     r.passed = true;
     return r;
 }
@@ -530,8 +532,9 @@ routing_test_result_t test_list_instances_include_retired_flag() {
         return r;
     }
     const auto& instances = json_array(with_retired.structured_content(), "instances");
+    const auto& identities = json_array(with_retired.aida_metadata(), "instance_identities");
     if (instances.size() != 1 || json_int(instances[0], "pid") != 42 ||
-        !json_bool(instances[0], "retired")) {
+        identities.size() != 1 || !json_bool(identities[0], "retired")) {
         r.message = "include_retired did not return the retired target identity";
         return r;
     }
@@ -978,19 +981,24 @@ routing_test_result_t test_list_instances_metadata_fields() {
     auto instances = json_array(structured, "instances");
     if (instances.empty()) { r.message = "expected 1 instance"; return r; }
     const auto& inst = instances[0];
-    if (!inst.contains("target_id")) { r.message = "missing target_id field"; return r; }
     if (!inst.contains("pid")) { r.message = "missing pid field"; return r; }
     if (!inst.contains("bin_name")) { r.message = "missing bin_name field"; return r; }
-    if (!inst.contains("generation")) { r.message = "missing generation field"; return r; }
-    if (!inst.contains("attach_generation")) { r.message = "missing attach_generation field"; return r; }
-    if (!inst.contains("live")) { r.message = "missing live field"; return r; }
-    if (!inst.contains("process_creation_identity")) { r.message = "missing process_creation_identity field"; return r; }
-    if (!inst.contains("revision")) { r.message = "missing revision field"; return r; }
+    if (inst.size() != 2) { r.message = "generated instance output contains extension fields"; return r; }
     if (json_int(inst, "pid") != 999) { r.message = "pid mismatch"; return r; }
     if (json_string(inst, "bin_name") != "metadata_test.exe") { r.message = "bin_name mismatch"; return r; }
     const auto& meta = result.aida_metadata();
     if (!meta.contains("resolver_target_count")) { r.message = "missing resolver_target_count in metadata"; return r; }
     if (json_int(meta, "resolver_target_count") != 1) { r.message = "resolver_target_count should be 1"; return r; }
+    const auto& identities = json_array(meta, "instance_identities");
+    if (identities.size() != 1 || !identities[0].contains("target_id") ||
+        !identities[0].contains("generation") ||
+        !identities[0].contains("attach_generation") ||
+        !identities[0].contains("live") ||
+        !identities[0].contains("process_creation_identity") ||
+        !identities[0].contains("revision")) {
+        r.message = "list_instances identity metadata is incomplete";
+        return r;
+    }
     r.passed = true;
     return r;
 }

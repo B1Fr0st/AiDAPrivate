@@ -39,14 +39,15 @@ namespace mcp_standalone
         json        data;
         std::string error_code;
         json        error_details;
+        json        meta = json::object();
 
-        static tool_result_t ok(const char* t) { return {true, std::string(t), {}, {}, {}}; }
-        static tool_result_t ok(const std::string& t) { return {true, t, {}, {}, {}}; }
-        static tool_result_t ok(const json& j) { return {true, j.dump(2), j, {}, {}}; }
-        static tool_result_t ok(const std::string& t, const json& d) { return {true, t, d, {}, {}}; }
-        static tool_result_t error(const std::string& e) { return {false, e, {}, {}, {}}; }
-        static tool_result_t error(const std::string& e, const json& d) { return {false, e, d, {}, {}}; }
-        static tool_result_t error(const std::string& e, const std::string& code, const json& d = json::object()) { return {false, e, d, code, d}; }
+        static tool_result_t ok(const char* t) { return {true, std::string(t), {}, {}, {}, {}}; }
+        static tool_result_t ok(const std::string& t) { return {true, t, {}, {}, {}, {}}; }
+        static tool_result_t ok(const json& j) { return {true, j.dump(2), j, {}, {}, {}}; }
+        static tool_result_t ok(const std::string& t, const json& d) { return {true, t, d, {}, {}, {}}; }
+        static tool_result_t error(const std::string& e) { return {false, e, {}, {}, {}, {}}; }
+        static tool_result_t error(const std::string& e, const json& d) { return {false, e, d, {}, {}, {}}; }
+        static tool_result_t error(const std::string& e, const std::string& code, const json& d = json::object()) { return {false, e, d, code, d, {}}; }
     };
 
     struct tool_param_t
@@ -168,6 +169,9 @@ namespace mcp_standalone
             const json& params,
             const workspace_request_context_t& context)> workspace_handler;
         json input_schema;
+        json output_schema;
+        json annotations;
+        bool target_independent = false;
     };
 
     using tool_validation_hook_t = std::function<tool_result_t(const tool_def_t&, const json&)>;

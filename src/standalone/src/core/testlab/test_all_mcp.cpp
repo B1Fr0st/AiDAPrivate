@@ -7,6 +7,7 @@
 #include "test_all_features.hpp"
 
 #include "../mcp/mcp_standalone.hpp"
+#include "../mcp/compat/ida_contracts_generated.hpp"
 #include "../mcp/ida_compat_schemas.hpp"
 #include "../mcp/schema_validator.hpp"
 #include "../ai/standalone_chat.hpp"
@@ -92,6 +93,8 @@
 namespace test_all_features {
 
 namespace {
+
+    namespace mcp_contract_compat = aida::standalone::mcp::compat;
 
     std::set<std::string> g_invoked_tools;
     uint32_t g_mcp_target_pid = 0;
@@ -20534,47 +20537,71 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 ++valid;
             }
 
-            const auto validator = mcp_standalone::ida_compat::schema_validator_status();
-            if (!validator.valid)
-                throw std::runtime_error("IDA schema validator unavailable: " + validator.summary());
-            const auto read_only_names = mcp_standalone::ida_compat::get_read_only_tool_names();
-            const auto mutation_names = mcp_standalone::ida_compat::get_mutation_tool_names();
-            if (read_only_names.size() != 27 || mutation_names.size() != 15)
-                throw std::runtime_error("IDA compatibility inventory must contain 27 read-only and 15 mutation registrations");
-            std::set<std::string> required(read_only_names.begin(), read_only_names.end());
-            required.insert(mutation_names.begin(), mutation_names.end());
-            if (required.size() != 42 || required.count("list_instances") != 1 ||
-                required.count("calculator") != 1 || required.count("calculate") != 1 ||
-                required.count("py_eval") != 0)
-                throw std::runtime_error("IDA compatibility inventory identity mismatch");
-
-            for (const auto& name : required) {
+            if (mcp_contract_compat::contract_count() !=
+                    mcp_contract_compat::k_archive_tool_count ||
+                mcp_contract_compat::k_archive_tool_count +
+                    mcp_contract_compat::k_aida_extension_count !=
+                    mcp_contract_compat::k_union_tool_count)
+                throw std::runtime_error("generated MCP contract cardinality mismatch");
+            const auto* descriptors = mcp_contract_compat::contracts();
+            if (!descriptors)
+                throw std::runtime_error("generated MCP descriptors are unavailable");
+            std::set<std::string> union_names;
+            for (std::size_t index = 0;
+                 index < mcp_contract_compat::contract_count(); ++index) {
+                const auto& descriptor = descriptors[index];
+                const std::string name(descriptor.name);
+                if (!union_names.emplace(name).second)
+                    throw std::runtime_error("duplicate generated MCP contract: " + name);
                 const auto found = by_name.find(name);
-                const auto* schema = mcp_standalone::ida_compat::find_schema(name);
-                if (found == by_name.end() || !schema)
-                    throw std::runtime_error("missing IDA compatibility registration: " + name);
+                if (found == by_name.end())
+                    throw std::runtime_error("missing generated MCP registration: " + name);
+                const auto input_schema = mcp_standalone::json::parse(
+                    descriptor.input_schema_json.begin(), descriptor.input_schema_json.end());
+                const auto output_schema = mcp_standalone::json::parse(
+                    descriptor.output_schema_json.begin(), descriptor.output_schema_json.end());
+                const auto annotations = mcp_standalone::json::parse(
+                    descriptor.annotations_json.begin(), descriptor.annotations_json.end());
                 const auto& tool = *found->second;
-                const bool mutation = std::find(mutation_names.begin(), mutation_names.end(), name) !=
-                    mutation_names.end();
-                const bool target_dependent = mcp_standalone::ida_compat::is_target_dependent_tool(name);
-                if (tool.input_schema != *schema || tool.read_only == mutation ||
+                if (tool.input_schema != input_schema ||
+                    tool.output_schema != output_schema ||
+                    tool.annotations != annotations ||
+                    tool.read_only != descriptor.read_only ||
                     tool.visibility != mcp_standalone::tool_visibility_t::external_visible ||
-                    static_cast<bool>(tool.workspace_handler) != target_dependent ||
-                    static_cast<bool>(tool.handler) == target_dependent)
-                    throw std::runtime_error("IDA compatibility schema/classification mismatch: " + name);
-                const auto rejection = srv->call_registered_tool(name,
-                    mcp_standalone::json{{"unexpected", true}}, true);
-                if (rejection.success || rejection.error_code != "MCP_TOOL_INPUT_SCHEMA_INVALID")
-                    throw std::runtime_error("IDA pre-dispatch schema validation did not reject: " + name);
+                    tool.target_independent == descriptor.target_dependent ||
+                    static_cast<bool>(tool.workspace_handler) != descriptor.target_dependent ||
+                    static_cast<bool>(tool.handler) == descriptor.target_dependent)
+                    throw std::runtime_error("generated MCP definition mismatch: " + name);
             }
-            if (by_name.count("py_eval") != 0 || by_name.at("infer_types")->read_only ||
+            for (const auto extension : mcp_contract_compat::k_aida_extension_names) {
+                const std::string name(extension);
+                if (!union_names.emplace(name).second || by_name.count(name) != 1)
+                    throw std::runtime_error("MCP extension registration mismatch: " + name);
+                const auto& tool = *by_name.at(name);
+                if (tool.input_schema.is_null() || tool.output_schema.is_null() ||
+                    tool.annotations.is_null())
+                    throw std::runtime_error("MCP extension definition is incomplete: " + name);
+            }
+            if (union_names.size() != mcp_contract_compat::k_union_tool_count ||
+                by_name.count("py_eval") != 0 || by_name.at("infer_types")->read_only ||
                 by_name.at("analyze_funcs")->read_only)
                 throw std::runtime_error("excluded tool or mutation classification mismatch");
 
+            const auto rejection = srv->call_registered_tool("int_convert",
+                mcp_standalone::json{{"unexpected", true}}, true);
+            if (rejection.success || rejection.error_code != "MCP_TOOL_INPUT_SCHEMA_INVALID")
+                throw std::runtime_error("int_convert pre-dispatch schema validation failed");
             const auto conversion = srv->call_registered_tool("int_convert",
-                mcp_standalone::json{{"value", "2A"}, {"from_format", "hex"},
-                                     {"to_format", "decimal"}}, true);
-            if (!conversion.success || conversion.data.value("output", std::string()) != "42")
+                mcp_standalone::json{{"inputs", mcp_standalone::json{{"text", "42"}}}}, true);
+            if (!conversion.success || !conversion.data.is_object() ||
+                conversion.data.contains("_meta") ||
+                !conversion.data.contains("result") ||
+                !conversion.data["result"].is_array() ||
+                conversion.data["result"].size() != 1 ||
+                conversion.data["result"][0].value("input", std::string()) != "42" ||
+                conversion.data["result"][0]["result"].value(
+                    "decimal", std::string()) != "42" ||
+                !conversion.meta.contains("aida"))
                 throw std::runtime_error("int_convert production handler failed");
             const mcp_standalone::json calculation = {
                 {"expression", "(1 << 65) + 3"}, {"format", "decimal"}
@@ -20597,12 +20624,20 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
             const auto instances = srv->call_registered_tool("list_instances",
                 mcp_standalone::json::object(), true);
             if (!instances.success || !instances.data.contains("instances") ||
-                !instances.data["instances"].is_array())
+                !instances.data["instances"].is_array() ||
+                instances.data.contains("count") || instances.data.contains("_meta") ||
+                std::any_of(instances.data["instances"].begin(),
+                    instances.data["instances"].end(), [](const auto& instance) {
+                        return !instance.is_object() || instance.size() != 2 ||
+                            !instance.contains("pid") || !instance.contains("bin_name");
+                    }))
                 throw std::runtime_error("list_instances production handler failed");
 
             log_msg(hf, tag,
-                "PASS -- general=%d hidden=%d ida_read_only=%zu ida_mutation=%zu exact_schemas=42 handler_smoke=int_convert,list_instances,calculator,calculate",
-                valid, hidden, read_only_names.size(), mutation_names.size());
+                "PASS -- general=%d hidden=%d generated=%zu extensions=%zu union=%zu exact_input_output_annotations=true handler_smoke=int_convert,list_instances,calculator,calculate",
+                valid, hidden, mcp_contract_compat::k_archive_tool_count,
+                mcp_contract_compat::k_aida_extension_count,
+                mcp_contract_compat::k_union_tool_count);
             passed.fetch_add(1);
         } catch (const std::exception& ex) {
             log_msg(hf, tag, "FAIL -- %s", ex.what());
@@ -20724,29 +20759,36 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 }
             }
 
-            const auto ida_read_only = mcp_standalone::ida_compat::get_read_only_tool_names();
-            const auto ida_mutations = mcp_standalone::ida_compat::get_mutation_tool_names();
-            auto verify_listed_contract = [&](const std::string& name, bool read_only) {
-                const auto found = listed_tools.find(name);
-                const auto* schema = mcp_standalone::ida_compat::find_schema(name);
-                return found != listed_tools.end() && schema &&
-                    found->second.value("read_only", !read_only) == read_only &&
-                    found->second.value("visibility", std::string()) == "external_visible" &&
-                    found->second.contains("inputSchema") && found->second["inputSchema"] == *schema &&
-                    found->second["annotations"].value("readOnlyHint", !read_only) == read_only &&
-                    found->second["annotations"].value("destructiveHint", read_only) == !read_only;
-            };
-            for (const auto& name : ida_read_only) {
-                if (!verify_listed_contract(name, true)) {
-                    log_msg(hf, tag, "FAIL -- tools/list IDA read-only contract mismatch tool=%s",
-                        name.c_str());
-                    failed.fetch_add(1);
-                    return;
-                }
+            const auto* descriptors = mcp_contract_compat::contracts();
+            if (!descriptors || mcp_contract_compat::contract_count() !=
+                    mcp_contract_compat::k_archive_tool_count) {
+                log_msg(hf, tag, "FAIL -- generated contract inventory unavailable");
+                failed.fetch_add(1);
+                return;
             }
-            for (const auto& name : ida_mutations) {
-                if (!verify_listed_contract(name, false)) {
-                    log_msg(hf, tag, "FAIL -- tools/list IDA mutation contract mismatch tool=%s",
+            for (std::size_t index = 0;
+                 index < mcp_contract_compat::contract_count(); ++index) {
+                const auto& descriptor = descriptors[index];
+                const std::string name(descriptor.name);
+                const auto found = listed_tools.find(name);
+                const auto input_schema = mcp_standalone::json::parse(
+                    descriptor.input_schema_json.begin(), descriptor.input_schema_json.end());
+                const auto output_schema = mcp_standalone::json::parse(
+                    descriptor.output_schema_json.begin(), descriptor.output_schema_json.end());
+                const auto annotations = mcp_standalone::json::parse(
+                    descriptor.annotations_json.begin(), descriptor.annotations_json.end());
+                if (found == listed_tools.end() ||
+                    found->second.value("read_only", !descriptor.read_only) !=
+                        descriptor.read_only ||
+                    found->second.value("visibility", std::string()) != "external_visible" ||
+                    !found->second.contains("inputSchema") ||
+                    found->second["inputSchema"] != input_schema ||
+                    !found->second.contains("outputSchema") ||
+                    found->second["outputSchema"] != output_schema ||
+                    !found->second.contains("annotations") ||
+                    found->second["annotations"] != annotations) {
+                    log_msg(hf, tag,
+                        "FAIL -- tools/list generated contract mismatch tool=%s",
                         name.c_str());
                     failed.fetch_add(1);
                     return;
@@ -20758,13 +20800,23 @@ try{window.addEventListener('load',function(){run('load');},{once:true});}catch(
                 {"id", 3},
                 {"method", "tools/call"},
                 {"params", {
-                    {"name", "debugger_get_attached"},
-                    {"arguments", mcp_standalone::json::object()}
+                    {"name", "int_convert"},
+                    {"arguments", mcp_standalone::json{
+                        {"inputs", mcp_standalone::json{{"text", "42"}}}
+                    }}
                 }}
             };
             auto call_resp = mcp_standalone::json::parse(mcp_standalone::handle_body(srv, call_req.dump()));
-            if (!call_resp.contains("result") && !call_resp.contains("error")) {
-                log_msg(hf, tag, "FAIL -- tools/call response missing result/error");
+            if (!call_resp.contains("result") ||
+                !call_resp["result"].contains("structuredContent") ||
+                !call_resp["result"]["structuredContent"].is_object() ||
+                call_resp["result"]["structuredContent"].contains("_meta") ||
+                !call_resp["result"].contains("_meta") ||
+                !call_resp["result"]["_meta"].contains("aida") ||
+                !call_resp["result"]["_meta"]["aida"].is_object() ||
+                call_resp["result"].value("isError", false)) {
+                log_msg(hf, tag,
+                    "FAIL -- successful tools/call omitted structuredContent or top-level _meta.aida");
                 failed.fetch_add(1);
                 return;
             }

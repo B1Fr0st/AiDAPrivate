@@ -601,7 +601,7 @@ workspace_result_t<response_t> deserialize_response(const request_t& request, co
         }
         if (kind != "result")
             throw decode_error_t("worker response kind is invalid");
-        require_exact_fields(envelope, {"schema", "schemaVersion", "kind", "sequence", "requestId", "moduleHash", "metadataToken", "offlineLockHash", "provider", "identity", "source", "tokenMap", "typeGraph", "ir", "unknowns", "diagnostics"});
+        require_exact_fields(envelope, {"schema", "schemaVersion", "kind", "sequence", "requestId", "moduleHash", "metadataToken", "offlineLockHash", "provider", "identity", "source", "tokenMap", "typeGraph", "returnTypeId", "ir", "unknowns", "diagnostics"});
         validate_response_header(envelope, request, "result");
         const auto& cli = std::get<cli_decompiler_entity_identity_t>(request.entity.identity);
 
@@ -682,6 +682,9 @@ workspace_result_t<response_t> deserialize_response(const request_t& request, co
             parsed.provenance = decompiler_fact_provenance_t::loader_metadata;
             types.edges.push_back(std::move(parsed));
         }
+        const auto return_type_id = require_u64(envelope, "returnTypeId");
+        if (return_type_id == 0 || known_type_ids.find(return_type_id) == known_type_ids.end())
+            throw decode_error_t("worker return type is not present in the type graph");
 
         provider_ir_t ir;
         ir.provider.provider = decompiler_provider_id_t::ilspy_cli;
@@ -813,7 +816,8 @@ workspace_result_t<response_t> deserialize_response(const request_t& request, co
             throw decode_error_t("worker typed provider IR violates the C03 contract");
         auto diagnostics = ir.diagnostics;
         response_t result;
-        result.analysis = analysis_t{std::move(ir), std::move(types), source_text, source_hash, std::move(token_map), std::move(diagnostics)};
+        result.analysis = analysis_t{std::move(ir), std::move(types), return_type_id,
+            source_text, source_hash, std::move(token_map), std::move(diagnostics)};
         return workspace_result_t<response_t>::success(std::move(result));
     } catch (const decode_error_t& exception) {
         return failure<response_t>(workspace_error_code_t::decode_failure, exception.what(), "managed_cli.response");

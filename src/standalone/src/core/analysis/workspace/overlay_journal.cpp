@@ -2,10 +2,9 @@
 
 #include "../incremental_reanalysis.hpp"
 #include "../overlay_projection.hpp"
-#include "analysis_metrics.hpp"
+#include "../spill_provider.hpp"
 #include "checked_range.hpp"
 #include "decompiler_service.hpp"
-#include "search_index.hpp"
 
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
@@ -22,6 +21,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace aida::analysis {
@@ -1325,6 +1325,10 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
                 "static overlay projection was cancelled",
                 "overlay_journal.projection"));
     }
+    auto binding = workspace.verify_provider_binding();
+    if (!binding)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            binding.error());
     std::vector<std::uint8_t> bytes;
     try {
         bytes.resize(static_cast<std::size_t>(target.image_size));
@@ -1337,7 +1341,7 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
     const auto image = workspace.image();
     if (image) {
         if (image->image_size() != target.image_size ||
-            image->headers_size() > workspace.provider().size() ||
+            image->headers_size() > workspace.source_provider().size() ||
             image->headers_size() > target.image_size) {
             return workspace_result_t<std::vector<std::uint8_t>>::failure(
                 make_workspace_error(workspace_error_code_t::target_conflict,
@@ -1345,7 +1349,7 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
                                      "overlay_journal.projection"));
         }
         if (image->headers_size() != 0) {
-            auto read = workspace.provider().read_exact(
+            auto read = workspace.source_provider().read_exact(
                 0, bytes.data(), image->headers_size(), cancel);
             if (!read)
                 return workspace_result_t<std::vector<std::uint8_t>>::failure(
@@ -1366,8 +1370,8 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
                 mapping.target_space != address_space_id_t::relative_virtual ||
                 mapping.size == 0)
                 continue;
-            if (mapping.source_start > workspace.provider().size() ||
-                mapping.size > workspace.provider().size() - mapping.source_start ||
+            if (mapping.source_start > workspace.source_provider().size() ||
+                mapping.size > workspace.source_provider().size() - mapping.source_start ||
                 mapping.target_start > target.image_size ||
                 mapping.size > target.image_size - mapping.target_start) {
                 return workspace_result_t<std::vector<std::uint8_t>>::failure(
@@ -1375,7 +1379,7 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
                                          "normalized overlay mapping exceeds image bounds",
                                          "overlay_journal.projection"));
             }
-            auto read = workspace.provider().read_exact(
+            auto read = workspace.source_provider().read_exact(
                 mapping.source_start,
                 bytes.data() + static_cast<std::size_t>(mapping.target_start),
                 mapping.size, cancel);
@@ -1393,8 +1397,8 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
             const auto destination =
                 static_cast<std::uint64_t>(section.virtual_address);
             const auto size = static_cast<std::uint64_t>(section.raw_size);
-            if (source > workspace.provider().size() ||
-                size > workspace.provider().size() - source ||
+            if (source > workspace.source_provider().size() ||
+                size > workspace.source_provider().size() - source ||
                 destination > target.image_size ||
                 size > target.image_size - destination) {
                 return workspace_result_t<std::vector<std::uint8_t>>::failure(
@@ -1402,7 +1406,7 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
                                          "PE overlay section exceeds image bounds",
                                          "overlay_journal.projection"));
             }
-            auto read = workspace.provider().read_exact(
+            auto read = workspace.source_provider().read_exact(
                 source,
                 bytes.data() + static_cast<std::size_t>(destination),
                 size, cancel);
@@ -1413,88 +1417,288 @@ workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
         copied_mapping = true;
     }
     if (!copied_mapping) {
-        if (workspace.provider().size() < target.image_size) {
+        if (workspace.source_provider().size() < target.image_size) {
             return workspace_result_t<std::vector<std::uint8_t>>::failure(
                 make_workspace_error(workspace_error_code_t::provider_unavailable,
                                      "overlay target exceeds the immutable provider",
                                      "overlay_journal.projection"));
         }
-        auto read = workspace.provider().read_exact(
+        auto read = workspace.source_provider().read_exact(
             0, bytes.data(), target.image_size, cancel);
         if (!read)
             return workspace_result_t<std::vector<std::uint8_t>>::failure(
                 read.error());
     }
+    binding = workspace.verify_provider_binding();
+    if (!binding)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            binding.error());
     return workspace_result_t<std::vector<std::uint8_t>>::success(
         std::move(bytes));
 }
 
-struct overlay_workspace_generation_t final {
-    std::shared_ptr<const analysis_snapshot_t> snapshot;
-    std::shared_ptr<search_index_t> search_index;
-    std::size_t retired_index_entries = 0;
+struct overlay_provider_mapping_t final {
+    std::uint64_t source_start = 0;
+    std::uint64_t target_start = 0;
+    std::uint64_t size = 0;
 };
 
-workspace_result_t<overlay_workspace_generation_t>
-prepare_workspace_generation(
-    const std::shared_ptr<analysis_workspace_t>& workspace,
-    const projection_invalidation_set_t& invalidation,
-    std::uint64_t source_generation,
-    std::uint64_t target_generation,
-    std::uint64_t target_overlay_revision,
-    const cancellation_token_t& cancel) {
-    const auto publication = workspace->analysis_publication();
-    if (!publication || !publication->snapshot ||
-        publication->generation != source_generation) {
-        return workspace_result_t<overlay_workspace_generation_t>::failure(
-            make_workspace_error(workspace_error_code_t::stale_generation,
-                                 "workspace publication changed before overlay projection",
-                                 "overlay_journal.publication"));
+class overlay_generation_provider_t final : public byte_provider_t {
+public:
+    overlay_generation_provider_t(
+        std::shared_ptr<const spill_provider_t> storage,
+        std::optional<provider_member_metadata_t> member)
+        : storage_(std::move(storage)), identity_(storage_->identity()) {
+        identity_.member = std::move(member);
     }
-    const bool metadata_only =
-        invalidation.invalidated_stages == projection_stage_flag_t::none &&
-        invalidation.affected_ranges.empty();
-    overlay_workspace_generation_t result;
+
+    const byte_provider_identity_t& identity() const noexcept override {
+        return identity_;
+    }
+
+    std::uint64_t size() const noexcept override {
+        return storage_->size();
+    }
+
+    std::uint64_t maximum_contiguous_lease(
+        std::uint64_t offset) const noexcept override {
+        return storage_->maximum_contiguous_lease(offset);
+    }
+
+    workspace_result_t<byte_view_t> lease(
+        std::uint64_t offset, std::uint64_t size,
+        const cancellation_token_t& cancel) const override {
+        return storage_->lease(offset, size, cancel);
+    }
+
+private:
+    std::shared_ptr<const spill_provider_t> storage_;
+    byte_provider_identity_t identity_;
+};
+
+workspace_result_t<std::vector<overlay_provider_mapping_t>>
+overlay_provider_mappings(
+    const analysis_workspace_t& workspace,
+    std::uint64_t projected_size) {
+    const auto normalized = workspace.normalized_image();
+    if (!normalized || projected_size != normalized->image_size)
+        return workspace_result_t<std::vector<overlay_provider_mapping_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "overlay projection has no matching normalized image",
+                                 "overlay_journal.provider"));
+    const auto source_size = workspace.source_provider().size();
+    std::vector<overlay_provider_mapping_t> mappings;
     try {
-        auto next = metadata_only
-            ? std::make_shared<analysis_snapshot_t>(*publication->snapshot)
-            : std::make_shared<analysis_snapshot_t>();
-        next->binary_id = publication->binary_id;
-        next->load_profile_hash = publication->load_profile_hash;
-        next->generation = target_generation;
-        next->overlay_revision = target_overlay_revision;
-        next->normalized_image = publication->snapshot->normalized_image;
-        next->image = publication->snapshot->image;
-        if (!metadata_only) {
-            next->analysis_revision = 0;
-            next->baseline_complete = false;
+        mappings.reserve(normalized->address_mappings.size() + 1);
+        for (const auto& mapping : normalized->address_mappings) {
+            if (mapping.size == 0)
+                continue;
+            if (mapping.source_space == address_space_id_t::file_offset &&
+                mapping.target_space == address_space_id_t::relative_virtual) {
+                mappings.push_back(
+                    {mapping.source_start, mapping.target_start, mapping.size});
+            } else if (
+                mapping.source_space == address_space_id_t::relative_virtual &&
+                mapping.target_space == address_space_id_t::file_offset) {
+                mappings.push_back(
+                    {mapping.target_start, mapping.source_start, mapping.size});
+            }
         }
-        result.snapshot = std::static_pointer_cast<const analysis_snapshot_t>(next);
-        if (metadata_only && publication->search_index) {
-            result.retired_index_entries =
-                publication->search_index->record_count();
-            auto metrics = std::make_shared<analysis_metrics_t>(target_generation);
-            auto rebuilt = search_index_t::build(
-                result.snapshot,
-                publication->search_index->data_candidates(),
-                publication->search_index->switches(),
-                publication->search_index->types(),
-                std::move(metrics), publication->search_index->limits(), cancel);
-            if (!rebuilt)
-                return workspace_result_t<overlay_workspace_generation_t>::failure(
-                    rebuilt.error());
-            result.search_index = rebuilt.take_value();
-        } else if (publication->search_index) {
-            result.retired_index_entries = publication->search_index->record_count();
+        if (mappings.empty()) {
+            if (normalized->header_size != 0)
+                mappings.push_back({0, 0, normalized->header_size});
+            const auto append_regions = [&](const auto& regions) {
+                for (const auto& region : regions) {
+                    if (region.file_size != 0)
+                        mappings.push_back({region.file_offset,
+                                            region.virtual_address,
+                                            region.file_size});
+                }
+            };
+            if (normalized->sections.empty())
+                append_regions(normalized->segments);
+            else
+                append_regions(normalized->sections);
         }
-    } catch (...) {
-        return workspace_result_t<overlay_workspace_generation_t>::failure(
+        if (mappings.empty() && source_size >= projected_size)
+            mappings.push_back({0, 0, projected_size});
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::vector<overlay_provider_mapping_t>>::failure(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
-                                 "overlay workspace generation allocation failed",
-                                 "overlay_journal.publication"));
+                                 "overlay provider mapping allocation failed",
+                                 "overlay_journal.provider"));
     }
-    return workspace_result_t<overlay_workspace_generation_t>::success(
-        std::move(result));
+    if (mappings.empty())
+        return workspace_result_t<std::vector<overlay_provider_mapping_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "overlay image has no provider-backed ranges",
+                                 "overlay_journal.provider"));
+    for (const auto& mapping : mappings) {
+        if (mapping.source_start > source_size ||
+            mapping.size > source_size - mapping.source_start ||
+            mapping.target_start > projected_size ||
+            mapping.size > projected_size - mapping.target_start)
+            return workspace_result_t<std::vector<overlay_provider_mapping_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "overlay provider mapping exceeds image bounds",
+                                     "overlay_journal.provider"));
+    }
+    std::sort(mappings.begin(), mappings.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.source_start, lhs.target_start, lhs.size) <
+                   std::tie(rhs.source_start, rhs.target_start, rhs.size);
+        });
+    for (std::size_t index = 1; index < mappings.size(); ++index) {
+        const auto previous_end =
+            mappings[index - 1].source_start + mappings[index - 1].size;
+        if (mappings[index].source_start < previous_end)
+            return workspace_result_t<std::vector<overlay_provider_mapping_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "overlay provider mappings overlap in source space",
+                                     "overlay_journal.provider"));
+    }
+    auto target_order = mappings;
+    std::sort(target_order.begin(), target_order.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.target_start, lhs.source_start, lhs.size) <
+                   std::tie(rhs.target_start, rhs.source_start, rhs.size);
+        });
+    for (std::size_t index = 1; index < target_order.size(); ++index) {
+        const auto previous_end =
+            target_order[index - 1].target_start + target_order[index - 1].size;
+        if (target_order[index].target_start < previous_end)
+            return workspace_result_t<std::vector<overlay_provider_mapping_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "overlay provider mappings overlap in image space",
+                                     "overlay_journal.provider"));
+    }
+    return workspace_result_t<std::vector<overlay_provider_mapping_t>>::success(
+        std::move(mappings));
+}
+
+bool overlay_range_is_provider_backed(
+    const overlay_static_range_v9_t& range,
+    const std::vector<overlay_provider_mapping_t>& target_order) noexcept {
+    if (range.size == 0)
+        return false;
+    const auto range_end = range.offset + range.size;
+    std::uint64_t cursor = range.offset;
+    for (const auto& mapping : target_order) {
+        const auto mapping_end = mapping.target_start + mapping.size;
+        if (mapping_end <= cursor)
+            continue;
+        if (mapping.target_start > cursor)
+            return false;
+        cursor = (std::min)(range_end, mapping_end);
+        if (cursor == range_end)
+            return true;
+    }
+    return false;
+}
+
+workspace_result_t<std::shared_ptr<const byte_provider_t>>
+materialize_projected_provider(
+    const analysis_workspace_t& workspace,
+    const projection_result_t& prepared,
+    const cancellation_token_t& cancel) {
+    auto binding = workspace.verify_provider_binding();
+    if (!binding)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            binding.error());
+    auto mappings = overlay_provider_mappings(
+        workspace, prepared.projected_bytes.size());
+    if (!mappings)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            mappings.error());
+    auto target_order = mappings.value();
+    std::sort(target_order.begin(), target_order.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.target_start, lhs.source_start, lhs.size) <
+                   std::tie(rhs.target_start, rhs.source_start, rhs.size);
+        });
+    for (const auto& item : prepared.projected_state.items) {
+        const auto kind = overlay_operation_kind_for_item_v9(
+            item.first, item.second);
+        if (!kind)
+            return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "projected overlay item has no operation kind",
+                                     "overlay_journal.provider"));
+        if (*kind != overlay_operation_kind_v9_t::patch)
+            continue;
+        if (item.first.range.size != item.second.bytes.size() ||
+            !overlay_range_is_provider_backed(item.first.range, target_order))
+            return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+                make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                     "projected patch is not fully provider-backed",
+                                     "overlay_journal.provider"));
+    }
+
+    const auto source = workspace.source_provider_handle();
+    if (!source || source->size() == 0)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_unavailable,
+                                 "immutable overlay source provider is unavailable",
+                                 "overlay_journal.provider"));
+    spill_provider_options_t options;
+    options.max_spill_bytes = source->size();
+    std::uint64_t cursor = 0;
+    const auto label = workspace.identity().binary_id().to_hex() +
+        "-overlay-g" + std::to_string(prepared.new_generation) +
+        "-r" + std::to_string(prepared.revision);
+    auto storage = spill_provider_t::from_stream(
+        label,
+        [source, mappings = mappings.take_value(),
+         &projected_bytes = prepared.projected_bytes,
+         cursor](std::uint8_t* destination, std::size_t capacity,
+                 const cancellation_token_t& token) mutable
+            -> workspace_result_t<std::size_t> {
+            if (cursor == source->size())
+                return workspace_result_t<std::size_t>::success(0);
+            const auto amount = (std::min)(
+                static_cast<std::uint64_t>(capacity), source->size() - cursor);
+            auto read = source->read_exact(cursor, destination, amount, token);
+            if (!read)
+                return workspace_result_t<std::size_t>::failure(read.error());
+            const auto chunk_end = cursor + amount;
+            for (const auto& mapping : mappings) {
+                const auto mapping_end = mapping.source_start + mapping.size;
+                if (mapping_end <= cursor)
+                    continue;
+                if (mapping.source_start >= chunk_end)
+                    break;
+                const auto overlap_start = (std::max)(cursor, mapping.source_start);
+                const auto overlap_end = (std::min)(chunk_end, mapping_end);
+                const auto target = mapping.target_start +
+                    (overlap_start - mapping.source_start);
+                std::memcpy(
+                    destination + static_cast<std::size_t>(overlap_start - cursor),
+                    projected_bytes.data() + static_cast<std::size_t>(target),
+                    static_cast<std::size_t>(overlap_end - overlap_start));
+            }
+            cursor = chunk_end;
+            return workspace_result_t<std::size_t>::success(
+                static_cast<std::size_t>(amount));
+        },
+        options, cancel);
+    if (!storage)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            storage.error());
+    binding = workspace.verify_provider_binding();
+    if (!binding)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            binding.error());
+    try {
+        auto provider = std::make_shared<overlay_generation_provider_t>(
+            storage.take_value(), source->member_metadata());
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::success(
+            std::static_pointer_cast<const byte_provider_t>(std::move(provider)));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "overlay generation provider allocation failed",
+                                 "overlay_journal.provider"));
+    }
 }
 
 projection_invalidation_hook_result_t invalidate_decompiler_cache(
@@ -1615,7 +1819,7 @@ projection_finalize_result_t publish_projected_overlay(
     const projection_result_t& prepared,
     const std::shared_ptr<analysis_workspace_t>& workspace,
     const std::shared_ptr<workspace_database_t>& database,
-    const std::shared_ptr<overlay_workspace_generation_t>& generation,
+    const std::shared_ptr<const byte_provider_t>& projected_provider,
     std::function<workspace_result_t<void>()> persistence_finalizer,
     const cancellation_token_t& cancel) {
     try {
@@ -1627,14 +1831,18 @@ projection_finalize_result_t publish_projected_overlay(
                     request, workspace, database, cancel);
             };
         hooks.packed_index =
-            [workspace, generation, persistence_finalizer =
-                 std::move(persistence_finalizer)](
+            [workspace, projected_provider,
+             target_overlay_revision = prepared.revision,
+             preserve_analysis =
+                 prepared.invalidation.invalidated_stages ==
+                     projection_stage_flag_t::none &&
+                 prepared.invalidation.affected_ranges.empty(),
+             persistence_finalizer = std::move(persistence_finalizer)](
                 const packed_index_invalidation_request_t& request) {
                 projection_invalidation_hook_result_t result;
-                if (!generation || !generation->snapshot ||
-                    generation->snapshot->generation != request.target_generation) {
+                if (!projected_provider) {
                     result.detail =
-                        "packed-index generation does not match overlay publication";
+                        "projected byte provider is unavailable";
                     return result;
                 }
                 const auto source = workspace->analysis_publication();
@@ -1644,19 +1852,19 @@ projection_finalize_result_t publish_projected_overlay(
                         "workspace generation changed before packed-index publication";
                     return result;
                 }
-                auto published = workspace->publish_analysis_bundle(
+                auto published = workspace->publish_projected_generation(
                     request.source_generation,
                     source->snapshot->analysis_revision,
-                    generation->snapshot,
-                    generation->search_index,
-                    generation->snapshot->baseline_complete,
+                    request.target_generation,
+                    target_overlay_revision,
+                    projected_provider,
+                    preserve_analysis,
                     persistence_finalizer);
                 if (!published) {
                     result.detail = published.error().message;
                     return result;
                 }
-                result.invalidated_entry_count =
-                    generation->retired_index_entries;
+                result.invalidated_entry_count = published.value();
                 result.succeeded = true;
                 return result;
             };
@@ -1987,12 +2195,44 @@ workspace_result_t<std::shared_ptr<overlay_journal_t>> overlay_journal_t::open(
                                  "persisted overlay revision precedes the workspace revision",
                                  "overlay_journal.open"));
     }
+    std::shared_ptr<const byte_provider_t> recovered_provider;
+    if (journal->revision_ > current_revision) {
+        const auto target = journal->fixed_target();
+        auto immutable_image = materialize_static_image(
+            *owner, target, journal->cancellation_.token());
+        if (!immutable_image)
+            return attach_failure(immutable_image.error());
+        auto state = make_v9_preflight_state(
+            journal->snapshot(), *owner, target);
+        if (!state)
+            return attach_failure(state.error());
+        const std::string_view immutable_bytes(
+            reinterpret_cast<const char*>(immutable_image.value().data()),
+            immutable_image.value().size());
+        auto projected = overlay_projection_t::project(
+            state.value(), immutable_bytes, target.generation);
+        if (!projected)
+            return attach_failure(
+                projection_error(projected, "overlay_journal.open"));
+        if (projected.revision != journal->revision_ ||
+            projected.new_generation != target.generation)
+            return attach_failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "recovered overlay projection has inconsistent revisions",
+                "overlay_journal.open"));
+        auto provider = materialize_projected_provider(
+            *owner, projected, journal->cancellation_.token());
+        if (!provider)
+            return attach_failure(provider.error());
+        recovered_provider = provider.take_value();
+    }
     auto registered = owner->register_lifecycle_participant(journal);
     if (!registered)
         return attach_failure(registered.error());
     if (journal->revision_ > current_revision) {
         const auto restored = owner->restore_overlay_revision(current_revision,
-                                                              journal->revision_);
+                                                              journal->revision_,
+                                                              recovered_provider);
         if (!restored)
             return attach_failure(restored.error());
     }
@@ -2459,8 +2699,12 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     if (request.dry_run)
         return workspace_result_t<overlay_transaction_result_t>::success(std::move(dry_result));
 
+    auto projected_provider = materialize_projected_provider(
+        *workspace, prepared, cancel);
+    if (!projected_provider)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            projected_provider.error());
     std::shared_ptr<std::unordered_map<std::string, overlay_operation_t>> next_items;
-    std::shared_ptr<overlay_workspace_generation_t> workspace_generation;
     try {
         next_items = std::make_shared<
             std::unordered_map<std::string, overlay_operation_t>>();
@@ -2474,14 +2718,6 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 next_items->insert_or_assign(
                     keys[index], materialized_operation(request.operations[index]));
         }
-        auto generation = prepare_workspace_generation(
-            workspace, prepared.invalidation, prepared.source_generation,
-            prepared.new_generation, prepared.revision, cancel);
-        if (!generation)
-            return workspace_result_t<overlay_transaction_result_t>::failure(
-                generation.error());
-        workspace_generation = std::make_shared<overlay_workspace_generation_t>(
-            generation.take_value());
     } catch (...) {
         return workspace_result_t<overlay_transaction_result_t>::failure(
             make_workspace_error(
@@ -2713,7 +2949,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     mutation_lock.unlock();
     const auto finalized = publish_projected_overlay(
         preflight_state.value(), prepared, workspace, database_,
-        workspace_generation, std::move(persistence_finalizer), cancel);
+        projected_provider.value(), std::move(persistence_finalizer), cancel);
     if ((publication_epoch_.load(std::memory_order_acquire) & 1U) != 0)
         publication_epoch_.fetch_add(1, std::memory_order_release);
     if (!finalized)
@@ -2963,8 +3199,12 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                     : reanalysis.detail,
                 "overlay_journal.history"));
     }
+    auto projected_provider = materialize_projected_provider(
+        *workspace, prepared, cancel);
+    if (!projected_provider)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            projected_provider.error());
     std::shared_ptr<std::unordered_map<std::string, overlay_operation_t>> next_items;
-    std::shared_ptr<overlay_workspace_generation_t> workspace_generation;
     try {
         next_items = std::make_shared<
             std::unordered_map<std::string, overlay_operation_t>>();
@@ -2978,14 +3218,6 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                 next_items->insert_or_assign(
                     item.key, materialized_operation(item.operation));
         }
-        auto generation = prepare_workspace_generation(
-            workspace, prepared.invalidation, prepared.source_generation,
-            prepared.new_generation, prepared.revision, cancel);
-        if (!generation)
-            return workspace_result_t<overlay_transaction_result_t>::failure(
-                generation.error());
-        workspace_generation = std::make_shared<overlay_workspace_generation_t>(
-            generation.take_value());
     } catch (...) {
         return workspace_result_t<overlay_transaction_result_t>::failure(
             make_workspace_error(
@@ -3199,7 +3431,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
     mutation_lock.unlock();
     const auto finalized = publish_projected_overlay(
         preflight_state.value(), prepared, workspace, database_,
-        workspace_generation, std::move(persistence_finalizer), cancel);
+        projected_provider.value(), std::move(persistence_finalizer), cancel);
     if ((publication_epoch_.load(std::memory_order_acquire) & 1U) != 0)
         publication_epoch_.fetch_add(1, std::memory_order_release);
     if (!finalized)

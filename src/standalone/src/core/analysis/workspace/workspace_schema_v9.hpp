@@ -187,6 +187,11 @@ workspace_result_t<void> publish_packed_generation_atomic(
     sqlite3* database, const packed_generation_publication_t& publication,
     const packed_publish_stop_predicate_t& stop_requested = {});
 
+workspace_result_t<void> stage_packed_generation_atomic(
+    sqlite3* database, const packed_generation_publication_t& publication,
+    const std::string& candidate_token,
+    const packed_publish_stop_predicate_t& stop_requested = {});
+
 workspace_result_t<std::optional<packed_generation_publication_t>>
     read_packed_generation_publication(sqlite3* database,
                                        std::uint64_t generation,
@@ -211,7 +216,8 @@ workspace_result_t<std::optional<overlay_v9_state_record_t>>
     read_overlay_v9_state(sqlite3* database);
 
 workspace_result_t<void> publish_packed_generation(
-    sqlite3* database, std::uint64_t generation);
+    sqlite3* database, std::uint64_t generation,
+    const packed_stop_predicate_t& stop_requested = {});
 
 workspace_result_t<void> rollback_packed_generation(
     sqlite3* database, std::uint64_t generation);

@@ -27,6 +27,7 @@ class persistence_queue_t;
 class search_index_t;
 class analysis_workspace_t;
 class workspace_registry_t;
+struct workspace_publication_state_t;
 
 class workspace_analysis_run_t final {
 public:
@@ -77,9 +78,11 @@ struct workspace_progress_t {
 
 struct analysis_publication_t final {
     analysis_publication_t(std::shared_ptr<const analysis_snapshot_t> snapshot_value,
+                           std::shared_ptr<const byte_provider_t> provider_value,
                            std::shared_ptr<search_index_t> search_index_value,
                            workspace_readiness_t readiness_value) noexcept
         : snapshot(std::move(snapshot_value)),
+          provider(std::move(provider_value)),
           search_index(std::move(search_index_value)),
           binary_id(snapshot ? snapshot->binary_id : binary_id_t{}),
           load_profile_hash(snapshot ? snapshot->load_profile_hash : sha256_digest_t{}),
@@ -91,6 +94,7 @@ struct analysis_publication_t final {
     bool coherent_with(const workspace_identity_t& identity) const noexcept;
 
     const std::shared_ptr<const analysis_snapshot_t> snapshot;
+    const std::shared_ptr<const byte_provider_t> provider;
     const std::shared_ptr<search_index_t> search_index;
     const binary_id_t binary_id;
     const sha256_digest_t load_profile_hash;
@@ -161,8 +165,12 @@ public:
 
     const workspace_identity_t& identity() const noexcept { return *identity_; }
     const std::shared_ptr<const workspace_identity_t>& identity_handle() const noexcept { return identity_; }
-    const byte_provider_t& provider() const noexcept { return *provider_; }
-    const std::shared_ptr<const byte_provider_t>& provider_handle() const noexcept { return provider_; }
+    const byte_provider_t& provider() const noexcept { return *provider_router_; }
+    std::shared_ptr<const byte_provider_t> provider_handle() const noexcept;
+    const byte_provider_t& source_provider() const noexcept { return *source_provider_; }
+    const std::shared_ptr<const byte_provider_t>& source_provider_handle() const noexcept {
+        return source_provider_;
+    }
     target_kind_t target_kind() const noexcept { return identity_->target_kind(); }
 
     workspace_result_t<void> verify_provider_binding() const;
@@ -186,16 +194,25 @@ public:
         std::shared_ptr<search_index_t> search_index,
         bool require_complete_coverage,
         std::function<workspace_result_t<void>()> finalizer = {});
+    workspace_result_t<std::size_t> publish_projected_generation(
+        std::uint64_t expected_generation,
+        std::uint64_t expected_analysis_revision,
+        std::uint64_t target_generation,
+        std::uint64_t target_overlay_revision,
+        std::shared_ptr<const byte_provider_t> projected_provider,
+        bool preserve_analysis,
+        std::function<workspace_result_t<void>()> finalizer);
 
     std::uint64_t generation() const noexcept;
     std::uint64_t analysis_revision() const noexcept;
-    std::uint64_t overlay_revision() const noexcept { return overlay_revision_.load(std::memory_order_acquire); }
+    std::uint64_t overlay_revision() const noexcept;
     workspace_result_t<workspace_analysis_run_t>
         try_begin_analysis(std::uint64_t expected_generation);
     workspace_result_t<std::uint64_t> begin_new_generation();
     workspace_result_t<std::uint64_t> advance_overlay_revision(std::uint64_t expected_revision);
     workspace_result_t<std::uint64_t> restore_overlay_revision(
-        std::uint64_t expected_current, std::uint64_t persisted_revision);
+        std::uint64_t expected_current, std::uint64_t persisted_revision,
+        std::shared_ptr<const byte_provider_t> projected_provider = {});
 
     cancellation_token_t cancellation_token() const;
     void request_cancel() noexcept;
@@ -251,14 +268,15 @@ private:
         const workspace_identity_t& identity,
         const workspace_provider_binding_t& binding);
     workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>
-        canonicalize_snapshot(std::shared_ptr<const analysis_snapshot_t> snapshot) const;
+        canonicalize_snapshot(std::shared_ptr<const analysis_snapshot_t> snapshot,
+                              const std::shared_ptr<const byte_provider_t>& provider) const;
     void release_analysis_run(std::uint64_t generation) noexcept;
 
     std::shared_ptr<const workspace_identity_t> identity_;
-    std::shared_ptr<const byte_provider_t> provider_;
-    std::shared_ptr<const analysis_publication_t> publication_;
+    std::shared_ptr<const byte_provider_t> source_provider_;
+    std::shared_ptr<workspace_publication_state_t> publication_state_;
+    std::shared_ptr<const byte_provider_t> provider_router_;
     workspace_provider_binding_t provider_binding_;
-    std::atomic<std::uint64_t> overlay_revision_{0};
     std::atomic<std::uint64_t> active_analysis_generation_{0};
     std::atomic<bool> closing_{false};
     std::atomic<bool> closed_{false};

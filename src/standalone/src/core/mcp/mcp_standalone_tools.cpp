@@ -3729,6 +3729,7 @@ namespace mcp_standalone
                 if (!read_bytes(address, found->length, result.bytes))
                     return std::nullopt;
                 result.stable_mask.assign(result.bytes.size(), 0xffU);
+                apply_operand_stability_mask(result);
                 return result;
             }
 
@@ -3837,6 +3838,66 @@ namespace mcp_standalone
             }
 
         private:
+            static void clear_mask_range(
+                std::vector<std::uint8_t>& mask,
+                std::uint8_t offset,
+                std::uint8_t bit_size) noexcept
+            {
+                const std::size_t begin = offset;
+                const std::size_t count = bit_size / 8U;
+                if (count == 0 || begin > mask.size() || count > mask.size() - begin)
+                    return;
+                std::fill(mask.begin() + begin, mask.begin() + begin + count, 0U);
+            }
+
+            static bool has_dynamic_x86_operand(
+                const ZydisDecodedInstruction& instruction,
+                const ZydisDecodedOperand* operands) noexcept
+            {
+                for (std::size_t index = 0; index < instruction.operand_count; ++index) {
+                    const auto& operand = operands[index];
+                    if (operand.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                        (operand.imm.is_relative || instruction.raw.imm[0].size >= 32U))
+                        return true;
+                    if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                        (operand.mem.base == ZYDIS_REGISTER_RIP ||
+                         (operand.mem.disp.has_displacement != ZYAN_FALSE &&
+                          instruction.raw.disp.size >= 32U)))
+                        return true;
+                }
+                return false;
+            }
+
+            static void apply_operand_stability_mask(
+                wave_c_handlers::signature_instruction_t& result) noexcept
+            {
+                if (result.architecture != wave_c_handlers::signature_architecture_t::x86 &&
+                    result.architecture != wave_c_handlers::signature_architecture_t::x64)
+                    return;
+                ZydisDecoder decoder;
+                const bool x64 = result.architecture ==
+                    wave_c_handlers::signature_architecture_t::x64;
+                if (!ZYAN_SUCCESS(ZydisDecoderInit(
+                        &decoder,
+                        x64 ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32,
+                        x64 ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32)))
+                    return;
+                ZydisDecodedInstruction instruction{};
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                        &decoder, result.bytes.data(), result.bytes.size(),
+                        &instruction, operands)) ||
+                    instruction.length != result.bytes.size() ||
+                    !has_dynamic_x86_operand(instruction, operands))
+                    return;
+                clear_mask_range(
+                    result.stable_mask, instruction.raw.disp.offset,
+                    instruction.raw.disp.size);
+                for (const auto& immediate : instruction.raw.imm)
+                    clear_mask_range(
+                        result.stable_mask, immediate.offset, immediate.size);
+            }
+
             std::uint64_t normalize_rva(std::uint64_t address) const noexcept
             {
                 return image_ && image_->image_base != 0 && address >= image_->image_base
@@ -4538,7 +4599,11 @@ namespace mcp_standalone
         class wave_c_adapter_runtime_t final {
         public:
             wave_c_adapter_runtime_t()
-                : registry_schemas_(64)
+                : registry_schemas_(256)
+                , targetless_workspace_(
+                    targetless_resolver_, adapter_lock_manager_,
+                    wave_c_compat::workspace_adapter_handlers_t{})
+                , targetless_core_handlers_(targetless_workspace_, registry_schemas_)
                 , registry_handlers_(
                     registry_resolver_, adapter_lock_manager_,
                     wave_c_unavailable_extension_handlers(), registry_schemas_)
@@ -4562,6 +4627,11 @@ namespace mcp_standalone
                         wave_c_protocol::result_error_code_t::invalid_contract,
                         "Wave C adapter symbol does not match the registered contract.",
                         json{{"tool", std::string(name)}}, invocation.aida_metadata);
+                if (name == "int_convert") {
+                    return targetless_core_handlers_.invoke(
+                        name, *invocation.arguments, *invocation.cancellation,
+                        {}, invocation.aida_metadata);
+                }
                 if (name == "list_instances")
                     return invoke_list_instances(invocation);
                 if (name == "calculator" || name == "calculate") {
@@ -4672,7 +4742,21 @@ namespace mcp_standalone
                         *invocation.cancellation, options, invocation.aida_metadata);
                 }
                 if (wave_c_name_in(wave_c_handlers::debugger_tool_names(), name)) {
-                    wave_c_handlers::debugger_handlers_t handlers(workspace, debugger_lane, schemas);
+                    wave_c_handlers::debugger_live_dispatch_t live_dispatch;
+                    if (context.kind == aida::analysis::target_kind_t::live_snapshot) {
+                        live_dispatch = [&live_routing, generation](
+                            const wave_c_compat::live_routing_invocation_context_t& route_context,
+                            const json& route_arguments) {
+                            auto bound_context = route_context;
+                            bound_context.expected_generation = generation;
+                            return live_routing.dispatch_debugger(
+                                bound_context, route_arguments);
+                        };
+                    }
+                    wave_c_handlers::debugger_handlers_t handlers(
+                        workspace, debugger_lane, schemas,
+                        wave_c_handlers::debugger_handler_limits_t{},
+                        std::move(live_dispatch));
                     wave_c_handlers::debugger_effect_approval_t approval;
                     approval.granted = true;
                     approval.approval_id = next_approval_id_.fetch_add(1, std::memory_order_relaxed);
@@ -4694,6 +4778,17 @@ namespace mcp_standalone
                     wave_c_handlers::memory_invocation_t options;
                     options.expected_generation = generation;
                     options.deadline = deadline;
+                    if (context.kind == aida::analysis::target_kind_t::live_snapshot) {
+                        options.expected_live_identity =
+                            wave_c_handlers::live_memory_identity_t{
+                                target.target_id,
+                                target.pid,
+                                target.process_creation_identity,
+                                target.live_capture_base,
+                                target.live_capture_size,
+                                target.attach_generation,
+                            };
+                    }
                     return handlers.invoke(
                         name, *invocation.arguments, *invocation.cancellation, options);
                 }
@@ -5188,38 +5283,13 @@ namespace mcp_standalone
                     aida::analysis::query_cursor_t>::success(std::move(cursor));
             }
 
-            static json serialize_query_cursor(
-                const aida::analysis::query_cursor_t& cursor)
-            {
-                return json{
-                    {"binary_id", cursor.generation.binary_id.to_hex()},
-                    {"load_profile_hash", cursor.generation.load_profile_hash.to_hex()},
-                    {"provider_content_hash", cursor.generation.provider_content_hash
-                        ? json(cursor.generation.provider_content_hash->to_hex())
-                        : json(nullptr)},
-                    {"generation", cursor.generation.generation},
-                    {"analysis_revision", cursor.generation.analysis_revision},
-                    {"overlay_revision", cursor.generation.overlay_revision},
-                    {"provider_size", cursor.generation.provider_size},
-                    {"query_fingerprint", cursor.query_fingerprint},
-                    {"position", cursor.position},
-                    {"matches_consumed", cursor.matches_consumed},
-                    {"integrity_tag", cursor.integrity_tag},
-                };
-            }
-
             static json query_cursor_response(const wave_c_query_page_t& page)
             {
-                json cursor{
+                return json{
                     {"next", page.next ? json(page.next->position) : json(page.total)},
                     {"done", !page.next.has_value()},
                     {"cancelled", false},
                 };
-                if (page.next) {
-                    for (const auto& entry : serialize_query_cursor(*page.next).items())
-                        cursor[entry.key()] = entry.value();
-                }
-                return cursor;
             }
 
             static const char* query_hit_kind_name(
@@ -5997,10 +6067,6 @@ namespace mcp_standalone
                                         "Reference target is invalid.",
                                     address ? "NO_SNAPSHOT" : "INVALID_REFERENCE_TARGET");
                             }
-                            if (offset != 0)
-                                return tool_result_t::error(
-                                    "Reference searches use the integrity-bound cursor instead of offset.",
-                                    "QUERY_CURSOR_REQUIRED");
                             std::unordered_set<std::uint64_t> sources;
                             for (const auto& xref : snapshot->xrefs) {
                                 if (xref.target.value == *address &&
@@ -6033,7 +6099,7 @@ namespace mcp_standalone
                                 auto queried = execute_query_index(
                                     context,
                                     aida::analysis::search_query_t{address_query},
-                                    0, limit, cursor, route_semantics);
+                                    offset, limit, cursor, route_semantics);
                                 if (!queried)
                                     return workspace_tool_error(queried.error());
                                 page = queried.take_value();
@@ -8658,8 +8724,11 @@ namespace mcp_standalone
                 std::string, wave_c_query_cursor_binding_t> query_cursor_bindings_;
             mutable std::uint64_t query_cursor_binding_sequence_ = 0;
             wave_c_compat::effect_lock_manager_t adapter_lock_manager_;
+            wave_c_compat::target_resolver_t targetless_resolver_;
             wave_c_compat::target_resolver_t registry_resolver_;
             wave_c_protocol::schema_runtime_t registry_schemas_;
+            wave_c_compat::workspace_adapter_t targetless_workspace_;
+            wave_c_handlers::core_handlers_t targetless_core_handlers_;
             wave_c_handlers::routing_extensions_t registry_handlers_;
             std::mutex registry_mutex_;
             std::unordered_map<std::uint64_t, std::uint32_t> registry_static_pids_;

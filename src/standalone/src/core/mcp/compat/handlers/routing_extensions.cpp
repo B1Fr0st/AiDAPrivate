@@ -129,8 +129,8 @@ routing_metadata_t metadata_for_extension(std::string_view name) {
         meta.target_requirement = protocol::target_requirement_t::independent;
         meta.accepts_pid = false;
         meta.accepts_bin_name = false;
-        meta.effect = protocol::tool_effect_t::unspecified;
-        meta.lock = protocol::effect_lock_t::unspecified;
+        meta.effect = protocol::tool_effect_t::registry_read;
+        meta.lock = protocol::effect_lock_t::registry_read;
         meta.read_only = true;
         meta.lane = extension_lane_t::local_calculator;
     } else {
@@ -399,11 +399,8 @@ mcp_result_t invoke_retained_calculator(
 json list_instances_input_schema() {
     return json{
         {"type", "object"},
-        {"properties", json{
-            {"filter", json{{"type", "string"}}},
-            {"include_retired", json{{"type", "boolean"}}},
-        }},
-        {"additionalProperties", false},
+        {"properties", json::object()},
+        {"required", json::array()},
     };
 }
 
@@ -411,10 +408,20 @@ json list_instances_output_schema() {
     return json{
         {"type", "object"},
         {"properties", json{
-            {"instances", json{{"type", "array"}, {"items", json{{"type", "object"}}}}},
-            {"count", json{{"type", "integer"}}},
+            {"instances", json{
+                {"type", "array"},
+                {"items", json{
+                    {"type", "object"},
+                    {"properties", json{
+                        {"pid", json{{"type", "integer"}}},
+                        {"bin_name", json{{"type", "string"}}},
+                    }},
+                    {"required", json::array({"pid", "bin_name"})},
+                    {"additionalProperties", false},
+                }},
+            }},
         }},
-        {"required", json::array({"instances", "count"})},
+        {"required", json::array({"instances"})},
     };
 }
 
@@ -489,12 +496,12 @@ const extension_contract_spec_t& extension_spec(std::string_view name) {
          "ida-pro-mcp compatible calculator.",
          calculator_input_schema, calculator_output_schema,
          protocol::target_requirement_t::independent, false, false,
-         protocol::tool_effect_t::unspecified, protocol::effect_lock_t::unspecified, true},
+         protocol::tool_effect_t::registry_read, protocol::effect_lock_t::registry_read, true},
         {k_extension_tool_calculate,
          "Safe target-independent integer, bytes, hash, floating-point, and address mapping calculator",
          calculator_input_schema, calculator_output_schema,
          protocol::target_requirement_t::independent, false, false,
-         protocol::tool_effect_t::unspecified, protocol::effect_lock_t::unspecified, true},
+         protocol::tool_effect_t::registry_read, protocol::effect_lock_t::registry_read, true},
     };
     for (const auto& spec : specs) {
         if (spec.name == name) {
@@ -770,6 +777,7 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
     refresh_known_instances(targets);
 
     json instances = json::array();
+    json instance_identities = json::array();
     std::string filter;
     bool include_retired = false;
     if (const auto filter_val = arguments.find("filter"); filter_val != arguments.end()) {
@@ -794,8 +802,12 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
                 continue;
             }
             instances.push_back(json{
+                {"pid", target.pid},
+                {"bin_name", target.bin_name},
+            });
+            instance_identities.push_back(json{
                 {"target_id", target.target_id},
-                {"pid", target.live ? target.pid : 0U},
+                {"pid", target.pid},
                 {"bin_name", target.bin_name},
                 {"generation", target.generation},
                 {"attach_generation", target.attach_generation},
@@ -816,11 +828,7 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
             protocol::json{{"phase", "list_instances_post_snapshot"}});
     }
 
-    json output{
-        {"instances", std::move(instances)},
-        {"count", static_cast<std::uint64_t>(0)},
-    };
-    output["count"] = output["instances"].size();
+    json output{{"instances", std::move(instances)}};
 
     std::string payload = output.dump();
     return protocol::mcp_result_t::success(
@@ -830,6 +838,7 @@ protocol::mcp_result_t routing_extensions_t::handle_list_instances(
             {"resolver_target_count", targets.size()},
             {"known_target_count", known_target_count},
             {"include_retired", include_retired},
+            {"instance_identities", std::move(instance_identities)},
         });
 }
 

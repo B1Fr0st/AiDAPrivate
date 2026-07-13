@@ -321,6 +321,14 @@ bool publish_stop_requested_v9(
     }
 }
 
+bool valid_candidate_token_v9(const std::string& token) noexcept {
+    return token.size() == 32 &&
+        std::all_of(token.begin(), token.end(), [](unsigned char value) {
+            return (value >= '0' && value <= '9') ||
+                   (value >= 'a' && value <= 'f');
+        });
+}
+
 workspace_error_t cancelled_read_error_v9(const char* phase) {
     auto error = make_workspace_error(workspace_error_code_t::cancelled,
                                       "packed generation read was cancelled",
@@ -1749,9 +1757,17 @@ workspace_result_t<std::optional<overlay_v9_state_record_t>>
         std::optional<overlay_v9_state_record_t>(std::move(record)));
 }
 
-workspace_result_t<void> publish_packed_generation_atomic(
+static workspace_result_t<void> write_packed_generation_atomic_v9(
     sqlite3* database, const packed_generation_publication_t& publication,
-    const packed_publish_stop_predicate_t& stop_requested) {
+    const packed_publish_stop_predicate_t& stop_requested,
+    bool mark_committed,
+    const std::string* candidate_token) {
+    if (candidate_token && !valid_candidate_token_v9(*candidate_token)) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "packed generation candidate token is malformed",
+            "workspace_schema_v9.stage_atomic"));
+    }
     if (publish_stop_requested_v9(stop_requested))
         return cancelled_publish_error();
     auto result = validate_publication_v9(publication, stop_requested);
@@ -1765,6 +1781,39 @@ workspace_result_t<void> publish_packed_generation_atomic(
         exec_sql_v9(database, "ROLLBACK", "workspace_schema_v9.publish_atomic.rollback");
         return failure;
     };
+    if (candidate_token) {
+        v9_statement_t candidate;
+        result = candidate.prepare(database,
+            "SELECT 1 FROM workspace_commit_state WHERE singleton=1 AND candidate_ready=1 AND candidate_token=?1 AND candidate_generation=?2 AND candidate_analysis_revision=?3 AND candidate_overlay_revision=?4",
+            "workspace_schema_v9.stage_atomic.candidate");
+        if (!result)
+            return fail(std::move(result));
+        result = candidate.bind_text(1, *candidate_token);
+        if (!result)
+            return fail(std::move(result));
+        result = candidate.bind_uint(2, publication.generation.generation);
+        if (!result)
+            return fail(std::move(result));
+        result = candidate.bind_uint(3, publication.generation.analysis_revision);
+        if (!result)
+            return fail(std::move(result));
+        result = candidate.bind_uint(4, publication.generation.overlay_revision);
+        if (!result)
+            return fail(std::move(result));
+        const int candidate_status = sqlite3_step(candidate.get());
+        if (candidate_status != SQLITE_ROW) {
+            if (candidate_status != SQLITE_DONE) {
+                return fail(workspace_result_t<void>::failure(schema_v9_error(
+                    database, candidate_status,
+                    "unable to verify packed-generation candidate ownership",
+                    "workspace_schema_v9.stage_atomic")));
+            }
+            return fail(workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::revision_conflict,
+                                     "packed generation is not bound to the pending snapshot candidate",
+                                     "workspace_schema_v9.stage_atomic")));
+        }
+    }
     auto existing = read_packed_generation(
         database, publication.generation.generation, false, stop_requested);
     if (!existing)
@@ -1835,23 +1884,25 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
         if (!result)
             return fail(std::move(result));
     }
-    v9_statement_t commit_statement;
-    result = commit_statement.prepare(database,
-        "UPDATE packed_generations SET committed=1 WHERE generation=?1 AND committed=0",
-        "workspace_schema_v9.publish_atomic.marker");
-    if (!result)
-        return fail(std::move(result));
-    result = commit_statement.bind_uint(1, manifest.generation);
-    if (!result)
-        return fail(std::move(result));
-    result = commit_statement.step_done();
-    if (!result)
-        return fail(std::move(result));
-    if (sqlite3_changes(database) != 1) {
-        return fail(workspace_result_t<void>::failure(
-            make_workspace_error(workspace_error_code_t::target_conflict,
-                                 "packed generation commit marker was not staged",
-                                 "workspace_schema_v9.publish_atomic")));
+    if (mark_committed) {
+        v9_statement_t commit_statement;
+        result = commit_statement.prepare(database,
+            "UPDATE packed_generations SET committed=1 WHERE generation=?1 AND committed=0",
+            "workspace_schema_v9.publish_atomic.marker");
+        if (!result)
+            return fail(std::move(result));
+        result = commit_statement.bind_uint(1, manifest.generation);
+        if (!result)
+            return fail(std::move(result));
+        result = commit_statement.step_done();
+        if (!result)
+            return fail(std::move(result));
+        if (sqlite3_changes(database) != 1) {
+            return fail(workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::target_conflict,
+                                     "packed generation commit marker was not staged",
+                                     "workspace_schema_v9.publish_atomic")));
+        }
     }
     if (publish_stop_requested_v9(stop_requested))
         return fail(cancelled_publish_error());
@@ -1862,6 +1913,21 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
         return result;
     }
     return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> publish_packed_generation_atomic(
+    sqlite3* database, const packed_generation_publication_t& publication,
+    const packed_publish_stop_predicate_t& stop_requested) {
+    return write_packed_generation_atomic_v9(
+        database, publication, stop_requested, true, nullptr);
+}
+
+workspace_result_t<void> stage_packed_generation_atomic(
+    sqlite3* database, const packed_generation_publication_t& publication,
+    const std::string& candidate_token,
+    const packed_publish_stop_predicate_t& stop_requested) {
+    return write_packed_generation_atomic_v9(
+        database, publication, stop_requested, false, &candidate_token);
 }
 
 workspace_result_t<std::optional<packed_generation_publication_t>>
@@ -1904,7 +1970,8 @@ workspace_result_t<std::optional<packed_generation_publication_t>>
 }
 
 workspace_result_t<void> publish_packed_generation(
-    sqlite3* database, std::uint64_t generation) {
+    sqlite3* database, std::uint64_t generation,
+    const packed_stop_predicate_t& stop_requested) {
     if (generation == 0) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -1925,7 +1992,10 @@ workspace_result_t<void> publish_packed_generation(
             "workspace_schema_v9.publish_packed_generation.release");
         return failure;
     };
-    auto manifest = read_packed_generation(database, generation, false);
+    if (publish_stop_requested_v9(stop_requested))
+        return fail(cancelled_publish_error());
+    auto manifest = read_packed_generation(
+        database, generation, false, stop_requested);
     if (!manifest)
         return fail(workspace_result_t<void>::failure(manifest.error()));
     if (!manifest.value() || manifest.value()->committed) {
@@ -1934,19 +2004,23 @@ workspace_result_t<void> publish_packed_generation(
                                  "packed generation not found or already committed",
                                  "workspace_schema_v9.publish_packed_generation")));
     }
-    auto pages = read_packed_pages(database, generation, false);
+    auto pages = read_packed_pages(
+        database, generation, false, stop_requested);
     if (!pages)
         return fail(workspace_result_t<void>::failure(pages.error()));
-    auto index = read_packed_page_index(database, generation, false);
+    auto index = read_packed_page_index(
+        database, generation, false, stop_requested);
     if (!index)
         return fail(workspace_result_t<void>::failure(index.error()));
     packed_generation_publication_t publication;
     publication.generation = *manifest.value();
     publication.pages = pages.take_value();
     publication.index = index.take_value();
-    auto validated = validate_publication_v9(publication);
+    auto validated = validate_publication_v9(publication, stop_requested);
     if (!validated)
         return fail(std::move(validated));
+    if (publish_stop_requested_v9(stop_requested))
+        return fail(cancelled_publish_error());
     v9_statement_t statement;
     auto result = statement.prepare(database,
         "UPDATE packed_generations SET committed=1 WHERE generation=?1 AND committed=0",

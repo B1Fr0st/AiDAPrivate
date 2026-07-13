@@ -3,6 +3,7 @@
 #include "../../src/core/mcp/compat/handlers/routing_extensions.hpp"
 #include "../../src/core/mcp/ida_compat_schemas.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
@@ -175,6 +176,16 @@ void verify_extension_contracts(const routing_extensions_t& extensions,
     require(li_contract.effect_policy.read_only,
             "list_instances is not read_only");
 
+    for (const auto name : {std::string_view("calculator"), std::string_view("calculate")}) {
+        const auto& contract = *extensions.find(name);
+        require(contract.target_policy.requirement ==
+                    protocol::target_requirement_t::independent &&
+                    contract.effect_policy.effect == protocol::tool_effect_t::registry_read &&
+                    contract.effect_policy.lock == protocol::effect_lock_t::registry_read &&
+                    contract.effect_policy.read_only,
+                "calculator extension effect policy is not registry_read");
+    }
+
     const auto& af_contract = *extensions.find("analyze_funcs");
     require(af_contract.target_policy.requirement == protocol::target_requirement_t::optional,
             "analyze_funcs target policy is not optional");
@@ -226,14 +237,17 @@ void verify_list_instances(routing_extensions_t& extensions, std::size_t& comple
     require_fixture(!result.is_error(), "list_instances", "valid", result.text());
     require_fixture(result.structured_content().contains("instances"),
                     "list_instances", "valid", "output missing instances array");
-    require_fixture(result.structured_content().contains("count"),
-                    "list_instances", "valid", "output missing count field");
-    const auto count = result.structured_content().at("count").get<std::size_t>();
     const auto instances = result.structured_content().at("instances");
     require_fixture(instances.size() == 2, "list_instances", "valid",
                     "instance count does not match published targets");
-    require_fixture(count == 2, "list_instances", "valid",
-                    "count field does not match instance array size");
+    require_fixture(!result.structured_content().contains("count") &&
+                        std::all_of(instances.begin(), instances.end(),
+                            [](const auto& instance) {
+                                return instance.is_object() && instance.size() == 2 &&
+                                    instance.contains("pid") && instance.contains("bin_name");
+                            }),
+                    "list_instances", "valid",
+                    "generated instance output contains extension fields");
     ++completed;
 }
 
@@ -532,7 +546,7 @@ void verify_list_instances_retired_semantics(routing_extensions_t& extensions,
     auto captured = adapters::list_instances(
         extensions, json::object(), cancellation_token_t::create());
     require_fixture(!captured.is_error() &&
-                        captured.structured_content().at("count").get<std::size_t>() == 3,
+                        captured.structured_content().at("instances").size() == 3,
                     "list_instances", "retired_capture",
                     "new target was not captured before retirement");
     require(static_cast<bool>(resolver.retire(3)),
@@ -541,18 +555,19 @@ void verify_list_instances_retired_semantics(routing_extensions_t& extensions,
     auto active_only = adapters::list_instances(
         extensions, json::object(), cancellation_token_t::create());
     require_fixture(!active_only.is_error() &&
-                        active_only.structured_content().at("count").get<std::size_t>() == 2,
+                        active_only.structured_content().at("instances").size() == 2,
                     "list_instances", "retired_default",
                     "retired target leaked into the default listing");
 
     auto including_retired = adapters::list_instances(
         extensions, json{{"include_retired", true}}, cancellation_token_t::create());
     require_fixture(!including_retired.is_error() &&
-                        including_retired.structured_content().at("count").get<std::size_t>() == 3,
+                        including_retired.structured_content().at("instances").size() == 3,
                     "list_instances", "retired_included",
                     "include_retired did not restore the retired identity");
     bool found_retired = false;
-    for (const auto& instance : including_retired.structured_content().at("instances")) {
+    for (const auto& instance :
+         including_retired.aida_metadata().at("instance_identities")) {
         if (instance.at("target_id").get<std::uint64_t>() == 3) {
             found_retired = instance.at("retired").get<bool>() &&
                 instance.at("pid").get<std::uint32_t>() == 4103;

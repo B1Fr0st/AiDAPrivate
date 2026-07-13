@@ -1680,7 +1680,11 @@ decompiler_contract_validation_t validate_decompiler_worker_message(const decomp
             if (envelope.kind != decompiler_worker_message_kind_t::cancel_request || message.job_id == 0 || message.stable_reason.empty())
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::worker_protocol_failure, "decompiler.worker.cancel"));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_document_message_t>) {
-            if (envelope.kind != decompiler_worker_message_kind_t::document || message.job_id == 0)
+            if (envelope.kind != decompiler_worker_message_kind_t::document || message.job_id == 0 ||
+                message.provider_artifacts.empty() ||
+                message.provider_artifacts.size() > 64U * 1024U * 1024U ||
+                message.provider_artifacts_hash.empty() ||
+                stable_serialization_hash(message.provider_artifacts) != message.provider_artifacts_hash)
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::worker_protocol_failure, "decompiler.worker.document"));
             append(result, validate_decompiler_document(message.document));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_failure_message_t>) {
@@ -1848,6 +1852,8 @@ std::string serialize_decompiler_worker_message(const decompiler_worker_message_
             writer.string(message.stable_reason);
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_document_message_t>) {
             writer.u64(message.job_id);
+            writer.string(message.provider_artifacts);
+            writer.digest(message.provider_artifacts_hash);
             writer.string(serialize_decompiler_document(message.document));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_failure_message_t>) {
             writer.u64(message.job_id);
@@ -1980,7 +1986,8 @@ decompiler_contract_decode_result_t<decompiler_worker_message_t> deserialize_dec
             decompiler_worker_document_message_t message;
             std::string document_bytes;
             message.envelope = envelope;
-            if (!reader.u64(message.job_id) || !reader.string(document_bytes))
+            if (!reader.u64(message.job_id) || !reader.string(message.provider_artifacts) ||
+                !reader.digest(message.provider_artifacts_hash) || !reader.string(document_bytes))
                 return false;
             auto document = deserialize_decompiler_document(document_bytes);
             if (!document.valid())

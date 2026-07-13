@@ -684,6 +684,48 @@ mcp_result_t adapter_failure(const adapter_error_t& error) {
         });
 }
 
+result_error_code_t live_routing_result_code(live_routing_error_code_t code) noexcept {
+    switch (code) {
+    case live_routing_error_code_t::snapshot_cancelled:
+    case live_routing_error_code_t::snapshot_deadline_exceeded:
+    case live_routing_error_code_t::debugger_cancelled:
+    case live_routing_error_code_t::debugger_deadline_exceeded:
+        return result_error_code_t::cancelled;
+    case live_routing_error_code_t::debugger_request_invalid:
+    case live_routing_error_code_t::snapshot_budget_exceeded:
+        return result_error_code_t::invalid_input;
+    case live_routing_error_code_t::target_not_resolved:
+    case live_routing_error_code_t::process_identity_mismatch:
+    case live_routing_error_code_t::module_identity_mismatch:
+    case live_routing_error_code_t::attach_generation_stale:
+        return result_error_code_t::target_policy_rejected;
+    case live_routing_error_code_t::debugger_lane_busy:
+    case live_routing_error_code_t::debugger_lane_serialization_violation:
+    case live_routing_error_code_t::static_mutation_blocked_live_write:
+    case live_routing_error_code_t::unsupported_live_effect:
+        return result_error_code_t::effect_policy_rejected;
+    case live_routing_error_code_t::routing_contract_not_found:
+        return result_error_code_t::invalid_contract;
+    case live_routing_error_code_t::none:
+    case live_routing_error_code_t::internal_error:
+    case live_routing_error_code_t::debugger_adapter_rejected:
+        return result_error_code_t::handler_failed;
+    }
+    return result_error_code_t::handler_failed;
+}
+
+mcp_result_t live_routing_failure(const live_routing_error_t& error) {
+    return mcp_result_t::failure(
+        live_routing_result_code(error.code),
+        "Live debugger routing rejected the request.",
+        json{
+            {"phase", "live_debugger_routing"},
+            {"stable_code", std::string(error.stable_code)},
+            {"expected", error.expected},
+            {"actual", error.actual},
+        });
+}
+
 }
 
 const std::array<std::string_view, k_debugger_tool_count>& debugger_tool_names() noexcept {
@@ -693,8 +735,10 @@ const std::array<std::string_view, k_debugger_tool_count>& debugger_tool_names()
 debugger_handlers_t::debugger_handlers_t(workspace_adapter_t& workspace,
                                           debugger_lane_t& lane,
                                           protocol::schema_runtime_t& schemas,
-                                          debugger_handler_limits_t limits)
-    : workspace_(workspace), lane_(lane), schemas_(schemas), limits_(std::move(limits)) {
+                                          debugger_handler_limits_t limits,
+                                          debugger_live_dispatch_t live_dispatch)
+    : workspace_(workspace), lane_(lane), schemas_(schemas), limits_(std::move(limits)),
+      live_dispatch_(std::move(live_dispatch)) {
     if (!valid_limits(limits_)) {
         throw std::invalid_argument(
             "debugger handler limits are invalid or weaken pinned maxima");
@@ -834,6 +878,58 @@ protocol::mcp_result_t debugger_handlers_t::dispatch(
             protocol::result_error_code_t::invalid_input,
             "Debugger tool arguments violate the bounded adapter policy.",
             *failure);
+    }
+
+    if (live_dispatch_) {
+        const auto* descriptor = aida::standalone::mcp::compat::find_contract(name);
+        if (!descriptor) {
+            return protocol::mcp_result_t::failure(
+                protocol::result_error_code_t::invalid_contract,
+                "Live debugger routing contract is unavailable.",
+                protocol::json{{"tool", std::string(name)}});
+        }
+        live_routing_invocation_context_t live_context;
+        live_context.contract_name = name;
+        live_context.effect = descriptor->effect;
+        live_context.cancellation = cancellation;
+        live_context.deadline = std::chrono::steady_clock::now() +
+            execution_timeout(contract, limits_.max_execution_time);
+        auto routed = live_dispatch_(live_context, arguments);
+        if (!routed)
+            return live_routing_failure(routed.error());
+        auto response = std::move(routed).take_value();
+        std::string payload;
+        try {
+            payload = response.structured.dump();
+        } catch (const std::exception&) {
+            return protocol::mcp_result_t::failure(
+                protocol::result_error_code_t::invalid_output,
+                "Live debugger routing returned unserializable output.",
+                protocol::json{{"phase", "live_debugger_output_serialization"}});
+        }
+        if (payload.empty() || payload.size() > limits_.max_response_bytes) {
+            return protocol::mcp_result_t::failure(
+                protocol::result_error_code_t::invalid_output,
+                "Live debugger routing output violates the bounded response policy.",
+                exceeded_value(
+                    "response_bytes",
+                    static_cast<std::uint64_t>(limits_.max_response_bytes),
+                    static_cast<std::uint64_t>(payload.size())));
+        }
+        return protocol::mcp_result_t::success(
+            std::move(payload), response.structured,
+            protocol::json{
+                {"adapter_truncated", response.truncated},
+                {"live_routing", protocol::json{
+                    {"target_id", response.identity.target_id},
+                    {"pid", response.identity.pid},
+                    {"process_creation_identity", response.identity.process_creation_identity},
+                    {"module_base", response.identity.module_base},
+                    {"module_size", response.identity.module_size},
+                    {"attach_generation", response.identity.attach_generation},
+                    {"workspace_generation", response.identity.workspace_generation},
+                }},
+            });
     }
 
     adapter_request_t request;

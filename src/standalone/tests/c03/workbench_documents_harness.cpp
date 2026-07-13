@@ -1577,6 +1577,20 @@ public:
     }
 
     void enable_parallel_edges() noexcept { parallel_edges_ = true; }
+    void set_parallel_ordinal_base(std::uint64_t value) noexcept
+    {
+        parallel_ordinal_base_ = value;
+    }
+    void force_out_of_bounds_lookup(bool value) noexcept
+    {
+        force_out_of_bounds_lookup_ = value;
+    }
+    void set_count_poll_steps(std::uint64_t value) noexcept
+    {
+        count_poll_steps_ = value == 0 ? 1 : value;
+    }
+    void reset_counts_calls() const noexcept { counts_calls_ = 0; }
+    std::uint64_t counts_calls() const noexcept { return counts_calls_; }
 
     std::uint64_t current_generation() const noexcept override { return generation_; }
     bool generation_current(std::uint64_t gen) const noexcept override
@@ -1592,31 +1606,49 @@ public:
         return kind == graph_document::graph_kind_t::cfg;
     }
 
-    std::uint64_t node_count(std::uint64_t gen, graph_document::graph_kind_t,
-                             std::uint64_t) const noexcept override
+    graph_document::graph_source_result_t counts(
+        std::uint64_t gen, graph_document::graph_kind_t kind,
+        std::uint64_t, const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_source_counts_t& output) const noexcept override
     {
-        if (gen == 0 || gen > generation_)
-            return 0;
-        return generations_[gen - 1].node_count;
+        output = {};
+        ++counts_calls_;
+        for (std::uint64_t step = 0; step < count_poll_steps_; ++step) {
+            if (cancellation && cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
+        }
+        if (gen == 0 || gen > generation_ || !supports_kind(kind) ||
+            !graph_document::graph_source_limits_valid(limits)) {
+            return graph_document::graph_source_result_t::rejected;
+        }
+        output.nodes = generations_[gen - 1].node_count;
+        output.edges = generations_[gen - 1].edge_count;
+        if (output.nodes > limits.max_nodes || output.edges > limits.max_edges)
+            return graph_document::graph_source_result_t::limit_exceeded;
+        return graph_document::graph_source_result_t::success;
     }
 
-    std::uint64_t edge_count(std::uint64_t gen, graph_document::graph_kind_t,
-                             std::uint64_t) const noexcept override
+    graph_document::graph_source_result_t node_at(
+        std::uint64_t gen, graph_document::graph_kind_t kind,
+        std::uint64_t, std::uint64_t ordinal,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_node_view_t& output) const noexcept override
     {
-        if (gen == 0 || gen > generation_)
-            return 0;
-        return generations_[gen - 1].edge_count;
-    }
-
-    bool node_at(std::uint64_t gen, graph_document::graph_kind_t,
-                 std::uint64_t, std::uint64_t ordinal,
-                 graph_document::graph_node_view_t& output) const noexcept override
-    {
-        if (gen == 0 || gen > generation_)
-            return false;
+        output = {};
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        if (gen == 0 || gen > generation_ || !supports_kind(kind) ||
+            !graph_document::graph_source_limits_valid(limits)) {
+            return graph_document::graph_source_result_t::rejected;
+        }
         const auto nc = generations_[gen - 1].node_count;
+        const auto ec = generations_[gen - 1].edge_count;
+        if (nc > limits.max_nodes || ec > limits.max_edges)
+            return graph_document::graph_source_result_t::limit_exceeded;
         if (ordinal >= nc)
-            return false;
+            return graph_document::graph_source_result_t::not_found;
         output.id = graph_document::compute_deterministic_node_id(0x500000U + ordinal * 0x10);
         output.kind = graph_document::graph_node_kind_t::basic_block;
         output.address = 0x500000U + ordinal * 0x10;
@@ -1624,18 +1656,29 @@ public:
         output.instruction_count = 5;
         output.in_degree = ordinal > 0 ? 1 : 0;
         output.out_degree = ordinal < nc - 1 ? 1 : 0;
-        return true;
+        return graph_document::graph_source_result_t::success;
     }
 
-    bool edge_at(std::uint64_t gen, graph_document::graph_kind_t,
-                 std::uint64_t, std::uint64_t ordinal,
-                 graph_document::graph_edge_view_t& output) const noexcept override
+    graph_document::graph_source_result_t edge_at(
+        std::uint64_t gen, graph_document::graph_kind_t kind,
+        std::uint64_t, std::uint64_t ordinal,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_edge_view_t& output) const noexcept override
     {
-        if (gen == 0 || gen > generation_)
-            return false;
+        output = {};
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        if (gen == 0 || gen > generation_ || !supports_kind(kind) ||
+            !graph_document::graph_source_limits_valid(limits)) {
+            return graph_document::graph_source_result_t::rejected;
+        }
+        const auto nc = generations_[gen - 1].node_count;
         const auto ec = generations_[gen - 1].edge_count;
+        if (nc > limits.max_nodes || ec > limits.max_edges)
+            return graph_document::graph_source_result_t::limit_exceeded;
         if (ordinal >= ec)
-            return false;
+            return graph_document::graph_source_result_t::not_found;
         const auto edge_ordinal = parallel_edges_ && ordinal < 2 ? 0 : ordinal;
         const auto src = graph_document::compute_deterministic_node_id(
             0x500000U + edge_ordinal * 0x10);
@@ -1645,68 +1688,114 @@ public:
         output.target = tgt;
         output.kind = graph_document::graph_edge_kind_t::unconditional;
         output.site_address = 0x500000U + edge_ordinal * 0x10 + 4;
-        output.parallel_ordinal = parallel_edges_ && ordinal < 2 ? ordinal : 0;
+        if (parallel_edges_ && ordinal < 2 &&
+            parallel_ordinal_base_ >
+                (std::numeric_limits<std::uint64_t>::max)() - ordinal) {
+            output = {};
+            return graph_document::graph_source_result_t::rejected;
+        }
+        output.parallel_ordinal = parallel_edges_ && ordinal < 2
+            ? parallel_ordinal_base_ + ordinal : 0;
         output.id = graph_document::compute_deterministic_edge_id(
             {output.source, output.target, output.kind, output.site_address,
              output.parallel_ordinal});
         output.label = "edge_" + std::to_string(ordinal);
-        return true;
+        return graph_document::graph_source_result_t::success;
     }
 
-    bool node_by_address(std::uint64_t gen, graph_document::graph_kind_t kind,
-                         std::uint64_t func_addr, std::uint64_t address,
-                         graph_document::graph_node_view_t& output,
-                         std::uint64_t& ordinal) const noexcept override
+    graph_document::graph_source_result_t node_by_address(
+        std::uint64_t gen, graph_document::graph_kind_t kind,
+        std::uint64_t func_addr, std::uint64_t address,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_node_view_t& output,
+        std::uint64_t& ordinal) const noexcept override
     {
+        output = {};
+        ordinal = 0;
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
         if (gen == 0 || gen > generation_)
-            return false;
+            return graph_document::graph_source_result_t::rejected;
         if (address < 0x500000U)
-            return false;
+            return graph_document::graph_source_result_t::not_found;
         const auto offset = address - 0x500000U;
         if (offset % 0x10 != 0)
-            return false;
+            return graph_document::graph_source_result_t::not_found;
         ordinal = offset / 0x10;
-        return node_at(gen, kind, func_addr, ordinal, output);
+        const auto result = node_at(gen, kind, func_addr, ordinal, limits,
+                                    cancellation, output);
+        if (result == graph_document::graph_source_result_t::success &&
+            force_out_of_bounds_lookup_) {
+            ordinal = generations_[gen - 1].node_count;
+        }
+        return result;
     }
 
-    bool node_by_id(std::uint64_t gen, graph_document::graph_kind_t kind,
-                    std::uint64_t func_addr,
-                    graph_document::graph_node_id_t id,
-                    graph_document::graph_node_view_t& output,
-                    std::uint64_t& ordinal) const noexcept override
+    graph_document::graph_source_result_t node_by_id(
+        std::uint64_t gen, graph_document::graph_kind_t kind,
+        std::uint64_t func_addr, graph_document::graph_node_id_t id,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_node_view_t& output,
+        std::uint64_t& ordinal) const noexcept override
     {
-        const auto count = node_count(gen, kind, func_addr);
-        for (std::uint64_t index = 0; index < count; ++index) {
+        output = {};
+        ordinal = 0;
+        graph_document::graph_source_counts_t source_counts;
+        const auto count_result = counts(gen, kind, func_addr, limits,
+                                         cancellation, source_counts);
+        if (count_result != graph_document::graph_source_result_t::success)
+            return count_result;
+        for (std::uint64_t index = 0; index < source_counts.nodes; ++index) {
+            if (cancellation && cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
             graph_document::graph_node_view_t candidate;
-            if (!node_at(gen, kind, func_addr, index, candidate))
-                return false;
+            const auto result = node_at(gen, kind, func_addr, index, limits,
+                                        cancellation, candidate);
+            if (result != graph_document::graph_source_result_t::success)
+                return result;
             if (candidate.id == id) {
                 output = std::move(candidate);
-                ordinal = index;
-                return true;
+                ordinal = force_out_of_bounds_lookup_
+                    ? source_counts.nodes : index;
+                return graph_document::graph_source_result_t::success;
             }
         }
-        return false;
+        return graph_document::graph_source_result_t::not_found;
     }
 
-    bool edge_by_id(std::uint64_t gen, graph_document::graph_kind_t kind,
-                    std::uint64_t func_addr,
-                    graph_document::graph_edge_id_t id,
-                    graph_document::graph_edge_view_t& output,
-                    std::uint64_t& ordinal) const noexcept override
+    graph_document::graph_source_result_t edge_by_id(
+        std::uint64_t gen, graph_document::graph_kind_t kind,
+        std::uint64_t func_addr, graph_document::graph_edge_id_t id,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_edge_view_t& output,
+        std::uint64_t& ordinal) const noexcept override
     {
-        const auto count = edge_count(gen, kind, func_addr);
-        for (std::uint64_t index = 0; index < count; ++index) {
+        output = {};
+        ordinal = 0;
+        graph_document::graph_source_counts_t source_counts;
+        const auto count_result = counts(gen, kind, func_addr, limits,
+                                         cancellation, source_counts);
+        if (count_result != graph_document::graph_source_result_t::success)
+            return count_result;
+        for (std::uint64_t index = 0; index < source_counts.edges; ++index) {
+            if (cancellation && cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
             graph_document::graph_edge_view_t candidate;
-            if (!edge_at(gen, kind, func_addr, index, candidate))
-                return false;
+            const auto result = edge_at(gen, kind, func_addr, index, limits,
+                                        cancellation, candidate);
+            if (result != graph_document::graph_source_result_t::success)
+                return result;
             if (candidate.id == id) {
                 output = std::move(candidate);
-                ordinal = index;
-                return true;
+                ordinal = force_out_of_bounds_lookup_
+                    ? source_counts.edges : index;
+                return graph_document::graph_source_result_t::success;
             }
         }
-        return false;
+        return graph_document::graph_source_result_t::not_found;
     }
 
 private:
@@ -1724,6 +1813,10 @@ private:
 
     std::uint64_t generation_ = 1;
     bool parallel_edges_ = false;
+    bool force_out_of_bounds_lookup_ = false;
+    std::uint64_t parallel_ordinal_base_ = 0;
+    std::uint64_t count_poll_steps_ = 1;
+    mutable std::uint64_t counts_calls_ = 0;
     std::vector<generation_data_t> generations_;
     std::vector<std::string> labels_;
 };
@@ -1740,22 +1833,39 @@ public:
         reported_count_ = count;
     }
 
-    std::uint32_t overlay_count(std::uint64_t) const noexcept override
+    graph_document::graph_source_result_t overlay_count(
+        std::uint64_t, std::uint32_t limit,
+        const graph_document::graph_cancellation_t* cancellation,
+        std::uint32_t& output) const noexcept override
     {
-        return reported_count_ != 0 ? reported_count_
-                                    : static_cast<std::uint32_t>(entries_.size());
+        output = 0;
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        output = reported_count_ != 0
+            ? reported_count_ : static_cast<std::uint32_t>(entries_.size());
+        return output > limit
+            ? graph_document::graph_source_result_t::limit_exceeded
+            : graph_document::graph_source_result_t::success;
     }
 
-    bool overlay_node(std::uint64_t, graph_document::graph_node_id_t node,
-                      std::string& text) const noexcept override
+    graph_document::graph_source_result_t overlay_node(
+        std::uint64_t, graph_document::graph_node_id_t node,
+        std::uint32_t max_label_bytes,
+        const graph_document::graph_cancellation_t* cancellation,
+        std::string& text) const noexcept override
     {
+        text.clear();
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
         for (const auto& entry : entries_) {
             if (entry.first == node) {
                 text = entry.second;
-                return true;
+                return text.size() > max_label_bytes
+                    ? graph_document::graph_source_result_t::limit_exceeded
+                    : graph_document::graph_source_result_t::success;
             }
         }
-        return false;
+        return graph_document::graph_source_result_t::not_found;
     }
 
 private:
@@ -1764,7 +1874,8 @@ private:
 };
 
 class graph_phase_cancellation_t final
-    : public graph_document::graph_layout_cancellation_t {
+    : public graph_document::graph_layout_cancellation_t,
+      public diff_document::diff_cancellation_t {
 public:
     explicit graph_phase_cancellation_t(std::uint64_t trigger) noexcept
         : trigger_(trigger)
@@ -1881,6 +1992,26 @@ void verify_graph_layout_cancellation()
     }
 }
 
+void verify_graph_source_cancellation()
+{
+    graph_source_t source(100, 99);
+    source.set_count_poll_steps(16);
+    source.reset_counts_calls();
+    graph_document::graph_document_model_t model(source);
+
+    graph_phase_cancellation_t cancellation(5);
+    graph_document::graph_page_request_t request;
+    request.limit = 10;
+    graph_document::graph_page_t page;
+    const auto error = model.page(request, &cancellation, page);
+    require(error.code == graph_document::graph_error_code_t::cancelled,
+            "graph count materialization must propagate cancellation");
+    require(source.counts_calls() == 1,
+            "graph cancellation must enter the bounded source count hook");
+    require(page.nodes.empty() && page.edges.empty(),
+            "graph count cancellation must not publish partial rows");
+}
+
 void verify_graph_deterministic_ids()
 {
     auto id1 = graph_document::compute_deterministic_node_id(0x401000U);
@@ -1926,6 +2057,22 @@ void verify_graph_deterministic_ids()
             "parallel edge paging must preserve both edges");
     require(page.edges[0].id != page.edges[1].id,
             "parallel edge paging must expose distinct stable identities");
+
+    graph_source_t malformed_parallel_source(2, 2);
+    malformed_parallel_source.enable_parallel_edges();
+    malformed_parallel_source.set_parallel_ordinal_base(1);
+    graph_document::graph_document_model_t malformed_model(
+        malformed_parallel_source);
+    graph_document::graph_layout_request_t layout_request;
+    layout_request.expected_generation = malformed_model.bound_generation();
+    layout_request.max_nodes = 2;
+    layout_request.max_edges = 2;
+    graph_document::graph_layout_t layout;
+    const auto malformed_error = malformed_model.compute_layout(
+        layout_request, nullptr, layout);
+    require(malformed_error.code ==
+                graph_document::graph_error_code_t::adapter_rejected,
+            "parallel edge ordinals must be dense from zero");
 }
 
 void verify_graph_cross_generation_diff()
@@ -2002,10 +2149,38 @@ void verify_graph_navigation_and_selection()
     require(err.ok(), "graph select must succeed");
     require(model.selection().node == result.node, "graph selection must preserve node");
 
+    graph_document::graph_selection_t malformed_none;
+    malformed_none.node = result.node;
+    err = model.select(malformed_none, model.bound_generation());
+    require(err.code == graph_document::graph_error_code_t::selection_rejected &&
+                model.selection().node == result.node,
+            "graph malformed none selection must not clear the active selection");
+
     err = model.clear_selection(model.bound_generation());
     require(err.ok(), "graph clear selection must succeed for the bound generation");
     require(model.selection().kind == selection_kind_t::none,
             "graph selection must be none after clear");
+
+    source.force_out_of_bounds_lookup(true);
+    err = model.navigate(nav, model.bound_generation(),
+                         graph_document::graph_kind_t::cfg, 0, result);
+    require(err.code == graph_document::graph_error_code_t::adapter_rejected &&
+                !result.found,
+            "graph navigation must reject a source ordinal outside node bounds");
+
+    graph_document::graph_selection_t edge_selection;
+    edge_selection.kind = selection_kind_t::entity;
+    graph_document::graph_edge_identity_t edge_identity;
+    edge_identity.source = graph_document::compute_deterministic_node_id(0x500000U);
+    edge_identity.target = graph_document::compute_deterministic_node_id(0x500010U);
+    edge_identity.kind = graph_document::graph_edge_kind_t::unconditional;
+    edge_identity.site_address = 0x500004U;
+    edge_selection.edge = graph_document::compute_deterministic_edge_id(edge_identity);
+    err = model.select(edge_selection, model.bound_generation(),
+                       graph_document::graph_kind_t::cfg, 0);
+    require(err.code == graph_document::graph_error_code_t::adapter_rejected &&
+                model.selection().kind == selection_kind_t::none,
+            "graph selection must reject a source ordinal outside edge bounds");
 }
 
 void verify_graph_page()
@@ -2064,8 +2239,16 @@ public:
     {
         entity_only_index_ = index;
     }
+    void set_count_poll_steps(std::uint64_t value) noexcept
+    {
+        count_poll_steps_ = value == 0 ? 1 : value;
+    }
     void reset_entry_reads() const noexcept { entry_reads_ = 0; }
     std::uint64_t entry_reads() const noexcept { return entry_reads_; }
+    void reset_count_reads() const noexcept { count_reads_ = 0; }
+    std::uint64_t count_reads() const noexcept { return count_reads_; }
+    void reset_summary_reads() const noexcept { summary_reads_ = 0; }
+    std::uint64_t summary_reads() const noexcept { return summary_reads_; }
 
     std::uint64_t current_generation() const noexcept override { return generation_; }
     bool generation_current(std::uint64_t gen) const noexcept override
@@ -2076,31 +2259,61 @@ public:
     {
         return kind <= diff_document::diff_kind_t::workspace;
     }
-    bool scope_available(
+    diff_document::diff_source_result_t scope_available(
         std::uint64_t gen,
-        const diff_document::diff_scope_t& scope) const noexcept override
+        const diff_document::diff_scope_t& scope,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation) const noexcept override
     {
-        return gen == generation_ && diff_document::diff_scope_valid(scope);
-    }
-
-    std::uint64_t entry_count(
-        std::uint64_t gen,
-        const diff_document::diff_scope_t& scope) const noexcept override
-    {
+        if (cancellation && cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
+        if (!diff_document::diff_source_limits_valid(limits))
+            return diff_document::diff_source_result_t::rejected;
         return gen == generation_ && diff_document::diff_scope_valid(scope)
-            ? entry_count_
-            : 0;
+            ? diff_document::diff_source_result_t::success
+            : diff_document::diff_source_result_t::not_found;
     }
 
-    bool entry_at(std::uint64_t gen,
-                  const diff_document::diff_scope_t& scope,
-                   std::uint64_t ordinal,
-                   diff_document::diff_entry_t& output) const noexcept override
+    diff_document::diff_source_result_t entry_count(
+        std::uint64_t gen,
+        const diff_document::diff_scope_t& scope,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation,
+        std::uint64_t& output) const noexcept override
     {
-        if (gen != generation_ || !diff_document::diff_scope_valid(scope) ||
-            ordinal >= entry_count_) {
-            return false;
+        output = 0;
+        ++count_reads_;
+        for (std::uint64_t step = 0; step < count_poll_steps_; ++step) {
+            if (cancellation && cancellation->cancelled())
+                return diff_document::diff_source_result_t::cancelled;
         }
+        if (gen != generation_ || !diff_document::diff_scope_valid(scope) ||
+            !diff_document::diff_source_limits_valid(limits)) {
+            return diff_document::diff_source_result_t::rejected;
+        }
+        output = entry_count_;
+        return output > limits.max_entries
+            ? diff_document::diff_source_result_t::limit_exceeded
+            : diff_document::diff_source_result_t::success;
+    }
+
+    diff_document::diff_source_result_t entry_at(
+        std::uint64_t gen, const diff_document::diff_scope_t& scope,
+        std::uint64_t ordinal,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation,
+        diff_document::diff_entry_t& output) const noexcept override
+    {
+        output = {};
+        if (cancellation && cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
+        if (gen != generation_ || !diff_document::diff_scope_valid(scope) ||
+            !diff_document::diff_source_limits_valid(limits))
+            return diff_document::diff_source_result_t::rejected;
+        if (entry_count_ > limits.max_entries)
+            return diff_document::diff_source_result_t::limit_exceeded;
+        if (ordinal >= entry_count_)
+            return diff_document::diff_source_result_t::not_found;
         ++entry_reads_;
         output.kind = (ordinal % 4 == 0) ? diff_document::diff_entry_kind_t::added :
                      (ordinal % 4 == 1) ? diff_document::diff_entry_kind_t::removed :
@@ -2137,27 +2350,39 @@ public:
             output.old_address = 0;
             output.new_address = 0;
         }
-        return true;
+        return diff_document::diff_source_result_t::success;
     }
 
-    bool summary(std::uint64_t gen,
-                 const diff_document::diff_scope_t& scope,
-                 diff_document::diff_summary_t& output) const noexcept override
+    diff_document::diff_source_result_t summary(
+        std::uint64_t gen, const diff_document::diff_scope_t& scope,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation,
+        diff_document::diff_summary_t& output) const noexcept override
     {
-        if (gen != generation_ || !diff_document::diff_scope_valid(scope))
-            return false;
         output = {};
+        ++summary_reads_;
+        if (cancellation && cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
+        if (gen != generation_ || !diff_document::diff_scope_valid(scope) ||
+            !diff_document::diff_source_limits_valid(limits))
+            return diff_document::diff_source_result_t::rejected;
+        if (entry_count_ > limits.max_entries)
+            return diff_document::diff_source_result_t::limit_exceeded;
         output.snapshot_generation = gen;
         output.scope = scope;
         output.total_entries = entry_count_;
         for (std::uint64_t i = 0; i < entry_count_; ++i) {
+            if (cancellation && cancellation->cancelled()) {
+                output = {};
+                return diff_document::diff_source_result_t::cancelled;
+            }
             const auto remainder = i % 4;
             if (remainder == 0) ++output.added_count;
             else if (remainder == 1) ++output.removed_count;
             else if (remainder == 2) ++output.modified_count;
             else ++output.moved_count;
         }
-        return true;
+        return diff_document::diff_source_result_t::success;
     }
 
 private:
@@ -2167,7 +2392,10 @@ private:
     diff_document::diff_domain_t forced_domain_ =
         diff_document::diff_domain_t::instruction;
     std::uint64_t entity_only_index_ = ~0ULL;
+    std::uint64_t count_poll_steps_ = 1;
     mutable std::uint64_t entry_reads_ = 0;
+    mutable std::uint64_t count_reads_ = 0;
+    mutable std::uint64_t summary_reads_ = 0;
 };
 
 diff_document::diff_scope_t generation_diff_scope()
@@ -2359,6 +2587,28 @@ void verify_diff_cancellation()
     auto err = model.page(req, model.bound_generation(), scope, &cancel_flag, page);
     require(err.code == diff_document::diff_error_code_t::cancelled,
             "diff page with cancellation must return cancelled");
+
+    source.set_count_poll_steps(16);
+    source.reset_count_reads();
+    source.reset_entry_reads();
+    graph_phase_cancellation_t count_cancellation(7);
+    err = model.page(req, model.bound_generation(), scope,
+                     &count_cancellation, page);
+    require(err.code == diff_document::diff_error_code_t::cancelled,
+            "diff count materialization must propagate cancellation");
+    require(source.count_reads() == 1 && source.entry_reads() == 0,
+            "diff count cancellation must stop before entry materialization");
+
+    source.set_count_poll_steps(1);
+    source.reset_summary_reads();
+    graph_phase_cancellation_t summary_cancellation(12);
+    diff_document::diff_summary_t summary;
+    err = model.compute_summary(model.bound_generation(), scope, summary,
+                                &summary_cancellation);
+    require(err.code == diff_document::diff_error_code_t::cancelled,
+            "diff summary materialization must propagate cancellation");
+    require(source.summary_reads() == 1 && summary.total_entries == 0,
+            "diff summary cancellation must clear partial aggregate state");
 }
 
 void verify_diff_expected_generation_and_caps()
@@ -2378,6 +2628,19 @@ void verify_diff_expected_generation_and_caps()
             "diff commands must reject a mismatched expected_generation");
     require(source.entry_reads() == 0,
             "diff stale-generation rejection must occur before entry traversal");
+
+    diff_document::diff_selection_t out_of_bounds_selection;
+    out_of_bounds_selection.kind = selection_kind_t::entity;
+    out_of_bounds_selection.entry_index = 100;
+    out_of_bounds_selection.domain = diff_document::diff_domain_t::instruction;
+    out_of_bounds_selection.entity_key = "entity_100";
+    source.reset_entry_reads();
+    auto selection_error = model.select(
+        out_of_bounds_selection, model.bound_generation(), scope);
+    require(selection_error.code ==
+                diff_document::diff_error_code_t::selection_rejected &&
+                source.entry_reads() == 0,
+            "diff selection must reject an out-of-bounds entry before materialization");
 
     diff_source_t oversized_source(diff_document::k_diff_document_max_entries + 1ULL);
     diff_document::diff_document_model_t oversized_model(oversized_source);
@@ -2477,6 +2740,7 @@ bool run_workbench_documents_harness(std::string& failure)
 
         verify_graph_large_cap();
         verify_graph_layout_cancellation();
+        verify_graph_source_cancellation();
         verify_graph_deterministic_ids();
         verify_graph_cross_generation_diff();
         verify_graph_missing_node();

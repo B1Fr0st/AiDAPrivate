@@ -889,6 +889,17 @@ json read_intent(std::string_view name, const normalized_request_t& normalized,
     if (invocation.expected_generation) {
         intent["expected_generation"] = *invocation.expected_generation;
     }
+    if (invocation.expected_live_identity) {
+        const auto& identity = *invocation.expected_live_identity;
+        intent["expected_live_identity"] = {
+            {"target_id", identity.target_id},
+            {"pid", identity.pid},
+            {"process_creation_identity", identity.process_creation_identity},
+            {"module_base", identity.module_base},
+            {"module_size", identity.module_size},
+            {"attach_generation", identity.attach_generation},
+        };
+    }
     return intent;
 }
 
@@ -1119,6 +1130,67 @@ validation_failure_t normalize_snapshot_receipt(
             !member_is_true(*snapshot, "identity_revalidated")) {
             return invalid_value("response._aida_memory.snapshot",
                                  "live_boundary_and_identity_evidence_required", *snapshot);
+        }
+        if (!invocation.expected_live_identity) {
+            return invalid_value("response._aida_memory.snapshot",
+                                 "live_identity_expectation_required", *snapshot);
+        }
+        std::uint64_t target_id = 0;
+        std::uint64_t pid = 0;
+        std::uint64_t process_creation_identity = 0;
+        std::uint64_t module_base = 0;
+        std::uint64_t module_size = 0;
+        std::uint64_t attach_generation = 0;
+        const std::string path = "response._aida_memory.snapshot";
+        if (auto failure = require_unsigned_member(
+                *snapshot, "target_id", path, target_id))
+            return failure;
+        if (auto failure = require_unsigned_member(*snapshot, "pid", path, pid))
+            return failure;
+        if (auto failure = require_unsigned_member(
+                *snapshot, "process_creation_identity", path,
+                process_creation_identity))
+            return failure;
+        if (auto failure = require_unsigned_member(
+                *snapshot, "module_base", path, module_base))
+            return failure;
+        if (auto failure = require_unsigned_member(
+                *snapshot, "module_size", path, module_size))
+            return failure;
+        if (auto failure = require_unsigned_member(
+                *snapshot, "attach_generation", path, attach_generation))
+            return failure;
+        if (target_id == 0 || pid == 0 ||
+            pid > (std::numeric_limits<std::uint32_t>::max)() ||
+            process_creation_identity == 0 || module_base == 0 || module_size == 0 ||
+            module_base > (std::numeric_limits<std::uint64_t>::max)() - module_size ||
+            attach_generation == 0) {
+            return invalid_value(path, "valid_live_identity_required", *snapshot);
+        }
+        const auto& expected = *invocation.expected_live_identity;
+        if (target_id != expected.target_id ||
+            pid != expected.pid ||
+            process_creation_identity != expected.process_creation_identity ||
+            module_base != expected.module_base || module_size != expected.module_size ||
+            attach_generation != expected.attach_generation) {
+            return invalid_value(path, "live_identity_mismatch", json{
+                {"expected", json{
+                    {"target_id", expected.target_id},
+                    {"pid", expected.pid},
+                    {"process_creation_identity", expected.process_creation_identity},
+                    {"module_base", expected.module_base},
+                    {"module_size", expected.module_size},
+                    {"attach_generation", expected.attach_generation},
+                }},
+                {"actual", json{
+                    {"target_id", target_id},
+                    {"pid", pid},
+                    {"process_creation_identity", process_creation_identity},
+                    {"module_base", module_base},
+                    {"module_size", module_size},
+                    {"attach_generation", attach_generation},
+                }},
+            });
         }
     } else {
         return invalid_value("response._aida_memory.snapshot.source",

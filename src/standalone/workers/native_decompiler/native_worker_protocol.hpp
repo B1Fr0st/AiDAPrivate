@@ -27,7 +27,7 @@ constexpr std::size_t k_bootstrap_bytes = 4 + 2 + 2 + k_digest_bytes + k_digest_
 constexpr std::size_t k_frame_header_without_tag_bytes = 4 + 2 + 2 + 8 + 4 + k_digest_bytes;
 constexpr std::size_t k_frame_header_bytes = k_frame_header_without_tag_bytes + k_digest_bytes;
 inline constexpr char k_protocol_hash_material[] =
-    "aida.native-decompiler.worker.frame.v1|bootstrap.v1|hmac-sha256|strict-sequence|readonly-snapshot";
+    "aida.isolated-decompiler.worker.frame.v2|bootstrap.v1|hmac-sha256|strict-sequence|readonly-provider-input|attested-provider-artifacts";
 
 enum class frame_kind_t : std::uint16_t {
     decompiler_contract = 1

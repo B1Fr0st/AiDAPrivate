@@ -359,6 +359,12 @@ private:
             snapshot["source"] = "bounded_live_snapshot";
             snapshot["module_boundary_validated"] = true;
             snapshot["identity_revalidated"] = true;
+            snapshot["target_id"] = target.target_id;
+            snapshot["pid"] = target.pid;
+            snapshot["process_creation_identity"] = target.process_creation_identity;
+            snapshot["module_base"] = target.live_capture_base;
+            snapshot["module_size"] = target.live_capture_size;
+            snapshot["attach_generation"] = target.attach_generation;
         } else {
             snapshot["source"] = "immutable_workspace_snapshot";
             snapshot["immutable"] = true;
@@ -531,16 +537,34 @@ void verify_static_and_live_snapshots(memory_handlers_t& handlers) {
 
     auto live_args = valid_arguments("get_bytes");
     live_args["pid"] = 4103U;
+    memory_invocation_t live_invocation;
+    live_invocation.expected_generation = 11U;
+    live_invocation.expected_live_identity = live_memory_identity_t{
+        3U, 4103U, 0xA103ULL, 0x140000000ULL, 0x20000ULL, 0x311ULL};
     auto live_result = handlers.get_bytes(
-        live_args, cancellation_token_t::create());
+        live_args, cancellation_token_t::create(), live_invocation);
     require_fixture(!live_result.is_error(), "live_snapshot", live_result.text());
     const auto& live_receipt = live_result.aida_metadata().at("memory_snapshot");
     require_fixture(live_receipt.value("source", std::string()) ==
                         "bounded_live_snapshot" &&
                         live_receipt.value("module_boundary_validated", false) &&
                         live_receipt.value("identity_revalidated", false) &&
+                        live_receipt.value("target_id", 0ULL) == 3U &&
+                        live_receipt.value("pid", 0U) == 4103U &&
+                        live_receipt.value("process_creation_identity", 0ULL) == 0xA103ULL &&
+                        live_receipt.value("module_base", 0ULL) == 0x140000000ULL &&
+                        live_receipt.value("module_size", 0ULL) == 0x20000ULL &&
+                        live_receipt.value("attach_generation", 0ULL) == 0x311ULL &&
                         live_receipt.value("read_only", false),
                     "live_snapshot", "bounded live-read receipt is incomplete");
+
+    auto mismatched_invocation = live_invocation;
+    mismatched_invocation.expected_live_identity->module_size = 0x20001ULL;
+    const auto mismatched = handlers.get_bytes(
+        live_args, cancellation_token_t::create(), mismatched_invocation);
+    require_fixture(mismatched.is_error() &&
+                        mismatched.error_code() == "MCP_TOOL_OUTPUT_INVALID",
+                    "live_snapshot", "live identity mismatch was not rejected");
 }
 
 void verify_complete_read_contract(memory_handlers_t& handlers,

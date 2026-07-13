@@ -157,6 +157,9 @@ dalvik_format_t instruction_format(std::uint8_t opcode) noexcept;
 
 const char* format_name(dalvik_format_t format) noexcept;
 
+std::string serialize_capture(const dalvik_ssa_capture_t& capture);
+std::optional<dalvik_ssa_capture_t> deserialize_capture(
+    const std::string& bytes, std::vector<decompiler_diagnostic_t>& diagnostics);
 std::string serialize_artifacts(const dalvik_ssa_typed_artifacts_t& artifacts);
 std::optional<dalvik_ssa_typed_artifacts_t> deserialize_artifacts(
     const std::string& bytes, std::vector<decompiler_diagnostic_t>& diagnostics);

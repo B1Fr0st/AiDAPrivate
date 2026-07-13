@@ -1,4 +1,5 @@
 #include "jvm_ssa.hpp"
+#include "../isolated_worker_codec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,8 @@ namespace {
 
 constexpr std::uint32_t k_artifact_magic = 0x5353564AU;
 constexpr std::uint32_t k_artifact_version = 1;
+constexpr std::uint32_t k_input_magic = 0x3249564AU;
+constexpr std::uint32_t k_input_version = 1;
 constexpr std::size_t k_artifact_max_bytes = 32U * 1024U * 1024U;
 
 decompiler_diagnostic_t make_diagnostic(decompiler_diagnostic_severity_t severity,
@@ -2480,6 +2483,151 @@ jvm_method_context_t extract_method_context(const classfile_image_t& classfile,
     }
 
     return ctx;
+}
+
+std::string serialize_jvm_method_input(const jvm_method_input_t& input)
+{
+    using isolated_worker_codec::writer_t;
+    if (!validate_decompiler_entity_key(input.entity).valid() ||
+        input.entity.kind != decompiler_entity_kind_t::jvm_method ||
+        input.provider.provider != decompiler_provider_id_t::jvm_ssa ||
+        input.provider.provider_name.empty() || input.provider.provider_version.empty() ||
+        input.provider.provider_binary_hash.empty() || input.provider.worker_build_id.empty() ||
+        input.provider.worker_build_hash.empty() || input.language.language_id.empty() ||
+        input.language.language_version.empty() || input.language.compiler_spec_id.empty() ||
+        input.language.language_spec_hash.empty() ||
+        input.language.architecture != architecture_id_t::jvm_bytecode ||
+        input.language.mode != architecture_mode_t::jvm || input.workspace_generation == 0 ||
+        input.type_graph_revision == 0 || input.context.class_internal_name.empty() ||
+        input.context.method_name.empty() || input.context.method_descriptor.empty())
+        return {};
+    writer_t writer;
+    writer.u32(k_input_magic);
+    writer.u32(k_input_version);
+    isolated_worker_codec::write_entity(writer, input.entity);
+    isolated_worker_codec::write_provider_identity(writer, input.provider);
+    isolated_worker_codec::write_language_identity(writer, input.language);
+    writer.u64(input.workspace_generation);
+    writer.u64(input.type_graph_revision);
+    writer.string(input.context.class_internal_name);
+    writer.string(input.context.method_name);
+    writer.string(input.context.method_descriptor);
+    writer.string(input.context.generic_signature);
+    writer.u16(input.context.access_flags);
+    writer.u16(input.context.max_stack);
+    writer.u16(input.context.max_locals);
+    writer.bytes(input.context.code);
+    writer.vector(input.context.exceptions, [](writer_t& target, const jvm_code_exception_t& value) {
+        target.u16(value.start_pc);
+        target.u16(value.end_pc);
+        target.u16(value.handler_pc);
+        target.u16(value.catch_type);
+        target.optional(value.catch_class_name,
+            [](writer_t& nested, const std::string& text) { nested.string(text); });
+    });
+    writer.vector(input.context.line_numbers, [](writer_t& target, const jvm_line_number_t& value) {
+        target.u16(value.start_pc);
+        target.u16(value.line_number);
+    });
+    writer.vector(input.context.local_variables, [](writer_t& target, const jvm_local_variable_t& value) {
+        target.u16(value.start_pc);
+        target.u16(value.length);
+        target.u16(value.name_index);
+        target.u16(value.descriptor_index);
+        target.u16(value.index);
+        target.string(value.name);
+        target.string(value.descriptor);
+    });
+    writer.vector(input.context.constant_pool, [](writer_t& target, const jvm_constant_pool_entry_t& value) {
+        target.enumeration(value.tag);
+        target.u16(value.index);
+        target.u64(value.file_offset);
+        target.string(value.utf8_value);
+        target.u32(value.int_float_value);
+        target.u64(value.long_double_value);
+        target.u16(value.ref_index1);
+        target.u16(value.ref_index2);
+        target.u8(value.reference_kind);
+        target.u16(value.bootstrap_method_attr_index);
+        target.boolean(value.is_double_slot);
+        target.boolean(value.valid);
+    });
+    writer.vector(input.context.bootstrap_methods, [](writer_t& target, const jvm_bootstrap_method_t& value) {
+        target.u16(value.bootstrap_method_ref);
+        target.vector(value.bootstrap_arguments,
+            [](writer_t& nested, const std::uint16_t argument) { nested.u16(argument); });
+    });
+    writer.u32(input.context.code_offset);
+    return writer.take();
+}
+
+std::optional<jvm_method_input_t> deserialize_jvm_method_input(
+    const std::string& bytes, std::vector<decompiler_diagnostic_t>& diagnostics)
+{
+    using isolated_worker_codec::reader_t;
+    diagnostics.clear();
+    reader_t reader(bytes);
+    jvm_method_input_t input;
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    const bool decoded = reader.u32(magic) && magic == k_input_magic &&
+        reader.u32(version) && version == k_input_version &&
+        isolated_worker_codec::read_entity(reader, input.entity) &&
+        isolated_worker_codec::read_provider_identity(reader, input.provider) &&
+        isolated_worker_codec::read_language_identity(reader, input.language) &&
+        reader.u64(input.workspace_generation) && reader.u64(input.type_graph_revision) &&
+        reader.string(input.context.class_internal_name) &&
+        reader.string(input.context.method_name) &&
+        reader.string(input.context.method_descriptor) &&
+        reader.string(input.context.generic_signature) &&
+        reader.u16(input.context.access_flags) && reader.u16(input.context.max_stack) &&
+        reader.u16(input.context.max_locals) && reader.bytes(input.context.code) &&
+        reader.vector(input.context.exceptions, [](reader_t& source, jvm_code_exception_t& value) {
+            return source.u16(value.start_pc) && source.u16(value.end_pc) &&
+                source.u16(value.handler_pc) && source.u16(value.catch_type) &&
+                source.optional(value.catch_class_name,
+                    [](reader_t& nested, std::string& text) { return nested.string(text); });
+        }) &&
+        reader.vector(input.context.line_numbers, [](reader_t& source, jvm_line_number_t& value) {
+            return source.u16(value.start_pc) && source.u16(value.line_number);
+        }) &&
+        reader.vector(input.context.local_variables, [](reader_t& source, jvm_local_variable_t& value) {
+            return source.u16(value.start_pc) && source.u16(value.length) &&
+                source.u16(value.name_index) && source.u16(value.descriptor_index) &&
+                source.u16(value.index) && source.string(value.name) &&
+                source.string(value.descriptor);
+        }) &&
+        reader.vector(input.context.constant_pool, [](reader_t& source, jvm_constant_pool_entry_t& value) {
+            return source.enumeration(value.tag) && source.u16(value.index) &&
+                source.u64(value.file_offset) && source.string(value.utf8_value) &&
+                source.u32(value.int_float_value) && source.u64(value.long_double_value) &&
+                source.u16(value.ref_index1) && source.u16(value.ref_index2) &&
+                source.u8(value.reference_kind) && source.u16(value.bootstrap_method_attr_index) &&
+                source.boolean(value.is_double_slot) && source.boolean(value.valid);
+        }) &&
+        reader.vector(input.context.bootstrap_methods, [](reader_t& source, jvm_bootstrap_method_t& value) {
+            return source.u16(value.bootstrap_method_ref) &&
+                source.vector(value.bootstrap_arguments,
+                    [](reader_t& nested, std::uint16_t& argument) { return nested.u16(argument); });
+        }) && reader.u32(input.context.code_offset) && reader.complete();
+    if (!decoded || !validate_decompiler_entity_key(input.entity).valid() ||
+        input.entity.kind != decompiler_entity_kind_t::jvm_method ||
+        input.provider.provider != decompiler_provider_id_t::jvm_ssa ||
+        input.provider.provider_name.empty() || input.provider.provider_version.empty() ||
+        input.provider.provider_binary_hash.empty() || input.provider.worker_build_id.empty() ||
+        input.provider.worker_build_hash.empty() || input.language.language_id.empty() ||
+        input.language.language_version.empty() || input.language.compiler_spec_id.empty() ||
+        input.language.language_spec_hash.empty() ||
+        input.language.architecture != architecture_id_t::jvm_bytecode ||
+        input.language.mode != architecture_mode_t::jvm || input.workspace_generation == 0 ||
+        input.type_graph_revision == 0 || input.context.class_internal_name.empty() ||
+        input.context.method_name.empty() || input.context.method_descriptor.empty()) {
+        diagnostics.push_back(make_diagnostic(decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::malformed_serialization,
+            "jvm_ssa.input.decode", 1));
+        return std::nullopt;
+    }
+    return input;
 }
 
 std::string serialize_jvm_ssa_result(const jvm_ssa_result_t& result)

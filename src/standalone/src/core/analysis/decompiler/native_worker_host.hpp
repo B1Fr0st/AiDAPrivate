@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decompiler_provider_registry.hpp"
+#include "isolated_worker_codec.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace aida::analysis::native_worker {
@@ -95,6 +97,8 @@ struct native_worker_launch_contract_t {
 struct packaged_native_worker_runtime_t {
     std::shared_ptr<decompiler_isolated_provider_host_t> provider_host;
     decompiler_provider_identity_t provider;
+    decompiler_provider_identity_t jvm_provider;
+    decompiler_provider_identity_t dalvik_provider;
     sha256_digest_t worker_protocol_hash;
     sha256_digest_t manifest_hash;
     std::uint32_t worker_protocol_version = 0;
@@ -115,6 +119,11 @@ struct native_worker_snapshot_t {
     bool valid() const noexcept;
 };
 
+struct native_provider_snapshot_t {
+    std::uint64_t image_base = 0;
+    std::vector<std::uint8_t> virtual_image;
+};
+
 struct native_worker_execution_request_t {
     std::uint64_t job_id = 0;
     decompiler_pipeline_cache_key_t cache_key;
@@ -127,6 +136,8 @@ struct native_worker_execution_request_t {
 struct native_worker_execution_result_t {
     native_worker_execution_status_t status = native_worker_execution_status_t::failed;
     std::optional<decompiler_document_t> document;
+    std::string provider_artifacts;
+    sha256_digest_t provider_artifacts_hash;
     std::vector<decompiler_diagnostic_t> worker_diagnostics;
     std::vector<native_worker_diagnostic_t> diagnostics;
     sha256_digest_t manifest_hash;
@@ -143,6 +154,40 @@ std::string serialize_native_worker_manifest(const native_worker_manifest_t& val
 native_worker_manifest_decode_t deserialize_native_worker_manifest(const std::string& value);
 sha256_digest_t native_worker_protocol_hash();
 std::optional<native_worker_snapshot_t> make_native_worker_snapshot(std::vector<std::uint8_t> bytes);
+inline std::string serialize_native_provider_snapshot(const native_provider_snapshot_t& snapshot)
+{
+    if (snapshot.image_base == 0 || snapshot.virtual_image.empty())
+        return {};
+    isolated_worker_codec::writer_t writer;
+    writer.u32(0x32504e47U);
+    writer.u32(1);
+    writer.u64(snapshot.image_base);
+    writer.bytes(snapshot.virtual_image);
+    return writer.take();
+}
+
+inline std::optional<native_provider_snapshot_t> deserialize_native_provider_snapshot(
+    const std::string& bytes, std::vector<decompiler_diagnostic_t>& diagnostics)
+{
+    diagnostics.clear();
+    isolated_worker_codec::reader_t reader(bytes);
+    native_provider_snapshot_t snapshot;
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    if (!reader.u32(magic) || magic != 0x32504e47U || !reader.u32(version) || version != 1 ||
+        !reader.u64(snapshot.image_base) || !reader.bytes(snapshot.virtual_image) ||
+        !reader.complete() || snapshot.image_base == 0 || snapshot.virtual_image.empty()) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::malformed_serialization;
+        diagnostic.localization_key = "decompiler.native_worker.snapshot_decode";
+        diagnostic.confidence = 100;
+        diagnostic.ordinal = 1;
+        diagnostics.push_back(std::move(diagnostic));
+        return std::nullopt;
+    }
+    return snapshot;
+}
 workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_worker_runtime(
     std::filesystem::path runtime_root = {});
 

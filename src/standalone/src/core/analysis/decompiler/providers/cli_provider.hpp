@@ -9,7 +9,7 @@
 
 namespace aida::analysis::managed_cli {
 
-constexpr std::uint32_t k_managed_cli_worker_protocol_version = 1;
+constexpr std::uint32_t k_managed_cli_worker_protocol_version = 2;
 
 struct offline_package_t {
     std::string id;
@@ -59,6 +59,7 @@ struct token_map_entry_t {
 struct analysis_t {
     provider_ir_t provider_ir;
     type_graph_t type_graph;
+    std::uint64_t return_type_id = 0;
     std::string decompiled_source;
     sha256_digest_t decompiled_source_hash;
     std::vector<token_map_entry_t> token_map;

@@ -1,4 +1,5 @@
 #include "dalvik_ssa.hpp"
+#include "../isolated_worker_codec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,11 +19,26 @@ namespace {
 
 constexpr std::uint32_t k_artifact_magic = 0x53534444U;
 constexpr std::uint32_t k_artifact_version = 1;
+constexpr std::uint32_t k_capture_magic = 0x32434444U;
+constexpr std::uint32_t k_capture_version = 1;
 constexpr std::size_t k_artifact_max_bytes = 32U * 1024U * 1024U;
 constexpr std::uint32_t k_no_register = 0xFFFFFFFFU;
 constexpr std::size_t k_max_blocks = 1U << 20;
 constexpr std::size_t k_max_values = 1U << 22;
 constexpr std::size_t k_max_types = 1U << 20;
+
+const char* restored_mnemonic(const std::uint16_t opcode_unit, const std::uint8_t opcode) noexcept
+{
+    if (opcode == 0) {
+        switch (opcode_unit >> 8U) {
+        case 1: return "packed-switch-payload";
+        case 2: return "sparse-switch-payload";
+        case 3: return "fill-array-data-payload";
+        default: break;
+        }
+    }
+    return dalvik_opcode_mnemonic(opcode);
+}
 
 struct artifact_reader_t {
     const std::string& bytes;
@@ -2217,6 +2233,266 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
 
     result.artifacts = dalvik_ssa_typed_artifacts_t{std::move(provider_ir), std::move(hir), std::move(type_graph)};
     return result;
+}
+
+std::string serialize_capture(const dalvik_ssa_capture_t& capture)
+{
+    using isolated_worker_codec::writer_t;
+    if (!capture.code_item || !validate_decompiler_entity_key(capture.request.entity).valid() ||
+        capture.request.entity.kind != decompiler_entity_kind_t::dalvik_method ||
+        capture.request.provider.provider != decompiler_provider_id_t::dalvik_ssa ||
+        capture.request.provider.provider_name.empty() ||
+        capture.request.provider.provider_version.empty() ||
+        capture.request.provider.provider_binary_hash.empty() ||
+        capture.request.provider.worker_build_id.empty() ||
+        capture.request.provider.worker_build_hash.empty() ||
+        capture.request.language.language_id.empty() ||
+        capture.request.language.language_version.empty() ||
+        capture.request.language.compiler_spec_id.empty() ||
+        capture.request.language.language_spec_hash.empty() ||
+        capture.request.language.architecture != architecture_id_t::dalvik_bytecode ||
+        capture.request.language.mode != architecture_mode_t::dalvik ||
+        capture.request.workspace_generation == 0 || capture.request.type_graph_revision == 0)
+        return {};
+    writer_t writer;
+    writer.u32(k_capture_magic);
+    writer.u32(k_capture_version);
+    isolated_worker_codec::write_provider_identity(writer, capture.request.provider);
+    isolated_worker_codec::write_language_identity(writer, capture.request.language);
+    isolated_worker_codec::write_entity(writer, capture.request.entity);
+    writer.u64(capture.request.workspace_generation);
+    writer.u64(capture.request.type_graph_revision);
+    writer.u64(capture.request.return_type_id);
+    writer.string(capture.request.dex_version);
+    const auto& code = *capture.code_item;
+    writer.u32(code.offset);
+    writer.u16(code.registers_size);
+    writer.u16(code.ins_size);
+    writer.u16(code.outs_size);
+    writer.u16(code.tries_size);
+    writer.u32(code.debug_info_offset);
+    writer.u32(code.instruction_count);
+    writer.vector(code.instructions, [](writer_t& target, const dalvik_instruction_t& value) {
+        target.u32(value.code_unit_offset);
+        target.u64(value.file_offset);
+        target.u16(value.opcode_unit);
+        target.u8(value.opcode);
+        target.u16(value.width_code_units);
+        target.boolean(value.payload);
+        target.enumeration(value.reference_kind);
+        target.optional(value.reference_index,
+            [](writer_t& nested, const std::uint32_t item) { nested.u32(item); });
+        target.optional(value.secondary_reference_index,
+            [](writer_t& nested, const std::uint32_t item) { nested.u32(item); });
+        target.optional(value.literal,
+            [](writer_t& nested, const std::int64_t item) { nested.i64(item); });
+        target.optional(value.branch_target,
+            [](writer_t& nested, const std::int32_t item) { nested.i32(item); });
+    });
+    writer.vector(code.tries, [](writer_t& target, const dex_try_item_t& value) {
+        target.u32(value.start_address);
+        target.u16(value.instruction_count);
+        target.u16(value.handler_offset);
+    });
+    writer.vector(code.catch_handlers, [](writer_t& target, const dex_catch_handler_t& value) {
+        target.u32(value.relative_offset);
+        target.vector(value.typed_handlers,
+            [](writer_t& nested, const std::pair<std::uint32_t, std::uint32_t>& item) {
+                nested.u32(item.first);
+                nested.u32(item.second);
+            });
+        target.optional(value.catch_all_address,
+            [](writer_t& nested, const std::uint32_t item) { nested.u32(item); });
+    });
+    writer.optional(code.debug_info, [](writer_t& target, const dex_debug_info_t& value) {
+        target.u32(value.offset);
+        target.u32(value.line_start);
+        target.vector(value.parameter_name_string_indices,
+            [](writer_t& nested, const std::optional<std::uint32_t>& item) {
+                nested.optional(item,
+                    [](writer_t& leaf, const std::uint32_t index) { leaf.u32(index); });
+            });
+        target.vector(value.positions, [](writer_t& nested, const dex_debug_position_t& item) {
+            nested.u32(item.address);
+            nested.i32(item.line);
+            nested.optional(item.source_file_string_index,
+                [](writer_t& leaf, const std::uint32_t index) { leaf.u32(index); });
+        });
+    });
+    writer.vector(capture.code_units,
+        [](writer_t& target, const std::uint16_t value) { target.u16(value); });
+    writer.vector(capture.strings, [](writer_t& target, const dex_string_t& value) {
+        target.u32(value.index);
+        target.u32(value.data_offset);
+        target.u32(value.utf16_length);
+        target.string(value.value);
+    });
+    writer.vector(capture.types, [](writer_t& target, const dex_type_t& value) {
+        target.u32(value.index);
+        target.u32(value.descriptor_string_index);
+        target.string(value.descriptor);
+    });
+    writer.vector(capture.protos, [](writer_t& target, const dex_proto_t& value) {
+        target.u32(value.index);
+        target.u32(value.shorty_string_index);
+        target.u32(value.return_type_index);
+        target.u32(value.parameters_offset);
+        target.string(value.shorty);
+        target.string(value.descriptor);
+        target.vector(value.parameter_type_indices,
+            [](writer_t& nested, const std::uint16_t item) { nested.u16(item); });
+    });
+    writer.vector(capture.fields, [](writer_t& target, const dex_field_t& value) {
+        target.u32(value.index);
+        target.u16(value.class_type_index);
+        target.u16(value.type_index);
+        target.u32(value.name_string_index);
+        target.string(value.class_descriptor);
+        target.string(value.type_descriptor);
+        target.string(value.name);
+    });
+    writer.vector(capture.methods, [](writer_t& target, const dex_method_t& value) {
+        target.u32(value.index);
+        target.u16(value.class_type_index);
+        target.u16(value.proto_index);
+        target.u32(value.name_string_index);
+        target.string(value.class_descriptor);
+        target.string(value.name);
+        target.string(value.descriptor);
+    });
+    writer.u32(capture.method_id);
+    writer.string(capture.class_descriptor);
+    writer.string(capture.method_name);
+    writer.string(capture.prototype);
+    writer.string(capture.shorty);
+    return writer.take();
+}
+
+std::optional<dalvik_ssa_capture_t> deserialize_capture(
+    const std::string& bytes, std::vector<decompiler_diagnostic_t>& diagnostics)
+{
+    using isolated_worker_codec::reader_t;
+    diagnostics.clear();
+    reader_t reader(bytes);
+    dalvik_ssa_capture_t capture;
+    dex_code_item_t code;
+    std::uint32_t magic = 0;
+    std::uint32_t version = 0;
+    const bool decoded = reader.u32(magic) && magic == k_capture_magic &&
+        reader.u32(version) && version == k_capture_version &&
+        isolated_worker_codec::read_provider_identity(reader, capture.request.provider) &&
+        isolated_worker_codec::read_language_identity(reader, capture.request.language) &&
+        isolated_worker_codec::read_entity(reader, capture.request.entity) &&
+        reader.u64(capture.request.workspace_generation) &&
+        reader.u64(capture.request.type_graph_revision) &&
+        reader.u64(capture.request.return_type_id) &&
+        reader.string(capture.request.dex_version) && reader.u32(code.offset) &&
+        reader.u16(code.registers_size) && reader.u16(code.ins_size) &&
+        reader.u16(code.outs_size) && reader.u16(code.tries_size) &&
+        reader.u32(code.debug_info_offset) && reader.u32(code.instruction_count) &&
+        reader.vector(code.instructions, [](reader_t& source, dalvik_instruction_t& value) {
+            const bool valid = source.u32(value.code_unit_offset) && source.u64(value.file_offset) &&
+                source.u16(value.opcode_unit) && source.u8(value.opcode) &&
+                source.u16(value.width_code_units) && source.boolean(value.payload) &&
+                source.enumeration(value.reference_kind) &&
+                source.optional(value.reference_index,
+                    [](reader_t& nested, std::uint32_t& item) { return nested.u32(item); }) &&
+                source.optional(value.secondary_reference_index,
+                    [](reader_t& nested, std::uint32_t& item) { return nested.u32(item); }) &&
+                source.optional(value.literal,
+                    [](reader_t& nested, std::int64_t& item) { return nested.i64(item); }) &&
+                source.optional(value.branch_target,
+                    [](reader_t& nested, std::int32_t& item) { return nested.i32(item); });
+            value.mnemonic = restored_mnemonic(value.opcode_unit, value.opcode);
+            return valid;
+        }) &&
+        reader.vector(code.tries, [](reader_t& source, dex_try_item_t& value) {
+            return source.u32(value.start_address) && source.u16(value.instruction_count) &&
+                source.u16(value.handler_offset);
+        }) &&
+        reader.vector(code.catch_handlers, [](reader_t& source, dex_catch_handler_t& value) {
+            return source.u32(value.relative_offset) &&
+                source.vector(value.typed_handlers,
+                    [](reader_t& nested, std::pair<std::uint32_t, std::uint32_t>& item) {
+                        return nested.u32(item.first) && nested.u32(item.second);
+                    }) &&
+                source.optional(value.catch_all_address,
+                    [](reader_t& nested, std::uint32_t& item) { return nested.u32(item); });
+        }) &&
+        reader.optional(code.debug_info, [](reader_t& source, dex_debug_info_t& value) {
+            return source.u32(value.offset) && source.u32(value.line_start) &&
+                source.vector(value.parameter_name_string_indices,
+                    [](reader_t& nested, std::optional<std::uint32_t>& item) {
+                        return nested.optional(item,
+                            [](reader_t& leaf, std::uint32_t& index) { return leaf.u32(index); });
+                    }) &&
+                source.vector(value.positions, [](reader_t& nested, dex_debug_position_t& item) {
+                    return nested.u32(item.address) && nested.i32(item.line) &&
+                        nested.optional(item.source_file_string_index,
+                            [](reader_t& leaf, std::uint32_t& index) { return leaf.u32(index); });
+                });
+        }) &&
+        reader.vector(capture.code_units,
+            [](reader_t& source, std::uint16_t& value) { return source.u16(value); }) &&
+        reader.vector(capture.strings, [](reader_t& source, dex_string_t& value) {
+            return source.u32(value.index) && source.u32(value.data_offset) &&
+                source.u32(value.utf16_length) && source.string(value.value);
+        }) &&
+        reader.vector(capture.types, [](reader_t& source, dex_type_t& value) {
+            return source.u32(value.index) && source.u32(value.descriptor_string_index) &&
+                source.string(value.descriptor);
+        }) &&
+        reader.vector(capture.protos, [](reader_t& source, dex_proto_t& value) {
+            return source.u32(value.index) && source.u32(value.shorty_string_index) &&
+                source.u32(value.return_type_index) && source.u32(value.parameters_offset) &&
+                source.string(value.shorty) && source.string(value.descriptor) &&
+                source.vector(value.parameter_type_indices,
+                    [](reader_t& nested, std::uint16_t& item) { return nested.u16(item); });
+        }) &&
+        reader.vector(capture.fields, [](reader_t& source, dex_field_t& value) {
+            return source.u32(value.index) && source.u16(value.class_type_index) &&
+                source.u16(value.type_index) && source.u32(value.name_string_index) &&
+                source.string(value.class_descriptor) && source.string(value.type_descriptor) &&
+                source.string(value.name);
+        }) &&
+        reader.vector(capture.methods, [](reader_t& source, dex_method_t& value) {
+            return source.u32(value.index) && source.u16(value.class_type_index) &&
+                source.u16(value.proto_index) && source.u32(value.name_string_index) &&
+                source.string(value.class_descriptor) && source.string(value.name) &&
+                source.string(value.descriptor);
+        }) && reader.u32(capture.method_id) && reader.string(capture.class_descriptor) &&
+        reader.string(capture.method_name) && reader.string(capture.prototype) &&
+        reader.string(capture.shorty) && reader.complete();
+    if (!decoded || !validate_decompiler_entity_key(capture.request.entity).valid() ||
+        capture.request.entity.kind != decompiler_entity_kind_t::dalvik_method ||
+        capture.request.provider.provider != decompiler_provider_id_t::dalvik_ssa ||
+        capture.request.provider.provider_name.empty() ||
+        capture.request.provider.provider_version.empty() ||
+        capture.request.provider.provider_binary_hash.empty() ||
+        capture.request.provider.worker_build_id.empty() ||
+        capture.request.provider.worker_build_hash.empty() ||
+        capture.request.language.language_id.empty() ||
+        capture.request.language.language_version.empty() ||
+        capture.request.language.compiler_spec_id.empty() ||
+        capture.request.language.language_spec_hash.empty() ||
+        capture.request.language.architecture != architecture_id_t::dalvik_bytecode ||
+        capture.request.language.mode != architecture_mode_t::dalvik ||
+        capture.request.workspace_generation == 0 || capture.request.type_graph_revision == 0 ||
+        code.instruction_count != capture.code_units.size()) {
+        diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::malformed_serialization,
+            "dalvik_ssa.capture.decode", 1));
+        return std::nullopt;
+    }
+    try {
+        capture.code_item = std::make_shared<const dex_code_item_t>(std::move(code));
+    } catch (...) {
+        diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::resource_limit,
+            "dalvik_ssa.capture.allocation", 1));
+        return std::nullopt;
+    }
+    return capture;
 }
 
 std::string serialize_artifacts(const dalvik_ssa_typed_artifacts_t& artifacts)

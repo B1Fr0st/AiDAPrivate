@@ -1,12 +1,14 @@
 #pragma once
 
 #include "../debugger_lane.hpp"
+#include "../live_routing_integration.hpp"
 #include "../../protocol/mcp_tool_contract.hpp"
 
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -44,6 +46,11 @@ struct debugger_effect_approval_t final {
     std::string source;
 };
 
+using debugger_live_dispatch_t = std::function<
+    live_routing_result_t<live_routing_dispatch_result_t>(
+        const live_routing_invocation_context_t&,
+        const protocol::json&)>;
+
 const std::array<std::string_view, k_debugger_tool_count>& debugger_tool_names() noexcept;
 
 class debugger_handlers_t final {
@@ -51,7 +58,8 @@ public:
     debugger_handlers_t(workspace_adapter_t& workspace,
                         debugger_lane_t& lane,
                         protocol::schema_runtime_t& schemas,
-                        debugger_handler_limits_t limits = {});
+                        debugger_handler_limits_t limits = {},
+                        debugger_live_dispatch_t live_dispatch = {});
 
     debugger_handlers_t(const debugger_handlers_t&) = delete;
     debugger_handlers_t& operator=(const debugger_handlers_t&) = delete;
@@ -80,6 +88,7 @@ private:
     debugger_lane_t& lane_;
     protocol::schema_runtime_t& schemas_;
     debugger_handler_limits_t limits_;
+    debugger_live_dispatch_t live_dispatch_;
     std::array<protocol::tool_contract_t, k_debugger_tool_count> contracts_;
 };
 

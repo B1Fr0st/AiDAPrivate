@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -1336,6 +1337,7 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
     schema_v9_fixture_result_t result;
     result.name = "database_open_queue_path";
     const auto source_path = temp_db_path("queue_source");
+    const std::string source_bytes = "AiDA schema v9 queued publication";
     std::string database_path;
     std::shared_ptr<workspace_database_t> database;
 
@@ -1347,8 +1349,8 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
                 result.message = "failed to create queue source fixture";
                 return;
             }
-            const std::string bytes = "AiDA schema v9 queued publication";
-            source.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            source.write(source_bytes.data(),
+                         static_cast<std::streamsize>(source_bytes.size()));
             if (!source) {
                 result.message = "failed to write queue source fixture";
                 return;
@@ -1571,7 +1573,32 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
         metadata_conflict.rejected_confidence = 60;
         snapshot->rich_facts.metadata_conflicts.push_back(metadata_conflict);
 
-        auto snapshot_ticket = database->persist_snapshot(snapshot, "{}", "{}");
+        persisted_search_products_t search_products;
+        search_products.generation = snapshot->generation;
+        search_products.analysis_revision = snapshot->analysis_revision;
+        search_products.overlay_revision = snapshot->overlay_revision;
+        search_products.data_candidates.push_back(data_candidate);
+        auto baseline_domains = encode_packed_baseline_domains(
+            *snapshot, search_products);
+        if (!baseline_domains) {
+            result.message = std::string("failed to encode packed baseline domains: ") +
+                baseline_domains.error().message;
+            return;
+        }
+        packed_page_encode_options_t baseline_options;
+        baseline_options.generation = snapshot->generation;
+        baseline_options.analysis_revision = snapshot->analysis_revision;
+        baseline_options.overlay_revision = snapshot->overlay_revision;
+        auto baseline_batch = packed_page_codec_t::encode_multi_domain_batch(
+            baseline_domains.value(), baseline_options);
+        if (!baseline_batch) {
+            result.message = std::string("failed to encode packed baseline batch: ") +
+                baseline_batch.error().message;
+            return;
+        }
+
+        auto snapshot_ticket = database->persist_snapshot(
+            snapshot, std::move(search_products), "{}", "{}");
         if (!snapshot_ticket.accepted || !snapshot_ticket.completion.valid() ||
             !snapshot_ticket.snapshot_candidate) {
             result.message = "workspace queue rejected rich snapshot persistence";
@@ -1594,10 +1621,77 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
                 exception.what();
             return;
         }
+        auto baseline_manifest = encode_packed_baseline_manifest(
+            *snapshot, snapshot_ticket.snapshot_candidate->token());
+        if (!baseline_manifest) {
+            result.message = std::string("failed to encode candidate-bound manifest: ") +
+                baseline_manifest.error().message;
+            return;
+        }
+        auto baseline_publication = packed_page_codec_t::build_publication(
+            baseline_batch.value(), baseline_manifest.take_value());
+        if (!baseline_publication) {
+            result.message = std::string("failed to build packed baseline publication: ") +
+                baseline_publication.error().message;
+            return;
+        }
+        auto baseline_ticket = database->publish_packed_generation(
+            baseline_publication.take_value(),
+            snapshot_ticket.snapshot_candidate);
+        if (!baseline_ticket.accepted || !baseline_ticket.completion.valid()) {
+            result.message = "workspace queue rejected candidate-bound packed baseline";
+            return;
+        }
+        if (baseline_ticket.completion.wait_for(std::chrono::seconds(10)) !=
+            std::future_status::ready) {
+            result.message = "candidate-bound packed baseline did not complete";
+            return;
+        }
+        try {
+            const auto& completion = baseline_ticket.completion.get();
+            if (!completion) {
+                result.message = std::string("candidate-bound packed baseline failed: ") +
+                    completion.error().message;
+                return;
+            }
+        } catch (const std::exception& exception) {
+            result.message = std::string("candidate-bound packed future failed: ") +
+                exception.what();
+            return;
+        }
+        if (!snapshot_ticket.snapshot_candidate->packed_generation_required()) {
+            result.message = "packed baseline did not bind to the snapshot candidate";
+            return;
+        }
+        auto hidden_generation = database->load_packed_generation(
+            snapshot->generation);
+        if (!hidden_generation || hidden_generation.value()) {
+            result.message = "unpromoted packed baseline became visible";
+            return;
+        }
         auto finalized = snapshot_ticket.snapshot_candidate->finalize();
         if (!finalized) {
             result.message = std::string("rich snapshot promotion failed: ") +
                 finalized.error().message;
+            return;
+        }
+        auto committed_baseline = database->load_packed_generation(
+            snapshot->generation);
+        if (!committed_baseline || !committed_baseline.value() ||
+            !committed_baseline.value()->generation.committed ||
+            committed_baseline.value()->generation.shard_count !=
+                static_cast<std::uint16_t>(packed_page_last_data_type) ||
+            committed_baseline.value()->pages.empty() ||
+            committed_baseline.value()->index.size() !=
+                committed_baseline.value()->pages.size()) {
+            result.message = "candidate promotion did not expose one complete packed baseline";
+            return;
+        }
+        auto restored_baseline = packed_page_codec_t::restore_publication(
+            *committed_baseline.value());
+        if (!restored_baseline) {
+            result.message = std::string("persisted warm-open index failed validation: ") +
+                restored_baseline.error().message;
             return;
         }
         auto reopened_snapshot = database->load_snapshot(normalized, {});
@@ -1615,6 +1709,14 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
             reopened_snapshot.value()->rich_facts.type_candidates.front().source_key !=
                 type_candidate.source_key) {
             result.message = "production snapshot reopen lost call-graph or rich facts";
+            return;
+        }
+        auto reopened_search = database->load_search_products(
+            snapshot->generation, snapshot->analysis_revision,
+            snapshot->overlay_revision);
+        if (!reopened_search || reopened_search.value().data_candidates.size() != 1 ||
+            reopened_search.value().data_candidates.front().id != data_candidate.id) {
+            result.message = "packed search-product reopen lost candidate data";
             return;
         }
 
@@ -1681,6 +1783,14 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
             result.message = "queued publication was not read as one committed generation";
             return;
         }
+        std::ifstream source_after(source_path, std::ios::binary);
+        const std::string observed_source(
+            std::istreambuf_iterator<char>(source_after),
+            std::istreambuf_iterator<char>());
+        if (!source_after.is_open() || observed_source != source_bytes) {
+            result.message = "packed persistence modified its source fixture";
+            return;
+        }
 
         database->request_cancel();
         auto closed_read = database->load_packed_generation(7001);
@@ -1715,7 +1825,7 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
             return;
         }
         result.passed = true;
-        result.message = "real queue publication, rich reopen, close gate, and packed invalidation passed";
+        result.message = "candidate-bound packed persistence, warm reopen, close gate, and invalidation passed";
     };
 
     result.elapsed_us = measure_us(run);

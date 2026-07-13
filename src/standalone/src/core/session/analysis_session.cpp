@@ -33,6 +33,7 @@
 #include "../infra/executor.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/standalone_driver_identity.hpp"
+#include "../workbench/workbench_shell_integration.hpp"
 #include "../ui/loading_binary_overlay.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -1252,6 +1253,21 @@ bool bind_workspace(const std::string& session_id,
         }
         return true;
     }
+    {
+        aida::workbench::workbench_shell_workspace_context_t workbench_context;
+        const auto workbench_attached =
+            aida::workbench::workbench_shell_runtime_t::instance()
+                .attach_analysis_workspace(workspace, workbench_context);
+        if (!workbench_attached) {
+            diag::log_tagged_fmt(
+                "analysis_session",
+                "workbench_attach_deferred session=%s binary_id=%s code=%u subject=%llu",
+                session_id.c_str(),
+                workspace->identity().binary_id().to_hex().c_str(),
+                static_cast<unsigned>(workbench_attached.code),
+                static_cast<unsigned long long>(workbench_attached.subject));
+        }
+    }
     if (symbols && pdb_state) {
         const std::filesystem::path source(workspace->identity().normalized_source_path());
         std::vector<std::string> search_paths;
@@ -1312,6 +1328,9 @@ void static_open_worker(std::string session_id, std::string path,
     if (!bind_workspace(session_id, result.workspace,
                         std::move(result.analysis_job), load_state)) {
         if (!workspace_for_session_id(session_id) && !result.joined_existing) {
+            static_cast<void>(
+                aida::workbench::workbench_shell_runtime_t::instance()
+                    .close_analysis_workspace(result.workspace));
             result.workspace->request_cancel();
             (void)workspace_registry().close(result.workspace->identity().binary_id(),
                 std::chrono::steady_clock::now() + std::chrono::seconds(10));
@@ -1715,6 +1734,17 @@ void close_workspace_async(std::shared_ptr<analysis_workspace_t> workspace,
     submission.target_pid = pid;
     submission.body = [workspace = std::move(workspace), pid, binding = std::move(binding)]() {
         if (workspace) {
+            const auto workbench_closed =
+                aida::workbench::workbench_shell_runtime_t::instance()
+                    .close_analysis_workspace(workspace);
+            if (!workbench_closed) {
+                diag::log_tagged_fmt(
+                    "analysis_session",
+                    "workbench_close_failed binary_id=%s code=%u subject=%llu",
+                    workspace->identity().binary_id().to_hex().c_str(),
+                    static_cast<unsigned>(workbench_closed.code),
+                    static_cast<unsigned long long>(workbench_closed.subject));
+            }
             workspace->request_cancel();
             const auto closed = workspace_registry().close(workspace->identity().binary_id(),
                 std::chrono::steady_clock::now() + std::chrono::seconds(10));
@@ -1732,6 +1762,17 @@ void close_workspace_async(std::shared_ptr<analysis_workspace_t> workspace,
     };
     if (!aida::infra::executor::submit(std::move(submission)).submitted) {
         if (fallback_workspace) {
+            const auto workbench_closed =
+                aida::workbench::workbench_shell_runtime_t::instance()
+                    .close_analysis_workspace(fallback_workspace);
+            if (!workbench_closed) {
+                diag::log_tagged_fmt(
+                    "analysis_session",
+                    "workbench_close_fallback_failed binary_id=%s code=%u subject=%llu",
+                    fallback_workspace->identity().binary_id().to_hex().c_str(),
+                    static_cast<unsigned>(workbench_closed.code),
+                    static_cast<unsigned long long>(workbench_closed.subject));
+            }
             fallback_workspace->request_cancel();
             (void)workspace_registry().close(
                 fallback_workspace->identity().binary_id(),
@@ -2125,6 +2166,9 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
     auto rollback_attach = [previous_pid, pid, attached_by_transaction, source_identity](
         const std::shared_ptr<analysis_workspace_t>& workspace = {}) {
         if (workspace) {
+            static_cast<void>(
+                aida::workbench::workbench_shell_runtime_t::instance()
+                    .close_analysis_workspace(workspace));
             workspace->request_cancel();
             (void)workspace_registry().close(workspace->identity().binary_id(),
                 std::chrono::steady_clock::now() + std::chrono::seconds(2));
@@ -2226,6 +2270,20 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         if (out_err) *out_err = error;
         rollback_attach(workspace);
         return false;
+    }
+    {
+        aida::workbench::workbench_shell_workspace_context_t workbench_context;
+        const auto workbench_attached =
+            aida::workbench::workbench_shell_runtime_t::instance()
+                .attach_analysis_workspace(workspace, workbench_context);
+        if (!workbench_attached) {
+            diag::log_tagged_fmt(
+                "analysis_session",
+                "live_workbench_attach_deferred pid=%u binary_id=%s code=%u subject=%llu",
+                pid, workspace->identity().binary_id().to_hex().c_str(),
+                static_cast<unsigned>(workbench_attached.code),
+                static_cast<unsigned long long>(workbench_attached.subject));
+        }
     }
     auto session = std::make_shared<analysis_session_t>();
     bool session_limit_reached = false;

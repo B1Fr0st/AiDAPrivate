@@ -58,6 +58,7 @@
 #include "../core/infra/executor.hpp"
 #include "../core/infra/taskflow_runtime.hpp"
 #include "../core/ui/ui_thread_dispatcher.hpp"
+#include "../core/workbench/workbench_shell_integration.hpp"
 #include "functions_panel.hpp"
 #include "function_index.hpp"
 #include "xref_index.hpp"
@@ -78,6 +79,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 
 static ID3D11ShaderResourceView* g_loader_icon_srv  = nullptr;
@@ -335,6 +337,87 @@ namespace {
 			case center_view_t::test_lab: return "test_lab";
 		}
 		return "unknown";
+	}
+
+	std::optional<aida::workbench::document_kind_t> workbench_document_kind(
+		center_view_t view)
+	{
+		switch (view) {
+			case center_view_t::disassembly:
+				return aida::workbench::document_kind_t::disassembly;
+			case center_view_t::hex_view:
+				return aida::workbench::document_kind_t::hex;
+			case center_view_t::pseudocode:
+				return aida::workbench::document_kind_t::pseudocode;
+			case center_view_t::graph_view:
+				return aida::workbench::document_kind_t::graph;
+			case center_view_t::snapshot_diff:
+				return aida::workbench::document_kind_t::diff;
+			default:
+				return std::nullopt;
+		}
+	}
+
+	std::optional<center_view_t> center_view_for_workbench_document(
+		aida::workbench::document_kind_t kind)
+	{
+		switch (kind) {
+			case aida::workbench::document_kind_t::disassembly:
+				return center_view_t::disassembly;
+			case aida::workbench::document_kind_t::hex:
+				return center_view_t::hex_view;
+			case aida::workbench::document_kind_t::pseudocode:
+				return center_view_t::pseudocode;
+			case aida::workbench::document_kind_t::graph:
+				return center_view_t::graph_view;
+			case aida::workbench::document_kind_t::diff:
+				return center_view_t::snapshot_diff;
+			default:
+				return std::nullopt;
+		}
+	}
+
+	void restore_workbench_center_view(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+	{
+		static std::weak_ptr<aida::analysis::analysis_workspace_t> restored_workspace;
+		const auto previous = restored_workspace.lock();
+		if (!workspace) {
+			restored_workspace.reset();
+			return;
+		}
+		if (previous == workspace)
+			return;
+		aida::workbench::workbench_shell_workspace_context_t context;
+		const auto restored =
+			aida::workbench::workbench_shell_runtime_t::instance()
+				.workspace_context(workspace, context);
+		if (!restored) {
+			static unsigned long long last_failure_ms = 0;
+			const auto now_ms = GetTickCount64();
+			if (now_ms - last_failure_ms >= 5000ULL) {
+				last_failure_ms = now_ms;
+				diag::log_tagged_fmt(
+					"workbench_shell",
+					"ui_restore_deferred binary_id=%s code=%u subject=%llu",
+					workspace->identity().binary_id().to_hex().c_str(),
+					static_cast<unsigned>(restored.code),
+					static_cast<unsigned long long>(restored.subject));
+			}
+			return;
+		}
+		restored_workspace = workspace;
+		const auto active = std::find_if(
+			context.persistence.documents.begin(),
+			context.persistence.documents.end(),
+			[&context](const aida::workbench::document_persistence_dto_t& document) {
+				return document.id == context.persistence.active_document;
+			});
+		if (active == context.persistence.documents.end())
+			return;
+		const auto center = center_view_for_workbench_document(active->identity.kind);
+		if (center)
+			globals::ui::active_center_view = *center;
 	}
 
 	void mark_center_render_section(const char* section, center_view_t view, bool overlay_blocking, float vw, float vh)
@@ -1775,6 +1858,7 @@ void helpers::render_title()
 	g_render_section = "entry";
 	float dt = ImGui::GetIO().DeltaTime;
 	const auto active_workspace_handle = analysis_session::active_workspace();
+	restore_workbench_center_view(active_workspace_handle);
 	const auto active_workspace_context = disasm_view::capture_workspace(active_workspace_handle);
 	globals::ui::load_timer += dt;
 	file_menu_deferred::run_pending();
@@ -7115,6 +7199,29 @@ void helpers::render_title()
 			cv = center_view_t::disassembly;
 		else if (hex_view::active(active_workspace_context))
 			cv = center_view_t::hex_view;
+	}
+	if (!overlay_blocking && active_workspace_handle) {
+		const auto kind = workbench_document_kind(cv);
+		if (kind) {
+			aida::workbench::workbench_shell_workspace_context_t workbench_context;
+			const auto activated =
+				aida::workbench::workbench_shell_runtime_t::instance()
+					.activate_document(active_workspace_handle, *kind,
+						std::nullopt, workbench_context);
+			if (!activated) {
+				static unsigned long long last_failure_ms = 0;
+				const auto now_ms = GetTickCount64();
+				if (now_ms - last_failure_ms >= 5000ULL) {
+					last_failure_ms = now_ms;
+					diag::log_tagged_fmt(
+						"workbench_shell",
+						"ui_activate_deferred view=%s code=%u subject=%llu",
+						center_view_name(cv),
+						static_cast<unsigned>(activated.code),
+						static_cast<unsigned long long>(activated.subject));
+				}
+			}
+		}
 	}
 
 	float vw = center_content_w;

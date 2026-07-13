@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace aida {
@@ -88,7 +89,7 @@ struct workbench_shell_workspace_context_t {
     pseudocode_document::pseudocode_document_model_t* pseudocode_document = nullptr;
     graph_document::graph_document_model_t* graph_document = nullptr;
     diff_document::diff_document_model_t* diff_document = nullptr;
-    const workbench_document_bridge_t* document_bridge = nullptr;
+    workbench_document_bridge_t* document_bridge = nullptr;
     std::uint64_t analysis_generation = 0;
     std::uint64_t analysis_revision = 0;
     std::uint64_t overlay_revision = 0;
@@ -187,6 +188,51 @@ private:
     explicit workbench_shell_integration_t(std::unique_ptr<impl_t> impl);
     std::unique_ptr<impl_t> impl_;
     workbench_shell_integration_config_t config_;
+};
+
+class workbench_shell_runtime_t final {
+public:
+    static workbench_shell_runtime_t& instance();
+
+    ~workbench_shell_runtime_t();
+    workbench_shell_runtime_t(const workbench_shell_runtime_t&) = delete;
+    workbench_shell_runtime_t& operator=(const workbench_shell_runtime_t&) = delete;
+
+    workbench_error_t attach_analysis_workspace(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t workspace_context(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t activate_document(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_kind_t kind,
+        std::optional<std::uint64_t> address,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t close_document(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_kind_t kind,
+        std::optional<std::uint64_t> address,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t navigate_document(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_kind_t kind,
+        std::optional<std::uint64_t> document_address,
+        const selection_context_t& selection,
+        const document_local_cursor_t& cursor,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t close_analysis_workspace(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace);
+
+private:
+    workbench_shell_runtime_t();
+    struct impl_t;
+    std::unique_ptr<impl_t> impl_;
 };
 
 }

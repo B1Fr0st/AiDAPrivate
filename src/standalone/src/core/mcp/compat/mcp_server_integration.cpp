@@ -207,22 +207,21 @@ protocol::cancellation_token_t cancellation_from(
 
 mcp_standalone::tool_result_t to_standalone_result(
     const protocol::mcp_result_t& result) {
-    json metadata = result.aida_metadata();
+    mcp_standalone::tool_result_t standalone;
     if (result.is_error()) {
         json details = result.structured_content();
         if (!details.is_object())
             details = json::object();
-        if (!metadata.empty())
-            details["_meta"]["aida_contract"] = std::move(metadata);
-        return mcp_standalone::tool_result_t::error(
+        standalone = mcp_standalone::tool_result_t::error(
             std::string(result.text()), std::string(result.error_code()), details);
+    } else {
+        standalone = mcp_standalone::tool_result_t::ok(
+            std::string(result.text()), result.structured_content());
     }
-    json data = result.structured_content();
-    if (!data.is_object())
-        data = json::object();
-    if (!metadata.empty())
-        data["_meta"]["aida_contract"] = std::move(metadata);
-    return mcp_standalone::tool_result_t::ok(std::string(result.text()), data);
+    const json& metadata = result.aida_metadata();
+    if (metadata.is_object() && !metadata.empty())
+        standalone.meta["aida"] = metadata;
+    return standalone;
 }
 
 bool server_has_tool(const mcp_standalone::server_t& server,
@@ -253,125 +252,6 @@ tool_provenance_metadata_t extension_provenance(
     provenance.read_only = binding.contract.effect_policy.read_only;
     provenance.unsafe = binding.contract.effect_policy.unsafe;
     return provenance;
-}
-
-json nonnegative_integer_schema() {
-    return json{{"type", "integer"}, {"minimum", 0}};
-}
-
-json query_cursor_schema() {
-    return json{
-        {"type", "object"},
-        {"properties", json{
-            {"binary_id", json{{"type", "string"}, {"minLength", 64}, {"maxLength", 64}}},
-            {"load_profile_hash", json{{"type", "string"}, {"minLength", 64}, {"maxLength", 64}}},
-            {"provider_content_hash", json{{"anyOf", json::array({
-                json{{"type", "string"}, {"minLength", 64}, {"maxLength", 64}},
-                json{{"type", "null"}},
-            })}}},
-            {"generation", nonnegative_integer_schema()},
-            {"analysis_revision", nonnegative_integer_schema()},
-            {"overlay_revision", nonnegative_integer_schema()},
-            {"provider_size", nonnegative_integer_schema()},
-            {"query_fingerprint", nonnegative_integer_schema()},
-            {"position", nonnegative_integer_schema()},
-            {"matches_consumed", nonnegative_integer_schema()},
-            {"integrity_tag", nonnegative_integer_schema()},
-            {"next", nonnegative_integer_schema()},
-            {"done", json{{"type", "boolean"}}},
-            {"cancelled", json{{"type", "boolean"}}},
-        }},
-        {"required", json::array({
-            "binary_id", "load_profile_hash", "provider_content_hash", "generation",
-            "analysis_revision", "overlay_revision", "provider_size",
-            "query_fingerprint", "position", "matches_consumed", "integrity_tag",
-        })},
-        {"additionalProperties", false},
-    };
-}
-
-void merge_query_cursor_schema(json& schema) {
-    if (!schema.is_object())
-        return;
-    if (auto properties = schema.find("properties");
-        properties != schema.end() && properties->is_object()) {
-        if (auto cursor = properties->find("cursor");
-            cursor != properties->end() && cursor->is_object()) {
-            const auto production = query_cursor_schema();
-            auto& cursor_properties = (*cursor)["properties"];
-            if (!cursor_properties.is_object())
-                cursor_properties = json::object();
-            for (const auto& entry : production.at("properties").items())
-                cursor_properties[entry.key()] = entry.value();
-            (*cursor)["additionalProperties"] = false;
-        }
-        for (auto& entry : properties->items())
-            merge_query_cursor_schema(entry.value());
-    }
-    if (auto items = schema.find("items"); items != schema.end())
-        merge_query_cursor_schema(*items);
-    for (const char* keyword : {"anyOf", "allOf", "oneOf"}) {
-        if (auto branches = schema.find(keyword);
-            branches != schema.end() && branches->is_array()) {
-            for (auto& branch : *branches)
-                merge_query_cursor_schema(branch);
-        }
-    }
-}
-
-void enrich_query_contract(protocol::tool_contract_t& contract) {
-    if (contract.name != "find" && contract.name != "find_bytes" &&
-        contract.name != "find_regex" && contract.name != "search_text")
-        return;
-    if (!contract.input_schema.is_object())
-        contract.input_schema = json{{"type", "object"}};
-    auto& properties = contract.input_schema["properties"];
-    if (!properties.is_object())
-        properties = json::object();
-    properties["cursor"] = query_cursor_schema();
-    merge_query_cursor_schema(contract.output_schema);
-}
-
-void enrich_list_instances_contract(protocol::tool_contract_t& contract) {
-    if (contract.name != "list_instances")
-        return;
-    contract.input_schema = json{
-        {"type", "object"},
-        {"properties", json{
-            {"filter", json{{"type", "string"}}},
-            {"include_retired", json{{"type", "boolean"}}},
-        }},
-        {"additionalProperties", false},
-    };
-    const json instance_schema{
-        {"type", "object"},
-        {"properties", json{
-            {"target_id", nonnegative_integer_schema()},
-            {"pid", nonnegative_integer_schema()},
-            {"bin_name", json{{"type", "string"}}},
-            {"generation", nonnegative_integer_schema()},
-            {"attach_generation", nonnegative_integer_schema()},
-            {"live", json{{"type", "boolean"}}},
-            {"retired", json{{"type", "boolean"}}},
-            {"snapshot_stale", json{{"type", "boolean"}}},
-            {"process_creation_identity", nonnegative_integer_schema()},
-            {"revision", nonnegative_integer_schema()},
-        }},
-        {"required", json::array({
-            "target_id", "pid", "bin_name", "generation", "attach_generation",
-            "live", "retired", "snapshot_stale", "process_creation_identity", "revision",
-        })},
-        {"additionalProperties", false},
-    };
-    contract.output_schema = json{
-        {"type", "object"},
-        {"properties", json{
-            {"instances", json{{"type", "array"}, {"items", instance_schema}}},
-            {"count", nonnegative_integer_schema()},
-        }},
-        {"required", json::array({"instances", "count"})},
-        {"additionalProperties", false},
-    };
 }
 
 }
@@ -730,8 +610,6 @@ mcp_server_integration_t::descriptor_to_contract(
         descriptor.annotations_json.begin(), descriptor.annotations_json.end());
     contract.target_policy = descriptor_to_target_policy(descriptor);
     contract.effect_policy = descriptor_to_effect_policy(descriptor);
-    enrich_query_contract(contract);
-    enrich_list_instances_contract(contract);
     return contract;
 }
 
@@ -744,6 +622,10 @@ mcp_server_integration_t::contract_to_tool_def(
     tool.read_only = contract.effect_policy.read_only;
     tool.visibility = mcp_standalone::tool_visibility_t::external_visible;
     tool.input_schema = contract.input_schema;
+    tool.output_schema = contract.output_schema;
+    tool.annotations = contract.annotations;
+    tool.target_independent = contract.target_policy.requirement ==
+        protocol::target_requirement_t::independent;
     return tool;
 }
 

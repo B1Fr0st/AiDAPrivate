@@ -1509,6 +1509,70 @@ inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,
 	return result;
 }
 
+inline ghidra_result_t decompile_isolated_buffer(
+	const uint8_t* data,
+	size_t size,
+	uint64_t base_addr,
+	uint64_t entry_addr,
+	const std::string& sleigh_id,
+	std::atomic<bool>* cancel,
+	std::optional<std::chrono::steady_clock::time_point> deadline,
+	const ghidra_decompile_result_limits_t& result_limits,
+	const aida::analysis::ghidra_ir_adapter::capture_request_t& typed_request)
+{
+	active_decompile_guard_t active_guard(cancel);
+	ghidra_result_t result;
+	result.function_addr = entry_addr;
+	if (active_guard.was_shutting_down) {
+		result.is_error = true;
+		result.error_text = "decompiler is shutting down";
+		return result;
+	}
+	if (!data || size == 0 || base_addr == 0 || entry_addr < base_addr ||
+		entry_addr - base_addr >= size || sleigh_id.empty() ||
+		!valid_decompile_result_limits(result_limits) ||
+		!aida::analysis::validate_decompiler_entity_key(typed_request.entity).valid()) {
+		result.is_error = true;
+		result.error_text = "isolated decompiler input violates the typed provider contract";
+		return result;
+	}
+	if (!g_state.initialized.load(std::memory_order_acquire) && !init()) {
+		result.is_error = true;
+		result.error_text = "dependency_blocked: ghidra decompiler not initialized; " + init_diagnostics();
+		return result;
+	}
+	if ((cancel && cancel->load(std::memory_order_acquire)) ||
+		(deadline && std::chrono::steady_clock::now() >= *deadline)) {
+		result.is_error = true;
+		result.error_text = "cancelled";
+		return result;
+	}
+	try {
+		detail::prepared_arch_t prepared(data, size, base_addr, nullptr, cancel, sleigh_id);
+		result = detail::do_decompile(prepared.arch.get(), entry_addr, cancel, deadline,
+			result_limits, &typed_request);
+	} catch (ghidra::LowlevelError& error) {
+		result.is_error = true;
+		result.error_text = error.explain;
+	} catch (ghidra::DecoderError& error) {
+		result.is_error = true;
+		result.error_text = error.explain;
+	} catch (...) {
+		result.is_error = true;
+		result.error_text = "isolated decompilation failed";
+	}
+	if (!result.is_error && !result.typed_artifacts) {
+		result.is_error = true;
+		result.complete = false;
+		result.error_text = "isolated decompilation completed without typed provider artifacts";
+	} else if (!result.is_error && !detail::decompile_result_within_limits(result, result_limits)) {
+		result.is_error = true;
+		result.complete = false;
+		result.error_text = "isolated decompilation result exceeds configured limits";
+	}
+	return result;
+}
+
 inline ghidra_result_t decompile_workspace(
 	const std::shared_ptr<const aida::analysis::byte_provider_t>& provider,
 	const std::shared_ptr<const aida::analysis::pe_image_t>& image,

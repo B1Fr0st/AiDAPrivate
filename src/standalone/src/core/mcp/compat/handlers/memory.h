@@ -33,9 +33,19 @@ struct memory_handler_limits_t final {
 
 const std::array<std::string_view, k_memory_tool_count>& memory_tool_names() noexcept;
 
+struct live_memory_identity_t final {
+    std::uint64_t target_id = 0;
+    std::uint32_t pid = 0;
+    std::uint64_t process_creation_identity = 0;
+    std::uint64_t module_base = 0;
+    std::uint64_t module_size = 0;
+    std::uint64_t attach_generation = 0;
+};
+
 struct memory_invocation_t final {
     std::optional<std::uint64_t> expected_generation;
     std::optional<std::chrono::steady_clock::time_point> deadline;
+    std::optional<live_memory_identity_t> expected_live_identity;
 };
 
 class memory_handlers_t final {

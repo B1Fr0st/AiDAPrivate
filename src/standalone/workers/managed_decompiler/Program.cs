@@ -12,11 +12,13 @@ internal static class Program
 
     private static async Task<int> Main(string[] arguments)
     {
-        if (arguments.Length != 2 || !string.Equals(arguments[0], "--offline-package-root", StringComparison.Ordinal))
+        if (arguments.Length != 4 || !string.Equals(arguments[0], "--offline-package-root", StringComparison.Ordinal) ||
+            !string.Equals(arguments[2], "--module-handle", StringComparison.Ordinal))
             return 2;
         try
         {
             OfflinePackageLock.EstablishStartupGate(arguments[1]);
+            MetadataAnalysis.EstablishModuleHandle(arguments[3]);
         }
         catch (Exception)
         {

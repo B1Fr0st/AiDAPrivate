@@ -54,6 +54,9 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input);
 jvm_method_context_t extract_method_context(const classfile_image_t& classfile,
                                              std::uint32_t method_index);
 
+std::string serialize_jvm_method_input(const jvm_method_input_t& input);
+std::optional<jvm_method_input_t> deserialize_jvm_method_input(
+    const std::string& bytes, std::vector<decompiler_diagnostic_t>& diagnostics);
 std::string serialize_jvm_ssa_result(const jvm_ssa_result_t& result);
 std::optional<jvm_ssa_result_t> deserialize_jvm_ssa_result(const std::string& bytes,
                                                             std::vector<decompiler_diagnostic_t>& diagnostics);

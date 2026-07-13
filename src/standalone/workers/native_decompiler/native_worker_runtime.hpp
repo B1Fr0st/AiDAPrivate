@@ -29,6 +29,7 @@ struct startup_t {
     HANDLE snapshot_handle = nullptr;
     HANDLE identity_handle = nullptr;
     std::size_t snapshot_size = 0;
+    decompiler_provider_id_t provider = decompiler_provider_id_t::ghidra_native;
     wire::session_material_t session;
     sha256_digest_t manifest_hash;
     wire::frame_reader_t reader;
@@ -74,6 +75,7 @@ inline bool parse_startup(int argc, wchar_t** argv, startup_t& output) noexcept
     bool snapshot = false;
     bool identity = false;
     bool size = false;
+    bool provider = false;
     for (int index = 1; index < argc; ++index) {
         const std::wstring_view argument(argv[index] ? argv[index] : L"");
         if (argument == L"--aida-native-decompiler-worker") {
@@ -110,6 +112,15 @@ inline bool parse_startup(int argc, wchar_t** argv, startup_t& output) noexcept
             continue;
         }
         std::size_t parsed_size = 0;
+        if (parse_size_argument(argument, L"--provider", parsed_size)) {
+            if (provider || (parsed_size != static_cast<std::size_t>(decompiler_provider_id_t::ghidra_native) &&
+                parsed_size != static_cast<std::size_t>(decompiler_provider_id_t::jvm_ssa) &&
+                parsed_size != static_cast<std::size_t>(decompiler_provider_id_t::dalvik_ssa)))
+                return false;
+            output.provider = static_cast<decompiler_provider_id_t>(parsed_size);
+            provider = true;
+            continue;
+        }
         if (parse_size_argument(argument, L"--snapshot-size", parsed_size)) {
             if (size)
                 return false;
@@ -117,7 +128,7 @@ inline bool parse_startup(int argc, wchar_t** argv, startup_t& output) noexcept
             size = true;
         }
     }
-    return marker && read && write && snapshot && identity && size;
+    return marker && read && write && snapshot && identity && size && provider;
 }
 
 inline bool receive_bootstrap(startup_t& startup) noexcept
@@ -156,8 +167,20 @@ inline std::optional<sha256_digest_t> executable_hash(HANDLE identity_handle)
 inline decompiler_provider_identity_t provider_identity(const startup_t& startup)
 {
     decompiler_provider_identity_t provider;
-    provider.provider = decompiler_provider_id_t::ghidra_native;
-    provider.provider_name = k_provider_name;
+    provider.provider = startup.provider;
+    switch (startup.provider) {
+    case decompiler_provider_id_t::ghidra_native:
+        provider.provider_name = k_provider_name;
+        break;
+    case decompiler_provider_id_t::jvm_ssa:
+        provider.provider_name = "aida-jvm-ssa";
+        break;
+    case decompiler_provider_id_t::dalvik_ssa:
+        provider.provider_name = "aida-dalvik-ssa";
+        break;
+    case decompiler_provider_id_t::ilspy_cli:
+        return provider;
+    }
     provider.provider_version = k_provider_version;
     const auto hash = executable_hash(startup.identity_handle);
     if (hash)
@@ -217,15 +240,18 @@ inline bool send_failure(startup_t& startup, std::uint64_t job_id, decompiler_di
     return send_failures(startup, job_id, std::move(diagnostics));
 }
 
-inline bool send_document(startup_t& startup, std::uint64_t job_id, decompiler_document_t document)
+inline bool send_document(startup_t& startup, std::uint64_t job_id,
+                          std::string provider_artifacts, decompiler_document_t document)
 {
     decompiler_worker_document_message_t result;
     result.envelope.kind = decompiler_worker_message_kind_t::document;
     result.envelope.session_nonce_hash = startup.session.nonce_hash;
     result.envelope.sequence = startup.next_worker_sequence;
     result.job_id = job_id;
+    result.provider_artifacts_hash = stable_serialization_hash(provider_artifacts);
+    result.provider_artifacts = std::move(provider_artifacts);
     result.document = std::move(document);
-    return send_message(startup, decompiler_worker_message_t{std::move(result)}, 8U * 1024U * 1024U);
+    return send_message(startup, decompiler_worker_message_t{std::move(result)}, 64U * 1024U * 1024U);
 }
 
 inline bool send_hello(startup_t& startup, const decompiler_provider_identity_t& provider, const sha256_digest_t& manifest_hash)

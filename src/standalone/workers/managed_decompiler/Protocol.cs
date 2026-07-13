@@ -6,7 +6,7 @@ namespace Aida.ManagedDecompiler;
 internal static class WorkerProtocol
 {
     internal const string Schema = "aida.c03.managed-cli.worker";
-    internal const int Version = 1;
+    internal const int Version = 2;
     internal static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -154,6 +154,7 @@ internal sealed record WorkerResult(
     WorkerSource Source,
     IReadOnlyList<WorkerTokenMap> TokenMap,
     WorkerTypeGraph TypeGraph,
+    ulong ReturnTypeId,
     WorkerIr Ir,
     IReadOnlyList<WorkerUnknown> Unknowns,
     IReadOnlyList<WorkerDiagnostic> Diagnostics);

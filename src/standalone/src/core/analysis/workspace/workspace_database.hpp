@@ -7,12 +7,14 @@
 #include "workspace_schema_v9.hpp"
 
 #include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct sqlite3;
@@ -105,6 +107,19 @@ struct persisted_search_products_t {
     std::vector<std::uint8_t> search_index_blob;
 };
 
+using packed_baseline_domains_t =
+    std::vector<std::pair<packed_page_type_t, std::vector<std::uint8_t>>>;
+
+workspace_result_t<packed_baseline_domains_t> encode_packed_baseline_domains(
+    const analysis_snapshot_t& snapshot,
+    const persisted_search_products_t& search_products,
+    const cancellation_token_t& cancel = {});
+
+workspace_result_t<std::vector<std::uint8_t>> encode_packed_baseline_manifest(
+    const analysis_snapshot_t& snapshot,
+    const std::string& candidate_token,
+    const cancellation_token_t& cancel = {});
+
 workspace_result_t<void> migrate_workspace_database_schema(
     sqlite3* database, bool& invalidate_derived_facts);
 
@@ -116,6 +131,7 @@ public:
     std::uint64_t generation() const noexcept;
     std::uint64_t analysis_revision() const noexcept;
     std::uint64_t overlay_revision() const noexcept;
+    bool packed_generation_required() const noexcept;
 
     workspace_result_t<void> finalize(
         const cancellation_token_t& cancel = {}) const;
@@ -135,6 +151,7 @@ private:
     std::uint64_t generation_ = 0;
     std::uint64_t analysis_revision_ = 0;
     std::uint64_t overlay_revision_ = 0;
+    mutable std::atomic<bool> packed_generation_required_{false};
 
     friend class workspace_database_t;
 };
@@ -169,11 +186,11 @@ public:
 
     workspace_result_t<std::shared_ptr<const analysis_snapshot_t>> load_snapshot(
         std::shared_ptr<const pe_image_t> image,
-        const cancellation_token_t& cancel = {}) const;
+        const cancellation_token_t& cancel = {});
     workspace_result_t<std::shared_ptr<const analysis_snapshot_t>> load_snapshot(
         std::shared_ptr<const workspace_image_t> image,
         std::shared_ptr<const pe_image_t> pe_adapter,
-        const cancellation_token_t& cancel = {}) const;
+        const cancellation_token_t& cancel = {});
     workspace_result_t<persisted_search_products_t> load_search_products(
         std::uint64_t expected_generation,
         std::uint64_t expected_analysis_revision,
@@ -192,6 +209,10 @@ public:
         cancellation_token_t cancel = {});
     persistence_ticket_t publish_packed_generation(
         packed_generation_publication_t publication,
+        cancellation_token_t cancel = {});
+    persistence_ticket_t publish_packed_generation(
+        packed_generation_publication_t publication,
+        std::shared_ptr<const workspace_persistence_candidate_t> candidate,
         cancellation_token_t cancel = {});
     workspace_result_t<std::optional<packed_generation_publication_t>>
         load_packed_generation(std::uint64_t generation,

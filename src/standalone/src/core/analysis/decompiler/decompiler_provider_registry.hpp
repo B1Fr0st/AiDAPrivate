@@ -11,12 +11,8 @@
 
 namespace aida::analysis {
 
-namespace ghidra_ir_adapter {
-struct typed_artifacts_t;
-}
-
 namespace managed_cli {
-struct analysis_t;
+struct request_t;
 }
 
 namespace jvm_ssa {
@@ -44,26 +40,26 @@ public:
 class ghidra_native_provider_context_t final : public decompiler_provider_context_t {
 public:
     explicit ghidra_native_provider_context_t(
-        std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t> artifacts);
+        std::shared_ptr<const std::vector<std::uint8_t>> snapshot,
+        sha256_digest_t snapshot_hash);
 
-    const std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t>& artifacts() const noexcept;
+    const std::shared_ptr<const std::vector<std::uint8_t>>& snapshot() const noexcept;
+    const sha256_digest_t& snapshot_hash() const noexcept;
 
 private:
-    std::shared_ptr<const ghidra_ir_adapter::typed_artifacts_t> artifacts_;
+    std::shared_ptr<const std::vector<std::uint8_t>> snapshot_;
+    sha256_digest_t snapshot_hash_;
 };
 
 class managed_cli_provider_context_t final : public decompiler_provider_context_t {
 public:
     managed_cli_provider_context_t(
-        std::shared_ptr<const managed_cli::analysis_t> analysis,
-        std::uint64_t return_type_id);
+        std::shared_ptr<const managed_cli::request_t> request);
 
-    const std::shared_ptr<const managed_cli::analysis_t>& analysis() const noexcept;
-    std::uint64_t return_type_id() const noexcept;
+    const std::shared_ptr<const managed_cli::request_t>& request() const noexcept;
 
 private:
-    std::shared_ptr<const managed_cli::analysis_t> analysis_;
-    std::uint64_t return_type_id_ = 0;
+    std::shared_ptr<const managed_cli::request_t> request_;
 };
 
 class jvm_ssa_provider_context_t final : public decompiler_provider_context_t {
@@ -157,7 +153,7 @@ struct decompiler_builtin_provider_registration_t {
         decompiler_profile_id_t::balanced,
         decompiler_profile_id_t::thorough};
     std::uint32_t priority = 100;
-    bool isolated = false;
+    bool isolated = true;
 };
 
 struct decompiler_builtin_provider_config_t {

@@ -9427,23 +9427,11 @@ static tool_result_t add_workspace_provenance(
     tool_result_t result,
     const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
 {
-    if (!result.success) {
-        if (!result.error_details.is_object())
-            result.error_details = json::object();
-        if (!result.error_details.contains("_meta") || !result.error_details["_meta"].is_object())
-            result.error_details["_meta"] = json::object();
-        result.error_details["_meta"]["aida"] = workspace_provenance(workspace);
-        return result;
-    }
-    if (!result.data.is_object()) {
-        json wrapped;
-        wrapped["result"] = result.data.is_null() ? json(result.text) : result.data;
-        result.data = std::move(wrapped);
-    }
-    if (!result.data.contains("_meta") || !result.data["_meta"].is_object())
-        result.data["_meta"] = json::object();
-    result.data["_meta"]["aida"] = workspace_provenance(workspace);
-    result.text = result.data.dump(2);
+    if (!result.meta.is_object())
+        result.meta = json::object();
+    if (!result.meta.contains("aida") || !result.meta["aida"].is_object())
+        result.meta["aida"] = json::object();
+    result.meta["aida"].update(workspace_provenance(workspace));
     return result;
 }
 
@@ -9488,7 +9476,8 @@ static bool is_active_session_independent_tool(const std::string& name)
 static std::string predicted_tool_lane(const tool_def_t& tool, const json& arguments)
 {
     const bool session_manager = is_analysis_session_management_tool(tool.name);
-    const bool session_independent = is_active_session_independent_tool(tool.name);
+    const bool session_independent = tool.target_independent ||
+        is_active_session_independent_tool(tool.name);
     json target_arguments_storage;
     const json& target_arguments = target_resolution_args_for_tool(tool, arguments, target_arguments_storage, false);
     const bool explicit_target = tool_args_select_session_target(target_arguments);
@@ -12633,7 +12622,8 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     tool_invocation_metrics_t* metrics = nullptr)
 {
     const bool session_manager = is_analysis_session_management_tool(tool.name);
-    const bool session_independent = is_active_session_independent_tool(tool.name);
+    const bool session_independent = tool.target_independent ||
+        is_active_session_independent_tool(tool.name);
     json target_arguments_storage;
     const json& target_arguments = target_resolution_args_for_tool(tool, arguments, target_arguments_storage, true);
     const bool explicit_target = tool_args_select_session_target(target_arguments);
@@ -12798,12 +12788,25 @@ bool server_t::register_tool(tool_def_t tool)
             tool.name.c_str());
         return false;
     }
+    if (!tool.output_schema.is_null() && !tool.output_schema.is_object()) {
+        diag::log_tagged_fmt("mcp_srv",
+            "register_tool rejected name='%s' reason=output_schema_not_object",
+            tool.name.c_str());
+        return false;
+    }
+    if (!tool.annotations.is_null() && !tool.annotations.is_object()) {
+        diag::log_tagged_fmt("mcp_srv",
+            "register_tool rejected name='%s' reason=annotations_not_object",
+            tool.name.c_str());
+        return false;
+    }
 
     bool already_has_binary_id = false;
     for (const auto& p : tool.params) {
         if (p.name == "binary_id") { already_has_binary_id = true; break; }
     }
-    bool is_targetless_tool = tool.name.rfind("sessions_", 0) == 0 ||
+    bool is_targetless_tool = tool.target_independent ||
+                              tool.name.rfind("sessions_", 0) == 0 ||
                               tool.name == "list_instances" ||
                               tool.name == "get_tool_descriptions" ||
                               is_camoufox_browser_tool_name(tool.name);
@@ -13513,27 +13516,29 @@ json server_t::tool_schema(const tool_def_t& tool, bool compact) const
         generated_input_schema = build_input_schema(tool);
         input_schema = &generated_input_schema;
     }
-    json annotations;
-    annotations["title"]           = snake_to_title(tool.name);
-    annotations["readOnlyHint"]    = tool.read_only;
-    annotations["destructiveHint"] = (!tool.read_only);
-    annotations["idempotentHint"]  = tool.read_only;
-    annotations["openWorldHint"]   = (tool.name == "sandbox_execute");
+    json annotations = tool.annotations;
+    if (annotations.is_null()) {
+        annotations = json::object();
+        annotations["title"]           = snake_to_title(tool.name);
+        annotations["readOnlyHint"]    = tool.read_only;
+        annotations["destructiveHint"] = (!tool.read_only);
+        annotations["idempotentHint"]  = tool.read_only;
+        annotations["openWorldHint"]   = (tool.name == "sandbox_execute");
+    }
 
     if (compact && tool.name != "get_tool_descriptions") {
         json t;
         t["name"]        = tool.name;
         t["description"] = tool.description;
         t["inputSchema"] = *input_schema;
+        if (!tool.output_schema.is_null())
+            t["outputSchema"] = tool.output_schema;
         t["read_only"]   = tool.read_only;
         t["visibility"]  = visibility_name(tool.visibility);
         const std::string domain = infer_tool_domain(tool.name);
         if (!domain.empty())
             t["domain"] = domain;
-        t["annotations"] = json{
-            {"readOnlyHint", tool.read_only},
-            {"destructiveHint", !tool.read_only}
-        };
+        t["annotations"] = annotations;
         return t;
     }
 
@@ -13541,6 +13546,8 @@ json server_t::tool_schema(const tool_def_t& tool, bool compact) const
     t["name"]        = tool.name;
     t["description"] = tool.description;
     t["inputSchema"] = *input_schema;
+    if (!tool.output_schema.is_null())
+        t["outputSchema"] = tool.output_schema;
     t["annotations"] = annotations;
     t["read_only"]   = tool.read_only;
     t["visibility"]  = visibility_name(tool.visibility);
@@ -14867,6 +14874,8 @@ json server_t::handle_tools_call(const json& id, const json& params)
 
     json result;
     result["content"] = content;
+    if (tr.success)
+        result["structuredContent"] = tr.data.is_null() ? json::object() : tr.data;
     if (!tr.success) {
         result["isError"] = true;
         if (has_structured_tool_error(tr)) {
@@ -14874,6 +14883,10 @@ json server_t::handle_tools_call(const json& id, const json& params)
             result["_meta"]["error"] = err;
             result["structuredContent"]["error"] = std::move(err);
         }
+    }
+    if (tr.meta.is_object()) {
+        for (const auto& entry : tr.meta.items())
+            result["_meta"][entry.key()] = entry.value();
     }
     release_browser_external_lease(mcp_tool_release_reason_from_result(tr, false));
     result["_meta"]["diagnostics"] = diagnostics;
@@ -17169,6 +17182,7 @@ void server_t::server_thread_func(int port)
         resp["diagnostics"]["late_result_disposition"] = api_delivery_evidence.value("disposition", std::string("delivered"));
         resp["diagnostics"]["late_result_fence"] = api_delivery_evidence;
         if (!tr.data.is_null() && !tr.data.empty()) resp["data"] = tr.data;
+        if (tr.meta.is_object() && !tr.meta.empty()) resp["_meta"] = tr.meta;
         if (has_structured_tool_error(tr)) {
             json err = structured_tool_error(tr);
             resp["error"] = err;

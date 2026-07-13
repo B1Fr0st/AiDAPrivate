@@ -5,6 +5,7 @@ using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.Metadata;
@@ -27,6 +28,7 @@ internal sealed record ParsedMethod(
     WorkerIdentity Identity,
     IReadOnlyList<WorkerTokenMap> TokenMap,
     WorkerTypeGraph TypeGraph,
+    ulong ReturnTypeId,
     WorkerIr Ir,
     IReadOnlyList<WorkerUnknown> Unknowns,
     IReadOnlyList<WorkerDiagnostic> Diagnostics);
@@ -38,6 +40,29 @@ internal static class MetadataAnalysis
     private const long MaximumModuleBytes = int.MaxValue;
     private const int MaximumSourceBytes = 8 * 1024 * 1024;
     private const int MaximumMetadataEntries = 1_048_576;
+    private static readonly object ModuleHandleGate = new();
+    private static nint moduleHandle;
+
+    internal static void EstablishModuleHandle(string value)
+    {
+        if (!ulong.TryParse(value, out var raw) || raw == 0 || raw > (ulong)nint.MaxValue)
+            throw new InvalidDataException("module handle is invalid");
+        var rawHandle = (nint)raw;
+        var candidate = new SafeFileHandle(rawHandle, ownsHandle: false);
+        if (candidate.IsInvalid || candidate.IsClosed)
+            throw new InvalidDataException("module handle is unavailable");
+        using (var stream = new FileStream(candidate, FileAccess.Read, 1, isAsync: false))
+        {
+            if (stream.Length <= 0 || stream.Length > MaximumModuleBytes)
+                throw new InvalidDataException("module handle length is invalid");
+        }
+        lock (ModuleHandleGate)
+        {
+            if (moduleHandle != 0)
+                throw new InvalidDataException("module handle was already established");
+            moduleHandle = rawHandle;
+        }
+    }
 
     internal static WorkerResult Analyze(WorkerRequest request, ResourceBudgetGuard resourceBudget, CancellationToken cancellationToken)
     {
@@ -80,6 +105,7 @@ internal static class MetadataAnalysis
             new WorkerSource(source, sourceHash),
             parsed.TokenMap,
             parsed.TypeGraph,
+            parsed.ReturnTypeId,
             parsed.Ir,
             parsed.Unknowns,
             parsed.Diagnostics);
@@ -111,7 +137,14 @@ internal static class MetadataAnalysis
         ResourceBudgetGuard resourceBudget,
         CancellationToken cancellationToken)
     {
-        using var stream = new FileStream(request.ModulePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
+        nint rawHandle;
+        lock (ModuleHandleGate)
+            rawHandle = moduleHandle;
+        if (rawHandle == 0)
+            throw new InvalidDataException("module handle is unavailable");
+        var handle = new SafeFileHandle(rawHandle, ownsHandle: false);
+        using var stream = new FileStream(handle, FileAccess.Read, 1024 * 1024, isAsync: false);
+        stream.Position = 0;
         var length = stream.Length;
         if (length <= 0 || length > MaximumModuleBytes)
             throw new ResourceLimitException(ResourceLimitKind.Memory);
@@ -220,7 +253,8 @@ internal static class MetadataAnalysis
             diagnostics.Add(new WorkerDiagnostic("warning", "unresolved_reference", "managed_cli.method_body_absent", Array.Empty<string>(), null, 0, false, 1));
         }
 
-        return new ParsedMethod(identity, tokenMap, typeGraph, new WorkerIr(blocks[0].Id, blocks), unknowns, diagnostics);
+        return new ParsedMethod(identity, tokenMap, typeGraph, typeIds[signature.ReturnType],
+            new WorkerIr(blocks[0].Id, blocks), unknowns, diagnostics);
     }
 
     private static WorkerIdentity BuildIdentity(

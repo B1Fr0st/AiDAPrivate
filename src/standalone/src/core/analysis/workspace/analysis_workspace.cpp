@@ -170,11 +170,207 @@ workspace_result_t<void> validate_complete_coverage(const analysis_snapshot_t& s
     return validate_regions(snapshot.normalized_image->segments);
 }
 
+workspace_result_t<std::shared_ptr<const workspace_image_t>> bind_publication_image(
+    std::shared_ptr<const workspace_image_t> image,
+    const workspace_identity_t& identity,
+    const byte_provider_t& provider,
+    const sha256_digest_t& provider_hash,
+    const char* phase) {
+    if (!image || provider_hash.empty())
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "publication image binding is incomplete", phase));
+    auto validation = validate_workspace_image(*image);
+    if (!validation)
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            validation.error());
+    const auto& provider_identity = provider.identity();
+    if (provider_identity.normalized_source.empty() ||
+        provider_identity.size != provider.size() ||
+        image->format != identity.format() ||
+        image->architecture != identity.architecture() ||
+        image->architecture_mode != identity.architecture_mode() ||
+        image->abi != identity.abi() || image->endian != identity.endian() ||
+        image->image_base != identity.image_base() ||
+        image->provider_size != provider.size() ||
+        image->member != provider_identity.member ||
+        (provider_identity.content_sha256 &&
+         *provider_identity.content_sha256 != provider_hash)) {
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "publication image conflicts with its byte provider", phase));
+    }
+    if (identity.target_kind() == target_kind_t::static_file &&
+        ((identity.normalized_member_path().has_value() != image->member.has_value()) ||
+         (image->member && image->member->normalized_member_path !=
+             *identity.normalized_member_path()))) {
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "publication image member conflicts with workspace identity",
+                                 phase));
+    }
+    try {
+        auto bound = std::make_shared<workspace_image_t>(*image);
+        bound->workspace_binary_id = identity.binary_id();
+        bound->provider_content_hash = provider_hash;
+        bound->provider_source = provider_identity.normalized_source;
+        bound->provider_size = provider.size();
+        bound->member = provider_identity.member;
+        bound->provider_binding_verified = true;
+        auto bound_validation = validate_workspace_image(*bound, {}, true);
+        if (!bound_validation)
+            return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+                bound_validation.error());
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::success(
+            std::static_pointer_cast<const workspace_image_t>(std::move(bound)));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "publication image binding allocation failed", phase));
+    }
+}
+
+bool snapshot_has_analysis_facts(const analysis_snapshot_t& snapshot) noexcept {
+    return !snapshot.instructions.empty() ||
+           !snapshot.delay_slot_counts.empty() ||
+           !snapshot.operand_facts.empty() ||
+           !snapshot.target_facts.empty() || !snapshot.blocks.empty() ||
+           !snapshot.function_chunks.empty() ||
+           !snapshot.function_block_memberships.empty() ||
+           !snapshot.functions.empty() || !snapshot.edges.empty() ||
+           !snapshot.call_graph.call_sites.empty() ||
+           !snapshot.call_graph.candidates.empty() ||
+           !snapshot.call_graph.edges.empty() ||
+           !snapshot.call_graph.conflicts.empty() || !snapshot.xrefs.empty() ||
+           !snapshot.strings.empty() || !snapshot.symbols.empty() ||
+           !snapshot.rich_facts.data_candidates.empty() ||
+           !snapshot.rich_facts.data_pointer_facts.empty() ||
+           !snapshot.rich_facts.data_conflicts.empty() ||
+           !snapshot.rich_facts.type_candidates.empty() ||
+           !snapshot.rich_facts.type_references.empty() ||
+           !snapshot.rich_facts.metadata_conflicts.empty() ||
+           !snapshot.coverage.empty();
+}
+
+workspace_result_t<std::uint64_t> executable_byte_count(
+    const analysis_snapshot_t& snapshot, const char* phase) {
+    if (!snapshot.normalized_image)
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "analysis snapshot has no normalized image", phase));
+    std::uint64_t executable_bytes = 0;
+    const auto count_regions = [&](const auto& regions) {
+        for (const auto& region : regions) {
+            if ((region.permissions & image_permission_execute) == 0)
+                continue;
+            const auto extent = std::max<std::uint64_t>(
+                region.virtual_size, region.file_size);
+            if (!checked_add_u64(executable_bytes, extent, executable_bytes))
+                return false;
+        }
+        return true;
+    };
+    const bool valid = snapshot.normalized_image->sections.empty()
+        ? count_regions(snapshot.normalized_image->segments)
+        : count_regions(snapshot.normalized_image->sections);
+    if (!valid)
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::range_overflow,
+                                 "executable byte count overflowed", phase));
+    return workspace_result_t<std::uint64_t>::success(executable_bytes);
+}
+
+workspace_readiness_t publication_readiness(
+    const analysis_snapshot_t& snapshot) noexcept {
+    if (snapshot.baseline_complete)
+        return workspace_readiness_t::baseline_ready;
+    if (snapshot.analysis_revision != 0)
+        return workspace_readiness_t::partial;
+    return snapshot.normalized_image
+        ? workspace_readiness_t::parsed
+        : workspace_readiness_t::provider_ready;
+}
+
+workspace_progress_t publication_progress(
+    workspace_readiness_t readiness, std::uint64_t executable_bytes) {
+    workspace_progress_t progress;
+    progress.readiness = readiness;
+    progress.phase = readiness == workspace_readiness_t::baseline_ready
+        ? "baseline_ready"
+        : readiness == workspace_readiness_t::partial
+            ? "partial"
+            : readiness == workspace_readiness_t::parsed
+                ? "parsed"
+                : "provider_ready";
+    progress.completed_units = 1;
+    progress.total_units = 1;
+    progress.completed_bytes = executable_bytes;
+    progress.total_bytes = executable_bytes;
+    return progress;
+}
+
+}
+
+struct workspace_publication_state_t final {
+    std::shared_ptr<const analysis_publication_t> publication;
+};
+
+namespace {
+
+class publication_router_provider_t final : public byte_provider_t {
+public:
+    publication_router_provider_t(
+        std::shared_ptr<workspace_publication_state_t> state,
+        std::shared_ptr<const byte_provider_t> source)
+        : state_(std::move(state)), source_(std::move(source)),
+          identity_(source_->identity()) {
+        identity_.immutable_snapshot = false;
+        identity_.content_sha256.reset();
+    }
+
+    const byte_provider_identity_t& identity() const noexcept override {
+        return identity_;
+    }
+
+    std::uint64_t size() const noexcept override {
+        return source_->size();
+    }
+
+    std::uint64_t maximum_contiguous_lease(
+        std::uint64_t offset) const noexcept override {
+        const auto provider = active_provider();
+        return provider ? provider->maximum_contiguous_lease(offset) : 0;
+    }
+
+    workspace_result_t<byte_view_t> lease(
+        std::uint64_t offset, std::uint64_t size_value,
+        const cancellation_token_t& cancel) const override {
+        const auto provider = active_provider();
+        if (!provider)
+            return workspace_result_t<byte_view_t>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "workspace byte publication is unavailable",
+                                     "workspace_provider"));
+        return provider->lease(offset, size_value, cancel);
+    }
+
+private:
+    std::shared_ptr<const byte_provider_t> active_provider() const noexcept {
+        const auto publication = std::atomic_load_explicit(
+            &state_->publication, std::memory_order_acquire);
+        return publication ? publication->provider : nullptr;
+    }
+
+    std::shared_ptr<workspace_publication_state_t> state_;
+    std::shared_ptr<const byte_provider_t> source_;
+    byte_provider_identity_t identity_;
+};
+
 }
 
 bool analysis_publication_t::coherent_with(
     const workspace_identity_t& identity) const noexcept {
-    if (!snapshot || binary_id != identity.binary_id() ||
+    if (!snapshot || !provider || binary_id != identity.binary_id() ||
         load_profile_hash != identity.load_profile_hash() ||
         snapshot->binary_id != binary_id ||
         snapshot->load_profile_hash != load_profile_hash ||
@@ -182,17 +378,25 @@ bool analysis_publication_t::coherent_with(
         snapshot->analysis_revision != analysis_revision ||
         snapshot->overlay_revision != overlay_revision || generation == 0)
         return false;
+    const auto& provider_identity = provider->identity();
+    if (provider_identity.normalized_source.empty() ||
+        provider_identity.size != provider->size())
+        return false;
     if (snapshot->normalized_image) {
         const auto& image = *snapshot->normalized_image;
         if (!image.provider_binding_verified ||
             image.workspace_binary_id != identity.binary_id() ||
-            image.provider_content_hash != identity.content_hash() ||
             image.format != identity.format() ||
             image.architecture != identity.architecture() ||
             image.architecture_mode != identity.architecture_mode() ||
             image.abi != identity.abi() || image.endian != identity.endian() ||
-            image.image_base != identity.image_base() || image.provider_size == 0 ||
-            image.provider_source.empty())
+            image.image_base != identity.image_base() ||
+            image.provider_size != provider->size() ||
+            image.provider_source != provider_identity.normalized_source ||
+            image.member != provider_identity.member ||
+            (provider_identity.content_sha256
+                 ? image.provider_content_hash != *provider_identity.content_sha256
+                 : image.provider_content_hash != identity.content_hash()))
             return false;
         if (identity.target_kind() == target_kind_t::static_file &&
             ((identity.normalized_member_path().has_value() != image.member.has_value()) ||
@@ -285,14 +489,14 @@ workspace_result_t<void> analysis_workspace_t::verify_provider_binding() const {
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "workspace provider binding was not verified at creation",
                                  "workspace_verify_binding"));
-    const auto& current_identity = provider_->identity();
+    const auto& current_identity = source_provider_->identity();
     if (!same_provider_identity(provider_binding_.verified_identity, current_identity))
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::file_changed,
                                  "workspace provider identity changed since creation",
                                  "workspace_verify_binding"));
-    if (provider_binding_.verified_identity.size != provider_->size() ||
-        provider_binding_.provider_size != provider_->size())
+    if (provider_binding_.verified_identity.size != source_provider_->size() ||
+        provider_binding_.provider_size != source_provider_->size())
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::file_changed,
                                  "workspace provider size changed since creation",
@@ -302,7 +506,8 @@ workspace_result_t<void> analysis_workspace_t::verify_provider_binding() const {
             make_workspace_error(workspace_error_code_t::file_changed,
                                  "workspace provider source path changed since creation",
                                  "workspace_verify_binding"));
-    if (const auto mapped = std::dynamic_pointer_cast<const mapped_file_provider_t>(provider_handle())) {
+    if (const auto mapped =
+            std::dynamic_pointer_cast<const mapped_file_provider_t>(source_provider_handle())) {
         auto revalidation = mapped->revalidate();
         if (!revalidation)
             return workspace_result_t<void>::failure(revalidation.error());
@@ -312,13 +517,23 @@ workspace_result_t<void> analysis_workspace_t::verify_provider_binding() const {
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "workspace provider content hash does not match its identity",
                                  "workspace_verify_binding"));
-    if (const auto image = normalized_image()) {
+    const auto publication = analysis_publication();
+    if (!publication || !publication->provider)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "workspace publication provider is unavailable",
+                                 "workspace_verify_binding"));
+    if (const auto image = publication->snapshot->normalized_image) {
+        const auto& published_identity = publication->provider->identity();
+        const auto published_hash = published_identity.content_sha256
+            ? *published_identity.content_sha256
+            : provider_binding_.content_hash;
         if (!image->provider_binding_verified ||
             image->workspace_binary_id != identity_->binary_id() ||
-            image->provider_content_hash != provider_binding_.content_hash ||
-            image->provider_source != provider_binding_.normalized_source ||
-            image->provider_size != provider_binding_.provider_size ||
-            image->member != provider_->member_metadata()) {
+            image->provider_content_hash != published_hash ||
+            image->provider_source != published_identity.normalized_source ||
+            image->provider_size != publication->provider->size() ||
+            image->member != publication->provider->member_metadata()) {
             return workspace_result_t<void>::failure(
                 make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
                                      "normalized image provider binding is stale",
@@ -1564,11 +1779,13 @@ analysis_workspace_t::bind_normalized_image(
 
 workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>
 analysis_workspace_t::canonicalize_snapshot(
-    std::shared_ptr<const analysis_snapshot_t> snapshot_value) const {
-    if (!snapshot_value)
+    std::shared_ptr<const analysis_snapshot_t> snapshot_value,
+    const std::shared_ptr<const byte_provider_t>& provider) const {
+    if (!snapshot_value || !provider)
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "snapshot is null", "workspace_snapshot_bind"));
+                                 "snapshot or publication provider is null",
+                                 "workspace_snapshot_bind"));
     std::shared_ptr<const workspace_image_t> normalized = snapshot_value->normalized_image;
     const auto current = analysis_publication();
     if (current && current->snapshot && current->snapshot->normalized_image &&
@@ -1580,7 +1797,8 @@ analysis_workspace_t::canonicalize_snapshot(
             std::move(snapshot_value));
     }
     if (!normalized && snapshot_value->image) {
-        auto converted = normalize_pe_image(*snapshot_value->image, *provider_, cancellation_.token());
+        auto converted = normalize_pe_image(
+            *snapshot_value->image, *provider, cancellation_.token());
         if (!converted)
             return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
                 converted.error());
@@ -1592,7 +1810,21 @@ analysis_workspace_t::canonicalize_snapshot(
                                  "snapshot has no normalized image", "workspace_snapshot_bind"));
     if (!current || !current->snapshot ||
         normalized != current->snapshot->normalized_image) {
-        auto bound = bind_normalized_image(std::move(normalized), *identity_, provider_binding_);
+        const auto& provider_identity = provider->identity();
+        sha256_digest_t provider_hash;
+        if (provider_identity.content_sha256) {
+            provider_hash = *provider_identity.content_sha256;
+        } else if (provider.get() == source_provider_.get()) {
+            provider_hash = provider_binding_.content_hash;
+        } else {
+            return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+                make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                     "publication provider has no content identity",
+                                     "workspace_snapshot_bind"));
+        }
+        auto bound = bind_publication_image(
+            std::move(normalized), *identity_, *provider, provider_hash,
+            "workspace_snapshot_bind");
         if (!bound)
             return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(bound.error());
         normalized = bound.take_value();
@@ -1618,7 +1850,10 @@ analysis_workspace_t::analysis_workspace_t(
     std::shared_ptr<const byte_provider_t> provider,
     std::shared_ptr<const workspace_image_t> image,
     std::shared_ptr<const pe_image_t> pe_adapter)
-    : identity_(std::move(identity)), provider_(std::move(provider)) {
+    : identity_(std::move(identity)), source_provider_(std::move(provider)),
+      publication_state_(std::make_shared<workspace_publication_state_t>()),
+      provider_router_(std::make_shared<publication_router_provider_t>(
+          publication_state_, source_provider_)) {
     auto initial = std::make_shared<analysis_snapshot_t>();
     initial->binary_id = identity_->binary_id();
     initial->load_profile_hash = identity_->load_profile_hash();
@@ -1630,11 +1865,12 @@ analysis_workspace_t::analysis_workspace_t(
     initial->image = std::move(pe_adapter);
     const auto readiness = initial->normalized_image ? workspace_readiness_t::parsed
                                           : workspace_readiness_t::provider_ready;
-    publication_ = std::make_shared<const analysis_publication_t>(
-        std::static_pointer_cast<const analysis_snapshot_t>(initial), nullptr, readiness);
+    publication_state_->publication = std::make_shared<const analysis_publication_t>(
+        std::static_pointer_cast<const analysis_snapshot_t>(initial),
+        source_provider_, nullptr, readiness);
     progress_.readiness = readiness;
     progress_.phase = initial->normalized_image ? "parsed" : "provider_ready";
-    progress_.total_bytes = provider_->size();
+    progress_.total_bytes = source_provider_->size();
 }
 
 analysis_workspace_t::~analysis_workspace_t() {
@@ -1653,10 +1889,17 @@ std::shared_ptr<const workspace_image_t> analysis_workspace_t::normalized_image(
 
 std::shared_ptr<const analysis_publication_t>
 analysis_workspace_t::analysis_publication() const noexcept {
-    auto publication = std::atomic_load_explicit(&publication_, std::memory_order_acquire);
+    auto publication = std::atomic_load_explicit(
+        &publication_state_->publication, std::memory_order_acquire);
     if (publication && !publication->coherent_with(*identity_))
         return {};
     return publication;
+}
+
+std::shared_ptr<const byte_provider_t>
+analysis_workspace_t::provider_handle() const noexcept {
+    const auto publication = analysis_publication();
+    return publication ? publication->provider : nullptr;
 }
 
 std::uint64_t analysis_workspace_t::generation() const noexcept {
@@ -1667,6 +1910,11 @@ std::uint64_t analysis_workspace_t::generation() const noexcept {
 std::uint64_t analysis_workspace_t::analysis_revision() const noexcept {
     const auto publication = analysis_publication();
     return publication ? publication->analysis_revision : 0;
+}
+
+std::uint64_t analysis_workspace_t::overlay_revision() const noexcept {
+    const auto publication = analysis_publication();
+    return publication ? publication->overlay_revision : 0;
 }
 
 std::shared_ptr<const analysis_snapshot_t> analysis_workspace_t::snapshot() const noexcept {
@@ -1726,7 +1974,14 @@ workspace_result_t<void> analysis_workspace_t::publish_image(
     if (workspace_cancel.stop_requested())
         return workspace_result_t<void>::failure(
             workspace_stop_error(workspace_cancel, "workspace_publish"));
-    auto normalized = normalize_pe_image(*image_value, *provider_, cancellation_.token());
+    const auto publication_provider = provider_handle();
+    if (!publication_provider)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "workspace publication provider is unavailable",
+                                 "workspace_publish"));
+    auto normalized = normalize_pe_image(
+        *image_value, *publication_provider, cancellation_.token());
     if (!normalized)
         return workspace_result_t<void>::failure(normalized.error());
     return publish_normalized_image(expected_generation, normalized.take_value(),
@@ -1748,7 +2003,27 @@ workspace_result_t<void> analysis_workspace_t::publish_normalized_image(
     if (workspace_cancel.stop_requested())
         return workspace_result_t<void>::failure(
             workspace_stop_error(workspace_cancel, "workspace_publish"));
-    auto bound = bind_normalized_image(std::move(image_value), *identity_, provider_binding_);
+    const auto publication_provider = provider_handle();
+    if (!publication_provider)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "workspace publication provider is unavailable",
+                                 "workspace_publish"));
+    const auto& provider_identity = publication_provider->identity();
+    sha256_digest_t provider_hash;
+    if (provider_identity.content_sha256) {
+        provider_hash = *provider_identity.content_sha256;
+    } else if (publication_provider.get() == source_provider_.get()) {
+        provider_hash = provider_binding_.content_hash;
+    } else {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "publication provider has no content identity",
+                                 "workspace_publish"));
+    }
+    auto bound = bind_publication_image(
+        std::move(image_value), *identity_, *publication_provider, provider_hash,
+        "workspace_publish");
     if (!bound)
         return workspace_result_t<void>::failure(bound.error());
     auto normalized = bound.take_value();
@@ -1776,7 +2051,8 @@ workspace_result_t<void> analysis_workspace_t::publish_normalized_image(
             make_workspace_error(workspace_error_code_t::stale_generation,
                                  "image publication generation is stale", "workspace_publish"));
     const auto current_publication = analysis_publication();
-    if (!current_publication || !current_publication->snapshot)
+    if (!current_publication || !current_publication->snapshot ||
+        current_publication->provider != publication_provider)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "workspace publication is missing",
@@ -1805,14 +2081,14 @@ workspace_result_t<void> analysis_workspace_t::publish_normalized_image(
     updated->normalized_image = std::move(normalized);
     updated->image = std::move(pe_adapter);
     const auto replacement = std::make_shared<const analysis_publication_t>(
-        std::static_pointer_cast<const analysis_snapshot_t>(updated), nullptr,
-        workspace_readiness_t::parsed);
+        std::static_pointer_cast<const analysis_snapshot_t>(updated),
+        current_publication->provider, nullptr, workspace_readiness_t::parsed);
     std::string parsed_phase = "parsed";
     {
         std::lock_guard state_lock(state_mutex_);
         progress_.readiness = workspace_readiness_t::parsed;
         progress_.phase = std::move(parsed_phase);
-        std::atomic_store_explicit(&publication_, replacement,
+        std::atomic_store_explicit(&publication_state_->publication, replacement,
                                    std::memory_order_release);
     }
     return workspace_result_t<void>::success();
@@ -1840,7 +2116,14 @@ workspace_result_t<void> analysis_workspace_t::publish_snapshot(
             make_workspace_error(workspace_error_code_t::substitution_rejected,
                                  "published snapshot belongs to another workspace",
                                  "workspace_publish"));
-    auto canonical_snapshot = canonicalize_snapshot(snapshot_value);
+    const auto publication_provider = provider_handle();
+    if (!publication_provider)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "workspace publication provider is unavailable",
+                                 "workspace_publish"));
+    auto canonical_snapshot = canonicalize_snapshot(
+        snapshot_value, publication_provider);
     if (!canonical_snapshot)
         return workspace_result_t<void>::failure(canonical_snapshot.error());
     snapshot_value = canonical_snapshot.take_value();
@@ -1860,7 +2143,8 @@ workspace_result_t<void> analysis_workspace_t::publish_snapshot(
     if (!validation)
         return validation;
     const auto replacement = std::make_shared<const analysis_publication_t>(
-        snapshot_value, nullptr, workspace_readiness_t::partial);
+        snapshot_value, publication_provider, nullptr,
+        workspace_readiness_t::partial);
     if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<void>::failure(
             publication_finalizer_conflict("workspace_publish"));
@@ -1892,6 +2176,7 @@ workspace_result_t<void> analysis_workspace_t::publish_snapshot(
                                      "workspace_publish"));
         const auto current_publication = analysis_publication();
         if (!current_publication || !current_publication->snapshot ||
+            current_publication->provider != publication_provider ||
             snapshot_value->normalized_image !=
                 current_publication->snapshot->normalized_image)
             return workspace_result_t<void>::failure(
@@ -1901,7 +2186,7 @@ workspace_result_t<void> analysis_workspace_t::publish_snapshot(
         progress_.readiness = workspace_readiness_t::partial;
         progress_.phase = std::move(partial_phase);
         progress_.error.reset();
-        std::atomic_store_explicit(&publication_, replacement,
+        std::atomic_store_explicit(&publication_state_->publication, replacement,
                                    std::memory_order_release);
     }
     return workspace_result_t<void>::success();
@@ -1914,23 +2199,10 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
     std::shared_ptr<search_index_t> search_index_value,
     bool require_complete_coverage,
     std::function<workspace_result_t<void>()> finalizer) {
-    if (!snapshot_value)
+    if (!snapshot_value || !search_index_value)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "analysis bundle requires a snapshot",
-                                 "workspace_publish"));
-    const bool overlay_generation_publication =
-        expected_generation != (std::numeric_limits<std::uint64_t>::max)() &&
-        snapshot_value->generation == expected_generation + 1;
-    if (overlay_generation_publication && !finalizer)
-        return workspace_result_t<void>::failure(
-            make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "overlay generation publication requires an atomic finalizer",
-                                 "workspace_publish"));
-    if (!overlay_generation_publication && !search_index_value)
-        return workspace_result_t<void>::failure(
-            make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "analysis bundle requires a search index",
+                                 "analysis bundle requires a snapshot and search index",
                                  "workspace_publish"));
     if (closing() || closed())
         return workspace_result_t<void>::failure(
@@ -1946,7 +2218,14 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
             make_workspace_error(workspace_error_code_t::substitution_rejected,
                                  "analysis bundle belongs to another workspace",
                                  "workspace_publish"));
-    auto canonical_snapshot = canonicalize_snapshot(snapshot_value);
+    const auto publication_provider = provider_handle();
+    if (!publication_provider)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "workspace publication provider is unavailable",
+                                 "workspace_publish"));
+    auto canonical_snapshot = canonicalize_snapshot(
+        snapshot_value, publication_provider);
     if (!canonical_snapshot)
         return workspace_result_t<void>::failure(canonical_snapshot.error());
     snapshot_value = canonical_snapshot.take_value();
@@ -1971,49 +2250,15 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "search index does not match the analysis snapshot",
                                  "workspace_publish"));
-    std::uint64_t executable_bytes = 0;
-    const auto count_executable_bytes = [&](const auto& regions) {
-        for (const auto& region : regions) {
-            if ((region.permissions & image_permission_execute) == 0)
-                continue;
-            const auto extent = std::max<std::uint64_t>(region.virtual_size,
-                                                        region.file_size);
-            if (!checked_add_u64(executable_bytes, extent, executable_bytes))
-                return false;
-        }
-        return true;
-    };
-    if ((!snapshot_value->normalized_image->sections.empty() &&
-         !count_executable_bytes(snapshot_value->normalized_image->sections)) ||
-        (snapshot_value->normalized_image->sections.empty() &&
-         !count_executable_bytes(snapshot_value->normalized_image->segments))) {
-        return workspace_result_t<void>::failure(
-            make_workspace_error(workspace_error_code_t::range_overflow,
-                                 "executable byte count overflowed",
-                                 "workspace_publish"));
-    }
-    const auto readiness = snapshot_value->baseline_complete
-        ? workspace_readiness_t::baseline_ready
-        : snapshot_value->analysis_revision != 0
-            ? workspace_readiness_t::partial
-            : snapshot_value->normalized_image
-                ? workspace_readiness_t::parsed
-                : workspace_readiness_t::provider_ready;
+    auto executable_bytes = executable_byte_count(
+        *snapshot_value, "workspace_publish");
+    if (!executable_bytes)
+        return workspace_result_t<void>::failure(executable_bytes.error());
+    const auto readiness = publication_readiness(*snapshot_value);
     const auto replacement = std::make_shared<const analysis_publication_t>(
-        snapshot_value, search_index_value, readiness);
-    workspace_progress_t replacement_progress;
-    replacement_progress.readiness = readiness;
-    replacement_progress.phase = readiness == workspace_readiness_t::baseline_ready
-        ? "baseline_ready"
-        : readiness == workspace_readiness_t::partial
-            ? "partial"
-            : readiness == workspace_readiness_t::parsed
-                ? "parsed"
-                : "provider_ready";
-    replacement_progress.completed_units = 1;
-    replacement_progress.total_units = 1;
-    replacement_progress.completed_bytes = executable_bytes;
-    replacement_progress.total_bytes = executable_bytes;
+        snapshot_value, publication_provider, search_index_value, readiness);
+    auto replacement_progress = publication_progress(
+        readiness, executable_bytes.value());
     if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<void>::failure(
             publication_finalizer_conflict("workspace_publish"));
@@ -2037,59 +2282,19 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
                                      "workspace_publish"));
         const auto current_publication = analysis_publication();
         if (!current_publication || !current_publication->snapshot ||
+            current_publication->provider != publication_provider ||
             snapshot_value->normalized_image !=
                 current_publication->snapshot->normalized_image)
             return workspace_result_t<void>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "analysis bundle image does not match the workspace",
                                      "workspace_publish"));
-        if (overlay_generation_publication) {
-            const auto current_overlay_revision = overlay_revision();
-            const bool reset_snapshot_has_facts =
-                !snapshot_value->instructions.empty() ||
-                !snapshot_value->delay_slot_counts.empty() ||
-                !snapshot_value->operand_facts.empty() ||
-                !snapshot_value->target_facts.empty() ||
-                !snapshot_value->blocks.empty() ||
-                !snapshot_value->function_chunks.empty() ||
-                !snapshot_value->function_block_memberships.empty() ||
-                !snapshot_value->functions.empty() ||
-                !snapshot_value->edges.empty() ||
-                !snapshot_value->call_graph.call_sites.empty() ||
-                !snapshot_value->call_graph.candidates.empty() ||
-                !snapshot_value->call_graph.edges.empty() ||
-                !snapshot_value->call_graph.conflicts.empty() ||
-                !snapshot_value->xrefs.empty() ||
-                !snapshot_value->strings.empty() ||
-                !snapshot_value->symbols.empty() ||
-                !snapshot_value->rich_facts.data_candidates.empty() ||
-                !snapshot_value->rich_facts.data_pointer_facts.empty() ||
-                !snapshot_value->rich_facts.data_conflicts.empty() ||
-                !snapshot_value->rich_facts.type_candidates.empty() ||
-                !snapshot_value->rich_facts.type_references.empty() ||
-                !snapshot_value->rich_facts.metadata_conflicts.empty() ||
-                !snapshot_value->coverage.empty();
-            if (active_analysis_generation_.load(std::memory_order_acquire) != 0 ||
-                analysis_revision() != expected_analysis_revision ||
-                current_overlay_revision ==
-                    (std::numeric_limits<std::uint64_t>::max)() ||
-                snapshot_value->overlay_revision != current_overlay_revision + 1 ||
-                snapshot_value->image != current_publication->snapshot->image ||
-                (snapshot_value->analysis_revision != 0 &&
-                 snapshot_value->analysis_revision != expected_analysis_revision) ||
-                (snapshot_value->analysis_revision == 0 &&
-                 (snapshot_value->baseline_complete || search_index_value ||
-                  reset_snapshot_has_facts)))
-                return workspace_result_t<void>::failure(
-                    make_workspace_error(workspace_error_code_t::revision_conflict,
-                                         "overlay generation publication conflicts with workspace state",
-                                         "workspace_publish"));
-        } else if (analysis_revision() != expected_analysis_revision ||
-                   expected_analysis_revision ==
-                       (std::numeric_limits<std::uint64_t>::max)() ||
-                   snapshot_value->generation != expected_generation ||
-                   snapshot_value->analysis_revision != expected_analysis_revision + 1 ||
-                   snapshot_value->overlay_revision != overlay_revision()) {
+        if (analysis_revision() != expected_analysis_revision ||
+            expected_analysis_revision ==
+                (std::numeric_limits<std::uint64_t>::max)() ||
+            snapshot_value->generation != expected_generation ||
+            snapshot_value->analysis_revision != expected_analysis_revision + 1 ||
+            snapshot_value->overlay_revision != overlay_revision()) {
             return workspace_result_t<void>::failure(
                 make_workspace_error(workspace_error_code_t::revision_conflict,
                                      "analysis bundle revision conflicts with workspace state",
@@ -2115,20 +2320,226 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
         std::lock_guard state_lock(state_mutex_);
         replacement_progress.cancellation_requested =
             cancellation_.token().stop_requested();
-        if (overlay_generation_publication) {
-            cancellation_source_t replacement_cancellation;
-            cancellation_.request_cancel();
-            cancellation_ = std::move(replacement_cancellation);
-            replacement_progress.cancellation_requested = false;
-        }
         progress_ = std::move(replacement_progress);
-        std::atomic_store_explicit(&publication_, replacement,
+        std::atomic_store_explicit(&publication_state_->publication, replacement,
                                    std::memory_order_release);
-        if (overlay_generation_publication)
-            overlay_revision_.store(snapshot_value->overlay_revision,
-                                    std::memory_order_release);
     }
     return workspace_result_t<void>::success();
+}
+
+workspace_result_t<std::size_t>
+analysis_workspace_t::publish_projected_generation(
+    std::uint64_t expected_generation,
+    std::uint64_t expected_analysis_revision,
+    std::uint64_t target_generation,
+    std::uint64_t target_overlay_revision,
+    std::shared_ptr<const byte_provider_t> projected_provider,
+    bool preserve_analysis,
+    std::function<workspace_result_t<void>()> finalizer) {
+    if (!projected_provider || !finalizer ||
+        expected_generation == (std::numeric_limits<std::uint64_t>::max)() ||
+        target_generation != expected_generation + 1 ||
+        target_overlay_revision == 0 ||
+        target_kind() != target_kind_t::static_file) {
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "projected generation publication is invalid",
+                                 "workspace_overlay_publish"));
+    }
+    const auto& projected_identity = projected_provider->identity();
+    if (!projected_identity.immutable_snapshot ||
+        !projected_identity.content_sha256 ||
+        projected_identity.content_sha256->empty() ||
+        projected_identity.normalized_source.empty() ||
+        projected_identity.size != projected_provider->size() ||
+        projected_provider->size() != source_provider_->size() ||
+        projected_identity.member != source_provider_->member_metadata()) {
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "projected provider identity is invalid",
+                                 "workspace_overlay_publish"));
+    }
+    if (closing() || closed())
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                                 "workspace is closing",
+                                 "workspace_overlay_publish"));
+    const auto workspace_cancel = cancellation_.token();
+    if (workspace_cancel.stop_requested())
+        return workspace_result_t<std::size_t>::failure(
+            workspace_stop_error(workspace_cancel, "workspace_overlay_publish"));
+    const auto source = analysis_publication();
+    if (!source || !source->snapshot || !source->provider ||
+        source->generation != expected_generation ||
+        source->analysis_revision != expected_analysis_revision ||
+        !source->snapshot->normalized_image) {
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::stale_generation,
+                                 "workspace publication changed before projected generation preparation",
+                                 "workspace_overlay_publish"));
+    }
+
+    std::shared_ptr<const analysis_snapshot_t> projected_snapshot;
+    std::shared_ptr<search_index_t> projected_index;
+    std::size_t retired_index_entries = source->search_index
+        ? source->search_index->record_count()
+        : 0;
+    try {
+        auto rebound = bind_publication_image(
+            source->snapshot->normalized_image, *identity_, *projected_provider,
+            *projected_identity.content_sha256, "workspace_overlay_publish");
+        if (!rebound)
+            return workspace_result_t<std::size_t>::failure(rebound.error());
+        auto next = preserve_analysis
+            ? std::make_shared<analysis_snapshot_t>(*source->snapshot)
+            : std::make_shared<analysis_snapshot_t>();
+        next->binary_id = source->binary_id;
+        next->load_profile_hash = source->load_profile_hash;
+        next->generation = target_generation;
+        next->overlay_revision = target_overlay_revision;
+        next->normalized_image = rebound.take_value();
+        next->image = source->snapshot->image;
+        if (!preserve_analysis) {
+            next->analysis_revision = 0;
+            next->baseline_complete = false;
+        }
+        projected_snapshot =
+            std::static_pointer_cast<const analysis_snapshot_t>(std::move(next));
+        if (preserve_analysis && source->search_index) {
+            auto metrics = std::make_shared<analysis_metrics_t>(target_generation);
+            auto rebuilt = search_index_t::build(
+                projected_snapshot,
+                source->search_index->data_candidates(),
+                source->search_index->switches(),
+                source->search_index->types(),
+                std::move(metrics), source->search_index->limits(),
+                workspace_cancel);
+            if (!rebuilt)
+                return workspace_result_t<std::size_t>::failure(rebuilt.error());
+            projected_index = rebuilt.take_value();
+        }
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "projected generation allocation failed",
+                                 "workspace_overlay_publish"));
+    }
+
+    auto validation = validate_analysis_snapshot(
+        *projected_snapshot, projected_snapshot->baseline_complete,
+        workspace_cancel);
+    if (!validation)
+        return workspace_result_t<std::size_t>::failure(validation.error());
+    if (projected_index &&
+        (!projected_index->matches(projected_snapshot) ||
+         !projected_index->matches(
+             identity_->binary_id(), identity_->load_profile_hash(),
+             target_generation, projected_snapshot->analysis_revision,
+             target_overlay_revision))) {
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "projected search index does not match its generation",
+                                 "workspace_overlay_publish"));
+    }
+    if ((!preserve_analysis &&
+         (projected_snapshot->analysis_revision != 0 ||
+          projected_snapshot->baseline_complete || projected_index ||
+          snapshot_has_analysis_facts(*projected_snapshot))) ||
+        (preserve_analysis &&
+         projected_snapshot->analysis_revision != expected_analysis_revision)) {
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "projected snapshot preservation policy is inconsistent",
+                                 "workspace_overlay_publish"));
+    }
+    auto executable_bytes = executable_byte_count(
+        *projected_snapshot, "workspace_overlay_publish");
+    if (!executable_bytes)
+        return workspace_result_t<std::size_t>::failure(executable_bytes.error());
+    const auto readiness = publication_readiness(*projected_snapshot);
+    std::shared_ptr<const analysis_publication_t> replacement;
+    workspace_progress_t replacement_progress;
+    try {
+        replacement = std::make_shared<const analysis_publication_t>(
+            projected_snapshot, projected_provider, projected_index, readiness);
+        replacement_progress = publication_progress(
+            readiness, executable_bytes.value());
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "projected publication allocation failed",
+                                 "workspace_overlay_publish"));
+    }
+    if (!replacement->coherent_with(*identity_))
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "projected publication is incoherent",
+                                 "workspace_overlay_publish"));
+    if (publication_finalizer_active_.load(std::memory_order_acquire))
+        return workspace_result_t<std::size_t>::failure(
+            publication_finalizer_conflict("workspace_overlay_publish"));
+
+    std::unique_lock<std::shared_mutex> mutation_lock(
+        mutation_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> publication_lock(
+        publication_mutex_, std::defer_lock);
+    std::lock(mutation_lock, publication_lock);
+    {
+        std::lock_guard state_lock(state_mutex_);
+        if (closing() || closed())
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::workspace_closing,
+                                     "workspace is closing",
+                                     "workspace_overlay_publish"));
+        const auto current = analysis_publication();
+        if (!current || current != source ||
+            current->generation != expected_generation)
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::stale_generation,
+                                     "workspace generation changed before projected publication",
+                                     "workspace_overlay_publish"));
+        if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::analysis_in_progress,
+                                     "projected generation cannot publish during analysis",
+                                     "workspace_overlay_publish"));
+        if (current->analysis_revision != expected_analysis_revision ||
+            current->overlay_revision ==
+                (std::numeric_limits<std::uint64_t>::max)() ||
+            target_overlay_revision != current->overlay_revision + 1 ||
+            projected_snapshot->image != current->snapshot->image)
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::revision_conflict,
+                                     "projected generation conflicts with workspace revisions",
+                                     "workspace_overlay_publish"));
+    }
+
+    publication_finalizer_active_.store(true, std::memory_order_release);
+    workspace_result_t<void> finalized = workspace_result_t<void>::success();
+    try {
+        finalized = finalizer();
+    } catch (...) {
+        finalized = workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::persistence_failure,
+                                 "projected publication finalizer threw an exception",
+                                 "workspace_overlay_publish"));
+    }
+    publication_finalizer_active_.store(false, std::memory_order_release);
+    if (!finalized)
+        return workspace_result_t<std::size_t>::failure(finalized.error());
+
+    {
+        std::lock_guard state_lock(state_mutex_);
+        cancellation_source_t replacement_cancellation;
+        cancellation_.request_cancel();
+        cancellation_ = std::move(replacement_cancellation);
+        replacement_progress.cancellation_requested = false;
+        progress_ = std::move(replacement_progress);
+        std::atomic_store_explicit(
+            &publication_state_->publication, replacement,
+            std::memory_order_release);
+    }
+    return workspace_result_t<std::size_t>::success(retired_index_entries);
 }
 
 workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
@@ -2168,16 +2579,18 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
     const auto readiness = empty->normalized_image ? workspace_readiness_t::parsed
                                         : workspace_readiness_t::provider_ready;
     const auto replacement = std::make_shared<const analysis_publication_t>(
-        std::static_pointer_cast<const analysis_snapshot_t>(empty), nullptr, readiness);
+        std::static_pointer_cast<const analysis_snapshot_t>(empty),
+        current_publication->provider, nullptr, readiness);
     cancellation_source_t replacement_cancellation;
     workspace_progress_t replacement_progress;
     replacement_progress.readiness = readiness;
     replacement_progress.phase = empty->normalized_image ? "parsed" : "provider_ready";
-    replacement_progress.total_bytes = provider_->size();
+    replacement_progress.total_bytes = current_publication->provider->size();
     cancellation_.request_cancel();
     cancellation_ = std::move(replacement_cancellation);
     progress_ = std::move(replacement_progress);
-    std::atomic_store_explicit(&publication_, replacement, std::memory_order_release);
+    std::atomic_store_explicit(
+        &publication_state_->publication, replacement, std::memory_order_release);
     return workspace_result_t<std::uint64_t>::success(next);
 }
 
@@ -2191,13 +2604,72 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::advance_overlay_revision
 }
 
 workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision(
-    std::uint64_t expected_current, std::uint64_t persisted_revision) {
-    if (analysis_revision() != 0) {
+    std::uint64_t expected_current, std::uint64_t persisted_revision,
+    std::shared_ptr<const byte_provider_t> projected_provider) {
+    const auto source = analysis_publication();
+    if (!source || !source->snapshot || !source->provider ||
+        source->analysis_revision != 0) {
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::revision_conflict,
                                  "overlay revision can only be restored before analysis publication",
                                  "workspace_overlay_restore"));
     }
+    if (persisted_revision == 0 || persisted_revision <= expected_current ||
+        persisted_revision == (std::numeric_limits<std::uint64_t>::max)())
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::revision_conflict,
+                                 "persisted overlay revision is not a valid monotonic restoration",
+                                 "workspace_overlay_restore"));
+    auto publication_provider = projected_provider
+        ? std::move(projected_provider)
+        : source->provider;
+    if (!publication_provider)
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "restored overlay provider is unavailable",
+                                 "workspace_overlay_restore"));
+    if (publication_provider != source->provider) {
+        const auto& provider_identity = publication_provider->identity();
+        if (!provider_identity.immutable_snapshot ||
+            !provider_identity.content_sha256 ||
+            provider_identity.content_sha256->empty() ||
+            provider_identity.normalized_source.empty() ||
+            provider_identity.size != publication_provider->size() ||
+            publication_provider->size() != source_provider_->size() ||
+            provider_identity.member != source_provider_->member_metadata())
+            return workspace_result_t<std::uint64_t>::failure(
+                make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                     "restored overlay provider identity is invalid",
+                                     "workspace_overlay_restore"));
+    }
+    std::shared_ptr<const analysis_snapshot_t> restored_snapshot;
+    try {
+        auto restored = std::make_shared<analysis_snapshot_t>(*source->snapshot);
+        restored->overlay_revision = persisted_revision;
+        if (publication_provider != source->provider && restored->normalized_image) {
+            auto rebound = bind_publication_image(
+                restored->normalized_image, *identity_, *publication_provider,
+                *publication_provider->identity().content_sha256,
+                "workspace_overlay_restore");
+            if (!rebound)
+                return workspace_result_t<std::uint64_t>::failure(rebound.error());
+            restored->normalized_image = rebound.take_value();
+        }
+        restored_snapshot =
+            std::static_pointer_cast<const analysis_snapshot_t>(std::move(restored));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "overlay restoration allocation failed",
+                                 "workspace_overlay_restore"));
+    }
+    const auto replacement = std::make_shared<const analysis_publication_t>(
+        restored_snapshot, publication_provider, nullptr, source->readiness);
+    if (!replacement->coherent_with(*identity_))
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "restored overlay publication is incoherent",
+                                 "workspace_overlay_restore"));
     if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<std::uint64_t>::failure(
             publication_finalizer_conflict("workspace_overlay_restore"));
@@ -2207,18 +2679,12 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::workspace_closing,
                                  "workspace is closing", "workspace_overlay_restore"));
-    if (persisted_revision == 0 || persisted_revision <= expected_current ||
-        persisted_revision == std::numeric_limits<std::uint64_t>::max())
-        return workspace_result_t<std::uint64_t>::failure(
-            make_workspace_error(workspace_error_code_t::revision_conflict,
-                                 "persisted overlay revision is not a valid monotonic restoration",
-                                 "workspace_overlay_restore"));
     const auto current_publication = analysis_publication();
-    if (analysis_revision() != 0 || !current_publication ||
+    if (current_publication != source || analysis_revision() != 0 ||
         !current_publication->snapshot ||
         current_publication->snapshot->analysis_revision != 0 ||
         current_publication->snapshot->baseline_complete ||
-        !current_publication->snapshot->instructions.empty() ||
+        snapshot_has_analysis_facts(*current_publication->snapshot) ||
         current_publication->search_index ||
         progress_.readiness == workspace_readiness_t::analyzing ||
         progress_.readiness == workspace_readiness_t::baseline_ready ||
@@ -2228,18 +2694,13 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
             make_workspace_error(workspace_error_code_t::revision_conflict,
                                  "overlay revision can only be restored before analysis publication",
                                  "workspace_overlay_restore"));
-    auto restored = std::make_shared<analysis_snapshot_t>(*current_publication->snapshot);
-    restored->overlay_revision = persisted_revision;
-    const auto replacement = std::make_shared<const analysis_publication_t>(
-        std::static_pointer_cast<const analysis_snapshot_t>(restored), nullptr,
-        current_publication->readiness);
-    if (overlay_revision_.load(std::memory_order_acquire) != expected_current)
+    if (current_publication->overlay_revision != expected_current)
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::revision_conflict,
                                  "overlay revision changed during restoration",
                                  "workspace_overlay_restore"));
-    std::atomic_store_explicit(&publication_, replacement, std::memory_order_release);
-    overlay_revision_.store(persisted_revision, std::memory_order_release);
+    std::atomic_store_explicit(
+        &publication_state_->publication, replacement, std::memory_order_release);
     return workspace_result_t<std::uint64_t>::success(persisted_revision);
 }
 
@@ -2612,8 +3073,9 @@ workspace_result_t<void> analysis_workspace_t::install_search_index(
                                  "search index does not match the current analysis publication",
                                  "workspace_service"));
     const auto replacement = std::make_shared<const analysis_publication_t>(
-        current->snapshot, std::move(index_value), current->readiness);
-    std::atomic_store_explicit(&publication_, replacement,
+        current->snapshot, current->provider, std::move(index_value),
+        current->readiness);
+    std::atomic_store_explicit(&publication_state_->publication, replacement,
                                std::memory_order_release);
     return workspace_result_t<void>::success();
 }

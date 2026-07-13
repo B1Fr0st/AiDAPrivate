@@ -5,13 +5,10 @@
 
 #include "decompiler_contracts.hpp"
 #include "pseudocode_renderer_v2.hpp"
-#include "providers/ghidra_ir_adapter.hpp"
 #include "typed_ast_v2.hpp"
 
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
-#include "../../disasm/ghidra_adapters/aida_function_db.hpp"
 #include "../../disasm/ghidra_adapters/aida_load_image.hpp"
-#include "../../disasm/ghidra_decompiler.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -294,7 +291,7 @@ decompiler_language_identity_t native_language_identity(
     return result;
 }
 
-decompiler_provider_identity_t in_process_provider_identity(
+decompiler_provider_identity_t packaged_provider_identity(
     const decompiler_provider_id_t provider,
     std::string provider_name,
     std::string worker_build_id)
@@ -309,77 +306,6 @@ decompiler_provider_identity_t in_process_provider_identity(
     result.worker_build_hash = stable_serialization_hash(
         result.worker_build_id + "|build|" + result.provider_version);
     return result;
-}
-
-void bind_coordinate(
-    source_coordinate_t& coordinate,
-    const decompiler_pipeline_cache_key_t& key)
-{
-    coordinate.workspace_generation = key.workspace_generation;
-    coordinate.entity = key.entity;
-}
-
-void bind_diagnostics(
-    std::vector<decompiler_diagnostic_t>& diagnostics,
-    const decompiler_pipeline_cache_key_t& key)
-{
-    for (std::size_t index = 0; index < diagnostics.size(); ++index) {
-        if (diagnostics[index].coordinate)
-            bind_coordinate(*diagnostics[index].coordinate, key);
-        diagnostics[index].ordinal = static_cast<std::uint32_t>(index + 1U);
-    }
-}
-
-void bind_unknowns(
-    std::vector<decompiler_unknown_t>& unknowns,
-    const decompiler_pipeline_cache_key_t& key)
-{
-    for (auto& unknown : unknowns)
-        bind_coordinate(unknown.coordinate, key);
-}
-
-void bind_typed_artifacts(
-    ghidra_ir_adapter::typed_artifacts_t& artifacts,
-    const decompiler_pipeline_cache_key_t& key)
-{
-    artifacts.provider_ir.provider = key.provider;
-    artifacts.provider_ir.language = key.language;
-    artifacts.provider_ir.entity = key.entity;
-    for (auto& block : artifacts.provider_ir.blocks) {
-        bind_coordinate(block.coordinate, key);
-        for (auto& value : block.values)
-            bind_coordinate(value.coordinate, key);
-    }
-    for (auto& coordinate : artifacts.provider_ir.source_coordinates)
-        bind_coordinate(coordinate, key);
-    bind_unknowns(artifacts.provider_ir.unknowns, key);
-    bind_diagnostics(artifacts.provider_ir.diagnostics, key);
-
-    artifacts.hir.entity = key.entity;
-    artifacts.hir.type_graph_revision = key.type_graph_revision;
-    for (auto& parameter : artifacts.hir.parameters)
-        bind_coordinate(parameter.coordinate, key);
-    for (auto& local : artifacts.hir.locals)
-        bind_coordinate(local.coordinate, key);
-    for (auto& block : artifacts.hir.blocks) {
-        bind_coordinate(block.coordinate, key);
-        for (auto& value : block.values)
-            bind_coordinate(value.coordinate, key);
-    }
-    for (auto& coordinate : artifacts.hir.source_coordinates)
-        bind_coordinate(coordinate, key);
-    bind_unknowns(artifacts.hir.unknowns, key);
-    bind_diagnostics(artifacts.hir.diagnostics, key);
-
-    artifacts.type_graph.entity = key.entity;
-    artifacts.type_graph.revision = key.type_graph_revision;
-    for (auto& node : artifacts.type_graph.nodes) {
-        for (auto& coordinate : node.coordinates)
-            bind_coordinate(coordinate, key);
-    }
-    bind_unknowns(artifacts.type_graph.unknowns, key);
-    bind_diagnostics(artifacts.type_graph.diagnostics, key);
-    artifacts.hir.provider_ir_hash = stable_serialization_hash(artifacts.provider_ir);
 }
 
 bool publication_matches_request(
@@ -406,7 +332,7 @@ capture_native_provider_context(
             ui_request_error(cancel.deadline_exceeded()
                     ? workspace_error_code_t::deadline_exceeded
                     : workspace_error_code_t::cancelled,
-                "native decompiler provider capture was cancelled",
+                "native decompiler snapshot capture was cancelled",
                 "decompiler_ui.native_capture"));
     }
     const auto& key = request.cache_key;
@@ -415,7 +341,7 @@ capture_native_provider_context(
         !validate_decompiler_pipeline_cache_key(key).valid()) {
         return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
             ui_request_error(workspace_error_code_t::provider_binding_mismatch,
-                "native decompiler provider request is not bound to this workspace",
+                "native decompiler snapshot request is not bound to this workspace",
                 "decompiler_ui.native_capture.binding"));
     }
     const auto publication = workspace->analysis_publication();
@@ -427,7 +353,7 @@ capture_native_provider_context(
         publication->load_profile_hash != key.loader_layout_hash) {
         return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
             ui_request_error(workspace_error_code_t::stale_generation,
-                "native decompiler provider request revision is stale",
+                "native decompiler snapshot request revision is stale",
                 "decompiler_ui.native_capture.revision"));
     }
     const auto image = publication->snapshot->normalized_image;
@@ -451,87 +377,86 @@ capture_native_provider_context(
     if (!load_image)
         return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
             load_image.error());
-    auto function_database = ghidra_adapter::ghidra_function_database_t::create(
-        workspace->identity(), *image, *publication->snapshot, language.value(),
-        revision.value(), {}, {}, {}, cancel);
-    if (!function_database)
-        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            function_database.error());
     const auto* native_identity = std::get_if<native_decompiler_entity_identity_t>(&key.entity.identity);
-    const auto* function = native_identity
-        ? function_database.value()->find_function(native_identity->function_id) : nullptr;
-    if (!native_identity || !function || function->key.address != native_identity->entry ||
-        function->end != native_identity->end) {
+    const auto function = native_identity
+        ? std::find_if(publication->snapshot->functions.begin(), publication->snapshot->functions.end(),
+            [native_identity](const function_record_t& current) {
+                return current.id == native_identity->function_id;
+            })
+        : publication->snapshot->functions.end();
+    if (!native_identity || function == publication->snapshot->functions.end() ||
+        function->start != native_identity->entry || function->end != native_identity->end) {
         return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
             ui_request_error(workspace_error_code_t::provider_binding_mismatch,
-                "native decompiler function identity changed before provider capture",
+                "native decompiler function identity changed before snapshot capture",
                 "decompiler_ui.native_capture.function"));
     }
-
-    ghidra_decompiler::ghidra_adapter_decompile_request_t adapter_request;
-    adapter_request.workspace_identity = &workspace->identity();
-    adapter_request.workspace_id = key.workspace_id;
-    adapter_request.normalized_image = image;
-    adapter_request.analysis_snapshot = publication->snapshot;
-    adapter_request.language_catalog.staging_root = language.value().language_root;
-    adapter_request.language_catalog.languages.push_back({
-        language.value().language_id, {language.value().compiler_spec_id}});
-    adapter_request.language = language.value();
-    adapter_request.revision = revision.value();
-    adapter_request.adapter_cache_key = load_image.value()->cache_key();
-    adapter_request.load_image = load_image.value();
-    adapter_request.function_database = function_database.value();
-    adapter_request.function = function->key;
-    adapter_request.typed_entity = key.entity;
-    adapter_request.type_revision = key.type_graph_revision;
-    adapter_request.cancellation = cancel;
-    adapter_request.cancel_check = [cancel] { return cancel.stop_requested(); };
-    adapter_request.deadline = request.deadline;
-    adapter_request.result_limits.capture_printc_evidence = false;
-    auto captured = ghidra_decompiler::decompile_adapter(adapter_request);
-    if (!captured)
+    constexpr std::uint64_t maximum_virtual_image_bytes =
+        256ULL * 1024ULL * 1024ULL - 64ULL;
+    if (image->image_size == 0 || image->image_size > maximum_virtual_image_bytes ||
+        image->image_size > (std::numeric_limits<std::size_t>::max)()) {
         return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            captured.error());
-    auto output = captured.take_value();
-    if (output.result.is_error || !output.result.typed_artifacts) {
-        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            ui_request_error(workspace_error_code_t::provider_unavailable,
-                "native decompiler adapter did not produce typed provider artifacts",
-                "decompiler_ui.native_capture.artifacts"));
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "native decompiler virtual image exceeds the isolated worker snapshot limit",
+                "decompiler_ui.native_capture.image_limit"));
     }
-    auto artifacts = std::move(*output.result.typed_artifacts);
-    artifacts.provider_ir.diagnostics.insert(artifacts.provider_ir.diagnostics.end(),
-        output.result.typed_diagnostics.begin(), output.result.typed_diagnostics.end());
-    bind_typed_artifacts(artifacts, key);
-    if (!validate_provider_ir(artifacts.provider_ir).valid() ||
-        !validate_hir_function(artifacts.hir).valid() ||
-        !validate_type_graph(artifacts.type_graph).valid() ||
-        artifacts.provider_ir.entity != key.entity || artifacts.hir.entity != key.entity ||
-        artifacts.type_graph.entity != key.entity ||
-        !equal_provider_identity(artifacts.provider_ir.provider, key.provider) ||
-        !equal_language_identity(artifacts.provider_ir.language, key.language) ||
-        artifacts.hir.provider_ir_hash != stable_serialization_hash(artifacts.provider_ir) ||
-        artifacts.hir.return_type_id == 0) {
-        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            ui_request_error(workspace_error_code_t::provider_binding_mismatch,
-                "native decompiler typed provider artifacts failed production binding",
-                "decompiler_ui.native_capture.contract"));
+    native_worker::native_provider_snapshot_t snapshot;
+    snapshot.image_base = image->image_base;
+    snapshot.virtual_image.resize(static_cast<std::size_t>(image->image_size), 0);
+    for (const auto& range : load_image.value()->mapped_ranges()) {
+        if (cancel.stop_requested() || std::chrono::steady_clock::now() >= request.deadline) {
+            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                ui_request_error(cancel.deadline_exceeded() ||
+                        std::chrono::steady_clock::now() >= request.deadline
+                        ? workspace_error_code_t::deadline_exceeded
+                        : workspace_error_code_t::cancelled,
+                    "native decompiler snapshot capture was cancelled",
+                    "decompiler_ui.native_capture.read"));
+        }
+        const auto rva = relative_value(range.start, image->image_base);
+        if (!rva || *rva > image->image_size || range.size > image->image_size - *rva) {
+            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                ui_request_error(workspace_error_code_t::integrity_failure,
+                    "native decompiler mapped range is outside the normalized image",
+                    "decompiler_ui.native_capture.mapping"));
+        }
+        auto read = load_image.value()->read(range.start, range.size, cancel);
+        if (!read)
+            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                read.error());
+        if (read.value().bytes.size() != range.size) {
+            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                ui_request_error(workspace_error_code_t::integrity_failure,
+                    "native decompiler mapped range snapshot is truncated",
+                    "decompiler_ui.native_capture.read"));
+        }
+        std::copy(read.value().bytes.begin(), read.value().bytes.end(),
+            snapshot.virtual_image.begin() + static_cast<std::size_t>(*rva));
     }
-    auto shared_artifacts = std::make_shared<const ghidra_ir_adapter::typed_artifacts_t>(
-        std::move(artifacts));
+    const auto serialized = native_worker::serialize_native_provider_snapshot(snapshot);
+    if (serialized.empty()) {
+        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "native decompiler snapshot serialization failed",
+                "decompiler_ui.native_capture.serialize"));
+    }
+    std::vector<std::uint8_t> serialized_bytes(serialized.begin(), serialized.end());
+    auto shared_snapshot = std::make_shared<const std::vector<std::uint8_t>>(
+        std::move(serialized_bytes));
     std::shared_ptr<const decompiler_provider_context_t> context =
-        std::make_shared<ghidra_native_provider_context_t>(std::move(shared_artifacts));
+        std::make_shared<ghidra_native_provider_context_t>(
+            std::move(shared_snapshot), stable_serialization_hash(serialized));
     return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::success(
         std::move(context));
 } catch (const std::bad_alloc&) {
     return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
         ui_request_error(workspace_error_code_t::limit_exceeded,
-            "native decompiler provider capture allocation failed",
+            "native decompiler snapshot capture allocation failed",
             "decompiler_ui.native_capture"));
 } catch (...) {
     return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
         ui_request_error(workspace_error_code_t::provider_unavailable,
-            "native decompiler provider capture failed",
+            "native decompiler snapshot capture failed",
             "decompiler_ui.native_capture"));
 }
 
@@ -686,18 +611,14 @@ decompiler_ui_integration_t::create_production(
         decompiler_builtin_provider_config_t builtin;
         builtin.native.identity = runtime.value().provider;
         builtin.native.isolated = true;
-        builtin.cli.identity = in_process_provider_identity(
+        builtin.cli.identity = packaged_provider_identity(
             decompiler_provider_id_t::ilspy_cli,
-            "aida-managed-cli", "aida-managed-cli-inprocess-v1");
-        builtin.cli.isolated = false;
-        builtin.jvm.identity = in_process_provider_identity(
-            decompiler_provider_id_t::jvm_ssa,
-            "aida-jvm-ssa", "aida-jvm-ssa-inprocess-v1");
-        builtin.jvm.isolated = false;
-        builtin.dalvik.identity = in_process_provider_identity(
-            decompiler_provider_id_t::dalvik_ssa,
-            "aida-dalvik-ssa", "aida-dalvik-ssa-inprocess-v1");
-        builtin.dalvik.isolated = false;
+            "aida-managed-cli", "aida-managed-cli-offline-worker-v2");
+        builtin.cli.isolated = true;
+        builtin.jvm.identity = runtime.value().jvm_provider;
+        builtin.jvm.isolated = true;
+        builtin.dalvik.identity = runtime.value().dalvik_provider;
+        builtin.dalvik.isolated = true;
         auto registered = register_builtin_decompiler_providers(*providers, builtin);
         if (!registered) {
             return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(

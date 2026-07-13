@@ -338,6 +338,16 @@ pseudocode_cached_document_t* pseudocode_document_model_t::find_cached(
     return nullptr;
 }
 
+const pseudocode_cached_document_t* pseudocode_document_model_t::find_cached(
+    const aida::analysis::decompiler_entity_key_t& entity) const
+{
+    for (const auto& entry : cache_) {
+        if (entry.entity == entity)
+            return &entry;
+    }
+    return nullptr;
+}
+
 bool pseudocode_document_model_t::evict_oldest()
 {
     if (cache_.size() < k_pseudocode_document_max_cached_documents)
@@ -448,8 +458,36 @@ void pseudocode_document_model_t::rebuild_address_map()
         active_->address_map.end());
 }
 
+pseudocode_error_t pseudocode_document_model_t::resolve_request(
+    std::uint64_t function_address,
+    aida::analysis::decompiler_profile_id_t profile,
+    std::uint64_t timeout_ms,
+    pseudocode_request_t& output) const
+{
+    output = {};
+    if (function_address == 0 || timeout_ms == 0)
+        return fail(pseudocode_error_code_t::invalid_argument, function_address);
+    const auto resolved = source_->resolve_request(
+        function_address, profile, timeout_ms, output);
+    if (!resolved)
+        return fail(pseudocode_error_code_t::adapter_rejected,
+                    static_cast<std::uint64_t>(resolved.code));
+    if (!pseudocode_request_valid(output)) {
+        output = {};
+        return fail(pseudocode_error_code_t::invalid_argument, function_address);
+    }
+    return {};
+}
+
 pseudocode_error_t pseudocode_document_model_t::request(
     const pseudocode_request_t& request)
+{
+    return request(request, false);
+}
+
+pseudocode_error_t pseudocode_document_model_t::request(
+    const pseudocode_request_t& request,
+    bool force_refresh)
 {
     if (!pseudocode_request_valid(request))
         return fail(pseudocode_error_code_t::invalid_argument);
@@ -458,7 +496,10 @@ pseudocode_error_t pseudocode_document_model_t::request(
 
     auto* existing = find_cached(request.entity);
     if (existing && existing->state == pseudocode_cache_state_t::requesting) {
-        if (existing->workspace_generation == bound_generation_)
+        active_ = existing;
+        line_views_.clear();
+        selection_ = {};
+        if (!force_refresh && existing->workspace_generation == bound_generation_)
             return fail(pseudocode_error_code_t::request_in_progress, existing->job_id);
         const auto cancel_error = source_->cancel_decompilation(existing->job_id);
         if (!cancel_error)
@@ -466,7 +507,8 @@ pseudocode_error_t pseudocode_document_model_t::request(
                         static_cast<std::uint64_t>(cancel_error.code));
         existing->state = pseudocode_cache_state_t::stale;
     }
-    if (existing && existing->state == pseudocode_cache_state_t::cached &&
+    if (!force_refresh && existing &&
+        existing->state == pseudocode_cache_state_t::cached &&
         existing->workspace_generation == bound_generation_ &&
         existing->profile_info.profile == request.profile) {
         active_ = existing;
@@ -529,11 +571,38 @@ pseudocode_error_t pseudocode_document_model_t::request(
     return {};
 }
 
+pseudocode_error_t pseudocode_document_model_t::activate(
+    const aida::analysis::decompiler_entity_key_t& entity)
+{
+    if (!aida::analysis::validate_decompiler_entity_key(entity).valid())
+        return fail(pseudocode_error_code_t::invalid_argument);
+    auto* existing = find_cached(entity);
+    if (!existing)
+        return fail(pseudocode_error_code_t::cache_miss);
+    const bool changed = active_ != existing;
+    active_ = existing;
+    if (changed)
+        selection_ = {};
+    if (existing->workspace_generation != bound_generation_ ||
+        !source_->generation_current(existing->workspace_generation)) {
+        line_views_.clear();
+        return stale();
+    }
+    if (existing->state == pseudocode_cache_state_t::cached) {
+        split_lines();
+        rebuild_address_map();
+    } else {
+        line_views_.clear();
+    }
+    return {};
+}
+
 pseudocode_error_t pseudocode_document_model_t::cancel(std::uint64_t job_id)
 {
     for (auto& entry : cache_) {
         if (entry.job_id != job_id)
             continue;
+        const bool entry_active = active_ == &entry;
         if (entry.state != pseudocode_cache_state_t::requesting)
             return fail(pseudocode_error_code_t::no_active_request, job_id);
         const auto adapter_error = source_->cancel_decompilation(job_id);
@@ -564,9 +633,10 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
             entry.failure_diagnostics.push_back(stale_result_diagnostic(
                 job_id, entry.workspace_generation, source_->current_generation()));
             entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
-            active_ = &entry;
-            line_views_.clear();
-            selection_ = {};
+            if (entry_active) {
+                line_views_.clear();
+                selection_ = {};
+            }
             return fail(pseudocode_error_code_t::stale_result, job_id);
         };
         if (source_->job_active(job_id)) {
@@ -604,9 +674,10 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
                         : "decompiler.document.rejected",
                     job_id));
                 entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
-                active_ = &entry;
-                line_views_.clear();
-                selection_ = {};
+                if (entry_active) {
+                    line_views_.clear();
+                    selection_ = {};
+                }
                 return error;
             }
             if (!source_->generation_current(entry.workspace_generation)) {
@@ -617,9 +688,10 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
             entry.failure_diagnostics.clear();
             entry.state = pseudocode_cache_state_t::cached;
             entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
-            active_ = &entry;
-            split_lines();
-            rebuild_address_map();
+            if (entry_active) {
+                split_lines();
+                rebuild_address_map();
+            }
             if (!source_->generation_current(entry.workspace_generation))
                 return reject_stale_result();
             return {};
@@ -649,9 +721,10 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
         entry.document.reset();
         entry.state = pseudocode_cache_state_t::failed;
         entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
-        active_ = &entry;
-        line_views_.clear();
-        selection_ = {};
+        if (entry_active) {
+            line_views_.clear();
+            selection_ = {};
+        }
         return fail(pseudocode_error_code_t::worker_failure, job_id);
     }
     return fail(pseudocode_error_code_t::no_active_request, job_id);
@@ -998,6 +1071,13 @@ pseudocode_document_model_t::cached_document() const noexcept
     return active_;
 }
 
+const pseudocode_cached_document_t*
+pseudocode_document_model_t::cached_document(
+    const aida::analysis::decompiler_entity_key_t& entity) const noexcept
+{
+    return find_cached(entity);
+}
+
 std::uint64_t pseudocode_document_model_t::current_generation() const noexcept
 {
     return source_->current_generation();
@@ -1014,6 +1094,14 @@ bool pseudocode_document_model_t::is_stale() const noexcept
     return !source_->generation_current(bound_generation_) ||
            (active_ && active_->state == pseudocode_cache_state_t::stale) ||
            (active_ && active_->workspace_generation != bound_generation_);
+}
+
+bool pseudocode_document_model_t::has_pending_requests() const noexcept
+{
+    return std::any_of(cache_.begin(), cache_.end(),
+        [](const pseudocode_cached_document_t& entry) {
+            return entry.state == pseudocode_cache_state_t::requesting;
+        });
 }
 
 std::uint32_t pseudocode_document_model_t::cached_document_count() const noexcept

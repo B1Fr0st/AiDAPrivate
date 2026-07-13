@@ -142,6 +142,12 @@ bool diff_scope_valid(const diff_scope_t& scope) noexcept
     }
 }
 
+bool diff_source_limits_valid(const diff_source_limits_t& limits) noexcept
+{
+    return limits.max_entries != 0 &&
+           limits.max_entries <= k_diff_document_max_entries;
+}
+
 bool diff_page_request_valid(const diff_page_request_t& request) noexcept
 {
     return request.limit != 0 && request.limit <= k_diff_document_max_page_size &&
@@ -196,6 +202,69 @@ diff_document_model_t::diff_document_model_t(
 {
 }
 
+diff_error_t diff_document_model_t::validate_source_scope(
+    const diff_scope_t& scope,
+    const diff_cancellation_t* cancellation) const
+{
+    if (cancellation_requested(cancellation))
+        return fail(diff_error_code_t::cancelled,
+                    scope.before.generation);
+    const diff_source_limits_t limits;
+    const auto source_result = source_->scope_available(
+        bound_generation_, scope, limits, cancellation);
+    if (cancellation_requested(cancellation) ||
+        source_result == diff_source_result_t::cancelled) {
+        return fail(diff_error_code_t::cancelled,
+                    scope.before.generation);
+    }
+    if (!source_->generation_current(bound_generation_))
+        return stale();
+    if (source_result == diff_source_result_t::limit_exceeded)
+        return fail(diff_error_code_t::resource_exhausted,
+                    k_diff_document_max_entries + 1U);
+    if (source_result != diff_source_result_t::success)
+        return fail(diff_error_code_t::adapter_rejected,
+                    scope.before.generation);
+    return {};
+}
+
+diff_error_t diff_document_model_t::read_entry_count(
+    const diff_scope_t& scope,
+    const diff_cancellation_t* cancellation,
+    std::uint64_t& output) const
+{
+    output = 0;
+    if (cancellation_requested(cancellation))
+        return fail(diff_error_code_t::cancelled,
+                    scope.before.generation);
+    const diff_source_limits_t limits;
+    const auto source_result = source_->entry_count(
+        bound_generation_, scope, limits, cancellation, output);
+    if (cancellation_requested(cancellation) ||
+        source_result == diff_source_result_t::cancelled) {
+        output = 0;
+        return fail(diff_error_code_t::cancelled,
+                    scope.before.generation);
+    }
+    if (!source_->generation_current(bound_generation_)) {
+        output = 0;
+        return stale();
+    }
+    if (source_result == diff_source_result_t::limit_exceeded ||
+        output > limits.max_entries) {
+        const auto subject = output > limits.max_entries
+            ? output : limits.max_entries + 1U;
+        output = 0;
+        return fail(diff_error_code_t::resource_exhausted, subject);
+    }
+    if (source_result != diff_source_result_t::success) {
+        output = 0;
+        return fail(diff_error_code_t::adapter_rejected,
+                    scope.before.generation);
+    }
+    return {};
+}
+
 diff_error_t diff_document_model_t::page(
     const diff_page_request_t& request,
     std::uint64_t expected_generation,
@@ -216,25 +285,27 @@ diff_error_t diff_document_model_t::page(
     if (!source_->supports_kind(scope.kind))
         return fail(diff_error_code_t::adapter_rejected,
                     static_cast<std::uint64_t>(scope.kind));
-    if (!source_->scope_available(bound_generation_, scope))
-        return fail(diff_error_code_t::adapter_rejected,
-                    scope.before.generation);
-    if (cancellation_requested(cancellation))
-        return fail(diff_error_code_t::cancelled, request.offset);
+    const auto scope_error = validate_source_scope(scope, cancellation);
+    if (!scope_error.ok())
+        return scope_error;
 
-    const auto total = source_->entry_count(bound_generation_, scope);
-    if (!source_->generation_current(bound_generation_))
-        return stale();
-    if (total > k_diff_document_max_entries)
-        return fail(diff_error_code_t::resource_exhausted, total);
+    std::uint64_t total = 0;
+    const auto count_error = read_entry_count(scope, cancellation, total);
+    if (!count_error.ok())
+        return count_error;
 
     output.snapshot_generation = bound_generation_;
     output.scope = scope;
     output.total_entries = total;
     output.offset = request.offset;
 
-    if (total == 0 || request.offset >= total)
+    if (total == 0 || request.offset >= total) {
+        if (!source_->generation_current(bound_generation_)) {
+            output = {};
+            return stale();
+        }
         return {};
+    }
 
     const auto remaining = total - request.offset;
     const auto max_read = (std::min)(static_cast<std::uint64_t>(request.limit),
@@ -253,7 +324,20 @@ diff_error_t diff_document_model_t::page(
             return fail(diff_error_code_t::cancelled, scan);
         }
         diff_entry_t entry;
-        if (!source_->entry_at(bound_generation_, scope, scan, entry) ||
+        const diff_source_limits_t limits;
+        const auto source_result = source_->entry_at(
+            bound_generation_, scope, scan, limits, cancellation, entry);
+        if (cancellation_requested(cancellation) ||
+            source_result == diff_source_result_t::cancelled) {
+            output = {};
+            return fail(diff_error_code_t::cancelled, scan);
+        }
+        if (source_result == diff_source_result_t::limit_exceeded) {
+            output = {};
+            return fail(diff_error_code_t::resource_exhausted,
+                        k_diff_document_max_entries + 1U);
+        }
+        if (source_result != diff_source_result_t::success ||
             !diff_entry_valid(entry)) {
             output = {};
             return fail(diff_error_code_t::adapter_rejected, scan);
@@ -280,7 +364,8 @@ diff_error_t diff_document_model_t::navigate(
     const diff_navigation_request_t& request,
     std::uint64_t expected_generation,
     const diff_scope_t& scope,
-    diff_navigation_result_t& output)
+    diff_navigation_result_t& output,
+    const diff_cancellation_t* cancellation)
 {
     output = {};
     if (request.page_size == 0 || request.page_size > k_diff_document_max_page_size)
@@ -295,20 +380,33 @@ diff_error_t diff_document_model_t::navigate(
     if (!source_->supports_kind(scope.kind))
         return fail(diff_error_code_t::adapter_rejected,
                     static_cast<std::uint64_t>(scope.kind));
-    if (!source_->scope_available(bound_generation_, scope))
-        return fail(diff_error_code_t::adapter_rejected,
-                    scope.before.generation);
+    const auto scope_error = validate_source_scope(scope, cancellation);
+    if (!scope_error.ok())
+        return scope_error;
 
-    const auto total = source_->entry_count(bound_generation_, scope);
-    if (!source_->generation_current(bound_generation_))
-        return stale();
-    if (total > k_diff_document_max_entries)
-        return fail(diff_error_code_t::resource_exhausted, total);
+    std::uint64_t total = 0;
+    const auto count_error = read_entry_count(scope, cancellation, total);
+    if (!count_error.ok())
+        return count_error;
     if (request.entry_index >= total)
         return fail(diff_error_code_t::navigation_rejected, request.entry_index);
 
     diff_entry_t entry;
-    if (!source_->entry_at(bound_generation_, scope, request.entry_index, entry) ||
+    const diff_source_limits_t limits;
+    const auto source_result = source_->entry_at(
+        bound_generation_, scope, request.entry_index, limits, cancellation,
+        entry);
+    if (cancellation_requested(cancellation) ||
+        source_result == diff_source_result_t::cancelled)
+        return fail(diff_error_code_t::cancelled, request.entry_index);
+    if (source_result == diff_source_result_t::limit_exceeded) {
+        return fail(diff_error_code_t::resource_exhausted,
+                    k_diff_document_max_entries + 1U);
+    }
+    if (source_result == diff_source_result_t::not_found)
+        return fail(diff_error_code_t::navigation_rejected,
+                    request.entry_index);
+    if (source_result != diff_source_result_t::success ||
         !diff_entry_valid(entry)) {
         return fail(diff_error_code_t::adapter_rejected, request.entry_index);
     }
@@ -332,7 +430,8 @@ diff_error_t diff_document_model_t::navigate(
 diff_error_t diff_document_model_t::select(
     const diff_selection_t& selection,
     std::uint64_t expected_generation,
-    const diff_scope_t& scope)
+    const diff_scope_t& scope,
+    const diff_cancellation_t* cancellation)
 {
     if (expected_generation != bound_generation_ ||
         !source_->generation_current(bound_generation_)) {
@@ -344,9 +443,6 @@ diff_error_t diff_document_model_t::select(
     if (!source_->supports_kind(scope.kind))
         return fail(diff_error_code_t::adapter_rejected,
                     static_cast<std::uint64_t>(scope.kind));
-    if (!source_->scope_available(bound_generation_, scope))
-        return fail(diff_error_code_t::adapter_rejected,
-                    scope.before.generation);
     if (!diff_selection_valid(selection)) {
         return fail(diff_error_code_t::selection_rejected,
                     static_cast<std::uint64_t>(selection.kind));
@@ -355,18 +451,34 @@ diff_error_t diff_document_model_t::select(
         selection_ = {};
         return {};
     }
+    const auto scope_error = validate_source_scope(scope, cancellation);
+    if (!scope_error.ok())
+        return scope_error;
 
-    const auto total = source_->entry_count(bound_generation_, scope);
-    if (!source_->generation_current(bound_generation_))
-        return stale();
-    if (total > k_diff_document_max_entries)
-        return fail(diff_error_code_t::resource_exhausted, total);
+    std::uint64_t total = 0;
+    const auto count_error = read_entry_count(scope, cancellation, total);
+    if (!count_error.ok())
+        return count_error;
     if (selection.entry_index >= total)
         return fail(diff_error_code_t::selection_rejected,
                     selection.entry_index);
 
     diff_entry_t entry;
-    if (!source_->entry_at(bound_generation_, scope, selection.entry_index, entry) ||
+    const diff_source_limits_t limits;
+    const auto source_result = source_->entry_at(
+        bound_generation_, scope, selection.entry_index, limits,
+        cancellation, entry);
+    if (cancellation_requested(cancellation) ||
+        source_result == diff_source_result_t::cancelled)
+        return fail(diff_error_code_t::cancelled, selection.entry_index);
+    if (source_result == diff_source_result_t::limit_exceeded) {
+        return fail(diff_error_code_t::resource_exhausted,
+                    k_diff_document_max_entries + 1U);
+    }
+    if (source_result == diff_source_result_t::not_found)
+        return fail(diff_error_code_t::selection_rejected,
+                    selection.entry_index);
+    if (source_result != diff_source_result_t::success ||
         !diff_entry_valid(entry)) {
         return fail(diff_error_code_t::adapter_rejected,
                     selection.entry_index);
@@ -396,7 +508,8 @@ diff_error_t diff_document_model_t::clear_selection(
 diff_error_t diff_document_model_t::compute_summary(
     std::uint64_t expected_generation,
     const diff_scope_t& scope,
-    diff_summary_t& output) const
+    diff_summary_t& output,
+    const diff_cancellation_t* cancellation) const
 {
     output = {};
     if (expected_generation != bound_generation_ ||
@@ -409,16 +522,28 @@ diff_error_t diff_document_model_t::compute_summary(
     if (!source_->supports_kind(scope.kind))
         return fail(diff_error_code_t::adapter_rejected,
                     static_cast<std::uint64_t>(scope.kind));
-    if (!source_->scope_available(bound_generation_, scope))
-        return fail(diff_error_code_t::adapter_rejected,
-                    scope.before.generation);
+    const auto scope_error = validate_source_scope(scope, cancellation);
+    if (!scope_error.ok())
+        return scope_error;
 
-    const auto total = source_->entry_count(bound_generation_, scope);
-    if (!source_->generation_current(bound_generation_))
-        return stale();
-    if (total > k_diff_document_max_entries)
-        return fail(diff_error_code_t::resource_exhausted, total);
-    if (!source_->summary(bound_generation_, scope, output) ||
+    std::uint64_t total = 0;
+    const auto count_error = read_entry_count(scope, cancellation, total);
+    if (!count_error.ok())
+        return count_error;
+    const diff_source_limits_t limits;
+    const auto source_result = source_->summary(
+        bound_generation_, scope, limits, cancellation, output);
+    if (cancellation_requested(cancellation) ||
+        source_result == diff_source_result_t::cancelled) {
+        output = {};
+        return fail(diff_error_code_t::cancelled, total);
+    }
+    if (source_result == diff_source_result_t::limit_exceeded) {
+        output = {};
+        return fail(diff_error_code_t::resource_exhausted,
+                    k_diff_document_max_entries + 1U);
+    }
+    if (source_result != diff_source_result_t::success ||
         output.snapshot_generation != bound_generation_ ||
         output.scope != scope || output.total_entries != total ||
         !summary_counts_valid(output)) {
@@ -446,14 +571,15 @@ diff_command_result_t diff_document_model_t::execute(
         break;
     case diff_command_kind_t::navigate:
         result.error = navigate(command.navigation, command.expected_generation,
-                                command.scope, result.navigation);
+                                command.scope, result.navigation,
+                                cancellation);
         result.changed = result.error.ok() && result.navigation.found;
         if (result.changed && command.navigation.select_entry)
             result.selection = selection_;
         break;
     case diff_command_kind_t::select:
         result.error = select(command.selection, command.expected_generation,
-                              command.scope);
+                              command.scope, cancellation);
         result.selection = selection_;
         result.changed = result.error.ok();
         break;
@@ -463,6 +589,11 @@ diff_command_result_t diff_document_model_t::execute(
         result.changed = result.error.ok();
         break;
     case diff_command_kind_t::refresh: {
+        if (cancellation_requested(cancellation)) {
+            result.error = fail(diff_error_code_t::cancelled,
+                                command.expected_generation);
+            break;
+        }
         if (command.expected_generation != bound_generation_ ||
             !source_->generation_current(bound_generation_)) {
             result.error = stale();
@@ -483,7 +614,8 @@ diff_command_result_t diff_document_model_t::execute(
     }
     case diff_command_kind_t::summary:
         result.error = compute_summary(command.expected_generation,
-                                       command.scope, result.summary);
+                                       command.scope, result.summary,
+                                       cancellation);
         result.changed = result.error.ok();
         break;
     default:

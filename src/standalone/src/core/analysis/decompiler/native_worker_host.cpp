@@ -1,6 +1,9 @@
 #include "native_worker_host.hpp"
 
+#include "isolated_worker_codec.hpp"
+#include "providers/dalvik_ssa.hpp"
 #include "providers/ghidra_ir_adapter.hpp"
+#include "providers/jvm_ssa.hpp"
 
 #include "../../../../workers/native_decompiler/native_worker_protocol.hpp"
 
@@ -15,6 +18,7 @@
 #include <cstring>
 #include <cwctype>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -754,6 +758,9 @@ bool launch_worker(const verified_worker_t& verified, const native_worker_execut
     }
     std::wstring command_line = quote_argument(verified.worker_path);
     command_line.append(L" --aida-native-decompiler-worker");
+    command_line.append(L" --provider=");
+    command_line.append(std::to_wstring(
+        static_cast<std::uint32_t>(request.cache_key.provider.provider)));
     command_line.append(L" --read-handle=");
     command_line.append(std::to_wstring(reinterpret_cast<std::uintptr_t>(child_read.get())));
     command_line.append(L" --write-handle=");
@@ -837,6 +844,40 @@ bool same_provider(const decompiler_provider_identity_t& lhs, const decompiler_p
     return lhs.provider == rhs.provider && lhs.provider_name == rhs.provider_name && lhs.provider_version == rhs.provider_version &&
         lhs.provider_binary_hash == rhs.provider_binary_hash && lhs.worker_build_id == rhs.worker_build_id &&
         lhs.worker_build_hash == rhs.worker_build_hash;
+}
+
+const char* isolated_provider_name(const decompiler_provider_id_t provider) noexcept
+{
+    switch (provider) {
+    case decompiler_provider_id_t::ghidra_native: return "aida-native-decompiler";
+    case decompiler_provider_id_t::jvm_ssa: return "aida-jvm-ssa";
+    case decompiler_provider_id_t::dalvik_ssa: return "aida-dalvik-ssa";
+    case decompiler_provider_id_t::ilspy_cli: return nullptr;
+    }
+    return nullptr;
+}
+
+decompiler_provider_identity_t isolated_provider_identity(
+    const decompiler_provider_identity_t& worker,
+    const decompiler_provider_id_t provider)
+{
+    auto result = worker;
+    result.provider = provider;
+    if (const auto* name = isolated_provider_name(provider))
+        result.provider_name = name;
+    return result;
+}
+
+bool compatible_worker_provider(
+    const decompiler_provider_identity_t& route,
+    const decompiler_provider_identity_t& manifest) noexcept
+{
+    const auto* expected_name = isolated_provider_name(route.provider);
+    return expected_name && route.provider_name == expected_name &&
+        route.provider_version == manifest.provider_version &&
+        route.provider_binary_hash == manifest.provider_binary_hash &&
+        route.worker_build_id == manifest.worker_build_id &&
+        route.worker_build_hash == manifest.worker_build_hash;
 }
 
 bool same_language(const decompiler_language_identity_t& lhs, const decompiler_language_identity_t& rhs) noexcept
@@ -1192,6 +1233,10 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
         packaged_native_worker_runtime_t result;
         result.provider_host = std::make_shared<native_worker_provider_host_t>(std::move(host));
         result.provider = decoded.value->provider;
+        result.jvm_provider = isolated_provider_identity(
+            decoded.value->provider, decompiler_provider_id_t::jvm_ssa);
+        result.dalvik_provider = isolated_provider_identity(
+            decoded.value->provider, decompiler_provider_id_t::dalvik_ssa);
         result.worker_protocol_hash = decoded.value->worker_protocol_hash;
         result.manifest_hash = manifest_hash;
         result.worker_protocol_version = decoded.value->worker_protocol_version;
@@ -1262,7 +1307,7 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
     auto verified = verify_worker(contract_, result);
     if (!verified)
         return result;
-    if (!same_provider(request.cache_key.provider, verified->manifest.provider)) {
+    if (!compatible_worker_provider(request.cache_key.provider, verified->manifest.provider)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::worker_identity_mismatch,
             "native_worker.request_identity",
             "cache provider identity does not match the verified worker manifest",
@@ -1304,7 +1349,9 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         return result;
     }
     const auto& hello = std::get<decompiler_worker_hello_t>(*decoded_hello.value);
-    if (hello.manifest_hash != verified->manifest_hash || !same_provider(hello.provider, verified->manifest.provider)) {
+    if (hello.manifest_hash != verified->manifest_hash ||
+        !same_provider(hello.provider, request.cache_key.provider) ||
+        !compatible_worker_provider(hello.provider, verified->manifest.provider)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::worker_identity_mismatch, "native_worker.hello_identity", "worker identity does not match verified manifest", ERROR_CRC, true);
         terminate_worker(worker, ERROR_CRC, result, true);
         return result;
@@ -1395,12 +1442,16 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             const auto& document = std::get<decompiler_worker_document_message_t>(*decoded.value);
             const auto document_validation = validate_decompiler_document(document.document);
             if (document.job_id != request.job_id || !document_validation.valid() || !(document.document.entity == request.cache_key.entity) ||
-                document.document.profile != request.profile.profile) {
+                document.document.profile != request.profile.profile ||
+                document.provider_artifacts.empty() || document.provider_artifacts_hash.empty() ||
+                stable_serialization_hash(document.provider_artifacts) != document.provider_artifacts_hash) {
                 append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.document", "worker document is not bound to the requested entity and profile", ERROR_INVALID_DATA, true);
                 terminate_worker(worker, ERROR_CRC, result, true);
                 return result;
             }
             result.document = document.document;
+            result.provider_artifacts = document.provider_artifacts;
+            result.provider_artifacts_hash = document.provider_artifacts_hash;
             result.status = native_worker_execution_status_t::completed;
             terminate_worker(worker, ERROR_SUCCESS, result, false);
             return result;
@@ -1432,9 +1483,19 @@ native_worker_provider_host_t::native_worker_provider_host_t(
 bool native_worker_provider_host_t::supports(
     const decompiler_provider_descriptor_t& descriptor) const noexcept
 {
-    return host_ && descriptor.isolated &&
-           descriptor.entity_kind == decompiler_entity_kind_t::native_function &&
-           descriptor.identity.provider == decompiler_provider_id_t::ghidra_native;
+    if (!host_ || !descriptor.isolated)
+        return false;
+    switch (descriptor.identity.provider) {
+    case decompiler_provider_id_t::ghidra_native:
+        return descriptor.entity_kind == decompiler_entity_kind_t::native_function;
+    case decompiler_provider_id_t::jvm_ssa:
+        return descriptor.entity_kind == decompiler_entity_kind_t::jvm_method;
+    case decompiler_provider_id_t::dalvik_ssa:
+        return descriptor.entity_kind == decompiler_entity_kind_t::dalvik_method;
+    case decompiler_provider_id_t::ilspy_cli:
+        return false;
+    }
+    return false;
 }
 
 decompiler_provider_result_t native_worker_provider_host_t::execute(
@@ -1468,65 +1529,72 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
         return result;
     }
 
-    const auto context = std::dynamic_pointer_cast<const ghidra_native_provider_context_t>(request.context);
-    if (!context || !context->artifacts()) {
-        decompiler_diagnostic_t diagnostic;
-        diagnostic.severity = decompiler_diagnostic_severity_t::error;
-        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
-        diagnostic.localization_key = "decompiler.native_host.context_rejected";
-        diagnostic.ordinal = 1;
-        result.diagnostics.push_back(std::move(diagnostic));
-        return result;
-    }
-
-    const auto& source = *context->artifacts();
     if (request.cache_key.stage != decompiler_cache_stage_t::provider_ir ||
         !validate_decompiler_pipeline_cache_key(request.cache_key).valid() ||
-        !validate_provider_ir(source.provider_ir).valid() ||
-        !validate_hir_function(source.hir).valid() ||
-        !validate_type_graph(source.type_graph).valid() ||
-        source.provider_ir.entity != request.cache_key.entity ||
-        source.hir.entity != request.cache_key.entity ||
-        source.type_graph.entity != request.cache_key.entity ||
-        !same_provider(source.provider_ir.provider, route.descriptor.identity) ||
-        !same_provider(request.cache_key.provider, route.descriptor.identity) ||
-        !same_language(source.provider_ir.language, request.cache_key.language) ||
-        source.hir.provider_ir_hash != stable_serialization_hash(source.provider_ir) ||
-        source.hir.type_graph_revision != request.cache_key.type_graph_revision ||
-        source.type_graph.revision != request.cache_key.type_graph_revision ||
-        source.hir.return_type_id == 0) {
+        !same_provider(request.cache_key.provider, route.descriptor.identity)) {
         decompiler_diagnostic_t diagnostic;
         diagnostic.severity = decompiler_diagnostic_severity_t::error;
         diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
-        diagnostic.localization_key = "decompiler.native_host.artifacts_rejected";
+        diagnostic.localization_key = "decompiler.isolated_host.request_rejected";
         diagnostic.ordinal = 1;
         result.diagnostics.push_back(std::move(diagnostic));
         return result;
     }
 
-    result.diagnostics = source.provider_ir.diagnostics;
     std::optional<native_worker_snapshot_t> snapshot;
     try {
-        const auto serialized = ghidra_ir_adapter::serialize_artifacts(source);
-        std::vector<std::uint8_t> bytes(serialized.begin(), serialized.end());
-        snapshot = make_native_worker_snapshot(std::move(bytes));
+        std::vector<std::uint8_t> bytes;
+        switch (route.descriptor.identity.provider) {
+        case decompiler_provider_id_t::ghidra_native: {
+            const auto context = std::dynamic_pointer_cast<const ghidra_native_provider_context_t>(request.context);
+            if (!context || !context->snapshot() || context->snapshot()->empty() ||
+                context->snapshot_hash().empty())
+                break;
+            bytes.assign(context->snapshot()->begin(), context->snapshot()->end());
+            snapshot = make_native_worker_snapshot(std::move(bytes));
+            if (snapshot && snapshot->hash != context->snapshot_hash())
+                snapshot.reset();
+            break;
+        }
+        case decompiler_provider_id_t::jvm_ssa: {
+            const auto context = std::dynamic_pointer_cast<const jvm_ssa_provider_context_t>(request.context);
+            if (!context || !context->input() || context->input()->entity != request.cache_key.entity ||
+                !same_provider(context->input()->provider, route.descriptor.identity) ||
+                !same_language(context->input()->language, request.cache_key.language) ||
+                context->input()->workspace_generation != request.cache_key.workspace_generation ||
+                context->input()->type_graph_revision != request.cache_key.type_graph_revision)
+                break;
+            const auto serialized = jvm_ssa::serialize_jvm_method_input(*context->input());
+            bytes.assign(serialized.begin(), serialized.end());
+            snapshot = make_native_worker_snapshot(std::move(bytes));
+            break;
+        }
+        case decompiler_provider_id_t::dalvik_ssa: {
+            const auto context = std::dynamic_pointer_cast<const dalvik_ssa_provider_context_t>(request.context);
+            if (!context || !context->capture() ||
+                context->capture()->request.entity != request.cache_key.entity ||
+                !same_provider(context->capture()->request.provider, route.descriptor.identity) ||
+                !same_language(context->capture()->request.language, request.cache_key.language) ||
+                context->capture()->request.workspace_generation != request.cache_key.workspace_generation ||
+                context->capture()->request.type_graph_revision != request.cache_key.type_graph_revision)
+                break;
+            const auto serialized = dalvik_ssa::serialize_capture(*context->capture());
+            bytes.assign(serialized.begin(), serialized.end());
+            snapshot = make_native_worker_snapshot(std::move(bytes));
+            break;
+        }
+        case decompiler_provider_id_t::ilspy_cli:
+            break;
+        }
     } catch (...) {
-        result.status = decompiler_provider_execution_status_t::failed;
-        decompiler_diagnostic_t diagnostic;
-        diagnostic.severity = decompiler_diagnostic_severity_t::error;
-        diagnostic.code = decompiler_diagnostic_code_t::resource_limit;
-        diagnostic.localization_key = "decompiler.native_host.snapshot_serialize";
-        diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
-        result.diagnostics.push_back(std::move(diagnostic));
-        return result;
+        snapshot.reset();
     }
     if (!snapshot) {
-        result.status = decompiler_provider_execution_status_t::failed;
         decompiler_diagnostic_t diagnostic;
         diagnostic.severity = decompiler_diagnostic_severity_t::error;
-        diagnostic.code = decompiler_diagnostic_code_t::resource_limit;
-        diagnostic.localization_key = "decompiler.native_host.snapshot_rejected";
-        diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
+        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
+        diagnostic.localization_key = "decompiler.isolated_host.input_snapshot_rejected";
+        diagnostic.ordinal = 1;
         result.diagnostics.push_back(std::move(diagnostic));
         return result;
     }
@@ -1566,13 +1634,67 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
     }
     switch (worker_result.status) {
     case native_worker_execution_status_t::completed:
-        if (worker_result.document) {
+        if (worker_result.document && !worker_result.provider_artifacts.empty() &&
+            worker_result.provider_artifacts_hash ==
+                stable_serialization_hash(worker_result.provider_artifacts)) {
             try {
                 decompiler_provider_artifacts_t provider_artifacts;
-                provider_artifacts.provider_ir = source.provider_ir;
-                provider_artifacts.hir = source.hir;
-                provider_artifacts.type_graph = source.type_graph;
-                provider_artifacts.return_type_id = source.hir.return_type_id;
+                std::vector<decompiler_diagnostic_t> decode_diagnostics;
+                switch (route.descriptor.identity.provider) {
+                case decompiler_provider_id_t::ghidra_native: {
+                    auto decoded = ghidra_ir_adapter::deserialize_artifacts(
+                        worker_result.provider_artifacts, decode_diagnostics);
+                    if (decoded) {
+                        provider_artifacts.provider_ir = std::move(decoded->provider_ir);
+                        provider_artifacts.hir = std::move(decoded->hir);
+                        provider_artifacts.type_graph = std::move(decoded->type_graph);
+                        provider_artifacts.return_type_id = provider_artifacts.hir->return_type_id;
+                    }
+                    break;
+                }
+                case decompiler_provider_id_t::jvm_ssa: {
+                    auto decoded = jvm_ssa::deserialize_jvm_ssa_result(
+                        worker_result.provider_artifacts, decode_diagnostics);
+                    if (decoded && decoded->succeeded() && decoded->provider_ir &&
+                        decoded->hir && decoded->type_graph) {
+                        provider_artifacts.provider_ir = std::move(*decoded->provider_ir);
+                        provider_artifacts.hir = std::move(*decoded->hir);
+                        provider_artifacts.type_graph = std::move(*decoded->type_graph);
+                        provider_artifacts.return_type_id = provider_artifacts.hir->return_type_id;
+                    }
+                    break;
+                }
+                case decompiler_provider_id_t::dalvik_ssa: {
+                    auto decoded = dalvik_ssa::deserialize_artifacts(
+                        worker_result.provider_artifacts, decode_diagnostics);
+                    if (decoded) {
+                        provider_artifacts.provider_ir = std::move(decoded->provider_ir);
+                        provider_artifacts.hir = std::move(decoded->hir);
+                        provider_artifacts.type_graph = std::move(decoded->type_graph);
+                        provider_artifacts.return_type_id = provider_artifacts.hir->return_type_id;
+                    }
+                    break;
+                }
+                case decompiler_provider_id_t::ilspy_cli:
+                    break;
+                }
+                result.diagnostics.insert(result.diagnostics.end(),
+                    decode_diagnostics.begin(), decode_diagnostics.end());
+                if (!validate_provider_ir(provider_artifacts.provider_ir).valid() ||
+                    !provider_artifacts.hir ||
+                    !validate_hir_function(*provider_artifacts.hir).valid() ||
+                    !validate_type_graph(provider_artifacts.type_graph).valid() ||
+                    provider_artifacts.provider_ir.entity != request.cache_key.entity ||
+                    provider_artifacts.hir->entity != request.cache_key.entity ||
+                    provider_artifacts.type_graph.entity != request.cache_key.entity ||
+                    !same_provider(provider_artifacts.provider_ir.provider, route.descriptor.identity) ||
+                    !same_language(provider_artifacts.provider_ir.language, request.cache_key.language) ||
+                    provider_artifacts.hir->provider_ir_hash !=
+                        stable_serialization_hash(provider_artifacts.provider_ir) ||
+                    provider_artifacts.hir->type_graph_revision != request.cache_key.type_graph_revision ||
+                    provider_artifacts.type_graph.revision != request.cache_key.type_graph_revision ||
+                    provider_artifacts.return_type_id == 0)
+                    throw std::invalid_argument("isolated provider artifacts failed binding");
                 result.artifacts = std::move(provider_artifacts);
                 result.attested_document = std::move(worker_result.document);
                 result.status = decompiler_provider_execution_status_t::completed;

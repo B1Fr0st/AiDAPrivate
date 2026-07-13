@@ -2,11 +2,16 @@
 
 #include "workbench_persistence.hpp"
 #include "../analysis/decompiler/decompiler_service.hpp"
+#include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../analysis/workspace/analysis_workspace.hpp"
 #include "../analysis/workspace/decompiler_service.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
+#include "../disasm/ghidra_adapters/aida_arch_map.hpp"
+#include "../infra/executor.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <future>
@@ -99,11 +104,22 @@ class workbench_analysis_source_t;
 
 class workbench_analysis_source_catalog_t final {
 public:
-    void publish(workspace_id_t workspace,
+    bool publish(workspace_id_t workspace,
+                 const analysis::binary_id_t& binary_id,
                  const std::shared_ptr<workbench_analysis_source_t>& source)
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        sources_[workspace.value] = source;
+        const auto found = sources_.find(workspace.value);
+        if (found != sources_.end()) {
+            const auto active = found->second.source.lock();
+            if (active && found->second.binary_id != binary_id)
+                return false;
+        }
+        source_entry_t entry;
+        entry.binary_id = binary_id;
+        entry.source = source;
+        sources_[workspace.value] = std::move(entry);
+        return true;
     }
 
     std::shared_ptr<workbench_analysis_source_t> find(
@@ -113,17 +129,67 @@ public:
         const auto found = sources_.find(workspace);
         if (found == sources_.end())
             return {};
-        auto source = found->second.lock();
+        auto source = found->second.source.lock();
         if (!source)
             sources_.erase(found);
         return source;
     }
 
 private:
+    struct source_entry_t final {
+        analysis::binary_id_t binary_id;
+        std::weak_ptr<workbench_analysis_source_t> source;
+    };
+
     mutable std::mutex mutex_;
-    mutable std::unordered_map<std::uint64_t,
-                               std::weak_ptr<workbench_analysis_source_t>> sources_;
+    mutable std::unordered_map<std::uint64_t, source_entry_t> sources_;
 };
+
+std::shared_ptr<workbench_analysis_source_catalog_t> production_source_catalog()
+{
+    static const auto catalog =
+        std::make_shared<workbench_analysis_source_catalog_t>();
+    return catalog;
+}
+
+const char* analysis_document_title(document_kind_t kind) noexcept
+{
+    switch (kind) {
+        case document_kind_t::disassembly:
+            return "Disassembly";
+        case document_kind_t::hex:
+            return "Hex";
+        case document_kind_t::pseudocode:
+            return "Pseudocode";
+        case document_kind_t::graph:
+            return "Graph";
+        case document_kind_t::diff:
+            return "Diff";
+        default:
+            return nullptr;
+    }
+}
+
+bool analysis_document_descriptor(const document_identity_t& identity,
+                                  document_descriptor_t& output)
+{
+    output = {};
+    const auto* title = analysis_document_title(identity.kind);
+    if (!title || !identity.workspace.valid() || identity.object_id != 1 ||
+        identity.variant_id != 0 || identity.provider_key != "analysis" ||
+        (identity.has_address && identity.address == 0))
+        return false;
+    output.identity = identity;
+    output.title = title;
+    if (identity.has_address) {
+        std::ostringstream stream;
+        stream << title << " 0x" << std::uppercase << std::hex
+               << identity.address;
+        output.title = stream.str();
+    }
+    output.can_open = true;
+    return true;
+}
 
 class workbench_analysis_source_t final
     : public std::enable_shared_from_this<workbench_analysis_source_t> {
@@ -2963,6 +3029,84 @@ public:
         }
     }
 
+    workbench_error_t resolve_request(
+        std::uint64_t function_address,
+        analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms,
+        pseudocode_document::pseudocode_request_t& output) const override
+    {
+        output = {};
+        const auto budget = profile_budget(profile);
+        const auto effective_timeout = (std::min)(
+            timeout_ms, budget.max_wall_clock_ms);
+        const auto publication = lease_.publication;
+        const auto workspace = lease_.source
+            ? lease_.source->analysis_workspace()
+            : nullptr;
+        if (function_address == 0 || timeout_ms == 0 ||
+            effective_timeout == 0 || !workspace ||
+            !publication || !publication->snapshot ||
+            !publication->snapshot->normalized_image ||
+            !generation_current(publication->generation) ||
+            effective_timeout > static_cast<std::uint64_t>(
+                (std::chrono::milliseconds::max)().count()))
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               function_address);
+
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(
+                static_cast<std::chrono::milliseconds::rep>(effective_timeout));
+        analysis::cancellation_source_t cancellation(deadline);
+        const auto language = analysis::ghidra_adapter::resolve_ghidra_language(
+            *publication->snapshot->normalized_image, cancellation.token());
+        if (!language)
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               function_address);
+
+        analysis::decompiler_ui_request_t identity_request;
+        identity_request.source =
+            analysis::decompiler_ui_invocation_source_t::keyboard_f5;
+        identity_request.function_address = function_address;
+        identity_request.language.language_id = language.value().language_id;
+        identity_request.language.language_version = "ghidra-staged-v1";
+        identity_request.language.compiler_spec_id =
+            language.value().compiler_spec_id;
+        identity_request.language.language_spec_hash =
+            analysis::stable_serialization_hash(
+                language.value().language_id + "|" +
+                language.value().compiler_spec_id);
+        identity_request.language.architecture =
+            publication->snapshot->normalized_image->architecture;
+        identity_request.language.mode =
+            publication->snapshot->normalized_image->architecture_mode;
+        identity_request.language.endian =
+            publication->snapshot->normalized_image->endian;
+        identity_request.worker_protocol_hash =
+            analysis::stable_serialization_hash(
+                "aida.workbench.pseudocode.identity.v1");
+        identity_request.metadata_revision = publication->analysis_revision;
+        identity_request.type_graph_revision = publication->analysis_revision;
+        identity_request.profile = profile;
+        identity_request.cache_mode =
+            analysis::decompiler_pipeline_cache_mode_t::read_write;
+        identity_request.deadline = deadline;
+
+        auto pipeline_request =
+            analysis::decompiler_ui_integration_t::build_pipeline_request(
+                identity_request, *workspace, 64ULL << 20, 65536,
+                cancellation.token());
+        if (!pipeline_request ||
+            !generation_current(publication->generation))
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               function_address);
+
+        output.entity = std::move(pipeline_request.value().entity);
+        output.profile = profile;
+        output.workspace_generation = publication->generation;
+        output.timeout_ms = effective_timeout;
+        return {};
+    }
+
     workbench_error_t request_decompilation(
         const pseudocode_document::pseudocode_request_t& request,
         std::uint64_t job_id) override
@@ -3425,7 +3569,7 @@ struct integration_state_t final {
                                  workbench_shell_integration_config_t cfg)
         : model(&mdl),
           config(std::move(cfg)),
-          source_catalog(std::make_shared<workbench_analysis_source_catalog_t>())
+          source_catalog(production_source_catalog())
     {
     }
 };
@@ -3889,7 +4033,10 @@ workbench_shell_integration_t::integrate_analysis_workspace(
                                workspace.value);
         }
     }
-    impl_->state.source_catalog->publish(workspace, source);
+    if (!impl_->state.source_catalog->publish(
+            workspace, analysis_workspace->identity().binary_id(), source))
+        return shell_error(workbench_error_code_t::duplicate_identifier,
+                           workspace.value);
     const auto rebuild_error = impl_->rebuild_documents(workspace_state, source);
     if (!rebuild_error)
         return rebuild_error;
@@ -3987,6 +4134,17 @@ workbench_shell_integration_t::restore_persisted_workspace_context(
     if (!load_error) {
         impl_->increment_metric(&workbench_shell_metrics_t::persistence_failures);
         return load_error;
+    }
+    for (const auto& document : persisted.documents) {
+        document_descriptor_t descriptor;
+        if (analysis_document_descriptor(document.identity, descriptor)) {
+            const auto publish_error = bridge->publish(std::move(descriptor));
+            if (!publish_error) {
+                impl_->increment_metric(
+                    &workbench_shell_metrics_t::persistence_failures);
+                return publish_error;
+            }
+        }
     }
     impl_->increment_metric(&workbench_shell_metrics_t::persistence_loads);
     return restore_workspace_context(workspace, expected_revision, persisted,
@@ -4166,6 +4324,648 @@ workbench_shell_integration_t::create_default_persistence(
     const fixed_layout_constraints_t& layout,
     std::uint32_t history_capacity) {
     return build_default_persistence(workspace, layout, history_capacity);
+}
+
+namespace {
+
+struct workbench_runtime_binding_t final {
+    std::mutex lifecycle_mutex;
+    std::mutex persistence_mutex;
+    analysis::binary_id_t binary_id;
+    workspace_id_t workspace;
+    std::shared_ptr<analysis::analysis_workspace_t> analysis_workspace;
+    std::unique_ptr<workbench_model_t> model;
+    std::shared_ptr<workbench_shell_integration_t> shell;
+    bool integrated = false;
+    bool restored = false;
+    bool closing = false;
+    std::atomic<std::uint64_t> dirty_revision{0};
+    std::atomic<std::uint64_t> persisted_revision{0};
+    std::atomic<bool> persistence_scheduled{false};
+    std::atomic<std::uint64_t> next_navigation_id{1};
+};
+
+workspace_id_t runtime_workspace_id(const analysis::binary_id_t& binary_id) noexcept
+{
+    std::uint64_t value = k_shell_fnv_offset;
+    for (const auto byte : binary_id.bytes) {
+        value ^= byte;
+        value *= k_shell_fnv_prime;
+    }
+    if (value == 0)
+        value = 1;
+    return workspace_id_t{value};
+}
+
+const document_persistence_dto_t* active_document(
+    const workbench_persistence_dto_t& persistence) noexcept
+{
+    const auto found = std::find_if(
+        persistence.documents.begin(), persistence.documents.end(),
+        [&persistence](const document_persistence_dto_t& document) {
+            return document.id == persistence.active_document;
+        });
+    return found != persistence.documents.end() ? &*found : nullptr;
+}
+
+void raise_dirty_revision(
+    const std::shared_ptr<workbench_runtime_binding_t>& binding,
+    std::uint64_t revision) noexcept
+{
+    auto observed = binding->dirty_revision.load(std::memory_order_acquire);
+    while (observed < revision &&
+           !binding->dirty_revision.compare_exchange_weak(
+               observed, revision, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+}
+
+void schedule_runtime_persistence(
+    const std::shared_ptr<workbench_runtime_binding_t>& binding);
+
+void persist_runtime_binding(
+    const std::shared_ptr<workbench_runtime_binding_t>& binding)
+{
+    const auto attempted_dirty_revision =
+        binding->dirty_revision.load(std::memory_order_acquire);
+    std::unique_lock<std::mutex> persistence_lock(binding->persistence_mutex);
+    bool allow_reschedule = true;
+    for (std::uint32_t attempt = 0; attempt != 16; ++attempt) {
+        workbench_shell_workspace_context_t context;
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(binding->lifecycle_mutex);
+            if (!binding->integrated || !binding->shell) {
+                allow_reschedule = false;
+                break;
+            }
+            const auto* current =
+                binding->shell->workspace_context(binding->workspace);
+            if (!current) {
+                allow_reschedule = false;
+                break;
+            }
+            context = *current;
+        }
+        const auto revision = context.persistence.revision.value;
+        if (revision == 0) {
+            allow_reschedule = false;
+            break;
+        }
+        if (revision <= binding->persisted_revision.load(
+                std::memory_order_acquire))
+            break;
+        const auto stored = binding->shell->store_workspace_context(
+            binding->workspace, context.persistence.revision);
+        if (!stored) {
+            if (stored.code == workbench_error_code_t::revision_mismatch)
+                continue;
+            diag::log_tagged_fmt(
+                "workbench_shell",
+                "persistence_store_failed workspace=%llu revision=%llu code=%u subject=%llu",
+                static_cast<unsigned long long>(binding->workspace.value),
+                static_cast<unsigned long long>(revision),
+                static_cast<unsigned>(stored.code),
+                static_cast<unsigned long long>(stored.subject));
+            allow_reschedule = false;
+            break;
+        }
+        binding->persisted_revision.store(revision, std::memory_order_release);
+        if (binding->dirty_revision.load(std::memory_order_acquire) <= revision)
+            break;
+    }
+    persistence_lock.unlock();
+    binding->persistence_scheduled.store(false, std::memory_order_release);
+    bool closing = false;
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(binding->lifecycle_mutex);
+        closing = binding->closing;
+    }
+    const auto current_dirty_revision =
+        binding->dirty_revision.load(std::memory_order_acquire);
+    if (!closing &&
+        (allow_reschedule ||
+         current_dirty_revision > attempted_dirty_revision) &&
+        current_dirty_revision >
+            binding->persisted_revision.load(std::memory_order_acquire))
+        schedule_runtime_persistence(binding);
+}
+
+void schedule_runtime_persistence(
+    const std::shared_ptr<workbench_runtime_binding_t>& binding)
+{
+    bool expected = false;
+    if (!binding->persistence_scheduled.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        return;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "workbench_shell";
+    submission.label = "workbench.persist";
+    submission.thread_class = "bounded_io";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.generation = binding->dirty_revision.load(
+        std::memory_order_acquire);
+    submission.ui_access_policy = "forbidden";
+    submission.failure_policy = "retain_dirty_state";
+    submission.shutdown_policy = "drain";
+    submission.body = [binding] { persist_runtime_binding(binding); };
+    const auto submitted =
+        aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        binding->persistence_scheduled.store(false, std::memory_order_release);
+        diag::log_tagged_fmt(
+            "workbench_shell",
+            "persistence_submit_failed workspace=%llu reason=%s",
+            static_cast<unsigned long long>(binding->workspace.value),
+            submitted.reject_reason.c_str());
+    }
+}
+
+void mark_runtime_dirty(
+    const std::shared_ptr<workbench_runtime_binding_t>& binding,
+    std::uint64_t revision)
+{
+    raise_dirty_revision(binding, revision);
+    schedule_runtime_persistence(binding);
+}
+
+workbench_error_t synchronize_runtime_documents(
+    const std::shared_ptr<workbench_runtime_binding_t>& binding,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto publication =
+        binding->analysis_workspace->analysis_publication();
+    if (!publication || !publication->snapshot ||
+        !publication->coherent_with(binding->analysis_workspace->identity()))
+        return shell_error(workbench_error_code_t::adapter_rejected,
+                           binding->workspace.value);
+    const auto overlay_revision =
+        binding->analysis_workspace->overlay_revision();
+    if (output.analysis_generation == publication->generation &&
+        output.analysis_revision == publication->analysis_revision &&
+        output.overlay_revision == overlay_revision)
+        return {};
+    if (output.pseudocode_document &&
+        output.pseudocode_document->has_pending_requests())
+        return {};
+    const auto refreshed =
+        binding->shell->refresh_analysis_documents(binding->workspace);
+    if (!refreshed)
+        return refreshed;
+    const auto* current = binding->shell->workspace_context(binding->workspace);
+    if (!current)
+        return shell_error(workbench_error_code_t::invalid_workspace,
+                           binding->workspace.value);
+    output = *current;
+    return {};
+}
+
+workbench_error_t publish_runtime_document(
+    workbench_shell_workspace_context_t& context,
+    const document_identity_t& identity)
+{
+    if (!context.document_bridge)
+        return shell_error(workbench_error_code_t::adapter_rejected,
+                           identity.object_id);
+    document_descriptor_t descriptor;
+    if (!analysis_document_descriptor(identity, descriptor))
+        return shell_error(workbench_error_code_t::invalid_document,
+                           identity.object_id);
+    return context.document_bridge->publish(std::move(descriptor));
+}
+
+document_identity_t runtime_document_identity(
+    workspace_id_t workspace,
+    document_kind_t kind,
+    std::optional<std::uint64_t> address)
+{
+    document_identity_t identity;
+    identity.workspace = workspace;
+    identity.kind = kind;
+    identity.object_id = 1;
+    identity.provider_key = "analysis";
+    if (address) {
+        identity.has_address = true;
+        identity.address = *address;
+    }
+    return identity;
+}
+
+}
+
+struct workbench_shell_runtime_t::impl_t {
+    mutable std::mutex mutex;
+    std::map<analysis::binary_id_t,
+             std::shared_ptr<workbench_runtime_binding_t>> bindings;
+
+    workbench_error_t binding_for(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        std::shared_ptr<workbench_runtime_binding_t>& output)
+    {
+        output.reset();
+        if (!analysis_workspace || analysis_workspace->closing() ||
+            analysis_workspace->closed() ||
+            analysis_workspace->identity().binary_id().empty())
+            return shell_error(workbench_error_code_t::invalid_workspace);
+        const auto binary_id = analysis_workspace->identity().binary_id();
+        std::lock_guard<std::mutex> lock(mutex);
+        auto found = bindings.find(binary_id);
+        if (found != bindings.end()) {
+            std::lock_guard<std::mutex> lifecycle_lock(
+                found->second->lifecycle_mutex);
+            if (!found->second->closing &&
+                found->second->analysis_workspace == analysis_workspace) {
+                output = found->second;
+                return {};
+            }
+            if (!found->second->closing &&
+                found->second->analysis_workspace &&
+                !found->second->analysis_workspace->closed())
+                return shell_error(workbench_error_code_t::duplicate_identifier,
+                                   found->second->workspace.value);
+            bindings.erase(found);
+        }
+
+        auto binding = std::make_shared<workbench_runtime_binding_t>();
+        binding->binary_id = binary_id;
+        binding->workspace = runtime_workspace_id(binary_id);
+        binding->analysis_workspace = analysis_workspace;
+        binding->model = std::make_unique<workbench_model_t>();
+        const auto initial =
+            workbench_shell_integration_t::create_default_persistence(
+                binding->workspace, {}, k_default_history_capacity);
+        workbench_snapshot_ptr_t initial_snapshot;
+        const auto created =
+            binding->model->create_workspace(initial, initial_snapshot);
+        if (!created)
+            return created;
+        binding->shell =
+            workbench_shell_integration_t::create(*binding->model);
+        if (!binding->shell)
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               binding->workspace.value);
+        binding->dirty_revision.store(initial.revision.value,
+                                      std::memory_order_release);
+        bindings.emplace(binary_id, binding);
+        output = std::move(binding);
+        return {};
+    }
+};
+
+workbench_shell_runtime_t& workbench_shell_runtime_t::instance()
+{
+    static workbench_shell_runtime_t runtime;
+    return runtime;
+}
+
+workbench_shell_runtime_t::workbench_shell_runtime_t()
+    : impl_(std::make_unique<impl_t>())
+{
+}
+
+workbench_shell_runtime_t::~workbench_shell_runtime_t()
+{
+    if (!impl_)
+        return;
+    std::vector<std::shared_ptr<workbench_runtime_binding_t>> bindings;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        for (auto& [binary_id, binding] : impl_->bindings) {
+            static_cast<void>(binary_id);
+            bindings.push_back(binding);
+        }
+        impl_->bindings.clear();
+    }
+    for (const auto& binding : bindings) {
+        {
+            std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+            binding->closing = true;
+        }
+        persist_runtime_binding(binding);
+    }
+}
+
+workbench_error_t workbench_shell_runtime_t::attach_analysis_workspace(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    workbench_shell_workspace_context_t& output)
+{
+    output = {};
+    if (!impl_)
+        return shell_error(workbench_error_code_t::invalid_workspace);
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+
+    bool persist_default = false;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        if (binding->closing)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        if (!binding->integrated) {
+            const auto integrated = binding->shell->integrate_analysis_workspace(
+                binding->workspace, analysis_workspace);
+            if (!integrated)
+                return integrated;
+            const auto host = binding->shell->integrate_document_host(
+                binding->workspace, {});
+            if (!host)
+                return host;
+            workbench_snapshot_ptr_t snapshot;
+            const auto made_default =
+                binding->shell->make_default_for_analysis(
+                    binding->workspace, snapshot);
+            if (!made_default)
+                return made_default;
+            binding->integrated = true;
+        }
+        if (!binding->restored) {
+            const auto* current =
+                binding->shell->workspace_context(binding->workspace);
+            if (!current)
+                return shell_error(workbench_error_code_t::invalid_workspace,
+                                   binding->workspace.value);
+            const auto restored =
+                binding->shell->restore_persisted_workspace_context(
+                    binding->workspace, current->persistence.revision,
+                    missing_document_policy_t::omit, output);
+            if (!restored) {
+                const auto* fallback =
+                    binding->shell->workspace_context(binding->workspace);
+                if (!fallback)
+                    return restored;
+                output = *fallback;
+                persist_default = true;
+                diag::log_tagged_fmt(
+                    "workbench_shell",
+                    "persistence_restore_default workspace=%llu code=%u subject=%llu",
+                    static_cast<unsigned long long>(binding->workspace.value),
+                    static_cast<unsigned>(restored.code),
+                    static_cast<unsigned long long>(restored.subject));
+            } else {
+                binding->persisted_revision.store(
+                    output.persistence.revision.value,
+                    std::memory_order_release);
+                binding->dirty_revision.store(
+                    output.persistence.revision.value,
+                    std::memory_order_release);
+            }
+            binding->restored = true;
+        } else {
+            const auto* current =
+                binding->shell->workspace_context(binding->workspace);
+            if (!current)
+                return shell_error(workbench_error_code_t::invalid_workspace,
+                                   binding->workspace.value);
+            output = *current;
+        }
+        const auto synchronized =
+            synchronize_runtime_documents(binding, output);
+        if (!synchronized)
+            return synchronized;
+    }
+    if (persist_default)
+        mark_runtime_dirty(binding, output.persistence.revision.value);
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::workspace_context(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::activate_document(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_kind_t kind,
+    std::optional<std::uint64_t> address,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto identity =
+            runtime_document_identity(binding->workspace, kind, address);
+        const auto descriptor_error = publish_runtime_document(output, identity);
+        if (!descriptor_error)
+            return descriptor_error;
+        if (const auto* active = active_document(output.persistence)) {
+            if (document_identity_equal(active->identity, identity) ||
+                (!address && active->identity.kind == kind))
+                return {};
+        }
+        workbench_command_t command;
+        command.kind = workbench_command_kind_t::open_document;
+        command.workspace = binding->workspace;
+        command.expected_revision = output.persistence.revision;
+        command.document_identity = identity;
+        command.request_focus = true;
+        workbench_command_result_t result;
+        const auto dispatched =
+            binding->shell->dispatch_command(command, {}, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current =
+            binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::close_document(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_kind_t kind,
+    std::optional<std::uint64_t> address,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto identity =
+            runtime_document_identity(binding->workspace, kind, address);
+        const auto found = std::find_if(
+            output.persistence.documents.begin(),
+            output.persistence.documents.end(),
+            [&identity](const document_persistence_dto_t& document) {
+                return document_identity_equal(document.identity, identity);
+            });
+        if (found == output.persistence.documents.end())
+            return {};
+        workbench_command_t command;
+        command.kind = workbench_command_kind_t::close_document;
+        command.workspace = binding->workspace;
+        command.expected_revision = output.persistence.revision;
+        command.document = found->id;
+        workbench_command_result_t result;
+        const auto dispatched =
+            binding->shell->dispatch_command(command, {}, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current =
+            binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::navigate_document(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_kind_t kind,
+    std::optional<std::uint64_t> document_address,
+    const selection_context_t& selection,
+    const document_local_cursor_t& cursor,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto target = runtime_document_identity(
+            binding->workspace, kind, document_address);
+        const auto descriptor_error = publish_runtime_document(output, target);
+        if (!descriptor_error)
+            return descriptor_error;
+        const auto focused_view = std::find_if(
+            output.persistence.views.begin(), output.persistence.views.end(),
+            [](const view_persistence_dto_t& view) { return view.focused; });
+        if (focused_view == output.persistence.views.end())
+            return shell_error(workbench_error_code_t::invalid_view,
+                               binding->workspace.value);
+        const auto source_document = std::find_if(
+            output.persistence.documents.begin(),
+            output.persistence.documents.end(),
+            [&focused_view](const document_persistence_dto_t& document) {
+                return document.id == focused_view->document;
+            });
+        if (source_document == output.persistence.documents.end())
+            return shell_error(workbench_error_code_t::invalid_document,
+                               focused_view->document.value);
+        document_navigation_bridge_request_t bridge_request;
+        auto event_id = binding->next_navigation_id.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (event_id == 0)
+            event_id = binding->next_navigation_id.fetch_add(
+                1, std::memory_order_acq_rel);
+        bridge_request.id = navigation_event_id_t{event_id};
+        bridge_request.sequence = event_id;
+        bridge_request.origin = navigation_origin_t::user;
+        bridge_request.source.workspace = binding->workspace;
+        bridge_request.source.document = source_document->id;
+        bridge_request.source.view = focused_view->id;
+        bridge_request.source.selection =
+            source_document->local_state.selection;
+        bridge_request.source.cursor = source_document->local_state.cursor;
+        bridge_request.source.synchronization_group =
+            focused_view->synchronization_group;
+        bridge_request.source.synchronization_policy =
+            focused_view->synchronization_policy;
+        bridge_request.target.document = target;
+        bridge_request.target.selection = selection;
+        bridge_request.target.cursor = cursor;
+        bridge_request.request_focus = true;
+        navigation_event_t event;
+        const auto emitted =
+            output.document_bridge->emit(bridge_request, event);
+        if (!emitted)
+            return emitted;
+        workbench_command_result_t result;
+        const auto dispatched = binding->shell->dispatch_navigation(
+            binding->workspace, output.persistence.revision, event, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current =
+            binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::close_analysis_workspace(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace)
+{
+    if (!impl_ || !analysis_workspace)
+        return shell_error(workbench_error_code_t::invalid_workspace);
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto found = impl_->bindings.find(
+            analysis_workspace->identity().binary_id());
+        if (found == impl_->bindings.end() ||
+            found->second->analysis_workspace != analysis_workspace)
+            return {};
+        binding = found->second;
+    }
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        binding->closing = true;
+        if (binding->shell) {
+            const auto* current =
+                binding->shell->workspace_context(binding->workspace);
+            if (current)
+                raise_dirty_revision(binding,
+                    current->persistence.revision.value);
+        }
+    }
+    persist_runtime_binding(binding);
+    const auto persisted =
+        binding->persisted_revision.load(std::memory_order_acquire);
+    const auto dirty = binding->dirty_revision.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const auto found = impl_->bindings.find(binding->binary_id);
+        if (found != impl_->bindings.end() && found->second == binding)
+            impl_->bindings.erase(found);
+    }
+    return persisted >= dirty
+        ? workbench_error_t{}
+        : shell_error(workbench_error_code_t::adapter_rejected, dirty);
 }
 
 }
